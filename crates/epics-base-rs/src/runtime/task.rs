@@ -572,10 +572,12 @@ impl RtPolicy {
 /// the runtime's worker threads at startup — not for individual async
 /// tasks.
 ///
-/// Platform support: the OS-scheduler change is wired on Linux (where
-/// the crate links `libc`). On other targets the priority enum + API
-/// surface still exist but `apply` reports [`PriorityApplied::Unsupported`]
-/// — the platform allows no portable change here.
+/// Platform support: the OS-scheduler change is wired on Linux, via the
+/// range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
+/// fixed map of `os/RTEMS-score/osdThread.c` inverted into POSIX space (see
+/// [`map_epics_priority_rtems`] — the two maps differ in shape, deliberately).
+/// On other targets the priority enum + API surface still exist but `apply`
+/// reports [`PriorityApplied::Unsupported`] — no band has been measured there.
 ///
 /// Opt-in: real-time scheduling is only ever requested when
 /// [`RT_PRIORITY_ENV`] is set (see [`RtPolicy`]). With the switch off this
@@ -691,7 +693,12 @@ fn probe_fifo_range() -> RtRange {
 /// C parity: `epicsThreadGetPosixPriority` (`osdThread.c:129-144`) — the
 /// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on
 /// RTEMS/vxWorks (`RTEMS-score/osdThread.c:94`, `vxWorks/osdThread.c:99`).
-#[cfg(target_os = "linux")]
+///
+/// **Hosted only.** RTEMS deliberately does not use this map — see
+/// [`map_epics_priority_rtems`] for the shape and the reason. The `test`
+/// arm of the cfg exists so the two maps can be compared in one process
+/// on the host; without it the divergence test would silently vanish.
+#[cfg(any(target_os = "linux", test))]
 fn map_epics_priority(epics_priority: u8, min: i32, max: i32) -> i32 {
     // `osdThread.c:133-134`: a degenerate range collapses to one level.
     if max == min {
@@ -705,20 +712,186 @@ fn map_epics_priority(epics_priority: u8, min: i32, max: i32) -> i32 {
     (oss as i32).clamp(min, max)
 }
 
+/// The highest RTEMS *core* priority number, i.e. the least urgent level.
+///
+/// Measured on the bring-up guest (RTEMS 6 + libbsd, QEMU
+/// `xilinx_zynq_a9`): `RTEMS_MAXIMUM_PRIORITY == 255`, the idle thread runs
+/// at core 255, and `sched_get_priority_min/max(SCHED_FIFO)` report `1`/`254`.
+/// The POSIX-to-core inversion `core = 255 - posix` was verified in both
+/// directions on that guest.
+#[cfg(any(target_os = "rtems", test))]
+const RTEMS_MAXIMUM_PRIORITY: i32 = 255;
+
+/// The RTEMS *core* priority an EPICS priority must land on.
+///
+/// Verbatim `epicsThreadGetOssPriorityValue` from EPICS's own RTEMS port,
+/// `libcom/src/osi/os/RTEMS-score/osdThread.c:94-102`:
+///
+/// ```c
+/// int epicsThreadGetOssPriorityValue(unsigned int osiPriority)
+/// {
+///     if (osiPriority > 99) { return 100; }
+///     else { return (199 - (signed int)osiPriority); }
+/// }
+/// ```
+///
+/// Fixed offsets, not a range-scaled slope. The whole EPICS space therefore
+/// occupies core `100..=199` and nothing else can be reached — which is the
+/// property [`map_epics_priority_rtems`] is chosen for.
+#[cfg(any(target_os = "rtems", test))]
+const fn rtems_core_priority(epics_priority: u8) -> i32 {
+    if epics_priority > 99 {
+        100
+    } else {
+        199 - epics_priority as i32
+    }
+}
+
+/// Map an EPICS priority onto an RTEMS **POSIX** SCHED_FIFO priority.
+///
+/// A distinct function from [`map_epics_priority`] on purpose: the two have
+/// different *shapes*, not different endpoints. Expressing this one as the
+/// hosted linear map with `min`/`max` retuned would re-introduce the linear
+/// map the moment somebody adjusted a constant, and the linear map is the
+/// thing this arm exists to avoid.
+///
+/// **Deliberate deviation from base-on-RTEMS-6.** EPICS base compiles
+/// `os/posix/osdThread.c` on RTEMS 6 — `configure/toolchain.c:31-36` sets
+/// `OS_API = posix` for `__RTEMS_MAJOR__ >= 5`, and `os/RTEMS-posix/` ships
+/// no `osdThread.c` — so upstream applies the *linear* map
+/// `oss = epics*(max-min)/100 + min` over `find_pri_range`'s result, which
+/// on this guest is `min=1`/`max=254`, with
+/// `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` defaulting to `YES`
+/// (`configure/CONFIG_ENV:57`). That places EPICS 91 (the CA server band) at
+/// posix 231, i.e. **core 24** — far above libbsd's network threads. The
+/// crossover is EPICS **63** (posix 160, core 95): every EPICS priority at or
+/// above it outranks the interrupt server. Reproducing that would reproduce
+/// the hazard, so this port takes EPICS's *own* RTEMS answer instead —
+/// [`rtems_core_priority`] — and inverts it into the POSIX space we actually
+/// set:
+///
+/// ```text
+/// core = RTEMS_MAXIMUM_PRIORITY - posix   (measured)
+/// core = 199 - epics                      (RTEMS-score/osdThread.c:94-102)
+/// ⟹ posix = 255 - (199 - epics) = 56 + epics
+/// ```
+///
+/// So EPICS 0 → posix 56 → core 199, EPICS 99 → posix 155 → core 100, and
+/// anything above 99 clamps to posix 155. Every value is inside the guest's
+/// settable `[1, 254]`, and the image is collision-free with libbsd by
+/// construction rather than by tuning — see
+/// `rtems_priority_map_stays_below_the_libbsd_network_band`.
+#[cfg(any(target_os = "rtems", test))]
+fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
+    RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
+}
+
 /// Ask the OS for SCHED_FIFO at `oss` on the **calling** thread. The single
 /// place this crate touches the scheduler; returns the raw `pthread_*`
-/// status (0 on success).
-#[cfg(target_os = "linux")]
+/// status (0 on success). Counting lives here so the "switch off ⟹ no
+/// scheduler call" guarantee is observable on every target that has one.
+#[cfg(any(target_os = "linux", target_os = "rtems"))]
 fn set_fifo_priority(oss: i32) -> i32 {
     SCHED_CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     SCHED_CALLS.with(|c| c.set(c.get() + 1));
+    set_fifo_priority_raw(oss)
+}
+
+#[cfg(target_os = "linux")]
+fn set_fifo_priority_raw(oss: i32) -> i32 {
     let param = libc::sched_param {
         sched_priority: oss,
     };
     // SAFETY: pthread_setschedparam operates on the calling thread with a
     // stack-local sched_param and a valid policy constant.
     unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
+}
+
+/// The RTEMS scheduler surface, declared here rather than taken from `libc`.
+///
+/// `libc`'s `newlib/rtems` module (0.2.188) declares neither `sched_param`,
+/// `SCHED_FIFO`, `pthread_setschedparam` nor `pthread_self` — its sibling
+/// newlib targets `vita` and `horizon` declare all of them, RTEMS does not.
+/// The functions exist in the RTEMS 6 kernel
+/// (`cpukit/posix/src/pthreadsetschedparam.c`) and in the toolchain headers;
+/// only the Rust binding is missing.
+///
+/// `libc::timespec` is deliberately NOT used to describe the sporadic-server
+/// tail: `libc` types `time_t` as `i32` for every newlib target except
+/// `horizon`/`espidf` (`src/unix/newlib/mod.rs:55-64`), while the arm-rtems6
+/// toolchain has `sizeof(time_t) == 8`. Its `timespec` is therefore half the
+/// real width on this target, so the tail is carried as opaque bytes sized
+/// from the target compiler instead.
+#[cfg(target_os = "rtems")]
+mod rtems_sched {
+    use std::ffi::c_int;
+
+    /// `sys/sched.h`: `#define SCHED_FIFO 1`.
+    pub const SCHED_FIFO: c_int = 1;
+
+    /// `struct sched_param` as arm-rtems6 lays it out.
+    ///
+    /// `sys/features.h:404-405` defines both `_POSIX_SPORADIC_SERVER` and
+    /// `_POSIX_THREAD_SPORADIC_SERVER`, so `sys/sched.h` compiles the
+    /// sporadic-server tail in. Measured with the target compiler
+    /// (`arm-rtems6-gcc`, `sizeof`/`offsetof` via array-length symbols):
+    ///
+    /// | field | offset | size |
+    /// |-------|--------|------|
+    /// | `sched_priority`        |  0 |  4 |
+    /// | `sched_ss_low_priority` |  4 |  4 |
+    /// | `sched_ss_repl_period`  |  8 | 16 |
+    /// | `sched_ss_init_budget`  | 24 | 16 |
+    /// | `sched_ss_max_repl`     | 40 |  4 |
+    ///
+    /// total 48, align 8. `SCHED_FIFO` makes the kernel read only
+    /// `sched_priority` (`_POSIX_Thread_Translate_sched_param` takes the
+    /// sporadic branch for `SCHED_SPORADIC` alone), but the struct is
+    /// declared at full width anyway so the kernel is never handed a pointer
+    /// to less memory than its own header describes.
+    #[repr(C, align(8))]
+    pub struct SchedParam {
+        pub sched_priority: c_int,
+        /// Offsets 4..48 — the sporadic-server fields, unused under
+        /// `SCHED_FIFO` and always zeroed.
+        pub sporadic_tail: [u8; 44],
+    }
+
+    // The whole point of the opaque tail is that the width is right. If a
+    // future edit reaches for `libc::timespec` here, this stops the build
+    // instead of silently handing the kernel a short buffer.
+    const _: () = {
+        assert!(core::mem::size_of::<SchedParam>() == 48);
+        assert!(core::mem::align_of::<SchedParam>() == 8);
+    };
+
+    unsafe extern "C" {
+        pub fn pthread_self() -> libc::pthread_t;
+        pub fn pthread_setschedparam(
+            thread: libc::pthread_t,
+            policy: c_int,
+            param: *const SchedParam,
+        ) -> c_int;
+    }
+}
+
+#[cfg(target_os = "rtems")]
+fn set_fifo_priority_raw(oss: i32) -> i32 {
+    let param = rtems_sched::SchedParam {
+        sched_priority: oss,
+        sporadic_tail: [0u8; 44],
+    };
+    // SAFETY: `pthread_setschedparam` acts on the calling thread, is handed a
+    // stack-local `sched_param` of the target's own width (asserted above),
+    // and a policy constant taken from `sys/sched.h`.
+    unsafe {
+        rtems_sched::pthread_setschedparam(
+            rtems_sched::pthread_self(),
+            rtems_sched::SCHED_FIFO,
+            &param,
+        )
+    }
 }
 
 /// The unprivileged-fallback message. Emitted **once per process**: the
@@ -769,34 +942,50 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "rtems")]
+fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+    // Without this, every IOC thread runs at one level just above idle:
+    // `cpukit/posix/src/pthreadattrdefault.c:49-58` sets
+    // `inheritsched = PTHREAD_INHERIT_SCHED` in the default attribute set and
+    // `std` never calls `pthread_attr_setinheritsched`, so a thread inherits
+    // its creator's parameters — and every IOC thread descends from
+    // `POSIX_Init`, which the boot shim deliberately lowers to
+    // `RTEMS_MAXIMUM_PRIORITY - 1`. The CA receiver/sender ordering that stops
+    // a stalled client starving command dispatch does not hold at one level.
+    //
+    // No range probe, unlike Linux. The probe exists there because
+    // `sched_get_priority_max` reports the *policy's* range while
+    // `RLIMIT_RTPRIO`/`CAP_SYS_NICE` decide the usable one, so the settable
+    // ceiling has to be searched for. RTEMS has no such permission gate —
+    // `pthread_setschedparam` (`cpukit/posix/src/pthreadsetschedparam.c`)
+    // performs no privilege check — and this map's image is a fixed
+    // `[56, 155]`, inside the measured settable `[1, 254]` by construction.
+    // There is nothing to discover, and a probe thread would itself need a
+    // band to run in.
+    let oss = map_epics_priority_rtems(epics_priority);
+    let rc = set_fifo_priority(oss);
+    if rc == 0 {
+        PriorityApplied::Realtime
+    } else {
+        tracing::debug!(
+            target: "epics_base_rs::runtime",
+            epics_priority,
+            oss,
+            errno = rc,
+            "SCHED_FIFO priority not applied; thread stays at default policy"
+        );
+        PriorityApplied::BestEffortFailed
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "rtems")))]
 fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
-    // No OS-scheduler priority API is wired on other targets.
-    //
-    // NOT because libc is missing — that was true when this arm was written
-    // and is no longer: `libc` is a `cfg(unix)` dependency of this crate, so
-    // `pthread_setschedparam` and `sched_get_priority_min/max(SCHED_FIFO)`
-    // are both reachable on RTEMS (verified against the RTEMS 6 source:
-    // `cpukit/posix/src/pthreadsetschedparam.c`,
-    // `cpukit/posix/src/sched_getprioritymax.c`).
-    //
-    // What RTEMS threads run at today, established from
-    // `cpukit/posix/src/pthreadattrdefault.c:49-58`: the default attribute
-    // set has `inheritsched = PTHREAD_INHERIT_SCHED`, and `std` never calls
-    // `pthread_attr_setinheritsched`, so every thread inherits the *creating*
-    // thread's parameters. Every IOC thread descends from `POSIX_Init`, which
-    // the boot shim deliberately lowers to `RTEMS_MAXIMUM_PRIORITY - 1`
-    // (`epics-rtems-boot/csrc/rtems_init.c`). So they all run just above idle,
-    // all at the same priority — the CA receiver/sender ordering that exists
-    // to stop a stalled client starving command dispatch does not hold there.
-    //
-    // What is still missing before this arm can be written is not a Rust
-    // question: it is which priority band libbsd's own network threads
-    // occupy. Mapping EPICS priorities onto the full `SCHED_FIFO` range
-    // without that number can place IOC threads above the network stack and
-    // starve it, which on a network-only target is indistinguishable from a
-    // hang. That measurement is the resource rung's job, and this arm stays
-    // `Unsupported` until it exists rather than guessing a band.
+    // No OS-scheduler priority API is wired on other targets. The two that
+    // are wired each needed a *measured* target band before they could be:
+    // Linux probes for its settable ceiling at runtime, and RTEMS's map is
+    // pinned against libbsd's network-thread band measured on the bring-up
+    // guest. Neither number is guessable, so a new target gets `Unsupported`
+    // until somebody measures it rather than a plausible-looking range.
     PriorityApplied::Unsupported
 }
 
@@ -814,7 +1003,7 @@ pub fn sched_calls_made() -> usize {
 
 static SCHED_CALLS_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "rtems")))]
 thread_local! {
     /// Every scheduler call this crate makes passes through
     /// [`set_fifo_priority`], which bumps this. Tests assert the delta is
@@ -1364,6 +1553,128 @@ mod tests {
         assert_eq!(map_epics_priority(99, 1, 10), 1 + (99.0 * 0.09) as i32);
         // Degenerate range collapses (osdThread.c:133).
         assert_eq!(map_epics_priority(50, 7, 7), 7);
+    }
+
+    /// The RTEMS map's *image* is the whole point of choosing it, so assert
+    /// the image, not sampled points: for **every** `u8` input the resulting
+    /// RTEMS core priority lands in `100..=199`, and therefore below libbsd's
+    /// network threads.
+    ///
+    /// Provenance of the band, measured on the bring-up guest (RTEMS 6 +
+    /// libbsd, QEMU `xilinx_zynq_a9`) — lower core number is *more* urgent:
+    ///
+    /// | core | thread |
+    /// |------|--------|
+    /// | 96   | libbsd `IRQS` (interrupt server) |
+    /// | 98   | libbsd `TIME` |
+    /// | 100  | libbsd default — eleven further network threads |
+    /// | 254  | DHCP, outside the band |
+    /// | 255  | idle, `RTEMS_MAXIMUM_PRIORITY` |
+    ///
+    /// So `core >= 100` means: never more urgent than any libbsd network
+    /// thread, and strictly less urgent than `IRQS`/`TIME`. That is a
+    /// property of the map's construction (fixed offsets over a 100-wide
+    /// EPICS space), not of the endpoints, which is why no input — including
+    /// the out-of-range ones `ThreadPriority::value` cannot currently produce
+    /// — can escape it.
+    #[test]
+    fn rtems_priority_map_stays_below_the_libbsd_network_band() {
+        /// libbsd's most urgent network thread on the measured guest.
+        const LIBBSD_IRQS_CORE: i32 = 96;
+        /// libbsd's default band; eleven of its threads sit here.
+        const LIBBSD_DEFAULT_CORE: i32 = 100;
+        // The guest's settable SCHED_FIFO range.
+        const POSIX_MIN: i32 = 1;
+        const POSIX_MAX: i32 = 254;
+
+        for epics in 0..=u8::MAX {
+            let posix = map_epics_priority_rtems(epics);
+            let core = RTEMS_MAXIMUM_PRIORITY - posix;
+            assert!(
+                (POSIX_MIN..=POSIX_MAX).contains(&posix),
+                "EPICS {epics} maps to posix {posix}, outside the settable \
+                 [{POSIX_MIN}, {POSIX_MAX}]"
+            );
+            assert!(
+                core >= LIBBSD_DEFAULT_CORE,
+                "EPICS {epics} maps to core {core}, more urgent than libbsd's \
+                 default band ({LIBBSD_DEFAULT_CORE}) and its IRQS \
+                 ({LIBBSD_IRQS_CORE})"
+            );
+            assert!(
+                core <= RTEMS_MAXIMUM_PRIORITY - 56,
+                "EPICS {epics} maps to core {core}, less urgent than the \
+                 EPICS band's own floor of 199"
+            );
+        }
+        // The two ends of the EPICS space, as `RTEMS-score/osdThread.c:94-102`
+        // defines them, and the clamp above it.
+        assert_eq!(map_epics_priority_rtems(0), 56);
+        assert_eq!(map_epics_priority_rtems(99), 155);
+        assert_eq!(map_epics_priority_rtems(100), 155);
+        assert_eq!(map_epics_priority_rtems(u8::MAX), 155);
+        // Ordering still holds: a higher EPICS priority is a more urgent core.
+        assert!(
+            RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(ThreadPriority::ScanLow.value())
+                < RTEMS_MAXIMUM_PRIORITY
+                    - map_epics_priority_rtems(ThreadPriority::CaServerHigh.value())
+        );
+    }
+
+    /// The RTEMS map is not the hosted map with retuned endpoints, and the
+    /// difference is exactly the reason the RTEMS arm exists.
+    ///
+    /// Stated as the hazard rather than as `assert_ne!` on a sample: over the
+    /// EPICS space, feeding the *hosted linear* map the guest's own probed
+    /// range (`min=1`, `max=254`) puts some priorities above libbsd's `IRQS`
+    /// at core 96, and the fixed RTEMS map puts none there. The crossover is
+    /// pinned at EPICS 63 because that number is the justification recorded in
+    /// the commit message; if base's map or the measured band ever moves, this
+    /// fails rather than the deviation quietly losing its reason.
+    #[test]
+    fn rtems_priority_map_is_not_the_hosted_linear_map() {
+        const LIBBSD_IRQS_CORE: i32 = 96;
+        // What `find_pri_range` yields on the guest (osdThread.c:295-311).
+        let (min, max) = (1, 254);
+
+        let hosted_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority(epics, min, max);
+        let rtems_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(epics);
+
+        let hosted_above_irqs: Vec<u8> = (0..=99)
+            .filter(|&e| hosted_core(e) < LIBBSD_IRQS_CORE)
+            .collect();
+        let rtems_above_irqs: Vec<u8> = (0..=99)
+            .filter(|&e| rtems_core(e) < LIBBSD_IRQS_CORE)
+            .collect();
+
+        assert_eq!(
+            rtems_above_irqs,
+            Vec::<u8>::new(),
+            "the RTEMS map must place no EPICS priority above libbsd's IRQS"
+        );
+        assert_eq!(
+            hosted_above_irqs.first().copied(),
+            Some(63),
+            "base-on-RTEMS-6's posix map crosses IRQS at EPICS 63; that number \
+             is the recorded reason for this deviation"
+        );
+        // And concretely at the CA server band the audit cares about.
+        assert_eq!(
+            hosted_core(91),
+            24,
+            "upstream posix map: EPICS 91 -> core 24"
+        );
+        assert_eq!(rtems_core(91), 108, "this port: EPICS 91 -> core 108");
+        // Shapes, not endpoints: the hosted map spans the whole probed range,
+        // this one spans exactly 100 levels wherever it is placed.
+        assert_eq!(
+            map_epics_priority_rtems(99) - map_epics_priority_rtems(0),
+            99
+        );
+        assert_eq!(
+            map_epics_priority(99, min, max) - map_epics_priority(0, min, max),
+            250
+        );
     }
 
     #[tokio::test]

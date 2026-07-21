@@ -80,31 +80,68 @@
 //! `tcp.rs` is untouched by stage 4, the hosted `select!` is byte-identical,
 //! and the ≤15 s window is gone for this driver anyway.
 //!
+//! # The accept side
+//!
+//! [`BlockingPvaServer`] owns the [`ConnRegistry`] and hands sockets to
+//! [`serve_connection_blocking`], assembling the arguments the hosted
+//! [`super::accept`] assembles for its own driver. Every thread it and this
+//! module create goes through `runtime::task::spawn_dedicated_thread` at
+//! `PVA_SERVER_PRIORITY` — see that constant for why they all share one
+//! number, and the seam function for why a plain `std::thread` is not enough
+//! on a hosted build.
+//!
 //! # Not here
 //!
-//! The accept loop that owns a [`ConnRegistry`] and hands sockets to
-//! [`serve_connection_blocking`] is item 7; on the host that role is
-//! [`super::accept`]'s, and it drives its connections as tasks rather than
-//! through this module.
+//! The UDP SEARCH responder: discovery still needs one, and its socket-free
+//! core is currently quarantined inside the host-only [`super::udp`], so it
+//! begins with the same extraction [`super::search`] was.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use epics_base_rs::runtime::task::block_on_sync;
+use epics_base_rs::runtime::task::spawn_dedicated_thread;
+use epics_base_rs::runtime::task::{ThreadPriority, apply_to_current_thread, block_on_sync};
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
-use super::source::DynSource;
+use super::peers::{PeerEntry, PeerRegistry};
+use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
+
+/// The EPICS priority every PVA server thread runs at.
+///
+/// pvxs runs its TCP acceptor **and** the reactor that reads, decodes and
+/// writes every connection on **one** thread, `PVXTCP`, at
+/// `epicsThreadPriorityCAServerLow-2` (`pvxs/src/server.cpp:388`), where
+/// `epicsThreadPriorityCAServerLow = 20` (`epicsThread.h:82`) — so 18. We
+/// split that same body of work across an accept thread plus a reader,
+/// operation and writer thread per connection, and all four take 18:
+/// splitting how the work is scheduled *internally* must not change how it is
+/// scheduled relative to everything else. Raising one of them (the writer,
+/// say) would be a design decision needing its own justification, not a
+/// default.
+///
+/// This sits below CA's server threads — `CaServerLow` = 20 for a client
+/// connection and 19 for its event thread — which is the upstream ordering
+/// for an IOC serving both protocols. pvxs puts its UDP search collector
+/// lower still, at `CaServerLow-4` = 16 (`udp_collector.cpp:93`), so a SEARCH
+/// flood cannot starve established connections; that one arrives with the
+/// blocking UDP responder.
+///
+/// Applying it is opt-in and best effort (`EPICS_RS_ALLOW_RT_PRIORITY`), and
+/// on RTEMS the platform arm reports `Unsupported` today — the call sites are
+/// what matter, so that bring-up is a scheduler change and not a hunt for
+/// every thread spawn.
+const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18);
 
 /// Depth of the reader → operation byte-chunk channel.
 ///
@@ -663,15 +700,21 @@ pub fn serve_connection_blocking(
     let room = Arc::new(WriteRoom::default());
     let writer_adapter = ChannelWriter::new(frame_tx.downgrade(), room.clone());
 
-    let reader = thread::Builder::new()
-        .name(format!("PVA-reader {peer}"))
-        .spawn(move || reader_thread(read_sock, chunk_tx, peer))
-        .map_err(PvaError::Io)?;
+    // Both children go through the seam at `PVA_SERVER_PRIORITY`, like every
+    // other thread in this module — see that constant for why all of them
+    // share one number.
+    let reader = spawn_dedicated_thread(
+        format!("PVAS-reader {peer}"),
+        PVA_SERVER_PRIORITY,
+        move || reader_thread(read_sock, chunk_tx, peer),
+    )
+    .map_err(PvaError::Io)?;
     let writer_room = room.clone();
     let writer_wake = registration.wake_handle();
-    let writer = thread::Builder::new()
-        .name(format!("PVA-writer {peer}"))
-        .spawn(move || {
+    let writer = spawn_dedicated_thread(
+        format!("PVAS-writer {peer}"),
+        PVA_SERVER_PRIORITY,
+        move || {
             writer_thread(
                 write_sock,
                 frame_rx,
@@ -680,8 +723,9 @@ pub fn serve_connection_blocking(
                 send_timeout,
                 peer,
             )
-        })
-        .map_err(PvaError::Io)?;
+        },
+    )
+    .map_err(PvaError::Io)?;
 
     let outcome = block_on_sync(handle_connection_io(
         source,
@@ -722,18 +766,228 @@ pub fn serve_connection_blocking(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Accept loop (item 7 stage C)
+// ---------------------------------------------------------------------------
+
+/// The accept loop's per-connection bookkeeping, undone on every exit path.
+///
+/// The peer entry and the `max_connections` slot are both taken *before* the
+/// connection thread starts, so both have to come back however that thread
+/// ends — clean return, I/O error, or a panic unwinding out of the connection.
+/// A guard is the only shape that covers the third, and the thread body is the
+/// one place that can hold it.
+struct ConnSlot {
+    peers: Arc<PeerRegistry>,
+    active: Arc<AtomicUsize>,
+    peer: SocketAddr,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.peers.remove(self.peer);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A blocking, thread-per-connection PVA TCP server — the accept side of the
+/// driver in this module, and the RTEMS counterpart of [`super::accept`].
+///
+/// [`serve_connection_blocking`] serves one connection on three threads; this
+/// is what gives it sockets and the arguments the hosted accept loop assembles
+/// in `accept.rs`. An N-client server therefore costs **3N+2** threads — this
+/// accept loop, the UDP search responder, and three per connection — where the
+/// hosted driver costs two tasks per connection. That is a stated RTEMS budget
+/// item, not an accident.
+///
+/// It owns the [`ConnRegistry`], because [`serve_connection_blocking`] cannot
+/// be called without one, and that makes [`shutdown`](Self::shutdown) able to
+/// end live connections rather than only stop accepting new ones.
+///
+/// TLS is not served: the blocking driver is plain-TCP only (§6), so every
+/// connection is registered with `tls = false` and authenticates through
+/// CONNECTION_VALIDATION.
+pub struct BlockingPvaServer {
+    listener: TcpListener,
+    source: DynSource,
+    config: PvaServerConfig,
+    peers: Arc<PeerRegistry>,
+    channel_invalidator: ChannelInvalidator,
+    connections: Arc<ConnRegistry>,
+    tcp_port: u16,
+    active: Arc<AtomicUsize>,
+    shutdown: AtomicBool,
+}
+
+impl BlockingPvaServer {
+    /// Bind the accept socket.
+    ///
+    /// Binding happens here and not in [`serve`](Self::serve), so a
+    /// constructed server *is* a listening server: [`tcp_port`](Self::tcp_port)
+    /// is answerable before any thread exists, and the port is never probed,
+    /// released and re-bound.
+    pub fn bind<A: ToSocketAddrs>(
+        addr: A,
+        source: DynSource,
+        config: PvaServerConfig,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        let tcp_port = listener.local_addr()?.port();
+        // Same wiring the hosted single-listener path does at
+        // `accept.rs:69-70`: the source needs the handle to force-disconnect
+        // downstream channels out of band.
+        let channel_invalidator = ChannelInvalidator::new();
+        source.set_channel_invalidator(channel_invalidator.clone());
+        Ok(Self {
+            listener,
+            source,
+            config,
+            peers: PeerRegistry::new(),
+            channel_invalidator,
+            connections: Arc::new(ConnRegistry::new()),
+            tcp_port,
+            active: Arc::new(AtomicUsize::new(0)),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    /// The actual bound address — the value to use when the configured port
+    /// was 0.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// The bound TCP port, as SEARCH replies must advertise it.
+    pub fn tcp_port(&self) -> u16 {
+        self.tcp_port
+    }
+
+    /// Live per-connection accounting, for the server report (`pvxsr`).
+    pub fn peers(&self) -> &Arc<PeerRegistry> {
+        &self.peers
+    }
+
+    /// Connections currently being served.
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Accept until [`shutdown`](Self::shutdown).
+    ///
+    /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
+    /// give it a thread of its own rather than calling it on a thread that has
+    /// other work.
+    pub fn serve(&self) {
+        let _ = apply_to_current_thread(PVA_SERVER_PRIORITY);
+        for stream in self.listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    // `shutdown` wakes this parked `accept` by dialling our own
+                    // socket; that throwaway connection arrives here and is
+                    // dropped with the flag already set.
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Ok(peer) = stream.peer_addr() else {
+                        continue;
+                    };
+                    if let Err(e) = self.start_connection(stream, peer) {
+                        warn!(?peer, error = %e, "blocking PVA server: connection not started");
+                    }
+                }
+                Err(e) => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    warn!(error = %e, "blocking PVA server: accept failed");
+                }
+            }
+        }
+    }
+
+    /// Take the slot and the peer entry, then hand the socket to a connection
+    /// thread. The slot is moved into the thread body, so a failed spawn
+    /// returns it exactly as a finished connection would.
+    fn start_connection(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
+        if self.active.load(Ordering::Acquire) >= self.config.max_connections {
+            // Dropping the stream closes it. Refusing costs more here than on
+            // the host: each connection is three threads, not two tasks.
+            debug!(
+                ?peer,
+                limit = self.config.max_connections,
+                "blocking PVA server: refusing connection, max_connections reached"
+            );
+            return Ok(());
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let peer_entry = PeerEntry::new(false);
+        self.peers.insert(peer, peer_entry.clone());
+        let slot = ConnSlot {
+            peers: self.peers.clone(),
+            active: self.active.clone(),
+            peer,
+        };
+
+        let source = self.source.clone();
+        let config = self.config.clone();
+        let invalidator = self.channel_invalidator.clone();
+        let connections = self.connections.clone();
+        spawn_dedicated_thread(
+            format!("PVAS-conn {peer}"),
+            PVA_SERVER_PRIORITY,
+            move || {
+                // Held for the whole connection: its `Drop` returns the slot and
+                // the peer entry even if the connection panics.
+                let _slot = slot;
+                let outcome = serve_connection_blocking(
+                    stream,
+                    peer,
+                    source,
+                    config,
+                    peer_entry,
+                    invalidator,
+                    &connections,
+                );
+                if let Err(e) = outcome {
+                    debug!(?peer, error = %e, "blocking PVA connection ended with error");
+                }
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Stop accepting, and end the connections already running. Idempotent.
+    ///
+    /// Two operations because there are two things to stop, and neither
+    /// implies the other: the flag plus a self-connect returns the parked
+    /// `accept`, and [`ConnRegistry::stop`] shuts every live connection's
+    /// socket. Without the second, a peer that never speaks and never hangs up
+    /// would hold three threads until the process exits — the semantic CA's
+    /// blocking server still has, and the reason the registry exists.
+    ///
+    /// Returns once the wakes are issued; each connection retires on its own
+    /// thread. Those threads are detached, so a caller that must observe them
+    /// gone watches [`active_connections`](Self::active_connections).
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(addr) = self.listener.local_addr() {
+            let _ = TcpStream::connect(addr);
+        }
+        self.connections.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::{ByteOrder, Command, PvaHeader, ReadExt, WriteExt, encode_string_into};
     use crate::pvdata::encode::encode_type_desc;
     use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use crate::server_native::peers::PeerEntry;
-    use crate::server_native::source::ChannelInvalidator;
     use crate::server_native::{SharedPV, SharedSource};
     use std::io::Cursor;
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
     use tokio::io::AsyncReadExt;
 
     /// Production scope of a source file: everything before the first
@@ -881,65 +1135,32 @@ mod tests {
         Arc::new(shared)
     }
 
-    /// A connection served by the blocking driver, plus the client's end of
-    /// the socket. Dropping the client end ends the connection.
-    struct Harness {
-        client: TcpStream,
-        conn: Option<tokio::task::JoinHandle<PvaResult<()>>>,
-    }
+    /// The client end of a connection, with just enough framing to drive the
+    /// server. Shared by the per-connection tests and the accept-loop tests
+    /// below, so neither grows its own frame reader.
+    struct TestClient(TcpStream);
 
-    impl Harness {
-        /// Bind loopback on an ephemeral port (never 5075), connect, and hand
-        /// the accepted socket to the blocking driver.
-        ///
-        /// The driver runs inside a spawned task rather than a bare thread
-        /// because on a hosted build the connection future needs tokio's
-        /// timer and spawner underneath it (module docs); `block_on_sync`
-        /// then takes its worker-handoff arm, which is the arm a hosted
-        /// caller is supposed to take.
-        ///
-        /// `registry` stands in for the accept loop item 7 will bring: these
-        /// tests are the registry's only driver until then, so they drive it
-        /// exactly as that loop will — one registry, N connections, `stop`.
-        fn start(config: PvaServerConfig, registry: Arc<ConnRegistry>) -> Harness {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
-            let addr = listener.local_addr().expect("local addr");
-            let client = TcpStream::connect(addr).expect("connect");
-            let (server_sock, peer) = listener.accept().expect("accept");
-            let source = test_source();
-            let conn = tokio::spawn(async move {
-                serve_connection_blocking(
-                    server_sock,
-                    peer,
-                    source,
-                    config,
-                    PeerEntry::new(false),
-                    ChannelInvalidator::new(),
-                    &registry,
-                )
-            });
-            client
-                .set_read_timeout(Some(Duration::from_secs(10)))
+    impl TestClient {
+        fn connect(addr: SocketAddr) -> TestClient {
+            let sock = TcpStream::connect(addr).expect("connect");
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("client read timeout");
-            Harness {
-                client,
-                conn: Some(conn),
-            }
+            TestClient(sock)
         }
 
         fn send(&mut self, bytes: &[u8]) {
-            self.client.write_all(bytes).expect("client write");
+            self.0.write_all(bytes).expect("client write");
         }
 
         /// Read exactly one PVA frame (header + declared body).
         fn read_frame(&mut self) -> (PvaHeader, Vec<u8>) {
             let mut head = [0u8; PvaHeader::SIZE];
-            self.client.read_exact(&mut head).expect("frame header");
+            self.0.read_exact(&mut head).expect("frame header");
             let header =
                 PvaHeader::decode(&mut Cursor::new(&head[..])).expect("decode frame header");
             let mut body = vec![0u8; header.payload_length as usize];
             if !body.is_empty() {
-                self.client.read_exact(&mut body).expect("frame body");
+                self.0.read_exact(&mut body).expect("frame body");
             }
             (header, body)
         }
@@ -953,6 +1174,54 @@ mod tests {
                 }
             }
             panic!("no {command:?} frame arrived within 32 frames");
+        }
+
+        fn close(&self) {
+            let _ = self.0.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// A connection served by the blocking driver, plus the client's end of
+    /// the socket. Dropping the client end ends the connection.
+    struct Harness {
+        client: TestClient,
+        conn: Option<tokio::task::JoinHandle<PvaResult<()>>>,
+    }
+
+    impl Harness {
+        /// Bind loopback on an ephemeral port (never 5075), connect, and hand
+        /// the accepted socket to the blocking driver.
+        ///
+        /// The driver runs inside a spawned task rather than a bare thread
+        /// because on a hosted build the connection future needs tokio's
+        /// timer and spawner underneath it (module docs); `block_on_sync`
+        /// then takes its worker-handoff arm, which is the arm a hosted
+        /// caller is supposed to take.
+        ///
+        /// `registry` stands in for the accept loop stage C brings: these
+        /// tests drive it as that loop does — one registry, N connections,
+        /// `stop`.
+        fn start(config: PvaServerConfig, registry: Arc<ConnRegistry>) -> Harness {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+            let client = TestClient::connect(addr);
+            let (server_sock, peer) = listener.accept().expect("accept");
+            let source = test_source();
+            let conn = tokio::spawn(async move {
+                serve_connection_blocking(
+                    server_sock,
+                    peer,
+                    source,
+                    config,
+                    PeerEntry::new(false),
+                    ChannelInvalidator::new(),
+                    &registry,
+                )
+            });
+            Harness {
+                client,
+                conn: Some(conn),
+            }
         }
 
         /// Collect the connection's result under a bound, so a regression that
@@ -969,7 +1238,7 @@ mod tests {
                     // into the runtime's drop would wait on that worker — the
                     // test would hang instead of failing, which is exactly
                     // what a mutation of the wake path must not be able to do.
-                    let _ = self.client.shutdown(Shutdown::Both);
+                    self.client.close();
                     panic!("the connection must retire within {within:?}, not stay parked");
                 }
             }
@@ -977,7 +1246,7 @@ mod tests {
 
         /// Close the client end and collect the connection's result.
         async fn finish(self) -> PvaResult<()> {
-            let _ = self.client.shutdown(Shutdown::Both);
+            self.client.close();
             self.wait_retired(RETIRE_BOUND).await
         }
     }
@@ -1032,12 +1301,12 @@ mod tests {
         let split = [3usize, PvaHeader::SIZE, PvaHeader::SIZE + 2, frame.len()];
         let mut from = 0;
         for to in split {
-            h.send(&frame[from..to]);
+            h.client.send(&frame[from..to]);
             from = to;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let body = h.read_until(Command::CreateChannel);
+        let body = h.client.read_until(Command::CreateChannel);
         let mut cur = Cursor::new(&body[..]);
         assert_eq!(cur.get_u32(order).expect("cid"), 7, "cid echoed");
         let _sid = cur.get_u32(order).expect("sid");
@@ -1074,15 +1343,15 @@ mod tests {
         let mut chunk_a = Vec::new();
         first.write_into(&mut chunk_a);
         chunk_a.extend_from_slice(&payload[..cut]);
-        h.send(&chunk_a);
+        h.client.send(&chunk_a);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let mut chunk_b = Vec::new();
         last.write_into(&mut chunk_b);
         chunk_b.extend_from_slice(&payload[cut..]);
-        h.send(&chunk_b);
+        h.client.send(&chunk_b);
 
-        let body = h.read_until(Command::CreateChannel);
+        let body = h.client.read_until(Command::CreateChannel);
         let mut cur = Cursor::new(&body[..]);
         assert_eq!(cur.get_u32(order).expect("cid"), 11, "cid echoed");
         let _sid = cur.get_u32(order).expect("sid");
@@ -1110,12 +1379,12 @@ mod tests {
         let order = ByteOrder::Little;
         let mut h = Harness::start(isolated_config(), Arc::new(ConnRegistry::new()));
 
-        h.send(&app_frame(
+        h.client.send(&app_frame(
             Command::CreateChannel,
             order,
             create_channel_payload(1, "dut", order),
         ));
-        let body = h.read_until(Command::CreateChannel);
+        let body = h.client.read_until(Command::CreateChannel);
         let mut cur = Cursor::new(&body[..]);
         let _cid = cur.get_u32(order).expect("cid");
         let sid = cur.get_u32(order).expect("sid");
@@ -1138,8 +1407,8 @@ mod tests {
         define.put_u8(0xFD);
         define.put_u16(SLOT, order);
         encode_type_desc(&req_desc, order, &mut define);
-        h.send(&app_frame(Command::Get, order, define));
-        let reply1 = h.read_until(Command::Get);
+        h.client.send(&app_frame(Command::Get, order, define));
+        let reply1 = h.client.read_until(Command::Get);
         let mut cur = Cursor::new(&reply1[..]);
         assert_eq!(cur.get_u32(order).expect("ioid"), 801);
         let _sub = cur.get_u8().expect("subcommand");
@@ -1157,8 +1426,8 @@ mod tests {
         reference.put_u8(INIT);
         reference.put_u8(0xFE);
         reference.put_u16(SLOT, order);
-        h.send(&app_frame(Command::Get, order, reference));
-        let reply2 = h.read_until(Command::Get);
+        h.client.send(&app_frame(Command::Get, order, reference));
+        let reply2 = h.client.read_until(Command::Get);
         let mut cur = Cursor::new(&reply2[..]);
         assert_eq!(cur.get_u32(order).expect("ioid"), 802);
         let _sub = cur.get_u8().expect("subcommand");
@@ -1421,12 +1690,12 @@ mod tests {
 
         // One complete exchange first, so the connection is provably past
         // setup and parked waiting for a frame that will never come.
-        h.send(&app_frame(
+        h.client.send(&app_frame(
             Command::CreateChannel,
             order,
             create_channel_payload(3, "dut", order),
         ));
-        let _ = h.read_until(Command::CreateChannel);
+        let _ = h.client.read_until(Command::CreateChannel);
         await_registered(&registry, 1).await;
 
         registry.stop();
@@ -1502,12 +1771,12 @@ mod tests {
         let registry = Arc::new(ConnRegistry::new());
         let mut h = Harness::start(isolated_config(), registry.clone());
 
-        h.send(&app_frame(
+        h.client.send(&app_frame(
             Command::CreateChannel,
             order,
             create_channel_payload(5, "dut", order),
         ));
-        let body = h.read_until(Command::CreateChannel);
+        let body = h.client.read_until(Command::CreateChannel);
         let mut cur = Cursor::new(&body[..]);
         let _cid = cur.get_u32(order).expect("cid");
         let sid = cur.get_u32(order).expect("sid");
@@ -1529,8 +1798,8 @@ mod tests {
             order,
             &mut init,
         );
-        h.send(&app_frame(Command::Get, order, init));
-        let reply = h.read_until(Command::Get);
+        h.client.send(&app_frame(Command::Get, order, init));
+        let reply = h.client.read_until(Command::Get);
         let mut cur = Cursor::new(&reply[..]);
         assert_eq!(cur.get_u32(order).expect("ioid"), 900);
         let _sub = cur.get_u8().expect("subcommand");
@@ -1652,5 +1921,258 @@ mod tests {
 
         writer.join().expect("writer thread");
         reader.join().expect("reader thread");
+    }
+
+    // ── the accept loop (stage C) ───────────────────────────────────────
+
+    /// Stand a server up and give it an accept thread.
+    ///
+    /// The accept thread goes through the seam, not `thread::spawn`, and that
+    /// is not decoration: on a hosted build `spawn_dedicated_thread` captures
+    /// the calling thread's runtime, so the per-connection threads the accept
+    /// loop spawns capture it in turn. The ambient context propagates down the
+    /// thread tree because every level was spawned the same way. On RTEMS
+    /// there is nothing to propagate and the same code is a plain thread.
+    fn start_server(config: PvaServerConfig) -> (Arc<BlockingPvaServer>, thread::JoinHandle<()>) {
+        let server = Arc::new(
+            BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), config)
+                .expect("bind the blocking PVA server"),
+        );
+        let serving = server.clone();
+        let accept =
+            spawn_dedicated_thread("test-PVAS-accept".into(), PVA_SERVER_PRIORITY, move || {
+                serving.serve()
+            })
+            .expect("accept thread spawned");
+        (server, accept)
+    }
+
+    /// Poll `f` until it holds, or fail. Connection setup and teardown both
+    /// finish on threads this test does not join, so every assertion about
+    /// them is "eventually", and it must be a bounded eventually.
+    fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if f() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{what} did not happen within 5s");
+    }
+
+    /// Shut the server down and collect its accept thread under a bound.
+    ///
+    /// `JoinHandle::join` cannot time out, so a regression in either half of
+    /// `shutdown` would hang the run rather than fail it — the same trap
+    /// `Harness::wait_retired` exists to avoid on the connection side.
+    fn stop_and_join(server: &BlockingPvaServer, accept: thread::JoinHandle<()>) {
+        server.shutdown();
+        eventually("shutdown returns the accept loop", || accept.is_finished());
+        accept.join().expect("accept thread joined");
+    }
+
+    /// The priority is derived from upstream, not typed in. pvxs runs PVXTCP
+    /// at `epicsThreadPriorityCAServerLow-2` (`server.cpp:388`) and
+    /// `epicsThreadPriorityCAServerLow` is 20 (`epicsThread.h:82`), so an edit
+    /// that "rounds" this to CaServerLow or to 19 has to fail something.
+    #[test]
+    fn the_server_priority_is_the_pvxs_value() {
+        assert_eq!(
+            PVA_SERVER_PRIORITY.value(),
+            ThreadPriority::CaServerLow.value() - 2,
+            "pvxs runs its TCP acceptor and connection reactor at CAServerLow-2"
+        );
+        assert_eq!(PVA_SERVER_PRIORITY.value(), 18);
+    }
+
+    /// One rule for every thread in this module: spawned through the runtime
+    /// seam, at `PVA_SERVER_PRIORITY`. A raw `thread::Builder` in production
+    /// would be a thread with no priority and, on the host, no ambient
+    /// runtime — the failure the accept loop's connections would hit first.
+    #[test]
+    fn every_server_thread_goes_through_the_seam() {
+        let prod = production_scope(include_str!("blocking.rs"));
+        assert_eq!(
+            prod.matches(concat!("thread", "::Builder")).count(),
+            0,
+            "spawn server threads with `spawn_dedicated_thread`, not directly: \
+             the seam is what applies the priority and carries the ambient runtime"
+        );
+        assert_eq!(
+            prod.matches("spawn_dedicated_thread(").count(),
+            3,
+            "the reader, the writer and the per-connection thread"
+        );
+    }
+
+    /// Binding *is* listening: the port is answerable and connectable before
+    /// any thread exists, so nothing ever probes a port, releases it and
+    /// re-binds.
+    #[test]
+    fn bind_owns_the_port_before_any_thread_exists() {
+        let server =
+            BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), isolated_config())
+                .expect("bind");
+        assert_ne!(server.tcp_port(), 0, "an ephemeral bind resolves the port");
+        assert_eq!(
+            server.local_addr().expect("local addr").port(),
+            server.tcp_port()
+        );
+        // No `serve()` yet: the listen backlog takes this.
+        let _client = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");
+        assert_eq!(server.active_connections(), 0);
+    }
+
+    /// The whole arg assembly, end to end: the accept loop must build what
+    /// `accept.rs` builds on the host — source, config, peer entry, channel
+    /// invalidator, registry — or the connection cannot answer a
+    /// CREATE_CHANNEL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_accept_loop_serves_a_real_channel() {
+        let order = ByteOrder::Little;
+        let (server, accept) = start_server(isolated_config());
+        let mut client = TestClient::connect(server.local_addr().expect("addr"));
+
+        client.send(&app_frame(
+            Command::CreateChannel,
+            order,
+            create_channel_payload(21, "dut", order),
+        ));
+        let body = client.read_until(Command::CreateChannel);
+        let mut cur = Cursor::new(&body[..]);
+        assert_eq!(cur.get_u32(order).expect("cid"), 21, "cid echoed");
+        let _sid = cur.get_u32(order).expect("sid");
+        assert_eq!(
+            cur.get_u8().expect("status"),
+            0xFF,
+            "a connection accepted by the blocking accept loop must serve channels"
+        );
+
+        stop_and_join(&server, accept);
+    }
+
+    /// The peer registry is the accept loop's job, and it is what the server
+    /// report reads. Present while the connection lives, gone when it ends —
+    /// and gone via the slot guard, so an error or a panic returns it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_is_tracked_in_the_peer_registry_and_released() {
+        let (server, accept) = start_server(isolated_config());
+        let client = TestClient::connect(server.local_addr().expect("addr"));
+
+        eventually("the peer registry gains the connection", || {
+            server.peers().snapshot().len() == 1
+        });
+        assert_eq!(server.active_connections(), 1);
+        let (_peer, snap) = server.peers().snapshot().remove(0);
+        assert!(!snap.tls, "the blocking driver serves plain TCP only");
+
+        client.close();
+        eventually("the peer registry releases the connection", || {
+            server.peers().snapshot().is_empty()
+        });
+        eventually("the connection slot is returned", || {
+            server.active_connections() == 0
+        });
+
+        stop_and_join(&server, accept);
+    }
+
+    /// Boundary: shutdown with nothing connected. The accept loop is parked
+    /// inside `accept()`, which no flag can return on its own — the
+    /// self-connect is what wakes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_returns_a_parked_accept_loop() {
+        let (server, accept) = start_server(isolated_config());
+
+        // Park the loop *provably*, and with an empty backlog. Merely
+        // connecting is not enough: a connection still queued in the listen
+        // backlog is itself a pending wake, and an accept loop that exits on
+        // it would pass this test with no self-connect at all. So drive one
+        // connection all the way through — served, then gone — and only then
+        // is the next `accept()` a park with nothing to return it.
+        let probe = TestClient::connect(server.local_addr().expect("addr"));
+        eventually("the probe connection is served", || {
+            server.active_connections() == 1
+        });
+        probe.close();
+        eventually("the probe connection is gone", || {
+            server.active_connections() == 0
+        });
+
+        stop_and_join(&server, accept);
+    }
+
+    /// Boundary: shutdown with a live connection that is not going anywhere by
+    /// itself. This is the half CA's blocking server still lacks — stopping
+    /// the accept loop leaves its clients running — and the reason the server
+    /// owns a `ConnRegistry`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_also_ends_a_live_connection() {
+        let order = ByteOrder::Little;
+        let (server, accept) = start_server(isolated_config());
+        let mut client = TestClient::connect(server.local_addr().expect("addr"));
+
+        // Drive one exchange so the connection is provably established and
+        // then silent — nothing but `shutdown` can end it.
+        client.send(&app_frame(
+            Command::CreateChannel,
+            order,
+            create_channel_payload(31, "dut", order),
+        ));
+        let _ = client.read_until(Command::CreateChannel);
+        eventually("the connection is tracked", || {
+            server.active_connections() == 1
+        });
+
+        server.shutdown();
+        eventually("shutdown ends the live connection", || {
+            server.active_connections() == 0
+        });
+        assert!(
+            server.peers().snapshot().is_empty(),
+            "its peer entry goes with it"
+        );
+        eventually("shutdown returns the accept loop", || accept.is_finished());
+        accept.join().expect("accept thread joined");
+    }
+
+    /// Boundary: at the connection limit. Each PVA connection is three
+    /// threads, so an unbounded accept loop is a worse hazard here than on the
+    /// host; the refusal must close the socket rather than queue it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn max_connections_refuses_the_next_client() {
+        let config = PvaServerConfig {
+            max_connections: 1,
+            ..isolated_config()
+        };
+        let (server, accept) = start_server(config);
+        let first = TestClient::connect(server.local_addr().expect("addr"));
+        eventually("the first connection is served", || {
+            server.active_connections() == 1
+        });
+
+        let mut refused = TestClient::connect(server.local_addr().expect("addr"));
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            refused
+                .0
+                .read(&mut byte)
+                .expect("read on the refused socket"),
+            0,
+            "over the limit the server must close the socket, not hold it open"
+        );
+        assert_eq!(
+            server.active_connections(),
+            1,
+            "a refused connection must not take a slot"
+        );
+
+        // And the slot frees up, so the limit is a limit and not a latch.
+        first.close();
+        eventually("the first connection releases its slot", || {
+            server.active_connections() == 0
+        });
+
+        stop_and_join(&server, accept);
     }
 }

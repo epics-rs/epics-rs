@@ -340,6 +340,36 @@ but reusing the blocking driver avoids writing a reactor at all. **RTEMS
 confirmed as a committed target 2026-07-20 → the sync-CA deep cut (§6) is the
 adopted path.**
 
+### 8.1.0 The gate is `scripts/rtems-check.sh` (2026-07-22)
+
+The invocation below is recorded here for its history; **the gate that runs is
+`./scripts/rtems-check.sh`**, and that is the form to quote when reporting an
+RTEMS check as green.
+
+The prose form was `-p <crate> --lib`, and `--lib` never compiles
+`src/bin/*.rs`. `rtems-ca-ioc` — the only binary anyone boots on the target —
+was therefore outside every "RTEMS gate green" report on this branch, and a
+build break introduced with `b594b18a` (E0433, a missing `StackSizeClass`
+import) survived until the bring-up box tried to boot the image. The defect was
+the gate's *scope*, not the code, which is the same shape as the
+`--all-targets` blindness to `#![cfg(feature = …)]` test files.
+
+Measured while fixing it, so the flag set is not a guess:
+
+* `--bins` and `--all-targets` fail for this triple, and not in the linker:
+  the host CLI tools (`caget-rs`, `caput-rs`, `camonitor-rs`, `softioc-rs`,
+  `ca-admin-rs`, `ca-soak`) do not compile for RTEMS at all
+  (E0432/E0433/E0308) and were never meant to.
+* The narrowest set that covers the target is `--lib` per crate **plus**
+  `--bin` per binary actually built for RTEMS.
+* `cargo check` does not link, so no RTEMS toolchain or BSP is needed for any
+  of it.
+* The break also reproduces on the host with
+  `cargo check -p epics-ca-rs --bin rtems-ca-ioc --features rtems-exec-model`.
+
+The script fails if a `src/bin/*.rs` compiled for RTEMS is absent from its
+list, so the next target binary cannot be added outside the gate silently.
+
 ### 8.1.1 Applied gating — `epics-base-rs` (2026-07-20)
 
 `cargo +nightly check -p epics-base-rs --lib -Zbuild-std=std,panic_abort

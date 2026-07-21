@@ -6,6 +6,7 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::task::JoinHandle;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
+pub use tokio::time::error::Elapsed;
 pub use tokio::time::interval;
 
 /// A synchronous caller asked to block on an async operation from a thread
@@ -102,6 +103,16 @@ pub async fn sleep(duration: Duration) {
 
 pub async fn sleep_until(deadline: std::time::Instant) {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+}
+
+/// Await `fut`, giving up after `duration` — the seam's only bounded wait.
+///
+/// It belongs here rather than at the call sites for the same reason [`sleep`]
+/// does: a deadline needs a timer, and which timer that is depends on the
+/// backend. Call sites that reach for `tokio::time::timeout` directly pin
+/// themselves to the tokio timer wheel.
+pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
+    tokio::time::timeout(duration, fut).await
 }
 
 pub fn runtime_handle() -> tokio::runtime::Handle {
@@ -345,6 +356,22 @@ mod tests {
         let start = std::time::Instant::now();
         sleep(Duration::from_millis(10)).await;
         assert!(start.elapsed() >= Duration::from_millis(10));
+    }
+
+    // The two halves of `timeout`'s contract. They read as trivial against a
+    // tokio delegation, and that is the point: they are what a later backend
+    // swap has to keep true, on a seam whose whole purpose is to be
+    // reimplemented.
+    #[tokio::test]
+    async fn timeout_yields_the_value_when_the_future_finishes_first() {
+        let r = timeout(Duration::from_secs(30), async { 42 }).await;
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn timeout_elapses_on_a_future_that_never_finishes() {
+        let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        assert!(r.is_err());
     }
 
     #[test]

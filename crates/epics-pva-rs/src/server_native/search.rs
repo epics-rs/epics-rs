@@ -8,8 +8,8 @@
 //!
 //! It lives beside the sources rather than inside [`super::udp`] because
 //! the TCP-circuit SEARCH handler needs exactly these three entry points
-//! ([`parse_search_request`], [`matched_cids_for_requester`],
-//! [`build_search_response_proto`]) while `udp` itself is host-only —
+//! (`parse_search_request`, `matched_cids_for_requester`,
+//! `build_search_response_proto`) while `udp` itself is host-only —
 //! `tokio::net::UdpSocket`, `socket2`, `if-addrs`. Keeping the protocol
 //! here is what lets `tcp` compile for `armv7-rtems-eabihf`; `udp`
 //! re-exports every item so its own call sites are unchanged.
@@ -18,7 +18,7 @@
 //! SEARCH must be filtered by the requested protocol list, an established
 //! circuit must not be (pvxs `serverchan.cpp:184-244`). That policy
 //! differs per transport, so `udp::search_matched_cids` wraps
-//! [`matched_cids_for_requester`] with it and `tcp` calls the core
+//! `matched_cids_for_requester` with it and `tcp` calls the core
 //! directly.
 
 use std::io::Cursor;

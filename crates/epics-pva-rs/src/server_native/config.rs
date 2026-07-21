@@ -19,7 +19,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-/// Runtime configuration for [`run_pva_server`].
+/// Runtime configuration for `runtime::run_pva_server`.
 #[derive(Clone)]
 pub struct PvaServerConfig {
     pub tcp_port: u16,
@@ -537,7 +537,8 @@ pub struct ClientCredentials {
     pub authority: String,
     /// Group / role memberships of [`Self::account`], re-derived
     /// SERVER-SIDE from the local passwd/group DB by
-    /// [`Self::with_server_roles`] (pvxs `ClientCredentials::roles()` →
+    /// `tcp::ClientCredentials::with_server_roles` (pvxs
+    /// `ClientCredentials::roles()` →
     /// `osdGetRoles`, serverconn.cpp:33-37). ACF rules of the form
     /// `R member group:operators` match against this set.
     ///

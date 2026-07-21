@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
+use crate::runtime::task::{ThreadPriority, apply_to_current_thread};
 
 /// How a due timer entry is run when its deadline arrives.
 enum TimerAction {
@@ -224,7 +225,18 @@ impl DelayedTimer {
         let worker_inner = Arc::clone(&inner);
         let worker = std::thread::Builder::new()
             .name("cbTimer".to_string())
-            .spawn(move || timer_loop(&worker_inner))
+            .spawn(move || {
+                // callback.c:300 — the delayed-callback queue is allocated
+                // with `epicsTimerQueueAllocate(0, epicsThreadPriorityScanHigh)`.
+                // That puts the timer above the Low (59) and Medium (64)
+                // bands it feeds but just below High (71), matching C: a
+                // due deadline preempts ordinary callback work, and a High
+                // callback still preempts the timer.
+                // Best effort, and only when the RT switch is on
+                // (`runtime::task::RT_PRIORITY_ENV`).
+                let _ = apply_to_current_thread(ThreadPriority::ScanHigh);
+                timer_loop(&worker_inner)
+            })
             .expect("failed to spawn delayed-callback timer thread");
         DelayedTimer {
             inner,

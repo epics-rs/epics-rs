@@ -463,7 +463,7 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    | 3 | *(renumbered into §8.1.2)* dep walls: socket2/if-addrs/tokio split/getgrouplist | — | ✅ `bc7c8f53`..`1906c7cb` |
    | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ 1–2 wk | ✅ `aeb41927`, `bbd74e6f`, `72239333` |
    | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** | blocked on CA-branch merge |
-   | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d | open (desktop-neutral) |
+   | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d | ✅ `f0ca0909`, `e278088c` — both per-connection helper tasks folded into the read loop's select; two structural collapses came free (`last_rx` Arc→local, watch receiver clone gone). Same shape remains in the PVA *client* (`client_native/server_conn.rs:634-679`) — out of scope by the server-only decision, named not forgotten |
    | 7 | Blocking accept/UDP/beacon threads + raw-libc ifconf/setsockopt subset | 1 wk | open |
    | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d | blocked on CA-branch merge |
    | 9 | 87 `abort()` sites → `TaskHandle` (abort maps — see §11) | 1 wk | blocked on CA-branch merge |
@@ -585,6 +585,25 @@ These were reasoned from source/library presence, **not** compiled:
   count is a function of concurrent client connections. Not yet measured
   against a BSP's configured task limit — this is the one cost the
   single-backend choice adds relative to the dropped reactor design.
+  **Materially improved 2026-07-21** by two changes: `future_exec` is now a
+  cooperative executor (`d704087d` on the CA branch — a spawned future no
+  longer parks a pool worker for its life; N sleeping tails share one band
+  worker, proven by `three_sleeping_tails_share_one_worker`), and PVA's
+  per-connection helper tasks are folded away (items 4+6: one MONITOR = 1
+  task, heartbeat and gate driver are select arms, not tasks). The budget
+  still needs measuring, but the per-connection multiplier is now bounded by
+  design rather than by workload.
+- **New (open): the `rtems-exec-model` feature-ON full `epics-ca-rs` suite is
+  red** (baseline 615 pass / 63 fail / 13 timeout before the cooperative
+  executor; 618/73/0 after — the timeouts were the starvation ceiling).
+  Dominant signature: the **async client**'s transport
+  (`client/transport.rs:1318`, `:1525`) panicking "there is no reactor
+  running" on `cbMedium` — client tokio-net work landing on callback-pool
+  workers, which is exactly what the feature routes it to. The feature was
+  built for targeted server-side tests; making feature-ON a usable full gate
+  means cfg-gating the async-client test modules under the feature (the
+  `server_connection_drop_tests` module already set the precedent). Follow-up
+  on the CA branch.
 - The CA deep-cut estimate depends on how many of the ~226 `snapshot()`/`set()`
   call-sites are already outside an async context (auto-reconciled by de-async)
   vs. need rewriting — not yet classified per-file.

@@ -771,8 +771,32 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 
 #[cfg(not(target_os = "linux"))]
 fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
-    // The crate links `libc` only on Linux; no portable OS-scheduler
-    // priority API is wired on other targets.
+    // No OS-scheduler priority API is wired on other targets.
+    //
+    // NOT because libc is missing — that was true when this arm was written
+    // and is no longer: `libc` is a `cfg(unix)` dependency of this crate, so
+    // `pthread_setschedparam` and `sched_get_priority_min/max(SCHED_FIFO)`
+    // are both reachable on RTEMS (verified against the RTEMS 6 source:
+    // `cpukit/posix/src/pthreadsetschedparam.c`,
+    // `cpukit/posix/src/sched_getprioritymax.c`).
+    //
+    // What RTEMS threads run at today, established from
+    // `cpukit/posix/src/pthreadattrdefault.c:49-58`: the default attribute
+    // set has `inheritsched = PTHREAD_INHERIT_SCHED`, and `std` never calls
+    // `pthread_attr_setinheritsched`, so every thread inherits the *creating*
+    // thread's parameters. Every IOC thread descends from `POSIX_Init`, which
+    // the boot shim deliberately lowers to `RTEMS_MAXIMUM_PRIORITY - 1`
+    // (`epics-rtems-boot/csrc/rtems_init.c`). So they all run just above idle,
+    // all at the same priority — the CA receiver/sender ordering that exists
+    // to stop a stalled client starving command dispatch does not hold there.
+    //
+    // What is still missing before this arm can be written is not a Rust
+    // question: it is which priority band libbsd's own network threads
+    // occupy. Mapping EPICS priorities onto the full `SCHED_FIFO` range
+    // without that number can place IOC threads above the network stack and
+    // starve it, which on a network-only target is indistinguishable from a
+    // hang. That measurement is the resource rung's job, and this arm stays
+    // `Unsupported` until it exists rather than guessing a band.
     PriorityApplied::Unsupported
 }
 

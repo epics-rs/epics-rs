@@ -216,8 +216,22 @@ void *POSIX_Init(void *argument)
      * priority, then lower again before libbsd comes up. We have no
      * epicsThread priority mapping to reach for, and base's second value is
      * strictly the lower of the two, so the two steps collapse into one: run
-     * the init task just above idle, and let libbsd's background work and the
-     * IOC's own server threads outrank it.
+     * the init task just above idle, and let libbsd's background work outrank
+     * it.
+     *
+     * CORRECTION, from the RTEMS source: this does NOT leave the IOC's own
+     * server threads outranking the init task, as this comment previously
+     * claimed. `_POSIX_Threads_Default_attributes` sets
+     * `inheritsched = PTHREAD_INHERIT_SCHED`
+     * (`cpukit/posix/src/pthreadattrdefault.c:49-58`), and Rust's `std` never
+     * calls `pthread_attr_setinheritsched`, so every thread created from here
+     * inherits *this* priority rather than getting one of its own. Every IOC
+     * thread therefore runs just above idle, all at the same level, until
+     * `apply_priority_impl` gains an RTEMS arm — see the note there for what
+     * that arm is still waiting on (libbsd's own band, which is unmeasured).
+     *
+     * That is survivable on a dedicated board, where nothing else competes,
+     * but it does mean none of the port's priority design is in effect here.
      */
     sc = rtems_task_set_priority(RTEMS_SELF, RTEMS_MAXIMUM_PRIORITY - 1U,
                                  &old_prio);

@@ -874,7 +874,19 @@ impl BlockingPvaServer {
         config: PvaServerConfig,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        let tcp_port = listener.local_addr()?.port();
+        // Same reason as the CA blocking driver's `bind`: on RTEMS `bind`
+        // succeeds and `local_addr` fails (libc omits the BSD `sin_len`
+        // byte), so these two failures must stay distinguishable rather than
+        // both surfacing as "cannot bind".
+        let tcp_port = listener
+            .local_addr()
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
+                )
+            })?
+            .port();
         // One GUID per server, stamped here for the same reason the hosted
         // runtime stamps it in `start()` (`runtime.rs:224-229`): the
         // TCP-circuit SEARCH handler reads it out of its per-connection config

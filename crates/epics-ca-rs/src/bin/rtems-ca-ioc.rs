@@ -141,14 +141,19 @@ mod ioc {
         let server = match BlockingCaServer::bind((Ipv4Addr::UNSPECIFIED, port), db, acf) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                eprintln!("rtems-ca-ioc: cannot bind CA TCP port {port}: {e}");
+                // Not "cannot bind": `BlockingCaServer::bind` also calls
+                // `local_addr`, and on RTEMS that is the call that fails.
+                // The inner error says which.
+                eprintln!("rtems-ca-ioc: cannot start the CA TCP server on port {port}: {e}");
                 return ExitCode::FAILURE;
             }
         };
         let udp = match bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("rtems-ca-ioc: cannot bind CA UDP search port {port}: {e}");
+                eprintln!(
+                    "rtems-ca-ioc: cannot start the CA UDP search responder on port {port}: {e}"
+                );
                 return ExitCode::FAILURE;
             }
         };

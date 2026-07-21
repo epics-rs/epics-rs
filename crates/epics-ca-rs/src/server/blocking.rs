@@ -155,7 +155,21 @@ impl BlockingCaServer {
         acf: SharedAcf,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        let tcp_port = listener.local_addr()?.port();
+        // Two fallible calls, two different diagnoses — so they must not
+        // collapse into one `io::Error` the caller then labels "cannot bind".
+        // On RTEMS this is the difference that matters: `bind` succeeds while
+        // `local_addr` returns InvalidInput, because the target's libc omits
+        // the BSD `sin_len` byte. Reporting that as a bind failure sends the
+        // reader after the wrong syscall.
+        let tcp_port = listener
+            .local_addr()
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
+                )
+            })?
+            .port();
         Ok(Self {
             listener,
             db,
@@ -1002,6 +1016,37 @@ mod tests {
             Some(i) => &src[..i],
             None => src,
         }
+    }
+
+    /// A bind failure must not be described as a `local_addr` failure, nor
+    /// the reverse. `BlockingCaServer::bind` makes two fallible calls, and on
+    /// RTEMS they fail for opposite reasons: `bind` succeeds while
+    /// `local_addr` returns InvalidInput (the target libc omits the BSD
+    /// `sin_len` byte). Collapsing both into "cannot bind" is what sent the
+    /// bring-up debugging the wrong syscall.
+    ///
+    /// Only the bind direction is forceable on Linux; the `local_addr`
+    /// direction cannot be provoked on this host, so its labelling is proven
+    /// by inspection of the `map_err` and not by this test.
+    #[tokio::test]
+    async fn a_bind_failure_is_not_reported_as_a_local_addr_failure() {
+        use std::net::TcpListener as StdTcpListener;
+
+        // Hold an ephemeral port so the real bind below must fail.
+        let held = StdTcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("held port");
+        let taken = held.local_addr().expect("held addr");
+
+        let db = Arc::new(PvDatabase::new());
+        let acf: SharedAcf = Arc::new(tokio::sync::RwLock::new(None));
+        // `expect_err` would need `Debug` on the server type; match instead.
+        let msg = match BlockingCaServer::bind(taken, db, acf) {
+            Ok(_) => panic!("binding an occupied port must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !msg.contains("local_addr"),
+            "a bind() failure must not be blamed on local_addr(): {msg}"
+        );
     }
 
     /// The CA server's threads are the ones that scale with client count, so

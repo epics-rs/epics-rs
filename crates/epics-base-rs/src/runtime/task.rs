@@ -466,7 +466,18 @@ pub enum StackSizeClass {
 
 impl StackSizeClass {
     /// Stack size in bytes for this class, matching the POSIX
-    /// `stackSizeTable` in `osdThread.c` on a 64-bit target.
+    /// `stackSizeTable` in `osdThread.c` on **every** target.
+    ///
+    /// C's `STACK_SIZE(f) = f * 0x10000 * sizeof(void*)` is parameterised by
+    /// pointer width and so is this, so the two agree by construction rather
+    /// than on one word size: 512 KiB / 1 MiB / 2 MiB on a 64-bit host, and
+    /// 256 KiB / 512 KiB / 1 MiB on `armv7-rtems-eabihf` — which is exactly
+    /// what a C IOC asks `pthread_attr_setstacksize` for on that target.
+    ///
+    /// Read "on a 64-bit target" here before: it was wrong in the direction
+    /// that matters, because the only target this crate is portable *to* is
+    /// 32-bit, and it invited a reader to assume the RTEMS numbers were
+    /// unverified.
     pub fn bytes(self) -> usize {
         // STACK_SIZE(f) = f * 0x10000 * sizeof(void*)
         let unit = 0x10000usize * std::mem::size_of::<usize>();

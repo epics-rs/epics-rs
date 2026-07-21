@@ -340,6 +340,49 @@ but reusing the blocking driver avoids writing a reactor at all. **RTEMS
 confirmed as a committed target 2026-07-20 → the sync-CA deep cut (§6) is the
 adopted path.**
 
+### 8.1.2 Applied gating — `epics-pva-rs` (2026-07-21)
+
+(The §8.1.1 counterpart — the same wall-walk for `epics-base-rs` — lives on the
+unmerged CA branch `caucus/WG0SFREHPX/ca-sans-io-1962c8be-1`; see the
+integration note at the end of this subsection.)
+
+On branch `phase6/pva-rtems-dep-gate` (commits `bc7c8f53`, `8f12cf30`,
+`73d3ec39`, `1906c7cb`, atop items 1/2), `cargo +nightly check -p epics-pva-rs
+--lib --no-default-features -Zbuild-std=std,panic_abort --target
+armv7-rtems-eabihf` reaches **exit 0 with zero warnings** — *when
+epics-base-rs's §8.1.1 gating is present*. Walls hit and closed:
+
+| Crate (ver) | Error class | Dependency path (from `epics-pva-rs`) | Gate applied |
+|---|---|---|---|
+| socket2 0.5 | 20 errs — no `msghdr`/`recvmsg`/`IovLen`, no `ip_mreqn`, no `SOCK_RAW` in newlib | direct **and** `socket2 ← tokio (net)` | direct dep → `[target.'cfg(not(target_os="rtems"))'.dependencies]`; users are `server_native::{udp,tcp}` only, gated with that layer |
+| if-addrs 0.13.4 | 2 errs — no `getifaddrs`/`freeifaddrs`/`ifaddrs` | direct | dep → host-only; 3 of 4 call sites ride out with the I/O layer, the 4th does **not** (`Config::expand` NIC fan-out — configuration, not I/O; `Config` is *absent* on RTEMS rather than present-and-wrong, and the raw enumerator is owed with phase 6 item 7 since newlib bindings expose no `ifreq`/`ifconf`/`SIOCGIFCONF` to verify against) |
+| mio 1.2.0 | 29 errs — no epoll/kqueue selector | `mio ← tokio (net)`, `tokio ← {epics-pva-rs, tokio-util}` | tokio declared per-target; RTEMS drops `net`/`signal`/`process` (per-target because Cargo *unions* features across matching tables) |
+| signal-hook-registry 1.4.8 | 4 errs — no `sa_sigaction`/`SA_RESTART` | `signal-hook-registry ← tokio (signal)` | same split; `util::SigInt` keeps its API but traps nothing on RTEMS — the documented "platform without signal support" case |
+| nix 0.31.3 | 21 errs | `nix ← rustyline ← epics-base-rs` | closed by base's §8.1.1 (CA branch), not here |
+| *(in-crate)* libc `getifaddrs` | 3 errs — `cli::iface_name_to_ipv4` | newlib binding has no `ifaddrs` | guard `all(unix, not(target_os="rtems"))`; the name path returns an explicit "pass the interface's IPv4 address instead" — the answer non-Unix hosts already got |
+| *(in-crate)* libc `getgrouplist` | 1 err — `auth::plain` | newlib lacks only this symbol of that path | RTEMS arm returns `vec![basegid]` (passwd primary group — the hosted loop's own fallback); `getuid`/`getpwuid`/`getgrgid` all exist, so the group still comes back named |
+
+Every gate is `target_os = "rtems"`, never a feature: it is not a choice a
+hosted build can make, and cannot be flipped on by accident.
+
+**Compile surface (measured):** of 96,875 non-bin src lines, **44,858 (46%)
+compile for RTEMS**; 28,164 (29%) are target-gated (`tcp` 21,415 + `udp` 3,486
++ `runtime` 2,181 + `peers` 485 + `server::pva_server` 452 + `server::iocsh`
+145); 23,853 (25%) are the client feature. The RTEMS surface is codec + config
++ the source/`SharedPV`/DB-bridge layer — the sans-io half that the phase-6
+item-7 blocking driver plugs into. De-asyncing the 21k-line `tcp.rs` protocol
+engine is separate work (item 5).
+
+**Integration note — the CA branch is now the critical path.** On this branch
+*as committed* the RTEMS check exits 101 with exactly the five base-side walls,
+because `epics-pva-rs`'s own edges to socket2/if-addrs are gone (verified:
+`cargo tree -p epics-pva-rs --target armv7-rtems-eabihf -i` shows one inbound
+edge each, through `epics-base-rs`) but base's gating lives unmerged on the CA
+branch. Phase-6 items 5/8/9 likewise depend on that branch's primitives
+(`run_event_task`, the `runtime::task` seam, `future_exec`). Merging
+`caucus/WG0SFREHPX/ca-sans-io-1962c8be-1` into main is the user's decision, but
+until it lands, no PVA RTEMS milestone can be *committed* green.
+
 ### 8.2 Gateable — excluded from the RTEMS build
 
 - **ring / rustls / tokio-rustls (TLS)** — `optional = true` in **epics-ca-rs
@@ -413,17 +456,29 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    roughly doubling the phase. Estimate at this scope: **~7–9 engineer-weeks**,
    ordered so the desktop-neutral items land first and shrink the big one:
 
-   | # | item | size |
-   |---|---|---|
-   | 1 | TLS/dep feature gate on `epics-pva-rs` (§8.2 correction) | 3–5 d |
-   | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d |
-   | 4 | `MonitorInbox::try_recv` (**done**) + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ **1–2 wk** |
-   | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** |
-   | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d |
-   | 7 | Blocking accept/UDP/beacon threads | 1 wk |
-   | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d |
-   | 9 | 87 `abort()` sites → `TaskHandle` (abort maps — see §11) | 1 wk |
-   | 10 | RTEMS `--lib` green + QEMU monitor-to-completion | 1 wk |
+   | # | item | size | status |
+   |---|---|---|---|
+   | 1 | TLS/dep feature gate on `epics-pva-rs` (§8.2 correction) | 3–5 d | ✅ `1d5476df` |
+   | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d | ✅ `24d514e8` |
+   | 3 | *(renumbered into §8.1.2)* dep walls: socket2/if-addrs/tokio split/getgrouplist | — | ✅ `bc7c8f53`..`1906c7cb` |
+   | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ 1–2 wk | ✅ `aeb41927`, `bbd74e6f`, `72239333` |
+   | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** | blocked on CA-branch merge |
+   | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d | open (desktop-neutral) |
+   | 7 | Blocking accept/UDP/beacon threads + raw-libc ifconf/setsockopt subset | 1 wk | open |
+   | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d | blocked on CA-branch merge |
+   | 9 | 87 `abort()` sites → `TaskHandle` (abort maps — see §11) | 1 wk | blocked on CA-branch merge |
+   | 10 | RTEMS `--lib` green + QEMU monitor-to-completion | 1 wk | `--lib` proven with base overlay (§8.1.2); committed-green blocked on CA-branch merge |
+
+   Items 1–4 landed 2026-07-21 on `phase6/pva-rtems-dep-gate` (items 1–3) and
+   `phase6/pva-channelsource-ring` (item 4), both off main, both
+   workspace-green (9743 and 9751 tests respectively), neither merged. Item 4's
+   outcome: **all six bridge tasks deleted** — `tokio::spawn` count in
+   `shared_pv.rs`/`server/native_source.rs`/`server_native/source.rs` is zero;
+   one MONITOR on a db-backed PVA IOC now costs 1 task, not 2–3. The three
+   transform bridges were *replaced* by `UpstreamMonitor` (owns the Db/Pv
+   subscription, applies the transform on pull; empty-mask filter and
+   connect-time seed preserved), and mapped-of-mapped is unrepresentable by
+   type, which is what keeps the default monitor path allocation-free.
 
    Items 1/2/4 are **desktop-neutral** — they improve the hosted build too and
    can land before any RTEMS wiring. Item 4 alone deletes 6 tasks: today a

@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
 //! Interpose (middleware) framework for layered I/O processing.
 //!
 //! Currently implements octet-level interpose only. The pattern is designed

@@ -420,6 +420,71 @@ impl Drop for ConnRegistration<'_> {
     }
 }
 
+/// Announce a per-connection child thread that did not end normally.
+///
+/// [`ReaderGuard`] and [`WriterGuard`] made both losses below *survivable* —
+/// the connection is torn down and its slot returned however a child ends.
+/// They did not make either loss *visible*, and an IOC that has lost a thread
+/// but reads exactly like a healthy one is what closes here. Two losses reach
+/// this function:
+///
+/// * the thread could not be created at all ([`spawn_child`]) — the
+///   per-connection thread ceiling, and the very condition [`ReaderGuard`]
+///   exists to survive;
+/// * the thread panicked, which the guards' `join()` used to discard with
+///   `let _ =`.
+///
+/// Through `errlog` and not `tracing` alone, for the reason the CA driver's
+/// client refusal is: `errlog_sev_printf` reaches the console whatever the log
+/// configuration — including an RTEMS console whose subscriber is the in-tree
+/// one — and printing it is what a C IOC does. The `tracing` event beside it is
+/// what a hosted operator with a subscriber already reads.
+fn child_thread_lost(role: &str, peer: SocketAddr, what: &str) {
+    epics_base_rs::runtime::log::errlog_sev_printf(
+        epics_base_rs::runtime::log::ErrlogSevEnum::Major,
+        &format!(
+            "PVA connection {peer}: the {role} thread {what}; this connection is \
+             being torn down. Other connections are unaffected."
+        ),
+    );
+    warn!(
+        ?peer,
+        role, what, "blocking PVA server: a per-connection thread was lost"
+    );
+}
+
+/// Spawn one of a connection's two child threads, announcing a failure to
+/// create it before the error propagates.
+///
+/// Both children take the same priority and the same stack class. `Small`:
+/// neither builds anything — the reader's whole frame is a [`READ_CHUNK`]
+/// buffer and a `read`/`send` loop (`reader_thread`), and the writer drains
+/// already-encoded frames from a queue onto the socket (`writer_thread`). The
+/// protocol state machine runs on the connection thread, which is `Big`.
+///
+/// One function rather than two spawn sites so that the failure cannot be
+/// propagated silently from either. This is the path that leaves a reader
+/// running with no writer — exactly what [`ReaderGuard`] was built to survive —
+/// and until now it reached the operator only through the connection thread's
+/// `debug!`, which is below every default filter and below the IOC console
+/// subscriber's threshold.
+fn spawn_child(
+    role: &str,
+    peer: SocketAddr,
+    body: impl FnOnce() + Send + 'static,
+) -> PvaResult<thread::JoinHandle<()>> {
+    spawn_dedicated_thread(
+        format!("PVAS-{role} {peer}"),
+        PVA_SERVER_PRIORITY,
+        StackSizeClass::Small,
+        body,
+    )
+    .map_err(|e| {
+        child_thread_lost(role, peer, &format!("could not be created ({e})"));
+        PvaError::Io(e)
+    })
+}
+
 /// The spawned reader thread, woken and joined on **every** exit path.
 ///
 /// # Invariant
@@ -445,6 +510,7 @@ impl Drop for ConnRegistration<'_> {
 /// applies to the panic path, which no error-branch cleanup could have covered.
 struct ReaderGuard {
     wake: ConnWake,
+    peer: SocketAddr,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -456,7 +522,14 @@ impl Drop for ReaderGuard {
             // module's single wake primitive, through the registry-issued
             // handle — the same one `ConnRegistry::stop` would use.
             self.wake.wake();
-            let _ = handle.join();
+            // The join result is the only place a panicked reader is ever
+            // reported: `reader_thread` returns `()`, so an `Err` here means it
+            // unwound, and the connection's own error will be a bland
+            // channel-closed rather than the cause. Discarding it left the two
+            // unlinkable.
+            if handle.join().is_err() {
+                child_thread_lost("reader", self.peer, "panicked");
+            }
         }
     }
 }
@@ -471,6 +544,7 @@ impl Drop for ReaderGuard {
 /// the declaration order of two separate locals.
 struct WriterGuard {
     frames: Option<mpsc::Sender<Vec<u8>>>,
+    peer: SocketAddr,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -481,7 +555,11 @@ impl Drop for WriterGuard {
         // `None`, and exits; on its way out it wakes the connection (§4.2b).
         drop(self.frames.take());
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            // Same reading as `ReaderGuard`'s: an `Err` is a panicked writer,
+            // and a writer that unwound with frames still queued dropped them.
+            if handle.join().is_err() {
+                child_thread_lost("writer", self.peer, "panicked");
+            }
         }
     }
 }
@@ -834,55 +912,40 @@ pub fn serve_connection_blocking(
     let room = Arc::new(WriteRoom::default());
     let writer_adapter = ChannelWriter::new(frame_tx.downgrade(), room.clone());
 
-    // Both children go through the seam at `PVA_SERVER_PRIORITY`, like every
-    // other thread in this module — see that constant for why all of them
-    // share one number.
-    // Small: this thread's whole frame is a 4 KiB `READ_CHUNK` buffer and a
-    // `read`/`send` loop (`reader_thread`, :475). It decodes nothing — the
-    // protocol state machine runs on the connection thread below.
+    // Both children go through `spawn_child`, which is the seam at
+    // `PVA_SERVER_PRIORITY` — like every other thread in this module, see that
+    // constant for why all of them share one number — plus the announcement a
+    // failure to create either one owes the operator.
+    //
     // From here on the reader is owned by a guard. Every exit below — the
     // writer-spawn `?`, and a panic unwinding out of the connection handler —
     // runs `ReaderGuard::drop`, which wakes and joins it. See that type for the
     // leak this closes.
     let reader = ReaderGuard {
         wake: registration.wake_handle(),
-        handle: Some(
-            spawn_dedicated_thread(
-                format!("PVAS-reader {peer}"),
-                PVA_SERVER_PRIORITY,
-                StackSizeClass::Small,
-                move || reader_thread(read_sock, chunk_tx, peer),
-            )
-            .map_err(PvaError::Io)?,
-        ),
+        peer,
+        handle: Some(spawn_child("reader", peer, move || {
+            reader_thread(read_sock, chunk_tx, peer)
+        })?),
     };
     let writer_room = room.clone();
     let writer_wake = registration.wake_handle();
-    // Small, for the same reason: it drains already-encoded frames from a
-    // queue onto the socket (`writer_thread`, :643) and builds nothing.
     let writer = WriterGuard {
         // The only strong sender moves into the guard, so it cannot be dropped
         // out of order with the join. `writer_adapter` above already took its
         // weak handle.
         frames: Some(frame_tx),
-        handle: Some(
-            spawn_dedicated_thread(
-                format!("PVAS-writer {peer}"),
-                PVA_SERVER_PRIORITY,
-                StackSizeClass::Small,
-                move || {
-                    writer_thread(
-                        write_sock,
-                        frame_rx,
-                        writer_room,
-                        writer_wake,
-                        send_timeout,
-                        peer,
-                    )
-                },
+        peer,
+        handle: Some(spawn_child("writer", peer, move || {
+            writer_thread(
+                write_sock,
+                frame_rx,
+                writer_room,
+                writer_wake,
+                send_timeout,
+                peer,
             )
-            .map_err(PvaError::Io)?,
-        ),
+        })?),
     };
 
     let outcome = block_on_sync(handle_connection_io(
@@ -2578,7 +2641,7 @@ mod tests {
     fn a_reader_is_released_when_connection_setup_fails_after_it_is_spawned() {
         // The client stays connected and silent, so nothing but a wake from
         // this side can return the reader's `read`.
-        let (_client, server, _peer) = socket_pair();
+        let (_client, server, peer) = socket_pair();
         let registry = ConnRegistry::new();
         let server = Arc::new(server);
 
@@ -2588,6 +2651,7 @@ mod tests {
             let read_sock = server.clone();
             let _reader = ReaderGuard {
                 wake: registration.wake_handle(),
+                peer,
                 handle: Some(thread::spawn(move || {
                     let mut buf = [0u8; 64];
                     let _ = (&*read_sock).read(&mut buf);
@@ -2619,7 +2683,7 @@ mod tests {
     /// of `handle_connection_io`.
     #[test]
     fn a_reader_is_released_when_the_connection_handler_panics() {
-        let (_client, server, _peer) = socket_pair();
+        let (_client, server, peer) = socket_pair();
         let registry = ConnRegistry::new();
         let server = Arc::new(server);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -2629,6 +2693,7 @@ mod tests {
             let read_sock = server.clone();
             let _reader = ReaderGuard {
                 wake: registration.wake_handle(),
+                peer,
                 handle: Some(thread::spawn(move || {
                     let mut buf = [0u8; 64];
                     let _ = (&*read_sock).read(&mut buf);
@@ -2664,6 +2729,7 @@ mod tests {
         let write_sock = server.clone();
         let writer = WriterGuard {
             frames: Some(tx),
+            peer,
             handle: Some(thread::spawn(move || {
                 writer_thread(
                     write_sock,
@@ -2706,6 +2772,8 @@ mod tests {
         for banned in [
             concat!("let reader = spawn_dedi", "cated_thread("),
             concat!("let writer = spawn_dedi", "cated_thread("),
+            concat!("let reader = spawn_", "child("),
+            concat!("let writer = spawn_", "child("),
         ] {
             let offenders: Vec<&&str> = code.iter().filter(|l| l.contains(banned)).collect();
             assert!(
@@ -2723,6 +2791,159 @@ mod tests {
                 code.iter().any(|l| l.contains(required)),
                 "connection setup no longer binds `{required}` — both threads \
                  must be owned by a guard that joins them on every exit path"
+            );
+        }
+    }
+
+    /// A subscriber that keeps what was emitted, so a test can assert an
+    /// announcement actually happened.
+    ///
+    /// `errlog_sev_printf` routes through `tracing` on the
+    /// `epics_base_rs::errlog` target *and* to the console fallback; the
+    /// `tracing` half is the observable one from in-process, and installing
+    /// this for the duration of a drop is how these tests read it.
+    #[derive(Clone, Default)]
+    struct CapturedLines(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedLines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields<'a>(&'a mut String);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut line = event.metadata().target().to_string();
+            event.record(&mut Fields(&mut line));
+            self.0.lock().expect("captured lines").push(line);
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Everything emitted on the calling thread while `f` runs.
+    fn lines_while(f: impl FnOnce()) -> Vec<String> {
+        let captured = CapturedLines::default();
+        tracing::subscriber::with_default(captured.clone(), f);
+        let lines = captured.0.lock().expect("captured lines");
+        lines.clone()
+    }
+
+    /// F3 made a lost child *survivable*; this is what makes it *visible*.
+    ///
+    /// `ReaderGuard::drop` joined and threw the result away, so a reader that
+    /// unwound left nothing behind: the connection's own error is a bland
+    /// channel-closed, and the two were unlinkable.
+    #[test]
+    fn a_panicked_reader_is_reported_and_not_discarded() {
+        let (_client, server, peer) = socket_pair();
+        let registry = ConnRegistry::new();
+        let server = Arc::new(server);
+        let registration = registry.register(server.clone());
+
+        let lines = lines_while(|| {
+            let _reader = ReaderGuard {
+                wake: registration.wake_handle(),
+                peer,
+                handle: Some(thread::spawn(|| panic!("reader blew up"))),
+            };
+        });
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("epics_base_rs::errlog")
+                    && l.contains("reader thread panicked")),
+            "a panicked reader must reach errlog, which prints whatever the log \
+             configuration is — including an RTEMS console. Captured: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_panicked_writer_is_reported_and_not_discarded() {
+        let (_client, _server, peer) = socket_pair();
+        let (frames, _rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
+
+        let lines = lines_while(|| {
+            let _writer = WriterGuard {
+                frames: Some(frames),
+                peer,
+                handle: Some(thread::spawn(|| panic!("writer blew up"))),
+            };
+        });
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("epics_base_rs::errlog")
+                    && l.contains("writer thread panicked")),
+            "a panicked writer dropped whatever frames were still queued; that \
+             must not be silent. Captured: {lines:?}"
+        );
+    }
+
+    /// The other boundary: an ordinary teardown is not a loss. Every
+    /// connection that ever closes runs these drops, so announcing there
+    /// would bury the real losses on a serial console.
+    #[test]
+    fn a_child_that_ends_cleanly_is_not_announced() {
+        let (_client, server, peer) = socket_pair();
+        let registry = ConnRegistry::new();
+        let server = Arc::new(server);
+        let registration = registry.register(server.clone());
+
+        let lines = lines_while(|| {
+            let _reader = ReaderGuard {
+                wake: registration.wake_handle(),
+                peer,
+                handle: Some(thread::spawn(|| {})),
+            };
+        });
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("was lost") || l.contains("panicked")),
+            "an ordinary connection teardown must print nothing: {lines:?}"
+        );
+    }
+
+    /// Structural closure as source, for the one loss no test can force: a
+    /// thread that cannot be created. Both guards and the single spawn site
+    /// must report through the one announcement function.
+    #[test]
+    fn every_child_loss_goes_through_the_announcement() {
+        let prod = production_scope(include_str!("blocking.rs"));
+        assert_eq!(
+            prod.matches(concat!("let _ = han", "dle.join()")).count(),
+            0,
+            "a discarded join result is a panicked child nobody hears about"
+        );
+        for owner in [
+            "impl Drop for ReaderGuard",
+            "impl Drop for WriterGuard",
+            "fn spawn_child(",
+        ] {
+            let at = prod
+                .find(owner)
+                .unwrap_or_else(|| panic!("`{owner}` is gone from this module"));
+            let body = &prod[at..(at + 900).min(prod.len())];
+            assert!(
+                body.contains(concat!("child_thread_", "lost(")),
+                "`{owner}` can lose a per-connection thread without saying so"
             );
         }
     }
@@ -2806,8 +3027,10 @@ mod tests {
         );
         assert_eq!(
             prod.matches("spawn_dedicated_thread(").count(),
-            3,
-            "the reader, the writer and the per-connection thread"
+            2,
+            "the per-connection thread, and `spawn_child` for the reader and \
+             the writer — which share one spawn site so that neither can fail \
+             silently"
         );
     }
 

@@ -88,9 +88,13 @@ impl AcceptBackoff {
 
     /// A connection was accepted: the listener works, so forget the history.
     ///
-    /// This is what makes the give-up rule safe under sustained fd exhaustion
-    /// — a server that still lands the occasional connection never reaches
-    /// [`GIVE_UP_AFTER`].
+    /// Only `accept()` itself feeds this counter, and on RTEMS that is not
+    /// where a loaded server actually fails. Measured under qemu at the
+    /// connection ceiling: `accept()` **succeeds** and the per-connection
+    /// thread spawn then fails with `EAGAIN`, 64 times in a row, without a
+    /// single `accept()` failure — because this call has already run by then.
+    /// So the backoff describes a broken *listener*, not a full *server*; the
+    /// refusal path announces the latter.
     pub fn accepted(&mut self) {
         self.consecutive = 0;
     }

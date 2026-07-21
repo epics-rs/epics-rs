@@ -91,6 +91,11 @@ impl OutboxDrain {
     /// blocked on the socket read is written promptly. Resolves to `None`
     /// only if every [`Outbox`] handle has been dropped, which cannot
     /// happen while the loop still holds its own handle.
+    ///
+    /// Used only by the async connection loop (`tcp::handle_client`); the
+    /// blocking driver drains synchronously via [`OutboxDrain::try_next`].
+    /// Host-only.
+    #[cfg(not(target_os = "rtems"))]
     pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
         self.rx.recv().await
     }

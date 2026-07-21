@@ -1,10 +1,25 @@
+// The bound-socket UDP responder stack (`socket2` shared-port setup, the
+// `tokio::net::UdpSocket` recv loops, the `epics_base_rs::net` RX-overflow
+// helpers) is the async host-only front-end. The RTEMS build answers SEARCH
+// through `server::blocking`'s `std::net` responder, reusing only the shared
+// decode/shape logic (`SearchReplyBatch`, `parse_search_datagram`,
+// `shape_search_reply_dg`) below. Those imports are gated out for RTEMS.
+#[cfg(not(target_os = "rtems"))]
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
+// `Ipv4Addr`, `Arc`, and `CaResult` are used only by the bound-socket responder
+// stack, which is host-only; the shared decode path uses `SocketAddr` only.
+#[cfg(not(target_os = "rtems"))]
+use std::net::Ipv4Addr;
+#[cfg(not(target_os = "rtems"))]
 use std::sync::Arc;
+#[cfg(not(target_os = "rtems"))]
 use tokio::net::UdpSocket;
 
 use crate::protocol::*;
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::error::CaResult;
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
 
@@ -35,6 +50,7 @@ use epics_base_rs::server::database::PvDatabase;
 /// that produces an extra group-only responder. A wildcard
 /// interface is therefore the single owner of ordinary
 /// unicast/broadcast SEARCH traffic, matching C's `conf->udp`.
+#[cfg(not(target_os = "rtems"))]
 fn plan_responder_specs(
     intf_addrs: Vec<Ipv4Addr>,
     mcast_addrs: &[Ipv4Addr],
@@ -59,6 +75,7 @@ fn plan_responder_specs(
 /// datagrams in the kernel, so a SEARCH that arrives before
 /// `CaServer::run()` is polled is answered once the recv loop starts
 /// rather than dropped.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone)]
 pub struct BoundResponder {
     bind_ip: Ipv4Addr,
@@ -71,12 +88,14 @@ pub struct BoundResponder {
 }
 
 /// The UDP search responders of one server, all bound to one port.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone)]
 pub struct BoundUdp {
     responders: Vec<BoundResponder>,
     port: u16,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl BoundUdp {
     /// The UDP port every responder is bound to. With a requested port
     /// of 0 this is the ephemeral port the kernel chose — the value a
@@ -99,6 +118,7 @@ impl BoundUdp {
 /// clients are pointed at exactly one. This is the race-free way to
 /// take a port — a caller that probes for a free port first and passes
 /// the number can still lose it to another socket in between.
+#[cfg(not(target_os = "rtems"))]
 pub fn bind_udp_responders(
     port: u16,
     intf_addrs: Vec<Ipv4Addr>,
@@ -129,6 +149,7 @@ pub fn bind_udp_responders(
 ///
 /// `ignore_addrs` filters out source addresses that should never receive
 /// search replies (EPICS_CAS_IGNORE_ADDR_LIST).
+#[cfg(not(target_os = "rtems"))]
 pub async fn run_udp_search_responder(
     db: Arc<PvDatabase>,
     bound: BoundUdp,
@@ -166,6 +187,7 @@ pub async fn run_udp_search_responder(
     result
 }
 
+#[cfg(not(target_os = "rtems"))]
 fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
@@ -265,6 +287,7 @@ fn bind_single_responder(
     })
 }
 
+#[cfg(not(target_os = "rtems"))]
 async fn run_single_responder(
     db: Arc<PvDatabase>,
     responder: BoundResponder,
@@ -301,6 +324,7 @@ async fn run_single_responder(
 /// Build and configure the per-bind UDP socket. Centralised so the
 /// primary (interface IP) and secondary (interface broadcast addr)
 /// sockets share identical socket-option setup.
+#[cfg(not(target_os = "rtems"))]
 fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // This is a *datagram fanout* socket, so it mirrors libcom's
@@ -700,6 +724,7 @@ pub(crate) async fn parse_search_datagram(
     }
 }
 
+#[cfg(not(target_os = "rtems"))]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
     db: Arc<PvDatabase>,
@@ -930,6 +955,7 @@ pub(crate) fn shape_search_reply_dg(
 /// Send one already-shaped reply datagram to `src`. On failure, log at warn
 /// level instead of silently discarding (`caserverio.c:214-222`
 /// `errlogPrintf` parity).
+#[cfg(not(target_os = "rtems"))]
 async fn send_reply_dg(socket: &UdpSocket, src: SocketAddr, payload: &[u8], bind_ip: &Ipv4Addr) {
     if let Err(e) = socket.send_to(payload, src).await {
         tracing::warn!(
@@ -946,6 +972,7 @@ async fn send_reply_dg(socket: &UdpSocket, src: SocketAddr, payload: &[u8], bind
 
 /// Shape the batch's trailing `send_buf` and send it as one datagram, then
 /// clear the batch buffer. The async responder's flush path.
+#[cfg(not(target_os = "rtems"))]
 async fn flush_send_buf(
     socket: &UdpSocket,
     src: SocketAddr,
@@ -968,6 +995,7 @@ async fn flush_send_buf(
 /// comparison per packet otherwise. The implementation is a fixed
 /// 1-second sliding window — coarse but cheap; replace with
 /// per-IP token buckets if a finer policy is ever needed.
+#[cfg(not(target_os = "rtems"))]
 struct UdpRateLimiter {
     enabled: bool,
     cap_per_sec: u32,
@@ -975,6 +1003,7 @@ struct UdpRateLimiter {
         std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl UdpRateLimiter {
     fn from_env() -> Self {
         let cap = epics_base_rs::runtime::env::get("EPICS_CAS_UDP_SEARCH_RATE_LIMIT")

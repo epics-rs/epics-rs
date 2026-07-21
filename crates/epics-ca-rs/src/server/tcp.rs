@@ -3,7 +3,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
+// These `tokio::io` traits/wrappers are used only by the async accept/read
+// front-end (`handle_client`, `drain_and_flush`); the shared read helper takes
+// a `tokio::io::AsyncReadExt` bound by full path. Host-only on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
+// `tokio::net::TcpListener` (and the `socket2` keepalive setup) back only the
+// async accept path; the RTEMS build serves TCP through `server::blocking`
+// (`std::net`), so the `tokio::net` accept front-end is gated out there.
+#[cfg(not(target_os = "rtems"))]
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -19,6 +27,7 @@ use tokio::sync::broadcast;
 /// received *next* frame pipelined behind a full one in the same read burst does
 /// not trip the guard before the first frame is drained. Mirrors the
 /// client-side cap in `client/transport.rs`.
+#[cfg(not(target_os = "rtems"))]
 fn max_accumulated() -> usize {
     crate::protocol::max_frame_body_bytes()
         .saturating_add(24)
@@ -55,6 +64,7 @@ fn resolve_inactivity_timeout() -> Option<Duration> {
 /// Read into `buf` with an optional idle cap. If `cap` is `None`, the read
 /// is unbounded (matches C `recv()` blocking semantics in `camsgtask.c`);
 /// if `cap` is `Some(d)`, returns `Err(d)` after `d` of inactivity.
+#[cfg(not(target_os = "rtems"))]
 async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -137,6 +147,7 @@ mod cap_parse_tests {
 /// stalling the whole per-client dispatcher task. C rsrv defaults
 /// SO_SNDTIMEO to 5 s; we honour the same default and let
 /// `EPICS_CAS_SEND_TMO` override.
+#[cfg(not(target_os = "rtems"))]
 fn send_timeout() -> Duration {
     static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(resolve_send_timeout)
@@ -145,6 +156,7 @@ fn send_timeout() -> Duration {
 /// The uncached resolution behind [`send_timeout`]. Resolving once per
 /// process keeps a rejected value from re-printing its diagnostic on every
 /// client connect.
+#[cfg(not(target_os = "rtems"))]
 fn resolve_send_timeout() -> Duration {
     crate::estdlib::env_double("EPICS_CAS_SEND_TMO")
         .ok()
@@ -228,7 +240,10 @@ pub enum ServerConnectionEvent {
 use super::LongStringMode;
 use crate::protocol::*;
 use crate::server::monitor::spawn_monitor_sender;
-use crate::server::outbox::{Outbox, OutboxDrain};
+use crate::server::outbox::Outbox;
+// `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
+#[cfg(not(target_os = "rtems"))]
+use crate::server::outbox::OutboxDrain;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
@@ -571,7 +586,7 @@ struct SubscriptionEntry {
     /// subscription down — so an ACF reload that later restores
     /// access can resume the same camonitor).
     denied: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    task: epics_base_rs::runtime::task::TaskHandle<()>,
     /// mirrors `ChannelEntry::long_string_mode`; stored here so the
     /// access-restore path and `reeval_access_rights` can apply the
     /// same boundary conversion without re-borrowing the channel entry.
@@ -630,6 +645,9 @@ pub(crate) struct ClientState {
     /// C `client->recvBytesToDrain` (`rsrv/camessage.c:2440`): bytes of
     /// an already-rejected message still to arrive. They are discarded
     /// on arrival rather than parsed as headers.
+    // Set in `ClientState::new`, consumed only by the async read/parse loop
+    // (`handle_client`), which is gated out on RTEMS.
+    #[cfg_attr(target_os = "rtems", allow(dead_code))]
     recv_bytes_to_drain: usize,
     /// C `client->evuser` (`rsrv/server.h`): this circuit's event user — the
     /// owner of `flowCtrlMode` (EVENTS_OFF/EVENTS_ON) and of the event queue
@@ -645,10 +663,15 @@ pub(crate) struct ClientState {
     /// branch test and no allocation.
     audit: Option<crate::audit::AuditLogger>,
     /// Optional per-client token bucket. None disables rate limiting.
+    // Set in `ClientState::new` / the async accept path, consumed only by the
+    // async read loop (`handle_client`), which is gated out on RTEMS.
+    #[cfg_attr(target_os = "rtems", allow(dead_code))]
     rate_limiter: Option<crate::server::rate_limit::RateLimiter>,
     /// Consecutive denied messages — disconnect when this exceeds the
     /// configured strike threshold.
+    #[cfg_attr(target_os = "rtems", allow(dead_code))]
     rate_limit_strikes: u32,
+    #[cfg_attr(target_os = "rtems", allow(dead_code))]
     rate_limit_strike_threshold: u32,
     /// Capability-token verifier shared across all clients on this
     /// listener. When set, CLIENT_NAME payloads beginning with `cap:`
@@ -680,7 +703,7 @@ pub(crate) struct ClientState {
     /// `serverPostRate` / `serverEventRate`) advance from the delivery
     /// layer. `None` in unit tests that drive the TCP path without a
     /// full `ServerStats` wired up.
-    stats: Option<Arc<super::ca_server::ServerStats>>,
+    stats: Option<Arc<super::stats::ServerStats>>,
 }
 
 /// The access-security host identity of one CA circuit, and — by
@@ -744,6 +767,8 @@ impl HostIdentity {
 }
 
 /// What [`ClientState::refuse_message`] left for the parse loop to do.
+/// Part of the async read/parse loop (`handle_client`); host-only.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refused {
     /// The whole body was already buffered — nothing to drain from
@@ -856,6 +881,9 @@ impl ClientState {
     /// never need to reason about the field themselves: a body that is
     /// already fully buffered leaves nothing to drain and parsing resumes
     /// in-buffer, while a short body carries only the shortfall forward.
+    ///
+    /// Part of the async read/parse loop (`handle_client`); host-only.
+    #[cfg(not(target_os = "rtems"))]
     fn refuse_message(&mut self, buffered: usize, offset: usize, msg_len: usize) -> Refused {
         let arrived = buffered - offset;
         match msg_len.checked_sub(arrived) {
@@ -1100,12 +1128,14 @@ impl ClientState {
 /// polled is queued rather than refused — owning a `CaServer` implies
 /// "listening", with no readiness handshake for the caller to get
 /// wrong.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone)]
 pub struct BoundTcp {
     listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>,
     port: u16,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl BoundTcp {
     /// The port every listener in this set is bound to. This is the
     /// port SEARCH replies and beacons advertise — it differs from the
@@ -1131,6 +1161,7 @@ impl BoundTcp {
 /// must use that same port; if a per-interface bind fails it is logged
 /// and skipped (matches C `cleanup:` / `continue;` in
 /// `caservertask.c:744-749`, which frees the conf and proceeds).
+#[cfg(not(target_os = "rtems"))]
 pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
     let intf_addrs: Vec<std::net::Ipv4Addr> = {
         let cfg = super::addr_list::from_env()?;
@@ -1212,6 +1243,7 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
 /// (`softioc-rs --port 0`); C cannot express that — `envGetInetPortConfigParam`
 /// rejects any port at or below 5000 — so getting one back is what was asked
 /// for, not a fallback, and C's warning has nothing to say about it.
+#[cfg(not(target_os = "rtems"))]
 fn announce_tcp_port(configured: u16, bound: u16) {
     if configured != 0 && bound != configured {
         // C `caservertask.c:580-590`, five `errlogPrintf` lines, verbatim —
@@ -1248,6 +1280,7 @@ fn announce_tcp_port(configured: u16, bound: u16) {
 /// is its own start, and the beacon-reset signal is reachable solely through
 /// [`CaServer::trigger_beacon_anomaly`](super::ca_server::CaServer::trigger_beacon_anomaly)
 /// — the ca-gateway's `generateBeaconAnomaly` analogue.
+#[cfg(not(target_os = "rtems"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
@@ -1260,7 +1293,7 @@ pub async fn run_tcp_listener(
     // PR #592 dbServerStats: per-connection byte counters feed the
     // `casr` iocsh command's `bytes in=… out=…` line. Optional so unit
     // tests of the TCP path don't need a full ServerStats wired up.
-    stats: Option<Arc<super::ca_server::ServerStats>>,
+    stats: Option<Arc<super::stats::ServerStats>>,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<
         Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
     >,
@@ -1385,6 +1418,7 @@ pub async fn run_tcp_listener(
 /// multi-NIC hosts can tell which listener saw the failure. The
 /// `actual_port` parameter is the TCP port shared across all
 /// listeners (decided in `bind_tcp_listeners`).
+#[cfg(not(target_os = "rtems"))]
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: Arc<TcpListener>,
@@ -1396,7 +1430,7 @@ async fn accept_loop(
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
     drain: Arc<std::sync::atomic::AtomicBool>,
-    stats: Option<Arc<super::ca_server::ServerStats>>,
+    stats: Option<Arc<super::stats::ServerStats>>,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<
         Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
     >,
@@ -1672,6 +1706,7 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
 /// Batching is preserved: a whole dispatch burst (or a run of monitor
 /// frames) is written back-to-back before the single `flush`, so N framed
 /// replies still collapse to one TCP write.
+#[cfg(not(target_os = "rtems"))]
 async fn drain_and_flush<W: AsyncWrite + Unpin>(
     sock: &mut BufWriter<W>,
     drain: &mut OutboxDrain,
@@ -1692,6 +1727,7 @@ async fn drain_and_flush<W: AsyncWrite + Unpin>(
 /// `peer.ip()` for the `state.hostname` ACF key — the
 /// cryptographically authenticated identity is always more
 /// trustworthy than the network address.
+#[cfg(not(target_os = "rtems"))]
 #[allow(clippy::too_many_arguments)]
 async fn handle_client<S>(
     stream: S,
@@ -1713,7 +1749,7 @@ async fn handle_client<S>(
     // flush (by inspecting `BufWriter::buffer().len()` before flush).
     // `None` skips all counter bookkeeping — used by the unit-test
     // dispatch fixtures that don't spin up a full CaServer.
-    stats: Option<Arc<super::ca_server::ServerStats>>,
+    stats: Option<Arc<super::stats::ServerStats>>,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
     // TLS channel binding (SHA-256 of the peer's leaf cert DER),
     // computed at the mTLS accept site. `None` for plaintext peers —
@@ -4583,7 +4619,7 @@ pub(crate) enum SubscriptionOutcome {
 /// Everything the async caller needs to record a spawned subscription and emit
 /// its `SubscriptionOpened` event.
 pub(crate) struct SpawnedSubscription {
-    pub task: tokio::task::JoinHandle<()>,
+    pub task: epics_base_rs::runtime::task::TaskHandle<()>,
     pub target: ChannelTarget,
     pub channel_sid: u32,
     pub sub_id: u32,
@@ -4609,7 +4645,7 @@ pub(crate) struct RegisteredSubscription {
     pub denied: Arc<AtomicBool>,
     pub long_string_mode: LongStringMode,
     pub client_minor: u16,
-    pub stats: Option<Arc<super::ca_server::ServerStats>>,
+    pub stats: Option<Arc<super::stats::ServerStats>>,
 }
 
 /// The subscription metadata [`cancel_subscription_reply`] needs, looked up by
@@ -5496,7 +5532,7 @@ pub(crate) struct MonitorDelivery {
     pub long_string_mode: LongStringMode,
     pub req_hdr: CaHeader,
     pub client_minor: u16,
-    pub stats: Option<Arc<super::ca_server::ServerStats>>,
+    pub stats: Option<Arc<super::stats::ServerStats>>,
 }
 
 /// Control messages from the blocking dispatch thread to its single event

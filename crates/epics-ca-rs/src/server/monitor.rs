@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::LongStringMode;
-use super::ca_server::ServerStats;
 use super::outbox::Outbox;
+use super::stats::ServerStats;
 use crate::protocol::*;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::pv::MonitorEvent;
@@ -46,7 +46,7 @@ pub(crate) fn spawn_monitor_sender(
     // for THIS client: a pre-CA_V49 peer gets `ECA_16KARRAYCLIENT` rather than
     // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
     reply: super::tcp::ReplyContext,
-) -> tokio::task::JoinHandle<()> {
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
     epics_base_rs::runtime::task::spawn(async move {
         loop {
             // C `event_read`: take this monitor's next queued entry, suspending
@@ -309,7 +309,7 @@ mod tests {
     /// loop rather than through a full TCP round-trip.
     mod subscription_event_counters {
         use super::*;
-        use crate::server::ca_server::ServerStats;
+        use crate::server::stats::ServerStats;
         use epics_base_rs::server::pv::ProcessVariable;
         use epics_base_rs::types::{DBR_DOUBLE, DbFieldType, EpicsValue};
         use std::time::Duration;

@@ -33,8 +33,21 @@ use super::source::DynSource;
 
 // exposed pub(crate) so the TCP-circuit SEARCH handler in
 // tcp.rs can reuse this struct + the parser below. The fields are
-// read-only after parse; TCP only consults `queries` and `protocols`
-// (and `seq` for the response echo).
+// read-only after parse. The TCP-circuit handler consults `queries` (through
+// `matched_cids_for_requester`), `must_reply`, `seq` and `byte_order`.
+//
+// It does NOT consult `protocols`, and that is upstream parity rather than an
+// omission: pvxs `serverchan.cpp:185-192` decodes the TCP circuit's protocol
+// list into a local `foundtcp` and then never reads it — `onSearch` is called
+// unconditionally at `:216` and the reply always names "tcp" at `:246`. The
+// protocol gate is a *broadcast* rule (see the module doc above), so wiring
+// one in here would make us answer strictly fewer TCP-circuit SEARCHes than
+// pvxs does. `tcp.rs` states the same conclusion at its call site.
+//
+// `protocols`, `reply_addr`, `reply_port`, `unicast` and `consumed` are read
+// only on the UDP paths. The parser fills them for every caller because it is
+// one parser, not two — which is also why an RTEMS build that has no UDP
+// responder wired yet reports them as never read.
 #[derive(Debug)]
 pub(crate) struct SearchRequest {
     pub(crate) seq: u32,

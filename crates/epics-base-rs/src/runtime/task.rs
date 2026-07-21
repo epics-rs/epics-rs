@@ -650,6 +650,10 @@ fn probe_fifo_range() -> RtRange {
     // its own `pthread_create`/`pthread_join` pair (`osdThread.c:316-334`).
     let probe = std::thread::Builder::new()
         .name("cbRtProbe".to_string())
+        // Two `sched_get_priority_*` calls and a `sched_setscheduler`; nothing
+        // recurses. Linux-only, so this is not the RTEMS ceiling — but there is
+        // no reason for a throwaway probe to reserve 2 MiB on any target.
+        .stack_size(StackSizeClass::Small.bytes())
         .spawn(move || {
             // `osdThread.c:277-287`: failing at the minimum means no
             // permission for SCHED_FIFO at all.
@@ -845,8 +849,24 @@ where
     )
 }
 
-/// Spawn a **dedicated OS thread** that runs `f` at `priority`, with whatever
-/// ambient async context [`block_on_sync`] needs on this target.
+/// Spawn a **dedicated OS thread** that runs `f` at `priority` with a `stack`
+/// of [`StackSizeClass`], plus whatever ambient async context
+/// [`block_on_sync`] needs on this target.
+///
+/// # Why the stack class is a parameter and not a default
+///
+/// C creates an IOC thread with `epicsThreadCreate(name, priority, stackSize,
+/// fn, arg)` — three attributes. This seam carried the first two and let the
+/// third fall through to whatever `std` picks, which is **2 MiB on RTEMS**:
+/// `std/src/sys/thread/unix.rs` gates its `DEFAULT_MIN_STACK_SIZE` on
+/// `not(any(l4re, vxworks, espidf, nuttx))`, and vxWorks got a 256 KiB
+/// carve-out where RTEMS did not.
+///
+/// That is invisible on the host, where a thread stack is lazily-committed
+/// virtual address space, and decisive on the target, where it is carved
+/// eagerly out of a fixed pool. Making it a parameter is what stops a new
+/// per-connection thread from silently costing 2 MiB: there is no default to
+/// inherit, so every caller states what the thread is for.
 ///
 /// Not [`spawn_blocking_with_priority`], and the difference is the point.
 /// That one hands the closure to a *pool*: tokio's blocking pool on the host,
@@ -878,20 +898,24 @@ where
 pub fn spawn_dedicated_thread<F>(
     name: String,
     priority: ThreadPriority,
+    stack: StackSizeClass,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
     let ambient = tokio::runtime::Handle::try_current().ok();
-    std::thread::Builder::new().name(name).spawn(move || {
-        // Held for the whole body: it is what makes `tokio::spawn` and the
-        // timer reachable from this thread, and therefore what lets a future
-        // written for the hosted driver run unchanged under `block_on_sync`.
-        let _ambient = ambient.as_ref().map(|h| h.enter());
-        let _ = apply_to_current_thread(priority);
-        f()
-    })
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(stack.bytes())
+        .spawn(move || {
+            // Held for the whole body: it is what makes `tokio::spawn` and the
+            // timer reachable from this thread, and therefore what lets a future
+            // written for the hosted driver run unchanged under `block_on_sync`.
+            let _ambient = ambient.as_ref().map(|h| h.enter());
+            let _ = apply_to_current_thread(priority);
+            f()
+        })
 }
 
 /// RTEMS: a plain thread is already complete — the exec backend's spawn pool
@@ -900,20 +924,96 @@ where
 pub fn spawn_dedicated_thread<F>(
     name: String,
     priority: ThreadPriority,
+    stack: StackSizeClass,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
-    std::thread::Builder::new().name(name).spawn(move || {
-        let _ = apply_to_current_thread(priority);
-        f()
-    })
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(stack.bytes())
+        .spawn(move || {
+            let _ = apply_to_current_thread(priority);
+            f()
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything before the first column-0 `#[cfg(test)]` — the code that
+    /// actually ships.
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// Every thread this crate creates states a stack size.
+    ///
+    /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
+    /// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
+    /// espidf and nuttx — not rtems). On the host that is lazily-committed
+    /// address space and costs nothing measurable; on the target it is carved
+    /// eagerly out of a fixed pool, which is why an unset stack size is the
+    /// first ceiling the IOC hits rather than a rounding error.
+    ///
+    /// `spawn_dedicated_thread` is enforced by its signature — the class is a
+    /// parameter, so a caller cannot omit it. This covers the threads that
+    /// still build a `std::thread::Builder` directly.
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_thread_in_this_crate_states_a_stack_size() {
+        // (file label, source) — every production `Builder` site in the crate.
+        let files = [
+            ("runtime/task.rs", include_str!("task.rs")),
+            (
+                "runtime/background/delayed_timer.rs",
+                include_str!("background/delayed_timer.rs"),
+            ),
+            (
+                "runtime/background/scan_once.rs",
+                include_str!("background/scan_once.rs"),
+            ),
+            (
+                "runtime/background/callback_executor.rs",
+                include_str!("background/callback_executor.rs"),
+            ),
+            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+        ];
+
+        let mut unclassified = Vec::new();
+        let mut checked = 0usize;
+        for (label, src) in files {
+            for (n, after) in production_scope(src)
+                .split("thread::Builder::new()")
+                .skip(1)
+                .enumerate()
+            {
+                checked += 1;
+                // The class must be set before the closure is handed over;
+                // `.spawn(` ends the builder chain.
+                let chain = after.split(".spawn(").next().unwrap_or("");
+                if !chain.contains(".stack_size(") {
+                    unclassified.push(format!("{label} (Builder #{})", n + 1));
+                }
+            }
+        }
+
+        assert!(
+            checked >= 6,
+            "expected to find the crate's Builder sites, found {checked} — \
+             did a file move? update this guard's file list"
+        );
+        assert!(
+            unclassified.is_empty(),
+            "these threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_spawn() {
@@ -938,6 +1038,7 @@ mod tests {
         let joined = spawn_dedicated_thread(
             "dedicated-with-runtime".into(),
             ThreadPriority::CaServerLow,
+            StackSizeClass::Small,
             move || {
                 let outcome = block_on_sync(async {
                     let inner = spawn(async { 7u32 }).await.expect("inner task");
@@ -973,6 +1074,7 @@ mod tests {
         let joined = spawn_dedicated_thread(
             "dedicated-no-runtime".into(),
             ThreadPriority::Low,
+            StackSizeClass::Small,
             move || {
                 let _ = tx.send((
                     std::thread::current().name().map(str::to_string),

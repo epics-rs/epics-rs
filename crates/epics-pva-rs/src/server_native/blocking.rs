@@ -119,7 +119,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::spawn_dedicated_thread;
-use epics_base_rs::runtime::task::{ThreadPriority, apply_to_current_thread, block_on_sync};
+use epics_base_rs::runtime::task::{
+    StackSizeClass, ThreadPriority, apply_to_current_thread, block_on_sync,
+};
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -736,17 +738,24 @@ pub fn serve_connection_blocking(
     // Both children go through the seam at `PVA_SERVER_PRIORITY`, like every
     // other thread in this module — see that constant for why all of them
     // share one number.
+    // Small: this thread's whole frame is a 4 KiB `READ_CHUNK` buffer and a
+    // `read`/`send` loop (`reader_thread`, :475). It decodes nothing — the
+    // protocol state machine runs on the connection thread below.
     let reader = spawn_dedicated_thread(
         format!("PVAS-reader {peer}"),
         PVA_SERVER_PRIORITY,
+        StackSizeClass::Small,
         move || reader_thread(read_sock, chunk_tx, peer),
     )
     .map_err(PvaError::Io)?;
     let writer_room = room.clone();
     let writer_wake = registration.wake_handle();
+    // Small, for the same reason: it drains already-encoded frames from a
+    // queue onto the socket (`writer_thread`, :643) and builds nothing.
     let writer = spawn_dedicated_thread(
         format!("PVAS-writer {peer}"),
         PVA_SERVER_PRIORITY,
+        StackSizeClass::Small,
         move || {
             writer_thread(
                 write_sock,
@@ -1007,9 +1016,16 @@ impl BlockingPvaServer {
         let config = self.config.clone();
         let invalidator = self.channel_invalidator.clone();
         let connections = self.connections.clone();
+        // Big: this is the deep one. It runs the whole protocol state machine
+        // under `block_on_sync` — channel create, GET/PUT/MONITOR, introspection
+        // and every dispatch into the database, including record processing.
+        // It is the structural counterpart of C's per-client `camsgtask`, which
+        // rsrv creates with `epicsThreadStackBig`
+        // (`rsrv/caservertask.c:109-111`).
         spawn_dedicated_thread(
             format!("PVAS-conn {peer}"),
             PVA_SERVER_PRIORITY,
+            StackSizeClass::Big,
             move || {
                 // Held for the whole connection: its `Drop` returns the slot and
                 // the peer entry even if the connection panics.
@@ -2223,11 +2239,13 @@ mod tests {
                 .expect("bind the blocking PVA server"),
         );
         let serving = server.clone();
-        let accept =
-            spawn_dedicated_thread("test-PVAS-accept".into(), PVA_SERVER_PRIORITY, move || {
-                serving.serve()
-            })
-            .expect("accept thread spawned");
+        let accept = spawn_dedicated_thread(
+            "test-PVAS-accept".into(),
+            PVA_SERVER_PRIORITY,
+            StackSizeClass::Medium,
+            move || serving.serve(),
+        )
+        .expect("accept thread spawned");
         (server, accept)
     }
 
@@ -2518,9 +2536,14 @@ mod tests {
             .expect("bind the blocking search socket");
         let search_addr = socket.local_addr().expect("search addr");
         let responding = server.clone();
-        let udp = spawn_dedicated_thread("test-PVAS-udp".into(), PVA_UDP_PRIORITY, move || {
-            responding.serve_udp_search(socket).expect("UDP responder");
-        })
+        let udp = spawn_dedicated_thread(
+            "test-PVAS-udp".into(),
+            PVA_UDP_PRIORITY,
+            StackSizeClass::Medium,
+            move || {
+                responding.serve_udp_search(socket).expect("UDP responder");
+            },
+        )
         .expect("UDP responder thread spawned");
         (server, search_addr, accept, udp)
     }

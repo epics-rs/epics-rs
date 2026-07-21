@@ -693,6 +693,10 @@ impl IocApplication {
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
                 .name("iocsh-startup".into())
+                // The shell runs arbitrary registered commands, which reach
+                // record processing and device support — the same depth the
+                // callback bands get, so the same class they use.
+                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in startup_commands {
@@ -1028,6 +1032,8 @@ impl IocApplication {
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
                 .name("iocsh-after-ioc-running".into())
+                // Same reasoning as "iocsh-startup" above.
+                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in shell_cmds_clone {

@@ -156,6 +156,9 @@ mod ioc {
         let srv_tcp = server.clone();
         let tcp_thread = match thread::Builder::new()
             .name("CAS-TCP".to_string())
+            // caservertask.c:716-718 — `epicsThreadStackMedium`. It accepts and
+            // hands off; the per-client thread is where the depth is.
+            .stack_size(StackSizeClass::Medium.bytes())
             .spawn(move || srv_tcp.serve())
         {
             Ok(h) => h,
@@ -167,6 +170,8 @@ mod ioc {
         let srv_udp = server.clone();
         let udp_thread = match thread::Builder::new()
             .name("CAS-UDP".to_string())
+            // caservertask.c:722-724 — `epicsThreadStackMedium`, same as TCP.
+            .stack_size(StackSizeClass::Medium.bytes())
             .spawn(move || srv_udp.serve_udp_search(udp))
         {
             Ok(h) => h,

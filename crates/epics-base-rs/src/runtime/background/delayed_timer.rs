@@ -225,6 +225,12 @@ impl DelayedTimer {
         let worker_inner = Arc::clone(&inner);
         let worker = std::thread::Builder::new()
             .name("cbTimer".to_string())
+            // C allocates the timer queue's thread with
+            // `epicsThreadGetStackSize(epicsThreadStackMedium)`
+            // (`libcom/src/timer/timerQueueActive.cpp:48`). This thread only
+            // fires expirations onto the callback bands; the arbitrary work
+            // runs on those, which are Big.
+            .stack_size(crate::runtime::task::StackSizeClass::Medium.bytes())
             .spawn(move || {
                 // callback.c:300 — the delayed-callback queue is allocated
                 // with `epicsTimerQueueAllocate(0, epicsThreadPriorityScanHigh)`.

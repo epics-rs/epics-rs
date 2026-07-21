@@ -104,7 +104,9 @@ use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::task::{ThreadPriority, apply_to_current_thread, block_on_sync};
+use epics_base_rs::runtime::task::{
+    StackSizeClass, ThreadPriority, apply_to_current_thread, block_on_sync,
+};
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
@@ -191,6 +193,11 @@ impl BlockingCaServer {
                     let tcp_port = self.tcp_port;
                     let spawned = thread::Builder::new()
                         .name(format!("CAS-client-blocking {peer}"))
+                        // caservertask.c:109-111 creates this same thread with
+                        // `epicsThreadGetStackSize(epicsThreadStackBig)`. It
+                        // runs the full CA command dispatch into the database,
+                        // so Big is the parity answer, not merely a safe one.
+                        .stack_size(StackSizeClass::Big.bytes())
                         .spawn(move || {
                             // caservertask.c:109 — the TCP receiver is created
                             // as `epicsThreadCreate("CAS-client",
@@ -658,6 +665,11 @@ fn handle_client_blocking(
     let event_send_lock = send_lock.clone();
     let event_thread = thread::Builder::new()
         .name(format!("CAS-event-blocking {peer}"))
+        // C's counterpart is the per-client event task, which `db_start_events`
+        // creates with `epicsThreadGetStackSize(epicsThreadStackMedium)`
+        // (`db/dbEvent.c:1117`) — one class below the receiver, because it
+        // formats and sends queued events rather than dispatching commands.
+        .stack_size(StackSizeClass::Medium.bytes())
         .spawn(move || {
             // caservertask.c:560 — "TCP sender: epicsThreadPriorityCAServerLow-1",
             // computed at :1508 as `epicsThreadHighestPriorityLevelBelow(
@@ -984,6 +996,61 @@ fn handle_client_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Everything before the first column-0 `#[cfg(test)]`.
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The CA server's threads are the ones that scale with client count, so
+    /// an unstated stack size here is what sets the target's first ceiling.
+    ///
+    /// Two threads per client at std's RTEMS default of 2 MiB is 4 MiB a
+    /// client; the classes C actually uses (`epicsThreadStackBig` for
+    /// `CAS-client` at `rsrv/caservertask.c:109-111`, `epicsThreadStackMedium`
+    /// for the event task at `db/dbEvent.c:1117`) come to 1.5 MiB on a 32-bit
+    /// target.
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_ca_server_thread_states_a_stack_size() {
+        let files = [
+            ("server/blocking.rs", include_str!("blocking.rs")),
+            (
+                "bin/rtems-ca-ioc.rs",
+                include_str!("../bin/rtems-ca-ioc.rs"),
+            ),
+        ];
+
+        let mut unclassified = Vec::new();
+        let mut checked = 0usize;
+        for (label, src) in files {
+            for (n, after) in production_scope(src)
+                .split("thread::Builder::new()")
+                .skip(1)
+                .enumerate()
+            {
+                checked += 1;
+                let chain = after.split(".spawn(").next().unwrap_or("");
+                if !chain.contains(".stack_size(") {
+                    unclassified.push(format!("{label} (Builder #{})", n + 1));
+                }
+            }
+        }
+
+        assert!(
+            checked >= 4,
+            "expected the CA server's Builder sites, found {checked} — \
+             did a file move? update this guard's file list"
+        );
+        assert!(
+            unclassified.is_empty(),
+            "these CA threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
+        );
+    }
+
     use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
     use epics_base_rs::types::{DbFieldType, EpicsValue};
     use std::net::Ipv4Addr;

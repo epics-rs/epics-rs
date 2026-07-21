@@ -4,8 +4,9 @@
 //! (conn.cpp:169-188) and uses it for all subsequent sends; old pvAccess
 //! accepts it from either peer at any time. The Rust server's read loop is
 //! the single owner of that latch: on SET_BYTE_ORDER it updates both its
-//! local outbound `order` and the shared cell read by the heartbeat, so the
-//! next outbound frame (here, the echo response) adopts the new order.
+//! local outbound `order` (used by its own synchronous replies and its
+//! heartbeat arm) and the shared cell the monitor subscriber tasks read, so
+//! the next outbound frame (here, the echo response) adopts the new order.
 //!
 //! Drives a real server over raw TCP: reads its initial SET_BYTE_ORDER
 //! (Little), sends a mid-stream SET_BYTE_ORDER(Big) followed by an

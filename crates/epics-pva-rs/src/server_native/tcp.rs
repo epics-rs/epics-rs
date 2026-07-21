@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3077,8 +3077,9 @@ fn parse_client_credentials(
 /// and TLS-wrapped streams.
 type SrvRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
-/// Per-connection write side. Producers (main read loop, heartbeat,
-/// monitor subscribers) push fully-framed PVA messages into the
+/// Per-connection write side. Producers (the main read loop — including
+/// its heartbeat arm — and the monitor subscribers) push fully-framed
+/// PVA messages into the
 /// channel; a single dedicated writer task drains it in arrival order.
 /// Replaces `Arc<Mutex<SrvWrite>>` so a slow client cannot block other
 /// producers waiting for the lock. The channel is *bounded* —
@@ -3253,17 +3254,39 @@ async fn handle_connection_io(
             }
         }
     });
-    // abort the writer + heartbeat tasks the moment the read
-    // loop returns. Without this, both linger up to `idle_timeout`
-    // (default 45s) emitting ECHOes into a channel nobody is reading
-    // and holding the writer half of the (now-disconnected) socket.
+    // abort the writer task the moment the read loop returns.
+    // Without this it lingers up to `idle_timeout` (default 45s) holding
+    // the writer half of the (now-disconnected) socket.
     // pvxs uses libevent-driven cleanup that shuts everything in one
     // pass; we rely on tokio JoinHandle::abort() via AbortOnDrop.
+    // The heartbeat needs no such guard: it is a deadline arm of this
+    // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
 
-    // Track per-connection liveness for the idle-timeout watchdog and the
-    // server-side echo heartbeat task.
-    let last_rx = Arc::new(AtomicU64::new(now_nanos()));
+    // Per-connection liveness for the idle-timeout watchdog. A plain local,
+    // not an `Arc<AtomicU64>`: the read loop both stamps it (on every frame)
+    // and reads it (in the heartbeat arm), so there is no second owner to
+    // share it with.
+    let mut last_rx = now_nanos();
+
+    // Server-side echo heartbeat as a deadline arm of the read loop rather
+    // than a per-connection task: send ECHO_REQUEST every 15 s, and stop
+    // beating once the peer has been silent for `idle_timeout`.
+    //
+    // `Interval::tick` is cancel-safe — losing the race in `select!` consumes
+    // no tick — so holding the interval across iterations reproduces the
+    // task's fixed 15 s cadence exactly, including tokio's default `Burst`
+    // catch-up if a long dispatch delays a tick.
+    let mut hb_tick = interval(Duration::from_secs(15));
+    // `interval` yields its first tick immediately; the task consumed it the
+    // same way, so the first beat lands 15 s in.
+    hb_tick.tick().await;
+    // Latched when the idle watchdog fires or the writer channel closes —
+    // the two conditions that used to `break` the task's loop. Note this
+    // stops the *heartbeat*, not the connection: the task ending never tore
+    // the connection down either (its `JoinHandle` was only ever aborted),
+    // so the existing "closing" wording overstates what happens.
+    let mut hb_stopped = false;
 
     // Outbound byte order as a shared, mutable per-connection cell, seeded
     // from the configured wire order. The read loop latches a new value if
@@ -3271,44 +3294,11 @@ async fn handle_connection_io(
     // conn.cpp:169-188 `sendBE`; old pvAccess accepts it from either peer
     // at any time). `true` = Big. Single writer (the read loop, which also
     // keeps an in-sync local `order` for the synchronous dispatch path it
-    // owns); one reader (the heartbeat task).
+    // owns); the readers are the spawned MONITOR subscriber tasks, which
+    // stamp each frame with the current order via their `order_now()`.
     let out_order = Arc::new(std::sync::atomic::AtomicBool::new(
         config.wire_byte_order.is_big(),
     ));
-
-    // Spawn server-side heartbeat: send ECHO_REQUEST every 15 s; close if
-    // we've been idle for `idle_timeout`.
-    let last_rx_hb = last_rx.clone();
-    let tx_hb = tx.clone();
-    let out_order_hb = out_order.clone();
-    let hb_handle = tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(15));
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let last = last_rx_hb.load(Ordering::SeqCst);
-            let elapsed = now_nanos().saturating_sub(last);
-            if Duration::from_nanos(elapsed) > idle_timeout {
-                warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
-                break;
-            }
-            // Read the current outbound order — the peer may have
-            // re-negotiated it via a mid-stream SET_BYTE_ORDER
-            // (pvxs conn.cpp:169-188).
-            let order_hb = if out_order_hb.load(Ordering::Relaxed) {
-                ByteOrder::Big
-            } else {
-                ByteOrder::Little
-            };
-            let h = PvaHeader::control(true, order_hb, ControlCommand::EchoRequest.code(), 0);
-            let mut buf = Vec::with_capacity(8);
-            h.write_into(&mut buf);
-            if tx_hb.send(buf).await.is_err() {
-                break;
-            }
-        }
-    });
-    let _hb_guard = AbortOnDrop(hb_handle.abort_handle());
 
     // Outbound order owner: this read loop. Mutable so a mid-stream
     // SET_BYTE_ORDER from the peer re-latches it (pvxs conn.cpp:169-188);
@@ -3655,6 +3645,29 @@ async fn handle_connection_io(
                 }
                 continue;
             }
+            _ = hb_tick.tick(), if !hb_stopped => {
+                // Server-side echo heartbeat, formerly its own per-connection
+                // task. Same cadence, same frame, same two stop conditions —
+                // only the owner changed, from a task reading `last_rx` and
+                // `out_order` through shared cells to this loop reading its
+                // own `last_rx` and `order` directly.
+                let elapsed = now_nanos().saturating_sub(last_rx);
+                if Duration::from_nanos(elapsed) > idle_timeout {
+                    warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
+                    hb_stopped = true;
+                    continue;
+                }
+                let h = PvaHeader::control(true, order, ControlCommand::EchoRequest.code(), 0);
+                let mut buf = Vec::with_capacity(8);
+                h.write_into(&mut buf);
+                if tx.send(buf).await.is_err() {
+                    // Writer gone. The loop-top `tx.is_closed()` check
+                    // unwinds the connection on the next iteration; stop
+                    // beating so this arm cannot spin in the meantime.
+                    hb_stopped = true;
+                }
+                continue;
+            }
             frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
                 frame_result?
             }
@@ -3662,7 +3675,7 @@ async fn handle_connection_io(
         // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
-        last_rx.store(now_nanos(), Ordering::SeqCst);
+        last_rx = now_nanos();
         if frame.header.flags.is_control() {
             // A peer may re-negotiate the connection byte order mid-stream
             // with another SET_BYTE_ORDER control frame. pvxs latches

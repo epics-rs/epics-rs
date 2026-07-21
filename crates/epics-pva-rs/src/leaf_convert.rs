@@ -30,9 +30,7 @@
 
 use crate::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
 use epics_base_rs::types::EpicsValue;
-// Only the PVA → EpicsValue direction rebuilds a `PvString`, and that
-// direction is host-only (see `pv_leaf_to_epics_value`).
-#[cfg(not(target_os = "rtems"))]
+// Only the PVA → EpicsValue direction rebuilds a `PvString`.
 use epics_base_rs::types::PvString;
 
 /// `EpicsValue` → PVA value-leaf `PvField` (scalar or scalar array).
@@ -171,12 +169,10 @@ pub(crate) fn epics_value_to_field_desc_leaf(v: &EpicsValue) -> FieldDesc {
 /// stand-in. `UShort`/`UInt` are not carried here; that is a pre-existing
 /// forward-bridge gap, not part of the `DBF_CHAR` family.
 ///
-/// The forward direction ([`epics_value_to_pv_leaf`],
-/// [`epics_value_to_field_desc_leaf`]) is target-neutral — the DB source
-/// builds replies with it. This backward direction is only ever driven by
-/// an inbound PUT in `server_native::tcp`, which is host-only, so it is
-/// gated with that layer rather than left dead on RTEMS.
-#[cfg(not(target_os = "rtems"))]
+/// Both directions are target-neutral. This backward direction is only ever
+/// driven by an inbound PUT in `server_native::tcp`, which used to be
+/// host-only and carried this function behind the same gate; `tcp` is now
+/// target-neutral itself, so the gate is gone and RTEMS gets the PUT path.
 pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
     fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
         Some(match sv {

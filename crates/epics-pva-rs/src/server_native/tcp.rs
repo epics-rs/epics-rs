@@ -47,9 +47,11 @@ use super::source::{ChannelInvalidator, DynSource, OpError};
 
 // The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
 // these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
-// every existing caller and doc link. Owed when this branch combines with
-// `phase6/pva-rtems-dep-gate`: `accept` is host-only there, so these three
-// names need the same `#[cfg(not(target_os = "rtems"))]` the module gets.
+// every existing caller and doc link. `accept` owns the listener socket and is
+// host-only, so the re-exports carry its gate — this is the shim, not the
+// protocol, and gating it is what the comment written here at the split
+// already prescribed for the merge with `phase6/pva-rtems-dep-gate`.
+#[cfg(not(target_os = "rtems"))]
 pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
@@ -5861,7 +5863,7 @@ async fn handle_tcp_search(
     frame.header.write_into(&mut raw);
     raw.extend_from_slice(&frame.payload);
 
-    let Some(req) = super::udp::parse_search_request(&raw) else {
+    let Some(req) = super::search::parse_search_request(&raw) else {
         // The command framing already classified this frame as a SEARCH,
         // so `parse_search_request` returning `None` here means the body
         // failed to decode (truncated, bad size prefix, missing channel
@@ -5903,12 +5905,12 @@ async fn handle_tcp_search(
     // requested transport). pvxs fills `Search::source` from the TCP peer
     // (serverchan.cpp:197-222), so a source can still scope advertisement
     // by the established peer endpoint via `searchable_from`.
-    let matched = super::udp::matched_cids_for_requester(source, &req, peer).await;
+    let matched = super::search::matched_cids_for_requester(source, &req, peer).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.
     if !matched.is_empty() || req.must_reply {
-        let response = super::udp::build_search_response_proto(
+        let response = super::search::build_search_response_proto(
             config.guid,
             req.seq,
             advertised_port,

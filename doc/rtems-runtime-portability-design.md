@@ -255,16 +255,29 @@ Implication — PVA is CA's mirror image:
 
 **Revised 2026-07-21 — PVA reuses the CA backend; no select reactor.** The
 earlier conclusion ("PVA's RTEMS bottleneck is a `select`-based reactor +
-minimal executor") conflated two different needs. What PVA's 68 spawned tasks
-actually require is **multiplexing many futures on few threads** — not
+minimal executor") conflated two different needs. What PVA's spawned tasks
+(**73 sites** — 67 `tokio::spawn` + 4 `JoinSet::spawn` + 2 already on the seam;
+42 production / 28 test / 3 bins, scoped 2026-07-21) actually require is
+**multiplexing many futures on few threads** — not
 readiness notification over many sockets. The CA blocking driver already
 delivers that: `run_event_task` drives N subscription futures plus a control
 channel through one `select_all` under a single `block_on_sync` on one thread,
 and `future_exec` + `park_on` behind the `runtime::task` seam run spawned
 tails. PVA mounts on the same primitives:
 
-- **reader thread** — blocking `read` → `handle_message` (already a sync `fn`)
-  → pushes frames to the existing mpsc;
+- **reader thread** — blocking `read` → frame parse → hand the frame to the
+  operation thread. **Correction (2026-07-21):** an earlier draft of this
+  bullet said "→ `handle_message` (already a sync `fn`)". That was wrong.
+  `handle_message` (`tcp.rs:6023`) is the leaf handler for PVA command 18
+  (`MESSAGE`, a client log line), not the dispatcher. The real dispatcher is
+  the inline `match Command::from_code(..)` at `tcp.rs:3790` and it is
+  **async** (`tx.send(..).await`, `handle_create_channel(..).await`,
+  `process_connection_validation(..).await`). So the reader thread does more
+  work than that bullet implied — and one invariant must survive the split:
+  `tcp.rs:3384-3395` makes the read loop the single owner of the inbound
+  `TypeCache`, dispatching every frame synchronously in wire order. Frame
+  *parsing* may move to the reader thread; **type-cache resolution must not**,
+  or a `0xFD` define races a later `0xFE` reference;
 - **writer thread** — blocking drain of that mpsc → `write_all` (the channel
   boundary PVA already has, `tcp.rs:3082/3215/3234`);
 - **operation thread** — `block_on_sync` over the per-operation futures
@@ -329,9 +342,18 @@ adopted path.**
 
 ### 8.2 Gateable — excluded from the RTEMS build
 
-- **ring / rustls / tokio-rustls (TLS)** — already `optional = true`, behind the
-  `experimental-rust-tls` feature (`epics-ca-rs/Cargo.toml:28,79`). The base
-  CA/PVA build does **not** pull ring. TLS on RTEMS is a separate, later
+- **ring / rustls / tokio-rustls (TLS)** — `optional = true` in **epics-ca-rs
+  only**, behind `experimental-rust-tls` (`epics-ca-rs/Cargo.toml:28,79`).
+  **Correction (2026-07-21):** the claim that "the base CA/PVA build does not
+  pull ring" was wrong for PVA. In `epics-pva-rs/Cargo.toml:36-38`
+  `rustls`/`rustls-pemfile`/`tokio-rustls` are **non-optional**, so
+  `cargo tree -i ring` resolves through them and drags **getrandom 0.2.17** —
+  the crate that `compile_error!`s on RTEMS. Same for `socket2 0.5`
+  (`:20`) and `if-addrs 0.13` (`:29`), also non-optional there, and
+  `config/env.rs:320/1326/1368` calls `get_if_addrs` on the **server** path so
+  it cannot be gated away with the client. A TLS/feature gate on epics-pva-rs
+  is therefore a **phase-6 prerequisite, not later cleanup**. For CA the
+  original statement stands. TLS on RTEMS proper is still a separate, later
   problem (swap ring → aws-lc-rs or a RustCrypto provider). **Not a hard
   blocker.**
 - **hickory-dns (DNS, tokio-runtime)** — optional; EPICS uses IP/broadcast, so
@@ -367,11 +389,17 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    reactor.
 4. **Dependency closure.** Resolve socket2 / getrandom / if-addrs on the RTEMS
    target (§8.1); gate off §8.2.
-5. **RTEMS entry point.** A runnable `main` for the target that starts the
-   blocking CA server plus the background executor. Until this exists the
-   RTEMS evidence is `--lib` type-checking only, and the §8.1 core-network
-   leaves (socket2 / if-addrs / getrandom) are *gated out* rather than solved —
-   they return at binary-link time. Prerequisite for every QEMU criterion.
+5. **RTEMS entry point.** ✅ **DONE 2026-07-21** (`15f1fc6c`,
+   `crates/epics-ca-rs/src/bin/rtems-ca-ioc.rs`). Starts `background_init()`,
+   a database via `IocBuilder` under `block_on_sync`, then `BlockingCaServer`
+   on `CAS-TCP`/`CAS-UDP` threads — no tokio runtime. **The feared regression
+   did not happen:** `cargo +nightly check --bin rtems-ca-ioc
+   --target armv7-rtems-eabihf` exits 0 and the bin's `--extern` set contains
+   **no socket2, no if-addrs, no getrandom, no mio** — the §8.1.1 `--lib`
+   gating holds unchanged at binary scope. (The `[[bin]]` deliberately carries
+   no `required-features`: that would make cargo *skip* the target and turn the
+   RTEMS gate into a vacuous pass.) Host proof: real `caget`/`camonitor` over
+   127.0.0.1, and `ps -T` shows zero tokio worker threads.
 6. **PVA on the CA backend** (revised 2026-07-21; was "`select` reactor +
    minimal executor"). Mount PVA's reader/writer/operation threads on the
    existing blocking driver primitives per §7. No new runtime is designed or
@@ -426,6 +454,17 @@ These were reasoned from source/library presence, **not** compiled:
 - ~~Exact `smol` migration cost if phase 6 fires: `broadcast` (41 sites) /
   `watch` (14) / `Notify` (64) have no drop-in in the `async-*` crates.~~
   **MOOT 2026-07-21** — phase 6 dropped; tokio stays the desktop driver.
+- ~~Whether the background executor can **abort a parked future** — the single
+  largest cost swing in the phase-6 estimate (87 `abort()` sites in
+  epics-pva-rs rely on tokio cancel-at-await-point).~~ **CLOSED 2026-07-21: it
+  can.** `future_exec` exposes `JoinFuture::abort` / `AbortHandle` /
+  `JoinError::is_cancelled`; `request_abort` latches the flag then unparks the
+  driving worker, and the driver runs
+  `park_on_interruptible(fut, || control.abort.load(Acquire))`
+  (`future_exec.rs:321`, `:352`), so a *parked* future does observe the abort
+  on wake. Semantics match tokio's: cancellation is observed at the next await
+  point, not mid-stretch. So `AbortOnDrop` guards port as a rename rather than
+  a redesign.
 - **New (open):** the RTEMS **task-count budget** under the single-backend
   decision. CA and PVA both run threads-per-connection, so peak RTEMS task
   count is a function of concurrent client connections. Not yet measured

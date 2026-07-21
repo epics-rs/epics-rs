@@ -228,3 +228,113 @@ mod tests {
         errlog_set_sev_to_log(ErrlogSevEnum::Minor);
     }
 }
+
+/// Render `record` so it cannot end or split a line in a line-oriented log.
+///
+/// Every ASCII control character — `0x00..=0x1F` (which includes `\n`, `\r`
+/// and NUL) and `0x7F` — becomes a printable `\xNN` escape. Everything else,
+/// including all non-ASCII UTF-8, is passed through untouched, so the common
+/// case allocates nothing.
+///
+/// # What this guarantees, and what it does not
+///
+/// It guarantees **line framing**: one record in, one line out, whatever the
+/// record contains. That is the property an audit log needs — a reader must
+/// not be able to mistake attacker-supplied text for a separate record.
+///
+/// It is deliberately **not** a reversible encoding: a backslash is left
+/// alone, so a user string containing the four literal characters `\x0a` and
+/// a real newline escape to the same bytes. Escaping backslashes would make
+/// it reversible but would also corrupt any record that is already escaped —
+/// a JSON record whose own encoder emitted `\n` would come back out as
+/// `\\n`. Leaving backslash alone is what makes this safe to apply uniformly
+/// at the writer, to every record, without the writer having to know which
+/// renderer produced it.
+///
+/// Applying it to already-escaped output is a no-op, because a correct
+/// encoder has already removed every raw control byte.
+pub fn single_line(record: &str) -> std::borrow::Cow<'_, str> {
+    fn must_escape(c: char) -> bool {
+        (c as u32) < 0x20 || c as u32 == 0x7F
+    }
+    if !record.contains(must_escape) {
+        return std::borrow::Cow::Borrowed(record);
+    }
+    let mut out = String::with_capacity(record.len() + 8);
+    for c in record.chars() {
+        if must_escape(c) {
+            use std::fmt::Write;
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod single_line_tests {
+    use super::single_line;
+
+    /// The framing guarantee, stated as a boundary sweep over every byte a
+    /// record could carry rather than as a story about one attack.
+    #[test]
+    fn no_input_can_produce_more_than_one_line() {
+        for b in 0u8..=0x7F {
+            let c = b as char;
+            let record = format!("a{c}b");
+            let out = single_line(&record);
+            assert_eq!(
+                out.lines().count().max(1),
+                1,
+                "byte {b:#04x} split the record: {out:?}"
+            );
+            assert!(!out.contains('\n'), "byte {b:#04x} left a newline");
+            assert!(!out.contains('\r'), "byte {b:#04x} left a carriage return");
+            assert!(!out.contains('\0'), "byte {b:#04x} left a NUL");
+        }
+    }
+
+    #[test]
+    fn exactly_the_ascii_control_range_is_escaped() {
+        for b in 0u8..=0xFF {
+            if b >= 0x80 {
+                continue; // non-ASCII is tested as UTF-8 below
+            }
+            let c = b as char;
+            let raw = c.to_string();
+            let out = single_line(&raw);
+            let escaped = out != raw;
+            assert_eq!(
+                escaped,
+                b < 0x20 || b == 0x7F,
+                "byte {b:#04x}: escaped={escaped}, expected={}",
+                b < 0x20 || b == 0x7F
+            );
+        }
+        assert_eq!(single_line("\n"), "\\x0a");
+        assert_eq!(single_line("\r"), "\\x0d");
+        assert_eq!(single_line("\0"), "\\x00");
+        assert_eq!(single_line("\u{7f}"), "\\x7f");
+    }
+
+    /// A clean record is returned borrowed — no allocation on the hot path.
+    #[test]
+    fn a_clean_record_is_passed_through_without_allocating() {
+        let clean = "Apr 09 14:35:21 alice@opi-1 TEMP:setpoint 3.14 old=? OK";
+        assert!(matches!(single_line(clean), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(single_line(clean), clean);
+        // Non-ASCII survives intact: this escapes line framing, not Unicode.
+        assert_eq!(single_line("설정값 μm"), "설정값 μm");
+    }
+
+    /// Applying it to output that is already escaped must not corrupt it —
+    /// this is what lets the writer apply ONE rule to every renderer instead
+    /// of asking which renderer produced the record.
+    #[test]
+    fn it_is_a_no_op_on_already_escaped_output() {
+        let json = r#"{"user":"a\nb","pv":"X"}"#;
+        assert_eq!(single_line(json), json);
+        assert_eq!(single_line(&single_line("a\nb")), single_line("a\nb"));
+    }
+}

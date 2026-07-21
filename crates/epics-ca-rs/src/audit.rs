@@ -56,6 +56,14 @@ impl AuditSink {
     }
 
     pub async fn write(&self, line: &str) {
+        // THE write point for every sink and every renderer. One record in,
+        // one line out — `to_aslog_line` interpolates the peer-supplied
+        // `user`, `host`, `pv` and `value` straight into a text line, and a
+        // CA CLIENT_NAME may legally contain a newline (the server checks
+        // only NUL-termination and a 511-byte cap, `server/tcp.rs:2416`).
+        // Applied uniformly rather than per-renderer: the JSON encoder has
+        // already removed every raw control byte, so this is a no-op there.
+        let line = &*epics_base_rs::runtime::log::single_line(line);
         match self {
             AuditSink::File(m) => {
                 let mut f = m.lock().await;
@@ -287,6 +295,83 @@ mod tests {
         assert!(s.contains("\"ev\":\"caput\""));
         assert!(s.contains("\"pv\":\"MOTOR:VAL\""));
         assert!(s.contains("\"result\":\"ok\""));
+    }
+
+    /// B1, second instance: `to_aslog_line` interpolates every peer-supplied
+    /// field into a text line with no escaping, and a CA `CLIENT_NAME` may
+    /// legally contain a newline — the server checks only NUL-termination
+    /// and a 511-byte cap (`server/tcp.rs:2416`). A VERIFIED cap-token's
+    /// `claims.sub` becomes `state.username` (`tcp.rs:2474`) and lands in
+    /// the same field, so this needs neither a forged identity nor a
+    /// rejected token.
+    ///
+    /// Boundary sweep over the fields, and over both renderers, because the
+    /// framing is applied at the sink and must therefore hold for whichever
+    /// one is configured.
+    #[tokio::test]
+    async fn no_wire_field_can_forge_a_second_audit_record() {
+        const FORGE: &str = "x\n04/09/2026 09:00:00 ASUSER W root@localhost caput: SAFETY:ILK=0 ok";
+
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl AuditWriter for Capture {
+            async fn write_line(&self, line: &str) {
+                self.0.lock().unwrap().push(line.to_string());
+            }
+        }
+
+        for field in ["user", "host", "pv", "value", "result"] {
+            let pick = |name: &str, clean: &'static str| {
+                if name == field { FORGE } else { clean }
+            };
+            let ev = AuditEvent {
+                event: "caput",
+                peer: "10.0.0.5:1234",
+                user: pick("user", "alice"),
+                host: pick("host", "opi-1"),
+                pv: pick("pv", "MOTOR:VAL"),
+                value: pick("value", "3.14"),
+                result: pick("result", "ok"),
+            };
+            for (name, rendered) in [("aslog", ev.to_aslog_line()), ("json", ev.to_json())] {
+                let cap = Capture::default();
+                let sink = AuditSink::Custom(Box::new(cap.clone()));
+                sink.write(&rendered).await;
+                let got = cap.0.lock().unwrap().clone();
+                assert_eq!(got.len(), 1, "{name}/{field}: one event, one write");
+                assert!(
+                    !got[0].contains('\n') && !got[0].contains('\r'),
+                    "{name}/{field}: the record must not carry a line break: {:?}",
+                    got[0]
+                );
+                assert!(
+                    got[0].contains("SAFETY:ILK"),
+                    "{name}/{field}: the injected text must survive, escaped"
+                );
+            }
+        }
+
+        // The JSON renderer's own escaping must survive the sink unchanged —
+        // this is what makes one uniform rule at the writer safe.
+        let ev = AuditEvent {
+            event: "caput",
+            peer: "p",
+            user: "a\nb",
+            host: "h",
+            pv: "P",
+            value: "v",
+            result: "ok",
+        };
+        assert!(
+            ev.to_json().contains(r#""user":"a\nb""#),
+            "the JSON encoder escapes the newline itself"
+        );
+        assert_eq!(
+            &*epics_base_rs::runtime::log::single_line(&ev.to_json()),
+            ev.to_json(),
+            "the sink must not re-escape already-escaped JSON"
+        );
     }
 
     /// libca asLib-compatible text format. Verifies the line

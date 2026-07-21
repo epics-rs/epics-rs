@@ -221,7 +221,11 @@ impl PvaServer {
     where
         S: ChannelSource + 'static,
     {
-        let guid = random_guid();
+        // `?` and not a fallback: a host with no entropy source must fail to
+        // start rather than advertise a guessable identity — see `random_guid`
+        // for why every consumer of a GUID collision degrades silently, which
+        // makes this the last moment the problem is visible.
+        let guid = random_guid()?;
         // the TCP-circuit SEARCH handler reads this guid
         // out of the per-connection config copy to populate the
         // SEARCH_RESPONSE body. Stamp it onto a local mut copy so

@@ -21,7 +21,7 @@
 //!
 //! Nothing here names a socket type, a runtime, or an address enumerator.
 
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP;
@@ -34,40 +34,100 @@ use super::search::{
     SearchRequest, build_search_response_proto, matched_cids_for_requester, parse_search_request,
 };
 use super::source::DynSource;
-/// Generate a 12-byte server GUID.
+/// Generate a 12-byte server GUID from the platform's entropy source.
 ///
-/// Prefers `/dev/urandom` (Unix) so two servers started at the same
-/// nanosecond on different machines get distinct GUIDs and clients
-/// can't predict a server's GUID from start time + PID — pvxs
-/// `Server::Pvt::randomGUID` parity (commit ca594f40 "server: randomize
-/// UUID"). Falls back to the previous time + PID layout on platforms
-/// without `/dev/urandom` so non-Unix builds still get a unique-enough
-/// GUID per process.
-pub fn random_guid() -> [u8; 12] {
+/// pvxs `Server::Pvt::randomGUID` parity (commit ca594f40 "server: randomize
+/// UUID"): two servers started at the same nanosecond on different machines
+/// must get distinct GUIDs, and a client must not be able to predict one from
+/// start time + PID.
+///
+/// # There is no fallback, on purpose
+///
+/// This used to derive the GUID from `SystemTime::now()` + `process::id()`
+/// when the entropy source was unavailable. That is worse than an error,
+/// because **every consumer of a GUID collision degrades silently**:
+///
+/// * pvxs `client.cpp:938-943` logs "Duplicate PV name" only when the two
+///   GUIDs *differ*, so two servers sharing one GUID and one PV name make the
+///   warning disappear — exactly the case an operator most needs told.
+/// * pvxs `client.cpp:807-824` treats a GUID change as a server restart. A
+///   board that reboots into the same GUID is not seen to have restarted, so
+///   no `Discovered::Timeout` is emitted and clients keep stale state.
+/// * pvxs `client.cpp:454-460` + `:880-886` (`ignoreServerGUIDs`) is gateway
+///   loop-avoidance. Two servers sharing a GUID means ignoring one silently
+///   blackholes the other.
+///
+/// None of the three fails an acceptance test, a `pvget`, or a connection —
+/// a fully green ladder passes with a colliding GUID live. So the failure has
+/// to be raised at the only moment it is still visible: server construction.
+///
+/// The fallback was also *specifically* dangerous on RTEMS, where both of its
+/// inputs are near-constant: EPICS base sets a fixed boot wall-clock
+/// (`rtems_init.c:958-966`) and there is one process. Two boards, or one board
+/// twice, could serve identical GUIDs.
+pub fn random_guid() -> io::Result<[u8; 12]> {
     let mut buf = [0u8; 12];
-    if !try_fill_secure(&mut buf) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        buf[..8].copy_from_slice(&now.to_le_bytes());
-        let pid = std::process::id().to_le_bytes();
-        buf[8..12].copy_from_slice(&pid);
+    fill_entropy(&mut buf)?;
+    Ok(buf)
+}
+
+/// RTEMS: `getentropy`, declared for this target by `libc`
+/// (`libc-0.2.186/src/unix/newlib/rtems/mod.rs:139`).
+///
+/// A dedicated arm rather than the Unix one below, because `target_family =
+/// "unix"` holds for RTEMS and would otherwise select a `/dev/urandom` open
+/// that a BSP need not provide — the silent selection of a Linux-shaped path
+/// that made this defect possible.
+///
+/// `getentropy` reports failure through `errno`, which is why it is used
+/// rather than the `arc4random_buf` beside it in the same header: that one
+/// returns `void` and so cannot tell us it had nothing to draw on, which is
+/// the same silence being removed here.
+#[cfg(target_os = "rtems")]
+fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
+    // SAFETY: `buf` is a valid, exclusively-borrowed 12-byte region and the
+    // length passed is its own; 12 is far below `getentropy`'s 256-byte cap,
+    // so a short read is not representable.
+    let rc = unsafe { libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
     }
-    buf
+    Ok(())
 }
 
-#[cfg(unix)]
-fn try_fill_secure(buf: &mut [u8]) -> bool {
+/// Every other Unix: `/dev/urandom`.
+#[cfg(all(unix, not(target_os = "rtems")))]
+fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
     use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(buf))
-        .is_ok()
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf))
 }
 
-#[cfg(not(unix))]
-fn try_fill_secure(_buf: &mut [u8]) -> bool {
-    false
+/// Windows: `ProcessPrng` — the per-process user-mode PRNG, the same call
+/// `getrandom` makes on this platform, and the one Microsoft documents as the
+/// replacement for `RtlGenRandom`. It draws on the kernel pool and needs no
+/// algorithm handle to open or close.
+#[cfg(windows)]
+fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
+    // SAFETY: `buf` is a valid, exclusively-borrowed 12-byte region and the
+    // length passed is its own.
+    let ok = unsafe {
+        windows_sys::Win32::Security::Cryptography::ProcessPrng(buf.as_mut_ptr(), buf.len())
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Anything else: refuse rather than invent. Reaching this arm is a porting
+/// task, and it must read as one at the call site instead of as a server that
+/// started and quietly advertised a guessable identity.
+#[cfg(not(any(unix, windows)))]
+fn fill_entropy(_buf: &mut [u8; 12]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no entropy source is wired for this target; a PVA server cannot be given a GUID",
+    ))
 }
 
 /// Build a forward-ready copy of `frame` when its first SEARCH message
@@ -440,4 +500,116 @@ pub(crate) enum Origin {
     Direct,
     FromOriginTag,
     Forwarded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Production scope of a source file: everything before the first
+    /// column-0 `#[cfg(test)]`. Same helper the driver modules use.
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The GUID is drawn, not defaulted. `[0u8; 12]` is what
+    /// `PvaServerConfig::default()` carries, so a `random_guid` that silently
+    /// produced it would look like a server that simply had not been stamped.
+    #[test]
+    fn a_drawn_guid_is_not_the_default_zeros() {
+        let guid = random_guid().expect("this host has an entropy source");
+        assert_ne!(guid, [0u8; 12], "a drawn GUID must not be the zero default");
+        assert!(
+            guid.iter().any(|&b| b != guid[0]),
+            "12 identical bytes is not a draw: {guid:?}"
+        );
+    }
+
+    /// Two draws in one process differ — and that is the assertion the old
+    /// time+PID fallback would have failed on RTEMS specifically.
+    ///
+    /// The fallback packed `SystemTime::now()` nanos into bytes 0..8 and the
+    /// PID into 8..12. One process has one PID, so two draws differed *only*
+    /// by the clock; under EPICS base's fixed RTEMS boot wall-clock
+    /// (`rtems_init.c:958-966`) plus a coarse tick, two draws in the same tick
+    /// were byte-identical. Drawing many times in a tight loop is what makes
+    /// that mechanism visible on any host: a clock-derived GUID collides here,
+    /// an entropy-derived one does not.
+    #[test]
+    fn draws_in_one_process_do_not_collide() {
+        const DRAWS: usize = 256;
+        let mut seen = HashSet::new();
+        for _ in 0..DRAWS {
+            let guid = random_guid().expect("this host has an entropy source");
+            assert!(
+                seen.insert(guid),
+                "two GUIDs collided within one process: {guid:?}"
+            );
+        }
+        assert_eq!(seen.len(), DRAWS);
+    }
+
+    /// **Proven by inspection, pinned by source guard.** The RTEMS arm cannot
+    /// be executed on this host, so what is testable here is that it *exists*
+    /// and that it is selected by the target rather than by the family.
+    ///
+    /// That distinction is the whole defect: `target_family = "unix"` holds
+    /// for RTEMS, so a bare `#[cfg(unix)]` arm silently routed RTEMS into a
+    /// `/dev/urandom` open a BSP need not provide. A future "simplification"
+    /// that merges the two arms back together must fail here rather than on a
+    /// board.
+    #[test]
+    fn rtems_selects_entropy_by_target_not_by_family() {
+        let prod = production_scope(include_str!("search_engine.rs"));
+        assert_eq!(
+            prod.matches(r#"#[cfg(target_os = "rtems")]"#).count(),
+            1,
+            "RTEMS must have an entropy arm of its own"
+        );
+        assert!(
+            prod.contains("libc::getentropy("),
+            "the RTEMS arm must call getentropy, which reports failure, \
+             and not arc4random_buf, which returns void"
+        );
+        assert_eq!(
+            prod.matches(r#"#[cfg(all(unix, not(target_os = "rtems")))]"#)
+                .count(),
+            1,
+            "the /dev/urandom arm must exclude RTEMS explicitly"
+        );
+        assert_eq!(
+            prod.matches(r#"#[cfg(unix)]"#).count(),
+            0,
+            "a bare cfg(unix) arm would capture RTEMS again — that is the defect"
+        );
+    }
+
+    /// No arm may substitute a derived value for entropy it could not get.
+    /// The removed fallback built the GUID from `SystemTime::now()` and
+    /// `process::id()`; neither may reappear anywhere in this module, on any
+    /// platform, because a near-deterministic GUID fails silently at every
+    /// consumer (see [`random_guid`]) while an error does not.
+    #[test]
+    fn no_arm_derives_a_guid_instead_of_drawing_one() {
+        // Comment lines are stripped, because the doc on `random_guid` names
+        // the removed fallback in order to explain why it is gone — the guard
+        // is about what the code does, not about what it documents.
+        let prod: String = production_scope(include_str!("search_engine.rs"))
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in ["SystemTime::now", "process::id", "UNIX_EPOCH"] {
+            assert_eq!(
+                prod.matches(banned).count(),
+                0,
+                "`{banned}` is a GUID fallback returning: entropy failure must \
+                 propagate as an error, not become a guessable identity"
+            );
+        }
+    }
 }

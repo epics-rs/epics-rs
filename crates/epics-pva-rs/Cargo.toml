@@ -172,10 +172,16 @@ libc = "0.2"
 # Windows (client_native::udp), mirroring pvxs os/WIN32/osdSockExt.cpp.
 # socket2 does not expose WSARecvMsg (a Winsock extension fn), so this
 # raw FFI is required.
+#
+# `Win32_Security_Cryptography` is for `ProcessPrng`, the server-GUID entropy
+# source (`server_native::search_engine::random_guid`). Windows has no
+# std-only entropy API, and the GUID must come from a source that can *report
+# failure* — the alternative is the time+PID fallback this dependency replaced.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    "Win32_Security_Cryptography",
     "Win32_System_IO",
 ] }
 

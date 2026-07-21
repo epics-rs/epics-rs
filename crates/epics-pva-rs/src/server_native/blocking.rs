@@ -874,8 +874,14 @@ impl BlockingPvaServer {
         // two. Stamping at construction is what makes that true by
         // construction — there is no window in which a thread reads the
         // caller's default zeros.
+        //
+        // `?` and not a fallback: a server with no entropy source must fail
+        // here, loudly, rather than start and advertise a guessable identity.
+        // See `random_guid` for why every consumer of a GUID collision
+        // degrades *silently*, which is what makes construction the last
+        // moment the problem is visible at all.
         let mut config = config;
-        config.guid = random_guid();
+        config.guid = random_guid()?;
         // Same wiring the hosted single-listener path does at
         // `accept.rs:69-70`: the source needs the handle to force-disconnect
         // downstream channels out of band.
@@ -2728,6 +2734,37 @@ mod tests {
         );
 
         stop_all(&server, accept, udp);
+    }
+
+    /// Two servers in one process are two identities, and neither is the
+    /// config's zeros.
+    ///
+    /// The interesting half is that both are built from the *same*
+    /// `isolated_config()` value: identity comes from `bind`, not from the
+    /// config a caller hands in, so a caller cannot accidentally clone one
+    /// server's identity by cloning its config. This is also the assertion
+    /// the removed time+PID fallback would have failed on RTEMS, where one
+    /// process and a fixed boot wall-clock made both of its inputs constant.
+    #[test]
+    fn two_servers_in_one_process_have_distinct_guids() {
+        let a = BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), isolated_config())
+            .expect("bind a");
+        let b = BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), isolated_config())
+            .expect("bind b");
+
+        assert_ne!(a.guid(), [0u8; 12], "a bound server never serves the zeros");
+        assert_ne!(b.guid(), [0u8; 12], "a bound server never serves the zeros");
+        assert_ne!(
+            a.guid(),
+            b.guid(),
+            "two servers built from one config value must not share an identity"
+        );
+        assert_eq!(
+            isolated_config().guid,
+            [0u8; 12],
+            "and the config they were built from still carries the default zeros, \
+             which is why `bind` stamping is what makes the identity real"
+        );
     }
 
     /// The stop seam. Nothing wakes the responder — it is parked in

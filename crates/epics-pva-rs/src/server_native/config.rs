@@ -42,13 +42,29 @@ pub struct PvaServerConfig {
     /// `5076` (pvxs `netcommon.h:133`); parsed from
     /// `EPICS_PVAS_TLS_PORT` / `EPICS_PVA_TLS_PORT` by [`Self::with_env`].
     pub tls_port: u16,
-    /// server identity propagated into the TCP-circuit
-    /// `Command::Search` reply (`pvxs serverchan.cpp:215-235`). UDP
-    /// SEARCH_RESPONSE uses the same guid emitted by the UDP
-    /// responder. The runtime fills this from `random_guid()` before
-    /// passing the config to `run_tcp_server_on_listener`; default
-    /// is zero so tests / direct callers that don't care still
-    /// compile.
+    /// Server identity, propagated into the TCP-circuit `Command::Search`
+    /// reply (`pvxs serverchan.cpp:215-235`); the UDP SEARCH_RESPONSE and the
+    /// beacons carry the same 12 bytes.
+    ///
+    /// **Whatever you put here is not what gets served.** Every server
+    /// constructor — [`PvaServer::start`](crate::server_native::PvaServer)
+    /// and `BlockingPvaServer::bind` — overwrites this field with
+    /// `search_engine::random_guid()` before any thread or task can read it,
+    /// or **fails to construct** if the platform has no entropy source. So
+    /// this field is not an input a caller supplies; it is where the server
+    /// records the identity it drew, and the [`Default`] zeros are a value no
+    /// running server ever advertises.
+    ///
+    /// (An earlier version of this comment said "the runtime fills this",
+    /// which read as an assumption about one code path rather than a rule. It
+    /// stopped being true the moment a second server constructor existed.)
+    ///
+    /// The one exception is the low-level
+    /// [`run_tcp_server_on_listener`](crate::server_native::tcp::run_tcp_server_on_listener)
+    /// family, which serves the config verbatim because it is one listener of
+    /// several and re-randomizing per listener would give a single server
+    /// several identities. A caller driving those directly owns the GUID and
+    /// must fill it.
     pub guid: [u8; 12],
     /// Per-frame read timeout. The server *also* applies the heartbeat-
     /// based idle timeout below — `op_timeout` is just the upper bound on

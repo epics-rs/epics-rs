@@ -518,3 +518,210 @@ becomes live when item 7 lands.
 * **Client-side (L26, L27, 20 locks) is enumerated but not classified**, per the
   RTEMS scope decision at `Cargo.toml:93-95`. If a PVA gateway on RTEMS ever
   comes back into scope, that classification is owed.
+
+---
+
+## §9 `epics-bridge-rs` lock sweep + the L16/L17 producer trace
+
+Read-only. Appendable to `doc/pi-lock-evaluation.md` as §9; lock IDs continue
+after §8's L27.
+
+**Provenance.** `crates/epics-bridge-rs` read in
+`/home/stevek/work/epics-rs/.caucus/worktrees/integration` @ **`42a42abf`**
+(branch `integration/rtems-scope-b`) — the concurrent panel's `PvaServerConfig`
+extraction, in flight during §8, has landed; HEAD moved `2ce9bd11` → `42a42abf`
+before this sweep began. HEAD `42a42abf` and a **clean** working tree at start,
+mid-sweep and end — no file cited here went dirty, so no re-verification was
+owed.
+
+**(d) column skipped.** qsrv's upstream is `pva2pva`/`qsrv`, which is not on this
+host: `/home/stevek/work/epics-modules` holds 30 modules but no `pva2pva` or
+`qsrv` (nearest neighbours are `pvxs` and `ca-gateway`), and `/home/stevek/codes`
+holds four unrelated projects. Per the brief this is a skip, not a stop — and
+the bridge is largely port-original anyway, so most rows would have no
+counterpart even with the source present.
+
+---
+
+### §9.0 The L16/L17 producer trace — §8.5's deferred question, answered
+
+**The answer overturns §8's classification of L16/L17.** I traced the emission
+path hop by hop and it does not lead where §8 assumed.
+
+**Hop chain, starting where the brief said to start:**
+
+| hop | site | what it does |
+|---|---|---|
+| 1 | `qsrv/pva_adapter.rs:85` `PvaPvHandle::post` | validates against the canonical descriptor, then `*self.latest.lock() = Some(value.clone())` (`:92`) and `let mut subs = self.subscribers.lock()` (`:93`) — **L28/L29 below** |
+| 2 | `ad-plugins-rs/src/pva.rs:70` `self.handle.post(payload)` | the only production caller anywhere in the workspace |
+| 3 | `ad-plugins-rs/src/pva.rs:62` `NDPluginProcess::process_array` | the plugin trait method containing hop 2 |
+| 4 | `ad-core-rs/src/plugin/runtime.rs:598` `self.processor.process_array(array, &self.pool)` | inside `process_and_publish` (`:581`) |
+| 5 | `ad-core-rs/src/plugin/runtime.rs:1913` `guard.process_and_publish(&msg.array)` | inside `plugin_data_loop` |
+| 6 | `ad-core-rs/src/plugin/runtime.rs:1751-1753` `thread::Builder::new().name(format!("plugin-data-{port_name}")).spawn(...)` | **the driving thread** |
+
+**The driving thread is `plugin-data-{port}`, a plain `std::thread` at default
+priority.** `rg "apply_to_current_thread|ThreadPriority"` over `crates/ad-core-rs/src`
+and `crates/ad-plugins-rs/src` returns **nothing** — it is SCHED_OTHER, not a
+callback band, not a tokio worker, not iocsh.
+
+**And this path never touches L16/L17 at all.** `PvaPvHandle` (`pva_adapter.rs:48-102`)
+is an *independent reimplementation* of the pvxs `SharedPV::post` contract, not a
+wrapper over `epics_pva_rs::SharedPV`: it owns its own `latest` (`:49`) and
+`subscribers` (`:50`) `parking_lot` mutexes and posts to `mpsc::Sender`s. Every
+mention of `SharedPV` in `pva_adapter.rs` (`:45`, `:77`, `:100`, `:113`, `:340`)
+is a doc comment citing pvxs as the *model*.
+
+**So who does drive L16/L17? Nothing in production.** `rg` for `SharedPV` /
+`try_post_checked` / `.try_post(` across the workspace excluding `epics-pva-rs`
+itself returns hits in exactly one file — `crates/epics-bridge-rs/tests/pva_gateway.rs`
+(`:61`, `:237`, `:344`, `:901`, `:1060`, `:1126`, `:1244`, `:1353`, `:1484`) —
+plus the doc comments above. **`SharedPV`/`MonitorQueue` are a public API surface
+for external embedders, exercised in-tree only by tests.**
+
+**The real IOC monitor path bypasses them entirely.** A records-backed PVA
+monitor is served by `MonitorStream::Upstream` (`server_native/source.rs:1739`)
+wrapping `UpstreamMonitor::from_db` (`:1912-1921`), which holds a
+`epics_base_rs::server::database::db_access::DbSubscription` (`:1913`) — i.e. it
+rides the **base** subscription machinery (§2's **L7**, `ProcessVariable::subscribers`,
+a tokio Mutex and already classified park_on-PI-invisible), never
+`shared_pv.rs`'s locks.
+
+**Consequences — three corrections to §8:**
+
+1. **L16/L17's "replace-with-PI" has no high-priority acquirer today, and item 7
+   does not create one.** Item 7 changes the *consumer* side (per-connection
+   threads); the *producer* side only exists when an external embedder posts.
+   The classification should be downgraded from "the top row of this sweep" to
+   **replace-with-PI, but unranked — no in-tree producer**. The pvxs parity gap
+   (`sharedpv.cpp:37`/`servermon.cpp:57` are `epicsMutex`) is real and still
+   worth closing for embedders, but it is not on any hot path this workspace
+   runs.
+2. **The row that *does* have a live producer is L29** (`PvaPvHandle::subscribers`),
+   and its producer is `plugin-data-{port}` at default priority — so it is a
+   low↔low pair today, not a band↔connection pair.
+3. **§8's L7 cross-reference was the right lock all along.** The IOC monitor path
+   the bridge actually uses lands on base's L7, which the parent sweep already
+   classified as park_on-PI-invisible.
+
+---
+
+### §9.1 (a)+(b)+(c) The table
+
+**Kind** as in §2/§8: `PL` = `parking_lot`, `STD` = `std::sync`, `TOK` =
+`tokio::sync` (park_on-invisible when reached from a blocking thread).
+
+**Shared?** — `hosted` = live today on the hosted tokio server; `item 7` =
+becomes relevant only if the bridge is ported to the RTEMS blocking driver;
+`host-only` = gateway subsystems with no RTEMS story at all.
+
+| # | lock | decl / evidence | Kind | shared? | class |
+|---|---|---|---|---|---|
+| **L28** | `PvaPvHandle::latest` | `qsrv/pva_adapter.rs:49` `Arc<parking_lot::Mutex<Option<PvField>>>`; `:92` write, `:117` read | **PL** | **hosted** — `plugin-data-{port}` writes, connection task reads | **accept-with-bounded-CS** — one `Option<PvField>` swap/clone |
+| **L29** | `PvaPvHandle::subscribers` | `qsrv/pva_adapter.rs:50` `Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>`; `:93` post-retain, `:125` subscribe | **PL** | **hosted** — see §9.0; producer is SCHED_OTHER today | **replace-with-PI** *conditionally* — only once `plugin-data-*` gets a priority (§9.3) |
+| **L30** | `PVA_PV_REGISTRY` | `qsrv/pva_adapter.rs:143` `std::sync::Mutex<HashMap<String, PvaPvHandle>>`; `:155` insert, `:163` `mem::take` drain | **STD** | **hosted**, init-time | **remove-the-sharing** — a global drained once by `take_registered_pva_pvs`; an init-time handoff, not shared state |
+| **L31** | `BridgeSource::pva_pvs` | `qsrv/pva_adapter.rs:194` `Arc<RwLock<HashMap<String, PvaPvHandle>>>` — **tokio** (import `:13`); ~10 `.read().await`: `:291`,`:337`,`:489`,`:526`,`:787`,`:1001`,`:1016`,`:1034`,`:1054` | **TOK** | **item 7** — read on every channel op | **(c) park_on — PI-invisible**; also **accept** (read-mostly after init) |
+| **L32** | `BridgeProvider` ×5: `groups` `qsrv/provider.rs:628` (PL RwLock), `record_cache` `:641` (**tokio** RwLock), `access_cell` `:647` (PL RwLock), `base_group_defs` `:656` (PL), `group_files` `:668` (PL) | mixed | **item 7** | 4× **accept-with-bounded-CS** (map/vec lookups, init-time writes); `record_cache` is **(c) PI-invisible** |
+| **L33** | qsrv group `atomic_write_lock` | `qsrv/group_config.rs:64` `Arc<tokio::sync::Mutex<()>>` | **TOK** | **item 7** — the group-atomic-put gate | **(c) park_on — PI-invisible**; the bridge's `dbScanLockMany` analogue, and it inherits **L1**'s whole problem (§3) |
+| **L34** | `PvaLinkResolver` ×6: `link_options` `pvalink/integration.rs:59`, `out_link_options` `:66`, `db` `:71`, `scan_targets` `:78` (PL RwLock), `forwarders` `:84` (PL Mutex), `qsrv` `:95` (PL RwLock) | **PL** ×6 | **hosted, and genuinely high↔low** — `impl LinkSet for PvaLinkResolver` (`:1115`), registered at `:837` `db.register_link_set("pva", …)`, so these are acquired during **record processing** | **replace-with-PI** — the highest-value rows in this crate (§9.2) |
+| **L35** | `PvaLink` ×5: `latest` `pvalink/link.rs:153`, `notify_rx` `:178`, `out_scratch` `:205`, `disconnect_time` `:222`,`:300`, `snap_alarm` `:248` | **PL** ×5 (import `:8`) | **hosted**, same record-processing path as L34 | **replace-with-PI** (`latest`, `disconnect_time`); **accept-with-bounded-CS** (`notify_rx`, `out_scratch`, `snap_alarm`) |
+| **L36** | `LinkRegistry` ×3: `map` `pvalink/registry.rs:81`, `pending` `:91`, `channel_records` `:98` | **PL** ×3 RwLock (import `:9`) | **hosted**, link open/close | **accept-with-bounded-CS** — hash probes; writes at link attach/detach |
+| **L37** | `ChannelEntry` ×3: `state` `pva_gateway/channel_cache.rs:81`, `latest_raw` `:99` (PL RwLock), `drop_poke` `:106` (PL Mutex) | **PL** ×3 | **host-only** | **accept-with-bounded-CS** |
+| **L38** | `ChannelCache` ×2: `entries` `pva_gateway/channel_cache.rs:597` (**tokio** Mutex, import `:34`), `cleanup_task` `:599` (PL Mutex) | mixed | **host-only** | **(c) PI-invisible** (`entries`); **accept** (`cleanup_task`) |
+| **L39** | `GatewaySource` ×3: `upstream_pool` `pva_gateway/source.rs:333` (PL Mutex, import `:18`), `asg_resolver` `:353` (**tokio** RwLock, import `:19`), `upstream_caches` `:375` (PL Mutex) | mixed | **host-only** | **accept-with-bounded-CS**; `asg_resolver` **(c) PI-invisible** |
+| **L40** | CA-gateway `PvCache` + per-entry: `entries: HashMap<String, Arc<RwLock<GwPvEntry>>>` `ca_gateway/cache.rs:282` and the cache itself `Arc<RwLock<PvCache>>` (`upstream.rs:227`,`:245`,`:293`; `server.rs:347`,`:829`; `command.rs:86`,`:117`) — **tokio** RwLock (import `cache.rs:34`) | **TOK** ×2 | **host-only** | **(c) PI-invisible**; note `cache.rs:335-341`/`:365` already document collect-then-act to bound the outer guard |
+| **L41** | `UpstreamManager` ×2: `subs` `ca_gateway/upstream.rs:303`, `pending` `:307` (PL Mutex) | **PL** ×2 | **host-only** | **accept-with-bounded-CS** |
+| **L42** | stats ×2: `per_host` `ca_gateway/stats.rs:161`, `last_refresh` `:169` — **tokio** Mutex (import `:100`) | **TOK** ×2 | **host-only** | **(c) PI-invisible**; also **accept** (introspection path) |
+| **L43** | downstream ×3: `log` `ca_gateway/downstream.rs:74` (PL Mutex), `server` `:278`, `replay_state` `:287` (**tokio** Mutex, import `:29`) | mixed | **host-only** | **accept**; the two tokio ones **(c) PI-invisible** |
+| **L44** | putlog ×2: `file` `ca_gateway/putlog.rs:135`, `bytes_written` `:139` — **tokio** Mutex (import `:68`) | **TOK** ×2 | **host-only** | **(c) PI-invisible**; held across `tokio::fs` I/O — the longest critical section in this table |
+| **L45** | beacon ×2: `last` `ca_gateway/beacon.rs:25`, `pulse` `:34` — **std::sync** Mutex (import `:14`) | **STD** ×2 | **host-only** | **accept-with-bounded-CS** — one `Instant`/`Option<Arc>` |
+
+**Totals: 45 distinct production locks** — 29 `PL`, 13 `TOK`, 3 `STD`. By
+subsystem: qsrv 10 (L28-L33), pvalink 14 (L34-L36), pva_gateway 8 (L37-L39),
+ca_gateway 13 (L40-L45).
+
+**(c) the park_on-reachable set: L31, L32's `record_cache`, L33, L38's `entries`,
+L39's `asg_resolver`, L40 ×2, L42 ×2, L43 ×2, L44 ×2 = 13 locks.** Only three of
+those (L31, L32-`record_cache`, L33) are in a subsystem item 7 could ever reach;
+the other ten are gateway-only and have no RTEMS story. **L33 is the one that
+matters**: it is the group-atomic-put gate, structurally the same problem as
+**L1** — a tokio `Mutex` standing in for `dbScanLockMany` — and it inherits §3's
+conclusion verbatim.
+
+---
+
+### §9.2 Why L34/L35 are the real find in this crate
+
+Unlike L16/L17, the pvalink rows have a **traced, live, high-priority acquirer**:
+`PvaLinkResolver` implements base's `LinkSet` (`pvalink/integration.rs:1115`) and
+is registered into the database at `:837` (`db.register_link_set("pva", Arc::new(resolver.clone()))`).
+Link resolution therefore runs inside record processing — on a callback band or
+`scanOnce` — while the same locks are taken by the monitor-forwarder side
+(`scan_once` at `:1003`, reaching `process_record_with_links` at `:1104` and
+`process_record_with_links_already_locked` at `:1100`).
+
+That makes L34/L35 the only rows in §8+§9 combined that are simultaneously
+(i) `parking_lot`, so PI is reachable by type replacement, (ii) contended across
+a genuine high/low boundary, and (iii) on a path this workspace actually runs.
+They outrank L16/L17 — which §8 nominated on an assumption this trace has now
+disproved.
+
+**One caveat that bounds the claim.** The forwarder side is spawned through a raw
+`tokio::runtime::Handle` (`integration.rs:36`, `:156`, `:417` `self.handle.spawn(run_notify_forwarder(...))`,
+`:829`), **not** through the `runtime::task` seam. So on the hosted backend the
+forwarder is a tokio worker (SCHED_OTHER) and the record-processing side is the
+band — a real high↔low pair. There is no exec-backend variant of this pair today,
+for the reason in §9.3.
+
+---
+
+### §9.3 Two findings outside the lock table
+
+**1. `epics-bridge-rs` uses the `runtime::task` seam exactly once.**
+`rg "runtime::task::spawn|epics_base_rs::runtime::task"` over
+`crates/epics-bridge-rs/src` returns a single production hit —
+`qsrv/pva_adapter.rs:1436`. Against that, raw `tokio::spawn` /
+`tokio::runtime::Handle` appear in 10 production files, `pvalink/integration.rs`
+alone holding 42. The crate is **not** RTEMS-gated in its own manifest
+(`rg rtems crates/epics-bridge-rs/Cargo.toml crates/epics-bridge-rs/src/lib.rs`
+→ nothing), so its RTEMS status is *undeclared* rather than *excluded*. I did not
+verify what the RTEMS build actually compiles, so I am not claiming a live seam
+violation — the accurate statement is: **if the bridge ever enters the RTEMS
+build, those sites are seam bypasses and would need auditing first.** That is a
+prerequisite finding for any "port qsrv to RTEMS" item, and it is cheap to close
+by declaring the crate host-only now.
+
+**2. The `plugin-data-{port}` thread has no priority.** `ad-core-rs/src/plugin/runtime.rs:1751-1753`
+(and a second at `:2296-2298`) spawn named `std::thread`s that drive all NDArray
+plugin processing, including hop 2 of §9.0. No `apply_to_current_thread` exists
+anywhere in `ad-core-rs` or `ad-plugins-rs`. In C, areaDetector plugin threads are
+created with an explicit `epicsThreadPriority` per plugin. This is the same class
+of gap as §6 step 2's `CAS-UDP`/periodic-scan/iocsh holes, in a crate neither §6
+nor §8 looked at.
+
+---
+
+### §9.4 Where this fits in §6's execution order
+
+| slot | step | rationale |
+|---|---|---|
+| **revises §6 step 4** | **Demote L16/L17.** They keep the pvxs parity gap but lose their ranking — no in-tree producer (§9.0). Convert for embedder correctness, not for latency. | §8 ranked them on an assumption this trace disproved |
+| **new, alongside §6 step 3** | **L34/L35 → PI.** `parking_lot`, live high↔low, on the record-processing path. The best-evidenced PI candidates found in three sweeps. | §9.2 |
+| **with §6 step 2** | **Give `plugin-data-{port}` a priority** (`runtime.rs:1751`, `:2296`), matching C's per-plugin `epicsThreadPriority`. Until then L29's producer/consumer are both SCHED_OTHER and its PI classification is inert. | §9.3 finding 2 |
+| **before any qsrv-on-RTEMS item** | **Declare `epics-bridge-rs` host-only, or audit its 40+ raw-spawn sites against the seam.** | §9.3 finding 1 |
+| **follows §6 step 1** | **L33** — the group-atomic-put gate inherits L1's decision exactly. | §9.1 |
+
+---
+
+### §9.5 What this sweep does not establish
+
+* **Nothing measured** — static analysis, same caveat as §7 and §8.5.
+* **I did not verify what the RTEMS build compiles.** §9.3 finding 1 is stated as
+  conditional for that reason; confirming it needs a `--target` build, which is
+  outside a read-only sweep.
+* **`ad-core-rs` / `ad-plugins-rs` were not swept for locks** — I entered them only
+  to complete the §9.0 hop chain. `runtime.rs:95` shows at least one
+  `Arc<Mutex<Option<Arc<NDArray>>>>` on the plugin path; the population is
+  unknown and is the next gap, exactly as `epics-bridge-rs` was this one.
+* **Test-only locks were excluded throughout**, using the last `#[cfg(test)]` in
+  each file as the boundary. `pva_gateway/source.rs` has an early `#[cfg(test)]`
+  at `:25` as well as the module at `:1982`; the `:1982` boundary is the one used.

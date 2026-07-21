@@ -578,6 +578,48 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    connect-time seed preserved), and mapped-of-mapped is unrepresentable by
    type, which is what keeps the default monitor path allocation-free.
 
+   **Merge ordering resolved 2026-07-21 — local branch
+   `integration/rtems-scope-b`** (off `main@5241145f`; main itself untouched,
+   nothing pushed). All three branches on item 7's critical path are merged
+   there: the dep gate (`7f0f9d3e`), the CA sans-io branch through `c065fe28`
+   (which adds the opt-in SCHED_FIFO wiring, below), and
+   `phase6/pva-channelsource-ring` (`aa1af842`). Conflict resolutions of
+   record: `iocsh/commands.rs` (main's `install_record_defs` structure +
+   the CA branch's sync record API, data-lock guard scoped per field before
+   `update_scan_index(..).await`); `runtime/task.rs` (a cfg-forked
+   `runtime::task::timeout` seam — the exec arm races a pinned `sleep`
+   against the future and returns a local `Elapsed`, since tokio's `Elapsed`
+   has no public constructor); the dep gate's TLS feature gates re-applied to
+   the split-out `accept.rs`. Verified at the branch tip (`2ce9bd11`): clippy
+   `--workspace --all-targets -D warnings` clean; nextest workspace
+   **9839/9839**; `rtems-exec-model` feature-ON suite **593/593**; and
+   `--lib` RTEMS checks exit 0 for epics-base-rs, epics-ca-rs **and
+   epics-pva-rs** — the committed-green pva RTEMS check that items 5, 7 and
+   10 were waiting on. Item-5 stages 3–5, item-7 stages C–G, and items 8–9
+   are unblocked on this branch. Next owed there: extract `PvaServerConfig`
+   out of the host-gated `runtime.rs` — 8 production `tcp.rs` signatures
+   name it (`tcp.rs:45`), so the gate re-point is **not** the "4 cfg lines"
+   named in `4c75e766` until that lands — then the `tcp`/`peers` gate
+   re-point and the `AbortOnDrop` → `TaskAbortHandle` rename.
+
+   **RT-Linux track (separate from RTEMS, user-ordered 2026-07-21).**
+   Item 4 landed as `c065fe28` on the CA branch: SCHED_FIFO application is
+   now opt-in behind `EPICS_RS_ALLOW_RT_PRIORITY` (default **off**;
+   deliberately not C's `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`,
+   whose default is YES), the policy is a parameter of
+   `apply_to_current_thread_under` so "switch off ⟹ no scheduler call"
+   holds by call graph, the permitted FIFO range is probed once (C's
+   `find_pri_range`, `osdThread.c:259-334`), and `cbTimer` /
+   `CAS-client-blocking` / `CAS-event-blocking` now carry their C
+   priorities. Item 4b's evaluation is at **`doc/pi-lock-evaluation.md`** —
+   headline: 14 of the 25 shared locks are tokio primitives that no PI
+   mutex can reach (blocking threads wait in `std::thread::park()`,
+   invisible to the kernel's PI chain), and L1, the `dbScanLock` analogue,
+   holds that property *by contract* (`OwnedMutexGuard` across await) — the
+   design decision gating any hard-RT claim. On RTEMS `apply_priority_impl`
+   still returns `Unsupported` (`task.rs:715-719`); target-side priority
+   belongs with BSP bring-up (§10).
+
    Items 1/2/4 are **desktop-neutral** — they improve the hosted build too and
    can land before any RTEMS wiring. Item 4 alone deletes 6 tasks: today a
    single MONITOR on a db-backed PVA IOC costs 2–3 tasks because

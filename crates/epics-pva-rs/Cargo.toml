@@ -89,7 +89,15 @@ rc-hmac = { package = "hmac", version = "0.13", optional = true }
 x509-parser = { version = "0.16", optional = true }
 
 [features]
-default = ["tls", "pkcs12"]
+default = ["tls", "pkcs12", "client"]
+# The native PVA client — `client_native` (connection pool, UDP search
+# engine, per-operation tasks) plus the `client` re-export module,
+# `PvaServer::client_config()`, and the `pv*` command-line binaries. ON by
+# default. Turning it off leaves a server-only build (design doc §9 phase 6,
+# scope decision: a PVA *gateway* on RTEMS is out of scope, so the client is
+# gate-out territory). The wire decoder the server needs is NOT part of this
+# feature — it is the always-compiled `crate::decode`.
+client = []
 # TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
 # drops rustls/tokio-rustls/rustls-pemfile/x509-parser — and with them `ring`
 # and `getrandom 0.2`, the crate that does not build for RTEMS. With the
@@ -142,18 +150,47 @@ rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"
 
+# The `pv*` command-line tools ARE the native client, so they carry
+# `required-features = ["client"]` — with the feature off there is no client
+# for them to drive and cargo skips them. (Unlike a target that exists to be
+# a compile gate, skipping these cannot mask anything: the phase-6 RTEMS gate
+# is `--lib`.) `mshim-rs` is the exception — it is a UDP shim built on
+# `server_native::udp` and needs no client.
 [[bin]]
 name = "pvget-rs"
 path = "src/bin/pvget-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvput-rs"
 path = "src/bin/pvput-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvmonitor-rs"
 path = "src/bin/pvmonitor-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvinfo-rs"
 path = "src/bin/pvinfo-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvcall-rs"
+path = "src/bin/pvcall-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvlist-rs"
+path = "src/bin/pvlist-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvxvct-rs"
+path = "src/bin/pvxvct-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "mshim-rs"
+path = "src/bin/mshim-rs.rs"

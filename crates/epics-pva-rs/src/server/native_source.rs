@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::client_native::context::PvGetResult; // not used; kept for re-export hygiene
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::SourceRead;
@@ -1208,8 +1207,6 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 
 #[allow(unused_imports)]
 use crate::error::PvaError;
-#[allow(unused_imports)]
-type _Pvr = PvGetResult;
 
 #[cfg(test)]
 mod tests {

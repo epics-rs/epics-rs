@@ -93,8 +93,8 @@ impl ChannelStat {
     /// the header by 8 bytes per request, so no caller can pass the body
     /// length alone here.
     ///
-    /// [`Frame`]: crate::client_native::decode::Frame
-    pub(crate) fn add_op_rx(&self, frame: &crate::client_native::decode::Frame) {
+    /// [`Frame`]: crate::decode::Frame
+    pub(crate) fn add_op_rx(&self, frame: &crate::decode::Frame) {
         self.add_rx(crate::proto::PvaHeader::SIZE + frame.payload.len());
     }
 }

@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
+use crate::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
@@ -8341,7 +8341,7 @@ fn fixed_out_order(order: ByteOrder) -> Arc<std::sync::atomic::AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
+    use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
 
     /// a throwaway MONITOR-completion sender for `handle_op`
@@ -13787,7 +13787,7 @@ mod tests {
     /// probe-reply), and with `MustReply` it likewise carries the CID.
     #[tokio::test]
     async fn tcp_search_does_not_gate_on_advertised_protocol() {
-        use crate::client_native::decode::{decode_search_response, try_parse_frame};
+        use crate::decode::{decode_search_response, try_parse_frame};
         use crate::server_native::{SharedPV, SharedSource};
 
         let order = ByteOrder::Little;
@@ -18692,7 +18692,7 @@ mod tests {
     /// and fabricated a Variant type tree.
     #[tokio::test]
     async fn get_field_none_introspection_replies_error_no_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::server_native::SharedSource;
         use std::sync::Arc;
 
@@ -18763,7 +18763,7 @@ mod tests {
     /// error-path fix).
     #[tokio::test]
     async fn get_field_slow_path_returns_source_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
         use crate::server_native::SharedSource;
         use crate::server_native::shared_pv::SharedPV;

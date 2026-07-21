@@ -1,8 +1,20 @@
-//! Server-side PVA response decoder.
+//! PVA response decoder — frames and the server→client application
+//! messages.
 //!
 //! Reads bytes off the wire frame-by-frame, dispatching to the correct
-//! application-message decoder. Pure data — no I/O — so it's exhaustively
-//! unit-testable.
+//! application-message decoder. Pure data — no I/O, no sockets, no tokio —
+//! so it's exhaustively unit-testable.
+//!
+//! Lived under `client_native` until 2026-07-21. It is the *client's*
+//! decoder by direction (it parses what a server sends), but it is not
+//! client I/O: `server_native::tcp` frames its own reads with
+//! [`try_parse_frame_role`], `server_native::peers` accounts received frames
+//! with [`Frame`], and both server unit tests and the fuzz targets decode
+//! replies with it. Keeping it inside the client I/O modules meant a
+//! server-only build (design doc §9 phase 6, item 2) had to drag the whole
+//! client — search engine, connection pool, operation tasks — along for a
+//! pure codec. `client_native::decode` remains as a re-export so the
+//! existing public path keeps resolving.
 
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -369,7 +381,7 @@ pub enum OpResponse {
 /// and for tests that intentionally pre-seed a cache to exercise the
 /// marker path directly.
 ///
-/// [`flatten_type_cache_markers`]: crate::client_native::decode::flatten_type_cache_markers
+/// [`flatten_type_cache_markers`]: crate::decode::flatten_type_cache_markers
 pub fn decode_op_response(
     frame: &Frame,
     introspection: Option<&FieldDesc>,
@@ -402,7 +414,7 @@ pub fn decode_op_response(
 /// monitor loop — asks this instead of re-deriving "is there a body?", so the
 /// three cannot disagree about whether a final update exists.
 ///
-/// [`flatten_type_cache_markers`]: crate::client_native::decode::flatten_type_cache_markers
+/// [`flatten_type_cache_markers`]: crate::decode::flatten_type_cache_markers
 pub(crate) fn monitor_finish_body(
     payload: &[u8],
     order: ByteOrder,
@@ -1855,6 +1867,11 @@ mod tests {
 
     /// `stats(true)` resets `n_srv_squash` (and the other
     /// running counters) while preserving the configured `limit_queue`.
+    ///
+    /// The one test in this module that reaches into the client — the type
+    /// under test is the client's subscription counter — so it rides the
+    /// `client` feature while the decoder itself does not.
+    #[cfg(feature = "client")]
     #[test]
     fn stats_reset_clears_srv_squash_keeps_limit() {
         use crate::client_native::ops_v2::SubscriptionStat;

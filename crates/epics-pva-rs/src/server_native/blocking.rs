@@ -90,15 +90,28 @@
 //! number, and the seam function for why a plain `std::thread` is not enough
 //! on a hosted build.
 //!
+//! # Discovery
+//!
+//! [`BlockingPvaServer::serve_udp_search`] is the second loop, on its own
+//! thread at `PVA_UDP_PRIORITY`: one `std::net::UdpSocket`, a 200 ms read
+//! timeout as the stop seam, and [`super::search_engine`]'s decode driven
+//! through `block_on_sync`. It sends what the decode returns and decides
+//! nothing about the protocol itself, so its replies are byte-identical to the
+//! hosted responder's.
+//!
 //! # Not here
 //!
-//! The UDP SEARCH responder: discovery still needs one, and its socket-free
-//! core is currently quarantined inside the host-only [`super::udp`], so it
-//! begins with the same extraction [`super::search`] was.
+//! Beacons, the per-NIC send bundle, and the loopback-multicast ORIGIN_TAG
+//! forwarding channel: all three need the interface enumerator and the socket
+//! options that do not cross to RTEMS. A client that unicasts or broadcasts a
+//! SEARCH to this server's port is answered; one that relies on being told we
+//! exist is not, yet.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,6 +126,9 @@ use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
+use super::search_engine::{
+    Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
+};
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
@@ -142,6 +158,23 @@ use crate::error::{PvaError, PvaResult};
 /// what matter, so that bring-up is a scheduler change and not a hunt for
 /// every thread spawn.
 const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18);
+
+/// The EPICS priority the UDP SEARCH responder runs at — deliberately **not**
+/// [`PVA_SERVER_PRIORITY`].
+///
+/// pvxs runs its UDP collector on `PVXUDP` at
+/// `epicsThreadPriorityCAServerLow-4` (`pvxs/src/udp_collector.cpp:93`), two
+/// steps below the `PVXTCP` acceptor/reactor's `CAServerLow-2`
+/// (`pvxs/src/server.cpp:388`), where `epicsThreadPriorityCAServerLow = 20`
+/// (`epicsThread.h:82`) — so 16 against 18.
+///
+/// The gap is the point, not an accident of upstream's numbering: SEARCH is
+/// broadcast traffic from every client on the subnet, and an established
+/// connection's reads, writes and operations must not be starved by a search
+/// storm the server did not ask for. Unifying the two constants would silently
+/// remove that protection, so `the_udp_responder_runs_below_the_connection_threads`
+/// pins both numbers and their ordering.
+const PVA_UDP_PRIORITY: ThreadPriority = ThreadPriority::Custom(16);
 
 /// Depth of the reader → operation byte-chunk channel.
 ///
@@ -833,6 +866,16 @@ impl BlockingPvaServer {
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let tcp_port = listener.local_addr()?.port();
+        // One GUID per server, stamped here for the same reason the hosted
+        // runtime stamps it in `start()` (`runtime.rs:224-229`): the
+        // TCP-circuit SEARCH handler reads it out of its per-connection config
+        // copy while the UDP responder reads it from ours, and a client that
+        // discovers us over UDP and then connects must see one identity, not
+        // two. Stamping at construction is what makes that true by
+        // construction — there is no window in which a thread reads the
+        // caller's default zeros.
+        let mut config = config;
+        config.guid = random_guid();
         // Same wiring the hosted single-listener path does at
         // `accept.rs:69-70`: the source needs the handle to force-disconnect
         // downstream channels out of band.
@@ -862,6 +905,11 @@ impl BlockingPvaServer {
         self.tcp_port
     }
 
+    /// This server's GUID, as both SEARCH paths advertise it.
+    pub fn guid(&self) -> [u8; 12] {
+        self.config.guid
+    }
+
     /// Live per-connection accounting, for the server report (`pvxsr`).
     pub fn peers(&self) -> &Arc<PeerRegistry> {
         &self.peers
@@ -870,6 +918,27 @@ impl BlockingPvaServer {
     /// Connections currently being served.
     pub fn active_connections(&self) -> usize {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// Answer UDP SEARCHes on `socket` until [`shutdown`](Self::shutdown).
+    ///
+    /// Blocks the calling thread and takes it to `PVA_UDP_PRIORITY`, so give
+    /// it a thread of its own — a *different* one from [`serve`](Self::serve),
+    /// which runs higher.
+    ///
+    /// Bind the socket with [`bind_udp_search`] and pass it in, rather than
+    /// having this bind it: the same reason [`bind`](Self::bind) binds the
+    /// listener. The caller then knows the search port is owned before any
+    /// thread exists, and for an ephemeral port can read the number back off
+    /// the socket it still holds.
+    pub fn serve_udp_search(&self, socket: UdpSocket) -> PvaResult<()> {
+        handle_udp_search_blocking(
+            socket,
+            &self.source,
+            &self.config,
+            self.tcp_port,
+            &self.shutdown,
+        )
     }
 
     /// Accept until [`shutdown`](Self::shutdown).
@@ -956,7 +1025,8 @@ impl BlockingPvaServer {
         Ok(())
     }
 
-    /// Stop accepting, and end the connections already running. Idempotent.
+    /// Stop accepting, stop answering SEARCHes, and end the connections
+    /// already running. Idempotent.
     ///
     /// Two operations because there are two things to stop, and neither
     /// implies the other: the flag plus a self-connect returns the parked
@@ -964,6 +1034,10 @@ impl BlockingPvaServer {
     /// socket. Without the second, a peer that never speaks and never hangs up
     /// would hold three threads until the process exits — the semantic CA's
     /// blocking server still has, and the reason the registry exists.
+    ///
+    /// [`serve_udp_search`](Self::serve_udp_search) needs no third operation:
+    /// nothing parks it for longer than its 200 ms read timeout, so the flag
+    /// alone retires it within one tick.
     ///
     /// Returns once the wakes are issued; each connection retires on its own
     /// thread. Those threads are detached, so a caller that must observe them
@@ -977,15 +1051,219 @@ impl BlockingPvaServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UDP SEARCH responder (item 7 stage D)
+// ---------------------------------------------------------------------------
+
+/// How long a `recv_from` may park before the loop re-reads the shutdown flag.
+/// Not a protocol timeout: it exists only so a stopped server does not keep a
+/// thread until the next datagram happens to arrive. Same value and same role
+/// as CA's blocking responder (`epics-ca-rs` `server/blocking.rs`).
+const UDP_STOP_TICK: Duration = Duration::from_millis(200);
+
+/// 64 KB — the IPv4 maximum datagram, so a recv never truncates.
+const UDP_RECV_BUF: usize = 64 * 1024;
+
+/// Bind a blocking UDP SEARCH socket.
+///
+/// Raw `libc` for the socket options rather than `socket2`, because `socket2`
+/// is one of the three crates that do not cross to RTEMS (`mod.rs`) — the
+/// same reason CA's blocking driver hand-rolls its bind.
+///
+/// `SO_REUSEADDR` + `SO_REUSEPORT` are set **before** bind for a well-known
+/// port so several PVA processes can share the search port, which is what
+/// pvxs does (`epicsSocketEnableAddressUseForDatagramFanout`, and see
+/// `udp_collector.cpp:140-151` for why the bind is wildcard rather than to the
+/// multicast address). An **ephemeral** port (`0`) is deliberately left bare:
+/// with the flags on, the kernel may join this socket to an unrelated reuse
+/// group and load-balance SEARCHes away from it — and because reuse means a
+/// collision does *not* fail, there would be no error to detect afterwards.
+/// [[pva-udp-port-sharing-is-silent]]
+pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    bind_udp_search_socket(addr)
+}
+
+#[cfg(unix)]
+fn set_reuse_opt(fd: std::os::fd::RawFd, opt: libc::c_int) -> io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a valid open socket; `one` outlives the call; the size
+    // matches a `c_int` option value.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `socket()` returns a fresh owned fd or -1.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Take ownership immediately so every early return closes the fd via Drop.
+    // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned above.
+    let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+    if addr.port() != 0 {
+        set_reuse_opt(fd, libc::SO_REUSEADDR)?;
+        set_reuse_opt(fd, libc::SO_REUSEPORT)?;
+    }
+    // Build sockaddr_in via zeroed to avoid touching platform-specific fields
+    // (`sin_len`/`sin_zero`); s_addr and sin_port are network byte order.
+    // SAFETY: `sockaddr_in` is a plain-old-data C struct; all-zero is a valid
+    // initial value.
+    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+    sin.sin_port = addr.port().to_be();
+    sin.sin_addr = libc::in_addr {
+        s_addr: u32::from(*addr.ip()).to_be(),
+    };
+    // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is exact.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket)
+}
+
+#[cfg(not(unix))]
+fn bind_udp_search_socket(addr: SocketAddrV4) -> io::Result<UdpSocket> {
+    // Non-Unix host: plain bind with no pre-bind reuse. RTEMS is Unix-family,
+    // so the arm above is the one that matters for the target.
+    UdpSocket::bind(addr)
+}
+
+/// Answer UDP SEARCHes on one socket until `shutdown` is set.
+///
+/// The decode is [`process_search_datagram`] — the same function the hosted
+/// responder drives, moved onto neutral ground by stage D part 1 — so replies
+/// are byte-identical between the two drivers, including the
+/// `MustReply`-with-no-matches reply that lets `pvlist` see this server at all.
+/// This loop owns only the socket: recv, filter, decode, send.
+///
+/// Three arguments the hosted responder computes per NIC are fixed here, and
+/// each is a *structural* consequence of having one wildcard socket and no
+/// interface enumerator, not a simplification:
+///
+/// * `reply_iface_ip = UNSPECIFIED` — there is no per-NIC bundle to pin a
+///   reply to, so the decode resolves `iface_hint` to `None` and the OS routes.
+/// * `origin = Direct` — datagrams arrive on the search socket itself, never
+///   peeled out of an ORIGIN_TAG prefix.
+/// * `origin_tag_forwarding = false` — no loopback multicast socket is bound,
+///   so no forward can be emitted.
+fn handle_udp_search_blocking(
+    socket: UdpSocket,
+    source: &DynSource,
+    config: &PvaServerConfig,
+    tcp_port: u16,
+    shutdown: &AtomicBool,
+) -> PvaResult<()> {
+    socket
+        .set_read_timeout(Some(UDP_STOP_TICK))
+        .map_err(PvaError::Io)?;
+    let _ = apply_to_current_thread(PVA_UDP_PRIORITY);
+    let mut buf = vec![0u8; UDP_RECV_BUF];
+
+    while !shutdown.load(Ordering::Acquire) {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            // The stop tick fired; nothing arrived. Re-check the flag.
+            Err(ref e) if is_socket_timeout(e.kind()) => continue,
+            // Every other recv error is logged and skipped, with no
+            // classification — byte-for-byte the hosted responder's rule
+            // (`udp.rs`, `Err(e) => { debug!("udp recv error: {e}"); continue; }`).
+            // A datagram socket's errors describe a *peer*, not us: an earlier
+            // reply drawing an ICMP port-unreachable surfaces here as
+            // ECONNREFUSED long after that peer is gone. Ending the loop on one
+            // would let any client kill this server's discovery by closing its
+            // port at the right moment, and would make the two drivers disagree
+            // about what a recv error means.
+            Err(e) => {
+                debug!(error = %e, "blocking UDP responder: recv error");
+                continue;
+            }
+        };
+        if !filter_inbound(src, &config.ignore_addrs) {
+            continue;
+        }
+
+        // The decode's only suspension point is the source name lookup. On
+        // RTEMS `block_on_sync` parks this thread; on a host test it does the
+        // same, since this loop owns its thread outright.
+        let outputs = match block_on_sync(process_search_datagram(
+            source,
+            false,
+            config.udp_port,
+            &buf[..len],
+            src,
+            Ipv4Addr::UNSPECIFIED,
+            Origin::Direct,
+            tcp_port,
+            config.guid,
+            "tcp",
+        )) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(PvaError::Protocol(
+                    "blocking UDP responder: decode future not blockable in this thread context"
+                        .into(),
+                ));
+            }
+        };
+
+        for out in outputs {
+            match out {
+                SearchOutput::Reply { dest, bytes, .. } => {
+                    // `iface_hint` is `None` by construction here (see the
+                    // `reply_iface_ip` note above), so there is no NIC to pin
+                    // and nothing to branch on.
+                    if let Err(e) = socket.send_to(&bytes, dest) {
+                        debug!(%dest, error = %e, "blocking UDP SEARCH reply send failed");
+                    }
+                }
+                // Unreachable while `origin_tag_forwarding` is false, which
+                // this responder passes unconditionally. Logged rather than
+                // silently dropped, as the hosted dispatcher does for its own
+                // unreachable arm.
+                SearchOutput::OriginTagForward { dest, .. } => {
+                    warn!(%dest, "blocking UDP responder produced an ORIGIN_TAG forward with no loopback multicast socket bound");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ByteOrder, Command, PvaHeader, ReadExt, WriteExt, encode_string_into};
+    use crate::codec::PvaCodec;
+    use crate::proto::{
+        ByteOrder, Command, PvaHeader, ReadExt, WriteExt, encode_string_into, ip_from_bytes,
+        ip_to_bytes,
+    };
     use crate::pvdata::encode::encode_type_desc;
     use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::search::build_search_response_proto;
     use crate::server_native::{SharedPV, SharedSource};
     use std::io::Cursor;
-    use std::net::Ipv4Addr;
+    use std::net::IpAddr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use tokio::io::AsyncReadExt;
@@ -2174,5 +2452,340 @@ mod tests {
         });
 
         stop_and_join(&server, accept);
+    }
+
+    // -----------------------------------------------------------------------
+    // UDP SEARCH responder (item 7 stage D)
+    // -----------------------------------------------------------------------
+
+    /// A SEARCH requester: its own UDP socket, and the two frames a real
+    /// client sends — a named search and a `pvlist` discovery probe.
+    struct SearchClient(UdpSocket);
+
+    impl SearchClient {
+        fn new() -> SearchClient {
+            let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("requester bind");
+            sock.set_read_timeout(Some(RETIRE_BOUND))
+                .expect("requester read timeout");
+            SearchClient(sock)
+        }
+
+        fn port(&self) -> u16 {
+            self.0.local_addr().expect("requester addr").port()
+        }
+
+        fn send(&self, frame: &[u8], to: SocketAddr) {
+            self.0.send_to(frame, to).expect("requester send");
+        }
+
+        fn recv(&self) -> Vec<u8> {
+            let mut buf = [0u8; 1500];
+            let (n, _) = self.0.recv_from(&mut buf).expect("SEARCH_RESPONSE");
+            buf[..n].to_vec()
+        }
+
+        /// No reply within `RETIRE_BOUND`, distinguished from a socket error.
+        fn expect_silence(&self) {
+            let mut buf = [0u8; 1500];
+            match self.0.recv_from(&mut buf) {
+                Ok((n, from)) => panic!("expected no reply, got {n} bytes from {from}"),
+                Err(e) if is_socket_timeout(e.kind()) => {}
+                Err(e) => panic!("requester recv failed: {e}"),
+            }
+        }
+    }
+
+    /// Bind a search socket, start the responder on its own thread, and hand
+    /// back the address a requester sends to. The responder thread goes
+    /// through the same seam the accept thread does, for the same reason.
+    #[allow(clippy::type_complexity)]
+    fn start_udp_responder(
+        config: PvaServerConfig,
+    ) -> (
+        Arc<BlockingPvaServer>,
+        SocketAddr,
+        thread::JoinHandle<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let (server, accept) = start_server(config);
+        let socket = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind the blocking search socket");
+        let search_addr = socket.local_addr().expect("search addr");
+        let responding = server.clone();
+        let udp = spawn_dedicated_thread("test-PVAS-udp".into(), PVA_UDP_PRIORITY, move || {
+            responding.serve_udp_search(socket).expect("UDP responder");
+        })
+        .expect("UDP responder thread spawned");
+        (server, search_addr, accept, udp)
+    }
+
+    fn stop_all(
+        server: &BlockingPvaServer,
+        accept: thread::JoinHandle<()>,
+        udp: thread::JoinHandle<()>,
+    ) {
+        server.shutdown();
+        eventually("shutdown returns the UDP responder", || udp.is_finished());
+        udp.join().expect("UDP thread joined");
+        stop_and_join(server, accept);
+    }
+
+    /// pvxs deliberately runs discovery *below* the connections it serves:
+    /// `PVXUDP` is `epicsThreadPriorityCAServerLow-4`
+    /// (`udp_collector.cpp:93`), `PVXTCP` is `CAServerLow-2`
+    /// (`server.cpp:388`). Both numbers are pinned, and so is the ordering —
+    /// an edit that unifies the two constants (the natural "simplification")
+    /// removes the protection an established connection has against a SEARCH
+    /// storm, and must fail here rather than in the field.
+    #[test]
+    fn the_udp_responder_runs_below_the_connection_threads() {
+        assert_eq!(
+            PVA_UDP_PRIORITY.value(),
+            ThreadPriority::CaServerLow.value() - 4,
+            "pvxs runs its UDP search collector at CAServerLow-4"
+        );
+        assert_eq!(PVA_UDP_PRIORITY.value(), 16);
+        assert!(
+            PVA_UDP_PRIORITY.value() < PVA_SERVER_PRIORITY.value(),
+            "SEARCH traffic must never be able to starve an established connection"
+        );
+    }
+
+    /// Both loops take their priority at the top of the thread they run on,
+    /// and there are exactly two such loops. A third `apply_to_current_thread`
+    /// would mean a loop nobody assigned a number to, or a number assigned
+    /// twice.
+    #[test]
+    fn both_serve_loops_take_their_priority_at_the_top() {
+        let prod = production_scope(include_str!("blocking.rs"));
+        assert_eq!(
+            prod.matches("apply_to_current_thread(").count(),
+            2,
+            "the accept loop and the UDP responder, each on the thread it blocks"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(PVA_SERVER_PRIORITY)")
+                .count(),
+            1,
+            "the accept loop runs at 18"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(PVA_UDP_PRIORITY)")
+                .count(),
+            1,
+            "the UDP responder runs at 16"
+        );
+    }
+
+    /// The whole point of the stage: a client that does not know the TCP port
+    /// can find it. And the reply must be the bytes the *hosted* responder
+    /// would have produced — the extraction in part 1 is what makes that a
+    /// consequence rather than a coincidence, so the golden is built from the
+    /// same shared wire builder.
+    #[test]
+    fn a_udp_search_is_answered_with_the_hosted_response_bytes() {
+        let (server, search_addr, accept, udp) = start_udp_responder(isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+
+        let frame = codec.build_search(7, 42, "dut", [127, 0, 0, 1], client.port(), false);
+        client.send(&frame, search_addr);
+        let reply = client.recv();
+
+        let golden = build_search_response_proto(
+            server.guid(),
+            7,
+            server.tcp_port(),
+            &[42],
+            ByteOrder::Little,
+            "tcp",
+        );
+        assert_eq!(
+            reply, golden,
+            "the blocking responder must emit the same SEARCH_RESPONSE bytes as the hosted one"
+        );
+
+        stop_all(&server, accept, udp);
+    }
+
+    /// The SEARCH reply advertises the server address as the **unspecified**
+    /// sentinel (v4-mapped `0.0.0.0`), never a concrete local address, and the
+    /// client uses the UDP source address instead.
+    ///
+    /// This is not cosmetic. It is what makes a NAT'd guest reachable: under
+    /// QEMU `hostfwd` the guest's own interface address is meaningless on the
+    /// host, so a responder that helpfully substituted its local IP would send
+    /// every client to an address that does not route — and the failure would
+    /// look like "the server never answered", not like a wrong byte. Pinned
+    /// here rather than left to a comment on `build_search_response_proto`.
+    #[test]
+    fn the_search_reply_advertises_the_unspecified_server_address() {
+        let (server, search_addr, accept, udp) = start_udp_responder(isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+
+        client.send(
+            &codec.build_search(1, 5, "dut", [127, 0, 0, 1], client.port(), false),
+            search_addr,
+        );
+        let reply = client.recv();
+
+        // SEARCH_RESPONSE payload: guid[12], seq[4], addr[16], port[2], ...
+        let addr_off = PvaHeader::SIZE + 12 + 4;
+        let addr = &reply[addr_off..addr_off + 16];
+        assert_eq!(
+            addr,
+            &ip_to_bytes(IpAddr::V4(Ipv4Addr::UNSPECIFIED))[..],
+            "the reply must carry the unspecified sentinel, not this host's address"
+        );
+        assert_eq!(
+            ip_from_bytes(&addr.try_into().expect("16 bytes")),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            "and it must decode as unspecified, so the client falls back to the UDP source"
+        );
+
+        stop_all(&server, accept, udp);
+    }
+
+    /// `pvlist` discovery: an empty protocol list matches nothing, so `found`
+    /// is 0 — but the `MustReply` bit still obliges a reply, and without it
+    /// this server is invisible to discovery even though it serves PVs.
+    #[test]
+    fn a_must_reply_discovery_probe_is_answered_with_found_zero() {
+        let (server, search_addr, accept, udp) = start_udp_responder(isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+
+        client.send(&codec.build_discover_search(9, client.port()), search_addr);
+        let reply = client.recv();
+
+        let golden = build_search_response_proto(
+            server.guid(),
+            9,
+            server.tcp_port(),
+            &[],
+            ByteOrder::Little,
+            "tcp",
+        );
+        assert_eq!(reply, golden, "a MustReply probe must be answered");
+        // found byte: guid[12] seq[4] addr[16] port[2] + "tcp" as a size-
+        // prefixed string (1 + 3).
+        let found_off = PvaHeader::SIZE + 12 + 4 + 16 + 2 + 4;
+        assert_eq!(reply[found_off], 0, "no names matched, so found = 0");
+
+        stop_all(&server, accept, udp);
+    }
+
+    /// `ignore_addrs` is consulted on the UDP path and only there (pvxs
+    /// `server.cpp:654-670` vs `serverconn.cpp:461-467`): a noisy host's
+    /// discovery traffic is dropped while its direct TCP clients still
+    /// connect. The blocking responder must apply the same filter, so a
+    /// gateway config that suppresses a peer is not silently ignored on RTEMS.
+    #[test]
+    fn an_ignored_peer_gets_no_search_reply() {
+        let client = SearchClient::new();
+        let config = PvaServerConfig {
+            ignore_addrs: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), client.port())],
+            ..isolated_config()
+        };
+        let (server, search_addr, accept, udp) = start_udp_responder(config);
+        let codec = PvaCodec { big_endian: false };
+
+        client.send(
+            &codec.build_search(3, 11, "dut", [127, 0, 0, 1], client.port(), false),
+            search_addr,
+        );
+        client.expect_silence();
+
+        stop_all(&server, accept, udp);
+    }
+
+    /// One server, one identity. `bind` stamps the GUID so the UDP responder
+    /// and the TCP-circuit SEARCH handler read the same field — a client that
+    /// discovers this server over UDP and then connects must not be told it
+    /// found two different servers.
+    #[test]
+    fn both_search_paths_advertise_one_guid() {
+        let (server, search_addr, accept, udp) = start_udp_responder(isolated_config());
+        let client = SearchClient::new();
+        let codec = PvaCodec { big_endian: false };
+
+        assert_ne!(
+            server.guid(),
+            [0u8; 12],
+            "bind must stamp a GUID, not leave the config default"
+        );
+
+        client.send(
+            &codec.build_search(2, 8, "dut", [127, 0, 0, 1], client.port(), false),
+            search_addr,
+        );
+        let reply = client.recv();
+        assert_eq!(
+            &reply[PvaHeader::SIZE..PvaHeader::SIZE + 12],
+            &server.guid()[..],
+            "the UDP reply must carry the same GUID the TCP-circuit handler reads from the config"
+        );
+
+        stop_all(&server, accept, udp);
+    }
+
+    /// The stop seam. Nothing wakes the responder — it is parked in
+    /// `recv_from` — so the read timeout is the only thing that returns it to
+    /// the flag. A regression that drops or lengthens the timeout leaves a
+    /// thread alive after `shutdown`, and this is where that surfaces.
+    ///
+    /// Both durations below are absolute, deliberately **not** expressed in
+    /// [`UDP_STOP_TICK`]. Written as `UDP_STOP_TICK * 2` the settle sleep moves
+    /// with the constant under test, so lengthening the tick to 30 s lands the
+    /// shutdown exactly on a timeout boundary and the test still passes — it
+    /// pins the loop's shape but not its latency. Absolute numbers make the
+    /// mutation visible.
+    #[test]
+    fn shutdown_retires_the_udp_responder_without_a_datagram() {
+        /// Long enough that the responder is provably parked mid-`recv_from`,
+        /// short enough to be nowhere near a lengthened tick's boundary.
+        const SETTLE: Duration = Duration::from_millis(500);
+        /// Generous against scheduler noise, still an order of magnitude below
+        /// any tick a regression would plausibly introduce.
+        const RETIRE_WITHIN: Duration = Duration::from_secs(2);
+
+        let (server, _search_addr, accept, udp) = start_udp_responder(isolated_config());
+        // Deliberately send nothing: the loop must be parked in `recv_from`,
+        // not returning through the top on its own.
+        thread::sleep(SETTLE);
+        assert!(!udp.is_finished(), "the responder must still be running");
+
+        let t0 = Instant::now();
+        server.shutdown();
+        eventually("shutdown returns the parked UDP responder", || {
+            udp.is_finished()
+        });
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < RETIRE_WITHIN,
+            "the responder must retire within one stop tick, not on the next datagram \
+             (took {elapsed:?})"
+        );
+        udp.join().expect("UDP thread joined");
+        stop_and_join(&server, accept);
+    }
+
+    /// An ephemeral search port is bound *bare* — no `SO_REUSEADDR`/
+    /// `SO_REUSEPORT` — so a second bind on that number fails loudly instead
+    /// of silently joining a reuse group and load-balancing SEARCHes away.
+    /// [[pva-udp-port-sharing-is-silent]] is exactly the failure this rule
+    /// prevents: with the flags on there is no error to detect afterwards.
+    #[test]
+    fn an_ephemeral_search_port_is_not_silently_shared() {
+        let first = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("first bind");
+        let port = first.local_addr().expect("addr").port();
+        assert_ne!(port, 0, "an ephemeral bind resolves the port");
+
+        let second = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        assert!(
+            second.is_err(),
+            "a second bind on an ephemeral port must fail, not silently share it"
+        );
     }
 }

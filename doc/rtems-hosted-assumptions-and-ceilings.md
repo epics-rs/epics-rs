@@ -1,5 +1,31 @@
 # Unguarded hosted assumptions, and the static-configuration ceiling
 
+> **CORRECTION (2026-07-22, after `b594b18a`).** §B.3's parity premise is
+> **wrong** and the projection built on it is wrong with it. This document says
+> *"`epicsThreadStackSmall` is what C `rsrv` uses for its per-client tasks, so
+> this is also the parity answer"*. Read from the C source: the per-client
+> `CAS-client` task uses **`epicsThreadStackBig`** (`caservertask.c:109-111`);
+> `epicsThreadStackSmall` is what **`CAS-beacon`** uses
+> (`caservertask.c:758-760`). Small would have been 4× *cheaper* than parity,
+> not equal to it.
+>
+> Which C table governs also had to be established rather than assumed: RTEMS 6
+> sets `OS_API = posix`, and `osdThread.c` exists only under `os/posix` and
+> `os/RTEMS-score`, so the **POSIX** size table applies — not RTEMS-score's
+> 5000/8000/11000 bytes.
+>
+> Consequence for §B.3's table: the ceiling after the fix is **~17 CA clients /
+> ~17 PVA connections**, not the ~44 / ~29 projected here. That is still 3.4×
+> and 5.7× better than the ~5 / ~3 measured before, and descriptors (~140)
+> remain ~8× further out, so **the ranking and the remedy in §B.3 both stand** —
+> only the projected magnitude was too optimistic.
+>
+> Everything else in this document was re-verified and holds. The correction is
+> recorded here rather than edited into §B.3 because the reasoning that produced
+> the wrong number is worth seeing: the audit inferred the parity class from the
+> *name* `epicsThreadStackSmall` matching "small per-client thread" instead of
+> reading which task actually passes it.
+
 **Measured at** integration worktree
 `/home/stevek/work/epics-rs/.caucus/worktrees/integration`, HEAD
 **`684e550878afa284884eaefa6a3d9064e7733976`** (`684e5508`, *"feat(rtems): the

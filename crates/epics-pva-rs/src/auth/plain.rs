@@ -50,7 +50,7 @@ pub fn authnz_default_user() -> String {
 /// give up (keeping just `basegid`) on an invalid or decreasing count. A
 /// single grow-and-retry loses the Darwin case for any account in more
 /// groups than the initial guess, silently dropping its extra roles.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "rtems")))]
 fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gid_t> {
     // Darwin binds the groups pointer as `*mut c_int`, Linux as
     // `*mut gid_t` (u32); use a raw `c_int` buffer and cast on the way
@@ -92,6 +92,17 @@ fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gi
         }
     }
     gids
+}
+
+/// RTEMS is `cfg(unix)` but its newlib has no `getgrouplist(3)` — there is
+/// no supplementary-group database behind it to enumerate. The account's
+/// passwd primary group is still resolvable (`getpwuid`/`getgrgid` do
+/// exist), so the answer is the primary group and nothing else. That is
+/// the same conservative result the hosted loop above falls back to when
+/// the kernel reports an unusable count, not an invented one.
+#[cfg(all(unix, target_os = "rtems"))]
+fn getgrouplist_ids(_name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gid_t> {
+    vec![basegid]
 }
 
 /// Enumerate the current process's POSIX group names. Mirrors pvxs

@@ -462,7 +462,7 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d | ✅ `24d514e8` |
    | 3 | *(renumbered into §8.1.2)* dep walls: socket2/if-addrs/tokio split/getgrouplist | — | ✅ `bc7c8f53`..`1906c7cb` |
    | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ 1–2 wk | ✅ `aeb41927`, `bbd74e6f`, `72239333` |
-   | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** | blocked on CA-branch merge |
+   | 5 | **reader/operation/writer split** — design settled 2026-07-21, see `doc/pva-rtems-item5-design.md` | ~~2–3 wk~~ **3–4.5 wk** | blocked on CA-branch merge; **shape revised**: NO op-future boxing (the boxing answered the worker-per-future defect that `d704087d` deleted — ops become 11 `runtime::task::spawn` swaps); reader hands **bytes not frames** via a new `SrvRead` implementor (TypeCache invariant holds in place, now at `tcp.rs:3418-3428`); writer = thread with a deadline loop over `write()` (SO_SNDTIMEO alone is per-syscall, strictly weaker than the per-frame bound `tcp.rs:3262-3273` documents); shutdown owner = operation thread, needs an explicit socket registry + `shutdown(Both)` because PVA's ~64,000 s `op_timeout` (`:3488`) cannot double as the wake mechanism the way CA's 45 s one does. 5 stages, each workspace-green; 3 decisions flagged before stage 3, one needing user sign-off (a `oneshot` writer-death arm that also speeds *hosted* teardown) |
    | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d | ✅ `f0ca0909`, `e278088c` — both per-connection helper tasks folded into the read loop's select; two structural collapses came free (`last_rx` Arc→local, watch receiver clone gone). Same shape remains in the PVA *client* (`client_native/server_conn.rs:634-679`) — out of scope by the server-only decision, named not forgotten |
    | 7 | Blocking accept/UDP/beacon threads + raw-libc ifconf/setsockopt subset | 1 wk | open |
    | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d | blocked on CA-branch merge |
@@ -593,17 +593,24 @@ These were reasoned from source/library presence, **not** compiled:
   task, heartbeat and gate driver are select arms, not tasks). The budget
   still needs measuring, but the per-connection multiplier is now bounded by
   design rather than by workload.
-- **New (open): the `rtems-exec-model` feature-ON full `epics-ca-rs` suite is
-  red** (baseline 615 pass / 63 fail / 13 timeout before the cooperative
-  executor; 618/73/0 after — the timeouts were the starvation ceiling).
-  Dominant signature: the **async client**'s transport
-  (`client/transport.rs:1318`, `:1525`) panicking "there is no reactor
-  running" on `cbMedium` — client tokio-net work landing on callback-pool
-  workers, which is exactly what the feature routes it to. The feature was
-  built for targeted server-side tests; making feature-ON a usable full gate
-  means cfg-gating the async-client test modules under the feature (the
-  `server_connection_drop_tests` module already set the precedent). Follow-up
-  on the CA branch.
+- ~~The `rtems-exec-model` feature-ON full `epics-ca-rs` suite is red.~~
+  **CLOSED 2026-07-21 (`aea5d73d`): the suite is now a usable gate — 569
+  tests, exit 0 on four consecutive runs** (three by the implementer, one by
+  the verifier). Classification, not blanket gating: 25 modules/files gated
+  with why-comments (the CLI subprocess suites, the in-process async stack,
+  and per-test gates preserving the 13 pure wire-format tests in mixed files);
+  the red population was dominated by the async **server**
+  (`server/tcp.rs:1336`, `server/udp.rs:771`, `server/ca_server.rs:1099`),
+  not the client as first assumed — same cause, same rule. One category-(b)
+  genuine bug found and fixed at source rather than gated:
+  `event_watcher_tests` raced a `yield_now` spin against band workers with no
+  happens-before edge (13/20 failures on the OLD executor — the race predated
+  the rewrite). Remaining gaps, open: (1) `blocking_rtems_e2e` had to be gated
+  because its *client* half is async — `async_write_notify_rtems_exec` is the
+  feature's only e2e until a blocking-client e2e exists; (2) the `interop`
+  profile under the feature is unmeasured; (3) the gate is convention, not
+  mechanically enforced — a new async-stack test can silently re-redden the
+  suite.
 - The CA deep-cut estimate depends on how many of the ~226 `snapshot()`/`set()`
   call-sites are already outside an async context (auto-reconciled by de-async)
   vs. need rewriting — not yet classified per-file.

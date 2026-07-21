@@ -59,11 +59,17 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 
-# Linux-only: `SO_RXQ_OVFL` setsockopt + `recvmsg`/cmsg parsing for
-# UDP RX overflow detection (`net::async_udp_v4::recv_from_with_drop_count`).
-# Cargo `target.'cfg(target_os = "linux")'` only links libc on Linux —
-# macOS / Windows builds skip it entirely.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Every unix: `runtime::time::thread_sleep_quantum` asks the OS for the clock
+# tick rate via `sysconf(_SC_CLK_TCK)` rather than restating it as a Rust
+# constant — on RTEMS that call resolves to the tick period configured in
+# `epics-rtems-boot`, so the C `#define` stays the single source of truth.
+#
+# Linux-only *uses* remain gated at their call sites (`SO_RXQ_OVFL` setsockopt
+# and `recvmsg`/cmsg parsing in `net::async_udp_v4`, `getifaddrs` in
+# `net::iface_map`, `SCHED_FIFO` in `runtime::task`, `PTHREAD_PRIO_INHERIT` in
+# `runtime::sync`); this gate governs only whether libc is linked at all.
+# Windows still skips it entirely.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Dev-only — `path` (no `version`) so `cargo publish` strips this

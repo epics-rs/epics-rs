@@ -39,6 +39,14 @@ extern void *POSIX_Init(void *argument);
  * the build so a timing experiment needs no source edit. This 10 ms quantum is
  * what `std::thread::sleep`, the delayed-timer band and every latency number
  * the acceptance ladder can produce are rounded to.
+ *
+ * This define is the SINGLE SOURCE OF TRUTH for the tick rate, including on the
+ * Rust side: `epics_base_rs::runtime::time::thread_sleep_quantum` reads it back
+ * through `sysconf(_SC_CLK_TCK)` -> `rtems_clock_get_ticks_per_second()` ->
+ * `_Watchdog_Ticks_per_second` = `1000000 / CONFIGURE_MICROSECONDS_PER_TICK`,
+ * so overriding it here moves record DLY quantization with it. Do not restate
+ * this number as a constant anywhere in Rust — a guard test in that module
+ * fails if anyone does.
  */
 #ifndef CONFIGURE_MICROSECONDS_PER_TICK
 #define CONFIGURE_MICROSECONDS_PER_TICK 10000

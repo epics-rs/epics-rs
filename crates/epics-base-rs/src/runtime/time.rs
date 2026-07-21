@@ -34,19 +34,46 @@ pub fn deadline_from_now(d: Duration) -> Instant {
 /// ```
 ///
 /// Records use it to round a delay field to a whole number of ticks — e.g.
-/// `sseqRecord.c:197-200` quantizes every `DLYn` at init. `_SC_CLK_TCK` is 100
-/// on Linux and macOS, hence the 0.01 s fallback on the targets where `libc`
-/// is not linked (it is a Linux-only dependency of this crate). Returns 0.0
-/// when the tick rate is unavailable, exactly as C does; callers must treat
-/// that as "no quantization" rather than dividing by it.
+/// `sseqRecord.c:197-200` quantizes every `DLYn` at init. Returns 0.0 when the
+/// tick rate is unavailable, exactly as C does; callers must treat that as "no
+/// quantization" rather than dividing by it.
+///
+/// # Why this asks instead of stating
+///
+/// The tick rate is not ours to declare. On RTEMS it is set by
+/// `CONFIGURE_MICROSECONDS_PER_TICK` in `epics-rtems-boot`'s
+/// `csrc/rtems_config.c`, which is deliberately `#ifndef`-overridable from the
+/// build so a timing experiment needs no source edit. A Rust constant here
+/// would be a second copy of that number, silently wrong the first time
+/// anyone overrides it — with nothing checking the two agree.
+///
+/// So the unix arm asks, and the answer comes from the same define:
+///
+/// ```text
+/// sysconf(_SC_CLK_TCK)
+///   -> rtems_clock_get_ticks_per_second()      cpukit/posix/src/sysconf.c:60-61
+///   -> _Watchdog_Ticks_per_second              rtems/rtems/clock.h:871
+///    = 1000000 / CONFIGURE_MICROSECONDS_PER_TICK   confdefs/clock.h:100-101
+/// ```
+///
+/// This is also what C itself does on RTEMS — `RTEMS-score/osdThread.c:860-865`
+/// returns `1.0 / rtemsTicksPerSecond_double` rather than a constant — so the
+/// port matches C's behaviour on the target, not just on posix.
+///
+/// The non-unix (Windows) arm keeps a constant. `_SC_CLK_TCK` is 100 on Linux
+/// and macOS, and 100 Hz is the historical default this port shipped; it
+/// restates no `#define` of ours. It is *not* C parity: `WIN32/osdThread.c:906-932`
+/// asks `GetSystemTimeAdjustment` and returns 0.0 on failure. Closing that gap
+/// needs a Windows syscall dependency this crate does not have, and is a
+/// separate change from the RTEMS one.
 pub fn thread_sleep_quantum() -> f64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         // SAFETY: `sysconf` is a pure query with no preconditions.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
         if hz <= 0.0 { 0.0 } else { 1.0 / hz }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         0.01
     }
@@ -118,6 +145,69 @@ fn c_long_cast(f: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything before the first column-0 `#[cfg(test)]` — the code that
+    /// actually ships. Same helper as `epics-pva-rs`'s source guards.
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The tick rate must be ASKED for, never restated.
+    ///
+    /// `CONFIGURE_MICROSECONDS_PER_TICK` in `epics-rtems-boot`'s
+    /// `csrc/rtems_config.c` owns the number, and it is `#ifndef`-overridable
+    /// from the build. A Rust constant restating it is a second source of
+    /// truth that goes silently wrong the first time anyone overrides it.
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn the_tick_rate_is_asked_for_not_restated() {
+        // Comment lines are stripped: the doc above `thread_sleep_quantum`
+        // spells out `1000000 / CONFIGURE_MICROSECONDS_PER_TICK` to explain
+        // the chain, and that text must not read as a restatement.
+        let src: String = production_scope(include_str!("time.rs"))
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let src = src.as_str();
+
+        assert!(
+            src.contains("libc::sysconf(libc::_SC_CLK_TCK)"),
+            "thread_sleep_quantum must ask the OS for the tick rate"
+        );
+
+        // The defect this replaced: asking only on Linux, and handing every
+        // other unix — RTEMS included — a constant.
+        assert!(
+            !src.contains("#[cfg(target_os = \"linux\")]"),
+            "the tick-rate arm must select on `unix`, not on `linux`: RTEMS is \
+             a unix that answers _SC_CLK_TCK from the boot crate's define"
+        );
+        assert_eq!(
+            src.matches("#[cfg(unix)]").count(),
+            1,
+            "exactly one arm asks; if a second appears, this guard needs updating"
+        );
+
+        // 10 ms expressed any of the ways someone would naturally write it.
+        // The sole surviving literal is the documented Windows arm.
+        assert_eq!(
+            src.matches("0.01").count(),
+            1,
+            "0.01 may appear only once, in the non-unix arm"
+        );
+        for restatement in ["10000", "10_000", "0.010", "1e-2"] {
+            assert!(
+                !src.contains(restatement),
+                "`{restatement}` restates CONFIGURE_MICROSECONDS_PER_TICK; \
+                 read it back through sysconf instead"
+            );
+        }
+    }
 
     #[test]
     fn test_now_wall() {

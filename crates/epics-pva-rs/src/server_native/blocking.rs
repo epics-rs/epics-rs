@@ -43,12 +43,51 @@
 //! hosted behaviour is unchanged — and the reader/writer threads and both
 //! adapters are exercised for real either way.
 //!
+//! # Shutdown: one wake primitive, three triggers
+//!
+//! A thread cannot be aborted the way the hosted accept loop aborts a task in
+//! its `JoinSet`, and PVA's `op_timeout` defaults to ~64,000 s so `SO_RCVTIMEO`
+//! cannot stand in either (§1.6, §4.2c). So there is exactly one way a parked
+//! connection thread is woken here — `ConnWake::wake`, i.e.
+//! `shutdown(Shutdown::Both)` on that connection's socket — and all three
+//! termination triggers go through it:
+//!
+//! | trigger | who wakes | the loop then sees |
+//! |---|---|---|
+//! | client EOF / read error (§4.2a) | nobody — the reader already returned | `Protocol("client closed")` |
+//! | writer death: write error or send deadline (§4.2b) | the writer thread, on its way out | `Protocol("client closed")` |
+//! | server stop (§4.2c) | [`ConnRegistry::stop`], walking every live connection | `Protocol("client closed")` |
+//!
+//! [`ConnRegistry`] is that primitive's **single owner**, and the invariant it
+//! enforces is:
+//!
+//! > **MUST** every connection served here is registered before either of its
+//! > threads starts and stays registered until both have joined.
+//! > **MUST NOT** any path shut a connection's socket down, or take it out of
+//! > the registry, other than through a handle the registry issued — a
+//! > `ConnWake`, which only `ConnRegistry::register` can construct, or the
+//! > registration guard, whose `Drop` is the only remover.
+//!
+//! Both halves hold by construction; see [`ConnRegistry`] for how.
+//!
+//! That third column is the point. §4.2b proposed closing the writer-death
+//! window with a `oneshot` and a **seventh `select!` arm** in the shared
+//! connection loop — which would have changed hosted teardown timing (a
+//! sign-off item) or else `cfg`-ed an arm into the protocol module, the one
+//! thing `doc/pva-rtems-item7-design.md` §6 forbids. Waking through the socket
+//! needs neither: a dead writer shuts the socket, the reader thread's `read`
+//! returns 0, and the connection unwinds down the **existing** EOF path. So
+//! `tcp.rs` is untouched by stage 4, the hosted `select!` is byte-identical,
+//! and the ≤15 s window is gone for this driver anyway.
+//!
 //! # Not here
 //!
-//! Server-wide shutdown (a socket registry walked by `PvaServer::stop`) and
-//! the writer-exit `oneshot` arm are stage 4 (§4.2b, §4.3). This module tears
-//! down only its own connection, and does it without either.
+//! The accept loop that owns a [`ConnRegistry`] and hands sockets to
+//! [`serve_connection_blocking`] is item 7; on the host that role is
+//! [`super::accept`]'s, and it drives its connections as tasks rather than
+//! through this module.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::pin::Pin;
@@ -99,6 +138,189 @@ const SEND_TICKS_PER_DEADLINE: u32 = 4;
 /// `WouldBlock`, some platforms as `TimedOut`.
 fn is_socket_timeout(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown: the wake handle and the registry that walks them
+// ---------------------------------------------------------------------------
+
+/// The one primitive that wakes a parked connection thread:
+/// `shutdown(Shutdown::Both)` on that connection's socket.
+///
+/// **Only [`ConnRegistry::register`] constructs one.** That is what makes the
+/// registry the single owner rather than merely the usual route: a wake handle
+/// cannot exist for a connection the registry does not know about, so there is
+/// no way to write a shutdown path that `stop` would miss.
+///
+/// It owns an `Arc` of the socket rather than borrowing a dup from one of the
+/// connection's threads, and that is the load-bearing part. A connection's
+/// three threads all exit and drop their own handles; a `stop` walking the
+/// registry at that moment must still hold something that keeps the fd open,
+/// or it would `shutdown` a fd number the OS has already handed to another
+/// connection. With the `Arc` here, waking a connection that has already ended
+/// is a no-op on a still-open fd.
+#[derive(Clone)]
+struct ConnWake(Arc<TcpStream>);
+
+impl ConnWake {
+    fn wake(&self) {
+        // `ENOTCONN` when the peer has already gone: there was nothing to
+        // wake, which is not a failure of anything.
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+#[derive(Default)]
+struct RegistryState {
+    stopped: bool,
+    next_id: u64,
+    conns: HashMap<u64, ConnWake>,
+}
+
+/// Server-wide registry of live blocking connections, and the single owner of
+/// their shutdown transition (§4.2c).
+///
+/// The hosted accept loop keeps its connections in a `tokio::task::JoinSet`
+/// and drops it to abort them all. Threads have no such handle, so the
+/// blocking driver keeps this instead: every live connection's wake handle,
+/// walked by [`stop`](Self::stop).
+///
+/// # Invariant
+///
+/// * **MUST** — every connection served by [`serve_connection_blocking`] is
+///   registered here before either of its threads starts, and stays registered
+///   until its operation thread has joined both of them.
+/// * **MUST NOT** — no path shuts a connection's socket down, or takes it out
+///   of the registry, except through a handle this registry issued: a
+///   `ConnWake` (which only `ConnRegistry::register` constructs) or the
+///   `ConnRegistration` guard (whose `Drop` is the only remover, and which
+///   goes through `ConnRegistry::deregister` rather than reaching into
+///   the map).
+///
+/// Both halves hold by construction, not by convention. Registration is not
+/// something a caller can forget or double up — it happens inside
+/// `serve_connection_blocking`, which cannot be called without a registry —
+/// and the connection's own natural death removes its entry through the same
+/// API a `stop` would, so there is one code path for "this connection is
+/// gone", not two.
+///
+/// `stop` is a one-way latch: afterwards a connection that registers (an
+/// accept already in flight when `stop` ran) is woken as it registers, so it
+/// retires down the same path as everything else instead of needing a second
+/// one. Calling `stop` twice is harmless.
+///
+/// Target-neutral, like the rest of this module: `std` sockets, `std` mutex,
+/// no `cfg`. Item 7's RTEMS accept loop owns one and calls `stop`; on the host
+/// that role belongs to [`super::accept`], which drives its connections as
+/// tasks and so has nothing to register here.
+pub struct ConnRegistry {
+    state: Mutex<RegistryState>,
+}
+
+impl Default for ConnRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnRegistry {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(RegistryState::default()),
+        }
+    }
+
+    /// Shut every live connection's socket, and every connection that
+    /// registers from here on.
+    ///
+    /// Returns as soon as the wakes are issued. Each connection retires on its
+    /// own operation thread, which is what joins its reader and writer; a
+    /// caller that must know they are all gone joins whatever it spawned those
+    /// operation threads with.
+    pub fn stop(&self) {
+        let wakes: Vec<ConnWake> = {
+            let mut st = self.state.lock().expect("connection registry poisoned");
+            st.stopped = true;
+            st.conns.values().cloned().collect()
+        };
+        // Outside the lock: `shutdown` is a syscall, and a connection retiring
+        // concurrently takes this same lock in its registration guard.
+        for wake in wakes {
+            wake.wake();
+        }
+    }
+
+    /// How many connections are currently registered. A connection that ended
+    /// on its own has already removed itself.
+    pub fn live_connections(&self) -> usize {
+        self.state
+            .lock()
+            .expect("connection registry poisoned")
+            .conns
+            .len()
+    }
+
+    /// Take ownership of a connection's socket and issue its wake handle.
+    ///
+    /// Consumes the `Arc` so the caller cannot keep a second route to the
+    /// socket: from here on the only way to shut this connection down is the
+    /// handle on the returned guard.
+    fn register(&self, socket: Arc<TcpStream>) -> ConnRegistration<'_> {
+        let wake = ConnWake(socket);
+        let (id, stopped) = {
+            let mut st = self.state.lock().expect("connection registry poisoned");
+            let id = st.next_id;
+            st.next_id += 1;
+            st.conns.insert(id, wake.clone());
+            (id, st.stopped)
+        };
+        if stopped {
+            wake.wake();
+        }
+        ConnRegistration {
+            registry: self,
+            id,
+            wake,
+        }
+    }
+
+    /// The only remover. Private, and reached only from
+    /// [`ConnRegistration::drop`].
+    fn deregister(&self, id: u64) {
+        self.state
+            .lock()
+            .expect("connection registry poisoned")
+            .conns
+            .remove(&id);
+    }
+}
+
+/// A connection's registration: its wake handle while it lives, and its
+/// removal from the registry on the way out — every way out, including a panic
+/// unwinding through the driver.
+struct ConnRegistration<'a> {
+    registry: &'a ConnRegistry,
+    id: u64,
+    wake: ConnWake,
+}
+
+impl ConnRegistration<'_> {
+    /// Wake this connection's parked threads.
+    fn wake(&self) {
+        self.wake.wake();
+    }
+
+    /// A clone of the wake handle, for a thread that outlives this borrow —
+    /// the writer, which wakes the connection on its way out (§4.2b).
+    fn wake_handle(&self) -> ConnWake {
+        self.wake.clone()
+    }
+}
+
+impl Drop for ConnRegistration<'_> {
+    fn drop(&mut self) {
+        self.registry.deregister(self.id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,10 +563,18 @@ fn write_frame_deadline(
 
 /// Drain frames to the socket in order. Ends when the driver drops the last
 /// strong sender, or on the first write error / send-deadline expiry.
+///
+/// Whichever of those ends it, it wakes the connection on the way out (§4.2b).
+/// A dead writer means the connection is over, and the operation loop must not
+/// wait up to a heartbeat period to find that out — but the fix is the socket
+/// shutdown, not a seventh `select!` arm: the reader's `read` then returns 0
+/// and the loop unwinds down the existing EOF path, leaving `tcp.rs` and the
+/// hosted timing alone. See the module docs.
 fn writer_thread(
     mut sock: TcpStream,
     mut rx: mpsc::Receiver<Vec<u8>>,
     room: Arc<WriteRoom>,
+    wake: ConnWake,
     send_timeout: Duration,
     peer: SocketAddr,
 ) {
@@ -360,6 +590,13 @@ fn writer_thread(
     }
     // Whatever parked the producer, it must not stay parked on a dead writer.
     room.wake();
+    // Uniform, not special-cased on *why* the writer ended: the only thing
+    // that ends it is the connection being over. On the error paths this is
+    // what retires the connection at once; on the normal path the driver is
+    // already tearing down and repeats the same shutdown a moment later,
+    // harmlessly — every frame this thread was given has been written before
+    // it gets here.
+    wake.wake();
 }
 
 // ---------------------------------------------------------------------------
@@ -375,9 +612,13 @@ fn writer_thread(
 ///
 /// `peer_entry` is this connection's row in the server report (`pvxsr`) and
 /// `channel_invalidator` is the server-wide out-of-band disconnect channel;
-/// both come from whatever accepts the socket. There is no TLS parameter: the
-/// blocking driver is plain-TCP only (§6), so the connection carries no x509
-/// identity and authenticates through CONNECTION_VALIDATION alone.
+/// both come from whatever accepts the socket. `registry` is that same
+/// accepter's [`ConnRegistry`], and taking it by value rather than by option
+/// is deliberate: a connection cannot be served outside a registry, so
+/// `ConnRegistry::stop` reaching every live connection is a property of the
+/// signature. There is no TLS parameter: the blocking driver is plain-TCP only
+/// (§6), so the connection carries no x509 identity and authenticates through
+/// CONNECTION_VALIDATION alone.
 ///
 /// **Hosted callers must run this on a multi-thread runtime worker**; see the
 /// module docs. On RTEMS a bare thread is correct.
@@ -388,6 +629,7 @@ pub fn serve_connection_blocking(
     config: PvaServerConfig,
     peer_entry: Arc<super::peers::PeerEntry>,
     channel_invalidator: super::source::ChannelInvalidator,
+    registry: &ConnRegistry,
 ) -> PvaResult<()> {
     let init = ConnInit {
         peer_entry,
@@ -408,10 +650,13 @@ pub fn serve_connection_blocking(
         .set_write_timeout(Some(send_tick))
         .map_err(PvaError::Io)?;
 
-    // One socket, three handles: this thread keeps the original for teardown,
-    // each child thread gets a dup'd fd.
+    // One socket, several handles: a dup'd fd for each child thread, and the
+    // original handed to the registry, which owns it from here on. Registering
+    // *before* either thread starts is what closes the window where a thread
+    // could be parked on a socket `stop` cannot reach.
     let read_sock = stream.try_clone().map_err(PvaError::Io)?;
     let write_sock = stream.try_clone().map_err(PvaError::Io)?;
+    let registration = registry.register(Arc::new(stream));
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE_DEPTH);
     let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
@@ -423,9 +668,19 @@ pub fn serve_connection_blocking(
         .spawn(move || reader_thread(read_sock, chunk_tx, peer))
         .map_err(PvaError::Io)?;
     let writer_room = room.clone();
+    let writer_wake = registration.wake_handle();
     let writer = thread::Builder::new()
         .name(format!("PVA-writer {peer}"))
-        .spawn(move || writer_thread(write_sock, frame_rx, writer_room, send_timeout, peer))
+        .spawn(move || {
+            writer_thread(
+                write_sock,
+                frame_rx,
+                writer_room,
+                writer_wake,
+                send_timeout,
+                peer,
+            )
+        })
         .map_err(PvaError::Io)?;
 
     let outcome = block_on_sync(handle_connection_io(
@@ -447,14 +702,17 @@ pub fn serve_connection_blocking(
     drop(frame_tx);
     let _ = writer.join();
     // Now the reader. Its `read` is parked with an effectively-infinite
-    // SO_RCVTIMEO, so the socket has to be shut to return it (§4.2c's
-    // mechanism, applied to our own fd — the server-wide registry that does
-    // this from outside is stage 4).
-    let _ = stream.shutdown(Shutdown::Both);
+    // SO_RCVTIMEO, so the socket has to be shut to return it — the same wake
+    // `ConnRegistry::stop` would issue, through the same registry-issued
+    // handle, because there is only one way to end a parked connection thread.
+    registration.wake();
     let _ = reader.join();
     // `room` outlives both, so a producer parked on a full queue is released
     // by the writer's exit wake rather than left holding a dead waker.
     drop(room);
+    // Both threads are joined; the connection is no longer reachable and its
+    // entry goes. This is the only removal path there is.
+    drop(registration);
 
     match outcome {
         Ok(result) => result,
@@ -639,7 +897,11 @@ mod tests {
         /// timer and spawner underneath it (module docs); `block_on_sync`
         /// then takes its worker-handoff arm, which is the arm a hosted
         /// caller is supposed to take.
-        fn start(config: PvaServerConfig) -> Harness {
+        ///
+        /// `registry` stands in for the accept loop item 7 will bring: these
+        /// tests are the registry's only driver until then, so they drive it
+        /// exactly as that loop will — one registry, N connections, `stop`.
+        fn start(config: PvaServerConfig, registry: Arc<ConnRegistry>) -> Harness {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
             let client = TcpStream::connect(addr).expect("connect");
@@ -653,6 +915,7 @@ mod tests {
                     config,
                     PeerEntry::new(false),
                     ChannelInvalidator::new(),
+                    &registry,
                 )
             });
             client
@@ -692,16 +955,37 @@ mod tests {
             panic!("no {command:?} frame arrived within 32 frames");
         }
 
+        /// Collect the connection's result under a bound, so a regression that
+        /// leaves the connection parked fails this test instead of hanging the
+        /// run. Every shutdown-path assertion below is "it retired", and this
+        /// is what makes that assertion falsifiable.
+        async fn wait_retired(mut self, within: Duration) -> PvaResult<()> {
+            let conn = self.conn.take().expect("connection task present");
+            match tokio::time::timeout(within, conn).await {
+                Ok(joined) => joined.expect("connection task joined"),
+                Err(_) => {
+                    // Release the connection *before* failing. The driver is
+                    // parked inside `block_in_place`, and unwinding straight
+                    // into the runtime's drop would wait on that worker — the
+                    // test would hang instead of failing, which is exactly
+                    // what a mutation of the wake path must not be able to do.
+                    let _ = self.client.shutdown(Shutdown::Both);
+                    panic!("the connection must retire within {within:?}, not stay parked");
+                }
+            }
+        }
+
         /// Close the client end and collect the connection's result.
-        async fn finish(mut self) -> PvaResult<()> {
+        async fn finish(self) -> PvaResult<()> {
             let _ = self.client.shutdown(Shutdown::Both);
-            self.conn
-                .take()
-                .expect("connection task present")
-                .await
-                .expect("connection task joined")
+            self.wait_retired(RETIRE_BOUND).await
         }
     }
+
+    /// How long a connection may take to notice it is over. Generous next to
+    /// the microseconds a socket shutdown actually needs, and far below the
+    /// ≤15 s heartbeat window a `select!`-arm-less design would have left.
+    const RETIRE_BOUND: Duration = Duration::from_secs(5);
 
     fn isolated_config() -> PvaServerConfig {
         PvaServerConfig {
@@ -736,7 +1020,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_header_and_partial_body_frames_reassemble() {
         let order = ByteOrder::Little;
-        let mut h = Harness::start(isolated_config());
+        let mut h = Harness::start(isolated_config(), Arc::new(ConnRegistry::new()));
 
         let frame = app_frame(
             Command::CreateChannel,
@@ -770,7 +1054,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn segmented_message_reassembles_across_a_chunk_boundary() {
         let order = ByteOrder::Little;
-        let mut h = Harness::start(isolated_config());
+        let mut h = Harness::start(isolated_config(), Arc::new(ConnRegistry::new()));
 
         let payload = create_channel_payload(11, "dut", order);
         let cut = payload.len() / 2;
@@ -824,7 +1108,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn type_cache_define_and_reference_survive_in_different_frames() {
         let order = ByteOrder::Little;
-        let mut h = Harness::start(isolated_config());
+        let mut h = Harness::start(isolated_config(), Arc::new(ConnRegistry::new()));
 
         h.send(&app_frame(
             Command::CreateChannel,
@@ -910,6 +1194,7 @@ mod tests {
             isolated_config(),
             PeerEntry::new(false),
             ChannelInvalidator::new(),
+            &ConnRegistry::new(),
         )
         .expect_err("a current-thread runtime must be refused");
         match err {
@@ -1067,5 +1352,305 @@ mod tests {
                 .expect_err("writing after the channel closed must fail");
             assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         }
+    }
+
+    // ── shutdown: the registry and the wake ─────────────────────────────
+    //
+    // One case per boundary of the stop transition, not one per story. The
+    // registry has no in-tree production caller until item 7's RTEMS accept
+    // loop, so these tests are its driver, and they drive it the way that
+    // loop will: one registry, connections registering and retiring under it,
+    // `stop` walking whatever is live.
+
+    /// Wait until `registry` holds `n` connections.
+    ///
+    /// `Harness::start` returning does not mean the connection is registered:
+    /// the driver registers on its own thread, once the spawned task is first
+    /// polled. Asserting the count directly is a race, and a `stop` issued
+    /// before registration would exercise the post-stop latch instead of the
+    /// case under test.
+    async fn await_registered(registry: &ConnRegistry, n: usize) {
+        for _ in 0..500 {
+            if registry.live_connections() == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "registry never reached {n} live connections (stuck at {})",
+            registry.live_connections()
+        );
+    }
+
+    /// A pair of connected loopback sockets, with the client end returned so
+    /// the caller can keep it open — a dropped client would retire the
+    /// connection on its own and make every assertion below vacuous.
+    fn socket_pair() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, peer) = listener.accept().expect("accept");
+        (client, server, peer)
+    }
+
+    /// Boundary: nothing registered. `stop` must be a no-op rather than
+    /// something with an empty-map special case, and must not invent state.
+    #[test]
+    fn stop_with_no_connections_is_harmless() {
+        let registry = ConnRegistry::new();
+        assert_eq!(registry.live_connections(), 0);
+        registry.stop();
+        assert_eq!(
+            registry.live_connections(),
+            0,
+            "stopping an empty registry must not leave an entry behind"
+        );
+    }
+
+    /// Boundary: the reader is parked in `read` — the common state, and the
+    /// one nothing else can end. `op_timeout` is ~64,000 s by default (§1.6),
+    /// so if the socket shutdown does not return that `read`, nothing does.
+    ///
+    /// Mutation-checked: make `ConnWake::wake` a no-op and this test fails on
+    /// its retire bound instead of hanging, because `wait_retired` is bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_wakes_a_connection_parked_in_its_read() {
+        let order = ByteOrder::Little;
+        let registry = Arc::new(ConnRegistry::new());
+        let mut h = Harness::start(isolated_config(), registry.clone());
+
+        // One complete exchange first, so the connection is provably past
+        // setup and parked waiting for a frame that will never come.
+        h.send(&app_frame(
+            Command::CreateChannel,
+            order,
+            create_channel_payload(3, "dut", order),
+        ));
+        let _ = h.read_until(Command::CreateChannel);
+        await_registered(&registry, 1).await;
+
+        registry.stop();
+        let _ = h.wait_retired(RETIRE_BOUND).await;
+        assert_eq!(
+            registry.live_connections(),
+            0,
+            "a retired connection must have removed its own entry"
+        );
+    }
+
+    /// Boundary: the writer is parked inside `write_frame_deadline` with a
+    /// deadline far longer than the test, on a peer that is not reading. The
+    /// deadline would eventually free it — that is §3.3 — but `stop` must not
+    /// have to wait for it.
+    ///
+    /// Mutation-checked: `ConnWake::wake` as a no-op leaves the writer parked
+    /// until its 30 s deadline, well past the 5 s `recv_timeout` here.
+    #[test]
+    fn stop_wakes_a_writer_parked_in_the_deadline_loop() {
+        // Kept alive and deliberately never read from: this is the stuck-peer
+        // case, so the socket buffers fill and the writer blocks.
+        let (_client, server, peer) = socket_pair();
+
+        let registry = ConnRegistry::new();
+        let registration =
+            registry.register(Arc::new(server.try_clone().expect("dup for registry")));
+        let write_sock = server.try_clone().expect("dup for writer");
+        write_sock
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .expect("SO_SNDTIMEO");
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
+        // Far longer than this test may take, so only the wake can explain a
+        // prompt exit.
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let room = Arc::new(WriteRoom::default());
+        let wake = registration.wake_handle();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            writer_thread(write_sock, rx, room, wake, DEADLINE, peer);
+            let _ = done_tx.send(());
+        });
+
+        // Bigger than any socket buffer, so the writer really is parked mid
+        // frame rather than done before `stop` runs.
+        tx.try_send(vec![0xA5u8; 8 * 1024 * 1024])
+            .expect("frame queued");
+        thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        registry.stop();
+        done_rx
+            .recv_timeout(RETIRE_BOUND)
+            .expect("stop must return a writer parked in the deadline loop");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < DEADLINE / 2,
+            "the writer must be woken by the shutdown, not released by its own \
+             {DEADLINE:?} deadline; took {elapsed:?}"
+        );
+        writer.join().expect("writer thread");
+        drop(tx);
+    }
+
+    /// Boundary: an operation is registered and not destroyed when `stop`
+    /// arrives. The connection must still retire — teardown drains `channels`,
+    /// which drops each `OpState` and fires its guards — rather than the
+    /// in-flight op holding the loop open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_retires_a_connection_with_an_operation_in_flight() {
+        let order = ByteOrder::Little;
+        let registry = Arc::new(ConnRegistry::new());
+        let mut h = Harness::start(isolated_config(), registry.clone());
+
+        h.send(&app_frame(
+            Command::CreateChannel,
+            order,
+            create_channel_payload(5, "dut", order),
+        ));
+        let body = h.read_until(Command::CreateChannel);
+        let mut cur = Cursor::new(&body[..]);
+        let _cid = cur.get_u32(order).expect("cid");
+        let sid = cur.get_u32(order).expect("sid");
+        assert_eq!(cur.get_u8().expect("status"), 0xFF, "channel created");
+
+        // A GET INIT that is answered but never destroyed: the ioid stays
+        // registered on the channel, so teardown has real state to unwind.
+        let mut init = Vec::new();
+        init.put_u32(sid, order);
+        init.put_u32(900, order);
+        init.put_u8(0x08);
+        init.put_u8(0xFD);
+        init.put_u16(0x0001, order);
+        encode_type_desc(
+            &FieldDesc::Structure {
+                struct_id: String::new(),
+                fields: Vec::new(),
+            },
+            order,
+            &mut init,
+        );
+        h.send(&app_frame(Command::Get, order, init));
+        let reply = h.read_until(Command::Get);
+        let mut cur = Cursor::new(&reply[..]);
+        assert_eq!(cur.get_u32(order).expect("ioid"), 900);
+        let _sub = cur.get_u8().expect("subcommand");
+        assert_eq!(cur.get_u8().expect("status"), 0xFF, "GET INIT succeeded");
+
+        await_registered(&registry, 1).await;
+        registry.stop();
+        let _ = h.wait_retired(RETIRE_BOUND).await;
+        assert_eq!(registry.live_connections(), 0);
+    }
+
+    /// Boundary: `stop` called more than once, including after everything has
+    /// already gone. It is a latch, not a toggle, and the second call must not
+    /// find a half-removed entry or panic on one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_is_idempotent() {
+        let registry = Arc::new(ConnRegistry::new());
+        let h = Harness::start(isolated_config(), registry.clone());
+        await_registered(&registry, 1).await;
+
+        registry.stop();
+        registry.stop();
+        let _ = h.wait_retired(RETIRE_BOUND).await;
+        assert_eq!(registry.live_connections(), 0);
+        // And once more with nothing left to walk.
+        registry.stop();
+        assert_eq!(registry.live_connections(), 0);
+    }
+
+    /// Boundary: the connection ends by itself, then `stop` runs. Two things
+    /// must hold — the entry is gone (no leak), and walking a registry that
+    /// raced a retiring connection cannot touch a recycled fd, which is why
+    /// the registry owns an `Arc` of the socket rather than a bare fd.
+    ///
+    /// Mutation-checked: make `ConnRegistration::drop` skip
+    /// `ConnRegistry::deregister` and the leak assertion fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_that_ended_on_its_own_leaves_no_entry() {
+        let registry = Arc::new(ConnRegistry::new());
+        let h = Harness::start(isolated_config(), registry.clone());
+        await_registered(&registry, 1).await;
+
+        // The client hangs up; nothing on the server side was told to stop.
+        let _ = h.finish().await;
+        assert_eq!(
+            registry.live_connections(),
+            0,
+            "a connection that ended on its own must not leave an entry for \
+             `stop` to walk"
+        );
+        // A later stop has nothing to do and must say so quietly.
+        registry.stop();
+    }
+
+    /// Boundary: registration *after* `stop`. An accept already in flight when
+    /// the server stopped must not produce a connection that outlives it, and
+    /// it retires down the same path as every other connection rather than a
+    /// second one — the latch is checked as part of registering, not by a
+    /// separate pre-flight the caller could skip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_registered_after_stop_is_shut_down_at_once() {
+        let registry = Arc::new(ConnRegistry::new());
+        registry.stop();
+
+        // The client stays connected and sends nothing: without the latch this
+        // connection would sit in `read` until `op_timeout`, i.e. ~64,000 s.
+        let h = Harness::start(isolated_config(), registry.clone());
+        let _ = h.wait_retired(RETIRE_BOUND).await;
+        assert_eq!(registry.live_connections(), 0);
+    }
+
+    /// §4.2b without a seventh `select!` arm: a writer that ends wakes the
+    /// connection through the socket, so the reader's parked `read` returns 0
+    /// and the loop unwinds down its existing EOF path. This is what lets
+    /// `tcp.rs` stay untouched and the hosted `select!` stay byte-identical.
+    ///
+    /// Mutation-checked: delete the `wake.wake()` at the end of
+    /// `writer_thread` and the parked reader here is never released.
+    #[test]
+    fn a_writer_that_ends_wakes_a_reader_parked_on_the_socket() {
+        // The client stays connected and silent, so the only thing that can
+        // return the reader's `read` is a shutdown from this side.
+        let (_client, server, peer) = socket_pair();
+
+        let registry = ConnRegistry::new();
+        let registration =
+            registry.register(Arc::new(server.try_clone().expect("dup for registry")));
+
+        let mut read_sock = server.try_clone().expect("dup for reader");
+        let (read_done, read_result) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = read_done.send(read_sock.read(&mut buf));
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
+        let wake = registration.wake_handle();
+        let write_sock = server.try_clone().expect("dup for writer");
+        let writer = thread::spawn(move || {
+            writer_thread(
+                write_sock,
+                rx,
+                Arc::new(WriteRoom::default()),
+                wake,
+                Duration::from_secs(5),
+                peer,
+            )
+        });
+
+        // The writer's last strong sender goes: it ends, and on the way out it
+        // wakes the connection.
+        drop(tx);
+        let n = read_result
+            .recv_timeout(RETIRE_BOUND)
+            .expect("a parked reader must be released when the writer ends")
+            .expect("the shutdown surfaces as a clean end-of-stream, not an error");
+        assert_eq!(n, 0, "the woken read must report end-of-stream");
+
+        writer.join().expect("writer thread");
+        reader.join().expect("reader thread");
     }
 }

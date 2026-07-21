@@ -19,7 +19,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
@@ -1944,7 +1943,7 @@ fn spawn_monitor_subscriber(
     // loop now owns directly.
     let loop_exec_rx = monitor_exec_rx;
 
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _fin_guard = MonitorFinishGuard {
             tx: mon_fin_tx,
             fin: mon_fin,
@@ -3267,7 +3266,7 @@ async fn handle_connection_io(
     //    on a non-blocking socket; without a guard the writer task
     //    would hang and back-pressure both the heartbeat and the
     //    read-side dispatcher (since both push into the same mpsc).
-    //    We wrap `write_all` in `tokio::time::timeout(send_timeout)`
+    //    We wrap `write_all` in `runtime::task::timeout(send_timeout)`
     //    so a stalled write breaks the task, closes the mpsc, and
     //    fails fast. Mirrors the parallel guard in `epics-ca-rs`'s
     //    server-side dispatch wrap (the CA G1 audit fix).
@@ -3275,9 +3274,11 @@ async fn handle_connection_io(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(config.write_queue_depth);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = epics_base_rs::runtime::task::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            match tokio::time::timeout(send_tmo, writer_raw.write_all(&frame)).await {
+            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&frame))
+                .await
+            {
                 Ok(Ok(())) => {
                     // bytes_out counter for PvaServer::report().
                     peer_entry_writer.touch_tx(frame.len());
@@ -3301,7 +3302,7 @@ async fn handle_connection_io(
     // Without this it lingers up to `idle_timeout` (default 45s) holding
     // the writer half of the (now-disconnected) socket.
     // pvxs uses libevent-driven cleanup that shuts everything in one
-    // pass; we rely on tokio JoinHandle::abort() via AbortOnDrop.
+    // pass; we rely on the spawn seam's handle `abort()` via AbortOnDrop.
     // The heartbeat needs no such guard: it is a deadline arm of this
     // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
@@ -3320,7 +3321,7 @@ async fn handle_connection_io(
     // no tick — so holding the interval across iterations reproduces the
     // task's fixed 15 s cadence exactly, including tokio's default `Burst`
     // catch-up if a long dispatch delays a tick.
-    let mut hb_tick = interval(Duration::from_secs(15));
+    let mut hb_tick = epics_base_rs::runtime::task::interval(Duration::from_secs(15));
     // `interval` yields its first tick immediately; the task consumed it the
     // same way, so the first beat lands 15 s in.
     hb_tick.tick().await;
@@ -4657,7 +4658,7 @@ async fn handle_put_get(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -5003,7 +5004,7 @@ async fn handle_process(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -5372,7 +5373,7 @@ async fn handle_channel_array(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
@@ -5506,7 +5507,9 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         let mut chunk = [0u8; 4096];
-        let n = match tokio::time::timeout(op_timeout, reader.read(&mut chunk)).await {
+        let n = match epics_base_rs::runtime::task::timeout(op_timeout, reader.read(&mut chunk))
+            .await
+        {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(PvaError::Io(e)),
             Err(_) => return Err(PvaError::Timeout),
@@ -5661,7 +5664,7 @@ async fn handle_create_channel(
         // resolution and the open callback agree.
         let open_cred = cred.clone();
         let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             for (cid, sid, nm) in batch {
                 let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
                     // Bind the owner that accepted this channel so every
@@ -6984,7 +6987,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let mut exec_fin_guard = ExecFinishGuard {
@@ -7134,7 +7137,7 @@ async fn handle_op(
                     success: false,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let join = tokio::spawn(async move {
+                let join = epics_base_rs::runtime::task::spawn(async move {
                     let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
@@ -7283,7 +7286,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7650,7 +7653,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7878,7 +7881,7 @@ async fn handle_get_field(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
         let _exec_fin_guard = ExecFinishGuard {
@@ -8387,6 +8390,43 @@ mod tests {
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
     use crate::server_native::MonitorStream;
+
+    /// Every task this file spawns for a *connection* — the writer, the MONITOR
+    /// subscriber, the CREATE_CHANNEL resolver, and the seven data-phase
+    /// execs — goes through `runtime::task::spawn`, not `tokio::spawn`
+    /// (RTEMS phase 6 item 5, stage 2). A bare `tokio::spawn` panics on a
+    /// thread with no tokio runtime, which is exactly the thread the blocking
+    /// driver will run a connection on — and it panics at *runtime*, on the
+    /// target, not here. So pin it as source inspection: production scope
+    /// must contain no `tokio::spawn` at all.
+    ///
+    /// The accept loop's `conn_tasks.spawn` is a `JoinSet` method, not this
+    /// literal, and the accept path's remaining tokio surface (`TcpListener`,
+    /// the TLS handshake deadlines, the accept-error backoff) is item 7's —
+    /// which is why this guard names the spawn literal only.
+    #[test]
+    fn connection_scope_spawns_go_through_the_runtime_seam() {
+        let src = include_str!("tcp.rs");
+        // Production scope ends at the first column-0 `#[cfg(test)]`.
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // Fail closed: an earlier `#[cfg(test)]` helper must not shrink the
+        // slice past the connection handler and make this pass vacuously.
+        assert!(
+            prod.contains("async fn handle_connection_io"),
+            "production slice no longer covers the connection handler"
+        );
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::spawn(");
+        let hits = prod.matches(literal).count();
+        assert_eq!(
+            hits, 0,
+            "production scope must spawn through `runtime::task::spawn`; \
+             found {hits} bare `{literal}`"
+        );
+    }
 
     /// a throwaway MONITOR-completion sender for `handle_op`
     /// calls in tests that do not exercise the read-loop owner's removal

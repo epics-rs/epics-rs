@@ -30,6 +30,7 @@ use std::sync::{
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use crate::server_native::source::{ChannelInvalidator, OpError};
@@ -297,6 +298,47 @@ impl MonitorInbox {
             }
             notified.await;
         }
+    }
+
+    /// Non-blocking [`Self::recv`] — the port of
+    /// [`EvQue::try_next`](epics_base_rs::server::event_queue) (`event_queue.rs:371`),
+    /// which is what `EventReader::try_recv` exposes on the CA side.
+    ///
+    /// Exists so a **blocking** per-connection drain loop can poll this ring
+    /// without entering async at all: the RTEMS backend has no reactor, so the
+    /// operation thread takes what is queued with this and only parks (via
+    /// `block_on_sync` → `park_on`) when everything is drained. The ring itself
+    /// is already runtime-agnostic — `Mutex<VecDeque>` plus a `tokio::sync::Notify`
+    /// that stores no reactor state — so this method is the last piece a
+    /// non-async consumer needed.
+    ///
+    /// **Drain-before-close, same as [`Self::recv`].** Items are inspected before
+    /// `producer_done`, so a closed producer whose queue still holds values keeps
+    /// yielding `Ok` and only reports `Disconnected` once empty. Reversing the two
+    /// would silently swallow the tail of a monitor whose PV just closed.
+    ///
+    /// Unlike [`Self::recv`] this does **not** arm the `Notify` first. Arming
+    /// exists to close the check/await race — register the waiter before
+    /// inspecting so a `notify_one()` landing in between is not lost. There is no
+    /// await here, so there is no race to close and no waiter to register;
+    /// `EvQue::try_next` likewise takes the lock and nothing else. The ordering
+    /// discipline that *does* carry over is the one above: one lock acquisition,
+    /// items examined before the closed flag.
+    ///
+    /// The error type is `tokio::sync::mpsc::error::TryRecvError` rather than a
+    /// private mirror so that a consumer polling this ring and a consumer polling
+    /// an mpsc-backed monitor stream read identically — the server's existing
+    /// drain idiom (`tcp.rs:2245`, `while let Ok(e) = rx.try_recv()`) works over
+    /// either without a conversion at the seam.
+    pub fn try_recv(&mut self) -> Result<PvField, TryRecvError> {
+        let mut inner = self.shared.inner.lock();
+        if let Some(v) = inner.items.pop_front() {
+            return Ok(v);
+        }
+        if inner.producer_done {
+            return Err(TryRecvError::Disconnected);
+        }
+        Err(TryRecvError::Empty)
     }
 }
 
@@ -2227,6 +2269,124 @@ mod tests {
         // Queue is now empty — no more posts were made.
         let empty = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(empty.is_err(), "queue must be empty after squash drain");
+    }
+
+    // ── MonitorInbox::try_recv — one case per invariant boundary ────────────
+    //
+    // `try_recv` has exactly two boundaries, and every case below pins one
+    // side of one of them:
+    //
+    //   items.is_empty()   false → Ok(front)      true → consult producer_done
+    //   producer_done      false → Err(Empty)     true → Err(Disconnected)
+    //
+    // The (items non-empty, producer_done true) corner is the one that a
+    // "check closed first" implementation would get wrong, so it gets its own
+    // case rather than riding along inside a longer scenario.
+
+    /// Boundary `items.is_empty() == true`, `producer_done == false`:
+    /// nothing queued yet but the producer is alive → `Empty`, never
+    /// `Disconnected`. A drain loop must read this as "park", not "tear down".
+    #[test]
+    fn try_recv_empty_ring_is_empty_not_disconnected() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        // Drop the seed `open()` queued so the ring is genuinely empty.
+        assert!(rx.try_recv().is_ok(), "seed value is queued by open()");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// Boundary `items.is_empty() == false`: one queued value comes back
+    /// without awaiting, and the ring returns to `Empty` behind it.
+    #[test]
+    fn try_recv_one_item_yields_it_then_empty() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(11));
+
+        let got = rx.try_recv().expect("posted value");
+        assert_eq!(extract_int(&got), 11);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// Same squash-to-tail rule `recv` observes (pvxs `servermon.cpp:283-286`)
+    /// must hold on the non-blocking path: with `limit = 2`, posts 3 and 4
+    /// overwrite the tail, so a `try_recv` drain sees `[1, 4]` — not `[1, 2]`
+    /// (drop-newest) and not `[3, 4]` (drop-oldest).
+    #[test]
+    fn try_recv_sees_the_squashed_tail_not_the_dropped_value() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(2).expect("subscribe"); // queue limit = 2
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(1)); // [1]
+        pv.try_post(nt_scalar_int_value(2)); // [1, 2] — full
+        pv.try_post(nt_scalar_int_value(3)); // squash: [1, 3]
+        pv.try_post(nt_scalar_int_value(4)); // squash: [1, 4]
+
+        let drained: Vec<i32> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|v| extract_int(&v))
+            .collect();
+        assert_eq!(
+            drained,
+            vec![1, 4],
+            "squash-to-tail: oldest distinct entry plus the newest value"
+        );
+    }
+
+    /// The corner that ordering gets wrong: `producer_done == true` while
+    /// items remain. Drain-before-close means those items are still delivered;
+    /// only once the ring runs dry does the closure surface. Checking
+    /// `producer_done` first would swallow the tail of a monitor whose PV just
+    /// closed.
+    #[test]
+    fn try_recv_drains_queued_items_before_reporting_producer_done() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(1));
+        pv.try_post(nt_scalar_int_value(2));
+        // `close()` clears `subscribers`, dropping the last `MonitorOutbox`
+        // endpoint → `producer_done = true` with two values still queued.
+        pv.close();
+
+        assert_eq!(extract_int(&rx.try_recv().expect("queued 1")), 1);
+        assert_eq!(extract_int(&rx.try_recv().expect("queued 2")), 2);
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Disconnected),
+            "closure surfaces only after the queue drained"
+        );
+    }
+
+    /// Boundary `items.is_empty() == true`, `producer_done == true`: the
+    /// terminal state. Distinct from `Empty` — a drain loop ends here instead
+    /// of parking forever on a ring nothing will ever post to. This is the
+    /// non-blocking twin of `recv()` returning `None`.
+    #[test]
+    fn try_recv_empty_ring_after_close_is_disconnected() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "alive and empty");
+
+        pv.close();
+
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+        // Terminal: repeated polls stay Disconnected, they do not flip back.
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     #[test]

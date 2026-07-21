@@ -21,6 +21,15 @@
 //! Skipping logic: each test calls `require_libca()` first, which
 //! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
 //! the test then becomes a noisy no-op rather than a hard failure.
+//!
+//! Host/tokio-only. The Rust half of each differential pair is the in-process
+//! async `CaServer`, which under `rtems-exec-model` panics with "there is no
+//! reactor running" (`server/tcp.rs:1338`, `server/ca_server.rs:1101`) before
+//! the C `caget` can connect — measured under `--profile interop`. The C half
+//! is unaffected, so this is the by-design async-server exclusion rather than
+//! a wire-compatibility difference between the two backends.
+
+#![cfg(not(feature = "rtems-exec-model"))]
 
 use std::process::{Command, Stdio};
 use std::time::Duration;

@@ -3,6 +3,21 @@
 //! Spawns the Rust IOC binary and exercises it from the C reference
 //! implementation so we can prove wire-level compatibility in the
 //! direction Rust-server → C-client.
+//!
+//! Host/tokio-only. The IOC spawned here is the `softioc-rs` binary, which
+//! cargo builds with this test's feature set; under `rtems-exec-model` its
+//! async `CaServer` reaches tokio I/O from a background-executor worker and
+//! dies with "there is no reactor running" (`server/udp.rs:773`,
+//! `server/tcp.rs:1338`), so the C client finds nothing to connect to. That is
+//! by design rather than a defect: the feature replaces the async server, and
+//! its entry point is `rtems-ca-ioc`, not `softioc-rs`. The equivalent
+//! feature-ON coverage is `blocking_real_record_e2e.rs`.
+//!
+//! Note this file carries no census marker: its tests are plain `#[test]`
+//! whose reactor dependency lives in a *child process*, which the
+//! `rtems_exec_model_gate` anchors cannot see.
+
+#![cfg(not(feature = "rtems-exec-model"))]
 
 mod common;
 

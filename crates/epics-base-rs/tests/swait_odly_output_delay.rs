@@ -62,8 +62,8 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         .await
         .unwrap();
     {
-        let r = db.get_record(name).await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record(name).unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = evnt.to_string();
     }
@@ -96,8 +96,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     // OUT/OUTN route through RecordInstance::put_common_field (populating
     // parsed_out for output dispatch), not the record's put_field.
     {
-        let r = db.get_record("W_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W_TGT".into()))
             .unwrap();
     }
@@ -170,8 +170,8 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     w.put_field("OEVT", EpicsValue::UShort(13)).unwrap();
     db.add_record("W3_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W3_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W3_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W3_TGT".into()))
             .unwrap();
     }
@@ -259,8 +259,8 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     w.put_field("OEVT", EpicsValue::UShort(17)).unwrap();
     db.add_record("W4_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W4_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W4_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W4_TGT".into()))
             .unwrap();
     }
@@ -347,8 +347,8 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     db.add_record("W5_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W5_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W5_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
             .unwrap();
     }
@@ -399,8 +399,8 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     w.put_field("OEVT", EpicsValue::UShort(11)).unwrap();
     db.add_record("W2_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W2_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W2_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W2_TGT".into()))
             .unwrap();
     }

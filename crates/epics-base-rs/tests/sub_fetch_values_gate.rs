@@ -65,8 +65,8 @@ async fn sub_db(inpb: &str) -> PvDatabase {
         .unwrap();
     db.add_record("SUB", Box::new(seed)).await.unwrap();
 
-    let arc = db.get_record("SUB").await.unwrap();
-    let mut inst = arc.write().await;
+    let arc = db.get_record("SUB").unwrap();
+    let mut inst = arc.write();
     let r = &mut inst.record;
     r.put_field("INPA", EpicsValue::String("SRCA".into()))
         .unwrap();
@@ -95,8 +95,8 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
         .await
         .unwrap();
 
-    let arc = db.get_record("SUB").await.unwrap();
-    let inst = arc.read().await;
+    let arc = db.get_record("SUB").unwrap();
+    let inst = arc.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Double(-1.0)),
@@ -128,8 +128,8 @@ async fn r9_69_unset_link_is_not_a_fetch_failure() {
         .await
         .unwrap();
 
-    let arc = db.get_record("SUB").await.unwrap();
-    let inst = arc.read().await;
+    let arc = db.get_record("SUB").unwrap();
+    let inst = arc.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Double(13.0)),
@@ -151,8 +151,8 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
         .unwrap();
 
     {
-        let arc = db.get_record("ASUB").await.unwrap();
-        let mut inst = arc.write().await;
+        let arc = db.get_record("ASUB").unwrap();
+        let mut inst = arc.write();
         let r = &mut inst.record;
         r.put_field("SNAM", EpicsValue::String("ran".into()))
             .unwrap();
@@ -172,8 +172,8 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
         .await
         .unwrap();
 
-    let arc = db.get_record("ASUB").await.unwrap();
-    let inst = arc.read().await;
+    let arc = db.get_record("ASUB").unwrap();
+    let inst = arc.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Long(-1)),

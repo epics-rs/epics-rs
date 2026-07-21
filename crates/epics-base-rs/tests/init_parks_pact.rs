@@ -31,8 +31,8 @@ use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn pact_of(db: &PvDatabase, name: &str) -> EpicsValue {
-    let arc = db.get_record(name).await.expect("record exists");
-    let inst = arc.read().await;
+    let arc = db.get_record(name).expect("record exists");
+    let inst = arc.read();
     inst.client_field_value("PACT").expect("PACT resolves")
 }
 

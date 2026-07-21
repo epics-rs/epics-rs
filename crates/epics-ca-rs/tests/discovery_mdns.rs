@@ -8,6 +8,8 @@
 
 #![cfg(feature = "discovery")]
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not built by default - this file is behind the `discovery` feature.
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -61,10 +61,9 @@ async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
         .unwrap();
     db.add_record("A6", Box::new(a)).await.unwrap();
 
-    let inst = db.get_record("A6").await.unwrap();
+    let inst = db.get_record("A6").unwrap();
     let mut cc_rx = inst
         .write()
-        .await
         .add_subscriber(
             "CC",
             1,
@@ -89,7 +88,7 @@ async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
     process(&db, "A6").await;
 
     assert_eq!(
-        inst.read().await.record.get_field("AMASK").unwrap(),
+        inst.read().record.get_field("AMASK").unwrap(),
         EpicsValue::ULong(1),
         "the expression stored into AA (bit 0) and nothing else"
     );

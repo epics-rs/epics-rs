@@ -64,8 +64,8 @@ async fn put(db: &PvDatabase, field: &str, v: EpicsValue) {
 }
 
 async fn channel(db: &PvDatabase, field: &str) -> f64 {
-    let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let rec = db.get_record("T").unwrap();
+    let g = rec.read();
     match g.record.get_field(field).unwrap() {
         EpicsValue::Double(d) => d,
         other => panic!("{field}: expected a double, got {other:?}"),
@@ -86,8 +86,8 @@ async fn an_overflowing_result_is_stored_in_the_channel_and_alarms() {
         "C `*presult` is written BEFORE the -1 (sCalcPerform.c:2034-2056), and \
          transformRecord.c:593-597 never rolls it back"
     );
-    let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let rec = db.get_record("T").unwrap();
+    let g = rec.read();
     assert_eq!(
         g.common.sevr,
         AlarmSeverity::Invalid,
@@ -109,8 +109,8 @@ async fn a_nan_result_is_stored_in_the_channel_and_alarms() {
         channel(&db, "B").await.is_nan(),
         "C: ACOS(2) → st=-1 d=nan; the nan IS written"
     );
-    let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let rec = db.get_record("T").unwrap();
+    let g = rec.read();
     assert_eq!(g.common.sevr, AlarmSeverity::Invalid);
     assert!(g.common.udf != 0);
 }
@@ -158,8 +158,8 @@ async fn an_operator_refusal_leaves_the_channel_untouched() {
         "C returns -1 BEFORE the epilogue for a zero divisor — *pval is never \
          assigned, so the channel keeps its previous value"
     );
-    let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let rec = db.get_record("T").unwrap();
+    let g = rec.read();
     assert_eq!(
         g.common.sevr,
         AlarmSeverity::Invalid,
@@ -176,8 +176,8 @@ async fn a_finite_result_stores_the_value_and_does_not_alarm() {
     process(&db, "T").await;
 
     assert_eq!(channel(&db, "A").await, 1e307);
-    let rec = db.get_record("T").await.unwrap();
-    let g = rec.read().await;
+    let rec = db.get_record("T").unwrap();
+    let g = rec.read();
     assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
     assert!(g.common.udf == 0);
 }

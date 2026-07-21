@@ -35,8 +35,8 @@ async fn process(db: &PvDatabase, name: &str) {
 
 /// (SEVR, STAT) as a client would read them.
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     (inst.common.sevr, inst.common.stat)
 }
 

@@ -61,12 +61,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn is_parked(db: &PvDatabase, rec: &str) -> bool {
-    db.get_record(rec)
-        .await
-        .unwrap()
-        .read()
-        .await
-        .is_processing()
+    db.get_record(rec).unwrap().read().is_processing()
 }
 
 /// The put-notify entry (`caput -c`). Returns `true` when the write completed
@@ -77,7 +72,7 @@ async fn put_notify(db: &PvDatabase, pv: &str, field: &str, value: &str) -> bool
         .put_record_field_from_ca(pv, field, EpicsValue::String(value.into()))
         .await
         .unwrap_or_else(|e| panic!("caput -c {pv}.{field} '{value}': {e:?}"));
-    rx.is_none()
+    rx.is_sync()
 }
 
 async fn readback(db: &PvDatabase, pv: &str, field: &str) -> String {

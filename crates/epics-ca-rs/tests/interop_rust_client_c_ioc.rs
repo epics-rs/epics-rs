@@ -5,6 +5,15 @@
 //! available (e.g. CI without EPICS install).
 //!
 //! Run with: `cargo test -p epics-ca-rs --test interop_rust_client_c_ioc`
+//!
+//! Host/tokio-only. The client side is the async `CaClient`, which needs a
+//! tokio reactor that `rtems-exec-model` deliberately does not start; measured
+//! under `--profile interop`, all four tests fail there with "there is no
+//! reactor running". The C `softIoc` side is fine — this is the same
+//! by-design async-client exclusion as the rest of the gated client suites,
+//! not an interop defect.
+
+#![cfg(not(feature = "rtems-exec-model"))]
 
 mod common;
 

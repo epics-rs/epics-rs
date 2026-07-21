@@ -44,15 +44,7 @@ async fn acalcout_db(nelm: u32, nuse: u32) -> PvDatabase {
 }
 
 async fn nuse(db: &PvDatabase) -> u32 {
-    match db
-        .get_record("AC")
-        .await
-        .unwrap()
-        .read()
-        .await
-        .record
-        .get_field("NUSE")
-    {
+    match db.get_record("AC").unwrap().read().record.get_field("NUSE") {
         Some(EpicsValue::ULong(v)) => v,
         other => panic!("NUSE reads as {other:?}"),
     }
@@ -75,16 +67,14 @@ async fn the_process_time_clamp_posts_the_corrected_nuse() {
     let db = acalcout_db(4, 2).await;
     assert_eq!(nuse(&db).await, 2, "legal at init");
 
-    let inst = db.get_record("AC").await.unwrap();
+    let inst = db.get_record("AC").unwrap();
     let mut rx = inst
         .write()
-        .await
         .add_subscriber("NUSE", 4, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("a NUSE subscription must be accepted");
 
     // The restore: straight into the field store, no `special()` in the path.
     inst.write()
-        .await
         .record
         .put_field("NUSE", EpicsValue::ULong(99))
         .unwrap();
@@ -104,10 +94,9 @@ async fn the_process_time_clamp_posts_the_corrected_nuse() {
 async fn a_put_of_an_illegal_nuse_is_refused_and_the_clamped_value_is_posted() {
     let db = acalcout_db(4, 0).await;
 
-    let inst = db.get_record("AC").await.unwrap();
+    let inst = db.get_record("AC").unwrap();
     let mut rx = inst
         .write()
-        .await
         .add_subscriber("NUSE", 4, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("a NUSE subscription must be accepted");
 

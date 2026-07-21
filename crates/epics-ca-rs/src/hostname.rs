@@ -24,6 +24,8 @@
 //!   paths (`cac::defaultExcep` → `tcpiiu::getHostName`) print exactly that:
 //!   the dotted IP until the engine has answered, the name afterwards.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 

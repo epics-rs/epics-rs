@@ -5,6 +5,13 @@
 //! `ca` link set, and a soft-channel record whose INP is a CA link fetches the
 //! remote PV's value through the monitor-backed cache — the C `dbCa.c` model.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,8 +181,8 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("CADST").await.expect("record exists");
-        let mut inst = rec.write().await;
+        let rec = db.get_record("CADST").expect("record exists");
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -186,8 +193,8 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CADST").await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record("CADST").expect("record exists");
+    let inst = rec.read();
     assert_eq!(
         inst.record.val().and_then(|v| v.to_f64()),
         Some(19.25),
@@ -240,8 +247,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -268,8 +275,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let v = {
-            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(5.0) {
@@ -298,8 +305,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let v = {
-            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(42.0) {
@@ -678,9 +685,8 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                     let rec = config
                         .db
                         .get_record("CALINK:SEAM:HOLDER")
-                        .await
                         .expect("holder loaded via dbLoadRecords");
-                    let inst = rec.read().await;
+                    let inst = rec.read();
                     inst.record.val().and_then(|v| v.to_f64())
                 };
                 if v == Some(5.0) {

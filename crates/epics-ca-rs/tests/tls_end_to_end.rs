@@ -7,6 +7,8 @@
 
 #![cfg(feature = "experimental-rust-tls")]
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not built by default - this file is behind the `experimental-rust-tls` feature.
+
 use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use epics_ca_rs::tls;

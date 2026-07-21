@@ -40,8 +40,8 @@ async fn add_record_runs_the_init_udf_prologue() {
         .await
         .unwrap();
 
-    let inst = db.get_record("AI").await.unwrap();
-    let inst = inst.read().await;
+    let inst = db.get_record("AI").unwrap();
+    let inst = inst.read();
     assert!(inst.common.udf != 0, "a fresh ai is undefined");
     assert_eq!(
         (inst.common.stat, inst.common.sevr),
@@ -66,15 +66,15 @@ async fn add_record_runs_init_record_pass_zero() {
     co.calc = "1".to_string();
     db.add_record("CO_OK", Box::new(co)).await.unwrap();
 
-    let rec = db.get_record("CO_EMPTY").await.unwrap();
+    let rec = db.get_record("CO_EMPTY").unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(-1)),
         "an empty CALC is CALC_ERR_NULL_ARG"
     );
-    let rec = db.get_record("CO_OK").await.unwrap();
+    let rec = db.get_record("CO_OK").unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0)),
         "CALC=\"1\" compiles"
     );
@@ -101,8 +101,8 @@ async fn add_record_runs_the_post_init_udf_tail() {
     db.add_record("HG", Box::new(hg)).await.unwrap();
 
     {
-        let rec = db.get_record("MBD").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("MBD").unwrap();
+        let inst = rec.read();
         assert!(inst.common.udf == 0, "the B0..B1F fold defines the record");
         assert_eq!(
             inst.record.get_field("VAL"),
@@ -111,8 +111,8 @@ async fn add_record_runs_the_post_init_udf_tail() {
         );
     }
     {
-        let rec = db.get_record("HG").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("HG").unwrap();
+        let inst = rec.read();
         assert!(
             inst.common.udf == 0,
             "the constant SVL load defines the histogram at init"

@@ -106,10 +106,10 @@ impl IfaceMap {
     /// migration; cable hot-plug) leaves the snapshot stale, and
     /// any sender that derives a broadcast destination from the
     /// snapshot ends up sending to the wrong subnet.
-    pub fn spawn_refresh(&self, period: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_refresh(&self, period: Duration) -> crate::runtime::task::TaskHandle<()> {
         let me = self.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(period);
+        crate::runtime::task::spawn(async move {
+            let mut tick = crate::runtime::task::interval(period);
             // First tick fires immediately — skip it so we don't
             // refresh twice in a row right after `IfaceMap::new()`
             // (which already populated the snapshot).

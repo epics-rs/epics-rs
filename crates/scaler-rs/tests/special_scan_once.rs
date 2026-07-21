@@ -36,15 +36,15 @@ async fn scaler_db(scan: ScanType) -> PvDatabase {
     rec.init_record(1).unwrap();
     db.add_record("SCAL", Box::new(rec)).await.unwrap();
     {
-        let r = db.get_record("SCAL").await.unwrap();
-        r.write().await.common.scan = scan;
+        let r = db.get_record("SCAL").unwrap();
+        r.write().common.scan = scan;
     }
     db
 }
 
 async fn ss(db: &PvDatabase) -> i16 {
-    let r = db.get_record("SCAL").await.unwrap();
-    let g = r.read().await;
+    let r = db.get_record("SCAL").unwrap();
+    let g = r.read();
     match g.record.get_field("SS").unwrap() {
         EpicsValue::Short(v) => v,
         other => panic!("SS is DBF_SHORT, got {other:?}"),
@@ -100,8 +100,8 @@ async fn r11_c11_passive_scaler_is_processed_once_by_the_put_itself() {
     // the state stays COUNTING. What must NOT happen is the framework
     // *double*-processing the put. Assert on the arm/reset commands the record
     // asked device support for: exactly one count start.
-    let r = db.get_record("SCAL").await.unwrap();
-    let g = r.read().await;
+    let r = db.get_record("SCAL").unwrap();
+    let g = r.read();
     let pcnt = g.record.get_field("PCNT").unwrap();
     assert_eq!(
         pcnt,

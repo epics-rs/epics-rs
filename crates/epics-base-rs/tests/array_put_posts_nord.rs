@@ -65,8 +65,8 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn nord_sub(db: &PvDatabase, rec: &str) -> EventReader {
-    let r = db.get_record(rec).await.unwrap();
-    let mut inst = r.write().await;
+    let r = db.get_record(rec).unwrap();
+    let mut inst = r.write();
     inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
         .unwrap_or_else(|| panic!("{rec}.NORD subscription accepted"))
 }

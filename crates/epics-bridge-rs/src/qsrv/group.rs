@@ -598,15 +598,19 @@ fn get_or_create_struct_array_desc<'a>(
 // Atomic multi-record locking (pvxs DBManyLocker equivalent)
 // ---------------------------------------------------------------------------
 
-/// Acquire read locks on all records backing a group's members, in sorted
-/// order to prevent deadlocks. Corresponds to C++ QSRV `DBManyLocker`
-/// (dbmanylocker.h). Returns guards that hold the locks.
+/// Collect the records backing a group's members, in sorted order to prevent
+/// deadlocks. Corresponds to C++ QSRV `DBManyLocker` (dbmanylocker.h). The
+/// caller acquires the per-record read guards synchronously from these handles:
+/// a `parking_lot` read guard is `!Send`, so it cannot be returned across this
+/// `async fn`'s `.await` boundary. The advisory gate the caller holds over the
+/// same record set keeps that synchronous acquisition uncontended and
+/// deadlock-free (no writer can hold any member's write guard meanwhile).
 async fn lock_group_records_read(
     db: &PvDatabase,
     members: &[GroupMember],
 ) -> Vec<(
     String,
-    tokio::sync::OwnedRwLockReadGuard<epics_base_rs::server::record::RecordInstance>,
+    Arc<parking_lot::RwLock<epics_base_rs::server::record::RecordInstance>>,
 )> {
     // Collect unique record names and sort for deterministic lock order.
     let mut record_names: Vec<String> = members
@@ -620,13 +624,13 @@ async fn lock_group_records_read(
     record_names.sort();
     record_names.dedup();
 
-    let mut guards = Vec::new();
+    let mut records = Vec::new();
     for name in &record_names {
-        if let Some(rec) = db.get_record(name).await {
-            guards.push((name.clone(), rec.read_owned().await));
+        if let Some(rec) = db.get_record(name) {
+            records.push((name.clone(), rec));
         }
     }
-    guards
+    records
 }
 
 /// collect the **canonical** record names backing a group's
@@ -646,10 +650,7 @@ async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> 
             continue; // Structure / Const — no backing record
         }
         let (rec, _) = epics_base_rs::server::database::parse_pv_name(&m.channel);
-        let canonical = db
-            .resolve_alias(rec)
-            .await
-            .unwrap_or_else(|| rec.to_string());
+        let canonical = db.resolve_alias(rec).unwrap_or_else(|| rec.to_string());
         names.push(canonical);
     }
     names.sort();
@@ -859,13 +860,24 @@ impl GroupChannel {
             let member_records = group_member_record_names(&self.db, &self.def.members).await;
             let _many_guard = self.db.lock_records(&member_records).await;
 
-            let guards = lock_group_records_read(&self.db, &self.def.members).await;
+            let member_guards = lock_group_records_read(&self.db, &self.def.members).await;
+            // Acquire every backing record's read guard synchronously, in the
+            // sorted order `member_guards` already carries. The advisory
+            // `_many_guard` gate (held above over the same set) keeps every writer
+            // out of its write guard for this window, so this acquisition is
+            // uncontended and deadlock-free; the guards are consumed synchronously
+            // by `read_member_locked` below and never held across an await.
+            let guards: Vec<(
+                &str,
+                parking_lot::RwLockReadGuard<'_, epics_base_rs::server::record::RecordInstance>,
+            )> = member_guards
+                .iter()
+                .map(|(name, rec)| (name.as_str(), rec.read()))
+                .collect();
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
-            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> = guards
-                .iter()
-                .map(|(name, g)| (name.as_str(), &**g))
-                .collect();
+            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> =
+                guards.iter().map(|(name, g)| (*name, &**g)).collect();
             for member in &self.def.members {
                 // Only `proc` places no value field. A `+type:"structure"`
                 // member emits an empty struct branch (resolved by
@@ -979,10 +991,9 @@ impl GroupChannel {
         let rec = self
             .db
             .get_record(record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         Self::decode_member(member, record_name, field_name, &instance)
     }
 
@@ -1124,10 +1135,9 @@ impl GroupChannel {
         let rec = self
             .db
             .get_record(record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         let field_upper = field_name.to_ascii_uppercase();
         let resolved = instance.client_field_value(&field_upper);
         let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, resolved.as_ref());
@@ -1151,11 +1161,11 @@ impl GroupChannel {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
 
-        let rec = match self.db.get_record(record_name).await {
+        let rec = match self.db.get_record(record_name) {
             Some(r) => r,
             None => return DbFieldType::Double,
         };
-        let instance = rec.read().await;
+        let instance = rec.read();
         let field_upper = field_name.to_ascii_uppercase();
         instance
             .client_field_value(&field_upper)
@@ -1193,8 +1203,8 @@ impl GroupChannel {
         // have loaded (the dbChannel creation would have failed); fall back
         // to record-type-blind name classification, which still catches the
         // unambiguous link families.
-        let record_type: &'static str = match self.db.get_record(record_name).await {
-            Some(rec) => rec.read().await.record.record_type(),
+        let record_type: &'static str = match self.db.get_record(record_name) {
+            Some(rec) => rec.read().record.record_type(),
             None => "",
         };
         dbf_link_class(record_type, field_name).is_some()
@@ -1261,10 +1271,10 @@ impl GroupChannel {
     async fn member_is_char_array(&self, member: &GroupMember) -> bool {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
-        let Some(rec) = self.db.get_record(record_name).await else {
+        let Some(rec) = self.db.get_record(record_name) else {
             return false;
         };
-        let instance = rec.read().await;
+        let instance = rec.read();
         matches!(
             instance.client_field_value(&field_name.to_ascii_uppercase()),
             Some(epics_base_rs::types::EpicsValue::CharArray(_))
@@ -4020,8 +4030,8 @@ mod tests {
             // precisely so no site outside the owner can open or close the
             // window (the wave-16 regression that stranded a parked put-notify).
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
-                let inst = rec.write().await;
+                let rec = db.get_record("PACT:rec").unwrap();
+                let inst = rec.write();
                 inst.enter_pact();
             }
             channel
@@ -4029,8 +4039,8 @@ mod tests {
                 .await
                 .expect("a group PUT onto an active record is not an error");
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
-                let inst = rec.read().await;
+                let rec = db.get_record("PACT:rec").unwrap();
+                let inst = rec.read();
                 assert!(
                     inst.common.rpro != 0,
                     "an active record takes the RPRO deferral (atomic={atomic})"
@@ -4048,8 +4058,8 @@ mod tests {
 
             // IDLE — the other side of the same boundary.
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
-                let mut inst = rec.write().await;
+                let rec = db.get_record("PACT:rec").unwrap();
+                let mut inst = rec.write();
                 // The release carries any put-notify parked on the window; this
                 // test parks none (a group PUT, not a put-callback), so there is
                 // nothing for the token to hand back.
@@ -4061,8 +4071,8 @@ mod tests {
                 .await
                 .expect("group PUT on an idle record processes");
             {
-                let rec = db.get_record("PACT:rec").await.unwrap();
-                let inst = rec.read().await;
+                let rec = db.get_record("PACT:rec").unwrap();
+                let inst = rec.read();
                 assert!(
                     inst.common.rpro == 0,
                     "an idle record processes now, it does not defer (atomic={atomic})"
@@ -4516,13 +4526,7 @@ mod tests {
 
         // "Unable to put value: Field Disabled: S_db_putDisabled" — the
         // member's backing record is DISP-disabled (doPreProcessing).
-        db.get_record("MSG:rec")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .disp = 1;
+        db.get_record("MSG:rec").unwrap().write().common.disp = 1;
         let disabled = GroupChannel::new(db.clone(), group_of(putable));
         let err = disabled
             .put(&v)
@@ -4738,35 +4742,36 @@ mod tests {
         mon.start().await.expect("group monitor starts");
 
         // FR-6: plain member subscribes its configured RVAL field, not VAL.
-        let plain = db.get_record("R:plain").await.unwrap();
-        let plain_inst = plain.read().await;
-        assert!(
-            plain_inst.subscribers.contains_key("RVAL"),
-            "plain member must subscribe its configured field RVAL"
-        );
-        assert!(
-            !plain_inst.subscribers.contains_key("VAL"),
-            "plain member must NOT subscribe the record-default VAL"
-        );
-        // FR-7: a plain (non-meta) member has exactly one value
-        // subscription (no property sub) with VALUE|ALARM|LOG.
-        let rval_subs = &plain_inst.subscribers["RVAL"];
-        assert_eq!(
-            rval_subs.len(),
-            1,
-            "plain mapping opens only the value subscription"
-        );
-        assert_eq!(
-            rval_subs[0].mask,
-            (EventMask::VALUE | EventMask::ALARM | EventMask::LOG).bits(),
-            "non-meta value mask must be VALUE|ALARM|LOG"
-        );
-        drop(plain_inst);
+        let plain = db.get_record("R:plain").unwrap();
+        {
+            let plain_inst = plain.read();
+            assert!(
+                plain_inst.subscribers.contains_key("RVAL"),
+                "plain member must subscribe its configured field RVAL"
+            );
+            assert!(
+                !plain_inst.subscribers.contains_key("VAL"),
+                "plain member must NOT subscribe the record-default VAL"
+            );
+            // FR-7: a plain (non-meta) member has exactly one value
+            // subscription (no property sub) with VALUE|ALARM|LOG.
+            let rval_subs = &plain_inst.subscribers["RVAL"];
+            assert_eq!(
+                rval_subs.len(),
+                1,
+                "plain mapping opens only the value subscription"
+            );
+            assert_eq!(
+                rval_subs[0].mask,
+                (EventMask::VALUE | EventMask::ALARM | EventMask::LOG).bits(),
+                "non-meta value mask must be VALUE|ALARM|LOG"
+            );
+        }
 
         // FR-7: meta member value subscription is ALARM-only; the
         // PROPERTY subscription is retained on the same field.
-        let meta = db.get_record("R:meta").await.unwrap();
-        let meta_inst = meta.read().await;
+        let meta = db.get_record("R:meta").unwrap();
+        let meta_inst = meta.read();
         let val_subs = &meta_inst.subscribers["VAL"];
         let masks: Vec<u16> = val_subs.iter().map(|s| s.mask).collect();
         assert!(

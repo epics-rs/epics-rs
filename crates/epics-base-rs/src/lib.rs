@@ -37,6 +37,10 @@ pub use async_trait::async_trait;
 
 pub mod calc;
 pub mod error;
+// The async UDP net stack (`tokio::net` + `socket2` + `if-addrs`) is host-only:
+// its deps do not build for RTEMS, and the RTEMS CA server uses the separate
+// S1 raw-libc socket driver, not this module. Gated out for the RTEMS target.
+#[cfg(not(target_os = "rtems"))]
 pub mod net;
 pub mod runtime;
 pub mod server;

@@ -68,8 +68,8 @@ fn mbbo_three_states() -> Box<dyn Record> {
 }
 
 async fn val_of(db: &PvDatabase, name: &str) -> EpicsValue {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.record.get_field("VAL").unwrap()
 }
 

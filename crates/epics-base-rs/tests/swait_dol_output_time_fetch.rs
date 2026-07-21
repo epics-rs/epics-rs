@@ -57,17 +57,16 @@ async fn swait_db(dopt: i16, doln: &str, oopt: i16, odly: f32) -> PvDatabase {
     db.add_record("W", Box::new(w)).await.unwrap();
 
     // OUT routes through RecordInstance::put_common_field (populates parsed_out).
-    let r = db.get_record("W").await.unwrap();
+    let r = db.get_record("W").unwrap();
     r.write()
-        .await
         .put_common_field("OUT", EpicsValue::String("W_TGT".into()))
         .unwrap();
     db
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).and_then(|v| v.to_f64())
 }
 

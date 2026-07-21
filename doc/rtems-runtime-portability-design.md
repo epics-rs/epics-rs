@@ -340,11 +340,47 @@ but reusing the blocking driver avoids writing a reactor at all. **RTEMS
 confirmed as a committed target 2026-07-20 → the sync-CA deep cut (§6) is the
 adopted path.**
 
+### 8.1.1 Applied gating — `epics-base-rs` (2026-07-20)
+
+`cargo +nightly check -p epics-base-rs --lib -Zbuild-std=std,panic_abort
+--target armv7-rtems-eabihf` now **exits 0** (no warnings). The `--lib` gate was
+walked one failing crate at a time; each wall and the gate that closed it:
+
+| Crate (ver) | Error class | Dependency path (from `epics-base-rs`) | Gate applied |
+|---|---|---|---|
+| nix 0.31.3 | 21 errs — no `sa_sigaction`/`SA_RESTART` in RTEMS libc | `nix ← rustyline` (direct) | `rustyline` → `[target.'cfg(not(target_os="rtems"))'.dependencies]`; `Iocsh::run_repl_interactive` (+ helpers `use_ansi_color`/`strip_ansi`/`format_error`) gated `cfg(not rtems)`; `run_repl` falls through to the existing piped-stdin REPL on RTEMS |
+| if-addrs 0.13.4 | 2 errs — no `getifaddrs`/`ifaddrs` | `if-addrs ← epics-base-rs` (direct) | `if-addrs` → host-only dep (used only by `net::iface_map`) |
+| socket2 0.5/0.6 | 20 errs — no `SOCK_RAW`/`msghdr`/cmsg | `socket2 ← epics-base-rs` (direct) **and** `socket2 ← tokio (net)` | `socket2` → host-only dep; `#[cfg(not(target_os="rtems"))] pub mod net` (no in-crate users outside `src/net`); tokio `net` feature dropped (below) |
+| mio 1.2.0 | 29 errs — no epoll/kqueue selector (`sys::selector`/`waker`/`event`, `IoSourceState`) | `mio ← tokio (net, signal)` | tokio declared per-target; RTEMS drops `net`/`signal`/`process` |
+| signal-hook-registry 1.4.8 | 4 errs — no `SA_RESTART`/`sa_sigaction` | `signal-hook-registry ← tokio (signal)` | RTEMS tokio drops `signal`; the `tokio::signal` SIGINT/SIGTERM race in `IocApplication::run` becomes `std::future::pending()` on RTEMS (RTEMS is `cfg(unix)` too, so the guard is `all(unix, not(target_os="rtems"))`) |
+
+**tokio per-target split.** Declared per-target rather than in shared
+`[dependencies]` because Cargo *unions* a dependency's features across all
+matching tables (a shared `full` would re-add the dropped features on RTEMS).
+Hosted keeps `full`; RTEMS gets `default-features=false` with
+`rt, rt-multi-thread, time, sync, macros, io-util, io-std, fs, parking_lot`
+— `full` minus `net`/`signal`/`process`. This retained set (larger than the
+"`sync`-only" first estimate) keeps every non-net tokio API the always-compiled
+base code references — `tokio::runtime::Handle`, `block_in_place`, `select!`,
+`pin!`, `tokio::sync::*` — type-checking on RTEMS with **no code gating** of the
+sync bridge (`block_on_sync`), `runtime_handle`, iocsh runtime dispatch, or
+`IocApplication::run`. Those tokio-runtime paths are unused on RTEMS (the sans-io
+task seam routes spawn/sleep/interval to the background executor) but must still
+compile for `--lib`. **Open decision for sign-off:** whether to narrow the RTEMS
+tokio set further (toward `sync`-only) once the RTEMS IOC entry point exists and
+those runtime paths are provably unreachable — narrowing would require gating the
+above always-compiled call sites, so it is deferred, not silently chosen.
+
+**Scope note.** This closes the `epics-base-rs --lib` walls only. The §8.1
+core-network blockers (socket2/if-addrs raw-libc replacements, getrandom) are
+**gated out** of base here, not solved — they return when the RTEMS CA/PVA
+socket driver (§9 phase 3/5) is first built for the target.
+
+
 ### 8.1.2 Applied gating — `epics-pva-rs` (2026-07-21)
 
-(The §8.1.1 counterpart — the same wall-walk for `epics-base-rs` — lives on the
-unmerged CA branch `caucus/WG0SFREHPX/ca-sans-io-1962c8be-1`; see the
-integration note at the end of this subsection.)
+(The §8.1.1 counterpart — the same wall-walk for `epics-base-rs` — is above;
+it landed with the CA branch.)
 
 On branch `phase6/pva-rtems-dep-gate` (commits `bc7c8f53`, `8f12cf30`,
 `73d3ec39`, `1906c7cb`, atop items 1/2), `cargo +nightly check -p epics-pva-rs

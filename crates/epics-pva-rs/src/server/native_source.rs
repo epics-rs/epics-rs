@@ -82,8 +82,8 @@ impl PvDatabaseSource {
             let db = asg_db.clone();
             Box::pin(async move {
                 let (base, _field) = parse_pv_name(&pv_name);
-                if let Some(rec) = db.get_record(base).await {
-                    let inst = rec.read().await;
+                if let Some(rec) = db.get_record(base) {
+                    let inst = rec.read();
                     return (inst.common.access_group().to_string(), inst.common.asl);
                 }
                 ("DEFAULT".to_string(), 0u8)
@@ -98,8 +98,8 @@ impl PvDatabaseSource {
             Box::pin(async move {
                 let (base, field) = parse_pv_name(&link);
                 let field = if field.is_empty() { "VAL" } else { field };
-                let rec = db.get_record(base).await?;
-                let inst = rec.read().await;
+                let rec = db.get_record(base)?;
+                let inst = rec.read();
                 inst.resolve_field(field).and_then(|v| v.to_f64())
             })
         });
@@ -571,9 +571,9 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
     let (_base, field) = parse_pv_name(name);
     match db.find_entry(name).await? {
-        PvEntry::Simple(pv) => Some(pv.snapshot().await),
+        PvEntry::Simple(pv) => Some(pv.snapshot()),
         PvEntry::Record(rec) => {
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field(field)
         }
     }
@@ -593,7 +593,7 @@ impl ChannelSource for PvDatabaseSource {
             // a PVA client doing channelList must see them so it can
             // connect by alias. has_name and find_entry already
             // resolve aliases on the server side.
-            names.extend(db.all_alias_names().await);
+            names.extend(db.all_alias_names());
             names
         }
     }
@@ -728,7 +728,7 @@ impl ChannelSource for PvDatabaseSource {
             // processing, and the client cannot stamp them.
             match db.find_entry(&name).await {
                 Some(PvEntry::Simple(pv)) => {
-                    let prior = pv.snapshot().await;
+                    let prior = pv.snapshot();
                     let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
                         OpError::failed("PUT value not representable as EpicsValue")
                     })?;
@@ -922,7 +922,7 @@ impl ChannelSource for PvDatabaseSource {
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
                         Some(mut sub) => {
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            let initial = snapshot_to_pv_field(&pv.snapshot());
                             tokio::spawn(async move {
                                 if tx.send(initial).await.is_err() {
                                     return;
@@ -941,7 +941,7 @@ impl ChannelSource for PvDatabaseSource {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
                             // the current value.
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
+                            let initial = snapshot_to_pv_field(&pv.snapshot());
                             let _ = tx.send(initial).await;
                         }
                     }
@@ -2316,8 +2316,8 @@ ASG(SECURE) {
             .await
             .unwrap();
         // Mark the record as belonging to the SECURE ASG.
-        let rec = db.get_record("AI:SECURE").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        let rec = db.get_record("AI:SECURE").unwrap();
+        rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -2372,8 +2372,8 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LOCKED").await.unwrap();
-        rec.write().await.common.asg = "LOCKED".to_string();
+        let rec = db.get_record("AI:LOCKED").unwrap();
+        rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -2412,8 +2412,8 @@ ASG(LOCKED) {
         db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:MON").await.unwrap();
-        rec.write().await.common.asg = "LOCKED".to_string();
+        let rec = db.get_record("AI:MON").unwrap();
+        rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -2455,8 +2455,8 @@ ASG(SECURE) {
         db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LIVE").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        let rec = db.get_record("AI:LIVE").unwrap();
+        rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
 
@@ -2542,13 +2542,7 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
@@ -3055,13 +3049,7 @@ ASG(DEFAULT) {
         // ASL is a u8; the parser clamps to 0/1 via put_common_field,
         // but the underlying field accepts any u8 — set it directly
         // for the test to exercise the gate above C's 0/1 range.
-        db.get_record("AI:LOCKED")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .asl = 3;
+        db.get_record("AI:LOCKED").unwrap().write().common.asl = 3;
 
         db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
             .await

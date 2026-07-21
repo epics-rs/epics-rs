@@ -45,18 +45,17 @@ async fn caput_val(db: &PvDatabase, text: &str) {
 }
 
 async fn stored_val(db: &PvDatabase) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field("VAL").unwrap()
 }
 
 /// Subscribe a VALUE|LOG monitor on `REC.VAL`, drive the oracle's put sequence,
 /// and return the number of value events delivered (must be 0).
 async fn per_put_value_events(db: &PvDatabase) -> usize {
-    let inst = db.get_record("REC").await.unwrap();
+    let inst = db.get_record("REC").unwrap();
     let mut rx = inst
         .write()
-        .await
         .add_subscriber(
             "VAL",
             1,

@@ -161,8 +161,8 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
     db.add_record(name, Box::new(rec)).await.unwrap();
 
     let mut rx = {
-        let inst = db.get_record(name).await.unwrap();
-        let mut inst = inst.write().await;
+        let inst = db.get_record(name).unwrap();
+        let mut inst = inst.write();
         inst.add_subscriber("VAL", 1, DbFieldType::String, EventMask::VALUE.bits())
             .unwrap()
     };

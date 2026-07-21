@@ -73,7 +73,7 @@ points:
 2. **`unsafe { &*self.0 }`**: dereferences the pointer in `Drop`.
    Justified by the lifetime of the parent `RecordInstance` strictly
    outliving the guard (the record sits inside an
-   `Arc<RwLock<RecordInstance>>` for the duration of the call).
+   `Arc<parking_lot::RwLock<RecordInstance>>` for the duration of the call).
 
 Both blocks have SAFETY comments since this audit. There's no easy
 way to express the lifetime relationship purely in safe Rust without

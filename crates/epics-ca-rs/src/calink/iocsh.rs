@@ -5,6 +5,8 @@
 //! record-link resolver reads cached monitor values without a blocking
 //! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -74,14 +76,7 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                 resolver.link_count()
             ));
             if let Some(rec) = target {
-                let db = ctx.db().clone();
-                let handle = ctx.runtime_handle().clone();
-                let rec_clone = rec.clone();
-                let links = std::thread::spawn(move || {
-                    handle.block_on(async move { db.record_link_fields(&rec_clone).await })
-                })
-                .join()
-                .unwrap_or_default();
+                let links = ctx.db().record_link_fields(&rec);
                 if links.is_empty() {
                     ctx.println(&format!(
                         "  '{rec}': no link fields found (or record missing)"
@@ -92,8 +87,8 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                         if let epics_base_rs::server::record::ParsedLink::Ca(ca) = parsed {
                             let name = ca.pv;
                             // The lset is async; this iocsh command is sync, so
-                            // its state is read through the same off-runtime
-                            // thread the record-field lookup above uses.
+                            // its state is read on an off-runtime thread that
+                            // blocks on the async link-set accessors.
                             let r = resolver.clone();
                             let n = name.clone();
                             let h = ctx.runtime_handle().clone();

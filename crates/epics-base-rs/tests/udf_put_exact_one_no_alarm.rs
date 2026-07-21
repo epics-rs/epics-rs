@@ -36,8 +36,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) {
 
 /// `(SEVR, STAT, udf byte)` after the put.
 async fn state(db: &PvDatabase) -> (AlarmSeverity, u16, u8) {
-    let inst = db.get_record("REC").await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record("REC").unwrap();
+    let g = inst.read();
     (g.common.sevr, g.common.stat, g.common.udf)
 }
 

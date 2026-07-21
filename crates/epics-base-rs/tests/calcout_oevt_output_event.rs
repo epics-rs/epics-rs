@@ -63,8 +63,8 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         .await
         .unwrap();
     {
-        let r = db.get_record(name).await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record(name).unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = evnt.to_string();
     }
@@ -143,8 +143,8 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     // Precondition: INVALID cycle, and output WOULD be due — so only the IVOA
     // gate stands between OEVT and the post.
     {
-        let rec = db.get_record("CALC_DD").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("CALC_DD").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.common.sevr,
             AlarmSeverity::Invalid,

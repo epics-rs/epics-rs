@@ -213,18 +213,16 @@ impl ThrottleRecord {
             tokio::task::yield_now().await;
             // OUT is written to, SINP is read from — the classifier answers a
             // CONSTANT link's field-type code by direction.
-            let (ov, _) = classify_link(&handle, &out, LinkRole::Output).await;
-            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input).await;
+            let (ov, _) = classify_link(&handle, &out, LinkRole::Output);
+            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input);
             if link_gen.is_current(token) {
-                let _ = handle
-                    .post_fields(
-                        &name,
-                        vec![
-                            ("OV".to_string(), EpicsValue::Short(ov)),
-                            ("SIV".to_string(), EpicsValue::Short(siv)),
-                        ],
-                    )
-                    .await;
+                let _ = handle.post_fields(
+                    &name,
+                    vec![
+                        ("OV".to_string(), EpicsValue::Short(ov)),
+                        ("SIV".to_string(), EpicsValue::Short(siv)),
+                    ],
+                );
             }
         });
     }
@@ -264,7 +262,7 @@ impl ThrottleRecord {
             }
             // C posts SYNC=Idle last (throttleRecord.c:651).
             fields.push(("SYNC".to_string(), EpicsValue::Short(THROTTLE_SYNC_IDLE)));
-            let _ = handle.post_fields(&name, fields).await;
+            let _ = handle.post_fields(&name, fields);
         });
     }
 

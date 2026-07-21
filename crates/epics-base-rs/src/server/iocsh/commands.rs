@@ -163,9 +163,9 @@ fn cmd_dbl() -> CommandDef {
 
             for name in &names {
                 if let Some(filter) = type_filter {
-                    let rec = ctx.block_on(ctx.db().get_record(name));
+                    let rec = ctx.db().get_record(name);
                     if let Some(rec) = rec {
-                        let inst = ctx.block_on(rec.read());
+                        let inst = rec.read();
                         if inst.record.record_type() != filter {
                             continue;
                         }
@@ -249,8 +249,8 @@ fn cmd_dbpf() -> CommandDef {
 
             // Try to determine the field type for proper parsing
             let dbf_type = ctx.block_on(async {
-                if let Some(rec) = ctx.db().get_record(base).await {
-                    let inst = rec.read().await;
+                if let Some(rec) = ctx.db().get_record(base) {
+                    let inst = rec.read();
                     // Check record-specific fields
                     if let Some(t) = crate::server::record::record_instance::declared_field_type_of(
                         inst.record.as_ref(),
@@ -295,7 +295,7 @@ fn cmd_dbpf() -> CommandDef {
             // the record. Fall back to put_pv for simple PVs.
             let put_result: CaResult<()> = ctx.block_on(async {
                 let db = ctx.db();
-                if db.get_record(base).await.is_some() {
+                if db.get_record(base).is_some() {
                     db.put_record_field_from_ca_no_notify(base, &field, value)
                         .await
                 } else {
@@ -359,19 +359,25 @@ fn cmd_dbpr() -> CommandDef {
             };
 
             let rec = ctx
-                .block_on(ctx.db().get_record(name))
+                .db()
+                .get_record(name)
                 .ok_or_else(|| format!("record '{}' not found", name))?;
 
             // Collect field values inside lock, format outside
             let fields: Vec<(String, String)> = ctx.block_on(async {
-                let inst = rec.read().await;
+                // Record name for the alias query, read under a short-lived
+                // guard that is dropped (block close) before the field reads
+                // below take their own `rec.read()`.
+                let rec_name = { rec.read().name.clone() };
+                let aliases = ctx.db().aliases_for_record(&rec_name);
+
+                let inst = rec.read();
                 let mut fields = Vec::new();
 
                 // Level 0: NAME, RTYP, VAL (+ alias names if any —
                 // base's dbpr surfaces aliases here so admins know
                 // every spelling that resolves to this record).
                 fields.push(("NAME".to_string(), inst.name.clone()));
-                let aliases = ctx.db().aliases_for_record(&inst.name).await;
                 if !aliases.is_empty() {
                     fields.push(("ALIASES".to_string(), aliases.join(", ")));
                 }
@@ -490,7 +496,7 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // for simple PVs the field-dump branch silently
     // skips since they're not records.
     let mut names = ctx.block_on(ctx.db().all_record_names());
-    names.extend(ctx.block_on(ctx.db().all_alias_names()));
+    names.extend(ctx.db().all_alias_names());
     names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
     names.sort();
     names.dedup();
@@ -506,8 +512,8 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
             continue;
         }
         // Dump each requested field for this record.
-        if let Some(rec_arc) = ctx.block_on(ctx.db().get_record(name)) {
-            let inst = ctx.block_on(rec_arc.read());
+        if let Some(rec_arc) = ctx.db().get_record(name) {
+            let inst = rec_arc.read();
             for fname in &fields {
                 let value = inst
                     .record
@@ -545,7 +551,7 @@ fn cmd_dbsr() -> CommandDef {
         "dbsr [interest level] — Database Server Report (served-channel statistics)",
         |_args: &[ArgValue], ctx: &CommandContext| {
             let records = ctx.block_on(ctx.db().all_record_names());
-            let aliases = ctx.block_on(ctx.db().all_alias_names());
+            let aliases = ctx.db().all_alias_names();
             let simple = ctx.block_on(ctx.db().all_simple_pv_names());
             ctx.println("Database Server Report");
             ctx.println(&format!("  Records served:     {}", records.len()));
@@ -788,7 +794,7 @@ fn cmd_db_create_record() -> CommandDef {
                 ctx.println(&format!("dbCreateRecord: {e}"));
                 return Ok(CommandOutcome::Continue);
             }
-            if ctx.block_on(ctx.db().get_record(&name)).is_some() {
+            if ctx.db().get_record(&name).is_some() {
                 ctx.println(&format!("dbCreateRecord: record '{name}' already exists"));
                 return Ok(CommandOutcome::Continue);
             }
@@ -1146,8 +1152,8 @@ async fn install_record_defs(
             // included NDArrayBase.template). A different
             // record_type is fatal. `dbRecordsOnceOnly` global
             // is not yet wired; tighten here if/when needed.
-            let existing = if let Some(rec) = ctx.db().get_record(&def.name).await {
-                let r = rec.read().await;
+            let existing = if let Some(rec) = ctx.db().get_record(&def.name) {
+                let r = rec.read();
                 let existing_type = r.record.record_type();
                 if existing_type != def.record_type {
                     return Err(format!(
@@ -1167,7 +1173,7 @@ async fn install_record_defs(
                 // Merge: apply field overrides directly to the
                 // existing record instance.
                 {
-                    let mut inst = rec_arc.write().await;
+                    let mut inst = rec_arc.write();
                     if let Err(e) =
                         db_loader::apply_fields(&mut inst.record, &def.fields, &mut common_fields)
                     {
@@ -1198,7 +1204,7 @@ async fn install_record_defs(
                 if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
                     return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
                 }
-                ctx.db().get_record(&def.name).await.ok_or_else(|| {
+                ctx.db().get_record(&def.name).ok_or_else(|| {
                     format!(
                         "dbLoadRecords: '{}' vanished between add_record and get_record",
                         def.name
@@ -1227,41 +1233,46 @@ async fn install_record_defs(
             // after. A fresh record took that ordering from the sink
             // and must not run the passes twice.
             if is_merge {
-                let mut instance = rec_arc.write().await;
-                // info(key, value) directives — last write
-                // wins. Populated before common-field application
-                // so device support seeing `init_record` can
-                // observe info tags.
-                for (k, v) in &def.info_tags {
-                    instance.set_info(k, v);
+                {
+                    let mut instance = rec_arc.write();
+                    // info(key, value) directives — last write
+                    // wins. Populated before common-field application
+                    // so device support seeing `init_record` can
+                    // observe info tags.
+                    for (k, v) in &def.info_tags {
+                        instance.set_info(k, v);
+                    }
                 }
                 for (name, value) in common_fields {
                     use crate::server::record::CommonFieldPutResult;
                     // `.db` load: C's loader converter, whose menu
                     // bound differs from a runtime dbPut's
                     // (`dbStaticRun.c::dbPutStringNum`).
-                    match instance.put_common_field_db_load(&name, value) {
+                    // The record data lock is scoped per field so it is
+                    // down before `update_scan_index` re-enters the
+                    // database — the same rule as `field_io`'s put path;
+                    // the data lock is not the processing-exclusion
+                    // mechanism, so the per-field release is a bounded,
+                    // `.await`-free window.
+                    let put = rec_arc.write().put_common_field_db_load(&name, value);
+                    match put {
                         Ok(CommonFieldPutResult::ScanChanged {
                             old_scan,
                             new_scan,
                             phas,
                         }) => {
-                            drop(instance);
                             ctx.db()
                                 .update_scan_index(&def.name, old_scan, new_scan, phas, phas)
                                 .await;
-                            instance = rec_arc.write().await;
                         }
                         Ok(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
                             new_phas,
                         }) => {
-                            drop(instance);
                             ctx.db()
                                 .update_scan_index(&def.name, scan, scan, old_phas, new_phas)
                                 .await;
-                            instance = rec_arc.write().await;
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {
@@ -1282,7 +1293,7 @@ async fn install_record_defs(
                 // alternative (skip init on merge) silently
                 // ignored field overrides that affect init —
                 // worse for typical use.
-                instance.run_init_passes(&def.name);
+                rec_arc.write().run_init_passes(&def.name);
             }
             {
                 // Hand the record its resolved common link fields so
@@ -1291,7 +1302,7 @@ async fn install_record_defs(
                 // the common OUT link is applied by the sink, after
                 // `set_async_context`. Defaulted no-op for records
                 // that do not classify common links.
-                let mut instance = rec_arc.write().await;
+                let mut instance = rec_arc.write();
                 let inst = &mut *instance;
                 inst.record.init_links(&inst.common);
             }
@@ -1299,7 +1310,7 @@ async fn install_record_defs(
             // `dbLoadLinkArray` from every soft INPUT dev support's
             // `init_record` — the only site that loads a constant INP
             // into the record's value.
-            ctx.db().rec_gbl_init_constant_links(&rec_arc).await;
+            ctx.db().rec_gbl_init_constant_links(&rec_arc);
             // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
             // &sval)`, run from every SIML-bearing `init_record`
             // (pass 1) — the only site that loads a constant
@@ -1309,7 +1320,7 @@ async fn install_record_defs(
             // (histogramRecord.c:168) — arms the SDEL monitor
             // watchdog; a re-arm supersedes the previous one, which is
             // what the merge re-init above needs.
-            ctx.db().arm_watchdog(&def.name).await;
+            ctx.db().arm_watchdog(&def.name);
             Ok(())
         }
         .await;
@@ -1750,8 +1761,8 @@ async fn suggest_field_name(
     typo: &str,
 ) -> Option<String> {
     let typo_uc = typo.to_ascii_uppercase();
-    let rec = db.get_record(record_name).await?;
-    let inst = rec.read().await;
+    let rec = db.get_record(record_name)?;
+    let inst = rec.read();
     let mut candidates: Vec<&str> = inst.record.field_list().iter().map(|d| d.name).collect();
     // Common dbCommon fields are also valid PUT targets.
     candidates.extend([
@@ -2008,8 +2019,8 @@ record(bo, "$(P)_calc_ctrl") {{
 
         let dtyp_of = |name: &str| -> String {
             ctx.block_on(async {
-                let rec = db.get_record(name).await.expect("record loaded");
-                let inst = rec.read().await;
+                let rec = db.get_record(name).expect("record loaded");
+                let inst = rec.read();
                 inst.common.dtyp.clone()
             })
         };
@@ -2084,8 +2095,8 @@ record(bo, "$(P)_calc_ctrl") {{
 
         // The device-support NAME landed on the record's DTYP.
         let dtyp = ctx.block_on(async {
-            let rec = db.get_record("DEV").await.expect("record present");
-            let inst = rec.read().await;
+            let rec = db.get_record("DEV").expect("record present");
+            let inst = rec.read();
             inst.common.dtyp.clone()
         });
         assert_eq!(dtyp, "Async Soft Channel");
@@ -2132,8 +2143,8 @@ record(bo, "$(P)_calc_ctrl") {{
         // The contributed NAME is what landed on DTYP — not NoChange, not a
         // stale value.
         let dtyp = ctx.block_on(async {
-            let rec = db.get_record("CONTRIB").await.expect("record present");
-            let inst = rec.read().await;
+            let rec = db.get_record("CONTRIB").expect("record present");
+            let inst = rec.read();
             inst.common.dtyp.clone()
         });
         assert_eq!(dtyp, "Dbpf Contributed Probe");
@@ -2242,9 +2253,8 @@ record(mbbo, "DUP:CM") {{
         ctx.block_on(async {
             let rec = db
                 .get_record("DUP:CM")
-                .await
                 .expect("DUP:CM must be registered exactly once");
-            let inst = rec.read().await;
+            let inst = rec.read();
             // Last-write-wins: DESC + ZRST should reflect the SECOND
             // record block. ONST stays from the FIRST block since
             // the second didn't override it.
@@ -2313,8 +2323,8 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
         ));
 
         ctx.block_on(async {
-            let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
-            let mut inst = rec.write().await;
+            let rec = db.get_record("BPT:RBK").expect("BPT:RBK exists");
+            let mut inst = rec.write();
             // The merge resolved "ramp" (non-standard) to the first user-table
             // index (15); standard menuConvert names reserve 3..=14.
             assert_eq!(
@@ -2381,8 +2391,8 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
         ));
 
         ctx.block_on(async {
-            let rec = db.get_record("A:BPT").await.expect("A:BPT exists");
-            let mut inst = rec.write().await;
+            let rec = db.get_record("A:BPT").expect("A:BPT exists");
+            let mut inst = rec.write();
             inst.record
                 .put_field("RVAL", crate::types::EpicsValue::Long(50))
                 .unwrap();
@@ -2472,7 +2482,7 @@ record(mbbo, "DUP:CM") {{
     }
 
     fn exists(db: &PvDatabase, ctx: &CommandContext, name: &str) -> bool {
-        ctx.block_on(async { db.get_record(name).await.is_some() })
+        ctx.block_on(async { db.get_record(name).is_some() })
     }
 
     /// Boundary: LOAD phase (pre-`iocInit`). Both creators work — the control
@@ -2673,7 +2683,7 @@ record(mbboDirect, "MBD0") {{ }}
         ctx.block_on(async {
             let udf = |name: &'static str| {
                 let db = db.clone();
-                async move { db.get_record(name).await.unwrap().read().await.common.udf != 0 }
+                async move { db.get_record(name).unwrap().read().common.udf != 0 }
             };
             assert!(
                 !udf("HG").await,
@@ -2684,13 +2694,7 @@ record(mbboDirect, "MBD0") {{ }}
                 "mbboDirect: the B0..B1F fold clears UDF at init (softIoc: UDF 0)"
             );
             assert_eq!(
-                db.get_record("MBD")
-                    .await
-                    .unwrap()
-                    .read()
-                    .await
-                    .record
-                    .get_field("VAL"),
+                db.get_record("MBD").unwrap().read().record.get_field("VAL"),
                 Some(crate::types::EpicsValue::Long(5)),
                 "B0|B2 folds into VAL=5"
             );

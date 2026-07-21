@@ -20,6 +20,8 @@
 //! you've cleared the network policy explicitly. There is no auth —
 //! treat this like `/proc`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

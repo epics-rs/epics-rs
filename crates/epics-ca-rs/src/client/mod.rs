@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
+
 mod beacon_monitor;
 mod circuit_breaker;
 mod search;
@@ -435,10 +437,15 @@ pub struct CaClient {
     /// [`CaClient::set_user_name`] / [`CaClient::set_host_name`] mutate it
     /// and notify already-connected circuits out of band.
     client_identity: types::ClientIdentitySlot,
-    _coordinator: tokio::task::JoinHandle<()>,
-    _search_task: tokio::task::JoinHandle<()>,
-    _transport_task: tokio::task::JoinHandle<()>,
-    _beacon_task: tokio::task::JoinHandle<()>,
+    // The spawned client background tasks. Typed as the `runtime::task`
+    // seam handle (not a bare `tokio::JoinHandle`) because they are spawned
+    // through `runtime::task::spawn`; under the hosted default this alias IS
+    // `tokio::task::JoinHandle`, and under the `rtems-exec-model` backend it
+    // is the executor's `JoinFuture`, so the field type follows the seam.
+    _coordinator: epics_base_rs::runtime::task::TaskHandle<()>,
+    _search_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _transport_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _beacon_task: epics_base_rs::runtime::task::TaskHandle<()>,
     /// Discovery backends retained for their lifetime. mDNS's
     /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
     /// runs only while the backend is alive — dropping it kills live
@@ -448,7 +455,7 @@ pub struct CaClient {
     /// `subscribe()` stream and feed `DiscoveryEvent`s into the
     /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
     /// drop so they don't outlive the client.
-    _discovery_forwarders: Vec<tokio::task::JoinHandle<()>>,
+    _discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -756,7 +763,8 @@ impl CaClient {
         // never discovered. The `backends` Vec — and the `ServiceDaemon`
         // an `MdnsBackend` owns — is retained on `CaClient` so the
         // browse keeps running for the client's lifetime.
-        let mut discovery_forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>> =
+            Vec::new();
         for backend in &backends {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
@@ -3206,7 +3214,8 @@ impl Drop for MonitorHandle {
 #[must_use = "dropping the EventWatcher immediately stops the watcher task; \
               bind it to a variable to keep watching"]
 pub struct EventWatcher {
-    handle: tokio::task::JoinHandle<()>,
+    // Spawned via `runtime::task::spawn`; seam handle (see `ServerConnection`).
+    handle: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 impl EventWatcher {
@@ -5736,6 +5745,26 @@ mod event_watcher_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Wait for a condition driven by *another* executor.
+    ///
+    /// These tests run on a `current_thread` tokio runtime but the watcher
+    /// task runs on whatever backend the `runtime::task` seam selects — a
+    /// tokio worker by default, a background-executor band worker under
+    /// `rtems-exec-model`. `yield_now()` only reschedules on *this*
+    /// runtime, so it establishes no happens-before edge with the other
+    /// executor: spinning on it is a race, not a wait. Poll with a real
+    /// time budget instead, which is a correct wait on either backend.
+    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{label} (waited 2s)");
+    }
 
     /// Dropping an `EventWatcher` must abort the spawned watcher task
     /// (a bare `JoinHandle` would only detach, leaking the task). The
@@ -5753,26 +5782,19 @@ mod event_watcher_tests {
         });
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
-        tokio::task::yield_now().await;
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "watcher task should have started"
-        );
+        wait_for("watcher task should have started", || {
+            ran.load(Ordering::SeqCst)
+        })
+        .await;
         assert!(
             !abort_handle.is_finished(),
             "task still running before drop"
         );
         drop(watcher);
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::drop must abort the watcher task"
-        );
+        wait_for("EventWatcher::drop must abort the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 
     /// `EventWatcher::abort()` is an explicit, named teardown that
@@ -5787,16 +5809,10 @@ mod event_watcher_tests {
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         watcher.abort();
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::abort must stop the watcher task"
-        );
+        wait_for("EventWatcher::abort must stop the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 }
 

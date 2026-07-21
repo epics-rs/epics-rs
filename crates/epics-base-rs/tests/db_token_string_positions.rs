@@ -51,15 +51,15 @@ async fn the_file_softioc_loads_loads() {
         .unwrap();
 
     for (pv, want) in [("QT1", 5.0), ("QT2", 6.0), ("QT2ALIAS", 6.0), ("QT2B", 6.0)] {
-        let rec = db.get_record(pv).await.unwrap_or_else(|| panic!("{pv}"));
+        let rec = db.get_record(pv).unwrap_or_else(|| panic!("{pv}"));
         assert_eq!(
-            rec.read().await.record.get_field("VAL"),
+            rec.read().record.get_field("VAL"),
             Some(EpicsValue::Double(want)),
             "{pv}.VAL"
         );
     }
-    let rec = db.get_record("QT1").await.unwrap();
-    let desc = rec.read().await.common.desc.clone();
+    let rec = db.get_record("QT1").unwrap();
+    let desc = rec.read().common.desc.clone();
     assert_eq!(desc, "quoted type and field");
 }
 

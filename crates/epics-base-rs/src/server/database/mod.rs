@@ -104,7 +104,7 @@ fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
 /// Unified entry in the PV database.
 pub enum PvEntry {
     Simple(Arc<ProcessVariable>),
-    Record(Arc<RwLock<RecordInstance>>),
+    Record(Arc<parking_lot::RwLock<RecordInstance>>),
 }
 
 /// Callback for resolving external PV names (CA/PVA links).
@@ -227,7 +227,7 @@ pub struct CpTarget {
 
 struct PvDatabaseInner {
     simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
-    records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
+    records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
     ///
@@ -267,7 +267,7 @@ struct PvDatabaseInner {
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: RwLock<HashMap<String, String>>,
+    aliases: parking_lot::RwLock<HashMap<String, String>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -588,13 +588,13 @@ impl PvDatabase {
                 search_resolver: RwLock::new(None),
                 existence_gate: RwLock::new(None),
                 link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
-                records: RwLock::new(HashMap::new()),
+                records: parking_lot::RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
                 load_order: RwLock::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: RwLock::new(HashMap::new()),
                 external_cp_links: RwLock::new(HashMap::new()),
-                aliases: RwLock::new(HashMap::new()),
+                aliases: parking_lot::RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
@@ -660,10 +660,9 @@ impl PvDatabase {
         // takes the per-record lock then the records-map lock, so there is no
         // confirmed cycle; uniform order forecloses one. Same idiom as
         // `all_record_names`. (The registry write lock was released above.)
-        let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
+        let instances: Vec<_> = self.inner.records.read().values().cloned().collect();
         for inst in instances {
             inst.write()
-                .await
                 .record
                 .install_breaktable_registry(snapshot.clone());
         }
@@ -872,7 +871,7 @@ impl PvDatabase {
             if tokio::time::Instant::now() >= deadline {
                 return (connected, total);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -940,15 +939,15 @@ impl PvDatabase {
     /// strings via [`Record::get_field`].
     ///
     /// Returns an empty Vec when the record doesn't exist.
-    pub async fn record_link_fields(
+    pub fn record_link_fields(
         &self,
         record_name: &str,
     ) -> Vec<(String, String, crate::server::record::ParsedLink)> {
-        let rec = match self.get_record(record_name).await {
+        let rec = match self.get_record(record_name) {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let inst = rec.read().await;
+        let inst = rec.read();
         let mut out = Vec::new();
         // Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
         // passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`),
@@ -1223,7 +1222,7 @@ impl PvDatabase {
             DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
-                tokio::spawn(init);
+                crate::runtime::task::spawn(init);
             }
         }
     }
@@ -1364,11 +1363,10 @@ impl PvDatabase {
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner
-            .records
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        self.inner.records.write().insert(
+            name.to_string(),
+            Arc::new(parking_lot::RwLock::new(instance)),
+        );
 
         // Assign a monotonic load-order sequence — the scan-index
         // secondary sort key, so same-PHAS records keep load order.
@@ -1401,9 +1399,9 @@ impl PvDatabase {
     async fn check_name_free(&self, name: &str) -> CaResult<()> {
         let kind = if self.inner.simple_pvs.read().await.contains_key(name) {
             Some("simple PV")
-        } else if self.inner.records.read().await.contains_key(name) {
+        } else if self.inner.records.read().contains_key(name) {
             Some("record")
-        } else if self.inner.aliases.read().await.contains_key(name) {
+        } else if self.inner.aliases.read().contains_key(name) {
             Some("alias")
         } else {
             None
@@ -1431,12 +1429,12 @@ impl PvDatabase {
     pub async fn remove_record(&self, name: &str) -> bool {
         let _gate = self.inner.registration_mutex.lock().await;
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
-        let removed = self.inner.records.write().await.remove(name);
+        let removed = self.inner.records.write().remove(name);
         let Some(rec_arc) = removed else {
             return false;
         };
         let scan = {
-            let inst = rec_arc.read().await;
+            let inst = rec_arc.read();
             inst.common.scan
         };
 
@@ -1470,7 +1468,7 @@ impl PvDatabase {
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
-        let mut aliases = self.inner.aliases.write().await;
+        let mut aliases = self.inner.aliases.write();
         aliases.retain(|_alias, target| target != name);
 
         true
@@ -1494,14 +1492,14 @@ impl PvDatabase {
         if let Some(pv) = self.inner.simple_pvs.read().await.get(record_path.as_str()) {
             return Some(PvEntry::Simple(pv.clone()));
         }
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        if let Some(rec) = self.inner.records.read().get(base) {
             return Some(PvEntry::Record(rec.clone()));
         }
         // Alias resolve (epics-base PR #336): the alternate name maps
         // to a canonical record name. Look up the real record after
         // translating the base.
-        if let Some(target) = self.inner.aliases.read().await.get(base).cloned() {
-            if let Some(rec) = self.inner.records.read().await.get(&target) {
+        if let Some(target) = self.inner.aliases.read().get(base).cloned() {
+            if let Some(rec) = self.inner.records.read().get(&target) {
                 return Some(PvEntry::Record(rec.clone()));
             }
         }
@@ -1522,7 +1520,7 @@ impl PvDatabase {
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
-        if !self.inner.records.read().await.contains_key(target) {
+        if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
             )));
@@ -1531,15 +1529,14 @@ impl PvDatabase {
         self.inner
             .aliases
             .write()
-            .await
             .insert(alias.to_string(), target.to_string());
         Ok(())
     }
 
     /// Resolve an alias to its target record name, or `None` when the
     /// name is not an alias.
-    pub async fn resolve_alias(&self, name: &str) -> Option<String> {
-        self.inner.aliases.read().await.get(name).cloned()
+    pub fn resolve_alias(&self, name: &str) -> Option<String> {
+        self.inner.aliases.read().get(name).cloned()
     }
 
     /// Queue an iocsh command line for post-PINI execution.
@@ -1579,13 +1576,13 @@ impl PvDatabase {
         {
             return true;
         }
-        if self.inner.records.read().await.contains_key(base) {
+        if self.inner.records.read().contains_key(base) {
             return true;
         }
         // Alias entry exists and points to a live record
         // (epics-base PR #336).
-        if let Some(target) = self.inner.aliases.read().await.get(base) {
-            return self.inner.records.read().await.contains_key(target);
+        if let Some(target) = self.inner.aliases.read().get(base) {
+            return self.inner.records.read().contains_key(target);
         }
         false
     }
@@ -1682,19 +1679,22 @@ impl PvDatabase {
     /// Use [`Self::get_record_no_resolve`] when the caller already
     /// holds a canonical name and wants to suppress the alias path
     /// (e.g. to detect alias collisions during builder wiring).
-    pub async fn get_record(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
-        if let Some(rec) = self.inner.records.read().await.get(name).cloned() {
+    pub fn get_record(&self, name: &str) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
+        if let Some(rec) = self.inner.records.read().get(name).cloned() {
             return Some(rec);
         }
-        let target = self.inner.aliases.read().await.get(name).cloned()?;
-        self.inner.records.read().await.get(&target).cloned()
+        let target = self.inner.aliases.read().get(name).cloned()?;
+        self.inner.records.read().get(&target).cloned()
     }
 
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub async fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
-        self.inner.records.read().await.get(name).cloned()
+    pub fn get_record_no_resolve(
+        &self,
+        name: &str,
+    ) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
+        self.inner.records.read().get(name).cloned()
     }
 
     /// Every record name, in **database load order** — the single owner of
@@ -1724,10 +1724,22 @@ impl PvDatabase {
     /// exists; `add_record` is the only insertion path — would sort last by
     /// name rather than nondeterministically.
     pub async fn all_record_names(&self) -> Vec<String> {
-        // Lock order records → load_order, matching `add_record`/`remove_record`.
-        let records = self.inner.records.read().await;
+        // Lock order records → load_order (matching `add_record`/`remove_record`):
+        // the `records` map is a sync `parking_lot::RwLock` now, so its guard is
+        // `!Send` and MUST NOT be held across the async `load_order` read. Snapshot
+        // the keys under the records guard, release it (block close), then await
+        // load_order — neither lock is ever held while waiting on the other, so the
+        // records→load_order order is honoured without an AB-BA against add_record.
+        // The two reads are no longer one atomic snapshot: a record inserted between
+        // them is absent from `load_order` and sorts last by name via the
+        // `unwrap_or(u64::MAX)` fallback — the same degradation already defined for a
+        // sequence-less record, and every whole-database walk is racy against a
+        // concurrent add/remove regardless.
+        let mut names: Vec<String> = {
+            let records = self.inner.records.read();
+            records.keys().cloned().collect()
+        };
         let load_order = self.inner.load_order.read().await;
-        let mut names: Vec<String> = records.keys().cloned().collect();
         names.sort_by(|a, b| {
             let seq = |n: &String| load_order.get(n).copied().unwrap_or(u64::MAX);
             seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))
@@ -1739,16 +1751,16 @@ impl PvDatabase {
     /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
     /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
     /// aliases when matching a glob.
-    pub async fn all_alias_names(&self) -> Vec<String> {
-        self.inner.aliases.read().await.keys().cloned().collect()
+    pub fn all_alias_names(&self) -> Vec<String> {
+        self.inner.aliases.read().keys().cloned().collect()
     }
 
     /// Return every alias that points at `canonical`. Sorted for
     /// stable output; empty when the record has no aliases. Used by
     /// `dbpr` to surface alias-form names so admins can see how
     /// clients may reach the record.
-    pub async fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
-        let aliases = self.inner.aliases.read().await;
+    pub fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+        let aliases = self.inner.aliases.read();
         let mut hits: Vec<String> = aliases
             .iter()
             .filter_map(|(alias, target)| {
@@ -2119,8 +2131,8 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
-        let via_canonical = db.get_record("TARGET").await;
-        let via_alias = db.get_record("ALIAS").await;
+        let via_canonical = db.get_record("TARGET");
+        let via_alias = db.get_record("ALIAS");
         assert!(via_canonical.is_some());
         assert!(via_alias.is_some(), "get_record must resolve alias");
         // Both calls return the same Arc (pointer equality).
@@ -2146,8 +2158,8 @@ mod tests {
         rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
         db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
 
-        let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let arc = db.get_record("AI:BPT").unwrap();
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
@@ -2177,8 +2189,8 @@ mod tests {
         .unwrap();
         db.add_breaktables(vec![ramp]).await;
 
-        let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let arc = db.get_record("AI:BPT").unwrap();
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
@@ -2197,9 +2209,9 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
-        assert!(db.get_record_no_resolve("TARGET").await.is_some());
+        assert!(db.get_record_no_resolve("TARGET").is_some());
         assert!(
-            db.get_record_no_resolve("ALIAS").await.is_none(),
+            db.get_record_no_resolve("ALIAS").is_none(),
             "get_record_no_resolve must not follow alias table"
         );
     }
@@ -2259,13 +2271,13 @@ mod tests {
 
         // Sorted, only TARGET's aliases.
         assert_eq!(
-            db.aliases_for_record("TARGET").await,
+            db.aliases_for_record("TARGET"),
             vec!["AA".to_string(), "ZZ".to_string()]
         );
         // OTHER's alone.
-        assert_eq!(db.aliases_for_record("OTHER").await, vec!["MM".to_string()]);
+        assert_eq!(db.aliases_for_record("OTHER"), vec!["MM".to_string()]);
         // Unknown record → empty, not None.
-        assert!(db.aliases_for_record("MISSING").await.is_empty());
+        assert!(db.aliases_for_record("MISSING").is_empty());
     }
 
     #[tokio::test]
@@ -2280,7 +2292,7 @@ mod tests {
         db.add_alias("ALIAS_A", "TARGET").await.unwrap();
         db.add_alias("ALIAS_B", "TARGET").await.unwrap();
 
-        let mut aliases = db.all_alias_names().await;
+        let mut aliases = db.all_alias_names();
         aliases.sort();
         assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
         // Canonical names are NOT returned here.
@@ -2451,7 +2463,7 @@ mod tests {
         db.add_pv("ALT1", EpicsValue::Double(0.0)).await.unwrap();
         db.add_pv("ALT2", EpicsValue::Double(0.0)).await.unwrap();
         // The unrelated alias must survive.
-        assert_eq!(db.resolve_alias("KEEPER").await, Some("OTHER".to_string()));
+        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".to_string()));
     }
 
     /// `add_alias` must reject collisions with
@@ -2578,11 +2590,11 @@ mod tests {
         // Device-support INP lives in `common.inp` (DBF_INLINK), the
         // exact storage a `field_list()` String scan cannot reach.
         {
-            let rec = db.get_record("AI").await.unwrap();
-            rec.write().await.common.inp = "pva://mini:current?proc=CP".to_string();
+            let rec = db.get_record("AI").unwrap();
+            rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
         }
 
-        let links = db.record_link_fields("AI").await;
+        let links = db.record_link_fields("AI");
         let inp = links
             .iter()
             .find(|(f, _, _)| f == "INP")

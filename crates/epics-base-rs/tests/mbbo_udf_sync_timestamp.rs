@@ -39,14 +39,14 @@ async fn add(db: &PvDatabase, name: &str, record: Box<dyn Record>) {
 }
 
 async fn time_of(db: &PvDatabase, name: &str) -> std::time::SystemTime {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.common.time
 }
 
 async fn udf_of(db: &PvDatabase, name: &str) -> u8 {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.common.udf
 }
 

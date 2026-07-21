@@ -28,8 +28,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).unwrap()
 }
 

@@ -44,11 +44,10 @@ async fn bare_sseq() -> PvDatabase {
 #[tokio::test]
 async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
     let db = bare_sseq().await;
-    let inst = db.get_record("SQV").await.unwrap();
+    let inst = db.get_record("SQV").unwrap();
 
     let mut val_rx = inst
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::Long, full())
         .unwrap();
 

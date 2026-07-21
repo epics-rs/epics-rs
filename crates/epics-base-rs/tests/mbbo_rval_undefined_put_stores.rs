@@ -39,8 +39,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 

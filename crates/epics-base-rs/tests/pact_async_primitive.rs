@@ -116,7 +116,7 @@ async fn async_token_stale_after_cancel_is_noop() {
 
     // Cancel (C `callbackCancelDelayed`): advance the generation so the
     // already-minted token is superseded.
-    db.cancel_async_reentry("T2").await;
+    db.cancel_async_reentry("T2");
     assert!(
         !token.is_current(),
         "token must be stale once the generation has advanced"
@@ -177,22 +177,21 @@ async fn post_fields_applies_and_posts_async_update() {
 
     // Subscribe to VAL (DBE_VALUE-class) before the async post.
     let mut rx = {
-        let rec = db.get_record("T3").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("T3").unwrap();
+        let mut inst = rec.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
             .expect("VAL subscription accepted")
     };
 
     let posted = db
         .post_fields("T3", vec![("VAL".to_string(), EpicsValue::Long(7))])
-        .await
         .expect("post_fields on an existing record");
     assert_eq!(posted, vec!["VAL".to_string()], "VAL reported as posted");
 
     // Field value applied (read back through the record).
     {
-        let rec = db.get_record("T3").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("T3").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Long(7)),
@@ -274,7 +273,7 @@ async fn reprocess_on_notify_with_cancelled_token_is_noop() {
     let handle = db.reprocess_on_notify(token, rx);
 
     // Cancel the outstanding token BEFORE the downstream completes.
-    db.cancel_async_reentry("T5").await;
+    db.cancel_async_reentry("T5");
     notify.leave();
 
     handle.await.expect("wiring task joins cleanly");
@@ -460,12 +459,11 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
     // Out-of-band field post through the delivered handle.
     let posted = handle
         .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(13))])
-        .await
         .expect("post through a live handle");
     assert_eq!(posted, vec!["VAL".to_string()], "VAL reported posted");
     {
-        let rec = db.get_record("H1").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("H1").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::Long(13)),
@@ -483,7 +481,6 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
     );
     let after = handle
         .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(99))])
-        .await
         .expect("post through a dead handle is Ok");
     assert!(
         after.is_empty(),
@@ -529,8 +526,8 @@ async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
         "SRC processed exactly twice: initial AsyncPending + completion re-entry"
     );
 
-    let rec = db.get_record("DST").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("DST").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Long(42)),
@@ -616,8 +613,8 @@ async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
         .unwrap();
 
     // The link write ran on the async-pending cycle.
-    let rec = db.get_record("PEND_DST").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("PEND_DST").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.record.get_field("VAL"),
         Some(EpicsValue::Long(42)),

@@ -21,7 +21,7 @@ use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
-use super::ca_server::ServerStats;
+use super::stats::ServerStats;
 
 /// `casr [<level>]` — print CA server runtime statistics. With no
 /// argument prints summary counters; level 1+ adds the active-client

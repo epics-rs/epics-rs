@@ -8,22 +8,56 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 bytes = "1"
 hostname = "0.4"
-socket2 = { version = "0.5", features = ["all"] }
 chrono = "0.4"
 parking_lot = "0.12"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }
-rustyline = "18"
-# Cross-platform interface enumeration (Linux/macOS/Windows). Used by
-# `epics_base_rs::net::iface_map` to expose ifindex/IP/broadcast/mcast caps.
-if-addrs = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }
+
+# Host-only dependencies — gated out for the RTEMS target (armv7-rtems-eabihf).
+#
+# `rustyline` pulls `nix`, which does not build for RTEMS (no `sa_sigaction` in
+# the RTEMS libc). It backs only the *interactive* iocsh line editor
+# (`iocsh::Iocsh::run_repl_interactive`); the piped-stdin REPL covers
+# non-interactive use, and RTEMS iocsh wiring is a later increment.
+#
+# `socket2` + `if-addrs` back the async UDP net stack (`net::async_udp_v4` /
+# `net::iface_map`); the whole `net` module is gated out on RTEMS (S1 raw-libc
+# CA driver), so its deps go host-only too.
+#
+# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# `net`, `signal`, and `process` features — the ones that pull `mio`,
+# `signal-hook-registry`, and `socket2`, none of which build for
+# armv7-rtems-eabihf. Declared per-target rather than in shared `[dependencies]`
+# because Cargo UNIONS a dependency's features across all matching tables, so a
+# shared `full` would re-add the dropped features on RTEMS. The retained set
+# (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
+# always-compiled base code uses (Handle, block_in_place, select!, sync
+# primitives) compiling on RTEMS; those paths are unused there (the sans-io seam
+# routes to the background executor) but must still type-check for `--lib`.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+rustyline = "18"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.13"
+
+[target.'cfg(target_os = "rtems")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 
 # Linux-only: `SO_RXQ_OVFL` setsockopt + `recvmsg`/cmsg parsing for
 # UDP RX overflow detection (`net::async_udp_v4::recv_from_with_drop_count`).
@@ -45,6 +79,17 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 
 [features]
+# Host-selectable RTEMS execution model. Routes the `runtime::task`
+# spawn/sleep/interval seam to the std-thread background executor
+# (callback pool + delayed timer + scanOnce worker) on a HOSTED target,
+# instead of the tokio runtime — the same runtime-free backend the RTEMS
+# build uses unconditionally. Intended for a Linux (e.g. PREEMPT_RT)
+# blocking-front-end deployment that runs the `std::net` CA server driver
+# and wants async record-processing completion driven on dedicated OS
+# threads with no tokio reactor. Compile-time backend switch (see
+# `build.rs`, which turns this into the `exec_backend` cfg). OFF by
+# default: the hosted default is byte-identical without it.
+rtems-exec-model = []
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on

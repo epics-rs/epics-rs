@@ -29,10 +29,8 @@ use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
     db.get_record(rec)
-        .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("T.{f} missing"))

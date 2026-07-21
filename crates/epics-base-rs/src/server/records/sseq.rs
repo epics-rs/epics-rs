@@ -508,8 +508,8 @@ impl SseqRecord {
         if let Some((name, handle)) = &self.async_ctx {
             let name = name.clone();
             let handle = handle.clone();
-            tokio::spawn(async move {
-                let _ = handle.post_fields(&name, fields).await;
+            crate::runtime::task::spawn(async move {
+                let _ = handle.post_fields(&name, fields);
             });
         }
     }
@@ -801,7 +801,7 @@ impl SseqRecord {
             let handle = handle.clone();
             let wake = wake.clone();
             let link = self.steps[i].lnk.clone();
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 if let Some(rx) = handle
                     .put_link_notify(&name, LNK_FIELDS[i], &link, value)
                     .await
@@ -835,7 +835,7 @@ impl SseqRecord {
         let name = name.clone();
         let handle = handle.clone();
         let wake = wake.clone();
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             wake.notified().await;
             reenter_now(&name, &handle).await;
         });
@@ -911,8 +911,8 @@ impl SseqRecord {
         if let Some((name, handle)) = &self.async_ctx {
             let name = name.clone();
             let handle = handle.clone();
-            tokio::spawn(async move {
-                handle.cancel_async_reentry(&name).await;
+            crate::runtime::task::spawn(async move {
+                handle.cancel_async_reentry(&name);
                 reenter_now(&name, &handle).await;
             });
         }
@@ -968,8 +968,8 @@ impl SseqRecord {
             tokio::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
             for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
-                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input).await;
-                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output).await;
+                let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input);
+                let (lnk_status, lnk_ft) = classify_link(&handle, lnk, LinkRole::Output);
                 let werr = wait_config_err(*wait, lnk_status);
                 fields.push((
                     DOLV_FIELDS[i].to_string(),
@@ -985,7 +985,7 @@ impl SseqRecord {
             }
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&name, fields).await;
+                let _ = handle.post_fields(&name, fields);
             }
         });
     }

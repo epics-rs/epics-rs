@@ -194,8 +194,8 @@ async fn r9_70_framework_put_path_matches_c() {
         .await
         .unwrap();
 
-    let inst = db.get_record("SQ").await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record("SQ").unwrap();
+    let g = inst.read();
     assert_eq!(
         g.record.get_field("DLYA").and_then(|v| v.to_f64()),
         Some(0.083),

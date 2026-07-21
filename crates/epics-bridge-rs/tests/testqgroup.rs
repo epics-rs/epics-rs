@@ -339,8 +339,8 @@ async fn group_monitor_subscribes_archive_log_events() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::LOG);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::LOG);
     }
     let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -369,8 +369,8 @@ async fn group_monitor_subscribes_archive_log_events() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::LOG);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::LOG);
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(200), mon.poll())
@@ -769,8 +769,8 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     for rec_name in ["TEST:level_na", "TEST:count_na"] {
-        let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record(rec_name).expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
         .await
@@ -835,8 +835,8 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     // mutated either — pvxs rejects the whole operation before any
     // member apply runs.
     let level = {
-        let rec = db.get_record("TEST:level").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:level").unwrap();
+        let inst = rec.read();
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
     assert!(
@@ -935,8 +935,8 @@ async fn br_fr12_named_trigger_marks_only_target() {
 
     // A `level` post triggers only `count`.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -951,8 +951,8 @@ async fn br_fr12_named_trigger_marks_only_target() {
 
     // A `count` post triggers only `level`.
     {
-        let rec = db.get_record("TEST:count").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:count").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1002,8 +1002,8 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
     // function of the DBE mask and the mapping, never of what the snapshot
     // diff happened to see move.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1049,8 +1049,8 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
 
     // Only `level` changes after start; `count` never posts.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1538,8 +1538,8 @@ async fn group_monitor_stop_disables_member_subscriptions() {
     );
 
     async fn post(db: &Arc<PvDatabase>) {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
 
     // Active (post-START): a member post wakes the group poll.
@@ -1687,8 +1687,8 @@ async fn r17_31_group_scalar_member_serves_long_string() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstrwf").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:lstrwf").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:lstrwf", EpicsValue::CharArray(b"hi\0".to_vec()))
         .await
@@ -1752,8 +1752,8 @@ async fn r18_26_plain_long_string_member_descriptor_matches_value() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:plls").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:plls").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec()))
         .await
@@ -2005,8 +2005,8 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstrwf").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:lstrwf").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
 
     let provider = Arc::new(BridgeProvider::new(db.clone()));

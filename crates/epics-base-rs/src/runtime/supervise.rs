@@ -203,7 +203,7 @@ where
                 delay_ms = policy.delay.as_millis() as u64,
                 "supervise: scheduling restart"
             );
-            tokio::time::sleep(policy.delay).await;
+            crate::runtime::task::sleep(policy.delay).await;
         }
 
         tracing::info!(attempt, "supervise: starting attempt");

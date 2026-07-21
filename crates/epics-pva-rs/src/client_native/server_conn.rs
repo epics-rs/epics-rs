@@ -425,7 +425,13 @@ impl ServerConn {
                             break;
                         }
                         Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
+                            if let Err(e) = crate::peer_buf::try_extend(
+                                &mut buf, &chunk[..n], "the connection receive buffer"
+                            ) {
+                                warn!(error = %e, "PVA client reader: closing");
+                                cancel_reader.cancel();
+                                return;
+                            }
                             last_rx_reader.store(now_nanos(), Ordering::SeqCst);
                             // count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
@@ -564,7 +570,15 @@ impl ServerConn {
                                         return;
                                     }
                                 }
-                                seg_buf.extend_from_slice(&frame.payload);
+                                if let Err(e) = crate::peer_buf::try_extend(
+                                    &mut seg_buf,
+                                    &frame.payload,
+                                    "the segment-reassembly buffer",
+                                ) {
+                                    warn!(error = %e, "PVA client reader: closing");
+                                    cancel_reader.cancel();
+                                    return;
+                                }
                                 if raw_seg != 0
                                     && raw_seg
                                         != crate::proto::HeaderFlags::SEGMENT_LAST
@@ -1091,7 +1105,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
         if n == 0 {
             return Err(PvaError::Protocol("server closed during handshake".into()));
         }
-        rx_buf.extend_from_slice(&chunk[..n]);
+        crate::peer_buf::try_extend(rx_buf, &chunk[..n], "the connection receive buffer")?;
     }
 }
 

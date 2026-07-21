@@ -2892,7 +2892,14 @@ async fn ns_run_once(
                         "NS closed",
                     ));
                 }
-                rx_buf.extend_from_slice(&tmp[..n]);
+                // Fallible growth: this buffer is sized by the name server's
+                // stream, and an infallible `extend_from_slice` would take the
+                // whole process down through `handle_alloc_error`. Losing the
+                // NS connection is survivable — the caller reconnects.
+                crate::peer_buf::try_extend(
+                    &mut rx_buf, &tmp[..n], "the name-server receive buffer"
+                )
+                .map_err(std::io::Error::other)?;
                 let mut pos = 0;
                 while rx_buf.len().saturating_sub(pos) >= PvaHeader::SIZE {
                     let Ok(hdr) =

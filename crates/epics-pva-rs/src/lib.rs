@@ -31,6 +31,7 @@ pub mod format;
 pub(crate) mod leaf_convert;
 pub mod log;
 pub mod nt;
+pub mod peer_buf;
 pub mod proto;
 pub mod pv_request;
 pub mod pvdata;

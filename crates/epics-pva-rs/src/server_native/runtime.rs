@@ -11,7 +11,7 @@ use super::udp::{random_guid, run_udp_responder_on_socket, run_udp_responder_v6}
 // The config record moved to [`super::config`] so the protocol layer can name
 // it without inheriting this module's host-only gate. Re-exported here so
 // every `server_native::runtime::PvaServerConfig` path keeps resolving.
-pub use super::config::PvaServerConfig;
+pub use super::config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
 
 /// Run a native PVA server forever.
 ///
@@ -1498,22 +1498,66 @@ mod tcp_fallback_tests {
 
 #[cfg(test)]
 mod sr9_message_size_tests {
-    //! the inbound message-size cap defaults to unbounded
-    //! (`None`), matching pvxs which deliberately keeps no RX cap. A
-    //! deployment opts into a hard ceiling by setting `Some(n)`.
+    //! The inbound message-size cap defaults to
+    //! [`DEFAULT_MAX_MESSAGE_SIZE`], **not** to pvxs's unbounded `None`.
+    //!
+    //! This module previously asserted the opposite ("must be unbounded
+    //! (None), not a fixed cap"), on pvxs parity grounds. That parity
+    //! argument was incomplete: pvxs affords an uncapped RX path because a
+    //! failed allocation there is a `bad_alloc` caught per connection
+    //! (`conn.cpp:307-335`), whereas in Rust an infallible `Vec` growth
+    //! reaches `handle_alloc_error` and aborts the IOC. The growth path is
+    //! now fallible too (`crate::peer_buf`), so both halves of pvxs's
+    //! behaviour are reachable — but on an RTEMS target whose whole heap is
+    //! a few hundred MiB, "unbounded" and "the machine" are the same number,
+    //! so the *default* is a ceiling and `None` stays available as the
+    //! explicit opt-out.
     use super::*;
 
     #[test]
-    fn default_message_size_is_unbounded() {
+    fn default_message_size_is_capped() {
         assert_eq!(
             PvaServerConfig::default().max_message_size,
-            None,
-            "default server config must be unbounded (None), not a fixed cap"
+            Some(DEFAULT_MAX_MESSAGE_SIZE),
+            "default server config must carry the default ceiling"
         );
         // `isolated()` inherits the default via `..Default::default()`.
-        assert_eq!(PvaServerConfig::isolated().max_message_size, None);
-        // `with_env()` does not introduce a cap either.
-        assert_eq!(PvaServerConfig::default().with_env().max_message_size, None);
+        assert_eq!(
+            PvaServerConfig::isolated().max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE)
+        );
+        // `with_env()` neither introduces nor removes a cap.
+        assert_eq!(
+            PvaServerConfig::default().with_env().max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE)
+        );
+    }
+
+    /// The cap is a default, not a policy nailed shut: pvxs-exact unbounded
+    /// behaviour stays one field away.
+    #[test]
+    fn unbounded_is_still_expressible() {
+        let cfg = PvaServerConfig {
+            max_message_size: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.max_message_size, None);
+    }
+
+    /// A ceiling below the largest frame the protocol layer will accept would
+    /// make the two limits disagree about which one refused a message.
+    #[test]
+    fn the_default_ceiling_admits_a_realistic_array() {
+        // 1M doubles — an NTScalarArray waveform an IOC can genuinely be
+        // asked to accept — must fit under whatever the default config
+        // actually serves, not merely under the constant.
+        let cap = PvaServerConfig::default()
+            .max_message_size
+            .expect("the default config must carry a ceiling");
+        assert!(
+            cap >= 1024 * 1024 * 8,
+            "default ceiling {cap} refuses a 1M-element double array"
+        );
     }
 }
 

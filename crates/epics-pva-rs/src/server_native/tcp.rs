@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
+use crate::peer_buf::try_extend;
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
     QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
@@ -3516,12 +3517,12 @@ pub(super) async fn handle_connection_io(
             seg_order = frame.order();
             seg_buf.clear();
         }
-        // Cap reassembly when an opt-in `max_message_size` is set.
-        // read_frame already enforces it per-frame; without this an
-        // adversary streams SegFirst → SegMiddle … forever, growing
-        // seg_buf without bound. `None` = unbounded (pvxs
-        // parity), so this guard only fires for hardened deployments
-        // that opted into a ceiling.
+        // Cap reassembly on the *accumulated* size. read_frame enforces
+        // `max_message_size` per frame; without this an adversary streams
+        // SegFirst → SegMiddle … forever, every segment individually legal,
+        // and seg_buf grows without bound. The server's default is a ceiling
+        // (`config::DEFAULT_MAX_MESSAGE_SIZE`); `None` is the explicit opt-out
+        // to pvxs's uncapped RX, and only then does this guard stand down.
         if let Some(cap) = max_msg_size {
             if seg_buf.len().saturating_add(frame.payload.len()) > cap {
                 return Err(PvaError::Protocol(format!(
@@ -3531,7 +3532,7 @@ pub(super) async fn handle_connection_io(
                 )));
             }
         }
-        seg_buf.extend_from_slice(&frame.payload);
+        try_extend(&mut seg_buf, &frame.payload, "the segment-reassembly buffer")?;
         if raw_seg != 0 && raw_seg != HeaderFlags::SEGMENT_LAST {
             // SegFirst (with following segments) or SegMiddle: keep
             // accumulating, do not dispatch yet.
@@ -5226,13 +5227,14 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             rx_buf.drain(..n);
             return Ok(frame);
         }
-        // Peek the header length once we have 8 bytes — if an opt-in
-        // `max_msg_size` is set and the peer claimed more, drop the
-        // connection before growing rx_buf any further.
-        // `None` = unbounded (pvxs parity, which keeps no RX cap).
-        // Even unbounded, the read stays incremental (4 KiB chunks)
-        // and `op_timeout`-deadlined, so a stalled or oversized peer
-        // is bounded by the deadline rather than the cap.
+        // Peek the header length once we have 8 bytes — if `max_msg_size` is
+        // set and the peer claimed more, refuse before growing rx_buf any
+        // further, so the IOC never spends the memory or the bandwidth on a
+        // message it has already decided to reject. `None` is the explicit
+        // opt-out to pvxs's uncapped RX. Even unbounded, the read stays
+        // incremental (4 KiB chunks), `op_timeout`-deadlined, and now
+        // fallible (`peer_buf::try_extend`), so a stalled, oversized, or
+        // heap-exhausting peer costs this connection and no other.
         if let Some(cap) = max_msg_size {
             if rx_buf.len() >= PvaHeader::SIZE {
                 if let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..])) {
@@ -5256,7 +5258,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         if n == 0 {
             return Err(PvaError::Protocol("client closed".into()));
         }
-        rx_buf.extend_from_slice(&chunk[..n]);
+        try_extend(rx_buf, &chunk[..n], "the connection receive buffer")?;
     }
 }
 
@@ -21566,6 +21568,100 @@ mod bfr15_tests {
         assert!(
             !channels[&sid].ops.contains_key(&ioid),
             "GET_FIELD one-shot is removed on every terminal reply, even an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inbound_message_cap_tests {
+    //! The inbound size cap: what `read_frame` does with a header that
+    //! announces more than the configured ceiling, and what the default
+    //! ceiling is when nobody configures one.
+    use super::*;
+    use crate::server_native::config::DEFAULT_MAX_MESSAGE_SIZE;
+
+    /// An 8-byte client→server application header announcing `payload_length`
+    /// and nothing else. The body is never sent: the point of the cap is that
+    /// the server refuses before it would allocate for one.
+    fn header_announcing(payload_length: u32) -> Vec<u8> {
+        let h = PvaHeader::application(
+            false, // client direction — a server's inbound frame
+            ByteOrder::Little,
+            Command::Get.code(),
+            payload_length,
+        );
+        let mut out = Vec::new();
+        h.write_into(&mut out);
+        assert_eq!(out.len(), PvaHeader::SIZE);
+        out
+    }
+
+    #[tokio::test]
+    async fn the_default_ceiling_refuses_an_oversized_header_without_reading_a_body() {
+        let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(
+            &mut reader,
+            &mut rx_buf,
+            Duration::from_secs(1),
+            Some(DEFAULT_MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect_err("an over-cap header must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds max_message_size"),
+            "refusal must name the cap it broke: {msg}"
+        );
+        // Only the header was ever buffered — the refusal happened before the
+        // body could be read, which is the whole reason the cap is checked on
+        // the header rather than after reassembly.
+        assert_eq!(rx_buf.len(), PvaHeader::SIZE);
+    }
+
+    /// The comparison is `>`, not `>=`: a message exactly at the ceiling is
+    /// admitted. An off-by-one here would refuse the largest legal message.
+    #[tokio::test]
+    async fn a_message_exactly_at_the_ceiling_is_admitted() {
+        let cap = 16usize;
+        let mut wire = header_announcing(cap as u32);
+        wire.extend_from_slice(&[0u8; 16]);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let frame = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+            .await
+            .expect("a message exactly at the cap must be admitted");
+        assert_eq!(frame.payload.len(), cap);
+    }
+
+    #[tokio::test]
+    async fn one_byte_over_the_ceiling_is_refused() {
+        let cap = 16usize;
+        let wire = header_announcing(cap as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+            .await
+            .expect_err("one byte over the cap must be refused");
+        assert!(err.to_string().contains("exceeds max_message_size"));
+    }
+
+    /// `None` is still expressible and still means unbounded — the same
+    /// header the default ceiling refuses is accepted for buffering when the
+    /// deployment opted out.
+    #[tokio::test]
+    async fn an_explicit_none_still_means_unbounded() {
+        let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), None)
+            .await
+            .expect_err("the stream ends after the header, so this cannot succeed");
+        // The refusal must be the *stream ending*, not the cap.
+        assert!(
+            err.to_string().contains("client closed"),
+            "an unbounded reader must not refuse on size: {err}"
         );
     }
 }

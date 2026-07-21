@@ -1886,6 +1886,54 @@ mod tests {
         let _ = h.finish().await;
     }
 
+    /// Reassembly is capped, and the cap is on the *accumulated* size — not
+    /// on any one segment. Each segment below is comfortably under the
+    /// ceiling, so `read_frame`'s per-frame check cannot be what refuses
+    /// them; only the accumulator can. Without that check a peer streams
+    /// SegFirst → SegMiddle … forever and `seg_buf` grows until the
+    /// allocator says no.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reassembly_is_capped_on_the_accumulated_size_not_the_segment() {
+        let order = ByteOrder::Little;
+        const CAP: usize = 24;
+        const SEG: usize = 16;
+        let config = PvaServerConfig {
+            max_message_size: Some(CAP),
+            ..isolated_config()
+        };
+        let mut h = Harness::start(config, Arc::new(ConnRegistry::new()));
+
+        let mut first =
+            PvaHeader::application(false, order, Command::CreateChannel.code(), SEG as u32);
+        first.flags.0 |= 0x10; // SegFirst
+        let mut middle =
+            PvaHeader::application(false, order, Command::CreateChannel.code(), SEG as u32);
+        middle.flags.0 |= 0x30; // SegMiddle (FIRST|LAST bits both set)
+
+        let mut wire = Vec::new();
+        first.write_into(&mut wire);
+        wire.extend_from_slice(&[0u8; SEG]);
+        middle.write_into(&mut wire);
+        wire.extend_from_slice(&[0u8; SEG]);
+        h.client.send(&wire);
+
+        let err = h
+            .wait_retired(RETIRE_BOUND)
+            .await
+            .expect_err("accumulating past the cap must end the connection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("segmented PVA message exceeds max_message_size"),
+            "the refusal must name the reassembly cap, got: {msg}"
+        );
+        // 16 + 16 = 32 against a 24-byte ceiling: neither segment alone
+        // exceeded it, which is what makes this the accumulator's refusal.
+        assert!(
+            msg.contains("32") && msg.contains("24"),
+            "the refusal must report accumulated vs cap, got: {msg}"
+        );
+    }
+
     /// The TypeCache invariant (§1.3), end to end through the blocking driver.
     ///
     /// A client may define a descriptor with `0xFD <slot> <desc>` in one frame

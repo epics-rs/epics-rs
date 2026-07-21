@@ -1605,7 +1605,13 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
         | PvaError::ConnectionRefused
         // The explicit disconnect variant: the virtual circuit dropped
         // after connecting, so a `retry` link queues the Put for replay.
-        | PvaError::Disconnected => true,
+        | PvaError::Disconnected
+        // This side could not allocate for an inbound message and shed the
+        // circuit rather than aborting the IOC (`epics-pva-rs` peer_buf).
+        // The channel is down afterwards exactly as if the peer had closed
+        // it, so it classifies with the transport failures, not with the
+        // value rejections — a `retry` link queues for replay on reconnect.
+        | PvaError::ResourceExhausted(_) => true,
         // The client reports a failed name search as a Protocol
         // error ("no servers found for PV ..."); that is a
         // not-connected condition, not a protocol violation. A

@@ -19,6 +19,25 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+/// Default ceiling on a single inbound message
+/// ([`PvaServerConfig::max_message_size`]): **16 MiB**.
+///
+/// The number is not chosen here — it is the one this workspace already gives
+/// as its answer to "the largest body we will allocate because a remote header
+/// said so". `epics_ca_rs::protocol::MAX_FRAME_BODY_BYTES` is the same 16 MiB,
+/// documented there as a Tier 2 deviation standing in for C's *no limit* (C's
+/// CA server is genuinely unbounded by default — `casExpandBuffer`
+/// `rsrv/caservertask.c:1326-1358` only consults `rsrvSizeofLargeBufTCP` when
+/// `EPICS_CA_AUTO_ARRAY_BYTES` is off, and it defaults on). Two protocols
+/// answering that question with two different numbers would mean two
+/// resource policies to reason about on one IOC, so PVA takes CA's.
+///
+/// Deliberately not derived from `MAX_FRAME_BODY_BYTES` by import: the crates
+/// do not depend on each other, and a PVA server has to be configurable
+/// without a CA server present. The coupling is a documented intent, not a
+/// build-time one.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Runtime configuration for `runtime::run_pva_server`.
 #[derive(Clone)]
 pub struct PvaServerConfig {
@@ -245,17 +264,27 @@ pub struct PvaServerConfig {
     /// libevent `bufferevent_set_timeouts`; we do it explicitly here.
     /// Default: 10 s, override via `EPICS_PVAS_TLS_HANDSHAKE_TMO`.
     pub tls_handshake_timeout: Duration,
-    /// Optional hard cap on a single inbound message's payload length.
-    /// `None` (the default) means **unbounded** — matching pvxs, which
-    /// deliberately keeps no RX message-size limit so PVA can carry
-    /// arbitrarily large structures (the design point that replaced
-    /// CA's `EPICS_CA_MAX_ARRAY_BYTES`). `read_frame` and the
-    /// segment-reassembly path stay bounded regardless via incremental
-    /// 4 KiB reads, the `op_timeout` deadline, and `safe_capacity`,
-    /// so the absence of a cap is not itself an
-    /// amplification vector. Set `Some(n)` to opt in to a hard ceiling
-    /// (e.g. a hardened deployment that wants to reject any header
-    /// claiming more than `n` bytes and drop the connection).
+    /// Hard cap on a single inbound message's payload length. Defaults to
+    /// [`DEFAULT_MAX_MESSAGE_SIZE`]; `None` means unbounded.
+    ///
+    /// **This default is a deliberate deviation from pvxs, which keeps no RX
+    /// message-size limit** so PVA can carry arbitrarily large structures (the
+    /// design point that replaced CA's `EPICS_CA_MAX_ARRAY_BYTES`). Two
+    /// reasons to cap anyway:
+    ///
+    /// * pvxs can afford to be uncapped because a failed allocation there is
+    ///   a `bad_alloc` caught per connection (`conn.cpp:307-335`). Ours is now
+    ///   fallible too (`try_reserve_or_shed`), but a cap refuses a doomed
+    ///   message *before* the IOC spends the memory and the bandwidth, and
+    ///   answers with a reason instead of an allocator failure.
+    /// * On RTEMS the whole heap is a few hundred MiB, so "unbounded" and
+    ///   "the machine" are the same number.
+    ///
+    /// Set `None` for pvxs-exact behaviour, or `Some(n)` to pick your own
+    /// ceiling. The reassembly and receive paths stay bounded regardless via
+    /// incremental 4 KiB reads, the `op_timeout` deadline, and
+    /// `safe_capacity`, so this cap is a resource policy rather than the only
+    /// thing standing between a peer and the heap.
     pub max_message_size: Option<usize>,
     /// Serve the `PUT_GET` operation (PVA cmd 12). `PUT_GET` is a Rust
     /// extension: pvxs declares the command but leaves `handle_PUT_GET`
@@ -385,7 +414,7 @@ impl Default for PvaServerConfig {
             auth_complete: None,
             send_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
-            max_message_size: None,
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             serve_put_get: true,
         }
     }

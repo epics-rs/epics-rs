@@ -372,3 +372,18 @@ item 7 as a single unit.
    `phase6/pva-rtems-dep-gate` merged first, then the CA branch. Three unmerged
    branches are now on item 7's critical path: `manual-ca-sans-io`,
    `pva-channelsource-ring`, `pva-rtems-dep-gate`.
+   **RESOLVED 2026-07-21:** all three are merged into the local branch
+   `integration/rtems-scope-b` (design doc §9), gates green at `2ce9bd11`.
+   Stages C–G build there.
+
+5. **PVAS thread priorities** (added 2026-07-21, from
+   `doc/pi-lock-evaluation.md` §8.0 finding 3 / §8.4). This design assigns no
+   EPICS priority to `PVAS-client {peer}`, `PVAS-UDP`, or `PVAS-beacon` —
+   which would re-open, for PVA, the exact asymmetry `blocking.rs:200`/`:669`
+   closed for CA (SCHED_OTHER server threads sharing L16/L17 with 59–71
+   callback bands). pvxs offers no per-thread precedent (one reactor thread),
+   so the anchor is C's CA server: **recommend** `CaServerLow` (20) for
+   `PVAS-client`, `CaServerLow-1` (19) for `PVAS-UDP`/`PVAS-beacon`, applied
+   via `apply_to_current_thread` at thread start, same shape as
+   `blocking.rs:200`. Cheapest moment is stage C, when the threads are first
+   written — not a retrofit after.

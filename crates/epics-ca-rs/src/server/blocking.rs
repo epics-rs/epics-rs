@@ -1366,6 +1366,14 @@ mod tests {
     /// for the event task at `db/dbEvent.c:1117`) come to 1.5 MiB on a 32-bit
     /// target.
     ///
+    /// It also bans the API that has no class to state. `std::thread::spawn`
+    /// cannot express a stack size at all, so a site using it does not *fail*
+    /// the `Builder` check above — it is invisible to it. Same defect, a
+    /// different anchor, and this is the file where the threads that scale with
+    /// client count live. `epics-base-rs`'s
+    /// `every_thread_in_this_crate_states_a_stack_size` has carried this half
+    /// since the classes were introduced; these two files did not.
+    ///
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn every_ca_server_thread_states_a_stack_size() {
@@ -1380,15 +1388,24 @@ mod tests {
         let mut unclassified = Vec::new();
         let mut checked = 0usize;
         for (label, src) in files {
-            for (n, after) in production_scope(src)
-                .split("thread::Builder::new()")
-                .skip(1)
-                .enumerate()
-            {
+            let prod = production_scope(src);
+            for (n, after) in prod.split("thread::Builder::new()").skip(1).enumerate() {
                 checked += 1;
                 let chain = after.split(".spawn(").next().unwrap_or("");
                 if !chain.contains(".stack_size(") {
                     unclassified.push(format!("{label} (Builder #{})", n + 1));
+                }
+            }
+            // The classless API. Needle split so this guard does not match
+            // itself in the file it is written in.
+            let bare = concat!("thread", "::spawn(");
+            for (n, line) in prod.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if t.contains(bare) && !t.contains("Builder") {
+                    unclassified.push(format!("{label}:{} (bare spawn)", n + 1));
                 }
             }
         }

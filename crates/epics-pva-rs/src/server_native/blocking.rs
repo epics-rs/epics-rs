@@ -3016,6 +3016,15 @@ mod tests {
     /// seam, at `PVA_SERVER_PRIORITY`. A raw `thread::Builder` in production
     /// would be a thread with no priority and, on the host, no ambient
     /// runtime — the failure the accept loop's connections would hit first.
+    ///
+    /// `thread::spawn` is banned for a second reason on top of that one: it
+    /// cannot express a stack size at all, so on RTEMS it takes std's generic
+    /// 2 MiB `DEFAULT_MIN_STACK_SIZE` instead of C's class. This module makes
+    /// three threads per connection, so that is the difference between 6 MiB
+    /// and 2 MiB of the target's fixed pool per client. The `Builder` ban above
+    /// does not cover it — `thread::spawn` is invisible to a check that keys on
+    /// `Builder` — which is why it is named separately here, as
+    /// `epics-base-rs`'s `every_thread_in_this_crate_states_a_stack_size` does.
     #[test]
     fn every_server_thread_goes_through_the_seam() {
         let prod = production_scope(include_str!("blocking.rs"));
@@ -3024,6 +3033,21 @@ mod tests {
             0,
             "spawn server threads with `spawn_dedicated_thread`, not directly: \
              the seam is what applies the priority and carries the ambient runtime"
+        );
+        let bare = concat!("thread", "::spawn(");
+        let offenders: Vec<String> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(bare) && !t.contains("Builder")
+            })
+            .map(|(n, _)| format!("blocking.rs:{}", n + 1))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these threads state no stack class and take std's 2 MiB RTEMS \
+             default — three per connection: {offenders:?}"
         );
         assert_eq!(
             prod.matches("spawn_dedicated_thread(").count(),

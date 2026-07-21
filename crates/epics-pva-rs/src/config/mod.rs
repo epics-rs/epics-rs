@@ -30,10 +30,14 @@
 pub mod env;
 
 pub use env::{
-    Config, Endpoint, PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled,
-    beacon_period, broadcast_port, client_tls_keychain_password, conn_timeout_secs,
-    expand_dollar_vars, list_broadcast_addresses, list_intf_addresses, name_servers,
-    parse_addr_list, parse_addr_list_with_port, parse_endpoints_with_port, seed_env_overrides,
-    server_addr_list, server_beacon_addr_list, server_broadcast_port, server_intf_addr_list,
-    server_port, server_tls_keychain_password,
+    Endpoint, PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled, beacon_period,
+    broadcast_port, client_tls_keychain_password, conn_timeout_secs, expand_dollar_vars,
+    list_intf_addresses, name_servers, parse_addr_list, parse_addr_list_with_port,
+    parse_endpoints_with_port, seed_env_overrides, server_addr_list, server_beacon_addr_list,
+    server_broadcast_port, server_intf_addr_list, server_port, server_tls_keychain_password,
 };
+
+// Both need live interface enumeration (`if-addrs`), which newlib cannot
+// build — see [`env::Config`] for what closing that for real requires.
+#[cfg(not(target_os = "rtems"))]
+pub use env::{Config, list_broadcast_addresses};

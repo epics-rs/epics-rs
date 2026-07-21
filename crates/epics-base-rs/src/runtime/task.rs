@@ -845,6 +845,72 @@ where
     )
 }
 
+/// Spawn a **dedicated OS thread** that runs `f` at `priority`, with whatever
+/// ambient async context [`block_on_sync`] needs on this target.
+///
+/// Not [`spawn_blocking_with_priority`], and the difference is the point.
+/// That one hands the closure to a *pool*: tokio's blocking pool on the host,
+/// and on RTEMS a shared callback-pool worker that also drops the priority
+/// (see its `exec_backend` arm). Both are right for work that finishes. A
+/// server thread that lives as long as its connection would occupy a pool
+/// worker for that whole time, so the pool is the wrong home for it — an IOC
+/// thread that a C IOC would create with `epicsThreadCreate` wants a thread of
+/// its own, and the priority a C IOC gives it.
+///
+/// # Why the ambient context is part of this, and not the caller's problem
+///
+/// `block_on_sync` picks its mechanism from the thread it is called on, but it
+/// cannot *create* the context a future needs. On the host a fresh
+/// `std::thread` has no runtime, so a future that spawns tasks or arms timers
+/// panics with "there is no reactor running" the moment it is polled — even
+/// though `block_on_sync` itself was perfectly happy to park. On RTEMS the
+/// exec backend is process-global (`background_init`), so a bare thread is
+/// already complete. That asymmetry is a property of the two backends, so it
+/// is resolved here, at the seam, rather than by a `cfg` in every server that
+/// wants a thread.
+///
+/// The captured context is whatever the *calling* thread is running under, so
+/// call this from the runtime the work should belong to. When there is none
+/// (RTEMS always; on the host a caller that is itself outside a runtime) the
+/// thread simply runs without one, which is exactly right for a future whose
+/// awaits are all runtime-agnostic.
+#[cfg(tokio_backend)]
+pub fn spawn_dedicated_thread<F>(
+    name: String,
+    priority: ThreadPriority,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let ambient = tokio::runtime::Handle::try_current().ok();
+    std::thread::Builder::new().name(name).spawn(move || {
+        // Held for the whole body: it is what makes `tokio::spawn` and the
+        // timer reachable from this thread, and therefore what lets a future
+        // written for the hosted driver run unchanged under `block_on_sync`.
+        let _ambient = ambient.as_ref().map(|h| h.enter());
+        let _ = apply_to_current_thread(priority);
+        f()
+    })
+}
+
+/// RTEMS: a plain thread is already complete — the exec backend's spawn pool
+/// and timer are process-global, so there is no per-thread context to enter.
+#[cfg(exec_backend)]
+pub fn spawn_dedicated_thread<F>(
+    name: String,
+    priority: ThreadPriority,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new().name(name).spawn(move || {
+        let _ = apply_to_current_thread(priority);
+        f()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,6 +925,69 @@ mod tests {
     async fn test_spawn_blocking() {
         let handle = spawn_blocking(|| 123);
         assert_eq!(handle.await.unwrap(), 123);
+    }
+
+    /// The property `spawn_dedicated_thread` exists for. A future written for
+    /// the hosted driver — one that spawns a task and arms a timer — must run
+    /// unchanged on the thread this hands back. On a plain `std::thread` it
+    /// does not: it panics with "there is no reactor running" as soon as it is
+    /// polled, however willing `block_on_sync` was to park.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dedicated_thread_carries_the_ambient_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joined = spawn_dedicated_thread(
+            "dedicated-with-runtime".into(),
+            ThreadPriority::CaServerLow,
+            move || {
+                let outcome = block_on_sync(async {
+                    let inner = spawn(async { 7u32 }).await.expect("inner task");
+                    sleep(Duration::from_millis(1)).await;
+                    inner
+                });
+                let _ = tx.send((
+                    std::thread::current().name().map(str::to_string),
+                    outcome.ok(),
+                ));
+            },
+        )
+        .expect("dedicated thread spawned");
+
+        let (name, value) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dedicated thread must complete, not panic");
+        assert_eq!(name.as_deref(), Some("dedicated-with-runtime"));
+        assert_eq!(
+            value,
+            Some(7),
+            "a spawn and a timer must both work on the dedicated thread"
+        );
+        joined.join().expect("dedicated thread joined");
+    }
+
+    /// The other boundary: no runtime to capture. The thread still runs, and a
+    /// runtime-agnostic await still completes — that is `park_on`, and it is
+    /// the only arm RTEMS ever takes.
+    #[test]
+    fn a_dedicated_thread_runs_without_an_ambient_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joined = spawn_dedicated_thread(
+            "dedicated-no-runtime".into(),
+            ThreadPriority::Low,
+            move || {
+                let _ = tx.send((
+                    std::thread::current().name().map(str::to_string),
+                    block_on_sync(async { 5u32 }).ok(),
+                ));
+            },
+        )
+        .expect("dedicated thread spawned");
+
+        let (name, value) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dedicated thread must run with no runtime to capture");
+        assert_eq!(name.as_deref(), Some("dedicated-no-runtime"));
+        assert_eq!(value, Some(5));
+        joined.join().expect("dedicated thread joined");
     }
 
     #[tokio::test]

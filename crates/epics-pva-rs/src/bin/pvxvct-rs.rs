@@ -25,9 +25,9 @@ use std::time::SystemTime;
 use clap::Parser;
 use tokio::sync::mpsc::Receiver;
 
-use epics_pva_rs::client_native::decode::try_parse_frame;
 use epics_pva_rs::client_native::udp::{CollectedDatagram, UdpManager};
 use epics_pva_rs::config::Endpoint;
+use epics_pva_rs::decode::try_parse_frame;
 use epics_pva_rs::proto::{Command, ReadExt, decode_size_nonnull, decode_string, ip_from_bytes};
 
 #[derive(Parser)]

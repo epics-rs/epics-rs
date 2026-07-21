@@ -1187,26 +1187,11 @@ fn load_pkcs12_keychain(
 
 // ─── X.509 identity → authorization credentials ─────────────────────────
 
-/// Authorization identity derived from a verified TLS peer certificate
-/// chain. Mirrors pvxs `PeerCredentials` for the `x509` auth method
-/// (`SSLContext::fill_credentials`, `src/ossl.cpp`):
-///
-/// - `account` = the **leaf** (peer) certificate's subject CommonName.
-/// - `authority` = the **root CA**'s subject CommonName, but only when
-///   that last cert in the chain is a self-signed CA (pvxs checks
-///   `X509_check_ca(root) && EXFLAG_SS`).
-///
-/// The `method` is always `"x509"`. Server-side ACF rules of the form
-/// `RULE(1, WRITE) { ... METHOD("x509") AUTHORITY("Root CA") }` match
-/// against these fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct X509Credentials {
-    /// Peer leaf certificate subject CommonName → ACF account.
-    pub account: String,
-    /// Root CA subject CommonName → ACF authority. Empty when the
-    /// chain has no self-signed CA at its end.
-    pub authority: String,
-}
+/// The credential type itself lives in [`crate::auth::x509`] so that a build
+/// without the `tls` feature can still name a peer's authorization identity
+/// without linking rustls. Only the *chain → credentials* mapping below
+/// needs the TLS types, and so only that stays here.
+pub use crate::auth::x509::X509Credentials;
 
 /// Extract the subject CommonName from a DER-encoded X.509 certificate.
 /// Returns `None` when the cert fails to parse, carries no CN RDN, or the

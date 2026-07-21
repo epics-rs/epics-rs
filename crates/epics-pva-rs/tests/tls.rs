@@ -6,7 +6,11 @@
 //! `client_native::server_conn::connect_tls` and the `tokio_rustls`
 //! acceptor in `server_native::tcp` actually shake hands and exchange
 //! frames.
+//!
+//! Compiled only with the `tls` feature (ON by default) — without it the
+//! crate links no rustls, so there is nothing here to exercise.
 
+#![cfg(feature = "tls")]
 #![allow(clippy::manual_async_fn)]
 
 use std::sync::Arc;

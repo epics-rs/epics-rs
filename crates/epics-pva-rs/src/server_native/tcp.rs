@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
+use crate::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
@@ -2444,10 +2444,18 @@ pub async fn run_tcp_server_on_listener(
     debug!(?bind_addr, "TCP listener up");
     let active = Arc::new(AtomicUsize::new(0));
 
+    #[cfg(feature = "tls")]
     let tls_acceptor = config
         .tls
         .as_ref()
         .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
+    // Without the `tls` feature there is no rustls type to build an acceptor
+    // from — and none is needed: `TlsServerConfig` is uninhabited, so
+    // `config.tls` is provably `None` and the config handle itself stands in
+    // as the acceptor slot. Same `Option` shape, so everything downstream
+    // (`acceptor.as_ref()`, `.is_some()`, the peek, the match) is untouched.
+    #[cfg(not(feature = "tls"))]
+    let tls_acceptor = config.tls.clone();
 
     // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
@@ -2588,6 +2596,11 @@ pub async fn run_tcp_server_on_listener(
                         // that completes TCP but stalls during ClientHello
                         // would otherwise hold a `max_connections` slot
                         // until OS keepalive reaps it (~30s).
+                        //
+                        // The only arm that names a rustls type. Without the
+                        // `tls` feature the acceptor is `Option<Infallible>`
+                        // and the `_` arm below is already exhaustive.
+                        #[cfg(feature = "tls")]
                         (Some(a), true) => {
                             match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
                                 .await
@@ -8328,7 +8341,7 @@ fn fixed_out_order(order: ByteOrder) -> Arc<std::sync::atomic::AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
+    use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
 
     /// a throwaway MONITOR-completion sender for `handle_op`
@@ -13774,7 +13787,7 @@ mod tests {
     /// probe-reply), and with `MustReply` it likewise carries the CID.
     #[tokio::test]
     async fn tcp_search_does_not_gate_on_advertised_protocol() {
-        use crate::client_native::decode::{decode_search_response, try_parse_frame};
+        use crate::decode::{decode_search_response, try_parse_frame};
         use crate::server_native::{SharedPV, SharedSource};
 
         let order = ByteOrder::Little;
@@ -18679,7 +18692,7 @@ mod tests {
     /// and fabricated a Variant type tree.
     #[tokio::test]
     async fn get_field_none_introspection_replies_error_no_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::server_native::SharedSource;
         use std::sync::Arc;
 
@@ -18750,7 +18763,7 @@ mod tests {
     /// error-path fix).
     #[tokio::test]
     async fn get_field_slow_path_returns_source_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
         use crate::server_native::SharedSource;
         use crate::server_native::shared_pv::SharedPV;

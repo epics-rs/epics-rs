@@ -15,10 +15,17 @@
 
 pub mod auth;
 pub mod cli;
+// The native PVA client — connection pool, UDP search engine, per-operation
+// tasks. Behind the `client` feature (ON by default) so a server-only build
+// (design doc §9 phase 6) can drop the client I/O surface. The wire decoder
+// the server also needs is NOT in here; it is `crate::decode`.
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
 pub mod client_native;
 pub mod codec;
 pub mod config;
+pub mod decode;
 pub mod error;
 pub mod format;
 pub(crate) mod leaf_convert;

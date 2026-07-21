@@ -1058,6 +1058,12 @@ impl PvaServer {
     /// client target, a v4-bound server hands out `127.0.0.1:port`.
     /// Otherwise a v6 listener on `[::1]` would be unreachable from
     /// the test client.
+    ///
+    /// The one server method whose *return type* is a client — so it is the
+    /// one that gates with the client (design doc §9 phase 6, item 2). Use
+    /// [`Self::bound_tcp_addr`] on a server-only build; that is what this
+    /// hands the builder anyway.
+    #[cfg(feature = "client")]
     pub fn client_config(&self) -> crate::client_native::context::PvaClient {
         let loopback = match self.effective_config.bind_ip {
             std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -1668,6 +1674,9 @@ mod tcp_fallback_tests {
     /// hands out a v6 loopback target to match the server family),
     /// and pvget the value. Proves the full PVA stack — TCP listener,
     /// handshake, channel creation, GET — works over IPv6.
+    ///
+    /// Drives a real client, so it rides the `client` feature.
+    #[cfg(feature = "client")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pvget_round_trip_over_ipv6_loopback() {
         use crate::nt::typed::TypedNT;

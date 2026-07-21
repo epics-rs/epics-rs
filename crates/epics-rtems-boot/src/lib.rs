@@ -151,18 +151,94 @@ pub const UNLINKABLE_MARKER: &str = "epics_rtems_boot__RTEMS_BSP_PREFIX_was_not_
 /// this workspace pins no patched `libc` (no `[patch]`/`[replace]`), so a
 /// stock resolution makes this `false` today.
 ///
-/// Only `time_t` and `timespec` are checked. `dev_t`, `ino_t` and `rlim_t` are
-/// equally wrong but appear nowhere in `epics-base-rs`, `epics-ca-rs` or
-/// `epics-pva-rs`; asserting types we never touch would make this a `libc`
-/// conformance suite that fails for reasons unrelated to us. Add one when the
-/// first use appears.
+/// # Which time types are checked
+///
+/// Both that the closure passes across the C boundary:
+///
+/// * `timespec` — `clock_gettime` under every `Instant`/`SystemTime` read, and
+///   `pthread_cond_timedwait` under `Condvar::wait_timeout`, which is the one
+///   production timed wait in the RTEMS closure
+///   (`runtime/background/delayed_timer.rs`).
+/// * `timeval` — `std` passes `optlen = size_of::<libc::timeval>()` to
+///   `setsockopt` for `SO_RCVTIMEO`/`SO_SNDTIMEO`
+///   (`std/src/sys/net/connection/socket/unix.rs`), and **both** blocking
+///   drivers call `set_read_timeout(...)?` before serving a client
+///   (`epics-ca-rs` `server/blocking.rs`, `epics-pva-rs`
+///   `server_native/blocking.rs`). A short `timeval` either fails every
+///   connection at setup or silently loses the timeout bound. We never name
+///   the type; `std` names it for us, which is exactly why a guard is the only
+///   place this becomes visible.
+///
+/// `dev_t`, `ino_t` and `rlim_t` are equally wrong but appear nowhere in
+/// `epics-base-rs`, `epics-ca-rs` or `epics-pva-rs`; asserting types we never
+/// touch would make this a `libc` conformance suite that fails for reasons
+/// unrelated to us. Add one when the first use appears.
 #[cfg(target_os = "rtems")]
 pub const RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT: bool = size_of::<libc::time_t>() == 8
     && size_of::<libc::timespec>() == 16
     && align_of::<libc::timespec>() == 8
     // At offset 4 this field reads the high word of the kernel's 64-bit
     // `tv_sec`, which is what turns the bug from garbage into a clean zero.
-    && core::mem::offset_of!(libc::timespec, tv_nsec) == 8;
+    && core::mem::offset_of!(libc::timespec, tv_nsec) == 8
+    // Same root cause, different struct: with `time_t` as i32 this is 8 bytes
+    // where the target's is 16, so the `optlen` std hands `setsockopt` is half
+    // what the kernel reads.
+    && size_of::<libc::timeval>() == 16
+    && align_of::<libc::timeval>() == 8
+    && core::mem::offset_of!(libc::timeval, tv_usec) == 8;
+
+/// Whether this build's `libc` gives the socket address structs their BSD
+/// length byte.
+///
+/// **False on a stock `libc`.** `src/unix/newlib/arm/mod.rs` defines
+/// `sockaddr_in` as `{ sin_family, sin_port, sin_addr, sin_zero }` with no
+/// `sin_len`, while `src/unix/newlib/aarch64/mod.rs` — the *same* crate, the
+/// same `target_env = "newlib"`, the other RTEMS architecture — defines it as
+/// `{ sin_len, sin_family, sin_port, sin_addr, sin_zero }`. The arm arm is the
+/// odd one out, and RTEMS 6 networking is rtems-libbsd, whose `sockaddr_in`
+/// carries `sin_len`.
+///
+/// # What that costs at runtime
+///
+/// `sa_family_t` is `u8` here, so the two layouts are the same 16 bytes and
+/// differ only in where the family lives: offset 0 for us, offset 1 for the
+/// kernel. We therefore write the address family into the kernel's *length*
+/// byte and leave the kernel's family byte as uninitialised padding.
+/// Measured on target: `bind()` succeeds, and then `local_addr()`, `accept()`
+/// and `recv_from()` all fail with `InvalidInput` and **no** OS error — `std`
+/// reads a family byte that was never written and refuses to decode the
+/// address. An IOC that cannot report its own bound address cannot answer a
+/// CA search or a PVA beacon.
+///
+/// The check is on the family's *offset*, not on the presence of `sin_len`:
+/// naming a field that does not exist is a compile error, which would take the
+/// toolchain-free portability gate down with it (see the note on
+/// [`_RTEMS_LIBC_TIME_LAYOUT`]). An offset of 1 says a length byte precedes
+/// the family, which is the property that matters.
+///
+/// # Which socket types are checked
+///
+/// The three the closure passes across the boundary by value or by pointer:
+/// `sockaddr_in` (raw UDP `bind` in both blocking servers, and the CA
+/// broadcast address list), `sockaddr_in6` and `sockaddr_storage`
+/// (`recvmsg` destination-address recovery in `epics-base-rs` `net/` and
+/// `epics-pva-rs` `client_native/udp.rs`).
+///
+/// Not checked, and why: `msghdr`, `cmsghdr`, `iovec`, `in_pktinfo`,
+/// `in6_pktinfo`, `ifaddrs`, `sched_param`, `pthread_attr_t`,
+/// `pthread_mutex_t` and `pthread_mutexattr_t` are all named by the closure,
+/// but no measured target layout for them exists — only `libc`'s own, which is
+/// the thing under suspicion. Asserting numbers nobody has measured would
+/// encode a guess as a build gate. Add each when the box reports its layout.
+#[cfg(target_os = "rtems")]
+pub const RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT: bool =
+    // The anchor: the family is one byte, so an offset of 1 can only mean a
+    // length byte sits in front of it.
+    size_of::<libc::sa_family_t>() == 1
+        && size_of::<libc::sockaddr_in>() == 16
+        && core::mem::offset_of!(libc::sockaddr_in, sin_family) == 1
+        && core::mem::offset_of!(libc::sockaddr_in6, sin6_family) == 1
+        && core::mem::offset_of!(libc::sockaddr_storage, ss_family) == 1;
 
 /// The refusal. Sited on the same `rtems_boot_linked` arm as the boot shim
 /// itself, so **bootable implies checked, by construction**: an image built
@@ -193,6 +269,25 @@ const _RTEMS_LIBC_TIME_LAYOUT: () = assert!(
      time_t to c_longlong for this target, in BOTH this workspace and the \
      copy -Zbuild-std compiles for std -- patching only one leaves std broken. \
      See RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT for the measured layouts."
+);
+
+/// The socket-layout refusal, on the same arm and for the same reason.
+#[cfg(all(target_os = "rtems", rtems_boot_linked))]
+const _RTEMS_LIBC_SOCKET_LAYOUT: () = assert!(
+    RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT,
+    "RTEMS libc layout bug: this build's `libc` defines the socket address \
+     structs without their BSD length byte (src/unix/newlib/arm/mod.rs), while \
+     the same crate's aarch64 arm -- the other RTEMS architecture -- defines \
+     `sockaddr_in` WITH `sin_len`, and RTEMS 6 networking is rtems-libbsd. \
+     `sa_family_t` is one byte, so the layouts are the same size and differ \
+     only in position: we write the address family into the kernel's LENGTH \
+     byte and leave the kernel's family byte uninitialised. Measured on \
+     target: bind() succeeds, then local_addr(), accept() and recv_from() all \
+     fail with InvalidInput and NO OS error, so the IOC cannot report its own \
+     bound address and cannot answer a CA search or a PVA beacon. WORKAROUND: \
+     patch libc's newlib/arm `sockaddr_in`/`sockaddr_in6`/`sockaddr_storage` \
+     to carry the leading length byte, in BOTH this workspace and the copy \
+     -Zbuild-std compiles for std. See RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT."
 );
 
 /// Pulls this crate — and with it the boot shim and the RTEMS libraries — into
@@ -285,30 +380,32 @@ mod tests {
             .0
     }
 
-    /// The refusal must stay on the *linkable-image* arm — not narrower, not
+    /// Every refusal must stay on the *linkable-image* arm — not narrower, not
     /// wider.
     ///
     /// Narrower (an added `feature = …`, or a `not(…)`) lets a bootable image
-    /// through with zero-resolution `Instant`. Wider (dropping
-    /// `rtems_boot_linked`) deletes the toolchain-free portability gate, which
-    /// is the one gate that runs without the bring-up box. Both directions are
-    /// regressions, so the cfg is pinned exactly.
+    /// through with zero-resolution `Instant` or an unreportable bound address.
+    /// Wider (dropping `rtems_boot_linked`) deletes the toolchain-free
+    /// portability gate, which is the one gate that runs without the bring-up
+    /// box. Both directions are regressions, so the cfg is pinned exactly — and
+    /// each occurrence of it must guard a refusal, nothing else.
     #[test]
-    fn the_libc_layout_refusal_fires_for_every_image_that_can_boot() {
+    fn the_libc_layout_refusals_fire_for_every_image_that_can_boot() {
         let src = production_source();
         let cfg = concat!("#[cfg(all(target_os = \"rtems\", ", "rtems_boot_linked))]");
+        let guarded: Vec<&str> = src
+            .split(cfg)
+            .skip(1)
+            .map(|after| after.trim_start().split_once(':').unwrap().0)
+            .collect();
         assert_eq!(
-            src.matches(cfg).count(),
-            1,
-            "the libc layout refusal must carry exactly `{cfg}`: an image that \
+            guarded,
+            vec![
+                "const _RTEMS_LIBC_TIME_LAYOUT",
+                "const _RTEMS_LIBC_SOCKET_LAYOUT"
+            ],
+            "that cfg guards the layout refusals and nothing else: an image that \
              links has a boot shim, and an image without one cannot link at all"
-        );
-        let (_, after) = src.split_once(cfg).unwrap();
-        assert!(
-            after
-                .trim_start()
-                .starts_with("const _RTEMS_LIBC_TIME_LAYOUT: () = assert!("),
-            "that cfg must guard the layout assertion and nothing else"
         );
     }
 
@@ -331,6 +428,69 @@ mod tests {
                 src.contains(required),
                 "the RTEMS libc layout predicate lost `{required}`; the target's \
                  timespec is 16/align 8 with tv_nsec at 8 and time_t is 8 signed"
+            );
+        }
+    }
+
+    /// The socket predicate, pinned the same way.
+    ///
+    /// `sa_family_t` is one byte on this target, so a family at offset 1 is the
+    /// only observable trace of the BSD length byte the kernel writes — and
+    /// relaxing the offset back to 0 is exactly the mutation that restores the
+    /// defect while every host build stays green.
+    #[test]
+    fn the_socket_predicate_pins_the_length_byte() {
+        let src = item_body("pub const RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT: bool =");
+        for required in [
+            "size_of::<libc::sa_family_t>() == 1",
+            "size_of::<libc::sockaddr_in>() == 16",
+            "offset_of!(libc::sockaddr_in, sin_family) == 1",
+            "offset_of!(libc::sockaddr_in6, sin6_family) == 1",
+            "offset_of!(libc::sockaddr_storage, ss_family) == 1",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS socket layout predicate lost `{required}`; the target's \
+                 sockaddr_in leads with sin_len, so the family sits at offset 1"
+            );
+        }
+    }
+
+    /// `timeval` is checked even though the closure never names it — `std`
+    /// names it, for every `set_read_timeout` both blocking drivers call.
+    #[test]
+    fn the_time_predicate_covers_the_type_std_passes_for_us() {
+        let src = item_body("pub const RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT: bool =");
+        for required in [
+            "size_of::<libc::timeval>() == 16",
+            "align_of::<libc::timeval>() == 8",
+            "offset_of!(libc::timeval, tv_usec) == 8",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS libc layout predicate lost `{required}`; SO_RCVTIMEO \
+                 carries optlen = size_of::<libc::timeval>() on every connection"
+            );
+        }
+    }
+
+    /// The socket refusal must name the defect and the way out, like the other.
+    #[test]
+    fn the_socket_refusal_message_names_the_defect_and_the_way_out() {
+        let src = item_body("const _RTEMS_LIBC_SOCKET_LAYOUT: () = assert!(");
+        for required in [
+            // the consequence, in the words that make it searchable
+            "InvalidInput",
+            "local_addr",
+            "bound address",
+            // where the evidence is, and the workaround's easy-to-miss half
+            "newlib/arm",
+            "aarch64",
+            "build-std",
+        ] {
+            assert!(
+                src.contains(required),
+                "the RTEMS socket layout refusal message must still name `{required}`"
             );
         }
     }

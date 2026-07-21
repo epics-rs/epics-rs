@@ -406,6 +406,10 @@ impl ConnectionPool {
                 max_message_size: *self.max_message_size.lock(),
             };
             let connect_result = match tls {
+                // Without the `tls` feature `TlsClientConfig` is uninhabited,
+                // so this arm cannot be reached — and is not compiled. The
+                // `None` arm below is then already exhaustive.
+                #[cfg(feature = "tls")]
                 Some(cfg) => {
                     ServerConn::connect_tls(
                         addr,
@@ -417,6 +421,8 @@ impl ConnectionPool {
                     )
                     .await
                 }
+                #[cfg(not(feature = "tls"))]
+                Some(cfg) => match *cfg {},
                 None => ServerConn::connect(addr, user, host, conn_config).await,
             };
             let fresh = connect_result?;

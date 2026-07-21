@@ -2444,10 +2444,18 @@ pub async fn run_tcp_server_on_listener(
     debug!(?bind_addr, "TCP listener up");
     let active = Arc::new(AtomicUsize::new(0));
 
+    #[cfg(feature = "tls")]
     let tls_acceptor = config
         .tls
         .as_ref()
         .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
+    // Without the `tls` feature there is no rustls type to build an acceptor
+    // from — and none is needed: `TlsServerConfig` is uninhabited, so
+    // `config.tls` is provably `None` and the config handle itself stands in
+    // as the acceptor slot. Same `Option` shape, so everything downstream
+    // (`acceptor.as_ref()`, `.is_some()`, the peek, the match) is untouched.
+    #[cfg(not(feature = "tls"))]
+    let tls_acceptor = config.tls.clone();
 
     // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
@@ -2588,6 +2596,11 @@ pub async fn run_tcp_server_on_listener(
                         // that completes TCP but stalls during ClientHello
                         // would otherwise hold a `max_connections` slot
                         // until OS keepalive reaps it (~30s).
+                        //
+                        // The only arm that names a rustls type. Without the
+                        // `tls` feature the acceptor is `Option<Infallible>`
+                        // and the `_` arm below is already exhaustive.
+                        #[cfg(feature = "tls")]
                         (Some(a), true) => {
                             match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
                                 .await

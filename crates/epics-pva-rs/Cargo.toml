@@ -32,10 +32,23 @@ if-addrs = "0.13"
 # reply (PVXS-SR-21). Already a workspace dep (epics-ca-rs, ad-core-rs).
 futures-util = "0.3"
 
-# TLS for `pvas://` (opt-in via `EPICS_PVAS_TLS_KEYCHAIN`).
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rustls-pemfile = "2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# TLS for `pvas://` (opt-in at runtime via `EPICS_PVAS_TLS_KEYCHAIN`, and at
+# compile time via the `tls` feature — ON by default, so a hosted build is
+# unchanged).
+#
+# These three are the reason `cargo tree -p epics-pva-rs -e normal -i ring`
+# resolved at all: `ring` drags `getrandom 0.2`, which `compile_error!`s on
+# `armv7-rtems-eabihf`. They are optional so an RTEMS server build can drop
+# the whole TLS stack (design doc §8.2; TLS on RTEMS proper — swapping ring
+# for aws-lc-rs or a RustCrypto provider — is a separate, later problem).
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+], optional = true }
 # PKCS#12 (`.p12`/`.pfx`) keychain parsing — pvxs `PKCS12_parse` parity.
 # Pure-Rust; opt-in via the `pkcs12` feature so PEM-only deployments
 # can drop the extra dependency. Enabled by default.
@@ -69,17 +82,34 @@ rc-sha1 = { package = "sha1", version = "0.11", optional = true }
 rc-hmac = { package = "hmac", version = "0.13", optional = true }
 # X.509 identity extraction from the verified TLS peer chain — pvxs
 # `SSLContext::fill_credentials` parity (CN → ACF account, root CA CN →
-# authority). Same crate/version `epics-ca-rs` already depends on.
-x509-parser = "0.16"
+# authority). Same crate/version `epics-ca-rs` already depends on. Used only
+# by `auth::tls`, so it rides the `tls` feature; the credential type it
+# produces (`auth::x509::X509Credentials`) is plain data and stays compiled
+# either way.
+x509-parser = { version = "0.16", optional = true }
 
 [features]
-default = ["pkcs12"]
+default = ["tls", "pkcs12"]
+# TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
+# drops rustls/tokio-rustls/rustls-pemfile/x509-parser — and with them `ring`
+# and `getrandom 0.2`, the crate that does not build for RTEMS. With the
+# feature off, `auth::TlsServerConfig`/`TlsClientConfig` become uninhabited
+# placeholder types: the `tls` fields on `ServerConfig` / `PvaClientBuilder`
+# still exist and still compile, but are provably `None` because no value of
+# the config type can be constructed. See `auth::mod`.
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:x509-parser"]
 # PKCS#12 keychain support in `auth::tls`. When disabled, the keychain
 # loader falls back to PEM-only and rejects DER/PKCS#12 inputs.
 # Covers both the classic PBE path (`p12`) and the PBES2/AES path
 # (stable `pkcs5`/`der`/`spki`), so any PKCS#12 written by OpenSSL 1.x
 # or 3.x loads with the feature on.
+#
+# Implies `tls`: the whole PKCS#12 loader lives inside `auth::tls`, and a
+# keychain with no TLS stack to install it into is meaningless. This also
+# closes the SECOND `getrandom 0.2` path — `p12` depends on it directly, not
+# only through `ring`.
 pkcs12 = [
+    "tls",
     "dep:p12",
     "dep:sha1",
     "dep:pkcs5",

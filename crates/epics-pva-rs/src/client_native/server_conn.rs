@@ -233,6 +233,11 @@ impl ServerConn {
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
+    ///
+    /// The only client entry point that names a rustls type, so it is the
+    /// only one gated on the `tls` feature; the `Option<Arc<TlsClientConfig>>`
+    /// plumbing that reaches it compiles either way (see [`crate::auth`]).
+    #[cfg(feature = "tls")]
     pub async fn connect_tls(
         target: SocketAddr,
         server_name: &str,

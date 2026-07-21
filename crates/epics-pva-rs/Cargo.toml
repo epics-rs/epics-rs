@@ -12,12 +12,10 @@ epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 serde_json = "1.0"
 thiserror = "2"
-socket2 = "0.5"
 hostname = "0.4"
 tokio-util = { version = "0.7", default-features = false }
 # Refcounted byte buffer used by the raw-frame monitor forwarding path
@@ -26,7 +24,6 @@ tokio-util = { version = "0.7", default-features = false }
 bytes = "1"
 parking_lot = "0.12"
 dashmap = "6"
-if-addrs = "0.13"
 # `FutureExt::catch_unwind` — converts a panic in a user-supplied source
 # handler into an error reply rather than letting it skip the exec
 # reply (PVXS-SR-21). Already a workspace dep (epics-ca-rs, ad-core-rs).
@@ -127,6 +124,43 @@ pkcs12 = [
     "dep:rc-sha1",
     "dep:rc-hmac",
 ]
+
+# ── Host network stack (everything except RTEMS) ────────────────────────
+#
+# `socket2` and `if-addrs` are §8.1 hard blockers on `armv7-rtems-eabihf`:
+# socket2 fails with 20 errors (newlib has no `msghdr`/`recvmsg`/`IovLen`,
+# no `ip_mreqn`, no `SOCK_RAW`) and if-addrs with 2 (no `getifaddrs`/
+# `ifaddrs`). Both are reached only from the tokio async I/O layer —
+# `server_native::{tcp,udp}` and `client_native` — which RTEMS does not use:
+# it gets a blocking thread-per-client driver instead (§4, §9 phase 6
+# item 7). So they are host-only deps, the same gate `epics-base-rs`
+# applied to its own copies (§8.1.1). NOT solved for RTEMS — see §8.1 for
+# what an RTEMS interface enumerator / raw-libc sockopt subset would take.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
+socket2 = "0.5"
+if-addrs = "0.13"
+tokio = { version = "1", features = ["full"] }
+
+# RTEMS gets tokio without `net`/`signal`/`process`: `net` pulls mio
+# (29 errors — no epoll/kqueue selector, and mio dropped its poll backend
+# deliberately) and `signal` pulls signal-hook-registry (4 errors — no
+# `sa_sigaction`/`SA_RESTART`). Declared per-target rather than in the
+# shared table because Cargo *unions* a dependency's features across every
+# matching table: a shared `full` would silently re-add the features this
+# drops. Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio
+# API surface the always-compiled code uses still type-checks.
+[target.'cfg(target_os = "rtems")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "macros",
+    "io-util",
+    "io-std",
+    "fs",
+    "parking_lot",
+] }
 
 # POSIX getgrouplist / getpwuid / getgrgid for posix_groups() — pvxs
 # osdGetRoles parity. The auth::plain::posix_groups() path is

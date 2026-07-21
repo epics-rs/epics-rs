@@ -4,7 +4,7 @@
 //!
 //! * **Protocol / source layer** — [`source`], [`shared_pv`], [`composite`],
 //!   [`server_info`], [`op_handle`], [`monitor_control`], [`config`],
-//!   [`search`], [`peers`]. No sockets; drives the codec in
+//!   [`search`], [`search_engine`], [`peers`]. No sockets; drives the codec in
 //!   [`crate::decode`] / [`crate::proto`]. Compiles for every target, RTEMS
 //!   included.
 //! * **Async I/O layer** — [`accept`], [`udp`], [`runtime`]. Built on
@@ -47,6 +47,12 @@ pub mod runtime;
 // SEARCH parse / name-match / response framing. Protocol only — both the UDP
 // responders and the TCP-circuit handler feed it bytes they read themselves.
 pub mod search;
+// One UDP datagram's worth of SEARCH decode on top of [`search`]: chained
+// message drain, ORIGIN_TAG forward decision, reply-destination resolution,
+// source filter. Returns the datagrams to send instead of sending them, so it
+// holds no socket either — [`udp`] is the async caller, the blocking RTEMS
+// responder is the other.
+pub mod search_engine;
 pub mod server_info;
 pub mod shared_pv;
 pub mod source;

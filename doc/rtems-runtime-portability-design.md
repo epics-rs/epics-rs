@@ -417,7 +417,7 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    |---|---|---|
    | 1 | TLS/dep feature gate on `epics-pva-rs` (§8.2 correction) | 3–5 d |
    | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d |
-   | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | 4–6 d |
+   | 4 | `MonitorInbox::try_recv` (**done**) + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ **1–2 wk** |
    | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** |
    | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d |
    | 7 | Blocking accept/UDP/beacon threads | 1 wk |
@@ -432,6 +432,39 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    copies the ring into it (`shared_pv.rs:1428-1445`). Its trait change ripples
    into `epics-bridge-rs`, so item 4 requires `nextest --workspace`, not
    per-crate.
+
+   **Item 4 re-measured 2026-07-21 — the 4–6 d figure was wrong by roughly an
+   order of magnitude.** Two facts found while starting it:
+
+   - **3 copies + 3 transforms, not 6 pure copies.** `shared_pv.rs:1434`,
+     `:1477` and `source.rs:1687` are pure copies. But
+     `native_source.rs:878/927/957` pull from `DbSubscription`/`PvSubscription`
+     and *transform* — `snapshot_to_pv_field`, `nt::event_leaves` marking with
+     an empty-mask `continue` filter, and an initial seed send at `:927`.
+     Deleting those three needs a lazy adapter owning the upstream
+     subscription and applying the transform inside its own `recv`/`try_recv`,
+     not a signature change. Enabler: both subscriptions are backed by
+     `EventReader`, which already has `try_recv` (`event_queue.rs:570`), so the
+     non-blocking path exists all the way down and only needs exposing.
+   - **112-site sweep across 2 crates**, not the 5 methods named in
+     `source.rs`: 81 sites in epics-pva-rs + 39 in epics-bridge-rs matching
+     `Option<mpsc::Receiver<(PvField|RawMonitorEvent|MonitorUpdate)>>`, plus the
+     public `SubscriptionSeed::updates` field; `ChannelSource` has 77 impls
+     workspace-wide. Mitigating: consumers need only `recv().await` and
+     `try_recv()`; the epics-bridge-rs middleware only *forwards* streams and
+     constructs no monitor channels, so those 39 are type-name swaps; and
+     `MonitorInbox`/`MonitorOutbox` are confined to `shared_pv.rs`.
+
+   Design to settle **before** the sweep, so it lands in one piece rather than
+   leaving the tree red: generic `MonitorRing<T>`; `MonitorStream<T>` as an
+   allocation-free enum `{Channel, Ring}`; `try_recv` exposed on
+   `Db`/`PvSubscription`; concrete adapter variants for the three
+   `native_source` transforms.
+
+   `MonitorInbox::try_recv` itself is **done** (`aeb41927` on
+   `phase6/pva-channelsource-ring`), with per-boundary tests: empty ring, one
+   item, squashed tail, `producer_done` with items still queued,
+   `producer_done` with an empty ring, and pending-credit decrement.
 
 The old phase 6 (`smol`/`polling` desktop-driver fallback) is **dropped
 outright** — see §4. The number is reused above by the PVA phase; there is no

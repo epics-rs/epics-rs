@@ -28,6 +28,11 @@
 
 #[cfg(not(target_os = "rtems"))]
 pub mod accept;
+// The blocking thread-per-connection driver — the second driver beside
+// [`accept`], for targets with no reactor (RTEMS item 5 stage 3). Owns
+// sockets, so it belongs to the I/O layer; host-compiled and host-tested so
+// hosted behaviour can be shown unchanged.
+pub mod blocking;
 pub mod composite;
 // The server config record. No socket, no async — see the module doc for why
 // it is not part of [`runtime`].

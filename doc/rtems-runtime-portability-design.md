@@ -596,11 +596,26 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    `--lib` RTEMS checks exit 0 for epics-base-rs, epics-ca-rs **and
    epics-pva-rs** — the committed-green pva RTEMS check that items 5, 7 and
    10 were waiting on. Item-5 stages 3–5, item-7 stages C–G, and items 8–9
-   are unblocked on this branch. Next owed there: extract `PvaServerConfig`
+   are unblocked on this branch. ~~Next owed there: extract `PvaServerConfig`
    out of the host-gated `runtime.rs` — 8 production `tcp.rs` signatures
    name it (`tcp.rs:45`), so the gate re-point is **not** the "4 cfg lines"
    named in `4c75e766` until that lands — then the `tcp`/`peers` gate
-   re-point and the `AbortOnDrop` → `TaskAbortHandle` rename.
+   re-point and the `AbortOnDrop` → `TaskAbortHandle` rename.~~
+   **LANDED 2026-07-21** (`42a42abf` config → `server_native/config.rs` ·
+   `4da1e04a` SEARCH protocol → `server_native/search.rs`, byte-identical
+   moves diff-proved · `04cdf6fa` tcp.rs's 3 handle annotations → seam
+   aliases · `5ff20f4a` exec `AbortHandle` gains the `Debug` its tokio
+   mirror has · `ab2d48e2` gate re-point: `tcp`/`peers`/`config`/`search`
+   target-neutral, `accept`/`runtime`/`udp` stay gated · `af2d5d16` rustdoc
+   links). RTEMS `--lib` exit 0 with `tcp.rs` **type-checked into the
+   build** (deliberate-type-error probe), workspace 9839 unchanged.
+   Known residue: **116 dead-code warnings on the RTEMS check** — with the
+   pre-split `run_tcp_server*` re-exports gated, RTEMS has no entry point
+   into `tcp` yet, so the whole module is unreachable until the blocking
+   thread-per-client driver (item 7 stage C) roots it; the count is the
+   honest measure of unwired surface, deliberately not `#[allow]`-ed.
+   Still owed: the crate-wide item-9 handle rename (~87 sites), item-5
+   stages 3–5, item-7 stages C–G.
 
    **RT-Linux track (separate from RTEMS, user-ordered 2026-07-21).**
    Item 4 landed as `c065fe28` on the CA branch: SCHED_FIFO application is

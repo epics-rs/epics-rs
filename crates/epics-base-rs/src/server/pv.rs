@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::runtime::sync::{Mutex, RwLock};
 
 use crate::error::CaError;
-use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome};
+use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome, TryRecvError};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
 
@@ -875,6 +875,31 @@ impl PvSubscription {
     /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-820`).
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
         Some(self.reader.recv().await?.snapshot)
+    }
+
+    /// Non-blocking [`Self::recv_snapshot`]. Delegates to
+    /// [`EventReader::try_recv`] (`event_queue.rs:570`) — same queue, same
+    /// EVENTS_OFF gate, no suspension.
+    ///
+    /// Lets a PVA monitor source that adapts this stream be polled from a
+    /// blocking drain loop with no reactor present
+    /// (`doc/rtems-runtime-portability-design.md` §9 phase 6).
+    pub fn try_recv_snapshot(&mut self) -> Result<Snapshot, TryRecvError> {
+        self.reader.try_recv().map(|e| e.snapshot)
+    }
+
+    /// Await the next change as the full [`MonitorEvent`] — snapshot plus the
+    /// per-event `DBE_*` mask. The mask-carrying counterpart of
+    /// [`recv_snapshot`](Self::recv_snapshot), matching
+    /// `DbSubscription::recv_event` so a consumer can treat a simple-PV and a
+    /// record subscription through one shape.
+    pub async fn recv_event(&mut self) -> Option<MonitorEvent> {
+        self.reader.recv().await
+    }
+
+    /// Non-blocking [`Self::recv_event`].
+    pub fn try_recv_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        self.reader.try_recv()
     }
 }
 

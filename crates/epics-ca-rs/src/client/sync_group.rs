@@ -29,10 +29,12 @@
 
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
-
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::spawn;
+// The seam handle, not a bare `tokio::task::JoinHandle`: `spawn` (imported
+// below) returns this, and under `rtems-exec-model` it is the executor's
+// `JoinFuture`. Byte-identical to `tokio::task::JoinHandle` under the default.
+use epics_base_rs::runtime::task::TaskHandle as JoinHandle;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use super::CaChannel;

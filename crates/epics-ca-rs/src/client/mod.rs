@@ -435,10 +435,15 @@ pub struct CaClient {
     /// [`CaClient::set_user_name`] / [`CaClient::set_host_name`] mutate it
     /// and notify already-connected circuits out of band.
     client_identity: types::ClientIdentitySlot,
-    _coordinator: tokio::task::JoinHandle<()>,
-    _search_task: tokio::task::JoinHandle<()>,
-    _transport_task: tokio::task::JoinHandle<()>,
-    _beacon_task: tokio::task::JoinHandle<()>,
+    // The spawned client background tasks. Typed as the `runtime::task`
+    // seam handle (not a bare `tokio::JoinHandle`) because they are spawned
+    // through `runtime::task::spawn`; under the hosted default this alias IS
+    // `tokio::task::JoinHandle`, and under the `rtems-exec-model` backend it
+    // is the executor's `JoinFuture`, so the field type follows the seam.
+    _coordinator: epics_base_rs::runtime::task::TaskHandle<()>,
+    _search_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _transport_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _beacon_task: epics_base_rs::runtime::task::TaskHandle<()>,
     /// Discovery backends retained for their lifetime. mDNS's
     /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
     /// runs only while the backend is alive — dropping it kills live
@@ -448,7 +453,7 @@ pub struct CaClient {
     /// `subscribe()` stream and feed `DiscoveryEvent`s into the
     /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
     /// drop so they don't outlive the client.
-    _discovery_forwarders: Vec<tokio::task::JoinHandle<()>>,
+    _discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -756,7 +761,8 @@ impl CaClient {
         // never discovered. The `backends` Vec — and the `ServiceDaemon`
         // an `MdnsBackend` owns — is retained on `CaClient` so the
         // browse keeps running for the client's lifetime.
-        let mut discovery_forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>> =
+            Vec::new();
         for backend in &backends {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
@@ -3206,7 +3212,8 @@ impl Drop for MonitorHandle {
 #[must_use = "dropping the EventWatcher immediately stops the watcher task; \
               bind it to a variable to keep watching"]
 pub struct EventWatcher {
-    handle: tokio::task::JoinHandle<()>,
+    // Spawned via `runtime::task::spawn`; seam handle (see `ServerConnection`).
+    handle: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 impl EventWatcher {

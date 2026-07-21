@@ -260,8 +260,11 @@ struct ServerConnection {
     /// circuit then). Mirrors libca's `tcpRecvWatchdog` model — see
     /// `TransportCommand::BeaconArrivalNotify` for full rationale.
     beacon_arrival_tx: mpsc::UnboundedSender<bool>,
-    _read_task: tokio::task::JoinHandle<()>,
-    _write_task: tokio::task::JoinHandle<()>,
+    // Spawned via `runtime::task::spawn`, so typed as the seam handle.
+    // Byte-identical to `tokio::task::JoinHandle` under the hosted default;
+    // the executor's `JoinFuture` under `rtems-exec-model`.
+    _read_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _write_task: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 /// Hard-stop on drop: abort both the per-server read and write tasks.
@@ -2549,7 +2552,11 @@ mod read_loop_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only: constructs `ServerConnection` tasks with `tokio::spawn` and
+// asserts tokio abort semantics. Under `rtems-exec-model` the task fields are
+// `JoinFuture` (not tokio handles) and the async client stack has no reactor to
+// run on, so this test is inapplicable there.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod server_connection_drop_tests {
     //! Verifies the per-circuit `ServerConnection::drop` aborts both
     //! its read and write tasks. Without this, every `connections`

@@ -96,6 +96,14 @@ windows-sys = { version = "0.59", features = [
 
 [features]
 default = []
+# Host-selectable RTEMS execution model — passthrough to
+# `epics-base-rs/rtems-exec-model`. Routes the `runtime::task` seam to the
+# std-thread background executor on a hosted target, so the blocking CA
+# server driver's async record-processing completion runs on the executor
+# (callback pool + delayed timer + scanOnce) instead of a tokio runtime —
+# the same backend the RTEMS build uses. OFF by default; the hosted default
+# is byte-identical without it. See `crates/epics-base-rs/build.rs`.
+rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # Bundled Prometheus exporter + tracing-subscriber init helpers.
 # Without this feature consumers wire up their own observability
 # stack via the bare `metrics` and `tracing` facades.

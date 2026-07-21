@@ -79,6 +79,17 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 
 [features]
+# Host-selectable RTEMS execution model. Routes the `runtime::task`
+# spawn/sleep/interval seam to the std-thread background executor
+# (callback pool + delayed timer + scanOnce worker) on a HOSTED target,
+# instead of the tokio runtime — the same runtime-free backend the RTEMS
+# build uses unconditionally. Intended for a Linux (e.g. PREEMPT_RT)
+# blocking-front-end deployment that runs the `std::net` CA server driver
+# and wants async record-processing completion driven on dedicated OS
+# threads with no tokio reactor. Compile-time backend switch (see
+# `build.rs`, which turns this into the `exec_backend` cfg). OFF by
+# default: the hosted default is byte-identical without it.
+rtems-exec-model = []
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on

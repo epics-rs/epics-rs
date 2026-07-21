@@ -130,20 +130,20 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
 // ---------------------------------------------------------------------------
 
 /// Handle to a spawned task — `await` for its result, `abort()` to cancel.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub type TaskHandle<T> = tokio::task::JoinHandle<T>;
 /// Detached cancellation handle for a spawned task.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub type TaskAbortHandle = tokio::task::AbortHandle;
 /// Error from awaiting a [`TaskHandle`] (cancelled or panicked).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub type TaskJoinError = tokio::task::JoinError;
 
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub type TaskHandle<T> = crate::runtime::background::future_exec::JoinFuture<T>;
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub type TaskAbortHandle = crate::runtime::background::future_exec::AbortHandle;
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub type TaskJoinError = crate::runtime::background::future_exec::JoinError;
 
 // ---------------------------------------------------------------------------
@@ -165,12 +165,12 @@ pub type TaskJoinError = crate::runtime::background::future_exec::JoinError;
 // compiled.
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_os = "rtems", test))]
+#[cfg(any(exec_backend, test))]
 static BACKGROUND: std::sync::OnceLock<crate::runtime::background::BackgroundExecutor> =
     std::sync::OnceLock::new();
 
 /// The process-global background executor, initialised on first use.
-#[cfg(any(target_os = "rtems", test))]
+#[cfg(any(exec_backend, test))]
 fn background() -> &'static crate::runtime::background::BackgroundExecutor {
     BACKGROUND.get_or_init(crate::runtime::background::BackgroundExecutor::new)
 }
@@ -180,12 +180,12 @@ fn background() -> &'static crate::runtime::background::BackgroundExecutor {
 /// a second call (or a prior lazy init) is a no-op, matching `callbackInit`'s
 /// own re-entry guard (callback.c:292-295). Only the RTEMS build uses the
 /// executor; hosted builds drive tails on the tokio runtime.
-#[cfg(any(target_os = "rtems", test))]
+#[cfg(any(exec_backend, test))]
 pub fn background_init() {
     let _ = background();
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -196,7 +196,7 @@ where
 
 /// RTEMS: drive the tail on a callback-pool worker via the host-tested future
 /// executor, at the default Medium band.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -210,7 +210,7 @@ where
     )
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -221,7 +221,7 @@ where
 
 /// RTEMS: run the blocking closure on a callback-pool worker at the default
 /// Medium band via the host-tested future executor.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -235,24 +235,24 @@ where
     )
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
 /// RTEMS: sleep on the delayed-callback timer via the host-tested `Sleep`.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub async fn sleep(duration: Duration) {
     crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub async fn sleep_until(deadline: std::time::Instant) {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
 }
 
 /// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub async fn sleep_until(deadline: std::time::Instant) {
     crate::runtime::background::timer_sleep::sleep_until(&background().timer().handle(), deadline)
         .await;
@@ -265,12 +265,12 @@ pub async fn sleep_until(deadline: std::time::Instant) {
 /// build substitutes the runtime-free
 /// [`crate::runtime::background::timer_sleep::TimerInterval`], which reproduces
 /// the same semantics over the delayed-callback timer.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub struct Interval {
     inner: tokio::time::Interval,
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 impl Interval {
     /// Complete at the next tick. The first tick is immediate (tokio parity);
     /// callers that want to skip it await `tick()` once up front.
@@ -281,12 +281,12 @@ impl Interval {
 
 /// RTEMS: the periodic ticker is the runtime-free `TimerInterval` (same
 /// immediate-first-tick + Burst catch-up semantics, same `tick()` surface).
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub type Interval = crate::runtime::background::timer_sleep::TimerInterval;
 
 /// Build a periodic ticker firing every `period` — the seam replacement for
 /// `tokio::time::interval`.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub fn interval(period: Duration) -> Interval {
     Interval {
         inner: tokio::time::interval(period),
@@ -294,7 +294,7 @@ pub fn interval(period: Duration) -> Interval {
 }
 
 /// RTEMS: build the periodic ticker on the delayed-callback timer.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub fn interval(period: Duration) -> Interval {
     crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
@@ -508,7 +508,7 @@ fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
 /// honoured the request. This is the priority-aware counterpart of
 /// [`spawn_blocking`] for IOC threads (CA server, scan) that a C IOC
 /// would run in a distinct SCHED band.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub fn spawn_blocking_with_priority<F, R>(priority: ThreadPriority, f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -527,7 +527,7 @@ where
 /// running worker per task would leak that priority into the next callback it
 /// drains. The closure runs at the pool's default Medium band; mapping
 /// `ThreadPriority` to a `CallbackPriority` band is deferred to RTEMS bring-up.
-#[cfg(target_os = "rtems")]
+#[cfg(exec_backend)]
 pub fn spawn_blocking_with_priority<F, R>(_priority: ThreadPriority, f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,

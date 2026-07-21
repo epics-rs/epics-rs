@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use super::facility::{recover, run_facility_loop, run_isolated};
 use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
@@ -155,7 +156,7 @@ impl PriorityQueue {
 
     /// Port of `callbackRequest` for a single band (`callback.c:341-377`).
     fn request(&self, name: &str, cb: Callback) -> Result<(), CallbackError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = recover(FACILITY, self.state.lock());
         if st.shutdown {
             // Pool stopped: C drops late callbackRequests after callbackStop
             // without surfacing an error (`callback.c:237-284`). Drop `cb`
@@ -196,13 +197,16 @@ impl PriorityQueue {
     }
 }
 
+/// What this facility is called when it has to report something about itself.
+const FACILITY: &str = "callback band";
+
 /// Port of `callbackTask` for one band (`callback.c:210-235`).
 fn worker_loop(pq: &PriorityQueue) {
     loop {
-        let mut st = pq.state.lock().unwrap();
+        let mut st = recover(FACILITY, pq.state.lock());
         // callback.c:220-221 — sleep on the wake event while the ring is empty.
         while st.queue.is_empty() && !st.shutdown {
-            st = pq.wake.wait(st).unwrap();
+            st = recover(FACILITY, pq.wake.wait(st));
         }
         if st.queue.is_empty() {
             // Empty *and* shutdown — drain complete, exit.
@@ -214,7 +218,7 @@ fn worker_loop(pq: &PriorityQueue) {
         st.overflow = false;
         drop(st);
         // callback.c:228 — run the callback with the ring lock released.
-        cb();
+        run_isolated(FACILITY, cb);
     }
 }
 
@@ -239,11 +243,7 @@ impl CallbackHandle {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        self.queues[priority.index()]
-            .state
-            .lock()
-            .unwrap()
-            .overflows
+        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
     }
 }
 
@@ -299,7 +299,14 @@ impl CallbackPool {
                         // callback.c:322 — `opts.priority = threadPriority[i]`,
                         // applied best-effort to this OS thread.
                         let _ = enter_ioc_thread(prio.os_priority());
-                        worker_loop(&pq);
+                        // A band with no worker left is a band whose queued
+                        // callbacks never run again — deferred record
+                        // processing, delayed callbacks, monitor tails.
+                        run_facility_loop(
+                            FACILITY,
+                            || worker_loop(&pq),
+                            || recover(FACILITY, pq.state.lock()).shutdown = true,
+                        );
                     })
                     .expect("failed to spawn callback worker thread");
                 workers.push(handle);
@@ -325,18 +332,14 @@ impl CallbackPool {
     /// Lifetime overflow count for a band — C `queueOverflows`
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
-        self.queues[priority.index()]
-            .state
-            .lock()
-            .unwrap()
-            .overflows
+        recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
     }
 
     /// Stop every band and join its workers — port of the shutdown half of
     /// `callbackStop`/`callbackCleanup` (`callback.c:237-284`). Idempotent.
     pub fn shutdown(&mut self) {
         for pq in &self.queues {
-            pq.state.lock().unwrap().shutdown = true;
+            recover(FACILITY, pq.state.lock()).shutdown = true;
             pq.wake.notify_all();
         }
         for w in self.workers.drain(..) {
@@ -365,6 +368,32 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// Boundary: a callback that panics. It runs on the band's own worker, so
+    /// before this one panicking callback silently retired the band and every
+    /// later callback on it — deferred processing, delayed callbacks, monitor
+    /// tails — simply never ran.
+    #[test]
+    fn a_panicking_callback_does_not_stop_the_band() {
+        let pool = CallbackPool::new();
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(|| panic!("a callback panicked on its band")),
+        )
+        .expect("enqueue the panicking callback");
+
+        let (tx, rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || tx.send(42u32).unwrap()),
+        )
+        .expect("enqueue the next callback");
+        assert_eq!(
+            rx.recv_timeout(T).unwrap(),
+            42,
+            "the callback after a panicking one never ran: the band worker died with it"
+        );
+    }
 
     #[test]
     fn enqueued_callback_runs() {

@@ -24,7 +24,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
+use super::facility::{recover, run_facility_loop, run_isolated};
 use crate::runtime::task::{ThreadPriority, enter_ioc_thread};
+
+/// What this facility is called when it has to report something about itself.
+const FACILITY: &str = "delayed-callback timer";
 
 /// How a due timer entry is run when its deadline arrives.
 enum TimerAction {
@@ -98,7 +102,7 @@ impl Inner {
     /// (`callback.c:418`).
     fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) {
         let deadline = Instant::now() + delay;
-        let mut st = self.state.lock().unwrap();
+        let mut st = recover(FACILITY, self.state.lock());
         if st.shutdown {
             // Timer thread stopped: match C dropping late delayed requests
             // during shutdown. Drop `cb` (never scheduled or fired) instead of
@@ -127,7 +131,7 @@ impl Inner {
 /// every due callback to the executor pool via `notify`
 /// (`callback.c:404-408`).
 fn timer_loop(inner: &Inner) {
-    let mut st = inner.state.lock().unwrap();
+    let mut st = recover(FACILITY, inner.state.lock());
     loop {
         if st.shutdown {
             return;
@@ -143,23 +147,25 @@ fn timer_loop(inner: &Inner) {
                 let entry = st.heap.pop().unwrap();
                 drop(st);
                 match entry.action {
-                    TimerAction::Inline => (entry.cb)(),
+                    TimerAction::Inline => {
+                        run_isolated(FACILITY, entry.cb);
+                    }
                     TimerAction::Pool(priority) => {
                         let _ = inner.sink.request(priority, entry.cb);
                     }
                 }
-                st = inner.state.lock().unwrap();
+                st = recover(FACILITY, inner.state.lock());
             }
             Some(deadline) => {
                 // Not yet due: sleep until it is, or until a nearer request
                 // wakes us.
                 let wait = deadline.saturating_duration_since(now);
-                let (guard, _timeout) = inner.wake.wait_timeout(st, wait).unwrap();
+                let (guard, _timeout) = recover(FACILITY, inner.wake.wait_timeout(st, wait));
                 st = guard;
             }
             None => {
                 // Nothing scheduled: sleep until a request or shutdown.
-                st = inner.wake.wait(st).unwrap();
+                st = recover(FACILITY, inner.wake.wait(st));
             }
         }
     }
@@ -241,7 +247,17 @@ impl DelayedTimer {
                 // Best effort, and only when the RT switch is on
                 // (`runtime::task::RT_PRIORITY_ENV`).
                 let _ = enter_ioc_thread(ThreadPriority::ScanHigh);
-                timer_loop(&worker_inner)
+                // Every timed facility in this runtime — `sleep`, `interval`,
+                // scan periods, `callbackRequestDelayed` — funnels through the
+                // loop below, on this one thread. Losing it stops all of them
+                // at once while the IOC goes on serving, so its loss is the
+                // one that must never be inferred from work that quietly stops
+                // happening.
+                run_facility_loop(
+                    FACILITY,
+                    || timer_loop(&worker_inner),
+                    || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+                );
             })
             .expect("failed to spawn delayed-callback timer thread");
         DelayedTimer {
@@ -267,7 +283,7 @@ impl DelayedTimer {
 impl Drop for DelayedTimer {
     fn drop(&mut self) {
         {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = recover(FACILITY, self.inner.state.lock());
             st.shutdown = true;
         }
         self.inner.wake.notify_all();
@@ -330,6 +346,65 @@ mod tests {
 
         assert_eq!(rx.recv_timeout(T).unwrap(), "short");
         assert_eq!(rx.recv_timeout(T).unwrap(), "long");
+    }
+
+    /// Boundary: a wake that panics. It runs inline on the timer thread, so
+    /// before this it took every later deadline in the IOC with it — sleep,
+    /// interval, scan periods, `callbackRequestDelayed` — and said nothing.
+    #[test]
+    fn a_panicking_wake_does_not_stop_the_timer() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        h.schedule_wake(
+            Duration::from_millis(10),
+            Box::new(|| panic!("a waker panicked on the timer thread")),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        timer.schedule(
+            Duration::from_millis(40),
+            CallbackPriority::High,
+            Box::new(move || tx.send(()).unwrap()),
+        );
+
+        assert_eq!(
+            rx.recv_timeout(T),
+            Ok(()),
+            "the deadline after a panicking wake never fired: the timer thread died with it"
+        );
+    }
+
+    /// Boundary: the state mutex is poisoned. Every scheduling path in this
+    /// file took it with `.unwrap()`, so one panic anywhere under the lock
+    /// stopped all timed work.
+    #[test]
+    fn a_poisoned_state_still_schedules_and_fires() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+
+        let inner = Arc::clone(&timer.inner);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = inner.state.lock().expect("first lock");
+            panic!("poison the timer state");
+        }));
+        assert!(
+            timer.inner.state.lock().is_err(),
+            "the state mutex must actually be poisoned for this to test anything"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        timer.schedule(
+            Duration::from_millis(10),
+            CallbackPriority::High,
+            Box::new(move || tx.send(()).unwrap()),
+        );
+        assert_eq!(
+            rx.recv_timeout(T),
+            Ok(()),
+            "a poisoned state stopped the timer facility"
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use super::facility::{recover, run_facility_loop, run_isolated};
 use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
 
 /// A queued "process this record" tail. C stores `{prec, cb, usr}`
@@ -66,7 +67,7 @@ struct Inner {
 impl Inner {
     /// Port of `scanOnceCallback` (`dbScan.c:674-698`).
     fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = recover(FACILITY, self.state.lock());
         if st.shutdown {
             // Worker stopped: C drops late scanOnce requests during shutdown
             // without surfacing an error (parity with `callbackStop` handling
@@ -103,13 +104,16 @@ impl Inner {
     }
 }
 
+/// What this facility is called when it has to report something about itself.
+const FACILITY: &str = "scanOnce worker";
+
 /// Port of `onceTask` (`dbScan.c:700-730`): wait on the wake event, drain the
 /// ring, run each queued tail.
 fn once_loop(inner: &Inner) {
     loop {
-        let mut st = inner.state.lock().unwrap();
+        let mut st = recover(FACILITY, inner.state.lock());
         while st.queue.is_empty() && !st.shutdown {
-            st = inner.wake.wait(st).unwrap();
+            st = recover(FACILITY, inner.wake.wait(st));
         }
         if st.queue.is_empty() {
             return; // empty + shutdown
@@ -117,7 +121,7 @@ fn once_loop(inner: &Inner) {
         let cb = st.queue.pop_front().unwrap();
         drop(st);
         // dbScan.c:719-723 — the queued tail owns lock/dbProcess/unlock/cb.
-        cb();
+        run_isolated(FACILITY, cb);
     }
 }
 
@@ -138,7 +142,7 @@ impl ScanOnceHandle {
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:68`).
     pub fn overflow_count(&self) -> u64 {
-        self.inner.state.lock().unwrap().overflows
+        recover(FACILITY, self.inner.state.lock()).overflows
     }
 }
 
@@ -179,7 +183,13 @@ impl ScanOnceQueue {
                 // With no periodic scan lists wired this increment, `nPeriodic`
                 // is 0, so the band is exactly ScanLow.
                 let _ = enter_ioc_thread(ThreadPriority::ScanLow);
-                once_loop(&worker_inner);
+                // Losing this thread stops every FLNK/scanOnce tail in the
+                // IOC while records still accept writes.
+                run_facility_loop(
+                    FACILITY,
+                    || once_loop(&worker_inner),
+                    || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+                );
             })
             .expect("failed to spawn scanOnce worker thread");
         ScanOnceQueue {
@@ -203,7 +213,7 @@ impl ScanOnceQueue {
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:68`).
     pub fn overflow_count(&self) -> u64 {
-        self.inner.state.lock().unwrap().overflows
+        recover(FACILITY, self.inner.state.lock()).overflows
     }
 }
 
@@ -216,7 +226,7 @@ impl Default for ScanOnceQueue {
 impl Drop for ScanOnceQueue {
     fn drop(&mut self) {
         {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = recover(FACILITY, self.inner.state.lock());
             st.shutdown = true;
         }
         self.inner.wake.notify_all();
@@ -234,6 +244,25 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// Boundary: a queued tail that panics. `dbProcess` runs inside it, so
+    /// before this one bad record stopped every FLNK and every `scanOnce` in
+    /// the IOC, with nothing said.
+    #[test]
+    fn a_panicking_tail_does_not_stop_the_worker() {
+        let q = ScanOnceQueue::new();
+        q.scan_once(Box::new(|| panic!("a scanOnce tail panicked")))
+            .expect("enqueue the panicking tail");
+
+        let (tx, rx) = mpsc::channel();
+        q.scan_once(Box::new(move || tx.send(7u32).unwrap()))
+            .expect("enqueue the next tail");
+        assert_eq!(
+            rx.recv_timeout(T).unwrap(),
+            7,
+            "the tail after a panicking one never ran: the worker died with it"
+        );
+    }
 
     #[test]
     fn enqueue_returns_immediately_and_worker_drains() {

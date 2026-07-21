@@ -29,14 +29,16 @@ use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
 enum TimerAction {
     /// Run the callback **inline on the timer thread**. For a non-blocking
     /// wakeup only — a `sleep`/`interval` waker (`Thread::unpark` for a
-    /// `park_on` driver, or a tokio task-schedule). Running it here instead of
-    /// handing it to the callback pool is what stops a `spawn`ed future that
-    /// awaits `sleep` from deadlocking: `future_exec::run_future` parks the pool
-    /// worker driving that future for its whole life, so the wake MUST NOT queue
-    /// behind it on the same band. A wakeup needs no worker — it just unparks —
-    /// so the timer thread runs it directly. The callback must never block or do
-    /// real work: it runs on the single timer thread and delays every later
-    /// deadline until it returns.
+    /// `park_on` driver, a `future_exec` task re-enqueue, or a tokio
+    /// task-schedule). A wakeup needs no worker, so it does not take one: the
+    /// timer thread runs it directly rather than queueing it on a callback
+    /// band. That keeps a band's sole job "run futures" and never "wake them",
+    /// which is what stopped the sleep-wake self-deadlock a `spawn`ed future
+    /// awaiting `sleep` used to hit (`bug_pattern
+    /// rtems-exec-sleep-wake-band-deadlock`; the executor no longer parks a
+    /// worker per future, but routing wakes off the band is still the rule).
+    /// The callback must never block or do real work: it runs on the single
+    /// timer thread and delays every later deadline until it returns.
     Inline,
     /// Hand the callback to the executor pool at this band — C
     /// `callbackRequestDelayed` → `callbackRequest` (`callback.c:404-419`). For
@@ -183,11 +185,13 @@ impl TimerHandle {
     /// task-schedule); it runs on the single timer thread and delays every later
     /// deadline until it returns.
     ///
-    /// This exists so a `spawn`ed future that awaits `sleep` is not deadlocked by
-    /// its own wake: `future_exec::run_future` parks the pool worker driving the
-    /// future for the future's whole life, so the wake cannot be dispatched to
-    /// that same (single-worker) band. Running it on the timer thread frees the
-    /// band from the dual role of "run futures" AND "wake them".
+    /// This exists so a `spawn`ed future that awaits `sleep` is never blocked by
+    /// its own wake: running it on the timer thread frees the band from the dual
+    /// role of "run futures" AND "wake them". It is what closed the sleep-wake
+    /// self-deadlock (`bug_pattern rtems-exec-sleep-wake-band-deadlock`), back
+    /// when `future_exec` parked a worker per future for the future's whole
+    /// life; that executor is now cooperative and holds a worker only across a
+    /// single poll, but a wake still costs no worker here.
     pub fn schedule_wake(&self, delay: Duration, cb: Callback) {
         self.inner.schedule(delay, TimerAction::Inline, cb);
     }

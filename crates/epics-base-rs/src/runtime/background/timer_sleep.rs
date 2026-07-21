@@ -18,13 +18,18 @@
 //! The wakeup is armed via [`TimerHandle::schedule_wake`], so it runs **inline
 //! on the timer thread** rather than being dispatched to the callback pool.
 //! Waking is a non-blocking `waker.wake()` (an `unpark` for a `park_on` driver,
-//! or a tokio task-schedule) and needs no worker. Dispatching it to the pool
-//! instead would self-deadlock any `spawn`ed future that awaits `sleep`:
-//! `future_exec::run_future` parks the pool worker driving that future for the
-//! future's whole life, so a wake queued on the same (single-worker) band would
-//! sit behind the very worker it must wake. Routing the wake off the band keeps
+//! a task re-enqueue for [`super::future_exec`], or a tokio task-schedule) and
+//! needs no worker, so it does not take one. Routing the wake off the band keeps
 //! the band's sole job "run futures" and makes the wake uniform for every
 //! sleeper — bare `spawn`ed tails and periodic-scan `interval` alike.
+//!
+//! This is also what closed the sleep-wake self-deadlock (`bug_pattern
+//! rtems-exec-sleep-wake-band-deadlock`): back when `future_exec` parked a pool
+//! worker for a spawned future's whole life, a wake dispatched to the same
+//! single-worker band sat behind the very worker it had to wake. That executor
+//! is cooperative now and releases its worker at every suspension, so the wake
+//! would no longer starve — but a wake that costs a worker is still the wrong
+//! shape, and `Inline` remains the rule.
 //!
 //! # Lazy arming and drop-cancel
 //!

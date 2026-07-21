@@ -223,6 +223,16 @@ path = "src/bin/ca-lint-rs.rs"
 name = "ca-admin-rs"
 path = "src/bin/ca-admin-rs.rs"
 
+# The RTEMS CA IOC entry point (design doc §9.5). Deliberately NOT given
+# `required-features`: it must be built by a bare `cargo check --bin
+# rtems-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
+# would make cargo silently *skip* the target instead, turning the RTEMS
+# gate into a vacuous pass. Under the hosted default backend it compiles and
+# is linted, but refuses to run (see the module docs).
+[[bin]]
+name = "rtems-ca-ioc"
+path = "src/bin/rtems-ca-ioc.rs"
+
 [[bin]]
 name = "ca-soak"
 path = "src/bin/ca-soak.rs"

@@ -104,7 +104,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::task::block_on_sync;
+use epics_base_rs::runtime::task::{ThreadPriority, apply_to_current_thread, block_on_sync};
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
@@ -192,6 +192,12 @@ impl BlockingCaServer {
                     let spawned = thread::Builder::new()
                         .name(format!("CAS-client-blocking {peer}"))
                         .spawn(move || {
+                            // caservertask.c:109 — the TCP receiver is created
+                            // as `epicsThreadCreate("CAS-client",
+                            // epicsThreadPriorityCAServerLow, ...)`. Best
+                            // effort, and only when the RT switch is on
+                            // (`runtime::task::RT_PRIORITY_ENV`).
+                            let _ = apply_to_current_thread(ThreadPriority::CaServerLow);
                             if let Err(e) = handle_client_blocking(stream, peer, db, acf, tcp_port)
                             {
                                 tracing::debug!(
@@ -653,6 +659,16 @@ fn handle_client_blocking(
     let event_thread = thread::Builder::new()
         .name(format!("CAS-event-blocking {peer}"))
         .spawn(move || {
+            // caservertask.c:560 — "TCP sender: epicsThreadPriorityCAServerLow-1",
+            // computed at :1508 as `epicsThreadHighestPriorityLevelBelow(
+            // epicsThreadPriorityCAServerLow)`. What matters is that the
+            // sender sits just below the receiver so a client that stops
+            // reading cannot starve command dispatch. (C's helper subtracts
+            // a further OS-range step at osdThread.c:874, landing on 18 for a
+            // full Linux FIFO range; the EPICS-space ordering is the same.)
+            let _ = apply_to_current_thread(ThreadPriority::Custom(
+                ThreadPriority::CaServerLow.value() - 1,
+            ));
             let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
             if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
                 tracing::error!(
@@ -971,6 +987,30 @@ mod tests {
     use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
     use epics_base_rs::types::{DbFieldType, EpicsValue};
     use std::net::Ipv4Addr;
+
+    /// The two CA-server thread priorities, against `caservertask.c`.
+    ///
+    /// Wiring them is a one-line call per thread that does nothing at all
+    /// with the RT switch off, so nothing else in the suite would notice the
+    /// pair being swapped. The ordering is the part that matters: C runs the
+    /// TCP receiver at `epicsThreadPriorityCAServerLow` (`:109`) and the
+    /// sender one level below it (`:560`, `:1508`), so a client that stops
+    /// reading its socket cannot starve command dispatch for the others.
+    #[test]
+    fn cas_thread_priorities_match_caservertask_c() {
+        let receiver = ThreadPriority::CaServerLow;
+        let sender = ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 1);
+        assert_eq!(receiver.value(), 20, "epicsThreadPriorityCAServerLow");
+        assert_eq!(sender.value(), 19, "one level below the receiver");
+        assert!(
+            sender.value() < receiver.value(),
+            "the CAS event sender must not outrank the receiver"
+        );
+        // Both stay inside the CA-server band, below the scan bands
+        // (epicsThread.h:73-83).
+        assert!(receiver.value() <= ThreadPriority::CaServerHigh.value());
+        assert!(receiver.value() < ThreadPriority::ScanLow.value());
+    }
 
     /// The RTEMS constraint (S1): the blocking driver must not touch tokio's
     /// async net/timer/spawn machinery — those don't build for RTEMS and

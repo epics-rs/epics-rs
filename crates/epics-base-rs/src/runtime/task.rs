@@ -322,6 +322,12 @@ pub fn runtime_handle() -> tokio::runtime::Handle {
 // (used by dedicated `spawn_blocking` threads and the runtime's worker
 // threads). `apply_to_current_thread` reports whether the OS actually
 // honoured the request.
+//
+// (c) is opt-in and off by default — see `RT_PRIORITY_ENV`. C's switch
+// (`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`) defaults to YES because
+// a C IOC is deployed onto a machine chosen for it; this crate is just as
+// often linked into a desktop tool, where a silent SCHED_FIFO request is
+// either a guaranteed failure or a way to starve the box.
 // ---------------------------------------------------------------------------
 
 /// Minimum EPICS thread priority (`epicsThreadPriorityMin`).
@@ -407,6 +413,10 @@ pub enum PriorityApplied {
     /// The OS scheduler honoured the requested priority (real-time
     /// SCHED_FIFO band applied).
     Realtime,
+    /// Real-time scheduling was never requested: the opt-in switch
+    /// [`RT_PRIORITY_ENV`] is off, so **no scheduler call was made at
+    /// all** and the thread keeps the process default policy.
+    Disabled,
     /// The platform does not expose a portable scheduler priority API
     /// (e.g. Windows here, or a non-Unix target) — no change applied.
     Unsupported,
@@ -422,6 +432,74 @@ impl PriorityApplied {
     /// `true` only when the OS actually applied a real-time priority.
     pub fn is_realtime(self) -> bool {
         matches!(self, PriorityApplied::Realtime)
+    }
+}
+
+/// Environment switch that opts this process in to real-time (SCHED_FIFO)
+/// scheduling for the IOC threads that carry an EPICS priority.
+///
+/// **Default off.** Requesting SCHED_FIFO needs `CAP_SYS_NICE` or a
+/// non-zero `RLIMIT_RTPRIO`; on a developer desktop the request fails,
+/// and where it *succeeds* an unattended RT band can starve the machine.
+/// Neither belongs in a default build, so the switch must be set
+/// deliberately by whoever is deploying onto an RT kernel.
+///
+/// Accepted "on" values, case-insensitive: `YES`, `TRUE`, `ON`, `1`.
+/// Anything else — including unset — is off.
+///
+/// # Relationship to the C switch
+///
+/// C base has the same concept under
+/// `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` (`envDefs.h:80`, read at
+/// `osdThread.c:389`), and `envGetBoolConfigParam` (`envSubr.c:331`) accepts
+/// only case-insensitive `yes`. We deliberately do **not** reuse that name:
+/// its base default is `YES` (`configure/CONFIG_ENV:57`) and ours is off, so
+/// one name would carry two opposite defaults depending on which
+/// implementation read it.
+pub const RT_PRIORITY_ENV: &str = "EPICS_RS_ALLOW_RT_PRIORITY";
+
+/// Whether this process may ask the OS for real-time scheduling.
+///
+/// Resolved from [`RT_PRIORITY_ENV`] exactly once per process by
+/// [`RtPolicy::current`]. It is a *parameter* of
+/// [`apply_to_current_thread_under`] rather than a check buried inside the
+/// syscall wrapper, so "switch off ⟹ no scheduler call" is a property of
+/// the call graph and not of a runtime branch some future caller can skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtPolicy {
+    /// Never touch the OS scheduler.
+    Disabled,
+    /// Best-effort SCHED_FIFO, falling back to default scheduling.
+    AllowRealtime,
+}
+
+impl RtPolicy {
+    /// Parse a raw switch value (`None` = unset).
+    pub fn from_env_value(raw: Option<&str>) -> RtPolicy {
+        let Some(raw) = raw else {
+            return RtPolicy::Disabled;
+        };
+        let v = raw.trim();
+        let on = v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("on")
+            || v == "1";
+        if on {
+            RtPolicy::AllowRealtime
+        } else {
+            RtPolicy::Disabled
+        }
+    }
+
+    /// The process-wide policy, read from [`RT_PRIORITY_ENV`] on first use
+    /// and cached. Caching matches C, which resolves its switch once in
+    /// `epicsThreadInit` (`osdThread.c:389`), and keeps later `set_var`
+    /// calls from changing the scheduling of threads already running.
+    pub fn current() -> RtPolicy {
+        static POLICY: std::sync::OnceLock<RtPolicy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| {
+            RtPolicy::from_env_value(std::env::var(RT_PRIORITY_ENV).ok().as_deref())
+        })
     }
 }
 
@@ -446,50 +524,192 @@ impl PriorityApplied {
 /// the crate links `libc`). On other targets the priority enum + API
 /// surface still exist but `apply` reports [`PriorityApplied::Unsupported`]
 /// — the platform allows no portable change here.
+///
+/// Opt-in: real-time scheduling is only ever requested when
+/// [`RT_PRIORITY_ENV`] is set (see [`RtPolicy`]). With the switch off this
+/// returns [`PriorityApplied::Disabled`] without calling the OS at all.
 pub fn apply_to_current_thread(priority: ThreadPriority) -> PriorityApplied {
-    apply_priority_impl(priority.value())
+    apply_to_current_thread_under(RtPolicy::current(), priority)
+}
+
+/// [`apply_to_current_thread`] with the real-time policy supplied by the
+/// caller instead of read from the environment.
+///
+/// The single gate: [`RtPolicy::Disabled`] returns before any scheduler
+/// call is reachable. Exposed so a caller that already owns its RT policy
+/// (and the tests that must exercise both states in one process, since
+/// [`RtPolicy::current`] is cached) does not have to mutate the environment.
+pub fn apply_to_current_thread_under(
+    policy: RtPolicy,
+    priority: ThreadPriority,
+) -> PriorityApplied {
+    match policy {
+        RtPolicy::Disabled => PriorityApplied::Disabled,
+        RtPolicy::AllowRealtime => apply_priority_impl(priority.value()),
+    }
+}
+
+/// The SCHED_FIFO priority range this process may actually enter.
+///
+/// C parity: `find_pri_range` (`osdThread.c:259-314`). The kernel's
+/// `sched_get_priority_max` reports the *policy's* range and ignores
+/// `RLIMIT_RTPRIO`, so on an RT box with a restricted limit the nominal
+/// range is wider than the usable one; C binary-searches for the real
+/// ceiling and so do we.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtRange {
+    /// The kernel does not report a SCHED_FIFO range at all.
+    Unsupported,
+    /// The range exists but this process may not enter it — no
+    /// `CAP_SYS_NICE` and `RLIMIT_RTPRIO` is 0. C's equivalent is
+    /// `usePolicy == 0` (`osdThread.c:279-285`, `:331`), which makes it
+    /// stop asking for SCHED_FIFO for the life of the process.
+    Denied,
+    /// Priorities `min..=max` are settable.
+    Available { min: i32, max: i32 },
+}
+
+/// Probe once per process and cache. Only reachable on the
+/// [`RtPolicy::AllowRealtime`] path, so a default (switch-off) process
+/// never runs the probe and never makes a scheduler call.
+#[cfg(target_os = "linux")]
+fn permitted_fifo_range() -> RtRange {
+    static RANGE: std::sync::OnceLock<RtRange> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(probe_fifo_range)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_fifo_range() -> RtRange {
+    // SAFETY: sched_get_priority_min/max take only an int policy and have
+    // no preconditions.
+    let (min, max) = unsafe {
+        (
+            libc::sched_get_priority_min(libc::SCHED_FIFO),
+            libc::sched_get_priority_max(libc::SCHED_FIFO),
+        )
+    };
+    if min < 0 || max < 0 || max < min {
+        return RtRange::Unsupported;
+    }
+
+    // The probe *changes the scheduling of the thread that runs it*, so it
+    // runs on a throwaway thread — exactly why C hands `find_pri_range` to
+    // its own `pthread_create`/`pthread_join` pair (`osdThread.c:316-334`).
+    let probe = std::thread::Builder::new()
+        .name("cbRtProbe".to_string())
+        .spawn(move || {
+            // `osdThread.c:277-287`: failing at the minimum means no
+            // permission for SCHED_FIFO at all.
+            if set_fifo_priority(min) != 0 {
+                return RtRange::Denied;
+            }
+            // `osdThread.c:296-307`: binary-search the real ceiling.
+            let (mut low, mut high) = (min, max);
+            while low < high {
+                let mid = (high + low) / 2;
+                if set_fifo_priority(mid) != 0 {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            // `osdThread.c:310`: `max_pri = try_pri(max) ? max-1 : max`.
+            let top = if set_fifo_priority(high) != 0 {
+                high - 1
+            } else {
+                high
+            };
+            RtRange::Available { min, max: top }
+        });
+    match probe.map(std::thread::JoinHandle::join) {
+        Ok(Ok(range)) => range,
+        // Cannot spawn, or the probe died: treat as no RT rather than
+        // guessing a range we have not shown to be settable.
+        _ => RtRange::Denied,
+    }
+}
+
+/// Map an EPICS priority `0..=99` onto the permitted SCHED_FIFO range.
+///
+/// C parity: `epicsThreadGetPosixPriority` (`osdThread.c:129-144`) — the
+/// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on
+/// RTEMS/vxWorks (`RTEMS-score/osdThread.c:94`, `vxWorks/osdThread.c:99`).
+#[cfg(target_os = "linux")]
+fn map_epics_priority(epics_priority: u8, min: i32, max: i32) -> i32 {
+    // `osdThread.c:133-134`: a degenerate range collapses to one level.
+    if max == min {
+        return max;
+    }
+    let slope = (max - min) as f64 / 100.0;
+    let oss = epics_priority as f64 * slope + min as f64;
+    // `ThreadPriority::value` caps at 99 and the slope is over 100, so this
+    // cannot exceed `max`; the clamp guards the probed bounds, which are
+    // runtime values rather than compile-time constants.
+    (oss as i32).clamp(min, max)
+}
+
+/// Ask the OS for SCHED_FIFO at `oss` on the **calling** thread. The single
+/// place this crate touches the scheduler; returns the raw `pthread_*`
+/// status (0 on success).
+#[cfg(target_os = "linux")]
+fn set_fifo_priority(oss: i32) -> i32 {
+    SCHED_CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    SCHED_CALLS.with(|c| c.set(c.get() + 1));
+    let param = libc::sched_param {
+        sched_priority: oss,
+    };
+    // SAFETY: pthread_setschedparam operates on the calling thread with a
+    // stack-local sched_param and a valid policy constant.
+    unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
+}
+
+/// The unprivileged-fallback message. Emitted **once per process**: the
+/// denial is a property of the process, not of the thread that happened to
+/// notice it first, and an IOC creates a thread per CA client.
+#[cfg(target_os = "linux")]
+fn warn_rt_denied_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        #[cfg(test)]
+        DENIED_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            target: "epics_base_rs::runtime",
+            switch = RT_PRIORITY_ENV,
+            "{RT_PRIORITY_ENV} asked for real-time scheduling, but this process may not \
+             use SCHED_FIFO (needs CAP_SYS_NICE or a non-zero RLIMIT_RTPRIO). Every IOC \
+             thread stays at the default scheduling policy; timing is not real-time. \
+             Logged once per process."
+        );
+    });
 }
 
 #[cfg(target_os = "linux")]
 fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
-    // SAFETY: sched_get_priority_min/max take only an int policy and
-    // have no preconditions; pthread_setschedparam operates on the
-    // calling thread with a stack-local sched_param.
-    unsafe {
-        let policy = libc::SCHED_FIFO;
-        let min = libc::sched_get_priority_min(policy);
-        let max = libc::sched_get_priority_max(policy);
-        if min < 0 || max < 0 || max < min {
-            return PriorityApplied::Unsupported;
+    let (min, max) = match permitted_fifo_range() {
+        RtRange::Unsupported => return PriorityApplied::Unsupported,
+        RtRange::Denied => {
+            warn_rt_denied_once();
+            return PriorityApplied::BestEffortFailed;
         }
-        // C `osdThread.c:138-139`: slope over a 0..100 EPICS range.
-        let slope = (max - min) as f64 / 100.0;
-        let mut oss = (epics_priority as f64 * slope) as i32 + min;
-        if oss < min {
-            oss = min;
-        }
-        if oss > max {
-            oss = max;
-        }
-        let param = libc::sched_param {
-            sched_priority: oss,
-        };
-        let rc = libc::pthread_setschedparam(libc::pthread_self(), policy, &param);
-        if rc == 0 {
-            PriorityApplied::Realtime
-        } else {
-            // EPERM (no RT permission) or EINVAL — C falls back to a
-            // non-RT thread here. Leave the thread at the default
-            // policy and report best-effort failure.
-            tracing::debug!(
-                target: "epics_base_rs::runtime",
-                epics_priority,
-                oss,
-                errno = rc,
-                "SCHED_FIFO priority not applied; thread stays at default policy"
-            );
-            PriorityApplied::BestEffortFailed
-        }
+        RtRange::Available { min, max } => (min, max),
+    };
+    let oss = map_epics_priority(epics_priority, min, max);
+    let rc = set_fifo_priority(oss);
+    if rc == 0 {
+        PriorityApplied::Realtime
+    } else {
+        // The probe proved this range settable, so a failure here is not
+        // the permission case the warning covers — keep it at debug.
+        tracing::debug!(
+            target: "epics_base_rs::runtime",
+            epics_priority,
+            oss,
+            errno = rc,
+            "SCHED_FIFO priority not applied; thread stays at default policy"
+        );
+        PriorityApplied::BestEffortFailed
     }
 }
 
@@ -499,6 +719,38 @@ fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
     // priority API is wired on other targets.
     PriorityApplied::Unsupported
 }
+
+/// How many times this process has asked the OS scheduler for SCHED_FIFO,
+/// across every thread — including the one-off range probe.
+///
+/// The observable form of the opt-in guarantee: with [`RT_PRIORITY_ENV`]
+/// unset, a process can run its whole life and this stays `0`. Also answers
+/// "did this IOC ever actually try to go real-time?" from a log line.
+///
+/// Always `0` off Linux, where no scheduler call is wired at all.
+pub fn sched_calls_made() -> usize {
+    SCHED_CALLS_MADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SCHED_CALLS_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Every scheduler call this crate makes passes through
+    /// [`set_fifo_priority`], which bumps this. Tests assert the delta is
+    /// zero with the switch off — the property "switch off ⟹ no sched
+    /// calls" observed directly rather than inferred from a return value.
+    ///
+    /// Per-thread, not global: `pthread_setschedparam` acts on the calling
+    /// thread, so a per-thread count is the exact quantity, and a test
+    /// cannot be perturbed by a concurrent one (the unit tests share a
+    /// process under plain `cargo test`).
+    static SCHED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the once-per-process denial warning was emitted.
+#[cfg(all(test, target_os = "linux"))]
+static DENIED_WARNINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Spawn a blocking closure on a dedicated thread and apply the given
 /// EPICS [`ThreadPriority`] to that thread before running `f`.
@@ -614,9 +866,181 @@ mod tests {
         assert!(matches!(
             outcome,
             PriorityApplied::Realtime
+                | PriorityApplied::Disabled
                 | PriorityApplied::Unsupported
                 | PriorityApplied::BestEffortFailed
         ));
+    }
+
+    #[test]
+    fn rt_switch_is_off_unless_explicitly_turned_on() {
+        // Unset is off — the default a desktop build gets.
+        assert_eq!(RtPolicy::from_env_value(None), RtPolicy::Disabled);
+        // C's `envGetBoolConfigParam` (envSubr.c:331) accepts only
+        // case-insensitive "yes"; we also take the spellings a hand-written
+        // startup script is likely to use.
+        for on in ["YES", "yes", "Yes", "true", "TRUE", "on", "1", " yes "] {
+            assert_eq!(
+                RtPolicy::from_env_value(Some(on)),
+                RtPolicy::AllowRealtime,
+                "{on:?} should turn the switch on"
+            );
+        }
+        // Everything else is off. Silence is the safe direction: a
+        // misspelling must never grant a process RT scheduling.
+        for off in ["", "NO", "no", "false", "off", "0", "y", "yes please", "2"] {
+            assert_eq!(
+                RtPolicy::from_env_value(Some(off)),
+                RtPolicy::Disabled,
+                "{off:?} should leave the switch off"
+            );
+        }
+    }
+
+    /// Switch off ⟹ the OS scheduler is never called.
+    ///
+    /// Mutation check: deleting the `RtPolicy::Disabled` arm in
+    /// `apply_to_current_thread_under` (so it always calls
+    /// `apply_priority_impl`) makes the `SCHED_CALLS` assertion fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_off_makes_no_scheduler_calls() {
+        let before = SCHED_CALLS.with(std::cell::Cell::get);
+        for p in [
+            ThreadPriority::Low,
+            ThreadPriority::CaServerLow,
+            ThreadPriority::ScanHigh,
+            ThreadPriority::Iocsh,
+            ThreadPriority::Custom(0),
+            ThreadPriority::Custom(99),
+        ] {
+            assert_eq!(
+                apply_to_current_thread_under(RtPolicy::Disabled, p),
+                PriorityApplied::Disabled
+            );
+        }
+        assert_eq!(
+            SCHED_CALLS.with(std::cell::Cell::get),
+            before,
+            "the switch is off, so nothing may reach pthread_setschedparam"
+        );
+    }
+
+    /// Switch on: either the host grants SCHED_FIFO — and then the policy
+    /// must actually be in force on the thread, at the mapped priority — or
+    /// it does not, and the thread keeps running under the default policy.
+    ///
+    /// Runs on its own thread: on a host that *does* grant RT, leaving the
+    /// test-harness thread in a real-time band would outlive the test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_on_either_sticks_or_falls_back_without_killing_the_thread() {
+        let outcome = std::thread::spawn(|| {
+            // Resolve (and cache) the probe first, so what the call below is
+            // expected to do is known rather than order-dependent.
+            let range = permitted_fifo_range();
+            let before = SCHED_CALLS.with(std::cell::Cell::get);
+            let outcome =
+                apply_to_current_thread_under(RtPolicy::AllowRealtime, ThreadPriority::ScanHigh);
+            let calls = SCHED_CALLS.with(std::cell::Cell::get) - before;
+
+            // Whatever the host allowed, this thread is still running.
+            assert_eq!(2 + 2, 4);
+
+            let mut policy = 0i32;
+            let mut param = libc::sched_param { sched_priority: 0 };
+            // SAFETY: reads the calling thread's own scheduling into
+            // stack-local outputs.
+            let rc = unsafe {
+                libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+            };
+            assert_eq!(rc, 0, "pthread_getschedparam failed");
+
+            match (range, outcome) {
+                (RtRange::Available { min, max }, PriorityApplied::Realtime) => {
+                    // The host permits FIFO — assert the policy stuck, at
+                    // the C-mapped priority, off exactly one scheduler call.
+                    assert_eq!(calls, 1, "one apply must be one scheduler call");
+                    assert_eq!(policy, libc::SCHED_FIFO, "SCHED_FIFO did not stick");
+                    assert_eq!(
+                        param.sched_priority,
+                        map_epics_priority(ThreadPriority::ScanHigh.value(), min, max),
+                        "wrong OS priority for epicsThreadPriorityScanHigh"
+                    );
+                }
+                (RtRange::Denied, PriorityApplied::BestEffortFailed) => {
+                    // Unprivileged: the fallback leaves the thread at the
+                    // default policy rather than failing the caller, and —
+                    // the anti-spam property — asks the OS nothing further
+                    // now that the probe has settled the question once.
+                    assert_eq!(calls, 0, "a settled denial must not re-ask the OS");
+                    assert_ne!(
+                        policy,
+                        libc::SCHED_FIFO,
+                        "fallback reported but the thread is real-time scheduled"
+                    );
+                }
+                (RtRange::Unsupported, PriorityApplied::Unsupported) => {
+                    assert_eq!(calls, 0, "no SCHED_FIFO range means no scheduler call");
+                }
+                (range, outcome) => {
+                    panic!("range {range:?} and outcome {outcome:?} disagree")
+                }
+            }
+            outcome
+        })
+        .join()
+        .expect("probe thread panicked");
+        eprintln!("host RT outcome: {outcome:?}");
+    }
+
+    /// The unprivileged fallback is logged once, not once per thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn denial_is_reported_once_not_per_thread() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..8 {
+                        let _ = apply_to_current_thread_under(
+                            RtPolicy::AllowRealtime,
+                            ThreadPriority::Low,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker panicked");
+        }
+        assert!(
+            DENIED_WARNINGS.load(std::sync::atomic::Ordering::Relaxed) <= 1,
+            "64 denied requests across 8 threads must not produce more than one warning"
+        );
+    }
+
+    /// The mapping itself, against `epicsThreadGetPosixPriority`
+    /// (`osdThread.c:129-144`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epics_priority_maps_onto_the_permitted_fifo_range() {
+        // Linux's nominal SCHED_FIFO range.
+        let (min, max) = (1, 99);
+        // oss = p * (max-min)/100 + min
+        assert_eq!(map_epics_priority(0, min, max), 1);
+        assert_eq!(map_epics_priority(20, min, max), 1 + (20.0 * 0.98) as i32);
+        assert_eq!(map_epics_priority(99, min, max), 1 + (99.0 * 0.98) as i32);
+        // Ordering is preserved: the CA server sits below the scan bands.
+        assert!(
+            map_epics_priority(ThreadPriority::CaServerHigh.value(), min, max)
+                < map_epics_priority(ThreadPriority::ScanLow.value(), min, max)
+        );
+        // A range restricted by RLIMIT_RTPRIO still spans the whole EPICS
+        // space rather than saturating at the top.
+        assert_eq!(map_epics_priority(0, 1, 10), 1);
+        assert_eq!(map_epics_priority(99, 1, 10), 1 + (99.0 * 0.09) as i32);
+        // Degenerate range collapses (osdThread.c:133).
+        assert_eq!(map_epics_priority(50, 7, 7), 7);
     }
 
     #[tokio::test]

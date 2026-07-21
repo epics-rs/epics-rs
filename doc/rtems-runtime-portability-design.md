@@ -462,7 +462,7 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d | ✅ `24d514e8` |
    | 3 | *(renumbered into §8.1.2)* dep walls: socket2/if-addrs/tokio split/getgrouplist | — | ✅ `bc7c8f53`..`1906c7cb` |
    | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | ~~4–6 d~~ 1–2 wk | ✅ `aeb41927`, `bbd74e6f`, `72239333` |
-   | 5 | **reader/operation/writer split** — design settled 2026-07-21, see `doc/pva-rtems-item5-design.md` | ~~2–3 wk~~ **3–4.5 wk** | blocked on CA-branch merge; **shape revised**: NO op-future boxing (the boxing answered the worker-per-future defect that `d704087d` deleted — ops become 11 `runtime::task::spawn` swaps); reader hands **bytes not frames** via a new `SrvRead` implementor (TypeCache invariant holds in place, now at `tcp.rs:3418-3428`); writer = thread with a deadline loop over `write()` (SO_SNDTIMEO alone is per-syscall, strictly weaker than the per-frame bound `tcp.rs:3262-3273` documents); shutdown owner = operation thread, needs an explicit socket registry + `shutdown(Both)` because PVA's ~64,000 s `op_timeout` (`:3488`) cannot double as the wake mechanism the way CA's 45 s one does. 5 stages, each workspace-green; 3 decisions flagged before stage 3, one needing user sign-off (a `oneshot` writer-death arm that also speeds *hosted* teardown) |
+   | 5 | **reader/operation/writer split** — design settled 2026-07-21, see `doc/pva-rtems-item5-design.md`; **stages 1–2 LANDED 2026-07-21** on `phase6/pva-channelsource-ring` (`ad268398` `runtime::task::timeout` seam + `93590517` 11 spawns + 3 timers onto the seam, production `tokio::spawn` in `tcp.rs` = 0 pinned by a fail-closed source-inspection test; workspace 9757 green; hosted-neutral — the seam delegates to tokio off-RTEMS). One owed rename post-merge: `AbortOnDrop`/`abort` field (`tcp.rs:783`/`:819`) still name `tokio::task::AbortHandle` because the `TaskAbortHandle` alias exists only cfg-gated on the CA branch — an ungated alias here would collide at merge | ~~2–3 wk~~ **3–4.5 wk** total, ~2.5–3.5 wk remaining | stages 3–5 blocked on CA-branch merge; **shape revised**: NO op-future boxing (the boxing answered the worker-per-future defect that `d704087d` deleted — ops become 11 `runtime::task::spawn` swaps); reader hands **bytes not frames** via a new `SrvRead` implementor (TypeCache invariant holds in place, now at `tcp.rs:3418-3428`); writer = thread with a deadline loop over `write()` (SO_SNDTIMEO alone is per-syscall, strictly weaker than the per-frame bound `tcp.rs:3262-3273` documents); shutdown owner = operation thread, needs an explicit socket registry + `shutdown(Both)` because PVA's ~64,000 s `op_timeout` (`:3488`) cannot double as the wake mechanism the way CA's 45 s one does. 5 stages, each workspace-green; 3 decisions flagged before stage 3, one needing user sign-off (a `oneshot` writer-death arm that also speeds *hosted* teardown) |
    | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d | ✅ `f0ca0909`, `e278088c` — both per-connection helper tasks folded into the read loop's select; two structural collapses came free (`last_rx` Arc→local, watch receiver clone gone). Same shape remains in the PVA *client* (`client_native/server_conn.rs:634-679`) — out of scope by the server-only decision, named not forgotten |
    | 7 | Blocking accept/UDP/beacon threads + raw-libc ifconf/setsockopt subset | 1 wk | open |
    | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d | blocked on CA-branch merge |
@@ -605,12 +605,21 @@ These were reasoned from source/library presence, **not** compiled:
   genuine bug found and fixed at source rather than gated:
   `event_watcher_tests` raced a `yield_now` spin against band workers with no
   happens-before edge (13/20 failures on the OLD executor — the race predated
-  the rewrite). Remaining gaps, open: (1) `blocking_rtems_e2e` had to be gated
+  the rewrite). Remaining gaps: (1) ~~`blocking_rtems_e2e` had to be gated
   because its *client* half is async — `async_write_notify_rtems_exec` is the
-  feature's only e2e until a blocking-client e2e exists; (2) the `interop`
-  profile under the feature is unmeasured; (3) the gate is convention, not
-  mechanically enforced — a new async-stack test can silently re-redden the
-  suite.
+  feature's only e2e until a blocking-client e2e exists~~ **CLOSED 2026-07-21
+  (`6f5f492f`)**: `blocking_raw_client_e2e.rs` — 4 raw-socket tests (no async
+  `CaClient`, zero `.await`), feature-neutral so it guards BOTH backends
+  (feature-ON 573, feature-OFF 695): full command round-trip incl. a delivered
+  monitor update, EVENT_CANCEL zero-payload ack (C `camessage.c:2002-2014`
+  shape), UDP search advertising the real TCP port + a circuit dialed from the
+  advert, accept-loop survival across client teardown. Still open within it:
+  the raw-socket e2e seeds a `SimplePv`, not `IocBuilder` records — a
+  real-record blocking e2e under the feature does not exist yet
+  (`async_write_notify_rtems_exec` covers the async-record path); (2) the
+  `interop` profile under the feature is unmeasured; (3) the gate is
+  convention, not mechanically enforced — a new async-stack test can silently
+  re-redden the suite.
 - The CA deep-cut estimate depends on how many of the ~226 `snapshot()`/`set()`
   call-sites are already outside an async context (auto-reconciled by de-async)
   vs. need rewriting — not yet classified per-file.

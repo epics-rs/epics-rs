@@ -106,25 +106,37 @@ runtime rewrite.
         │      protocol cores (sans-io where it pays)   │   ← platform-agnostic
         │      CA state machine · PVA operations        │
         └───────────────┬──────────────────────────────┘
-                        │  runtime seam (Spawn / Reactor / Timer / net traits)
+                        │  runtime seam (task/timer seam + net newtypes)
         ┌───────────────┴───────────────┬──────────────────────────┐
-        │  desktop driver               │  RTEMS driver             │
-        │  (tokio; lighter stack later) │  CA: blocking thread/conn │
-        │  Linux/macOS/Win/FreeBSD      │      (NO reactor)         │
-        │                               │  PVA: select reactor +    │
-        │                               │       minimal executor    │
+        │  desktop driver               │  RTEMS driver — ONE       │
+        │  (tokio reactor)              │  blocking thread/conn     │
+        │  Linux/macOS/Win/FreeBSD      │  + park_on + background   │
+        │                               │  executor — CA *and* PVA  │
         └───────────────────────────────┴──────────────────────────┘
 ```
 
 - **Desktop (Linux/macOS/Windows/FreeBSD):** keep tokio. It already works on
-  all four. (If desktop footprint later proves a real problem — measured, not
-  assumed — migrate this driver to the lighter `smol`/`async-io`/`polling`
-  stack. That is a driver swap behind the seam, not a rewrite.)
-- **RTEMS / CA:** blocking thread-per-client. Mirrors RSRV exactly, needs no
-  reactor — the cheapest possible RTEMS path.
-- **RTEMS / PVA:** a `select()`-based single-thread reactor + a minimal futures
-  executor that drives PVA's existing per-operation tasks. Mirrors what
-  libevent does for pvxs.
+  all four, and it stays the default forever — see the dropped fallback below.
+- **RTEMS — one backend for both protocols (decided 2026-07-21).** Blocking
+  thread-per-client over RTEMS libc sockets (`std::net`), with `park_on`
+  driving whatever async remains and the std-thread background executor behind
+  the `runtime::task` seam. **CA and PVA share it.** There is no second RTEMS
+  runtime design.
+- **No `select()` reactor for PVA.** PVA needs *multiplexing*, not a reactor:
+  many concurrent operations on one connection. The CA driver already supplies
+  exactly that — `run_event_task` multiplexes N subscription futures plus a
+  control channel through one `select_all` under a single `block_on_sync`, on
+  one thread. PVA's per-operation tasks (monitor/get/put/RPC) mount on that same
+  pattern, so the "new systems work" a select reactor implied is already built
+  and exercised. This trades pvxs's one-reactor-for-N-connections for RSRV's
+  threads-per-connection — an RTEMS task-count cost, deliberately accepted in
+  exchange for a single backend.
+- **Dropped: the `smol`/`async-io`/`polling` fallback** (was phase 6). Not
+  merely unnecessary — *blocked*: the probe in §8.1 shows `polling` routes its
+  syscalls through **rustix**, which hard-codes Linux signal constants absent
+  from newlib (~181 errors). Adopting it would mean owning a rustix fork. The
+  seam still permits a driver swap later if a *measured* desktop footprint
+  target ever fails, but no such swap is planned and no work is reserved for it.
 
 ### 4.1 Rejected alternative: bespoke cross-platform runtime
 
@@ -133,11 +145,13 @@ Writing our own reactor+executor for all five platforms means, concretely,
 timer wheel, async net types, and re-homing ~487 `tokio::sync::*` call sites —
 then owning that runtime across five kernels forever. It would spend
 person-years to replace a battle-tested runtime on the four platforms that
-already work, in order to serve the one platform (RTEMS) that needs only a
-`poll`/`select` reactor. Runtime bugs surface as rare production hangs/races —
-the worst failure class for a controls system. Cost/benefit is lopsided;
-this is a fallback, triggered only if the lighter-stack driver is *measured*
-unable to meet a hard RTEMS footprint/determinism target.
+already work, in order to serve the one platform (RTEMS) — which, under the
+single-backend decision above, needs **no reactor at all**: blocking sockets
+plus `park_on` plus the background executor. Runtime bugs surface as rare
+production hangs/races — the worst failure class for a controls system.
+Cost/benefit is lopsided. With the `smol`/`polling` fallback dropped, this
+alternative is rejected outright rather than held in reserve: nothing in the
+plan now depends on replacing tokio on the desktop.
 
 ---
 
@@ -233,20 +247,40 @@ Implication — PVA is CA's mirror image:
 
 | | CA (RSRV) | PVA (pvxs) |
 |---|---|---|
-| RTEMS direction | collapse to **sync** thread-per-client | keep **async**, swap the runtime |
-| reactor needed? | **no** | **yes** (select-based) |
+| RTEMS direction | collapse to **sync** thread-per-client | keep **async**, drive it on the CA backend |
+| reactor needed? | **no** | **no** — see the revision below |
 | db de-async needed? | **yes** (dominates cost) | **no** — keep async db under the executor |
 | wire output split | must be built (~150 sites) | **already a channel** |
 | monitor | redesign to sync callback | keep existing tasks |
 
-So PVA's RTEMS bottleneck is **not** sans-io (largely done) — it is the
-**`select`-based reactor + minimal executor** that drives the 68 spawned tasks.
-That piece does not evaporate for PVA the way it does for CA, because PVA is
-reactor-shaped even in C++. It is new systems work but not novel — it is what
-libevent already does, expressed as a Rust futures executor. Crucially, PVA
-does **not** need the db de-async (the cross-crate blast radius that dominates
-CA's deep cut) because a select executor simply awaits the existing db futures.
-**Order: substantial, dominated by the reactor/executor, not the protocol.**
+**Revised 2026-07-21 — PVA reuses the CA backend; no select reactor.** The
+earlier conclusion ("PVA's RTEMS bottleneck is a `select`-based reactor +
+minimal executor") conflated two different needs. What PVA's 68 spawned tasks
+actually require is **multiplexing many futures on few threads** — not
+readiness notification over many sockets. The CA blocking driver already
+delivers that: `run_event_task` drives N subscription futures plus a control
+channel through one `select_all` under a single `block_on_sync` on one thread,
+and `future_exec` + `park_on` behind the `runtime::task` seam run spawned
+tails. PVA mounts on the same primitives:
+
+- **reader thread** — blocking `read` → `handle_message` (already a sync `fn`)
+  → pushes frames to the existing mpsc;
+- **writer thread** — blocking drain of that mpsc → `write_all` (the channel
+  boundary PVA already has, `tcp.rs:3082/3215/3234`);
+- **operation thread** — `block_on_sync` over the per-operation futures
+  (monitor/get/put/RPC) multiplexed with `select_all` + a control channel,
+  i.e. the `run_event_task` shape verbatim;
+- **spawned tails** — the background executor via the task seam.
+
+So PVA's RTEMS cost is now dominated by **wiring onto an existing backend**,
+not by building a new one. PVA still does **not** need the db de-async (the
+cross-crate blast radius that dominates CA's deep cut) — `block_on_sync`
+awaits the existing db futures exactly as a select executor would have.
+The accepted trade is task count: pvxs multiplexes N connections on one
+libevent thread, whereas this runs threads per connection (the RSRV shape).
+If a deployment's RTEMS task budget makes that bite, the fix is bounding
+connection count or folding several connections onto one operation thread —
+both local changes, not a return to the reactor design.
 
 ---
 
@@ -266,7 +300,8 @@ minimal.
 
 | Crate | Status | What is missing on RTEMS | Path |
 |---|---|---|---|
-| **mio 1.2** (under tokio) | blocked (by design) | no epoll/kqueue | §4 — select reactor, or CA blocking-thread needs none |
+| **mio 1.2** (under tokio) | blocked (by design) | no epoll/kqueue; mio dropped its poll/select backend deliberately (thin epoll/kqueue/IOCP-only wrapper) | §4 — not needed: the single RTEMS backend is blocking thread-per-client for both CA and PVA, so no selector is ever constructed |
+| **polling 3.11** (smol/async-io reactor; the mio alternative) | **FAILS — ~181 errors, but in `rustix`, not polling** | polling's OWN backend selection handles RTEMS (RTEMS is `unix` → its generic `poll()` backend, lib.rs:105-113). The blocker is transitive: polling routes syscalls through **rustix 1.1**, whose libc backend hard-codes Linux signal constants (`SIGSTKFLT`, `SIGPWR`, …) absent from newlib | Using the smol/polling stack on RTEMS requires porting **rustix** to newlib (upstream or fork). polling's design is RTEMS-ready; rustix is the wall. Verified 2026-07-20, isolated probe. |
 | **socket2 0.5** (`features=["all"]`, **non-optional**; asyn/base/ca/pva) | **FAILS — 20 errors** | libc lacks `msghdr`/`recvmsg`/`sendmsg`/`IovLen` (scatter-gather), `ip_mreqn` (only `ip_mreq` exists), `ip_mreq_source`+`IP_{ADD,DROP}_SOURCE_MEMBERSHIP`, `SOCK_RAW`/`SOCK_RDM`/`SOCK_SEQPACKET`, `MSG_TRUNC`/`MSG_EOR`, `IPV6_RECVHOPLIMIT`/`IPV6_RECVTCLASS`/`IP_HDRINCL`/`IP_RECVTOS` | Most missing symbols are for APIs CA/PVA do **not** use (raw/seqpacket sockets, source-specific multicast, sendmsg/recvmsg). The subset they need — basic multicast join (`ip_mreq`, present), `setsockopt` for SO_REUSEADDR/buffer sizes — works over raw libc. Wrap that subset; do not port all of socket2. |
 | **getrandom 0.2.17** (transitive: ed25519 / rustls / ahash …) | **FAILS — explicit `compile_error!("target is not supported")`** | RTEMS not in getrandom 0.2's supported-target list | RTEMS newlib *does* have `getentropy`/`arc4random_buf` → register a custom source (`register_custom_getrandom!`) or move to a getrandom version/backend that maps RTEMS onto them |
 | **if-addrs 0.13.4** | **FAILS — 2 errors** | libc lacks `getifaddrs`/`freeifaddrs`/`ifaddrs` for rtems; the non-Apple path also needs Linux `sockaddr_nl`/`AF_NETLINK`/`NETLINK_ROUTE`/`SOCK_RAW` | Interface enumeration must use an RTEMS-specific route (libbsd `getifaddrs` via a `-sys` binding, or an RTEMS ioctl-based enumerator). Not a drop-in. |
@@ -275,6 +310,22 @@ Positive result from the same run: **`std` itself builds for
 `armv7-rtems-eabihf`** via `-Z build-std` **without** an RTEMS gcc/BSP present —
 so `cargo check` is a usable RTEMS gate on this machine today. The blockers are
 all in these leaf crates, not in std.
+
+**Ecosystem-wide finding (2026-07-20).** Every mainstream async-I/O dependency
+probed — mio, socket2, getrandom, if-addrs, and polling→rustix — fails on
+RTEMS. RTEMS async is therefore **not "pick the portable crate"; it is a
+dependency-porting project under any strategy** (the reactor abstraction, mio
+or polling, always bottoms out on a syscall-wrapper crate that hard-codes
+Linux/BSD). This shifts the strategy trade-off decisively toward the **sync CA
+path (§4 RTEMS/CA)**: a blocking thread-per-client CA over *raw RTEMS libc*
+(blocking sockets + `poll()`) touches **none** of these crates, keeping the
+RTEMS-specific cost internal and reviewable (our de-async) rather than external
+and forever-maintained (a forked rustix/mio). **Extended 2026-07-21:** the same
+reasoning is why PVA now shares that backend instead of getting its own
+reactor (§4, §7) — a hand-rolled `poll()` reactor would have avoided rustix,
+but reusing the blocking driver avoids writing a reactor at all. **RTEMS
+confirmed as a committed target 2026-07-20 → the sync-CA deep cut (§6) is the
+adopted path.**
 
 ### 8.2 Gateable — excluded from the RTEMS build
 
@@ -316,15 +367,23 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    reactor.
 4. **Dependency closure.** Resolve socket2 / getrandom / if-addrs on the RTEMS
    target (§8.1); gate off §8.2.
-5. **PVA `select` reactor + minimal executor.** Drives PVA's existing async
-   tasks on RTEMS. PVA protocol is already channel-split, so this phase is
-   dominated by the reactor/executor, not protocol surgery.
-6. **(Fallback only)** If a *measured* desktop footprint/determinism target
-   fails, swap the desktop driver to the `smol`/`polling` stack; if *that*
-   cannot meet an RTEMS hard target, only then consider a bespoke runtime.
+5. **RTEMS entry point.** A runnable `main` for the target that starts the
+   blocking CA server plus the background executor. Until this exists the
+   RTEMS evidence is `--lib` type-checking only, and the §8.1 core-network
+   leaves (socket2 / if-addrs / getrandom) are *gated out* rather than solved —
+   they return at binary-link time. Prerequisite for every QEMU criterion.
+6. **PVA on the CA backend** (revised 2026-07-21; was "`select` reactor +
+   minimal executor"). Mount PVA's reader/writer/operation threads on the
+   existing blocking driver primitives per §7. No new runtime is designed or
+   built; this phase is wiring plus the RTEMS dependency work PVA adds on top
+   of CA's.
 
-Phases 1–4 deliver a working RTEMS **CA** IOC — the cheaper, higher-value
-half — before the heavier PVA reactor work in phase 5.
+The old phase 6 (`smol`/`polling` desktop-driver fallback) is **dropped
+outright** — see §4. The number is reused above by the PVA phase; there is no
+fallback phase in this plan any more.
+
+Phases 1–5 deliver a working RTEMS **CA** IOC — the cheaper, higher-value
+half — before PVA is wired onto the same backend in phase 6.
 
 ---
 
@@ -337,8 +396,8 @@ half — before the heavier PVA reactor work in phase 5.
 - RTEMS CA: `cargo check --target armv7-rtems-eabihf` on the CA server crate +
   its deps builds; a blocking thread-per-client IOC accepts a CA connection and
   serves a `caget`/monitor under QEMU.
-- PVA RTEMS: the select reactor drives an existing PVA monitor operation to
-  completion under QEMU.
+- PVA RTEMS: an existing PVA monitor operation runs to completion under QEMU on
+  the **same** blocking backend as CA (no separate reactor in the build).
 
 ---
 
@@ -358,12 +417,20 @@ These were reasoned from source/library presence, **not** compiled:
   Net: the RTEMS core-network dependency work is real but bounded to these three
   leaves (plus mio), and CA/PVA use only a subset of socket2 that maps onto
   what RTEMS libc *does* expose.
-- Whether the `polling`/`async-io` stack can host an RTEMS `poll`/`select`
-  backend today (it has a poll-based fallback; RTEMS-specific support unchecked)
-  — only matters if the fallback desktop-stack swap in phase 6 is triggered.
-- Exact `smol` migration cost if phase 6 fires: `broadcast` (41 sites) /
-  `watch` (14) / `Notify` (64) have no drop-in in the `async-*` crates and need
-  mapping.
+- ~~Whether the `polling`/`async-io` stack can host an RTEMS `poll`/`select`
+  backend today.~~ **MOOT 2026-07-21** — phase 6 dropped (§4). The probe answer
+  is recorded in §8.1 anyway: `polling`'s own backend selection is RTEMS-ready,
+  but it routes syscalls through **rustix**, which fails on newlib (~181
+  errors, hard-coded Linux signal constants). Adopting the stack would mean
+  owning a rustix fork.
+- ~~Exact `smol` migration cost if phase 6 fires: `broadcast` (41 sites) /
+  `watch` (14) / `Notify` (64) have no drop-in in the `async-*` crates.~~
+  **MOOT 2026-07-21** — phase 6 dropped; tokio stays the desktop driver.
+- **New (open):** the RTEMS **task-count budget** under the single-backend
+  decision. CA and PVA both run threads-per-connection, so peak RTEMS task
+  count is a function of concurrent client connections. Not yet measured
+  against a BSP's configured task limit — this is the one cost the
+  single-backend choice adds relative to the dropped reactor design.
 - The CA deep-cut estimate depends on how many of the ~226 `snapshot()`/`set()`
   call-sites are already outside an async context (auto-reconciled by de-async)
   vs. need rewriting — not yet classified per-file.
@@ -373,7 +440,9 @@ These were reasoned from source/library presence, **not** compiled:
 ## 12. One-line summary
 
 Do **not** rewrite the runtime. Put a thin seam under the protocol cores; keep
-tokio on the four platforms that already work; give RTEMS the one thing it
-lacks — a blocking-thread CA driver (no reactor) and a `select`-based PVA
-reactor — mirroring exactly what RSRV (thread-per-client) and pvxs (libevent)
-already do in C.
+tokio on the four platforms that already work; give RTEMS **one** driver —
+blocking thread-per-client sockets plus `park_on` and a std-thread background
+executor — and run **both CA and PVA** on it. CA mirrors RSRV exactly; PVA
+gives up pvxs's single-reactor shape in exchange for reusing a backend that is
+already built and exercised, paying in RTEMS task count rather than in a second
+runtime design.

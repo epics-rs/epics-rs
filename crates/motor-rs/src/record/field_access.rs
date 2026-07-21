@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{rec_gbl_get_alarm_double, rec_gbl_get_graphic_double};
 use epics_base_rs::types::{DbFieldType, EpicsValue};

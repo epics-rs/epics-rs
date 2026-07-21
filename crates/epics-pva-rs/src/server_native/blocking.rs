@@ -116,15 +116,17 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
+use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
 use epics_base_rs::runtime::task::spawn_dedicated_thread;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
@@ -983,9 +985,11 @@ impl BlockingPvaServer {
     /// other work.
     pub fn serve(&self) {
         let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
+        let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    backoff.accepted();
                     // `shutdown` wakes this parked `accept` by dialling our own
                     // socket; that throwaway connection arrives here and is
                     // dropped with the flag already set.
@@ -1004,6 +1008,26 @@ impl BlockingPvaServer {
                         break;
                     }
                     warn!(error = %e, "blocking PVA server: accept failed");
+                    // The failed connection is still queued, so an immediate
+                    // retry spins at 100% CPU exactly when the machine is out
+                    // of fds or memory. See `runtime::accept` for why the
+                    // retry/give-up decision cannot be made from `e`.
+                    match backoff.failed() {
+                        AcceptRetry::After(delay) => thread::sleep(delay),
+                        AcceptRetry::GiveUp => {
+                            error!(
+                                failures = backoff.consecutive_failures(),
+                                "blocking PVA server: accept failed continuously; listener is \
+                                 dead, stopping the accept loop"
+                            );
+                            break;
+                        }
+                    }
+                    // `shutdown()` may have been asked for while we slept, and
+                    // its self-dial cannot wake an `accept()` that is failing.
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             }
         }
@@ -1309,6 +1333,81 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use tokio::io::AsyncReadExt;
+
+    /// Source guard for F2: both PVA accept loops back off through
+    /// [`AcceptBackoff`], and the count is pinned so a *new* accept loop
+    /// cannot be added without one.
+    ///
+    /// The blocking loop re-looped instantly on failure — a hot spin at 100%
+    /// CPU while the log floods, because a failed accept leaves the connection
+    /// queued. The hosted loop in `accept.rs` did have a sleep, but a flat
+    /// 50 ms with no way out: a listener that could never accept again spun at
+    /// 20 Hz for the life of the process.
+    ///
+    /// Whole-file scope and `concat!`-split needles: this guard lives in one
+    /// of the two files it reads, so an unsplit needle would match its own
+    /// source and pass vacuously.
+    #[test]
+    fn every_pva_accept_loop_backs_off_through_the_primitive() {
+        for (file, src) in [
+            ("server_native/blocking.rs", include_str!("blocking.rs")),
+            ("server_native/accept.rs", include_str!("accept.rs")),
+        ] {
+            let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
+                + src
+                    .matches(concat!("res = listener.acc", "ept() => res,"))
+                    .count();
+            let backoffs = src.matches(concat!("AcceptBack", "off::new()")).count();
+            assert_eq!(
+                loops, 1,
+                "{file}: expected exactly one production accept loop; if one was \
+                 added or removed, update this guard and give it a backoff"
+            );
+            assert_eq!(
+                backoffs, loops,
+                "{file}: an accept loop has no AcceptBackoff. A failed accept leaves \
+                 the connection queued, so retrying with no delay spins at 100% CPU \
+                 exactly when fds or memory have run out"
+            );
+            assert!(
+                src.contains(concat!("backoff.fai", "led()")),
+                "{file}: the accept-failure arm must ask the backoff what to do"
+            );
+            assert!(
+                src.contains(concat!("backoff.acce", "pted()")),
+                "{file}: a successful accept must reset the give-up budget, or a \
+                 busy server under sustained EMFILE eventually stops accepting"
+            );
+            assert!(
+                !src.contains(concat!("sleep(Duration::from_mil", "lis(50)).await")),
+                "{file}: the hardcoded accept-error sleep is back; it has no \
+                 give-up path, so a dead listener spins at 20 Hz forever"
+            );
+            assert_delay_is_actually_waited(file, src);
+        }
+    }
+
+    /// `AcceptRetry` is `#[must_use]`, but nothing in the type system stops a
+    /// caller from matching the `After(delay)` arm and then dropping `delay`
+    /// on the floor — which reinstates the hot spin while every other
+    /// assertion above still passes. Verified by mutation on the CA side:
+    /// replacing the sleep with `{}` was invisible until this check existed.
+    fn assert_delay_is_actually_waited(file: &str, src: &str) {
+        let arm = concat!("AcceptRetry::Af", "ter(delay) =>");
+        let mut arms = 0;
+        for (i, _) in src.match_indices(arm) {
+            arms += 1;
+            let tail = &src[i + arm.len()..];
+            let window = &tail[..tail.len().min(160)];
+            assert!(
+                window.contains(concat!("sle", "ep(delay)")),
+                "{file}: an AcceptRetry::After arm does not wait for its delay — \
+                 the accept loop is spinning again. Arm body starts: {:?}",
+                &window[..window.len().min(80)]
+            );
+        }
+        assert!(arms > 0, "{file}: no AcceptRetry::After arm at all");
+    }
 
     /// Production scope of a source file: everything before the first
     /// column-0 `#[cfg(test)]`. Same helper the accept-driver guard uses.

@@ -233,6 +233,11 @@ use crate::server::recv::{Admit, RecvAccumulator, Refused};
 #[cfg(not(target_os = "rtems"))]
 use crate::server::outbox::OutboxDrain;
 use epics_base_rs::error::CaResult;
+// The accept backoff is shared with the blocking driver, but this file's only
+// user of it is the async `accept_loop`; host-only, same gate as that fn. The
+// RTEMS driver reaches the same primitive from `server::blocking`.
+#[cfg(not(target_os = "rtems"))]
+use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::pv::ProcessVariable;
@@ -1376,6 +1381,7 @@ async fn accept_loop(
     // also reaps completed tasks so the set doesn't accumulate
     // finished JoinHandles.
     let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut backoff = AcceptBackoff::new();
 
     loop {
         // Drain mode: stop accepting new connections. Existing
@@ -1388,7 +1394,35 @@ async fn accept_loop(
         }
         let (stream, peer) = tokio::select! {
             biased;
-            res = listener.accept() => res?,
+            // Was `res?`. A single transient failure — `ECONNABORTED` from a
+            // client that resets between SYN and accept is routine on a busy
+            // network — returned from the whole loop, and this interface
+            // stopped accepting CA circuits for the life of the server. Same
+            // primitive as the three other accept loops.
+            res = listener.accept() => match res {
+                Ok(accepted) => {
+                    backoff.accepted();
+                    accepted
+                }
+                Err(e) => {
+                    tracing::warn!(intf = %intf, error = %e, "CA accept failed");
+                    match backoff.failed() {
+                        AcceptRetry::After(delay) => {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        AcceptRetry::GiveUp => {
+                            tracing::error!(
+                                intf = %intf,
+                                failures = backoff.consecutive_failures(),
+                                "CA accept failed continuously; listener is dead, \
+                                 stopping the accept loop"
+                            );
+                            return Err(e.into());
+                        }
+                    }
+                }
+            },
             // Drain finished connection tasks. Returns None when the
             // set is empty — that branch resolves immediately, but
             // `biased` makes the listener arm preferred so we never

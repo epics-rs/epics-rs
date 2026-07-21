@@ -104,6 +104,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread, name_current_thread,
 };
@@ -196,9 +197,11 @@ impl BlockingCaServer {
         // identifiable in an RTEMS task listing, where `Builder::name` alone
         // never reaches the kernel.
         name_current_thread();
+        let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection is dropped here.
                     if self.shutdown.load(Ordering::Acquire) {
@@ -250,6 +253,28 @@ impl BlockingCaServer {
                         target: "epics_ca_rs::server::blocking",
                         error = %e, "blocking CA accept failed"
                     );
+                    // The failed connection is still queued, so returning to
+                    // `accept()` with no delay spins at 100% CPU exactly when
+                    // the machine is out of fds or memory. See the module docs
+                    // on `runtime::accept` for why the retry/give-up decision
+                    // cannot be made from `e`.
+                    match backoff.failed() {
+                        AcceptRetry::After(delay) => thread::sleep(delay),
+                        AcceptRetry::GiveUp => {
+                            tracing::error!(
+                                target: "epics_ca_rs::server::blocking",
+                                failures = backoff.consecutive_failures(),
+                                "blocking CA accept failed continuously; listener is dead, \
+                                 stopping the accept loop"
+                            );
+                            break;
+                        }
+                    }
+                    // `shutdown()` may have been asked for while we slept, and
+                    // its self-dial cannot wake an `accept()` that is failing.
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             }
         }
@@ -1794,6 +1819,81 @@ mod tests {
                  size must be refused with ECA_TOLARGE before it is trusted"
             );
         }
+    }
+
+    /// Source guard for F2: every CA accept loop backs off through
+    /// [`AcceptBackoff`], and the count is pinned so a *new* accept loop
+    /// cannot be added without one.
+    ///
+    /// The defect this closes is the same shape as the `RecvAccumulator` one
+    /// below — two drivers, one of which had learned the guard. Here neither
+    /// had: the blocking loop re-looped instantly on failure (hot spin at
+    /// 100% CPU while the log floods, because the failed connection stays
+    /// queued), and the async loop did `res?`, so one routine
+    /// `ECONNABORTED` stopped the interface accepting for good.
+    ///
+    /// Whole-file scope and `concat!`-split needles for the same two reasons
+    /// the guard below documents: `production_scope` returns a 95-line prefix
+    /// on tcp.rs, and this test lives in one of the files it reads.
+    #[test]
+    fn every_ca_accept_loop_backs_off_through_the_primitive() {
+        for (file, src) in [
+            ("server/blocking.rs", include_str!("blocking.rs")),
+            ("server/tcp.rs", include_str!("tcp.rs")),
+        ] {
+            // One accept loop per file today. Counting rather than merely
+            // checking presence is what makes this catch a *newly added*
+            // loop that forgot the backoff.
+            let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
+                + src
+                    .matches(concat!("res = listener.acc", "ept() => match res {"))
+                    .count();
+            let backoffs = src.matches(concat!("AcceptBack", "off::new()")).count();
+            assert_eq!(
+                loops, 1,
+                "{file}: expected exactly one production accept loop; if one was \
+                 added or removed, update this guard and give it a backoff"
+            );
+            assert_eq!(
+                backoffs, loops,
+                "{file}: an accept loop has no AcceptBackoff. A failed accept leaves \
+                 the connection queued, so retrying with no delay spins at 100% CPU \
+                 exactly when fds or memory have run out"
+            );
+            assert!(
+                src.contains(concat!("backoff.fai", "led()")),
+                "{file}: the accept-failure arm must ask the backoff what to do"
+            );
+            assert!(
+                src.contains(concat!("backoff.acce", "pted()")),
+                "{file}: a successful accept must reset the give-up budget, or a \
+                 busy server under sustained EMFILE eventually stops accepting"
+            );
+            assert_delay_is_actually_waited(file, src);
+        }
+    }
+
+    /// `AcceptRetry` is `#[must_use]`, but nothing in the type system stops a
+    /// caller from matching the `After(delay)` arm and then dropping `delay`
+    /// on the floor — which reinstates the hot spin while every other
+    /// assertion above still passes. Verified by mutation: replacing
+    /// `thread::sleep(delay)` with `{}` was invisible until this check
+    /// existed. So the arm is checked for an actual wait.
+    fn assert_delay_is_actually_waited(file: &str, src: &str) {
+        let arm = concat!("AcceptRetry::Af", "ter(delay) =>");
+        let mut arms = 0;
+        for (i, _) in src.match_indices(arm) {
+            arms += 1;
+            let tail = &src[i + arm.len()..];
+            let window = &tail[..tail.len().min(160)];
+            assert!(
+                window.contains(concat!("sle", "ep(delay)")),
+                "{file}: an AcceptRetry::After arm does not wait for its delay — \
+                 the accept loop is spinning again. Arm body starts: {:?}",
+                &window[..window.len().min(80)]
+            );
+        }
+        assert!(arms > 0, "{file}: no AcceptRetry::After arm at all");
     }
 
     /// (iii) The read timeout actually fires: a socket with a short

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
 use tokio::net::TcpListener;
 use tracing::{debug, error, warn};
 
@@ -115,6 +116,7 @@ pub async fn run_tcp_server_on_listener(
     // finished JoinHandles.
     let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    let mut backoff = AcceptBackoff::new();
     loop {
         let accept_result = tokio::select! {
             biased;
@@ -127,6 +129,7 @@ pub async fn run_tcp_server_on_listener(
         };
         match accept_result {
             Ok((stream, peer)) => {
+                backoff.accepted();
                 // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
                 // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
                 // TCP accept callback registers a `ServerConn` with no
@@ -340,7 +343,21 @@ pub async fn run_tcp_server_on_listener(
             }
             Err(e) => {
                 error!("accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Was a flat 50 ms with no way out: a listener that could never
+                // accept again spun at 20 Hz for the life of the process. Same
+                // primitive as the two blocking loops now — see
+                // `runtime::accept` for why the decision cannot come from `e`.
+                match backoff.failed() {
+                    AcceptRetry::After(delay) => tokio::time::sleep(delay).await,
+                    AcceptRetry::GiveUp => {
+                        error!(
+                            failures = backoff.consecutive_failures(),
+                            "accept failed continuously; listener is dead, stopping the \
+                             accept loop"
+                        );
+                        return Err(PvaError::Io(e));
+                    }
+                }
             }
         }
     }

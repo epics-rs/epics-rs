@@ -2457,17 +2457,61 @@ pub use super::config::ClientCredentials;
 // building one from a CONNECTION_VALIDATION reply or a verified TLS chain is
 // this module's job, so the constructors stay here.
 impl ClientCredentials {
-    /// Re-derive [`Self::roles`] server-side from [`Self::account`]
-    /// against the local passwd/group DB (pvxs `ClientCredentials::roles`
-    /// → `osdGetRoles`). The single funnel every constructor / parse path
-    /// passes through, so `roles` is server-derived by construction and a
-    /// wire-advertised value can never reach the ACF gate.
-    fn with_server_roles(mut self) -> Self {
+    /// The ACF host identity for a connection: its peer address, numeric.
+    ///
+    /// Byte-for-byte what QSRV does (`ioc/credentials.cpp:27-29`):
+    ///
+    /// ```cpp
+    /// SockAddr addr(clientCredentials.peer);
+    /// addr.setPort(0);
+    /// host = std::string(SB()<<addr.map6to4());
+    /// ```
+    ///
+    /// `setPort(0)` is why only the IP is taken, and `map6to4` is why an
+    /// IPv4-mapped IPv6 peer renders as its IPv4 form — so a client reaching a
+    /// dual-stack listener matches the same HAG entry it would over IPv4.
+    /// [`Ipv6Addr::to_ipv4_mapped`] is the exact counterpart (`to_ipv4` is
+    /// not: it also maps IPv4-*compatible* addresses, turning `::1` into
+    /// `0.0.0.1`).
+    ///
+    /// Numeric, not reverse-DNS, and deliberately: a reverse lookup is a
+    /// second network operation that can fail, and its failure path lands
+    /// back in the sentinel/empty-string behaviour this whole change exists
+    /// to remove. On a target with no resolver that failure is the *expected*
+    /// branch, not the exceptional one. Numeric is also what upstream
+    /// compares — QSRV never consults `asCheckClientIP`, so its PVA host is
+    /// always the numeric peer.
+    fn acf_host_from_peer(peer: std::net::SocketAddr) -> String {
+        match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => v6.to_string(),
+            },
+        }
+    }
+
+    /// Derive every server-side identity field from server-side truth:
+    /// [`Self::roles`] from [`Self::account`] against the local passwd/group
+    /// DB (pvxs `ClientCredentials::roles` → `osdGetRoles`), and
+    /// [`Self::host`] from the connection's peer address (QSRV
+    /// `ioc/credentials.cpp:27-29`).
+    ///
+    /// The single funnel every constructor and parse path passes through, so
+    /// both fields are server-derived **by construction** and a
+    /// wire-advertised value can never reach the ACF gate. `host` used to be
+    /// copied verbatim off the CONNECTION_VALIDATION body, three lines above
+    /// the comment explaining why `roles` must not be; taking the peer here —
+    /// rather than overwriting the wire value afterwards — is what makes the
+    /// wire value unable to reach the field at all, instead of merely
+    /// corrected after the fact.
+    fn with_server_derived(mut self, peer: std::net::SocketAddr) -> Self {
         self.roles = crate::auth::osd_get_roles(&self.account);
+        self.host = Self::acf_host_from_peer(peer);
         self
     }
 
-    fn anonymous() -> Self {
+    fn anonymous(peer: std::net::SocketAddr) -> Self {
         Self {
             method: "anonymous".into(),
             account: "anonymous".into(),
@@ -2475,14 +2519,14 @@ impl ClientCredentials {
             authority: String::new(),
             roles: Vec::new(),
         }
-        .with_server_roles()
+        .with_server_derived(peer)
     }
 
     /// Build `x509` credentials from a verified TLS peer chain.
     /// Mirrors pvxs `SSLContext::fill_credentials`: the leaf cert's
     /// subject CommonName becomes the `account` and the root CA's
     /// subject CommonName becomes the `authority`.
-    fn x509(creds: crate::auth::X509Credentials) -> Self {
+    fn x509(creds: crate::auth::X509Credentials, peer: std::net::SocketAddr) -> Self {
         Self {
             method: "x509".into(),
             account: creds.account,
@@ -2490,7 +2534,7 @@ impl ClientCredentials {
             authority: creds.authority,
             roles: Vec::new(),
         }
-        .with_server_roles()
+        .with_server_derived(peer)
     }
 
     /// Format a one-line debug label for tracing / diagnostics.
@@ -2574,7 +2618,7 @@ async fn process_connection_validation(
         // a decode fault here is still fatal —
         // log + propagate. Pre-fix swallowed; pvxs
         // `serverconn.cpp:211-216` calls `bev.reset()`.
-        match parse_client_credentials(frame, decode_cache)? {
+        match parse_client_credentials(frame, decode_cache, peer)? {
             Some(claimed) => debug!(
                 ?peer,
                 x509_account = %cred.account,
@@ -2603,7 +2647,7 @@ async fn process_connection_validation(
         // anonymous handshake (empty/"anonymous" method) returns Ok(None) and
         // keeps whatever credential is already in force — anonymous on a fresh
         // connection, the committed identity on a re-auth.
-        let candidate = parse_client_credentials(frame, decode_cache)?;
+        let candidate = parse_client_credentials(frame, decode_cache, peer)?;
         // The method that would take effect: the claim's method when the client
         // sent one, otherwise the credential already in force (so an anonymous
         // re-handshake stays advertised against the live method, never resetting
@@ -2686,9 +2730,12 @@ async fn process_connection_validation(
     Ok(())
 }
 
+/// `peer` is taken because the ACF host identity is derived from it, never
+/// from the body being parsed — see `with_server_derived`.
 fn parse_client_credentials(
     frame: &Frame,
     decode_cache: &mut TypeCache,
+    peer: std::net::SocketAddr,
 ) -> PvaResult<Option<ClientCredentials>> {
     // Inbound application payloads are decoded with the frame's own header
     // byte order (pvxs latches `peerBE` per received message,
@@ -2764,14 +2811,21 @@ fn parse_client_credentials(
                     ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
                         creds.account = v.as_str_lossy().into_owned();
                     }
-                    ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.host = v.as_str_lossy().into_owned();
-                    }
-                    // A `groups`/`roles` field MAY be advertised here, but the
-                    // server MUST NOT trust it (ACL bypass — see the `roles`
-                    // field doc). pvxs reads only `user`/`host` off the wire
-                    // and re-derives roles via `osdGetRoles`. We ignore it and
-                    // re-derive in `with_server_roles` before returning.
+                    // NOTE the absence of a `host` arm, and do not add one.
+                    // A client MAY advertise `host`, and pvxs has no field to
+                    // put it in: `server::ClientCredentials`
+                    // (`src/pvxs/srvcommon.h:36-56`) carries peer, iface,
+                    // method, account, raw and roles() and no host at all.
+                    // QSRV derives the ACF host from the socket instead
+                    // (`ioc/credentials.cpp:27-29`). We used to copy the wire
+                    // string straight into the field the HAG gate matches,
+                    // which let a client pick its own host identity — so the
+                    // field is now written only by `with_server_derived`, from
+                    // the peer, and this parser cannot reach it.
+                    //
+                    // Same rule, same reason, as the `groups`/`roles` field a
+                    // client MAY also advertise: trusting it would be an ACL
+                    // bypass. Both are ignored here and derived below.
                     _ => {}
                 }
             }
@@ -2794,9 +2848,10 @@ fn parse_client_credentials(
         return Ok(None);
     }
     // Roles are re-derived server-side from `account` (pvxs
-    // `ClientCredentials::roles()`); any wire-advertised `groups`/`roles`
+    // `ClientCredentials::roles()`) and the host from the peer socket (QSRV
+    // `ioc/credentials.cpp:27-29`); any wire-advertised `groups`/`roles`/`host`
     // was ignored above.
-    Ok(Some(creds.with_server_roles()))
+    Ok(Some(creds.with_server_derived(peer)))
 }
 
 /// Type-erased read/write halves so the same handler works for plain TCP
@@ -3093,8 +3148,8 @@ pub(super) async fn handle_connection_io(
     // Fed into the server's ACF `AccessGate::check` for every op.
     let x509_locked = x509_identity.is_some();
     let mut cred = match x509_identity {
-        Some(id) => ClientCredentials::x509(id),
-        None => ClientCredentials::anonymous(),
+        Some(id) => ClientCredentials::x509(id, peer),
+        None => ClientCredentials::anonymous(peer),
     };
     // Per-connection emit-side TypeStore. Only consulted when
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
@@ -8068,6 +8123,18 @@ fn fixed_out_order(order: ByteOrder) -> Arc<std::sync::atomic::AtomicBool> {
     Arc::new(std::sync::atomic::AtomicBool::new(order.is_big()))
 }
 
+/// The peer every credentials-constructing test is reached from. A
+/// documentation range (RFC 5737 TEST-NET-3), deliberately NOT the loopback
+/// or any name a wire `host` string in these tests uses, so a wire value
+/// leaking into `ClientCredentials::host` is visible rather than
+/// coincidentally equal. Defined at module level so every `#[cfg(test)]`
+/// sub-module reaches it via `super::*`. Nothing binds it.
+#[cfg(test)]
+const TEST_PEER: std::net::SocketAddr = std::net::SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+    44321,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8116,6 +8183,74 @@ mod tests {
             hits, 0,
             "production scope must spawn through `runtime::task::spawn`; \
              found {hits} bare `{literal}`"
+        );
+    }
+
+    /// A1, structural: `ClientCredentials::host` is the string the ACF
+    /// `HAG(...)` gate matches, and this file is the only place in the
+    /// workspace that writes it. Pin the two properties that make a wire
+    /// value *unable* to reach it, rather than merely corrected afterwards:
+    ///
+    /// 1. Production scope holds exactly ONE write, and it is the funnel's
+    ///    `self.host = Self::acf_host_from_peer(peer)`.
+    /// 2. `parse_client_credentials` — the one function that reads the
+    ///    CONNECTION_VALIDATION body — has no `("host", ...)` decode arm and
+    ///    hands back credentials only through `with_server_derived`.
+    ///
+    /// Mutation-provable: re-add the deleted `("host", …)` arm, or make the
+    /// parser return `Ok(Some(creds))` un-funnelled, and this fails.
+    /// Comment lines are stripped first so the NOTE explaining the absent arm
+    /// does not satisfy the check it documents.
+    #[test]
+    fn the_acf_host_is_written_only_by_the_peer_funnel() {
+        let src = include_str!("tcp.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains("fn parse_client_credentials"),
+            "production slice no longer covers the credentials parser"
+        );
+        let code = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prod_code = code(prod);
+        let writes: Vec<&str> = prod_code
+            .lines()
+            .filter(|l| l.contains(".host =") || l.contains(".host="))
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["        self.host = Self::acf_host_from_peer(peer);"],
+            "the ACF host must be written only by `with_server_derived`"
+        );
+
+        let start = prod
+            .find("fn parse_client_credentials")
+            .expect("checked above");
+        let end = prod[start..]
+            .find("\n/// Type-erased read/write halves")
+            .expect("parser is followed by the SrvRead/SrvWrite aliases")
+            + start;
+        let parser = code(&prod[start..end]);
+        assert!(
+            !parser.contains("\"host\""),
+            "the CONNECTION_VALIDATION parser must have no `host` decode arm"
+        );
+        let returns: Vec<&str> = parser
+            .lines()
+            .filter(|l| l.contains("Ok(Some("))
+            .map(|l| l.trim())
+            .collect();
+        assert_eq!(
+            returns,
+            vec!["Ok(Some(creds.with_server_derived(peer)))"],
+            "every credential the parser hands back must pass the funnel"
         );
     }
 
@@ -9767,7 +9902,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -9775,7 +9910,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             // INIT: valid Int descriptor, then a truncated (2-byte) i32
             // value — a present-but-malformed pvRequest body.
@@ -9862,7 +9997,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -9870,7 +10005,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             // INIT: valid Int descriptor, then NOTHING — the value body
             // the descriptor requires is absent (descriptor-only frame).
@@ -9956,7 +10091,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -9964,7 +10099,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT: empty `structure {}` descriptor, no value body.
         let req_desc = FieldDesc::Structure {
@@ -10051,7 +10186,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -10059,7 +10194,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             let mut payload = Vec::new();
             payload.put_u32(sid, order);
@@ -10714,7 +10849,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -10723,7 +10858,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (subcmd 0x08, no pipeline bit) with an unparseable
         // `pipeline` value → pipeline disabled, one Warn logRemote.
@@ -10824,7 +10959,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -10833,7 +10968,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // pipeline=true, a valid queueSize, and an ARRAY ackAny — `Int32A` is
         // Kind::Integer but stores as an array, and `copyOut` has no scalar arm
@@ -10917,7 +11052,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -10926,7 +11061,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // Pipeline MONITOR INIT: subcmd 0x88 (INIT | pipeline), a valid
         // pipeline pvRequest, and the trailing u32 initial-nack rider the
@@ -11167,7 +11302,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11176,7 +11311,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT with pipeline=true, queueSize=2 and an explicit
         // initial nack rider of 2 (subcmd 0x88 sets the 0x80 pipeline bit,
@@ -11335,7 +11470,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11447,7 +11582,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT with queueSize 8 — large enough to hold the seed + 3 posts
         // with no squash.
@@ -11520,7 +11655,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -11588,7 +11723,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11641,7 +11776,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11699,7 +11834,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11800,7 +11935,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -11864,7 +11999,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -11911,7 +12046,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12090,7 +12225,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12111,7 +12246,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12179,7 +12314,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -12319,7 +12454,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12327,7 +12462,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12486,7 +12621,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12494,7 +12629,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12581,7 +12716,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12590,7 +12725,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT with pipeline=true, queueSize=2, but subcmd 0x08:
         // the 0x80 bit is CLEAR, so NO initial-nack rider follows the
@@ -12707,7 +12842,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12720,7 +12855,7 @@ mod tests {
         );
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT, pipeline OFF, queueSize=2.
         let req_val = make_pipeline_request(
@@ -12808,7 +12943,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12817,7 +12952,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (pipeline, queueSize=4 so an ACK is well-formed).
         let req_val = make_pipeline_request(
@@ -12997,7 +13132,7 @@ mod tests {
                 introspection: None,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13023,7 +13158,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // ACK frame (subcmd 0x80) with NO u32 ack-count payload.
         let mut payload = Vec::new();
@@ -13076,7 +13211,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13129,7 +13264,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13273,7 +13408,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13317,7 +13452,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0xC4 = ACK(0x80)|START(0x04)|start(0x40), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13393,7 +13528,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0x84 = ACK(0x80)|STOP(0x04, no start bit), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13468,7 +13603,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0xC4 with a 3-credit ACK count.
         let mut payload = Vec::new();
@@ -13720,7 +13855,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13765,7 +13900,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             }
         };
@@ -13853,7 +13988,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13953,7 +14088,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14053,7 +14188,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14140,7 +14275,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14752,7 +14887,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -14810,7 +14945,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -14865,7 +15000,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, inbound_order);
@@ -14962,7 +15097,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15425,7 +15560,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -15498,7 +15633,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15577,7 +15712,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15586,7 +15721,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT: sid + ioid + subcmd=0x08 + pvRequest(type + value).
         // Use an empty Structure pvRequest (full mask).
@@ -15710,7 +15845,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15719,7 +15854,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
@@ -15832,7 +15967,7 @@ mod tests {
         let source: DynSource = Arc::new(shared);
 
         let config = PvaServerConfig::default();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // A channel carrying one already-INIT'd GET op.
         let make_channels = || {
@@ -15855,7 +15990,7 @@ mod tests {
                     introspection: Some(intro.clone()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops,
                 },
             );
@@ -16013,7 +16148,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16022,7 +16157,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // The "empty pvRequest" structure (no `field` child) → wildcard
         // mask. Its only role here is to be a real descriptor the client can
@@ -16116,7 +16251,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16509,7 +16644,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16518,7 +16653,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT.
         let req_desc = FieldDesc::Structure {
@@ -16640,7 +16775,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16649,7 +16784,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT_GET INIT (subcmd 0x08).
         let req_desc = FieldDesc::Structure {
@@ -16967,7 +17102,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -16985,6 +17120,95 @@ mod tests {
             authority: authority.into(),
             roles: Vec::new(),
         }
+    }
+
+    /// A1: the ACF host identity must come from the socket, never the wire.
+    ///
+    /// A crafted `ca` client sends `host` naming a machine an operator's
+    /// `HAG(...)` trusts. A2 is the same defect through `asCheckClientIP=1`,
+    /// where `hag_members` (`access_security.rs:1499-1529`) stores either a
+    /// dotted quad or the literal `unresolved:<name>` sentinel a failed
+    /// load-time DNS lookup leaves behind — so both of those are typeable
+    /// too, and the sentinel turns a *failed* lookup into a password. All
+    /// three shapes are covered below. Pre-fix the string was copied
+    /// verbatim into `ClientCredentials::host`
+    /// (`tcp.rs:2768`), which is the value `compute_rules` matches HAG
+    /// members against, so a client could grant itself any host-scoped rule.
+    ///
+    /// pvxs cannot express this: `server::ClientCredentials`
+    /// (`src/pvxs/srvcommon.h:36-56`) has no host field, and QSRV derives it
+    /// from the socket (`ioc/credentials.cpp:27-29`).
+    ///
+    /// Fails today on Linux with no network: it is a pure decode.
+    #[test]
+    fn parse_client_credentials_never_takes_the_acf_host_from_the_wire() {
+        let order = ByteOrder::Little;
+        let account = "pvxs_nobody_zz";
+        // Both shapes an attacker would pick: a trusted-looking name, and
+        // the sentinel a failed HAG lookup leaves behind (A2).
+        for forged in ["trusted-console.lab", "unresolved:lab-pc1", "192.0.2.7"] {
+            let mut payload = Vec::new();
+            payload.put_u32(0x10000, order); // buffer_size
+            payload.put_u16(1, order); // intro_size
+            payload.put_u16(0, order); // qos
+            encode_string_into("ca", order, &mut payload);
+            payload.put_u8(0xFD);
+            payload.put_u16(1, order);
+            payload.put_u8(0x80);
+            payload.put_u8(0x00);
+            payload.put_u8(2); // n_fields
+            payload.put_u8(0x04);
+            payload.extend_from_slice(b"user");
+            payload.put_u8(0x60); // string
+            payload.put_u8(0x04);
+            payload.extend_from_slice(b"host");
+            payload.put_u8(0x60); // string
+            encode_string_into(account, order, &mut payload);
+            encode_string_into(forged, order, &mut payload);
+
+            let header = PvaHeader::application(
+                false,
+                order,
+                Command::ConnectionValidation.code(),
+                payload.len() as u32,
+            );
+            let frame = Frame { header, payload };
+
+            let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
+                .expect("decode must succeed")
+                .expect("ca with a user field yields Some");
+
+            assert_ne!(
+                creds.host, forged,
+                "the wire `host` reached the field the HAG gate matches"
+            );
+            assert_eq!(
+                creds.host, "198.51.100.7",
+                "host must be the numeric peer (QSRV credentials.cpp:27-29)"
+            );
+        }
+    }
+
+    /// The peer-derivation itself, on the boundaries QSRV's `map6to4` covers.
+    #[test]
+    fn acf_host_from_peer_matches_qsrv_map6to4() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 5075);
+        assert_eq!(ClientCredentials::acf_host_from_peer(v4), "10.0.0.3");
+
+        // IPv4-mapped IPv6 renders as its IPv4 form, so a dual-stack peer
+        // matches the same HAG entry it would over IPv4.
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(10, 0, 0, 3).to_ipv6_mapped()),
+            5075,
+        );
+        assert_eq!(ClientCredentials::acf_host_from_peer(mapped), "10.0.0.3");
+
+        // A genuine IPv6 peer keeps its own form; `to_ipv4` (as opposed to
+        // `to_ipv4_mapped`) would have rendered ::1 as "0.0.0.1".
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5075);
+        assert_eq!(ClientCredentials::acf_host_from_peer(v6), "::1");
     }
 
     /// Security regression: the server MUST NOT trust wire-advertised
@@ -17039,7 +17263,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("ca with a user field yields Some");
 
@@ -17083,8 +17307,8 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let parsed =
-            parse_client_credentials(&frame, &mut TypeCache::new()).expect("decode must succeed");
+        let parsed = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
+            .expect("decode must succeed");
         assert!(
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
@@ -17127,7 +17351,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("non-anonymous method yields Some");
         assert_eq!(
@@ -17165,7 +17389,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
         assert_eq!(
@@ -17203,7 +17427,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("capitalized `Anonymous` is not the exact fold → Some");
         assert_eq!(
@@ -17359,7 +17583,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -17479,7 +17703,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -17861,7 +18085,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18048,7 +18272,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18187,7 +18411,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18202,7 +18426,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18247,7 +18471,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18260,7 +18484,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18314,7 +18538,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18328,7 +18552,7 @@ mod tests {
         let inbound_body = frame.payload.len();
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18419,7 +18643,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -18495,7 +18719,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18508,7 +18732,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18579,7 +18803,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18592,7 +18816,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18685,7 +18909,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18699,7 +18923,7 @@ mod tests {
             synth_frame(Command::GetField, order, payload)
         };
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
         let frame1 = build();
@@ -19109,7 +19333,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -19463,7 +19687,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -19473,7 +19697,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (subcmd 0x08): empty pvRequest → full monitor.
         let req_val = PvField::Structure(PvStructure {
@@ -19639,7 +19863,7 @@ mod tests {
                 introspection: intro,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -19690,7 +19914,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // GET INIT (subcmd 0x08) — succeeds via ch.introspection.
         let mut init_payload = Vec::new();
@@ -19769,7 +19993,7 @@ mod tests {
                     introspection: Some(three_field_intro()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -19803,7 +20027,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT a fresh GET on channel sid=2 reusing ioid=5.
         let mut init_payload = Vec::new();
@@ -19884,7 +20108,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT (subcmd 0x08).
         let mut init_payload = Vec::new();
@@ -19968,7 +20192,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut init_payload = Vec::new();
         init_payload.put_u32(sid, order);
@@ -20099,7 +20323,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous();
+        let mut cred = ClientCredentials::anonymous(TEST_PEER);
         // One connection-scope inbound decode cache shared across both
         // validation frames, mirroring the read loop's single `rx_type_cache`.
         let mut decode_cache = TypeCache::new();
@@ -20237,7 +20461,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous();
+        let mut cred = ClientCredentials::anonymous(TEST_PEER);
         let mut decode_cache = TypeCache::new();
 
         // Initial handshake: identity becomes alice/ca.
@@ -20398,7 +20622,7 @@ mod autoexec_tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -20407,7 +20631,7 @@ mod autoexec_tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let req_desc = pv_request.descriptor();
         let mut init_payload = Vec::new();
@@ -20595,7 +20819,7 @@ mod r14_tests {
         let source: DynSource = std::sync::Arc::new(SlowGetSource);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let intro = FieldDesc::Variant;
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -20613,7 +20837,7 @@ mod r14_tests {
                 introspection: Some(intro),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -20798,7 +21022,7 @@ mod bfr15_tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -20890,7 +21114,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -20975,7 +21199,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21055,7 +21279,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21111,7 +21335,7 @@ mod bfr15_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21242,7 +21466,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -21323,7 +21547,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );

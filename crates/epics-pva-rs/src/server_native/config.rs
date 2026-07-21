@@ -542,9 +542,21 @@ pub struct ClientCredentials {
     /// leaf cert subject CommonName). Empty when the auth method does
     /// not carry one.
     pub account: String,
-    /// Host name claim from the `ca` auth, when present. Informational
-    /// only — never trust it for access decisions over the network
-    /// hostname / mTLS-verified peer.
+    /// Host identity of the peer, as the ACF `HAG(...)` gate matches it:
+    /// the connection's peer address in numeric form, port stripped and
+    /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
+    ///
+    /// SECURITY: this is NEVER populated from the wire. A client MAY
+    /// advertise a `host` field in CONNECTION_VALIDATION, and this server
+    /// ignores it — trusting it would let any client type the string its
+    /// `HAG` rules are matched against and grant itself every host-scoped
+    /// rule, including the `unresolved:<name>` sentinel a failed ACF-load
+    /// DNS lookup leaves behind. pvxs makes this impossible by having no
+    /// host field at all (`src/pvxs/srvcommon.h:36-56`); we make it
+    /// impossible by deriving the value in `with_server_derived` from the
+    /// peer socket, which is the same funnel that derives [`Self::roles`],
+    /// and by leaving the CONNECTION_VALIDATION parser no arm that can write
+    /// here.
     pub host: String,
     /// Certificate authority for the `x509` method: the root CA's
     /// subject CommonName (pvxs `PeerCredentials::authority`). Empty for
@@ -553,7 +565,7 @@ pub struct ClientCredentials {
     pub authority: String,
     /// Group / role memberships of [`Self::account`], re-derived
     /// SERVER-SIDE from the local passwd/group DB by
-    /// `tcp::ClientCredentials::with_server_roles` (pvxs
+    /// `tcp::ClientCredentials::with_server_derived` (pvxs
     /// `ClientCredentials::roles()` →
     /// `osdGetRoles`, serverconn.cpp:33-37). ACF rules of the form
     /// `R member group:operators` match against this set.
@@ -562,6 +574,6 @@ pub struct ClientCredentials {
     /// advertises a `groups`/`roles` field in CONNECTION_VALIDATION, but
     /// trusting it would let `account="nobody", roles=["admin"]` satisfy
     /// any group-gated rule — an ACL bypass. Every constructor funnels
-    /// through `with_server_roles`, so a wire value can never reach here.
+    /// through `with_server_derived`, so a wire value can never reach here.
     pub roles: Vec<String>,
 }

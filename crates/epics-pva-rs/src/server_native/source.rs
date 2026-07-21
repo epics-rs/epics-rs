@@ -96,7 +96,14 @@ pub struct ChannelContext {
     pub account: String,
     /// Auth method (`"anonymous"`, `"ca"`, `"x509"`).
     pub method: String,
-    /// Reverse-resolved host name. Empty when DNS lookup failed.
+    /// Host identity of the peer as the ACF `HAG(...)` gate matches it —
+    /// [`Self::peer`]'s address in numeric form, port stripped and
+    /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
+    ///
+    /// NOT reverse-resolved, and never taken from the wire: a client's
+    /// advertised `host` field is ignored by the CONNECTION_VALIDATION
+    /// parser, because this is the string host-scoped ACF rules are matched
+    /// against. See `ClientCredentials::host`.
     pub host: String,
     /// Certificate authority for the `x509` method: the root CA's
     /// subject CommonName. Empty for non-TLS methods. ACF

@@ -126,10 +126,15 @@ pub fn bsp_lib_dir(prefix: &str, bsp: &str) -> String {
 /// the shim includes (`<rtems.h>`, `<machine/rtems-bsd-config.h>`,
 /// `<rtems/netcmds-config.h>`, `<rtems/shellconfig.h>`) are installed.
 ///
-/// Unverified: no RTEMS header tree exists on the development machine, so this
-/// is the standard RTEMS 6 install layout rather than an observed path. If the
-/// shim fails to find `<rtems.h>`, this is the line to correct — take the `-I`
-/// set from a BSP sample's *compile* line.
+/// Verified on the bring-up box: a translation unit including all four of
+/// `<rtems.h>`, `<machine/rtems-bsd-config.h>`, `<rtems/netcmds-config.h>` and
+/// `<rtems/shellconfig.h>` compiles with this directory as the *only*
+/// `-isystem` (`arm-rtems6-gcc -fsyntax-only`, exit 0).
+///
+/// One caveat for anyone re-deriving this: the RTEMS kernel's own waf build
+/// compiles out of its source tree, so a BSP sample's compile line shows
+/// in-tree `-I`s and is *not* evidence about the installed layout. libbsd is
+/// the right analogue, because it builds against the installed BSP as we do.
 pub fn bsp_include_dir(prefix: &str, bsp: &str) -> String {
     format!("{}/include", bsp_lib_dir(prefix, bsp))
 }

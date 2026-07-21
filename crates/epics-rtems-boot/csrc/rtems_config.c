@@ -115,9 +115,16 @@ extern void *POSIX_Init(void *argument);
  * This is the binding constraint on concurrent clients: one connection is one
  * descriptor however many threads serve it.
  *
- * UNVERIFIED: whether RTEMS 6 still spells the macro this way (base's score arm
- * uses CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS) and whether any library linked
- * into the image — libbsd in particular — calls select() on a high descriptor.
+ * VERIFIED on the bring-up box: CONFIGURE_MAXIMUM_FILE_DESCRIPTORS is the
+ * correct RTEMS 6 spelling. confdefs/libio.h:89 is what reads it, and
+ * confdefs/obsolete.h:109-111 turns the older CONFIGURE_LIBIO_MAXIMUM_FILE_-
+ * DESCRIPTORS into a #warning that it "has been renamed to
+ * CONFIGURE_MAXIMUM_FILE_DESCRIPTORS since RTEMS 5.1".
+ *
+ * The FD_SETSIZE worry is settled too, and does not bind: newlib's
+ * sys/select.h:33-34 takes the __rtems__ arm and defines FD_SETSIZE 256
+ * (confirmed by preprocessing with the real BSP include path), so 150 is under
+ * the ceiling even for a library that does call select().
  * Overridable from the build so the box can bisect it without a source edit.
  */
 #ifndef CONFIGURE_MAXIMUM_FILE_DESCRIPTORS
@@ -133,9 +140,13 @@ extern void *POSIX_Init(void *argument);
  * extensions. libbsd's own testsuite default-init.h reserves 1, which is the
  * value proven to boot on this BSP.
  *
- * If a future image fails to create an extension anyway, raise this first:
- * CONFIGURE_STACK_CHECKER_ENABLED below also consumes extension capacity, and
- * base reserves 5.
+ * MEASURED again with CONFIGURE_STACK_CHECKER_ENABLED on: 1 is still enough.
+ * The image boots and the exit-time stack-usage report prints, because the
+ * stack checker is installed as an *initial* extension out of the statically
+ * generated table rather than through rtems_extension_create(), and this
+ * directive sizes only the runtime-created pool that libbsd draws its one
+ * extension from. If a future image does fail to create an extension, raise
+ * this first; base reserves 5.
  */
 #ifndef CONFIGURE_MAXIMUM_USER_EXTENSIONS
 #define CONFIGURE_MAXIMUM_USER_EXTENSIONS 1

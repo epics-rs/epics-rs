@@ -306,3 +306,215 @@ same change as 0a/0b, while that context is open.
 * **The three modified files are uncommitted.** If the concurrent panel amends
   or drops those edits, rows marked ⚠ **moved** revert and §6 steps 0a/0b return
   to the list.
+
+---
+
+## §8 `epics-pva-rs` lock sweep — closing §7's named gap
+
+Read-only. Appendable to `doc/pi-lock-evaluation.md` as §8; lock IDs continue the
+parent table's numbering (parent ends at L15).
+
+**Provenance.** `crates/epics-pva-rs` read in
+`/home/stevek/work/epics-rs/.caucus/worktrees/integration` @ **`2ce9bd11`**
+(branch `integration/rtems-scope-b`). HEAD unchanged start to end, but the
+working tree **went dirty mid-sweep** (as in §0): a concurrent panel's
+`PvaServerConfig` extraction modified `server_native/{mod,runtime,tcp}.rs` and
+added `server_native/config.rs`. Re-verified against the final state — `tcp.rs`
+is unaffected in every respect cited here (still 21,378 lines, test module still
+at `:8097`, production still lock-free, imports still `:25`/`:26`/`:30`);
+`runtime.rs` lost 494 lines to `config.rs` and **both** are lock-free in
+production; only `mod.rs`'s gate line numbers shifted +3, and the numbers below
+are the post-move ones. Planned-thread classification is against
+`doc/pva-rtems-item7-design.md` in that same worktree. (d) is answered: **pvxs is
+present** at `/home/stevek/work/epics-modules/pvxs` @ `9348ebc` — the
+CLAUDE.md-listed `/Users/stevek/...` path does not exist on this host, the
+documented fallback does.
+
+---
+
+### §8.0 Headline — three findings
+
+**1. The PVA protocol scope is lock-free, and that is the opposite of the base
+picture.** `server_native/tcp.rs` production (lines 1-8096; the test module
+starts at `:8097`) contains **zero** `Mutex`/`RwLock`/`Condvar` — the only match
+in 8096 lines is the words `Arc<Mutex<SrvWrite>>` inside a doc comment at
+`:2841` explaining what the design *replaced*. Per-connection state is carried
+by `Arc`, `AtomicU32`/`AtomicU64` and `tokio::sync::mpsc` (`tcp.rs:25-30`).
+`udp.rs`, `runtime.rs`, `accept.rs`, `monitor_control.rs`, `op_handle.rs` and
+`server_info.rs` are likewise lock-free in production — as is the newly
+extracted `config.rs`. So the whole 21,378-line
+TCP module contributes **no rows to this table**. Item 7's thread-per-connection
+split therefore does not multiply lock contention in the protocol path — a
+materially better starting position than `epics-base-rs`, where 25 shared locks
+sit under the record path.
+
+**2. Where the port does hold locks, they are almost all `parking_lot` — so
+unlike the parent sweep, PI is actually reachable here.** Of **21 distinct
+server-side locks**, 17 are `parking_lot`, 3 are `std::sync`, and exactly
+**one** is `tokio::sync` (L23, the ACF cell). The parent table's dominant class —
+park_on-PI-invisible, 14 of 25 — is here a **single row**. `epics-pva-rs` never
+re-exports `runtime::sync`, so it never fell into the naming trap that made
+`database/mod.rs:19` and `pv.rs:4` silently async.
+
+**3. The item-7 design assigns no thread priorities, so it would re-open the
+exact asymmetry §6 steps 0a/0b just closed for CA.** `rg -i "priorit|ThreadPriority|apply_to_current_thread"`
+over `doc/pva-rtems-item7-design.md` returns **nothing**. The three planned
+threads — `PVAS-client {peer}` (`§2` of that doc, replacing `tcp.rs:2539`),
+`PVAS-UDP` (replacing the `:962-975` spawn), `PVAS-beacon` (replacing
+`udp.rs:500`) — would run SCHED_OTHER while the callback bands that *post* to
+them run 59-71. Every "shared" row below is shared precisely across that line.
+
+---
+
+### §8.1 (a)+(b)+(c) The table
+
+**Kind** as in §2: `PL` = `parking_lot`, `STD` = `std::sync` (both kernel-visible,
+PI-able by replacement), `TOK` = `tokio::sync` (awaited; park_on-invisible).
+
+**Shared?** — the blocking PVA driver does not exist yet, so per the brief every
+row is classified against the *planned* item-7 threads, not live ones. `now` =
+already shared today on the hosted tokio server; `item 7` = becomes shared when
+the planned threads land; `gated` = module is `#[cfg(not(target_os = "rtems"))]`
+today (`server_native/mod.rs:24,34,36,41,43` — `accept`, `peers`, `runtime`,
+`tcp`, `udp`) so it has no RTEMS presence until item 7 un-gates it.
+
+| # | lock | decl / evidence | Kind | shared? | class | pvxs parity |
+|---|---|---|---|---|---|---|
+| **L16** | `SharedPV::inner` | `shared_pv.rs:468` `Arc<Mutex<Inner>>` (`parking_lot`, import `:31`); ~30 acquisitions `:495`-`:975`; write side `try_post_checked` `:650`, `put_delta` `:798`; read side `:602`,`:610`,`:640` | **PL** | **now** — cb band posts, connection thread reads | **replace-with-PI** — the top row of this sweep | `sharedpv.cpp:37` `mutable epicsMutex lock` — **PI on RTOS** |
+| **L17** | `MonitorQueue::inner` | `shared_pv.rs:159` `Mutex<MonitorQueueInner<T>>` (PL); producer `post` `:235`,`:239`,`:282`,`:305`; consumer `try_recv` `:347`,`:348` | **PL** | **now** — producer is the posting band, consumer is the per-connection thread | **replace-with-PI** — the cleanest high/low split in the crate | `servermon.cpp:57` `mutable epicsMutex lock` — **PI on RTOS** |
+| **L18** | `PvRegistry::pvs` | `shared_pv.rs:1218` `Mutex<HashMap<String, SharedPV>>` (PL); `:1287`,`:1332`,`:1348`,`:1391`,`:1399`,`:1404`,`:1412`,`:1417`,`:1426`,`:1448` | **PL** | **item 7** — `PVAS-UDP` search + `PVAS-beacon` `list_pvs` vs. registration | **accept-with-bounded-CS** (§8.2) | no counterpart — pvxs `StaticSource` is reactor-confined |
+| **L19** | `PvRegistry::invalidator` | `shared_pv.rs:1245` `Mutex<Option<ChannelInvalidator>>` (PL); `:1295`, `:1392` — **both taken while `pvs` is held**, ordering pvs→invalidator | **PL** | **item 7** | **accept-with-bounded-CS**; one `Option` clone | — |
+| **L20** | `CompositeSource::entries` | `composite.rs:38`,`:65` `Arc<parking_lot::RwLock<Vec<SourceEntry>>>`; writes `:108`,`:128`, read `:160` | **PL** | **item 7** — every channel lookup from every connection thread | **accept-with-bounded-CS** — writes are registration-time only | — (reactor-confined) |
+| **L21** | `RemoteLogQueue::queued` | `source.rs:51` `Arc<Mutex<Vec<RemoteLogMessage>>>` (`std::sync`, import `:7`); `:66` push, `:76` drain via `mem::take` | **STD** | **item 7** | **accept-with-bounded-CS** — push/`mem::take`, no allocation held | `log.cpp` uses `epicsMutex` |
+| **L22** | `ChannelInvalidator::subscribers` | `source.rs:440` `Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<Arc<[String]>>>>>`; `:457`, `:470` | **STD** | **item 7** | **accept-with-bounded-CS** — `Vec` retain over subscriber senders | — |
+| **L23** | PVA `AcfCell` | `server/native_source.rs:30` `Arc<RwLock<Option<AccessSecurityConfig>>>` — **tokio** (import `:21`); written `pva_server.rs:145`,`:162` `.write().await`; read in base at `access_security.rs:317` `.read().await` | **TOK** | **item 7** — read on every access check from every connection thread | **(c) park_on — PI-invisible**; also **accept** (read-mostly, written only by `reload_acf_from`/`clear_acf`) | `asLock` family; pvxs delegates to base |
+| **L24** | `PeerEntry` ×3: `report_info` `peers.rs:47`, `credentials` `:130`, `channels_by_sid` `:137` | all `parking_lot::Mutex`; `:68`,`:168`,`:179`,`:186`,`:247`,`:254`,`:320`,`:323`,`:329` | **PL** ×3 | **gated** → item 7 | **accept-with-bounded-CS** — per-peer, and the introspection reader is the only cross-thread acquirer | **none** — pvxs `serverconn.h`/`server.h` declare **no mutex at all** |
+| **L25** | `PeerRegistry::inner` | `peers.rs:201` `parking_lot::RwLock<HashMap<SocketAddr, Arc<PeerEntry>>>`; `:210` insert, `:214` remove, `:229`/`:265` read — `:229-254` holds the registry read **across** `channels_by_sid.lock()` and `report_info.lock()`, ordering registry→entry→channel | **PL** | **gated** → item 7 | **accept-with-bounded-CS**, with the nesting named (§8.2) | **none** — same as L24 |
+| **L26** | `client_native` ×11: `channel.rs:77` `state` (PL RwLock, import `:26`), `:80` `transition_lock` (**tokio**, import `:27`), `:100`,`:112`,`:128`,`:143`,`:155`,`:186`,`:195`,`:196`,`:203` (PL) | see decls | mixed **PL**/**TOK** | **never** — `#[cfg(feature = "client")]` (`lib.rs:22`,`:24`; `Cargo.toml:97`), and the client is gate-out territory on RTEMS by explicit scope decision (`Cargo.toml:93-95`) | **out of scope** — one-line note, not classified | `clientimpl.h` uses `epicsMutex` |
+| **L27** | `client_native` rest: `server_conn.rs:111`,`:923` (PL), `context.rs:376` (PL RwLock), `beacon_throttle.rs:72` (PL RwLock), `udp.rs:86`,`:87`,`:211` (`std::sync`), `ops_v2.rs:1908`,`:1917` (PL) | see decls | mixed | **never** — same gate as L26 | **out of scope** | `udp_collector.cpp:597` `epicsMutex lock` |
+
+**Server-side totals (L16-L25): 21 distinct locks** — 17 `PL`, 3 `STD`, 1 `TOK`.
+Client-side (L26-L27): 20 further locks, all behind `feature = "client"`, not
+classified.
+
+**(c) The park_on set is one row: L23.** It is the only `tokio::sync` primitive
+a planned blocking PVA thread would wait on, and it reaches
+`access_security.rs:317`'s `.read().await` — under a `PVAS-client` thread that
+becomes `block_on_sync` → `park_on` → `std::thread::park()`
+(`epics-base-rs/src/runtime/task.rs:80`), invisible to the kernel PI chain for
+the reasons given in §3. Consequence for L23 specifically is mild: it is a
+read-mostly cell whose only writers are `reload_acf_from`/`clear_acf`
+(`pva_server.rs:145`,`:162`), so the inversion window is an operator action, not
+a steady-state path. **No other PVA lock is park_on-reachable** — which is why
+the parent sweep's dominant class is nearly empty here.
+
+---
+
+### §8.2 (b) Rationale for the non-obvious rows
+
+**replace-with-PI (L16, L17).** Both are `parking_lot` mutexes with no `.await`
+in the critical section (guaranteed by type — `parking_lot::MutexGuard` is
+`!Send`). Both sit exactly on the band/connection boundary: the poster is
+whatever thread drives record processing (a callback band in an IOC), the reader
+is the per-connection thread that item 7 will create. **L17 is the higher-value
+of the two**: it is the narrowest lock with the clearest producer/consumer split
+(`post` `:235` vs `try_recv` `:347`), so a PI swap there is a contained change.
+L16 is the broader one (~30 acquisition sites) and should follow L17.
+
+Note the nesting: `try_post_checked` (`:650`) and `put_delta` (`:798`) hold
+`SharedPV::inner` **while** calling `tx.post(...)` (`:664`, `:837`), which takes
+`MonitorQueue::inner`. Ordering is uniformly L16→L17. Any PI conversion must
+convert them together or the donated priority stops at the outer lock.
+
+**accept-with-bounded-CS (L18-L22, L24, L25).** Bounds, stated:
+* **L18** — one hash probe plus a `SharedPV` clone (itself an `Arc`); the two
+  cross-lock sites (`:1391-1392`, `:1287-1295`) additionally clone one `Option`.
+* **L19** — a single `Option<ChannelInvalidator>` clone.
+* **L20** — writes only at source registration (`:108`, `:128`); the hot path is
+  the `:160` read, a `Vec` iteration over registered sources (small N).
+* **L21** — `Vec::push` and `mem::take` (`:76`); the drain moves the buffer out
+  rather than iterating under the lock.
+* **L22** — `Vec` retain over subscriber senders.
+* **L24/L25** — per-peer fields; the only cross-thread reader is the
+  introspection/`snapshot` path (`:229-254`, `:320-329`). Bound is O(peers ×
+  channels) **and it is held across two nested locks**, so it is the one
+  "accept" row with a real tail: a `snapshot` during a large channel population
+  blocks peer insert/remove at `:210`/`:214`. Acceptable because `snapshot` is
+  an operator/introspection call, not a per-datagram path — but that is the
+  invalidating condition, and it should be named in the code rather than left to
+  a reader to infer.
+
+**No remove-the-sharing rows.** The parent table had two (L8 subset, L14) because
+base holds init-time-write state behind runtime locks. The PVA server does not:
+L20's writes are registration-time but the lock is still needed for the hot read
+path (sources can be added after start), and L18/L19 are genuinely dynamic.
+
+---
+
+### §8.3 (d) pvxs parity — and why it is mostly "no counterpart"
+
+pvxs @ `9348ebc`. Where pvxs holds a lock, it is an `epicsMutex` — i.e. the same
+`PTHREAD_PRIO_INHERIT` / `RTEMS_INHERIT_PRIORITY` family established in §5:
+
+* `sharedpv.cpp:37` `mutable epicsMutex lock` (guards typedef'd at `:22-23`,
+  taken at `:86`,`:167`,`:197`,`:214`,`:239`,`:259`,`:267`,`:283`) ↔ **L16**.
+* `servermon.cpp:57` `mutable epicsMutex lock` (`:111`,`:201`,`:267`,`:305`,
+  `:331`) ↔ **L17**.
+* `udp_collector.cpp:597` `epicsMutex lock` ↔ **L27** (client side).
+
+But for the rows that came out of *our* threading model, pvxs has nothing to
+compare against: `rg "epicsMutex|Guard G\("` over `server.cpp`, `serverconn.cpp`,
+`server.h`, `serverconn.h`, `serverimpl.h` returns **zero matches**. pvxs runs
+one libevent reactor thread and confines connection and peer state to it, so
+there is no peer-registry lock to be PI or not (**L24, L25**), and no
+source-registry lock on the hot path (**L20**).
+
+**The parity verdict is therefore two-sided, and the second half is the
+important one:**
+
+1. Both locks pvxs *does* have are PI on an RTOS; neither of our counterparts
+   (L16, L17) is. That is a straight parity gap, and it is fixable by type
+   replacement because both are `parking_lot`.
+2. Four of our rows exist **only because item 7 replaces one reactor with N
+   threads** (L20, L24, L25, and L18's cross-thread reader). Item 7 does not
+   inherit these from pvxs — it creates them. The §6 execution order should
+   treat them as new debt introduced by the port's threading model, not as
+   parity work.
+
+This also retires the caveat in the brief ("pvxs single-reactor has no
+lock-per-lock analogue anyway"): it has an analogue for exactly the two rows
+that matter most, and its *absence* elsewhere is itself the finding.
+
+---
+
+### §8.4 Where this fits in §6's execution order
+
+These do not displace §6 steps 1-2; they slot in as a PVA track that only
+becomes live when item 7 lands.
+
+| slot | step | rationale |
+|---|---|---|
+| **before item 7 stage C** | **Assign priorities to `PVAS-client`, `PVAS-UDP`, `PVAS-beacon` in the item-7 design.** The design currently names none (§8.0 finding 3). C has no PVA precedent, but `ThreadPriority::CaServerLow`/`CaServerHigh` (`task.rs:370-371`) is the obvious mapping, matching what `blocking.rs:200`/`:669` just did for CA. Cheapest possible moment is before the threads are written. | prevents re-opening the asymmetry §6 0a/0b closed |
+| **with §6 step 3-4** | **L17 → PI, then L16 → PI** (in that order; convert together per the L16→L17 nesting). Both `parking_lot`, both with a pvxs `epicsMutex` precedent. | closes the only genuine C++-parity lock gap in the crate |
+| **with §6 step 7** | **L23** — inherits whatever §6 step 1 decides for tokio-locked shared cells; low urgency (operator-action writer only). | shares L1's constraint, not its severity |
+| **item 7 review gate** | **Name L25's `snapshot` bound in code**, and re-check L18/L20 if sources or PVs become registerable from a datagram path. | the two "accept" rows with a stated invalidating condition |
+
+---
+
+### §8.5 What this sweep does not establish
+
+* **Nothing measured** — static analysis only, same caveat as §7.
+* **The producer identity for L16/L17 is inferred from the API, not traced to a
+  band.** `SharedPV::post`'s only production callers inside `epics-pva-rs` are
+  its own internals; the cross-crate producer lives in `epics-bridge-rs`
+  (`qsrv/pva_adapter.rs:85` `PvaPvHandle::post`, whose own
+  `subscribers: Arc<parking_lot::Mutex<...>>` at `:50`/`:67`/`:93` is a **22nd
+  lock in a crate this brief did not scope**). Whether that call arrives on a
+  callback band or a tokio worker depends on the bridge's emission path, which I
+  did not trace.
+* **`epics-bridge-rs` was not swept** — `pva_adapter.rs:50` is one confirmed
+  shared lock there; the population is unknown. That is the next gap, exactly as
+  `epics-pva-rs` was this one.
+* **Client-side (L26, L27, 20 locks) is enumerated but not classified**, per the
+  RTEMS scope decision at `Cargo.toml:93-95`. If a PVA gateway on RTEMS ever
+  comes back into scope, that classification is owed.

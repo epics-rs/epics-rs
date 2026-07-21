@@ -795,7 +795,7 @@ impl std::fmt::Debug for ChannelState {
 /// Shared abort guard: when the last clone is dropped (HashMap removal,
 /// connection end, ...), the spawned task is aborted automatically.
 #[derive(Debug)]
-struct AbortOnDrop(tokio::task::AbortHandle);
+struct AbortOnDrop(epics_base_rs::runtime::task::TaskAbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -831,7 +831,7 @@ fn finish_exec_data_task(
     ch: &mut ChannelState,
     ioid: u32,
     subcmd: u8,
-    abort: tokio::task::AbortHandle,
+    abort: epics_base_rs::runtime::task::TaskAbortHandle,
 ) {
     if let Some(op_mut) = ch.ops.get_mut(&ioid) {
         if subcmd & QosFlags::DESTROY != 0 {
@@ -1890,14 +1890,17 @@ struct MonitorSubscriberArgs {
 ///
 /// Executing state is read from the op's `monitor_exec` watch (set by
 /// [`MonitorStartControl`] on every START/STOP edge). Teardown: the returned
-/// `JoinHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
+/// `TaskHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
 /// the `OpState` (DESTROY / channel destroy / disconnect — including
 /// DESTROY-before-START and never-START) aborts the task, dropping `rx` and the
 /// source subscription handle, releasing the upstream. The `MonitorFinishGuard`
 /// installed as the first task statement reports terminal removal on every exit.
 fn spawn_monitor_subscriber(
     args: MonitorSubscriberArgs,
-) -> (tokio::task::JoinHandle<()>, Arc<MonitorStartControl>) {
+) -> (
+    epics_base_rs::runtime::task::TaskHandle<()>,
+    Arc<MonitorStartControl>,
+) {
     let MonitorSubscriberArgs {
         sid,
         ioid,

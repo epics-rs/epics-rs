@@ -481,6 +481,38 @@ branch. Phase-6 items 5/8/9 likewise depend on that branch's primitives
 `caucus/WG0SFREHPX/ca-sans-io-1962c8be-1` into main is the user's decision, but
 until it lands, no PVA RTEMS milestone can be *committed* green.
 
+### 8.1.3 Measured, not applied — `epics-bridge-rs` (2026-07-21)
+
+`doc/rtems-bridge-walls.md` settles the status this document and the PI-lock
+evaluation §9 both left undeclared. Measured on `integration/rtems-scope-b`
+@ `af2d5d16`, three `cargo check --target armv7-rtems-eabihf` runs (default /
+`--no-default-features` / `--features qsrv`), all exit 101:
+
+- **Every wall is a dependency wall; not one is in bridge source** — mio 1.2.0
+  (29), socket2 0.6 (20), signal-hook-registry 1.4.8 (4), getrandom 0.2.17 (1).
+- **Root cause is one line**, `epics-bridge-rs/Cargo.toml:93`
+  `tokio = { version = "1", features = ["full"] }` in the *plain*
+  `[dependencies]` table while `epics-base-rs:43-44`, `epics-ca-rs:69-70` and
+  `epics-pva-rs:139-142` all split the same dep per target. Cargo **unions**
+  features across the graph, so that one line silently re-enables
+  `net`/`signal`/`process` for every crate in any build containing the bridge —
+  a latent hazard for *any* target-restricted build, not only RTEMS. Proved by
+  `cargo tree -i tokio -e features`: the bridge is the sole enabler of `full`.
+- **Dep-gating alone is predicted sufficient for the `qsrv` subset** (3
+  Cargo.toml edits, 0 source changes): `qsrv`/`pvalink`/`pva_gateway` use
+  `tokio::net`/`signal`/`process` **0** times; only `ca_gateway` does, at 3
+  production sites (`pvlist.rs:244`, `server.rs:1219`, `:1285`), and every
+  module already sits behind its own feature (`lib.rs:69,72,75,82`). Compile
+  surface would be 32,787 / 59,380 src lines (55%). **Not verified to exit 0** —
+  the gates were not applied; this is a well-evidenced prediction.
+- **Nobody's blocker today.** No inbound edge from base/ca/pva; the only RTEMS
+  binary that exists (`rtems-ca-ioc`) does not depend on the bridge, and
+  `rtems-pva-ioc` does not exist yet. It becomes a blocker only if item-7 stage G
+  chooses *group-aware* db-backed PVA — and stage G can avoid it entirely, since
+  `epics-pva-rs` already serves records off `DbSubscription` via
+  `PvDatabaseSource` + `UpstreamMonitor::from_db` (`server_native/source.rs:1912-1921`)
+  in a `server/` module that is **not** RTEMS-gated.
+
 ### 8.2 Gateable — excluded from the RTEMS build
 
 - **ring / rustls / tokio-rustls (TLS)** — `optional = true` in **epics-ca-rs

@@ -5,6 +5,13 @@
 //! `ca` link set, and a soft-channel record whose INP is a CA link fetches the
 //! remote PV's value through the monitor-backed cache — the C `dbCa.c` model.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;

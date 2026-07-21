@@ -237,7 +237,13 @@ impl SyncGroup {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only: the shared `push_delayed_get` harness spawns
+// `tokio::time::sleep` through the `runtime::task` seam, which under
+// `rtems-exec-model` lands on a background-executor worker with no tokio
+// reactor. Three of the four tests here build their batch with it. Module
+// granularity follows `server_connection_drop_tests`; only
+// `empty_group_blocks_immediately` would stand alone under the feature.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod tests {
     use super::*;
 

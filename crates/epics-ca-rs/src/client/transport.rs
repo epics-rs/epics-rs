@@ -3908,12 +3908,17 @@ mod priority_circuit_tests {
     //! message carries the priority in its `m_dataType` field, and
     //! tearing one priority circuit down leaves the other connected.
     use super::*;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use crate::client::types::{InFlightOps, ServerLastRxAt};
     use crate::protocol::{CA_PROTO_VERSION, CaHeader};
+    #[cfg(not(feature = "rtems-exec-model"))]
     use std::collections::HashMap;
     use std::sync::Arc;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use std::time::Duration;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(not(feature = "rtems-exec-model"))]
     use tokio::net::{TcpListener, TcpStream};
 
     /// Identity slot resolved from this process's env — the same source
@@ -4011,6 +4016,8 @@ mod priority_circuit_tests {
     /// Spawn a transport manager wired to fresh channels; return its
     /// command sender, event receiver, and the (observable) per-circuit
     /// writer registry.
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn spawn_manager() -> (
         mpsc::UnboundedSender<TransportCommand>,
         mpsc::UnboundedReceiver<TransportEvent>,
@@ -4053,6 +4060,8 @@ mod priority_circuit_tests {
     /// because the test shares this process's USER/host env) leaves the
     /// socket positioned at the next frame, so a later read observes
     /// genuinely new traffic rather than buffered handshake bytes.
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn drain_handshake(stream: &mut TcpStream) -> u8 {
         let mut head = [0u8; 16];
         stream
@@ -4071,6 +4080,8 @@ mod priority_circuit_tests {
         pri
     }
 
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn wait_for_writers(sw: &DirectServerWriters, n: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sw.len() < n {
@@ -4086,6 +4097,9 @@ mod priority_circuit_tests {
     /// Test 1: two channels to the same server at different priorities
     /// open two independent transport circuit entries, and the server
     /// sees both priorities on the wire.
+    // Spawns the async circuit manager, which has no tokio reactor
+    // under `rtems-exec-model`; same reason as `server_connection_drop_tests`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_priorities_open_two_circuits() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4150,6 +4164,9 @@ mod priority_circuit_tests {
     /// Test 3: dropping one priority circuit closes only that circuit;
     /// the sibling circuit at another priority stays connected and keeps
     /// carrying frames.
+    // Spawns the async circuit manager, which has no tokio reactor
+    // under `rtems-exec-model`; same reason as `server_connection_drop_tests`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_one_priority_circuit_leaves_the_other() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

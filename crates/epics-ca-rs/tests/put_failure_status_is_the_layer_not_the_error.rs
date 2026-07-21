@@ -23,6 +23,13 @@
 //! These cases are the boundary between the two layers: same channel, same
 //! wire type, only the reason for the refusal differs.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::time::Duration;
 
 use epics_base_rs::error::CaError;

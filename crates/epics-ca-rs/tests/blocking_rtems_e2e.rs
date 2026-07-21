@@ -56,6 +56,14 @@
 //! feature that routes the `task::spawn`/`sleep`/`interval` seam to the executor
 //! on a hosted target.
 
+// Host/tokio-only despite exercising the blocking server: the *client*
+// side of this e2e is the ordinary async `CaClient` (tokio `UdpSocket`),
+// which under `rtems-exec-model` has no reactor on the executor worker.
+// The blocking server itself is fine under the feature — it is the async
+// client harness that cannot run, so this file cannot be the feature's
+// e2e proof; `async_write_notify_rtems_exec` is.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;

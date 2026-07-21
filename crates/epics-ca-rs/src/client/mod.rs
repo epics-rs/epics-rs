@@ -5743,6 +5743,26 @@ mod event_watcher_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Wait for a condition driven by *another* executor.
+    ///
+    /// These tests run on a `current_thread` tokio runtime but the watcher
+    /// task runs on whatever backend the `runtime::task` seam selects — a
+    /// tokio worker by default, a background-executor band worker under
+    /// `rtems-exec-model`. `yield_now()` only reschedules on *this*
+    /// runtime, so it establishes no happens-before edge with the other
+    /// executor: spinning on it is a race, not a wait. Poll with a real
+    /// time budget instead, which is a correct wait on either backend.
+    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{label} (waited 2s)");
+    }
 
     /// Dropping an `EventWatcher` must abort the spawned watcher task
     /// (a bare `JoinHandle` would only detach, leaking the task). The
@@ -5760,26 +5780,19 @@ mod event_watcher_tests {
         });
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
-        tokio::task::yield_now().await;
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "watcher task should have started"
-        );
+        wait_for("watcher task should have started", || {
+            ran.load(Ordering::SeqCst)
+        })
+        .await;
         assert!(
             !abort_handle.is_finished(),
             "task still running before drop"
         );
         drop(watcher);
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::drop must abort the watcher task"
-        );
+        wait_for("EventWatcher::drop must abort the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 
     /// `EventWatcher::abort()` is an explicit, named teardown that
@@ -5794,16 +5807,10 @@ mod event_watcher_tests {
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         watcher.abort();
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::abort must stop the watcher task"
-        );
+        wait_for("EventWatcher::abort must stop the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 }
 

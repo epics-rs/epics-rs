@@ -434,10 +434,29 @@ impl ThreadPriority {
 
 /// Stack-size class — `epicsThreadStackSizeClass` (`epicsThread.h:91`).
 ///
-/// The byte size is implementation-dependent in C; the values here
-/// mirror the POSIX table `STACK_SIZE(f) = f * 0x10000 * sizeof(void*)`
-/// (`osdThread.c:506-509`) for a 64-bit target (`sizeof(void*) == 8`):
-/// Small = 1, Medium = 2, Big = 4 units of `0x10000 * 8`.
+/// The byte size is implementation-dependent in C. These mirror the POSIX
+/// table `STACK_SIZE(f) = f * 0x10000 * sizeof(void*)`
+/// (`libcom/src/osi/os/posix/osdThread.c:506-509`), pointer-width
+/// parameterised exactly as the C macro is: Small = 1, Medium = 2, Big = 4
+/// units of `0x10000 * sizeof(void*)`. On a 64-bit host that is
+/// 512 KiB / 1 MiB / 2 MiB; on `armv7-rtems-eabihf` it is
+/// **256 KiB / 512 KiB / 1 MiB**.
+///
+/// # This is the table a C IOC on RTEMS 6 uses too
+///
+/// Base has a second, much smaller table — 5000 / 8000 / 11000 bytes, floored
+/// at `RTEMS_MINIMUM_STACK_SIZE` — in `os/RTEMS-score/osdThread.c:136-150`.
+/// It does not apply here. `configure/toolchain.c:29-35` selects
+/// `OS_API = posix` for `__RTEMS_MAJOR__ >= 5`, so an RTEMS 6 build searches
+/// `os/RTEMS-posix` then `os/RTEMS`, neither of which contains an
+/// `osdThread.c`, and lands on `os/posix/osdThread.c` — the file above. The
+/// score table is what RTEMS **4/5** used.
+///
+/// Do not "align" these constants with 5000/8000/11000. That would be a
+/// regression against the C IOC we are matching, not a correction: on RTEMS 6
+/// the C IOC asks `pthread_attr_setstacksize` for the POSIX number
+/// (`os/posix/osdThread.c:212-215`), which is the same call `std` makes for
+/// us, with the same argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackSizeClass {
     Small,
@@ -1314,6 +1333,16 @@ mod tests {
     /// parameter, so a caller cannot omit it. This covers the threads that
     /// still build a `std::thread::Builder` directly.
     ///
+    /// It also bans the API that has no class to state:
+    /// `std::thread::spawn` cannot express a stack size at all, so a site
+    /// using it does not fail the `Builder` check above — it is invisible to
+    /// it. Same defect, different anchor. (The six bare `thread::spawn` sites
+    /// elsewhere in the workspace — `ca::repeater`, `ca::calink`,
+    /// `ca::server::ca_server`, `pva::server::pva_server` — all sit behind
+    /// `#[cfg(not(target_os = "rtems"))]` module gates and are therefore
+    /// distinct: they are not in the RTEMS closure at all. Every file listed
+    /// here is.)
+    ///
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn every_thread_in_this_crate_states_a_stack_size() {
@@ -1338,17 +1367,26 @@ mod tests {
         let mut unclassified = Vec::new();
         let mut checked = 0usize;
         for (label, src) in files {
-            for (n, after) in production_scope(src)
-                .split("thread::Builder::new()")
-                .skip(1)
-                .enumerate()
-            {
+            let prod = production_scope(src);
+            for (n, after) in prod.split("thread::Builder::new()").skip(1).enumerate() {
                 checked += 1;
                 // The class must be set before the closure is handed over;
                 // `.spawn(` ends the builder chain.
                 let chain = after.split(".spawn(").next().unwrap_or("");
                 if !chain.contains(".stack_size(") {
                     unclassified.push(format!("{label} (Builder #{})", n + 1));
+                }
+            }
+            // The classless API. Split so this guard does not match its own
+            // needle in the file it is written in.
+            let bare = concat!("thread", "::spawn(");
+            for (n, line) in prod.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if t.contains(bare) && !t.contains("Builder") {
+                    unclassified.push(format!("{label}:{} (bare spawn)", n + 1));
                 }
             }
         }
@@ -1502,6 +1540,110 @@ mod tests {
             StackSizeClass::Small.bytes(),
             0x10000 * std::mem::size_of::<usize>()
         );
+    }
+
+    /// The three classes against the C table, factor by factor.
+    ///
+    /// `STACK_SIZE(f) = f * 0x10000 * sizeof(void*)` with factors 1, 2, 4
+    /// (`libcom/src/osi/os/posix/osdThread.c:506-509`) — the file a C IOC on
+    /// RTEMS 6 compiles, because `configure/toolchain.c:29-35` picks
+    /// `OS_API = posix` for `__RTEMS_MAJOR__ >= 5`. Pinning the factors
+    /// separately from the unit is what makes a silent edit of one of them
+    /// fail: `stack_size_classes_ordered` above is satisfied by any
+    /// increasing triple.
+    #[test]
+    fn the_classes_are_the_c_posix_table_factor_for_factor() {
+        let unit = 0x10000 * std::mem::size_of::<usize>();
+        assert_eq!(StackSizeClass::Small.bytes(), unit);
+        assert_eq!(StackSizeClass::Medium.bytes(), 2 * unit);
+        assert_eq!(StackSizeClass::Big.bytes(), 4 * unit);
+        // And what the same table yields on the target the RTEMS port builds
+        // for (`sizeof(void*) == 4`), spelled out so a reader on a 64-bit
+        // host does not have to re-derive it.
+        const TARGET_UNIT: usize = 0x10000 * 4;
+        assert_eq!(
+            [TARGET_UNIT, 2 * TARGET_UNIT, 4 * TARGET_UNIT],
+            [256 * 1024, 512 * 1024, 1024 * 1024],
+            "armv7-rtems-eabihf: Small / Medium / Big in bytes"
+        );
+    }
+
+    /// The stack a caller *states* is the stack the thread *reports*.
+    ///
+    /// The source guard above only proves a number reached the builder. This
+    /// asks the running thread what it actually got, through
+    /// `pthread_getattr_np`, and that is the property the RTEMS ceiling
+    /// depends on: `std` gates its 2 MiB `DEFAULT_MIN_STACK_SIZE` on a
+    /// carve-out list that omits rtems, so a size that fails to arrive is
+    /// silently 2 MiB rather than an error.
+    ///
+    /// The mechanism this exercises is not host-specific: `std`'s
+    /// `Thread::new` calls `pthread_attr_setstacksize(attr, max(stack,
+    /// PTHREAD_STACK_MIN))` on every non-espidf/nuttx unix
+    /// (`std/src/sys/thread/unix.rs`), and `libc` gives rtems
+    /// `PTHREAD_STACK_MIN = 0`, so the `max` cannot raise our request there
+    /// either. Glibc-only because `pthread_getattr_np` is the readback API.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dedicated_thread_reports_the_stack_it_was_asked_for() {
+        fn reported_stack_bytes() -> usize {
+            unsafe {
+                let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_getattr_np(libc::pthread_self(), &mut attr),
+                    0,
+                    "pthread_getattr_np"
+                );
+                let mut addr: *mut libc::c_void = std::ptr::null_mut();
+                let mut size: libc::size_t = 0;
+                assert_eq!(
+                    libc::pthread_attr_getstack(&attr, &mut addr, &mut size),
+                    0,
+                    "pthread_attr_getstack"
+                );
+                libc::pthread_attr_destroy(&mut attr);
+                size
+            }
+        }
+
+        for class in [
+            StackSizeClass::Small,
+            StackSizeClass::Medium,
+            StackSizeClass::Big,
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let joined = spawn_dedicated_thread(
+                format!("stack-readback-{class:?}"),
+                ThreadPriority::CaServerLow,
+                class,
+                move || {
+                    let _ = tx.send(reported_stack_bytes());
+                },
+            )
+            .expect("dedicated thread spawned");
+            let got = rx.recv().expect("the thread reported its stack");
+            joined.join().expect("thread joined");
+
+            let asked = class.bytes();
+            // The kernel rounds up to a page; it must never round *down*, and
+            // it must not silently substitute something of a different order.
+            assert!(
+                got >= asked && got < asked + 64 * 1024,
+                "{class:?}: asked for {asked} bytes, thread reports {got}"
+            );
+        }
+    }
+
+    /// The distinguishing half of the readback: a class below `std`'s default
+    /// must land below it. Without this the test above would pass on a
+    /// platform that ignored every request and handed out 2 MiB, for the two
+    /// classes that happen to be smaller than that on a 64-bit host.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_small_classes_are_below_the_default_that_would_mask_a_failure() {
+        const STD_DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
+        assert!(StackSizeClass::Small.bytes() < STD_DEFAULT_MIN_STACK_SIZE);
+        assert!(StackSizeClass::Medium.bytes() < STD_DEFAULT_MIN_STACK_SIZE);
     }
 
     #[test]

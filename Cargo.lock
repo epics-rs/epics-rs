@@ -1054,6 +1054,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "epics-base-rs",
+ "epics-rtems-boot",
  "futures-util",
  "hickory-client",
  "hickory-proto",
@@ -1181,6 +1182,13 @@ dependencies = [
  "optics-rs",
  "scaler-rs",
  "std-rs",
+]
+
+[[package]]
+name = "epics-rtems-boot"
+version = "0.24.3"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

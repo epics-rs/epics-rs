@@ -1,0 +1,179 @@
+/*
+ * RTEMS application configuration for an epics-rs IOC.
+ *
+ * Derived from EPICS base's POSIX arm,
+ * `modules/libcom/RTEMS/posix/rtems_config.c` (read in full); every directive
+ * below cites the base line it comes from, and `doc/rtems-boot-shim-design.md`
+ * §1.1 lists what base configures that we deliberately do not — NFS, TFTP,
+ * telnetd, ftpd, libblock/BDBUF, the RTC driver, the ~25-command shell.
+ *
+ * This is a *configuration* translation unit: `<rtems/confdefs.h>` at the
+ * bottom turns the `CONFIGURE_*` macros above it into the actual RTEMS object
+ * tables, so nothing may follow it and the order of the includes matters. The
+ * ordering here mirrors base's, which is known to build.
+ *
+ * NOT COMPILED ON THIS MACHINE: no arm-rtems6 toolchain and no RTEMS headers
+ * exist on the development host, so this file is type-checked by nobody until
+ * the bring-up box builds it. The host-side tests in `src/contract.rs` guard
+ * its *structure* (entry point, confdefs last, the user-extension count, the
+ * absence of the dropped facilities) — not its compilability.
+ */
+
+#include <rtems.h>
+
+/*
+ * A. The entry contract (base :22-26).
+ *
+ * `POSIX_Init` is defined in rtems_init.c. RTEMS >= 5 uses the POSIX API arm
+ * (base `configure/toolchain.c:31-35`), which is also what Rust needs: its
+ * `std::thread` is pthreads.
+ */
+extern void *POSIX_Init(void *argument);
+
+#define CONFIGURE_POSIX_INIT_THREAD_TABLE
+#define CONFIGURE_POSIX_INIT_THREAD_ENTRY_POINT POSIX_Init
+#define CONFIGURE_POSIX_INIT_THREAD_STACK_SIZE (64 * 1024)
+
+/*
+ * D. Tick period (base :34-36), kept at base's value and left overridable from
+ * the build so a timing experiment needs no source edit. This 10 ms quantum is
+ * what `std::thread::sleep`, the delayed-timer band and every latency number
+ * the acceptance ladder can produce are rounded to.
+ */
+#ifndef CONFIGURE_MICROSECONDS_PER_TICK
+#define CONFIGURE_MICROSECONDS_PER_TICK 10000
+#endif
+
+/*
+ * E. Task stack pool (base :39). Every Rust thread's stack comes out of this,
+ * and this port is thread-per-connection: CA runs one thread per client, PVA
+ * three (the 3N+2 budget in `server_native/blocking.rs`). Base's generous value
+ * is kept; shrinking it is an optimisation to make after the acceptance
+ * ladder's `stackuse` rung measures real usage, not before.
+ */
+#define CONFIGURE_EXTRA_TASK_STACKS (4000 * RTEMS_MINIMUM_STACK_SIZE)
+
+/*
+ * K. Filesystems (base :42, :46, :49). A writable root is required because
+ * dhcpcd writes /etc/dhcpcd.conf; DEVFS is what provides /dev/console — and is
+ * where /dev/urandom would appear if this BSP has one, which is the open
+ * question behind the server-GUID entropy arm.
+ */
+#define CONFIGURE_FILESYSTEM_DEVFS
+#define CONFIGURE_FILESYSTEM_IMFS
+#define CONFIGURE_USE_IMFS_AS_BASE_FILESYSTEM
+
+/*
+ * J. libbsd (base :57-59). This is what puts the network stack in the image;
+ * without it Rust's `std::net` links against nothing. Must precede confdefs.
+ */
+#define RTEMS_BSD_CONFIG_BSP_CONFIG
+#define RTEMS_BSD_CONFIG_INIT
+#include <machine/rtems-bsd-config.h>
+
+/*
+ * B, C. Drivers (base :65-66). No clock driver means no ticks, so
+ * `rtems_task_wake_after`, every `std::thread::sleep` and the delayed-timer
+ * band never fire. The console is the acceptance instrument: every rung of the
+ * ladder scrapes stdout off the serial line.
+ */
+#define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
+#define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
+
+/*
+ * F. File-descriptor ceiling (base :83, with base's own caveat at :70-81).
+ *
+ * Base caps this at 64 solely to stay below newlib's FD_SETSIZE, because
+ * `select()` on a descriptor at or above FD_SETSIZE faults — and base's comment
+ * says outright that "IOC core components (libca and RSRV) do not make
+ * select() calls". Neither do we: an `rg 'libc::select|libc::poll|FD_SET'`
+ * across epics-base-rs, epics-ca-rs and epics-pva-rs returns zero hits, because
+ * this port is blocking thread-per-connection with no reactor anywhere. Base's
+ * own score arm sets 150 (`score/rtems_config.c:36`), so that is the value
+ * taken here.
+ *
+ * This is the binding constraint on concurrent clients: one connection is one
+ * descriptor however many threads serve it.
+ *
+ * UNVERIFIED: whether RTEMS 6 still spells the macro this way (base's score arm
+ * uses CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS) and whether any library linked
+ * into the image — libbsd in particular — calls select() on a high descriptor.
+ * Overridable from the build so the box can bisect it without a source edit.
+ */
+#ifndef CONFIGURE_MAXIMUM_FILE_DESCRIPTORS
+#define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 150
+#endif
+
+/*
+ * User extensions (base :87 sets 5).
+ *
+ * MEASURED: a shim without this directive does not boot. libbsd fails during
+ * early init with `emerg: rtems_bsd_threads_init_early: cannot create
+ * extension`, because CONFIGURE_UNLIMITED_OBJECTS does not cover user
+ * extensions. libbsd's own testsuite default-init.h reserves 1, which is the
+ * value proven to boot on this BSP.
+ *
+ * If a future image fails to create an extension anyway, raise this first:
+ * CONFIGURE_STACK_CHECKER_ENABLED below also consumes extension capacity, and
+ * base reserves 5.
+ */
+#ifndef CONFIGURE_MAXIMUM_USER_EXTENSIONS
+#define CONFIGURE_MAXIMUM_USER_EXTENSIONS 1
+#endif
+
+/*
+ * H, I. Object tables and heap (base :89-91). Unlimited objects is what makes
+ * thread-per-connection viable at all — a fixed task table would cap clients at
+ * a compile-time constant. Unified work areas keeps the RTEMS object heap and
+ * the Rust allocator from being two pools we would both have to size right.
+ */
+#define CONFIGURE_UNLIMITED_ALLOCATION_SIZE 32
+#define CONFIGURE_UNLIMITED_OBJECTS
+#define CONFIGURE_UNIFIED_WORK_AREAS
+
+/*
+ * G. Stack checking (base :93). The single most valuable directive for a Rust
+ * port: Rust's own stack-guard machinery is thin on a tier-3 target, so without
+ * this a blown thread stack is silent memory corruption rather than a report.
+ * POSIX_Init installs the exit hook that prints the usage report (base
+ * :818-827), which is what makes the ladder's stack rung a measurement.
+ */
+#define CONFIGURE_STACK_CHECKER_ENABLED
+
+/*
+ * L. A reduced shell (base :112-158 configures ~25 commands; these are the four
+ * the acceptance ladder actually uses). netstat is the "is the server
+ * listening" rung, ifconfig is the diagnosis path when the guest is
+ * unreachable, stackuse and malloc_info are the resource rung.
+ */
+#define CONFIGURE_SHELL_COMMANDS_INIT
+
+#include <rtems/netcmds-config.h>
+
+#define CONFIGURE_SHELL_USER_COMMANDS                                          \
+    &rtems_shell_NETSTAT_Command, &rtems_shell_IFCONFIG_Command
+
+#define CONFIGURE_SHELL_COMMAND_STACKUSE
+#define CONFIGURE_SHELL_COMMAND_MALLOC_INFO
+
+#include <rtems/shellconfig.h>
+
+/*
+ * M. Driver table (base :173). libbsd, the console and the shell each register
+ * several, and the slots are cheap.
+ */
+#define CONFIGURE_MAXIMUM_DRIVERS 40
+
+/*
+ * N. confdefs generates the tables from everything above, so these two lines
+ * are last (base :192-194).
+ *
+ * Note what is absent: CONFIGURE_APPLICATION_NEEDS_RTC_DRIVER. Base guards it
+ * out for __arm__ (:180-184) and its own comment says the RTC "seems to be
+ * missing with libbsd and qemu" (rtems_init.c:960). That is the mechanism
+ * behind the fixed boot clock in rtems_init.c, and therefore behind the rule
+ * that nothing may derive an identity from the wall clock on this target.
+ */
+#define CONFIGURE_INIT
+
+#include <rtems/confdefs.h>

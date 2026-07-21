@@ -9,6 +9,13 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# The RTEMS boot shim for `rtems-ca-ioc`. Empty on every non-RTEMS target, so
+# this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
+# one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
+# the IOC's `main`. (The design's reason for gating it — that a host build
+# would otherwise try to cross-compile C — is closed by the shim's build
+# script, which no-ops off RTEMS.)
+epics-rtems-boot = { workspace = true }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
@@ -166,6 +173,12 @@ cap-tokens = [
     "dep:serde_json",
     "dep:sha2",
 ]
+
+# `build.rs` calls `epics_rtems_boot::contract::emit_link_args()`. Also
+# unconditional: a `[target.'cfg(...)'.build-dependencies]` table is evaluated
+# against the HOST, so a `cfg(target_os = "rtems")` one would never match.
+[build-dependencies]
+epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

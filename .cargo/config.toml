@@ -1,0 +1,18 @@
+# Read on EVERY cargo invocation in this workspace, so it holds exactly one
+# thing: the linker for the RTEMS target. A `[target.<triple>]` table applies
+# only when that triple is selected, so the host build is untouched — and
+# nothing RTEMS may ever go in `[build]`, whose `target`/`rustflags` would
+# apply to every build and break `cargo nextest run --workspace`.
+#
+# Everything else about the RTEMS link — the BSP prefix, the multilib
+# selectors, `-qrtems`, `-u POSIX_Init`, `-lbsd -lm -lz` — is emitted from
+# `crates/epics-rtems-boot`, computed from the `RTEMS_BSP_PREFIX` environment
+# variable. That keeps the link contract in one owner that has tests, instead
+# of in a file that cannot be tested, and keeps every machine-specific path
+# out of the repository.
+#
+# `arm-rtems6-gcc` is resolved from PATH: the toolchain prefix differs per
+# machine, so naming it absolutely here would commit one machine's layout.
+# Export `$RTEMS_BSP_PREFIX/bin` on PATH before building for RTEMS.
+[target.armv7-rtems-eabihf]
+linker = "arm-rtems6-gcc"

@@ -105,6 +105,16 @@ mod ioc {
     }
 
     pub fn main() -> ExitCode {
+        // (0) Pull the RTEMS boot shim into the link. Measured: rustc forwards
+        //     a dependency's `rustc-link-lib` entries only when the binary
+        //     actually references that dependency, so without this call the
+        //     shim archive, `-lbsd -lm -lz` and `POSIX_Init` itself are all
+        //     absent from the image. Compiles to nothing on a host build.
+        //
+        //     By the time this runs, `POSIX_Init` has already brought up the
+        //     console, the clock, libbsd and DHCP, and called us.
+        epics_rtems_boot::link_anchor();
+
         // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
         //     timer and scanOnce worker exist before any record can defer a
         //     tail into them. Idempotent.

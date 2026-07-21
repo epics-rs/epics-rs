@@ -1,5 +1,7 @@
 //! The `ca://` lset must answer link reads on any runtime flavor.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::LinkSet;
 use epics_ca_rs::calink::CaLinkResolver;
 

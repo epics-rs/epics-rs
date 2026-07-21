@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 // The bound-socket UDP responder stack (`socket2` shared-port setup, the
 // `tokio::net::UdpSocket` recv loops, the `epics_base_rs::net` RX-overflow
 // helpers) is the async host-only front-end. The RTEMS build answers SEARCH

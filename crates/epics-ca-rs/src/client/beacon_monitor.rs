@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};

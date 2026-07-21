@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
+
 mod beacon_monitor;
 mod circuit_breaker;
 mod search;

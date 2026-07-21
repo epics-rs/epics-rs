@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

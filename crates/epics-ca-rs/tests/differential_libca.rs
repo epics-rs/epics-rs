@@ -22,6 +22,8 @@
 //! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
 //! the test then becomes a noisy no-op rather than a hard failure.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile (default-filter excludes it) and `#[ignore]`d; needs C epics-base.
+
 use std::process::{Command, Stdio};
 use std::time::Duration;
 

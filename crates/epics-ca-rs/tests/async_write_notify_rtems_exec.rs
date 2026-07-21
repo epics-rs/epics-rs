@@ -50,6 +50,8 @@
 //! off it compiles to nothing, so the hosted default test set is unchanged.
 #![cfg(feature = "rtems-exec-model")]
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - this file IS the feature-ON e2e; it runs and passes there.
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};

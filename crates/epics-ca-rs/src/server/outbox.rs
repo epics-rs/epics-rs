@@ -38,6 +38,8 @@
 //! contiguous `Vec<u8>` per message for the pre-existing abort-safety
 //! invariant, so this is the shape they already produce.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::runtime::sync::mpsc;
 
 /// Cloneable producer handle. Handed to every emit site (in-loop handlers

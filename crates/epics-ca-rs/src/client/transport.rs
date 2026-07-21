@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(18): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]

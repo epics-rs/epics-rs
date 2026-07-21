@@ -6,6 +6,8 @@
 //!
 //! Run with: `cargo test -p epics-ca-rs --test interop_rust_client_c_ioc`
 
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile (default-filter excludes it); needs C epics-base.
+
 mod common;
 
 use std::time::Duration;

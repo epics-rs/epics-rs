@@ -39,8 +39,10 @@ pub mod calc;
 pub mod error;
 // The async UDP net stack (`tokio::net` + `socket2` + `if-addrs`) is host-only:
 // its deps do not build for RTEMS, and the RTEMS CA server uses the separate
-// S1 raw-libc socket driver, not this module. Gated out for the RTEMS target.
-#[cfg(not(target_os = "rtems"))]
+// S1 raw-libc socket driver, not those modules. The gate now sits on the
+// socket-bearing submodules rather than on `net` itself, so the wire constants
+// beside them (`ORIGIN_TAG_MCAST_GROUP`) stay reachable from the protocol code
+// that has to embed them on RTEMS too — see the module doc.
 pub mod net;
 pub mod runtime;
 pub mod server;

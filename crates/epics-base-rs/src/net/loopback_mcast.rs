@@ -25,11 +25,10 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
-/// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
-/// `udp_collector.cpp:127`: `"224.0.0.128,1@127.0.0.1"` — TTL=1,
-/// iface=loopback. We expose the group separately so callers can
-/// embed it in send addresses without re-parsing the pvxs string.
-pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
+// The group literal itself is wire data, not a socket, and lives in
+// [`super::ORIGIN_TAG_MCAST_GROUP`] so RTEMS builds — which drop this
+// module — can still name it.
+pub use super::ORIGIN_TAG_MCAST_GROUP;
 
 /// Bind a UDP socket configured for the pvxs ORIGIN_TAG forwarding
 /// channel.

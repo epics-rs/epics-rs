@@ -42,7 +42,7 @@ use crate::pvdata::encode::{
 };
 use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
-use super::runtime::PvaServerConfig;
+use super::config::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
 
 // The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
@@ -98,7 +98,7 @@ struct PipelineOptions {
     enabled: bool,
     /// The NEGOTIATED per-op queue limit — pvxs `MonitorOp::limit`
     /// (`servermon.cpp:66`), seeded from
-    /// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]
+    /// [`crate::server_native::config::PvaServerConfig::monitor_queue_limit`]
     /// and overridden by a valid (`>= 2`) `record._options.queueSize`
     /// whether or not pipeline is enabled (`op->limit = qSize` sits
     /// OUTSIDE the `if(op->pipeline)` block, `:533-543`).
@@ -562,7 +562,7 @@ fn parse_monitor_init_nack(
 ///
 /// `default_limit` is the limit a fresh `MonitorOp` starts with (pvxs
 /// `limit=4u`, `servermon.cpp:66`; here
-/// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]).
+/// [`crate::server_native::config::PvaServerConfig::monitor_queue_limit`]).
 /// Every returned [`PipelineOptions`] names a resolved
 /// [`PipelineOptions::queue_size`], so no caller re-derives the depth.
 ///
@@ -2441,52 +2441,16 @@ impl OpKind {
     }
 }
 
-/// Identity used for per-connection authorisation.
-///
-/// Mirrors pvxs `server::ClientCredentials` (serverconn.cpp:73-234).
-/// Two population paths feed it:
-///
-/// - **`ca` / `anonymous`** — parsed off the CONNECTION_VALIDATION reply
-///   (`parse_client_credentials`).
-/// - **`x509`** — derived from the *verified* TLS peer certificate chain
-///   after the handshake (pvxs `SSLContext::fill_credentials`). The TLS
-///   identity is authoritative: it overrides whatever the client claims
-///   in CONNECTION_VALIDATION, because the chain was cryptographically
-///   verified against the configured root CA.
-///
-/// The structured form is consumed by the server's ACF access gate
-/// (`AccessGate::check`) and lands in `tracing` for audit.
-#[derive(Debug, Clone)]
-pub struct ClientCredentials {
-    /// Selected auth method ("anonymous" / "ca" / "x509" / ...).
-    pub method: String,
-    /// Account name (e.g., the `ca` auth's `user` field, or the x509
-    /// leaf cert subject CommonName). Empty when the auth method does
-    /// not carry one.
-    pub account: String,
-    /// Host name claim from the `ca` auth, when present. Informational
-    /// only — never trust it for access decisions over the network
-    /// hostname / mTLS-verified peer.
-    pub host: String,
-    /// Certificate authority for the `x509` method: the root CA's
-    /// subject CommonName (pvxs `PeerCredentials::authority`). Empty for
-    /// non-TLS methods. ACF `RULE(... ){ AUTHORITY("...") }` scopes
-    /// match against this.
-    pub authority: String,
-    /// Group / role memberships of [`Self::account`], re-derived
-    /// SERVER-SIDE from the local passwd/group DB by
-    /// [`Self::with_server_roles`] (pvxs `ClientCredentials::roles()` →
-    /// `osdGetRoles`, serverconn.cpp:33-37). ACF rules of the form
-    /// `R member group:operators` match against this set.
-    ///
-    /// SECURITY: this is NEVER populated from the wire. A client
-    /// advertises a `groups`/`roles` field in CONNECTION_VALIDATION, but
-    /// trusting it would let `account="nobody", roles=["admin"]` satisfy
-    /// any group-gated rule — an ACL bypass. Every constructor funnels
-    /// through `with_server_roles`, so a wire value can never reach here.
-    pub roles: Vec<String>,
-}
+// `ClientCredentials` moved to [`super::config`] with `PvaServerConfig`, whose
+// `auth_complete` hook names it in its public signature — the config cannot be
+// target-neutral while the type in its own signature is not. It is identity
+// data, not socket code. Re-exported so `server_native::tcp::ClientCredentials`
+// keeps resolving for every existing caller.
+pub use super::config::ClientCredentials;
 
+// The credential *record* is target-neutral and lives beside the config;
+// building one from a CONNECTION_VALIDATION reply or a verified TLS chain is
+// this module's job, so the constructors stay here.
 impl ClientCredentials {
     /// Re-derive [`Self::roles`] server-side from [`Self::account`]
     /// against the local passwd/group DB (pvxs `ClientCredentials::roles`

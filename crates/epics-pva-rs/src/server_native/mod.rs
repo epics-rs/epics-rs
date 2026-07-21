@@ -24,6 +24,9 @@
 #[cfg(not(target_os = "rtems"))]
 pub mod accept;
 pub mod composite;
+// The server config record. No socket, no async — see the module doc for why
+// it is not part of [`runtime`].
+pub mod config;
 pub mod monitor_control;
 pub mod op_handle;
 // Per-connection accounting for the report (`pvxsr`). Every reader and

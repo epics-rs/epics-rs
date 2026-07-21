@@ -104,7 +104,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
+use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread, name_current_thread,
 };
@@ -278,20 +278,10 @@ impl BlockingCaServer {
                     // The failed connection is still queued, so returning to
                     // `accept()` with no delay spins at 100% CPU exactly when
                     // the machine is out of fds or memory. See the module docs
-                    // on `runtime::accept` for why the retry/give-up decision
-                    // cannot be made from `e`.
-                    match backoff.failed() {
-                        AcceptRetry::After(delay) => thread::sleep(delay),
-                        AcceptRetry::GiveUp => {
-                            tracing::error!(
-                                target: "epics_ca_rs::server::blocking",
-                                failures = backoff.consecutive_failures(),
-                                "blocking CA accept failed continuously; listener is dead, \
-                                 stopping the accept loop"
-                            );
-                            break;
-                        }
-                    }
+                    // on `runtime::accept` for why the loop always retries:
+                    // C `rsrv` never leaves this loop, and an IOC that stops
+                    // accepting for good is worse than one that keeps trying.
+                    thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
                     if self.shutdown.load(Ordering::Acquire) {
@@ -2130,27 +2120,36 @@ mod tests {
         }
     }
 
-    /// `AcceptRetry` is `#[must_use]`, but nothing in the type system stops a
-    /// caller from matching the `After(delay)` arm and then dropping `delay`
-    /// on the floor — which reinstates the hot spin while every other
-    /// assertion above still passes. Verified by mutation: replacing
-    /// `thread::sleep(delay)` with `{}` was invisible until this check
-    /// existed. So the arm is checked for an actual wait.
+    /// The wait must actually happen.
+    ///
+    /// `failed()` is `#[must_use]`, but binding its result to `_` silences
+    /// that and reinstates the hot spin while every other assertion above
+    /// still passes. Verified by mutation: replacing the wait with `{}` was
+    /// invisible until this check existed. Every call is therefore checked for
+    /// an enclosing sleep, and — since the give-up path was removed for C
+    /// parity — for the absence of any exit variant.
+    ///
+    /// Needles are `concat!`-split for the reason given above: this guard
+    /// lives in one of the files it reads.
     fn assert_delay_is_actually_waited(file: &str, src: &str) {
-        let arm = concat!("AcceptRetry::Af", "ter(delay) =>");
-        let mut arms = 0;
-        for (i, _) in src.match_indices(arm) {
-            arms += 1;
-            let tail = &src[i + arm.len()..];
-            let window = &tail[..tail.len().min(160)];
+        let call = concat!("backoff.fai", "led()");
+        let mut calls = 0;
+        for (i, _) in src.match_indices(call) {
+            calls += 1;
+            let before = &src[i.saturating_sub(40)..i];
             assert!(
-                window.contains(concat!("sle", "ep(delay)")),
-                "{file}: an AcceptRetry::After arm does not wait for its delay — \
-                 the accept loop is spinning again. Arm body starts: {:?}",
-                &window[..window.len().min(80)]
+                before.contains(concat!("sle", "ep(")),
+                "{file}: an accept failure is not waited on — the accept loop is \
+                 spinning again. Call context: {before:?}"
             );
         }
-        assert!(arms > 0, "{file}: no AcceptRetry::After arm at all");
+        assert!(calls > 0, "{file}: no accept-backoff call at all");
+        assert!(
+            !src.contains(concat!("AcceptRe", "try")),
+            "{file}: the give-up path is back. C rsrv never leaves its accept \
+             loop (caservertask.c:82-121); an IOC that stops accepting for the \
+             life of the process is the failure that removal closed."
+        );
     }
 
     /// (iii) The read timeout actually fires: a socket with a short

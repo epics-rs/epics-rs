@@ -237,7 +237,7 @@ use epics_base_rs::error::CaResult;
 // user of it is the async `accept_loop`; host-only, same gate as that fn. The
 // RTEMS driver reaches the same primitive from `server::blocking`.
 #[cfg(not(target_os = "rtems"))]
-use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
+use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::pv::ProcessVariable;
@@ -1406,21 +1406,8 @@ async fn accept_loop(
                 }
                 Err(e) => {
                     tracing::warn!(intf = %intf, error = %e, "CA accept failed");
-                    match backoff.failed() {
-                        AcceptRetry::After(delay) => {
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        AcceptRetry::GiveUp => {
-                            tracing::error!(
-                                intf = %intf,
-                                failures = backoff.consecutive_failures(),
-                                "CA accept failed continuously; listener is dead, \
-                                 stopping the accept loop"
-                            );
-                            return Err(e.into());
-                        }
-                    }
+                    tokio::time::sleep(backoff.failed()).await;
+                    continue;
                 }
             },
             // Drain finished connection tasks. Returns None when the

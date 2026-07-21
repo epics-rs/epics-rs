@@ -32,20 +32,36 @@
 //! calls while its libc omits the BSD `sin_len` byte, so a rule keyed on it
 //! would make every RTEMS accept loop quit on its first call.
 //!
-//! So the decision is made from **behaviour over time, not from the error**:
-//! a listener that has failed [`GIVE_UP_AFTER`] times in a row with no
-//! successful accept in between is not serving anyone, whatever the errno
-//! says. One success resets the count, which is what keeps a busy server
-//! under sustained `EMFILE` alive — it accepts whenever an fd frees.
+//! So there is no decision to make: **the loop always retries**, exactly as C
+//! does. The only thing this type computes is how long to wait first.
 //!
-//! # Deviation from C, deliberate
+//! # There is no give-up, and that is C parity
 //!
-//! C sleeps a flat 15 s and never returns; the thread is pinned forever on a
-//! listener that will never accept again. This backs off geometrically from
-//! [`FIRST`] to [`CEILING`] — recovering from a transient blip about 15×
-//! faster than C while still capping the log at one line per second once
-//! saturated — and returns after [`GIVE_UP_AFTER`] unbroken failures so a dead
-//! listener does not pin a thread for the life of the IOC.
+//! An earlier revision returned after 64 consecutive failures. That was a
+//! deliberate deviation and it was wrong: C `rsrv` has no such path
+//! (`caservertask.c:82-121` — `errlogPrintf`, `epicsThreadSleep(15.0)`,
+//! `continue`, at every one of its three failure points, with
+//! `cantProceed("Unreachable.  Perpetual thread.")` after the loop to say so).
+//! On target the deviation meant an IOC that had seen a minute of `EMFILE`
+//! stopped accepting **for the life of the process** while every other part of
+//! it went on looking healthy — the worst available outcome, and unrecoverable
+//! without a reboot, where C would have resumed the moment an fd freed.
+//!
+//! What is kept from that revision is the geometric backoff: [`FIRST`] to
+//! [`CEILING`], which recovers from a transient blip about 15× faster than C's
+//! flat 15 s while still capping the retry rate once saturated.
+//!
+//! # Saying so without a subscriber
+//!
+//! C prints on *every* failed accept, through `errlogPrintf`, which reaches
+//! the console whatever the log configuration. Ours does both: a `tracing`
+//! event per failure for a host with a subscriber (C parity, exactly), and an
+//! `errlog` line on the 1st, 2nd, 4th, 8th … consecutive failure, which
+//! reaches an RTEMS console that has no subscriber at all
+//! ([`crate::runtime::log::errlog_sev_printf`]). Powers of two because the
+//! backoff ceiling is 1 s where C's is 15 s: printing every failure at our
+//! cadence would be 15× C's console traffic on a serial line. It needs no
+//! clock, and it cannot suppress the first occurrence.
 
 use std::time::Duration;
 
@@ -55,30 +71,6 @@ pub const FIRST: Duration = Duration::from_millis(25);
 /// Longest delay between two accept attempts. Also the steady-state log rate
 /// while a listener stays broken: one line per ceiling.
 pub const CEILING: Duration = Duration::from_secs(1);
-
-/// Consecutive failures — with **no** successful accept in between — after
-/// which the listener is declared dead and the loop returns.
-///
-/// With [`FIRST`] and [`CEILING`] as they are, this is roughly a minute of
-/// unbroken failure. Long enough that ordinary resource exhaustion recovers
-/// (any single success resets the count), short enough that a thread parked on
-/// a broken listener is not a permanent leak.
-pub const GIVE_UP_AFTER: u32 = 64;
-
-/// What the loop must do after a failed `accept()`.
-///
-/// `#[must_use]`: dropping this is the original defect — a failure that is
-/// neither waited on nor returned from is the hot spin.
-#[must_use = "an accept failure must be either backed off or returned from, never ignored"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcceptRetry {
-    /// Wait this long, then accept again. The caller does the waiting, because
-    /// only it knows whether it is a thread (`thread::sleep`) or a task
-    /// (`tokio::time::sleep`).
-    After(Duration),
-    /// [`GIVE_UP_AFTER`] consecutive failures. Leave the loop.
-    GiveUp,
-}
 
 /// Consecutive-failure counter for one accept loop.
 ///
@@ -103,19 +95,37 @@ impl AcceptBackoff {
         self.consecutive = 0;
     }
 
-    /// An `accept()` failed. Returns the delay to wait, or [`AcceptRetry::GiveUp`].
-    pub fn failed(&mut self) -> AcceptRetry {
+    /// An `accept()` failed. Returns how long to wait before the next attempt.
+    ///
+    /// There is no other outcome: the loop retries forever, as C does. The
+    /// caller does the waiting, because only it knows whether it is a thread
+    /// (`thread::sleep`) or a task (`tokio::time::sleep`).
+    ///
+    /// Announces the failure on the way past — see the module docs on why an
+    /// `errlog` line at powers of two, and not the `tracing` event alone,
+    /// is what an RTEMS console can actually receive.
+    ///
+    /// `#[must_use]`: dropping the delay is the original defect — a failure
+    /// that is not waited on is the hot spin.
+    #[must_use = "an accept failure must be backed off, never ignored"]
+    pub fn failed(&mut self) -> Duration {
         self.consecutive = self.consecutive.saturating_add(1);
-        if self.consecutive > GIVE_UP_AFTER {
-            return AcceptRetry::GiveUp;
+        if self.consecutive.is_power_of_two() {
+            crate::runtime::log::errlog_sev_printf(
+                crate::runtime::log::ErrlogSevEnum::Major,
+                &format!(
+                    "accept failed {} time(s) in a row; the server is not taking \
+                     connections and keeps retrying",
+                    self.consecutive
+                ),
+            );
         }
         // Doubling, saturating at the ceiling. `checked_shl`-free: the shift
         // amount is clamped so it can never reach the width of the type.
         let shift = (self.consecutive - 1).min(32);
-        let delay = FIRST
+        FIRST
             .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
-            .min(CEILING);
-        AcceptRetry::After(delay)
+            .min(CEILING)
     }
 
     /// Failures since the last success. Diagnostics and tests.
@@ -131,19 +141,13 @@ mod tests {
     #[test]
     fn the_first_failure_waits_and_does_not_spin() {
         let mut b = AcceptBackoff::new();
-        assert_eq!(b.failed(), AcceptRetry::After(FIRST));
+        assert_eq!(b.failed(), FIRST);
     }
 
     #[test]
     fn the_delay_doubles_then_saturates_at_the_ceiling() {
         let mut b = AcceptBackoff::new();
-        let mut seen = Vec::new();
-        for _ in 0..10 {
-            match b.failed() {
-                AcceptRetry::After(d) => seen.push(d),
-                AcceptRetry::GiveUp => panic!("gave up inside the backoff ramp"),
-            }
-        }
+        let seen: Vec<Duration> = (0..10).map(|_| b.failed()).collect();
         assert_eq!(seen[0], FIRST);
         assert_eq!(seen[1], FIRST * 2);
         assert_eq!(seen[2], FIRST * 4);
@@ -157,55 +161,52 @@ mod tests {
     /// The boundary that keeps a busy server alive under sustained `EMFILE`:
     /// one accepted connection erases the whole failure history.
     #[test]
-    fn one_success_resets_the_give_up_budget() {
+    fn one_success_resets_the_history() {
         let mut b = AcceptBackoff::new();
-        for _ in 0..GIVE_UP_AFTER {
-            assert_ne!(b.failed(), AcceptRetry::GiveUp);
-        }
-        assert_eq!(b.consecutive_failures(), GIVE_UP_AFTER);
-        b.accepted();
-        assert_eq!(b.consecutive_failures(), 0);
-        assert_eq!(b.failed(), AcceptRetry::After(FIRST));
-    }
-
-    /// The other boundary: exactly `GIVE_UP_AFTER` failures still retry, the
-    /// next one returns.
-    #[test]
-    fn give_up_lands_one_past_the_budget() {
-        let mut b = AcceptBackoff::new();
-        for i in 1..=GIVE_UP_AFTER {
-            assert_ne!(b.failed(), AcceptRetry::GiveUp, "gave up early at {i}");
-        }
-        assert_eq!(b.failed(), AcceptRetry::GiveUp);
-    }
-
-    /// Once it gives up it stays given up — a loop that ignores the first
-    /// `GiveUp` must not be told to retry on the next failure.
-    #[test]
-    fn give_up_is_sticky() {
-        let mut b = AcceptBackoff::new();
-        for _ in 0..=GIVE_UP_AFTER {
+        for _ in 0..64 {
             let _ = b.failed();
         }
-        for _ in 0..5 {
-            assert_eq!(b.failed(), AcceptRetry::GiveUp);
-        }
+        assert_eq!(b.consecutive_failures(), 64);
+        b.accepted();
+        assert_eq!(b.consecutive_failures(), 0);
+        assert_eq!(b.failed(), FIRST);
     }
 
-    /// A permanently broken listener must not pin a thread for the life of the
-    /// IOC (C's `caservertask.c` behaviour, deliberately not copied), and must
-    /// not give up so fast that a slow resource recovery is fatal.
+    /// The boundary this type exists to hold after the give-up path was
+    /// removed: C `rsrv` never leaves its accept loop
+    /// (`caservertask.c:82-121`, and `cantProceed("Unreachable.  Perpetual
+    /// thread.")` after it). Past the old 64-failure budget, and far past it,
+    /// there must still be a delay to wait — never an exit.
     #[test]
-    fn the_give_up_budget_is_about_a_minute_of_unbroken_failure() {
+    fn the_loop_still_retries_long_after_the_old_give_up_budget() {
         let mut b = AcceptBackoff::new();
-        let mut total = Duration::ZERO;
-        while let AcceptRetry::After(d) = b.failed() {
-            total += d;
+        for _ in 0..1_000 {
+            let d = b.failed();
+            assert!(
+                d > Duration::ZERO && d <= CEILING,
+                "a failure past the old budget must still yield a bounded wait, got {d:?}"
+            );
         }
-        assert!(
-            total >= Duration::from_secs(30) && total <= Duration::from_secs(120),
-            "give-up window is {total:?}; under 30s risks killing a recoverable \
-             listener, over 120s is a thread parked on a dead one"
-        );
+        assert_eq!(b.consecutive_failures(), 1_000);
+    }
+
+    /// The counter must not wrap into a zero delay after a very long outage.
+    #[test]
+    fn a_saturated_counter_still_waits_the_ceiling() {
+        let mut b = AcceptBackoff {
+            consecutive: u32::MAX - 1,
+        };
+        assert_eq!(b.failed(), CEILING);
+        assert_eq!(b.failed(), CEILING, "saturating_add must not wrap to 0");
+        assert_eq!(b.consecutive_failures(), u32::MAX);
+    }
+
+    /// The console announcement is bounded and cannot be silenced at the
+    /// first occurrence — the property the RTEMS console needs, since the
+    /// per-failure `tracing` event reaches nothing there.
+    #[test]
+    fn the_console_announcement_is_first_then_powers_of_two() {
+        let announced: Vec<u32> = (1..=64u32).filter(|n| n.is_power_of_two()).collect();
+        assert_eq!(announced, vec![1, 2, 4, 8, 16, 32, 64]);
     }
 }

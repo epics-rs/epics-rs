@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use epics_base_rs::runtime::accept::{AcceptBackoff, AcceptRetry};
+use epics_base_rs::runtime::accept::AcceptBackoff;
 use tokio::net::TcpListener;
 use tracing::{debug, error, warn};
 
@@ -347,17 +347,7 @@ pub async fn run_tcp_server_on_listener(
                 // accept again spun at 20 Hz for the life of the process. Same
                 // primitive as the two blocking loops now — see
                 // `runtime::accept` for why the decision cannot come from `e`.
-                match backoff.failed() {
-                    AcceptRetry::After(delay) => tokio::time::sleep(delay).await,
-                    AcceptRetry::GiveUp => {
-                        error!(
-                            failures = backoff.consecutive_failures(),
-                            "accept failed continuously; listener is dead, stopping the \
-                             accept loop"
-                        );
-                        return Err(PvaError::Io(e));
-                    }
-                }
+                tokio::time::sleep(backoff.failed()).await;
             }
         }
     }

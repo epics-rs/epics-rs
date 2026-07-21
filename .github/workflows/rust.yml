@@ -20,6 +20,8 @@ jobs:
         toolchain: 1.94.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    - name: Format
+      run: cargo fmt --all -- --check
     - name: Clippy
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Build

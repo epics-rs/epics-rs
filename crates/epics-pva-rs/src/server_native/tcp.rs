@@ -1484,31 +1484,58 @@ impl Drop for WatermarkWithdrawOnDrop {
     }
 }
 
-/// Drive a per-op MONITOR gate ([`crate::server_native::source::
+/// Drives a per-op MONITOR gate ([`crate::server_native::source::
 /// MonitorGate`], supplied by the source on its `SubscriptionSeed`) from
-/// this op's executing-state watch. Applies the current state
-/// immediately on spawn — so a STOP that fired before this driver started
-/// is not missed — then re-applies on every edge [`MonitorStartControl`]
-/// publishes, coalescing to the latest executing state (idempotent
-/// `set_active`, so net state always matches `executing`). Runs in its own
-/// task so the hot monitor update loop is untouched; ends when the op tears
-/// down and drops the watch sender (the backing subscriptions are then
-/// removed with the aborted monitor — STOP=disable, teardown=remove).
-fn spawn_monitor_gate_driver(
-    gate: crate::server_native::source::MonitorGate,
-    mut exec_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    tokio::spawn(async move {
-        let mut cur = *exec_rx.borrow_and_update();
-        gate.set_active(cur).await;
-        while exec_rx.changed().await.is_ok() {
-            let desired = *exec_rx.borrow_and_update();
-            if desired != cur {
-                cur = desired;
-                gate.set_active(desired).await;
-            }
+/// this op's executing state.
+///
+/// This used to be a task of its own, watching the same
+/// `tokio::sync::watch` the subscriber loop already watches. It is now
+/// owned by that loop: the loop reads the executing state once per
+/// iteration and wakes on every edge (its `exec_rx.changed()` arm), so it
+/// is already at the exact observation points the driver task duplicated —
+/// the extra task bought a second observer, not a second observation.
+///
+/// Semantics carried over unchanged:
+///
+/// * The **first** application is unconditional (`applied: None`), which is
+///   what made a STOP that fired before the driver started not get missed.
+///   It is issued where the spawn used to be, before the loop is entered.
+/// * Every later application is edge-only, coalescing to the latest
+///   executing state — `set_active` is idempotent, so the net gate state
+///   always matches `executing`.
+/// * No gate (`None`) is the common case — only a QSRV db/group monitor
+///   supplies one — and costs one `Option` check per iteration.
+///
+/// Lifetime: ends with the subscriber. Teardown then removes the backing
+/// subscriptions along with the op (STOP=disable, teardown=remove), so no
+/// final edge is owed after the loop exits — the driver task did not apply
+/// one either; it simply ended when the watch sender dropped.
+struct MonitorGateDriver {
+    gate: Option<crate::server_native::source::MonitorGate>,
+    /// Last state handed to the gate; `None` until the unconditional first
+    /// application, which is what distinguishes "not yet applied" from
+    /// "applied, and it was Idle".
+    applied: Option<bool>,
+}
+
+impl MonitorGateDriver {
+    fn new(gate: Option<crate::server_native::source::MonitorGate>) -> Self {
+        Self {
+            gate,
+            applied: None,
         }
-    });
+    }
+
+    async fn apply(&mut self, executing: bool) {
+        let Some(gate) = &self.gate else {
+            return;
+        };
+        if self.applied == Some(executing) {
+            return;
+        }
+        self.applied = Some(executing);
+        gate.set_active(executing).await;
+    }
 }
 
 /// single owner of one MONITOR op's Executing<->Idle edge.
@@ -1887,9 +1914,10 @@ fn spawn_monitor_subscriber(
     };
 
     // Per-op executing-state watch. `MonitorStartControl` publishes each
-    // Executing<->Idle edge here; the subscriber loop reads it as its emit gate
-    // and (when the source supplies one) the `MonitorGate` driver reads it too.
-    // Starts `false` (Idle) — the first MONITOR START flips it to `true`.
+    // Executing<->Idle edge here and the subscriber loop is its ONLY reader:
+    // the loop uses it both as its emit gate and — via `MonitorGateDriver` —
+    // to drive the source's optional `MonitorGate`. Starts `false` (Idle);
+    // the first MONITOR START flips it to `true`.
     let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
     let start_ctl = Arc::new(MonitorStartControl::new(
         src.clone(),
@@ -1911,9 +1939,10 @@ fn spawn_monitor_subscriber(
         ioid,
         op_id: monitor_op_id,
     };
-    // One receiver clone drives the emit-gate loop; the original drives the
-    // optional `MonitorGate` (QSRV suspend/enable) driver on the decoded path.
-    let loop_exec_rx = monitor_exec_rx.clone();
+    // A single receiver, moved into the subscriber task. The second clone
+    // this used to make belonged to the `MonitorGate` driver task, which the
+    // loop now owns directly.
+    let loop_exec_rx = monitor_exec_rx;
 
     let join = tokio::spawn(async move {
         let _fin_guard = MonitorFinishGuard {
@@ -2148,9 +2177,17 @@ fn spawn_monitor_subscriber(
             updates: mut rx,
             on_start: seed_on_start,
         } = seed;
-        if let Some(gate) = seed_on_start {
-            spawn_monitor_gate_driver(gate, monitor_exec_rx);
-        }
+        // Owned by this loop rather than a task of its own; the
+        // unconditional first application happens here, where the spawn
+        // used to be, so a STOP that fired before the subscription opened
+        // is still not missed. `borrow` (not `borrow_and_update`) leaves the
+        // loop's own seen-state alone, so an edge landing between here and
+        // the first iteration is still delivered to `exec_rx.changed()`.
+        let mut gate_driver = MonitorGateDriver::new(seed_on_start);
+        // Bound to a local so the watch `Ref` is dropped before the await —
+        // it is not `Send`, and this future is spawned.
+        let executing_now = *exec_rx.borrow();
+        gate_driver.apply(executing_now).await;
         let mut queue_over_high = false;
         let wm_levels = wm_levels_init;
         let credit = MonitorPipelineCredit {
@@ -2211,6 +2248,12 @@ fn spawn_monitor_subscriber(
         let mut source_open = true;
         loop {
             let executing = *exec_rx.borrow_and_update();
+            // Apply this op's gate from the state we just read. The
+            // `exec_rx.changed()` arm below wakes the loop on every edge, so
+            // this reaches the source's suspend/resume as promptly as the
+            // driver task did — including while the loop is parked waiting
+            // for an update that a suspended upstream will never send.
+            gate_driver.apply(executing).await;
             // The terminal FINISH is Executing-gated, exactly like every DATA
             // frame: pvxs holds both the backlog and the finish until the client
             // is Executing (servermon.cpp:82,142-154). Break — and so send the
@@ -19372,8 +19415,24 @@ mod tests {
             }
         });
 
-        let (exec_tx, exec_rx) = tokio::sync::watch::channel(false);
-        spawn_monitor_gate_driver(gate, exec_rx);
+        let (exec_tx, mut exec_rx) = tokio::sync::watch::channel(false);
+        // Stand-in for the subscriber loop, reduced to the two things that
+        // matter here: it reads the executing state and applies the gate once
+        // per iteration, and it wakes on every watch edge. The production
+        // loop does exactly this (`let executing = *exec_rx.borrow_and_update()`
+        // then `gate_driver.apply(executing).await`, with an
+        // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
+        // covers the same path end to end through a real MONITOR.
+        let mut gate_driver = MonitorGateDriver::new(Some(gate));
+        tokio::spawn(async move {
+            loop {
+                let executing = *exec_rx.borrow_and_update();
+                gate_driver.apply(executing).await;
+                if exec_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
         let ctl = MonitorStartControl::new(src.clone(), "dut".into(), bfr12_anon_ctx(), exec_tx);
 
         async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
@@ -19405,6 +19464,138 @@ mod tests {
             *starts.lock(),
             vec![true, false, true],
             "notify_monitor_start fires the same edges (only real edges, no initial apply)"
+        );
+    }
+
+    /// A source that hands the subscriber a gate plus an updates stream
+    /// that never produces — so the subscriber loop parks in `rx.recv()`.
+    #[derive(Clone)]
+    struct GatedQuietSource {
+        intro: FieldDesc,
+        gate_log: Arc<parking_lot::Mutex<Vec<bool>>>,
+        /// Keeps the updates channel open; dropping it would end the loop.
+        _keepalive: Arc<mpsc::Sender<crate::server_native::MonitorUpdate>>,
+        keep: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::MonitorUpdate>>>>,
+    }
+    impl crate::server_native::source::ChannelSource for GatedQuietSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            None
+        }
+        async fn subscribe_seeded(
+            &self,
+            _checked: crate::server_native::source::AccessChecked,
+            _ctx: crate::server_native::source::ChannelContext,
+            _opts: crate::server_native::MonitorOptions,
+        ) -> Option<
+            crate::server_native::source::SubscriptionSeed<crate::server_native::MonitorUpdate>,
+        > {
+            let log = self.gate_log.clone();
+            Some(crate::server_native::source::SubscriptionSeed {
+                initial: None,
+                updates: self.keep.lock().take()?.into(),
+                on_start: Some(crate::server_native::source::MonitorGate::new(
+                    move |active| {
+                        let log = log.clone();
+                        async move {
+                            log.lock().push(active);
+                        }
+                    },
+                )),
+            })
+        }
+    }
+
+    /// The gate driver is no longer a task of its own, so a START/STOP edge
+    /// now reaches the source only if the subscriber loop observes it. The
+    /// case that would expose a missed observation is precisely the one
+    /// where nothing else can wake the loop: a monitor with no updates
+    /// flowing, parked in `rx.recv()`. Drive INIT -> START -> STOP against
+    /// such a monitor and require the gate to see the initial Idle plus both
+    /// edges.
+    ///
+    /// Revert-verify: drop the per-iteration `gate_driver.apply(executing)`
+    /// (keeping only the pre-loop application) and the log stalls at
+    /// `[false]`.
+    #[tokio::test]
+    async fn bfr12_gate_reaches_a_parked_monitor() {
+        let intro = three_field_intro();
+        let gate_log = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(4);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: intro.clone(),
+            gate_log: gate_log.clone(),
+            _keepalive: Arc::new(keep_tx),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+
+        let (wire_tx, _wire_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (_join, start_ctl) = spawn_monitor_subscriber(MonitorSubscriberArgs {
+            sid: 1,
+            ioid: 2,
+            pv_name: "dut".into(),
+            intro: intro.clone(),
+            mask: BitSet::with_capacity(intro.total_bits()),
+            tx: ChannelTx::new(
+                wire_tx,
+                crate::server_native::peers::ChannelStat::new("dut".into()),
+            ),
+            src: src.clone(),
+            queue_depth: 4,
+            high_watermark: 0,
+            mon_ctx: bfr12_anon_ctx(),
+            window: None,
+            window_notify: None,
+            filters: Arc::new(Default::default()),
+            monitor_options: Default::default(),
+            wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            monitor_op_id: 7,
+            wm_levels: None,
+            mon_fin_tx,
+            out_order: fixed_out_order(ByteOrder::Little),
+        });
+
+        async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
+            for _ in 0..400 {
+                if log.lock().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("gate log never reached {n} entries: {:?}", log.lock());
+        }
+
+        // Initial Idle, applied where the driver used to be spawned. Wait for
+        // it before the first edge so the watch cannot coalesce the two.
+        wait_len(&gate_log, 1).await;
+        start_ctl.set(true); // START: resume the upstream
+        wait_len(&gate_log, 2).await;
+        start_ctl.set(false); // STOP: suspend it again, loop still parked
+        wait_len(&gate_log, 3).await;
+
+        assert_eq!(
+            *gate_log.lock(),
+            vec![false, true, false],
+            "a parked monitor must still relay initial Idle and both edges to \
+             its source gate"
         );
     }
 

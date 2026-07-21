@@ -38,7 +38,7 @@ use super::command::CommandHandler;
 use super::command::GatewayCommand;
 use super::downstream::DownstreamServer;
 use super::putlog::{PutLog, PutLogScope};
-use super::pvlist::PvList;
+use super::pvlist::{PolicyHost, PvList};
 use super::stats::Stats;
 use super::upstream::{UpstreamManager, UpstreamManagerConfig};
 
@@ -637,7 +637,9 @@ impl GatewayServer {
                     let m = {
                         let pvlist = pvlist.load_full();
                         match peer {
-                            Some(addr) => pvlist.match_name_for_host(&name, &addr.ip().to_string()),
+                            Some(addr) => {
+                                pvlist.match_name_for_host(&name, &PolicyHost::from_peer(addr))
+                            }
                             None => pvlist.match_name(&name),
                         }
                     };
@@ -748,7 +750,7 @@ impl GatewayServer {
                         let pvlist = pvlist.load_full();
                         match peer {
                             Some(addr) => pvlist
-                                .match_name_for_host(&name, &addr.ip().to_string())
+                                .match_name_for_host(&name, &PolicyHost::from_peer(addr))
                                 .is_some(),
                             None => pvlist.match_name(&name).is_some(),
                         }

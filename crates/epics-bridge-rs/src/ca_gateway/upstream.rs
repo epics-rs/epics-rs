@@ -59,7 +59,7 @@ use crate::error::{BridgeError, BridgeResult};
 use super::access::AccessConfig;
 use super::cache::{PvCache, PvState};
 use super::putlog::{PutLog, PutLogLine, PutLogScope, PutOutcome};
-use super::pvlist::PvList;
+use super::pvlist::{PolicyHost, PvList};
 use super::server::CacheMode;
 use super::stats::Stats;
 
@@ -1600,12 +1600,34 @@ fn build_write_hook(
             // ECA status differs from "ACL deny" and operators can
             // distinguish in audits. `load_full` is wait-free.
             let pvlist = env.pvlist.load_full();
-            if pvlist.is_host_denied(&pv_name, &ctx.host) {
+            // The identity is the SOCKET, never `ctx.host` — that field is
+            // the name the client claims in CA `HOST_NAME`, so using it here
+            // let a client pick which DENY row applied to its own writes,
+            // and disagreed with the search/create path
+            // (`server.rs`) which has always used the peer address. C pins
+            // this to the socket too, with `getClientHostName` commented out
+            // (`gateServer.cc:1523-1530`). `PolicyHost` is constructible
+            // only from a peer, so the two points cannot drift apart again.
+            //
+            // An unparseable peer is DENY: a blacklist cannot be shown not
+            // to apply to a peer we cannot establish.
+            let Some(policy_host) = PolicyHost::from_peer_str(&ctx.peer) else {
+                tracing::warn!(
+                    peer = %ctx.peer, pv = %pv_name,
+                    "pvlist DENY FROM: peer address unparseable, refusing the put"
+                );
+                env.stats.record_readonly_reject();
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
+                return Err(CaError::PutDisabled(format!(
+                    "{pv_name} (peer address unavailable for pvlist evaluation)"
+                )));
+            };
+            if pvlist.is_host_denied(&pv_name, &policy_host) {
                 env.stats.record_readonly_reject();
                 log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::PutDisabled(format!(
                     "{pv_name} (host {} denied by pvlist)",
-                    ctx.host
+                    policy_host.as_str()
                 )));
             }
 

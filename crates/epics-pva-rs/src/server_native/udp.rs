@@ -1935,6 +1935,7 @@ fn rebuild_beacon_forward(b: &BeaconForward, source: SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_native::MonitorStream;
     use crate::server_native::source::OpError;
 
     /// End-to-end forward path: `process_search_datagram` invoked
@@ -1952,7 +1953,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Minimal source: has_pv returns false for every name. The
         // forward path triggers BEFORE local processing, so the
@@ -1992,7 +1992,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2073,7 +2073,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Same EmptySource as above; duplicated to keep the tests
         // independent of test-ordering.
@@ -2111,7 +2110,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2166,7 +2165,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Source that DOES claim to host "MY:PV" — proves the drop is
         // because of the isAny() rule, not because the PV was unknown.
@@ -2205,7 +2203,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2263,7 +2261,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
@@ -2300,7 +2297,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2592,7 +2589,6 @@ mod tests {
         use crate::pvdata::{FieldDesc, PvField};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
-        use tokio::sync::mpsc;
 
         // Claims "MY:PV" only for a requester at 10.0.0.5.
         struct ScopedSource;
@@ -2639,7 +2635,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2686,7 +2682,6 @@ mod tests {
         use crate::pvdata::{FieldDesc, PvField, ScalarType};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
-        use tokio::sync::mpsc;
 
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
@@ -2723,7 +2718,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }

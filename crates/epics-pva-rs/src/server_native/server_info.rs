@@ -306,7 +306,10 @@ impl ChannelSource for ServerInfoSource {
     /// The `server` PV is queried with one-shot GET/RPC, not MONITOR
     /// — pvxs's `ServerSource` installs no `onSubscribe`. Returning
     /// `None` makes a MONITOR INIT against `server` fail cleanly.
-    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _name: &str,
+    ) -> Option<crate::server_native::source::MonitorStream<PvField>> {
         None
     }
 

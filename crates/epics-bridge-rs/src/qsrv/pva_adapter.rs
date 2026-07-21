@@ -6,6 +6,7 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -812,7 +813,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
@@ -831,7 +832,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             )
             .await?
             {
-                OpenedMonitor::Native(rx) => Some(rx),
+                OpenedMonitor::Native(rx) => Some(rx.into()),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
                     tokio::spawn(async move {
@@ -855,7 +856,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         }
                         monitor.stop().await;
                     });
-                    Some(rx)
+                    Some(rx.into())
                 }
             }
         }
@@ -878,16 +879,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>>,
+        Output = Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>>,
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
             match open_monitor(provider, pva_pvs, checked, ctx, opts).await? {
-                OpenedMonitor::Native(rx) => {
-                    Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
-                }
-                OpenedMonitor::Db(monitor) => Some(spawn_db_monitor_updates(monitor)),
+                OpenedMonitor::Native(rx) => Some(
+                    epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
+                ),
+                OpenedMonitor::Db(monitor) => Some(spawn_db_monitor_updates(monitor).into()),
             }
         }
     }
@@ -929,7 +930,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     let initial = self.read_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
-                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
+                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
                         on_start: None,
                     })
                 }
@@ -984,7 +985,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         });
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
-                        updates,
+                        updates: updates.into(),
                         on_start: Some(gate),
                     })
                 }
@@ -1115,7 +1116,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
@@ -1124,7 +1125,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // dropped receivers) so the plugin's `post()` fans out into
             // the PVA server.
             if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
-                return Some(handle.add_subscriber());
+                return Some(handle.add_subscriber().into());
             }
             let channel = self.channel(&name_owned).await?;
             let mut monitor = channel.create_monitor().await.ok()?;
@@ -1149,7 +1150,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 }
                 monitor.stop().await;
             });
-            Some(rx)
+            Some(rx.into())
         }
     }
 }

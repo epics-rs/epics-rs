@@ -17,12 +17,11 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::mpsc;
 
 use epics_pva_rs::proto::{ByteOrder, ControlCommand, PvaHeader};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
@@ -52,7 +51,7 @@ impl ChannelSource for EmptySource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
         None
     }
 }

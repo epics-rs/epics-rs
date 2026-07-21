@@ -29,9 +29,9 @@ use std::sync::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use super::source::MonitorStream;
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use crate::server_native::source::{ChannelInvalidator, OpError};
 
@@ -148,15 +148,15 @@ pub type OnStartFn = Arc<dyn Fn(&SharedPV, bool) + Send + Sync>;
 
 // ── Per-subscriber bounded queue with squash-to-tail semantics ──────────────
 
-struct MonitorQueueInner {
-    items: VecDeque<PvField>,
+struct MonitorQueueInner<T> {
+    items: VecDeque<T>,
     limit: usize,
     /// True once the producer side (SharedPV) signals no more data.
     producer_done: bool,
 }
 
-struct MonitorQueueShared {
-    inner: Mutex<MonitorQueueInner>,
+struct MonitorQueueShared<T> {
+    inner: Mutex<MonitorQueueInner<T>>,
     notify: tokio::sync::Notify,
     /// Set in MonitorInbox::drop; post() checks this to decide whether to remove
     /// the outbox from the subscriber list.
@@ -178,16 +178,30 @@ struct MonitorQueueShared {
 /// endpoint drops" — is enforced structurally here and in `Drop`,
 /// so a transient clone used for lock-free delivery cannot close the
 /// subscriber's inbox.
-pub struct MonitorOutbox {
-    shared: Arc<MonitorQueueShared>,
+pub struct MonitorOutbox<T = PvField> {
+    shared: Arc<MonitorQueueShared<T>>,
 }
 
-/// Receiver half of a per-subscriber queue. Returned by `SharedPV::subscribe`.
-pub struct MonitorInbox {
-    shared: Arc<MonitorQueueShared>,
+/// Receiver half of a per-subscriber queue — the **monitor ring**.
+///
+/// Generic in the element type so the one primitive serves every monitor
+/// stream shape the `ChannelSource` trait carries (`PvField`,
+/// `MonitorUpdate`, `RawMonitorEvent`), instead of each source bridging its
+/// ring into an `mpsc` just to satisfy the trait's return type. Nothing in
+/// the queue was ever `PvField`-specific — append/squash-to-tail and the
+/// producer-closed flag are element-agnostic.
+///
+/// Returned by `SharedPV::subscribe` (as the [`MonitorInbox`] alias) and
+/// carried by [`MonitorStream::Ring`](super::source::MonitorStream).
+pub struct MonitorRing<T = PvField> {
+    shared: Arc<MonitorQueueShared<T>>,
 }
 
-fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
+/// The `PvField` ring — the shape `SharedPV` hands out. Kept as a named
+/// alias because that is the only element type a `SharedPV` ever queues.
+pub type MonitorInbox = MonitorRing<PvField>;
+
+fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
     let limit = limit.max(1);
     let shared = Arc::new(MonitorQueueShared {
         inner: Mutex::new(MonitorQueueInner {
@@ -210,15 +224,15 @@ fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
         MonitorOutbox {
             shared: Arc::clone(&shared),
         },
-        MonitorInbox { shared },
+        MonitorRing { shared },
     )
 }
 
-impl MonitorOutbox {
+impl<T> MonitorOutbox<T> {
     /// Post a value. `maybe=false`: full queue → squash tail (pvxs servermon.cpp:283-286).
     /// `maybe=true`: full queue → drop silently.
     /// Returns `false` when the receiver has been dropped (caller should remove this outbox).
-    fn post(&self, value: PvField, maybe: bool) -> bool {
+    fn post(&self, value: T, maybe: bool) -> bool {
         if self.shared.receiver_dropped.load(Ordering::Relaxed) {
             return false;
         }
@@ -246,7 +260,7 @@ impl MonitorOutbox {
     }
 }
 
-impl Clone for MonitorOutbox {
+impl<T> Clone for MonitorOutbox<T> {
     fn clone(&self) -> Self {
         // every live endpoint counts. A clone made for a
         // lock-free post is a producer endpoint until it drops.
@@ -257,7 +271,7 @@ impl Clone for MonitorOutbox {
     }
 }
 
-impl Drop for MonitorOutbox {
+impl<T> Drop for MonitorOutbox<T> {
     fn drop(&mut self) {
         // signal `producer_done` only when the *last* producer
         // endpoint for this queue drops. A transient clone (e.g. the
@@ -271,15 +285,15 @@ impl Drop for MonitorOutbox {
     }
 }
 
-impl Drop for MonitorInbox {
+impl<T> Drop for MonitorRing<T> {
     fn drop(&mut self) {
         self.shared.receiver_dropped.store(true, Ordering::Relaxed);
     }
 }
 
-impl MonitorInbox {
+impl<T> MonitorRing<T> {
     /// Async receive. Returns `None` when the producer closed and the queue is drained.
-    pub async fn recv(&mut self) -> Option<PvField> {
+    pub async fn recv(&mut self) -> Option<T> {
         loop {
             let notified = self.shared.notify.notified();
             tokio::pin!(notified);
@@ -330,7 +344,7 @@ impl MonitorInbox {
     /// an mpsc-backed monitor stream read identically — the server's existing
     /// drain idiom (`tcp.rs:2245`, `while let Ok(e) = rx.try_recv()`) works over
     /// either without a conversion at the seam.
-    pub fn try_recv(&mut self) -> Result<PvField, TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         let mut inner = self.shared.inner.lock();
         if let Some(v) = inner.items.pop_front() {
             return Ok(v);
@@ -1465,23 +1479,14 @@ impl super::source::ChannelSource for SharedSource {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move {
             // pvxs servermon.cpp:66: default queue limit = 4.
             let inbox = pv.and_then(|p| p.subscribe(4))?;
-            // Bridge MonitorInbox → mpsc::Receiver so the ChannelSource trait
-            // signature stays stable; squash-to-tail semantics live in inbox.
-            let (tx, rx) = mpsc::channel::<PvField>(1);
-            tokio::spawn(async move {
-                let mut inbox = inbox;
-                while let Some(v) = inbox.recv().await {
-                    if tx.send(v).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(rx)
+            // The ring IS the stream: no bridge task, no second queue.
+            // Squash-to-tail semantics live in the ring itself.
+            Some(MonitorStream::Ring(inbox))
         }
     }
 
@@ -1515,22 +1520,13 @@ impl super::source::ChannelSource for SharedSource {
         };
         async move {
             let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(queue_limit))?;
-            let (tx, rx) = mpsc::channel::<PvField>(1);
-            tokio::spawn(async move {
-                let mut inbox = inbox;
-                while let Some(v) = inbox.recv().await {
-                    if tx.send(v).await.is_err() {
-                        break;
-                    }
-                }
-            });
             Some(super::source::SubscriptionSeed {
                 // A SharedPV's stored Value is wholly assigned by `open()` /
                 // `post()`, so it declares no leaf subset — the server frames
                 // every leaf the request selected, as pvxs does for a
                 // fully-marked `Value`.
                 initial: initial.map(super::source::SourceRead::from),
-                updates: super::source::plain_monitor_updates(rx),
+                updates: super::source::plain_monitor_updates(MonitorStream::Ring(inbox)),
                 on_start: None,
             })
         }

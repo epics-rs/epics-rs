@@ -15,6 +15,7 @@
 #![cfg(test)]
 #![allow(clippy::manual_async_fn, clippy::approx_constant)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -199,7 +200,7 @@ async fn pvxs_pvget_to_rust_server_get() {
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::Mutex;
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
     use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
@@ -250,7 +251,7 @@ async fn pvxs_pvget_to_rust_server_get() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }
@@ -381,7 +382,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
     let pvxget = find_pvxs_bin("pvxget").unwrap();
 
     use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::Mutex;
 
     use epics_pva_rs::nt::nd_array::{
         NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
@@ -470,7 +471,7 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }
@@ -538,7 +539,6 @@ async fn pvxs_pvxget_to_rust_server_ntndarray() {
 #[ignore]
 async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     use epics_pva_rs::client_native::context::PvaClient;
     use epics_pva_rs::nt::nd_array::{
@@ -607,7 +607,7 @@ async fn rust_client_to_rust_server_ntndarray_full_roundtrip() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }
@@ -736,7 +736,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
     let pvxcall = find_pvxs_bin("pvxcall").unwrap();
 
     use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::Mutex;
 
     use epics_pva_rs::pvdata::{
         FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue,
@@ -788,7 +788,7 @@ async fn pvxs_pvxcall_to_rust_server_rpc() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
         fn rpc(

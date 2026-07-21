@@ -627,7 +627,7 @@ impl ChannelSource for ControlSource {
             .map_err(OpError::failed)
     }
 
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         // Control PVs are RPC targets — a monitor against one would
         // never see an event. Only diagnostic PVs get a live channel.
         if !self.is_diag(name) {

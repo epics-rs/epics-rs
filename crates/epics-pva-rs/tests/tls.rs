@@ -9,12 +9,13 @@
 
 #![allow(clippy::manual_async_fn)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use epics_pva_rs::auth::{TlsClientConfig, TlsServerConfig};
 use epics_pva_rs::client_native::context::PvaClient;
@@ -142,7 +143,7 @@ impl ChannelSource for StaticSource {
     fn subscribe(
         &self,
         _name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }

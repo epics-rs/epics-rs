@@ -1689,7 +1689,7 @@ impl ChannelSource for GatewayChannelSource {
     async fn subscribe_raw(
         &self,
         name: &str,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_raw_seeded`).
         self.subscribe_raw_inner(self.cache.clone(), name, None)
@@ -1697,7 +1697,7 @@ impl ChannelSource for GatewayChannelSource {
             .map(|(_initial, updates)| updates)
     }
 
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_seeded`). The internal
         // stream is `MonitorUpdate`; adapt to bare `PvField` for this
@@ -1785,7 +1785,7 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         if !checked.allows_read() {
             return None;
         }
@@ -1803,7 +1803,7 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         if !checked.allows_read() {
             return None;
         }
@@ -1843,7 +1843,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         _opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         // Delegate to the ACF-gated `subscribe_checked` path, which
         // forwards `ctx.pv_request` to a per-pvRequest upstream monitor.
         // The cooked `subscribe_checked_opts_marked` variant the server
@@ -1860,7 +1860,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         _opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         self.subscribe_raw_checked(checked, ctx).await
     }
 

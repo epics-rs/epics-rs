@@ -440,7 +440,10 @@ impl ChannelSource for FailAtDataSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }
@@ -508,7 +511,10 @@ impl ChannelSource for PanicSource {
     async fn is_writable(&self, _: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }

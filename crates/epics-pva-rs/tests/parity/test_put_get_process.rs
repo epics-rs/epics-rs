@@ -15,12 +15,12 @@
 
 #![cfg(test)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
 use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
 use epics_pva_rs::PvaError;
@@ -108,7 +108,7 @@ impl ChannelSource for DoublingSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
@@ -595,7 +595,7 @@ impl ChannelSource for DenySource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
@@ -780,7 +780,7 @@ impl ChannelSource for TwoFieldSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }
@@ -983,7 +983,7 @@ impl ChannelSource for EnumSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }

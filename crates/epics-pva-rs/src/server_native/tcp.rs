@@ -8330,6 +8330,7 @@ mod tests {
     use super::*;
     use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::MonitorStream;
 
     /// a throwaway MONITOR-completion sender for `handle_op`
     /// calls in tests that do not exercise the read-loop owner's removal
@@ -8427,7 +8428,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_watermark(
@@ -12237,7 +12241,7 @@ mod tests {
     struct RawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
     }
 
     #[cfg(test)]
@@ -12260,13 +12264,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12287,7 +12291,7 @@ mod tests {
         let source: DynSource = Arc::new(RawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         channels.insert(
@@ -12452,7 +12456,7 @@ mod tests {
     struct FlipRawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
         gate: epics_base_rs::server::access_security::AccessGate,
     }
 
@@ -12479,13 +12483,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12515,7 +12519,7 @@ mod tests {
         let source: DynSource = Arc::new(FlipRawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
             gate,
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -12658,9 +12662,9 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(4);
-            Some(rx)
+            Some(rx.into())
         }
     }
 
@@ -13400,9 +13404,9 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -15139,7 +15143,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_channel_close(
@@ -15269,7 +15276,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn notify_channel_open(
@@ -16622,7 +16629,7 @@ mod tests {
             async fn is_writable(&self, _: &str) -> bool {
                 true
             }
-            async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -17134,7 +17141,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn process(
@@ -18866,7 +18873,7 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -19245,11 +19252,11 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             // Sender dropped immediately → receiver closed → the subscriber
             // loop sees end-of-stream and the task ends (source close).
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -19680,7 +19687,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -20635,7 +20642,10 @@ mod r14_tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }
@@ -20825,7 +20835,7 @@ mod bfr15_tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }

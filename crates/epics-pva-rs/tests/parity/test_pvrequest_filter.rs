@@ -14,10 +14,9 @@
 
 #![cfg(test)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::mpsc;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -118,7 +117,7 @@ impl ChannelSource for NTScalarSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }

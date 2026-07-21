@@ -406,6 +406,33 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    built; this phase is wiring plus the RTEMS dependency work PVA adds on top
    of CA's.
 
+   **Scope: PVA SERVER only (decided 2026-07-21).** A PVA *gateway* on RTEMS
+   is explicitly out of scope — it would need a reader/writer/heartbeat trio
+   per upstream connection plus the UDP search engine, flipping the 12
+   `client_native` production spawn sites from "gate out" to "restructure" and
+   roughly doubling the phase. Estimate at this scope: **~7–9 engineer-weeks**,
+   ordered so the desktop-neutral items land first and shrink the big one:
+
+   | # | item | size |
+   |---|---|---|
+   | 1 | TLS/dep feature gate on `epics-pva-rs` (§8.2 correction) | 3–5 d |
+   | 2 | Split `client_native::decode`; gate client modules + `client_config()` | 2–4 d |
+   | 4 | `MonitorInbox::try_recv` + widen `ChannelSource`; delete 6 bridge tasks | 4–6 d |
+   | 5 | **reader/operation/writer split; frame channel; box 10 op futures into `select_all`** | **2–3 wk** |
+   | 6 | Fold heartbeat + monitor-gate driver into the operation loop | 2–3 d |
+   | 7 | Blocking accept/UDP/beacon threads | 1 wk |
+   | 8 | Re-home 9 timer sites; 2 socket timeouts → `SO_{SND,RCV}TIMEO` | 2–3 d |
+   | 9 | 87 `abort()` sites → `TaskHandle` (abort maps — see §11) | 1 wk |
+   | 10 | RTEMS `--lib` green + QEMU monitor-to-completion | 1 wk |
+
+   Items 1/2/4 are **desktop-neutral** — they improve the hosted build too and
+   can land before any RTEMS wiring. Item 4 alone deletes 6 tasks: today a
+   single MONITOR on a db-backed PVA IOC costs 2–3 tasks because
+   `ChannelSource` pins the return type to `mpsc::Receiver` and a bridge task
+   copies the ring into it (`shared_pv.rs:1428-1445`). Its trait change ripples
+   into `epics-bridge-rs`, so item 4 requires `nextest --workspace`, not
+   per-crate.
+
 The old phase 6 (`smol`/`polling` desktop-driver fallback) is **dropped
 outright** — see §4. The number is reused above by the PVA phase; there is no
 fallback phase in this plan any more.

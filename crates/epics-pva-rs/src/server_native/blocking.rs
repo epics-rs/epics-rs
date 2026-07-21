@@ -304,6 +304,35 @@ impl ConnRegistry {
         }
     }
 
+    /// The only way this type takes its lock, and the reason it never
+    /// propagates poisoning.
+    ///
+    /// This mutex is **process-wide**: every connection registers and
+    /// deregisters through it, and the accept loop takes it for every accept.
+    /// So `.expect()` here does not fail one operation — one connection that
+    /// panics anywhere between `register` and `deregister` poisons the mutex,
+    /// and from then on *every* subsequent accept panics too. One client takes
+    /// the server down. (Contrast the CA driver's send-lock `expect`s, which
+    /// look identical but sit on a **per-client** mutex, so the blast radius
+    /// is the one connection that already died. The difference is ownership
+    /// scope, not care.)
+    ///
+    /// A poisoned registry is recoverable state, not corrupt state. The
+    /// protected value is a `HashMap<u64, ConnWake>` and an id counter; a
+    /// panic part-way through an insert or a remove leaves the map itself
+    /// intact — at worst one entry is present that should not be, and the
+    /// wake it holds is idempotent (`shutdown` on an already-shut socket is
+    /// harmless). Losing every future connection is strictly worse than
+    /// carrying on with that.
+    fn state(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            // Deliberately not re-poisoning and not logging per-acquisition:
+            // this is taken on every accept, and a poisoned mutex stays
+            // poisoned, so a log line here would flood.
+            poisoned.into_inner()
+        })
+    }
+
     /// Shut every live connection's socket, and every connection that
     /// registers from here on.
     ///
@@ -313,7 +342,7 @@ impl ConnRegistry {
     /// operation threads with.
     pub fn stop(&self) {
         let wakes: Vec<ConnWake> = {
-            let mut st = self.state.lock().expect("connection registry poisoned");
+            let mut st = self.state();
             st.stopped = true;
             st.conns.values().cloned().collect()
         };
@@ -327,11 +356,7 @@ impl ConnRegistry {
     /// How many connections are currently registered. A connection that ended
     /// on its own has already removed itself.
     pub fn live_connections(&self) -> usize {
-        self.state
-            .lock()
-            .expect("connection registry poisoned")
-            .conns
-            .len()
+        self.state().conns.len()
     }
 
     /// Take ownership of a connection's socket and issue its wake handle.
@@ -342,7 +367,7 @@ impl ConnRegistry {
     fn register(&self, socket: Arc<TcpStream>) -> ConnRegistration<'_> {
         let wake = ConnWake(socket);
         let (id, stopped) = {
-            let mut st = self.state.lock().expect("connection registry poisoned");
+            let mut st = self.state();
             let id = st.next_id;
             st.next_id += 1;
             st.conns.insert(id, wake.clone());
@@ -361,11 +386,7 @@ impl ConnRegistry {
     /// The only remover. Private, and reached only from
     /// [`ConnRegistration::drop`].
     fn deregister(&self, id: u64) {
-        self.state
-            .lock()
-            .expect("connection registry poisoned")
-            .conns
-            .remove(&id);
+        self.state().conns.remove(&id);
     }
 }
 
@@ -2422,6 +2443,71 @@ mod tests {
 
         writer.join().expect("writer thread");
         reader.join().expect("reader thread");
+    }
+
+    /// F6: a connection that panics while holding the registry lock must not
+    /// take every later connection with it.
+    ///
+    /// The registry mutex is process-wide, so `.expect()` on it turned one
+    /// client's panic into a panic on every subsequent accept. This is the
+    /// formerly-fatal path: poison the mutex, then use the registry normally.
+    #[test]
+    fn a_poisoned_registry_still_registers_and_stops() {
+        let registry = ConnRegistry::new();
+        let (_client, server, _peer) = socket_pair();
+        let server = Arc::new(server);
+
+        // Poison it exactly the way a connection would: panic while holding
+        // the lock.
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.state();
+            panic!("a connection blew up holding the registry lock");
+        }));
+        assert!(poisoner.is_err(), "precondition: the closure must panic");
+        assert!(
+            registry.state.is_poisoned(),
+            "precondition: the mutex must actually be poisoned, or this test \
+             proves nothing"
+        );
+
+        // Every entry point must still work. Before the fix each of these
+        // panicked.
+        assert_eq!(registry.live_connections(), 0);
+        {
+            let _registration = registry.register(server.clone());
+            assert_eq!(registry.live_connections(), 1);
+            registry.stop();
+        }
+        assert_eq!(
+            registry.live_connections(),
+            0,
+            "deregistration on drop must still run through a poisoned lock"
+        );
+    }
+
+    /// The state a poisoned registry carries forward is the state it had: the
+    /// recovery must not silently reset the map or the id counter.
+    #[test]
+    fn poison_recovery_preserves_the_registry_contents() {
+        let registry = ConnRegistry::new();
+        let (_c1, s1, _p1) = socket_pair();
+        let (_c2, s2, _p2) = socket_pair();
+        let first = registry.register(Arc::new(s1));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.state();
+            panic!("boom");
+        }));
+        assert!(poisoned.is_err());
+
+        assert_eq!(
+            registry.live_connections(),
+            1,
+            "the connection registered before the panic must still be there"
+        );
+        let second = registry.register(Arc::new(s2));
+        assert_ne!(first.id, second.id, "the id counter must not have reset");
+        assert_eq!(registry.live_connections(), 2);
     }
 
     /// F3, the formerly-bypassing path: the reader is spawned, connection

@@ -1,4 +1,7 @@
-//! The real-time scheduling switch is off unless someone asks for it.
+//! The real-time scheduling switch is off on a HOSTED target unless someone
+//! asks for it. (On RTEMS the default is the other way — see
+//! `runtime::task::DEFAULT_POLICY` for why the two targets differ. This is an
+//! integration test binary, so it only ever runs hosted.)
 //!
 //! `runtime::task::apply_to_current_thread` can put an IOC thread into a
 //! SCHED_FIFO band. Doing that without being asked is wrong twice over: on a
@@ -28,7 +31,7 @@ fn a_default_process_never_calls_the_os_scheduler() {
     assert_eq!(
         RtPolicy::current(),
         RtPolicy::Disabled,
-        "an unset switch must resolve to off"
+        "an unset switch must resolve to off on a hosted target"
     );
 
     // Every priority a runtime or background thread carries today: the

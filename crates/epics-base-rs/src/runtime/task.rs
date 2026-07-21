@@ -490,14 +490,11 @@ impl PriorityApplied {
 /// Environment switch that opts this process in to real-time (SCHED_FIFO)
 /// scheduling for the IOC threads that carry an EPICS priority.
 ///
-/// **Default off.** Requesting SCHED_FIFO needs `CAP_SYS_NICE` or a
-/// non-zero `RLIMIT_RTPRIO`; on a developer desktop the request fails,
-/// and where it *succeeds* an unattended RT band can starve the machine.
-/// Neither belongs in a default build, so the switch must be set
-/// deliberately by whoever is deploying onto an RT kernel.
+/// The switch is read in both directions on every target; what differs is
+/// what it defaults to when unset — see [`DEFAULT_POLICY`].
 ///
 /// Accepted "on" values, case-insensitive: `YES`, `TRUE`, `ON`, `1`.
-/// Anything else — including unset — is off.
+/// Any other *explicit* value is off.
 ///
 /// # Relationship to the C switch
 ///
@@ -505,9 +502,9 @@ impl PriorityApplied {
 /// `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` (`envDefs.h:80`, read at
 /// `osdThread.c:389`), and `envGetBoolConfigParam` (`envSubr.c:331`) accepts
 /// only case-insensitive `yes`. We deliberately do **not** reuse that name:
-/// its base default is `YES` (`configure/CONFIG_ENV:57`) and ours is off, so
-/// one name would carry two opposite defaults depending on which
-/// implementation read it.
+/// its base default is `YES` on every target (`configure/CONFIG_ENV:57`)
+/// while ours is `YES` only on RTEMS, so one name would carry two different
+/// defaults on a hosted build depending on which implementation read it.
 pub const RT_PRIORITY_ENV: &str = "EPICS_RS_ALLOW_RT_PRIORITY";
 
 /// Whether this process may ask the OS for real-time scheduling.
@@ -525,11 +522,58 @@ pub enum RtPolicy {
     AllowRealtime,
 }
 
+/// What [`RT_PRIORITY_ENV`] means when it is **unset**, for the target this
+/// was compiled for.
+///
+/// `AllowRealtime` on RTEMS, `Disabled` everywhere else. The asymmetry is
+/// deliberate and is a property of the default itself — not a `setenv` the
+/// boot shim performs before `main()`. A `setenv` is a runtime side effect any
+/// later caller can undo or reorder, and a variable one component writes for
+/// another to read is the dual-meaning shape this code keeps removing.
+///
+/// Why the two targets differ:
+///
+///   - Base's own equivalent switch,
+///     `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`, defaults to `YES`
+///     (`configure/CONFIG_ENV:57`). An IOC that honours its priorities is
+///     upstream's default posture, not an opt-in.
+///   - The opt-in gate exists for RT-Linux, where asking for SCHED_FIFO needs
+///     `CAP_SYS_NICE` or a non-zero `RLIMIT_RTPRIO` (so on a desktop the
+///     request merely fails), and where a runaway RT band on a box that
+///     *grants* it can wedge a developer's machine. Neither failure mode
+///     exists on RTEMS: there is no RLIMIT_RTPRIO and no desktop to wedge.
+///   - The band invariant is now a test rather than a hope —
+///     `rtems_priority_map_stays_below_the_libbsd_network_band` proves every
+///     u8 input lands in core 100..199, at or below libbsd's default band and
+///     strictly less urgent than IRQS(96)/TIME(98).
+///
+/// An explicit value still wins in **both** directions on both targets, so
+/// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS.
+pub const DEFAULT_POLICY: RtPolicy = default_policy(cfg!(target_os = "rtems"));
+
+/// [`DEFAULT_POLICY`] as a pure function of the one target fact it depends
+/// on, so both arms are reachable from a host test run. A host CI will never
+/// execute the RTEMS arm otherwise, and an untested default is exactly the
+/// kind that drifts.
+const fn default_policy(on_rtems: bool) -> RtPolicy {
+    if on_rtems {
+        RtPolicy::AllowRealtime
+    } else {
+        RtPolicy::Disabled
+    }
+}
+
 impl RtPolicy {
-    /// Parse a raw switch value (`None` = unset).
+    /// Parse a raw switch value (`None` = unset ⇒ [`DEFAULT_POLICY`]).
     pub fn from_env_value(raw: Option<&str>) -> RtPolicy {
+        Self::resolve(raw, DEFAULT_POLICY)
+    }
+
+    /// [`Self::from_env_value`] with the unset-default injected, so a host
+    /// test can ask what an RTEMS process would do with the same input.
+    pub fn resolve(raw: Option<&str>, default: RtPolicy) -> RtPolicy {
         let Some(raw) = raw else {
-            return RtPolicy::Disabled;
+            return default;
         };
         let v = raw.trim();
         let on = v.eq_ignore_ascii_case("yes")
@@ -1476,10 +1520,58 @@ mod tests {
         ));
     }
 
+    /// Both defaults, and both override directions against each default.
+    ///
+    /// The RTEMS arm is unreachable from a host test run unless the default
+    /// is a function of the target rather than a `cfg` block, which is why
+    /// `default_policy`/`resolve` take their input explicitly.
     #[test]
-    fn rt_switch_is_off_unless_explicitly_turned_on() {
-        // Unset is off — the default a desktop build gets.
-        assert_eq!(RtPolicy::from_env_value(None), RtPolicy::Disabled);
+    fn the_rt_default_is_on_for_rtems_and_off_for_hosted() {
+        // (1) the two defaults themselves
+        assert_eq!(
+            default_policy(true),
+            RtPolicy::AllowRealtime,
+            "RTEMS honours its priorities by default, as base does \
+             (EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=YES, CONFIG_ENV:57)"
+        );
+        assert_eq!(
+            default_policy(false),
+            RtPolicy::Disabled,
+            "hosted stays opt-in: RLIMIT_RTPRIO makes the request fail on a \
+             desktop, and where it succeeds a runaway band wedges the machine"
+        );
+
+        // (2) the compiled-in default is wired to the target, not to a guess
+        assert_eq!(DEFAULT_POLICY, default_policy(cfg!(target_os = "rtems")));
+        assert_eq!(RtPolicy::from_env_value(None), DEFAULT_POLICY);
+
+        // (3) an explicit value wins over EITHER default, in BOTH directions.
+        //     The RTEMS-off case is the one an operator needs: turning RT
+        //     scheduling off on a target that defaults to on.
+        for default in [RtPolicy::AllowRealtime, RtPolicy::Disabled] {
+            assert_eq!(
+                RtPolicy::resolve(Some("NO"), default),
+                RtPolicy::Disabled,
+                "explicit NO must turn it off even where the default is {default:?}"
+            );
+            assert_eq!(
+                RtPolicy::resolve(Some("YES"), default),
+                RtPolicy::AllowRealtime,
+                "explicit YES must turn it on even where the default is {default:?}"
+            );
+            assert_eq!(
+                RtPolicy::resolve(None, default),
+                default,
+                "unset must resolve to the default and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_switch_explicit_values_win_over_the_default() {
+        // Unset takes the target's default; that is
+        // `the_rt_default_is_on_for_rtems_and_off_for_hosted`'s subject.
+        assert_eq!(RtPolicy::from_env_value(None), DEFAULT_POLICY);
         // C's `envGetBoolConfigParam` (envSubr.c:331) accepts only
         // case-insensitive "yes"; we also take the spellings a hand-written
         // startup script is likely to use.

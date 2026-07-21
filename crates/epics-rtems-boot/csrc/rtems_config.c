@@ -89,6 +89,18 @@ extern void *POSIX_Init(void *argument);
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
 
 /*
+ * Block-device buffering. MEASURED: dropping this does not drop libblock from
+ * the image, it only drops libblock's *configuration*, and the link then dies
+ * with "undefined reference to `rtems_bdbuf_configuration'" from
+ * librtemscpu.a(bdbuf.c.70.o). RTEMS_BSD_CONFIG_BSP_CONFIG above pulls in this
+ * BSP's nexus devices, which include the two Arasan SDHCI controllers, and the
+ * SD/MMC stack references bdbuf unconditionally. confdefs/bdbuf.h:54,133 only
+ * defines rtems_bdbuf_configuration under this macro, so on a BSP whose nexus
+ * device set contains a block device the directive is not optional.
+ */
+#define CONFIGURE_APPLICATION_NEEDS_LIBBLOCK
+
+/*
  * F. File-descriptor ceiling (base :83, with base's own caveat at :70-81).
  *
  * Base caps this at 64 solely to stay below newlib's FD_SETSIZE, because

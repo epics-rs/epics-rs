@@ -192,6 +192,21 @@ mod tests {
         assert!(cfg.contains("#define CONFIGURE_UNLIMITED_OBJECTS"));
     }
 
+    /// Regression guard for the measured *link* failure, the sibling of the one
+    /// above: without `CONFIGURE_APPLICATION_NEEDS_LIBBLOCK` the link dies with
+    /// `undefined reference to rtems_bdbuf_configuration` from
+    /// `librtemscpu.a(bdbuf.c.70.o)`. Omitting the directive does not drop
+    /// libblock from the image, only its configuration, and
+    /// `RTEMS_BSD_CONFIG_BSP_CONFIG` pulls in this BSP's nexus devices —
+    /// including its two SDHCI controllers, whose SD/MMC stack references bdbuf
+    /// unconditionally. `confdefs/bdbuf.h:54,133` defines the symbol only under
+    /// this macro.
+    #[test]
+    fn the_shim_configures_libblock_for_the_bsps_block_devices() {
+        let cfg = include_str!("../csrc/rtems_config.c");
+        assert!(cfg.contains("#define CONFIGURE_APPLICATION_NEEDS_LIBBLOCK"));
+    }
+
     /// `<rtems/confdefs.h>` generates the object tables from the macros above
     /// it, so anything after it is ignored — silently.
     #[test]
@@ -238,6 +253,15 @@ mod tests {
     /// size; each is also a service with its own failure modes on a board we
     /// cannot debug interactively. Re-adding one should be a decision, not a
     /// paste.
+    ///
+    /// `CONFIGURE_APPLICATION_NEEDS_LIBBLOCK` was on this list and is
+    /// deliberately no longer: this guard fired on the first cross-toolchain
+    /// link and demanded the decision it exists to demand. The decision, with
+    /// the measurement, is at the directive in `rtems_config.c` — omitting it
+    /// does not drop libblock from the image, only its *configuration*, and the
+    /// BSP's nexus devices reference `rtems_bdbuf_configuration` unconditionally.
+    /// `the_shim_configures_libblock_for_the_bsps_block_devices` now guards it
+    /// from the other direction, so removing it is caught too.
     #[test]
     fn no_dropped_facility_crept_back_into_the_configuration() {
         let cfg = include_str!("../csrc/rtems_config.c");
@@ -251,7 +275,6 @@ mod tests {
             "CONFIGURE_FILESYSTEM_TFTPFS",
             "RTEMS_BSD_CONFIG_SERVICE_TELNETD",
             "RTEMS_BSD_CONFIG_SERVICE_FTPD",
-            "CONFIGURE_APPLICATION_NEEDS_LIBBLOCK",
             "CONFIGURE_APPLICATION_NEEDS_RTC_DRIVER",
         ] {
             assert!(

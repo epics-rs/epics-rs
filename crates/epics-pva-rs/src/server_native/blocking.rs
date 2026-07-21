@@ -379,13 +379,15 @@ struct ConnRegistration<'a> {
 }
 
 impl ConnRegistration<'_> {
-    /// Wake this connection's parked threads.
-    fn wake(&self) {
-        self.wake.wake();
-    }
-
-    /// A clone of the wake handle, for a thread that outlives this borrow —
-    /// the writer, which wakes the connection on its way out (§4.2b).
+    /// A clone of the wake handle, for a thread that outlives this borrow, or
+    /// for the guard that owns one — [`WriterGuard`]'s thread wakes the
+    /// connection on its way out (§4.2b), and [`ReaderGuard`] wakes it to
+    /// return a parked `read`.
+    ///
+    /// This is the *only* way to obtain a wake from a registration. There used
+    /// to be a `wake(&self)` beside it, which meant the retiring path could
+    /// wake without holding anything that joins — the shape that let the
+    /// reader leak. Now a wake is only reachable through a guard that joins.
     fn wake_handle(&self) -> ConnWake {
         self.wake.clone()
     }
@@ -394,6 +396,72 @@ impl ConnRegistration<'_> {
 impl Drop for ConnRegistration<'_> {
     fn drop(&mut self) {
         self.registry.deregister(self.id);
+    }
+}
+
+/// The spawned reader thread, woken and joined on **every** exit path.
+///
+/// # Invariant
+///
+/// MUST: once `reader_thread` has been spawned, it is woken and joined before
+/// [`serve_connection_blocking`] returns — clean return, `?`, or a panic
+/// unwinding out of the connection handler.
+///
+/// # The defect this closes
+///
+/// A writer-spawn failure used to `?` out with the reader already running.
+/// [`ConnRegistration::drop`] deregisters WITHOUT waking — which is right, the
+/// wake belongs to whoever retires the connection — so [`ConnRegistry::stop`]
+/// could no longer reach that reader. It sat parked in `read` behind an
+/// `SO_RCVTIMEO` of `op_timeout` (~64,000 s by default), holding its socket
+/// and its descriptor for the life of the IOC. The `max_connections` slot was
+/// returned correctly, which is exactly what made the leak invisible: the
+/// connection count looked healthy while descriptors drained away.
+///
+/// Owning the handle in a guard, rather than calling cleanup on the error
+/// branch, is what makes the leak unexpressible: there is no way to have
+/// spawned the reader without also holding the value that joins it. The same
+/// applies to the panic path, which no error-branch cleanup could have covered.
+struct ReaderGuard {
+    wake: ConnWake,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // The reader's `read` is parked behind an effectively-infinite
+            // timeout, so the socket has to be shut to return it. This is the
+            // module's single wake primitive, through the registry-issued
+            // handle — the same one `ConnRegistry::stop` would use.
+            self.wake.wake();
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The spawned writer thread and the only strong frame sender, retired
+/// together on **every** exit path.
+///
+/// The sender lives here rather than beside the guard because the writer parks
+/// on `frame_rx.recv()` and leaves only when the last strong sender drops.
+/// A guard that joined without dropping the sender would hang; keeping the two
+/// in one value means the order cannot be got wrong, and does not depend on
+/// the declaration order of two separate locals.
+struct WriterGuard {
+    frames: Option<mpsc::Sender<Vec<u8>>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        // Decisive because it is the only strong sender — the `ChannelWriter`
+        // adapter holds a weak handle. The writer drains what is queued, sees
+        // `None`, and exits; on its way out it wakes the connection (§4.2b).
+        drop(self.frames.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -751,33 +819,50 @@ pub fn serve_connection_blocking(
     // Small: this thread's whole frame is a 4 KiB `READ_CHUNK` buffer and a
     // `read`/`send` loop (`reader_thread`, :475). It decodes nothing — the
     // protocol state machine runs on the connection thread below.
-    let reader = spawn_dedicated_thread(
-        format!("PVAS-reader {peer}"),
-        PVA_SERVER_PRIORITY,
-        StackSizeClass::Small,
-        move || reader_thread(read_sock, chunk_tx, peer),
-    )
-    .map_err(PvaError::Io)?;
+    // From here on the reader is owned by a guard. Every exit below — the
+    // writer-spawn `?`, and a panic unwinding out of the connection handler —
+    // runs `ReaderGuard::drop`, which wakes and joins it. See that type for the
+    // leak this closes.
+    let reader = ReaderGuard {
+        wake: registration.wake_handle(),
+        handle: Some(
+            spawn_dedicated_thread(
+                format!("PVAS-reader {peer}"),
+                PVA_SERVER_PRIORITY,
+                StackSizeClass::Small,
+                move || reader_thread(read_sock, chunk_tx, peer),
+            )
+            .map_err(PvaError::Io)?,
+        ),
+    };
     let writer_room = room.clone();
     let writer_wake = registration.wake_handle();
     // Small, for the same reason: it drains already-encoded frames from a
     // queue onto the socket (`writer_thread`, :643) and builds nothing.
-    let writer = spawn_dedicated_thread(
-        format!("PVAS-writer {peer}"),
-        PVA_SERVER_PRIORITY,
-        StackSizeClass::Small,
-        move || {
-            writer_thread(
-                write_sock,
-                frame_rx,
-                writer_room,
-                writer_wake,
-                send_timeout,
-                peer,
+    let writer = WriterGuard {
+        // The only strong sender moves into the guard, so it cannot be dropped
+        // out of order with the join. `writer_adapter` above already took its
+        // weak handle.
+        frames: Some(frame_tx),
+        handle: Some(
+            spawn_dedicated_thread(
+                format!("PVAS-writer {peer}"),
+                PVA_SERVER_PRIORITY,
+                StackSizeClass::Small,
+                move || {
+                    writer_thread(
+                        write_sock,
+                        frame_rx,
+                        writer_room,
+                        writer_wake,
+                        send_timeout,
+                        peer,
+                    )
+                },
             )
-        },
-    )
-    .map_err(PvaError::Io)?;
+            .map_err(PvaError::Io)?,
+        ),
+    };
 
     let outcome = block_on_sync(handle_connection_io(
         source,
@@ -790,19 +875,16 @@ pub fn serve_connection_blocking(
 
     // Teardown, in §4.3's order and for its reason: the writer goes down
     // first so frames the connection emitted on its way out (MONITOR FINISH,
-    // DESTROY_CHANNEL) reach the wire before the socket is torn down.
+    // DESTROY_CHANNEL) reach the wire before the socket is torn down. Then the
+    // reader, which needs the socket shut to return its parked `read`.
     //
-    // Dropping this sender is decisive because it is the only strong one —
-    // the adapter holds a weak handle. The writer drains what is queued, then
-    // sees `None` and exits.
-    drop(frame_tx);
-    let _ = writer.join();
-    // Now the reader. Its `read` is parked with an effectively-infinite
-    // SO_RCVTIMEO, so the socket has to be shut to return it — the same wake
-    // `ConnRegistry::stop` would issue, through the same registry-issued
-    // handle, because there is only one way to end a parked connection thread.
-    registration.wake();
-    let _ = reader.join();
+    // These two drops are explicit only to pin that order at the point a
+    // reader would look for it. They are not what makes the teardown happen —
+    // the guards' own `Drop` is, which is why the `?` and panic paths above are
+    // covered too. Their declaration order (reader, then writer) already gives
+    // this same reverse-drop order if control never reaches here.
+    drop(writer);
+    drop(reader);
     // `room` outlives both, so a producer parked on a full queue is released
     // by the writer's exit wake rather than left holding a dead waker.
     drop(room);
@@ -2340,6 +2422,168 @@ mod tests {
 
         writer.join().expect("writer thread");
         reader.join().expect("reader thread");
+    }
+
+    /// F3, the formerly-bypassing path: the reader is spawned, connection
+    /// setup then fails before the writer exists, and the function `?`s out.
+    ///
+    /// Before the guard this leaked the reader permanently.
+    /// `ConnRegistration::drop` deregisters without waking, so
+    /// `ConnRegistry::stop` could no longer reach it and it stayed parked in
+    /// `read` behind an `op_timeout` of ~64,000 s, holding its socket and
+    /// descriptor for the life of the IOC — while `live_connections()` read 0
+    /// and the `max_connections` slot came back, so nothing looked wrong.
+    #[test]
+    fn a_reader_is_released_when_connection_setup_fails_after_it_is_spawned() {
+        // The client stays connected and silent, so nothing but a wake from
+        // this side can return the reader's `read`.
+        let (_client, server, _peer) = socket_pair();
+        let registry = ConnRegistry::new();
+        let server = Arc::new(server);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        {
+            let registration = registry.register(server.clone());
+            let read_sock = server.clone();
+            let _reader = ReaderGuard {
+                wake: registration.wake_handle(),
+                handle: Some(thread::spawn(move || {
+                    let mut buf = [0u8; 64];
+                    let _ = (&*read_sock).read(&mut buf);
+                    let _ = done_tx.send(());
+                })),
+            };
+            assert_eq!(registry.live_connections(), 1);
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                done_rx.try_recv().is_err(),
+                "precondition: the reader must be parked in `read`, or this \
+                 test proves nothing"
+            );
+            // Stand-in for the writer-spawn `?`: leave the scope with the
+            // reader running and the writer never created.
+        }
+        done_rx
+            .recv_timeout(RETIRE_BOUND)
+            .expect("a reader spawned before a failed setup must still be woken and joined");
+        assert_eq!(
+            registry.live_connections(),
+            0,
+            "the registration must still be removed"
+        );
+    }
+
+    /// The same guard on the panic path, which no cleanup on the error branch
+    /// could have covered — `catch_unwind` stands in for a panic unwinding out
+    /// of `handle_connection_io`.
+    #[test]
+    fn a_reader_is_released_when_the_connection_handler_panics() {
+        let (_client, server, _peer) = socket_pair();
+        let registry = ConnRegistry::new();
+        let server = Arc::new(server);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let registration = registry.register(server.clone());
+            let read_sock = server.clone();
+            let _reader = ReaderGuard {
+                wake: registration.wake_handle(),
+                handle: Some(thread::spawn(move || {
+                    let mut buf = [0u8; 64];
+                    let _ = (&*read_sock).read(&mut buf);
+                    let _ = done_tx.send(());
+                })),
+            };
+            panic!("connection handler blew up");
+        }));
+
+        assert!(panicked.is_err(), "precondition: the closure must panic");
+        done_rx
+            .recv_timeout(RETIRE_BOUND)
+            .expect("a panic unwinding past the reader must still wake and join it");
+        assert_eq!(registry.live_connections(), 0);
+    }
+
+    /// The ordering that a naive guard gets wrong: the writer parks on
+    /// `frame_rx.recv()` and leaves only when the last strong sender drops, so
+    /// a guard that joined *before* dropping the sender would hang forever.
+    ///
+    /// Holding the sender inside [`WriterGuard`] is what makes that
+    /// unexpressible — it cannot be dropped out of order with the join, and
+    /// the ordering does not depend on two locals' declaration order.
+    #[test]
+    fn a_writer_guard_drops_its_sender_before_joining() {
+        let (_client, server, peer) = socket_pair();
+        let registry = ConnRegistry::new();
+        let server = Arc::new(server);
+        let registration = registry.register(server.clone());
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
+        let wake = registration.wake_handle();
+        let write_sock = server.clone();
+        let writer = WriterGuard {
+            frames: Some(tx),
+            handle: Some(thread::spawn(move || {
+                writer_thread(
+                    write_sock,
+                    rx,
+                    Arc::new(WriteRoom::default()),
+                    wake,
+                    Duration::from_secs(5),
+                    peer,
+                )
+            })),
+        };
+
+        // Drop off-thread so a guard that hangs fails this test instead of
+        // hanging the whole suite.
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(writer);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx.recv_timeout(RETIRE_BOUND).expect(
+            "WriterGuard::drop must drop the last strong sender before joining; \
+             otherwise the writer stays parked on recv and the join never returns",
+        );
+    }
+
+    /// Structural closure, as source: both connection threads are owned by a
+    /// guard. A bare `let reader = spawn_dedicated_thread(..)` is the shape
+    /// that leaked, and it must not come back.
+    #[test]
+    fn both_connection_threads_are_owned_by_a_joining_guard() {
+        let src = include_str!("blocking.rs");
+        // Comment lines are skipped: the doc comment above names the banned
+        // shape on purpose, and this guard is about CODE. A real binding
+        // cannot live on a line starting with `//`. (Needles are split for the
+        // same reason — this guard lives in the file it reads.)
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        for banned in [
+            concat!("let reader = spawn_dedi", "cated_thread("),
+            concat!("let writer = spawn_dedi", "cated_thread("),
+        ] {
+            let offenders: Vec<&&str> = code.iter().filter(|l| l.contains(banned)).collect();
+            assert!(
+                offenders.is_empty(),
+                "a connection thread is held in a bare handle again: `{banned}`. \
+                 An exit path that does not join it leaks the thread, its socket \
+                 and its descriptor for the life of the IOC"
+            );
+        }
+        for required in [
+            concat!("let reader = Reader", "Guard {"),
+            concat!("let writer = Writer", "Guard {"),
+        ] {
+            assert!(
+                code.iter().any(|l| l.contains(required)),
+                "connection setup no longer binds `{required}` — both threads \
+                 must be owned by a guard that joins them on every exit path"
+            );
+        }
     }
 
     // ── the accept loop (stage C) ───────────────────────────────────────

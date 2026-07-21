@@ -68,7 +68,7 @@ mod ioc {
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::net::cas_server_port;
-    use epics_base_rs::runtime::task::{background_init, block_on_sync};
+    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search};

@@ -535,6 +535,20 @@ pub struct AbortHandle {
     control: Arc<Control>,
 }
 
+// `tokio::task::AbortHandle` is `Debug`, and call sites rely on it: pva's
+// `server_native::tcp::AbortOnDrop` is a `#[derive(Debug)]` newtype over
+// whichever handle the seam selected. `Control` holds a `Mutex<Option<Weak<dyn
+// Schedulable>>>` that cannot be derived, so the mirror is written out — the
+// two flags are the whole observable state of the handle.
+impl std::fmt::Debug for AbortHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortHandle")
+            .field("aborted", &self.control.abort.load(Ordering::Relaxed))
+            .field("finished", &self.control.finished.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
 impl AbortHandle {
     /// Request cancellation — mirrors `tokio::task::AbortHandle::abort`.
     pub fn abort(&self) {

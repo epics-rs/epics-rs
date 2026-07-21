@@ -16,6 +16,7 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -65,7 +66,7 @@ impl ChannelSource for StreamingSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
         let (tx, rx) = mpsc::channel::<PvField>(8);
         tokio::spawn(async move {
             let mut i = 1.0f64;
@@ -74,7 +75,7 @@ impl ChannelSource for StreamingSource {
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
         });
-        Some(rx)
+        Some(rx.into())
     }
 }
 

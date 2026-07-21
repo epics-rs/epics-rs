@@ -12,6 +12,7 @@ use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, Ty
 use crate::server_native::source::SourceRead;
 use crate::server_native::{ChannelSource, OpError};
 
+use crate::server_native::source::{MonitorStream, UpstreamMonitor};
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
@@ -844,7 +845,7 @@ impl ChannelSource for PvDatabaseSource {
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
     > + Send {
         let db = self.db.clone();
         async move {
@@ -866,49 +867,29 @@ impl ChannelSource for PvDatabaseSource {
             // same events arrive; each is narrowed by its own posted mask
             // below. The prior VALUE|LOG subscription could not deliver a
             // DBE_PROPERTY event at all.
-            let mut sub = DbSubscription::subscribe_with_mask(
+            let sub = DbSubscription::subscribe_with_mask(
                 &db,
                 &name,
                 0,
                 crate::nt::monitor_mask().bits(),
             )
             .await?;
-            let (tx, rx) = mpsc::channel::<crate::server_native::source::MonitorUpdate>(64);
-            tokio::spawn(async move {
-                while let Some(ev) = sub.recv_event().await {
-                    let marked = crate::nt::event_leaves(
-                        ev.mask,
-                        ev.snapshot.properties,
-                        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
-                    );
-                    // A class that marks nothing is an event with no wire
-                    // meaning — C would have assigned no leaf either.
-                    if marked.is_empty() {
-                        continue;
-                    }
-                    let update = crate::server_native::source::MonitorUpdate {
-                        marked: Some(marked),
-                        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(
-                            &ev.snapshot,
-                        ))
-                    };
-                    if tx.send(update).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(rx)
+            // The subscription IS the stream: `marked_update` runs as the
+            // server pulls, so no task stands between the two.
+            Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
+                sub,
+                marked_update,
+            )))
         }
     }
 
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let db = self.db.clone();
         let name = name.to_string();
         async move {
-            let (tx, rx) = mpsc::channel::<PvField>(64);
             let entry = db.find_entry(&name).await?;
             match entry {
                 PvEntry::Simple(pv) => {
@@ -921,51 +902,68 @@ impl ChannelSource for PvDatabaseSource {
                     // `ProcessVariable::set` -> `notify_subscribers`.
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
-                        Some(mut sub) => {
+                        Some(sub) => {
                             let initial = snapshot_to_pv_field(&pv.snapshot());
-                            tokio::spawn(async move {
-                                if tx.send(initial).await.is_err() {
-                                    return;
-                                }
-                                while let Some(snap) = sub.recv_snapshot().await {
-                                    let field = snapshot_to_pv_field(&snap);
-                                    if tx.send(field).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                // `sub` drops here → its `Drop` removes the
-                                // subscriber slot from the ProcessVariable.
-                            });
+                            // The seed rides on the stream and is handed out
+                            // ahead of the subscription's own events, exactly
+                            // as the bridge's `tx.send(initial)` did before it
+                            // entered the loop. Dropping the stream drops
+                            // `sub`, whose `Drop` removes the subscriber slot
+                            // from the ProcessVariable.
+                            Some(MonitorStream::Upstream(
+                                UpstreamMonitor::from_pv(sub, event_field).with_seed(initial),
+                            ))
                         }
                         None => {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
-                            // the current value.
-                            let initial = snapshot_to_pv_field(&pv.snapshot());
-                            let _ = tx.send(initial).await;
+                            // the current value, then end the stream.
+                            let (tx, rx) = mpsc::channel::<PvField>(1);
+                            let _ = tx.send(snapshot_to_pv_field(&pv.snapshot())).await;
+                            Some(MonitorStream::Channel(rx))
                         }
                     }
                 }
                 PvEntry::Record(_rec) => {
                     // Subscribe via the public DbSubscription API.
                     use epics_base_rs::server::database::db_access::DbSubscription;
-                    let mut sub = match DbSubscription::subscribe(&db, &name).await {
-                        Some(s) => s,
-                        None => return None,
-                    };
-                    tokio::spawn(async move {
-                        while let Some(snap) = sub.recv_snapshot().await {
-                            let pv = snapshot_to_pv_field(&snap);
-                            if tx.send(pv).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    let sub = DbSubscription::subscribe(&db, &name).await?;
+                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
+                        sub,
+                        event_field,
+                    )))
                 }
             }
-            Some(rx)
         }
     }
+}
+
+/// The per-event transform the record-backed marked-monitor bridge task used
+/// to apply. A free `fn` so it can be a [`UpstreamMonitor`] map pointer.
+///
+/// `None` (the bridge's `continue`) is an event whose `DBE_*` class marks no
+/// leaf — no wire meaning, since C would have assigned none either.
+fn marked_update(
+    ev: epics_base_rs::server::pv::MonitorEvent,
+) -> Option<crate::server_native::source::MonitorUpdate> {
+    let marked = crate::nt::event_leaves(
+        ev.mask,
+        ev.snapshot.properties,
+        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
+    );
+    if marked.is_empty() {
+        return None;
+    }
+    Some(crate::server_native::source::MonitorUpdate {
+        marked: Some(marked),
+        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(&ev.snapshot))
+    })
+}
+
+/// The unmarked transform of the two plain `subscribe` bridge tasks: every
+/// event yields its snapshot as a `PvField`, none are filtered.
+fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
+    Some(snapshot_to_pv_field(&ev.snapshot))
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
@@ -1247,7 +1245,7 @@ mod tests {
             &self,
             pv: &str,
             ctx: ChannelContext,
-        ) -> Option<tokio::sync::mpsc::Receiver<PvField>>;
+        ) -> Option<MonitorStream<PvField>>;
     }
 
     impl PvaSourceTestExt for PvDatabaseSource {
@@ -1276,7 +1274,7 @@ mod tests {
             &self,
             pv: &str,
             ctx: ChannelContext,
-        ) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        ) -> Option<MonitorStream<PvField>> {
             let checked = self
                 .access()
                 .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
@@ -2243,19 +2241,21 @@ mod tests {
     /// sent one snapshot and dropped the channel, so a PVA PUT through the
     /// same server never reached the monitor. pvxs `SharedPV::post()` fans
     /// every update out to its stored subscribers (`sharedpv.cpp:417-440`).
+    /// The `value` leaf of a monitor frame, whether the source framed a bare
+    /// scalar or a full NT structure.
+    fn monitor_double(field: &PvField) -> Option<f64> {
+        match field {
+            PvField::Scalar(ScalarValue::Double(v)) => Some(*v),
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Double(v))) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn simple_pv_monitor_observes_later_puts() {
-        fn monitor_double(field: &PvField) -> Option<f64> {
-            match field {
-                PvField::Scalar(ScalarValue::Double(v)) => Some(*v),
-                PvField::Structure(s) => match s.get_field("value") {
-                    Some(PvField::Scalar(ScalarValue::Double(v))) => Some(*v),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-
         let db = Arc::new(PvDatabase::new());
         db.add_pv("SIMPLE:MON", EpicsValue::Double(1.0))
             .await
@@ -3293,6 +3293,116 @@ ASG(DEFAULT) {
             !property.iter().any(|l| l == "value" || l == "timeStamp"),
             "a property-only post assigns no value/timeStamp, got {property:?}"
         );
+    }
+
+    // ── UpstreamMonitor boundaries ─────────────────────────────────────
+    //
+    // The three monitor bridge tasks became `MonitorStream::Upstream`
+    // adapters that own the subscription and apply the transform on pull.
+    // Three boundaries the deleted tasks used to hold, one test each:
+    // the seed ordering, the empty-mask filter, and Empty-vs-Disconnected
+    // on the non-blocking path (the whole reason the adapters exist).
+
+    /// The `PvSubscription` bridge sent the connect-time snapshot before
+    /// entering its loop. The adapter must hand the same value out first —
+    /// and, unlike the task, without the consumer awaiting anything: this
+    /// is the property that lets an RTEMS operation thread drain a monitor
+    /// without a reactor.
+    #[tokio::test]
+    async fn the_upstream_seed_is_the_first_item_and_needs_no_await() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("SEED:MON", EpicsValue::Double(7.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+
+        let mut rx = src
+            .subscribe_ctx("SEED:MON", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("subscribe to simple PV");
+
+        let first = rx.try_recv().expect("the seed is available with no await");
+        assert_eq!(
+            monitor_double(&first),
+            Some(7.0),
+            "the first item is the connect-time snapshot"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "after the seed and before any post the stream is Empty, not \
+             Disconnected — the producer is alive"
+        );
+    }
+
+    /// The marked bridge's `if marked.is_empty() { continue; }`. The adapter
+    /// expresses it as `map -> None`, so the filter has to survive as a
+    /// property of the transform itself.
+    #[test]
+    fn an_event_whose_class_marks_nothing_is_filtered_out() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::snapshot::Snapshot;
+
+        let mk = |mask: EventMask| epics_base_rs::server::pv::MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+            origin: 0,
+            mask,
+        };
+
+        assert!(
+            marked_update(mk(EventMask::from_bits(0))).is_none(),
+            "a class that marks no leaf has no wire meaning — C assigns none \
+             either, so it must not reach the client as an update"
+        );
+        let value = marked_update(mk(EventMask::VALUE)).expect("a DBE_VALUE post is an update");
+        assert!(
+            value
+                .marked
+                .expect("a record update declares its marks")
+                .iter()
+                .any(|m| m == "value"),
+            "the positive control: a marking event still comes through"
+        );
+    }
+
+    /// A record monitor with nothing posted yet reports `Empty` (park), and
+    /// only reports `Disconnected` when the producer is really gone. Getting
+    /// this backwards would make an RTEMS drain loop tear down every idle
+    /// monitor, which is why the mapping is spelled once in `from_queue_err`.
+    #[tokio::test]
+    async fn an_idle_record_monitor_is_empty_not_disconnected() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:IDLE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check("AI:IDLE", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "an armed record monitor with no post yet is Empty"
+        );
+
+        db.put_record_field_from_ca_no_notify("AI:IDLE", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put");
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an update must post within 2s")
+            .expect("stream open");
     }
 
     /// A simple/mailbox PV has no record body; PROCESS reports unsupported

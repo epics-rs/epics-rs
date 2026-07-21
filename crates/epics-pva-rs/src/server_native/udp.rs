@@ -734,10 +734,9 @@ pub async fn run_udp_responder_on_socket(
                 if !filter_inbound(meta.src, &ignore_addrs) {
                     continue;
                 }
-                process_search_datagram(
+                let outputs = process_search_datagram(
                     &source,
-                    &socket,
-                    lo_mcast.as_ref(),
+                    lo_mcast.is_some(),
                     udp_port,
                     &buf[..frame_len],
                     meta.src,
@@ -748,6 +747,7 @@ pub async fn run_udp_responder_on_socket(
                     protocol,
                 )
                 .await;
+                dispatch_search_outputs(&socket, lo_mcast.as_ref(), outputs).await;
             }
             r = recv_lo => {
                 let r = match r {
@@ -791,10 +791,9 @@ pub async fn run_udp_responder_on_socket(
                         }
                         LoopbackClass::Drop => continue,
                     };
-                process_search_datagram(
+                let outputs = process_search_datagram(
                     &source,
-                    &socket,
-                    lo_mcast.as_ref(),
+                    lo_mcast.is_some(),
                     udp_port,
                     inner,
                     src,
@@ -805,6 +804,7 @@ pub async fn run_udp_responder_on_socket(
                     protocol,
                 )
                 .await;
+                dispatch_search_outputs(&socket, lo_mcast.as_ref(), outputs).await;
             }
         }
     }
@@ -890,11 +890,49 @@ fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
     !ignored
 }
 
+/// One datagram the search decoder decided to emit, and the path it must
+/// leave by. The decoder does not own a socket, so this is how it says
+/// "send this" — see [`process_search_datagram`].
+///
+/// Two variants because the two outputs genuinely leave by different
+/// sockets, not because one field means two things: a SEARCH_RESPONSE goes
+/// out on the per-NIC bundle (and may be pinned to a NIC), while an
+/// ORIGIN_TAG re-broadcast goes out on the loopback multicast socket (where
+/// a NIC hint would be meaningless).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SearchOutput {
+    /// SEARCH_RESPONSE for the per-NIC bundle.
+    Reply {
+        dest: SocketAddr,
+        /// NIC to send from. `None` means "let the OS route" — the
+        /// `reply_iface_ip = UNSPECIFIED` case, which arrives on
+        /// FromOriginTag packets whose peeled origDest was the all-zeros
+        /// `isAny()` and so carries no useful NIC pin.
+        iface_hint: Option<Ipv4Addr>,
+        bytes: Vec<u8>,
+    },
+    /// ORIGIN_TAG-prefixed re-broadcast for the loopback multicast socket.
+    OriginTagForward { dest: SocketAddr, bytes: Vec<u8> },
+}
+
 /// Process one fully-received UDP datagram: drain it for chained PVA
 /// messages (pvxs `udp_collector.cpp::process_one` L329) and reply to
 /// each SEARCH that matches a hosted PV. Replies route via the NIC
 /// matched by `reply_iface_ip` (with OS fallback), or to the SEARCH
 /// payload's announced reply addr when present.
+///
+/// **I/O-free.** It decides *what* to send and returns it; the caller owns
+/// the sockets and performs the sends ([`dispatch_search_outputs`] is the
+/// async responder's tail). That split exists so the blocking RTEMS driver
+/// — one `std::net::UdpSocket`, no `AsyncUdpV4`, no runtime — can reuse
+/// this decode verbatim and produce byte-identical replies, the same shape
+/// CA took for its blocking front-end (`epics-ca-rs` `ad477153`:
+/// `parse_search_datagram` pure, `send_reply_dg` the tail). RTEMS phase 6
+/// item 7 stage B, `doc/pva-rtems-item7-design.md` §3.3.
+///
+/// `origin_tag_forwarding` stands in for "a loopback multicast socket is
+/// bound": the forward path is skipped when it is `false`, exactly as it
+/// was skipped when `lo_mcast` was `None`.
 ///
 /// `origin` controls forwarding-related semantics:
 /// - [`Origin::Direct`]: no special handling; reply to the UDP source
@@ -907,8 +945,7 @@ fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn process_search_datagram(
     source: &DynSource,
-    socket: &AsyncUdpV4,
-    lo_mcast: Option<&Arc<tokio::net::UdpSocket>>,
+    origin_tag_forwarding: bool,
     udp_port: u16,
     frame: &[u8],
     udp_src: SocketAddr,
@@ -917,7 +954,8 @@ async fn process_search_datagram(
     tcp_port: u16,
     guid: [u8; 12],
     protocol: &'static str,
-) {
+) -> Vec<SearchOutput> {
+    let mut out_dgs: Vec<SearchOutput> = Vec::new();
     // Forward path (pvxs `udp_collector.cpp:387-396`): a unicast
     // SEARCH addressed at one of our NIC unicast IPs (origin=Direct +
     // unicast flag) is wrapped in CMD_ORIGIN_TAG and re-broadcast to
@@ -928,7 +966,7 @@ async fn process_search_datagram(
     // back via IP_MULTICAST_LOOP=1, where it re-enters this function
     // as origin=FromOriginTag and is processed locally.
     if origin == Origin::Direct {
-        if let Some(lo) = lo_mcast {
+        if origin_tag_forwarding {
             // Forwarding rule deviation from pvxs: pvxs classifies
             // by *destination address* (`udp_collector.cpp:286-318`)
             // because it has IP_PKTINFO cmsg telling it the original
@@ -971,10 +1009,8 @@ async fn process_search_datagram(
                         out.extend_from_slice(&forward);
                         let dest =
                             SocketAddr::V4(SocketAddrV4::new(ORIGIN_TAG_MCAST_GROUP, udp_port));
-                        if let Err(e) = lo.send_to(&out, dest).await {
-                            debug!("ORIGIN_TAG forward to {dest}: {e}");
-                        }
-                        return;
+                        out_dgs.push(SearchOutput::OriginTagForward { dest, bytes: out });
+                        return out_dgs;
                     }
                 }
             }
@@ -1009,7 +1045,11 @@ async fn process_search_datagram(
                             debug!(
                                 "forwarded SEARCH announced isAny() reply addr; dropping per pvxs"
                             );
-                            return;
+                            // Abandons the rest of the datagram, as the
+                            // pre-refactor `return` did; replies already
+                            // decided for earlier chained messages still go
+                            // out, as they were already sent before.
+                            return out_dgs;
                         }
                         // Direct origin: keep the UDP source's IP
                         // but use the announced reply port (pvxs
@@ -1044,20 +1084,18 @@ async fn process_search_datagram(
                     // origDest was the all-zeros isAny() — there's no
                     // useful NIC pin so go straight to OS routing
                     // instead of paying the AddrNotAvailable round-trip.
-                    let send = if reply_iface_ip.is_unspecified() {
-                        socket.send_to(&resp, reply_dest).await
+                    // Resolved to `None` here so the field the caller reads
+                    // means one thing: a NIC to send from.
+                    let iface_hint = if reply_iface_ip.is_unspecified() {
+                        None
                     } else {
-                        match socket.send_via(&resp, reply_dest, reply_iface_ip).await {
-                            Ok(n) => Ok(n),
-                            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
-                                socket.send_to(&resp, reply_dest).await
-                            }
-                            Err(e) => Err(e),
-                        }
+                        Some(reply_iface_ip)
                     };
-                    if let Err(e) = send {
-                        debug!("udp send to {reply_dest} via {reply_iface_ip}: {e}");
-                    }
+                    out_dgs.push(SearchOutput::Reply {
+                        dest: reply_dest,
+                        iface_hint,
+                        bytes: resp,
+                    });
                 }
                 consumed
             }
@@ -1070,6 +1108,57 @@ async fn process_search_datagram(
             break;
         }
         pos = pos.saturating_add(consumed);
+    }
+    out_dgs
+}
+
+/// Send what [`process_search_datagram`] decided, over the sockets this
+/// responder owns. The async responder's send tail, lifted out of the
+/// decoder unchanged: same destinations, same NIC pinning, same
+/// `AddrNotAvailable` fallback, same `debug!` text on failure.
+///
+/// An [`SearchOutput::OriginTagForward`] can only be produced when the
+/// caller passed `origin_tag_forwarding = true`, which the responder does
+/// exactly when `lo_mcast` is bound — so the `None` arm below is
+/// unreachable in this caller and logged rather than silently dropped.
+async fn dispatch_search_outputs(
+    socket: &AsyncUdpV4,
+    lo_mcast: Option<&Arc<tokio::net::UdpSocket>>,
+    outputs: Vec<SearchOutput>,
+) {
+    for out in outputs {
+        match out {
+            SearchOutput::Reply {
+                dest,
+                iface_hint,
+                bytes,
+            } => {
+                let send = match iface_hint {
+                    None => socket.send_to(&bytes, dest).await,
+                    Some(iface_ip) => match socket.send_via(&bytes, dest, iface_ip).await {
+                        Ok(n) => Ok(n),
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                            socket.send_to(&bytes, dest).await
+                        }
+                        Err(e) => Err(e),
+                    },
+                };
+                if let Err(e) = send {
+                    // `via` keeps the pre-refactor text, including the
+                    // `0.0.0.0` rendering of the no-NIC-pin case.
+                    let via = iface_hint.unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    debug!("udp send to {dest} via {via}: {e}");
+                }
+            }
+            SearchOutput::OriginTagForward { dest, bytes } => match lo_mcast {
+                Some(lo) => {
+                    if let Err(e) = lo.send_to(&bytes, dest).await {
+                        debug!("ORIGIN_TAG forward to {dest}: {e}");
+                    }
+                }
+                None => debug!("ORIGIN_TAG forward to {dest} dropped: no loopback socket"),
+            },
+        }
     }
 }
 
@@ -1935,7 +2024,162 @@ fn rebuild_beacon_forward(b: &BeaconForward, source: SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_native::MonitorStream;
     use crate::server_native::source::OpError;
+
+    /// Decode + dispatch in one call, with the argument list
+    /// `process_search_datagram` had before stage B split the sends out of
+    /// it. These cases are end-to-end by design — they assert on datagrams
+    /// a real sniffer socket receives, which is what makes them wire-golden
+    /// — so they keep driving both halves rather than inspecting the
+    /// returned [`SearchOutput`] list.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_and_dispatch(
+        source: &DynSource,
+        socket: &AsyncUdpV4,
+        lo_mcast: Option<&Arc<tokio::net::UdpSocket>>,
+        udp_port: u16,
+        frame: &[u8],
+        udp_src: SocketAddr,
+        reply_iface_ip: Ipv4Addr,
+        origin: Origin,
+        tcp_port: u16,
+        guid: [u8; 12],
+        protocol: &'static str,
+    ) {
+        let outputs = process_search_datagram(
+            source,
+            lo_mcast.is_some(),
+            udp_port,
+            frame,
+            udp_src,
+            reply_iface_ip,
+            origin,
+            tcp_port,
+            guid,
+            protocol,
+        )
+        .await;
+        dispatch_search_outputs(socket, lo_mcast, outputs).await;
+    }
+
+    /// Stage B's point, stated as a test: the decode half runs with **no
+    /// socket at all**. No `AsyncUdpV4`, no `tokio::net::UdpSocket`, and so
+    /// no `epics_base_rs::net` — none of which exist on the RTEMS target
+    /// (`doc/pva-rtems-item7-design.md` §1), which is why the blocking
+    /// driver could not reuse this decode before the split.
+    ///
+    /// The reply bytes must be exactly what the wire builder produces, so
+    /// a driver that sends them over `std::net::UdpSocket` is byte-identical
+    /// to this one.
+    #[tokio::test]
+    async fn the_search_decoder_produces_replies_without_a_socket() {
+        use crate::server_native::source::ChannelSource;
+        use std::sync::Arc;
+
+        struct OneSource;
+        #[allow(clippy::manual_async_fn)]
+        impl ChannelSource for OneSource {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { vec!["MY:PV".into()] }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == "MY:PV";
+                async move { m }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<crate::pvdata::FieldDesc>> + Send
+            {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<crate::pvdata::PvField>> + Send
+            {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: crate::pvdata::PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("read-only".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<MonitorStream<crate::pvdata::PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let source: DynSource = Arc::new(OneSource);
+        let codec = PvaCodec { big_endian: false };
+        // seq = 7, cid = 42, reply announced at 127.0.0.1:9999.
+        let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, false);
+        let udp_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 9, 5), 30000));
+        let guid = [3u8; 12];
+
+        let outputs = process_search_datagram(
+            &source,
+            false, // no ORIGIN_TAG forwarding
+            5076,
+            &frame,
+            udp_src,
+            Ipv4Addr::new(192, 168, 9, 10), // NIC the SEARCH arrived on
+            Origin::Direct,
+            5075,
+            guid,
+            "tcp",
+        )
+        .await;
+
+        let golden = build_search_response_proto(guid, 7, 5075, &[42], ByteOrder::Little, "tcp");
+        assert_eq!(
+            outputs,
+            vec![SearchOutput::Reply {
+                dest: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
+                iface_hint: Some(Ipv4Addr::new(192, 168, 9, 10)),
+                bytes: golden,
+            }],
+            "the decoder must return the announced reply dest, the arrival NIC, \
+             and byte-identical SEARCH_RESPONSE bytes"
+        );
+
+        // The `reply_iface_ip = UNSPECIFIED` sentinel — set on ORIGIN_TAG
+        // packets whose peeled origDest was `isAny()` — must resolve to
+        // "no NIC pin" rather than travel on as an address.
+        let outputs = process_search_datagram(
+            &source,
+            false,
+            5076,
+            &frame,
+            udp_src,
+            Ipv4Addr::UNSPECIFIED,
+            Origin::Direct,
+            5075,
+            guid,
+            "tcp",
+        )
+        .await;
+        assert!(
+            matches!(
+                outputs.as_slice(),
+                [SearchOutput::Reply {
+                    iface_hint: None,
+                    ..
+                }]
+            ),
+            "the UNSPECIFIED sentinel must resolve to `iface_hint: None`, got {outputs:?}"
+        );
+    }
 
     /// End-to-end forward path: `process_search_datagram` invoked
     /// with `Origin::Direct` and a unicast-flagged SEARCH MUST emit
@@ -1952,7 +2196,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Minimal source: has_pv returns false for every name. The
         // forward path triggers BEFORE local processing, so the
@@ -1992,7 +2235,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2017,7 +2260,7 @@ mod tests {
         // prefix as the orig destination.
         let reply_iface_ip = Ipv4Addr::new(192, 168, 99, 10);
 
-        process_search_datagram(
+        process_and_dispatch(
             &source,
             &socket,
             Some(&lo_mcast),
@@ -2073,7 +2316,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Same EmptySource as above; duplicated to keep the tests
         // independent of test-ordering.
@@ -2111,7 +2353,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2128,7 +2370,7 @@ mod tests {
         let codec = PvaCodec { big_endian: false };
         let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, true);
 
-        process_search_datagram(
+        process_and_dispatch(
             &source,
             &socket,
             Some(&lo_mcast),
@@ -2166,7 +2408,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         // Source that DOES claim to host "MY:PV" — proves the drop is
         // because of the isAny() rule, not because the PV was unknown.
@@ -2205,7 +2446,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2225,7 +2466,7 @@ mod tests {
         let codec = PvaCodec { big_endian: false };
         let frame = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], sniffer_addr.port(), false);
 
-        process_search_datagram(
+        process_and_dispatch(
             &source,
             &socket,
             None, // no lo_mcast — irrelevant for this code path
@@ -2263,7 +2504,6 @@ mod tests {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
         use std::time::Duration;
-        use tokio::sync::mpsc;
 
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
@@ -2300,7 +2540,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2324,7 +2564,7 @@ mod tests {
         let frame =
             codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], requester_addr.port(), false);
 
-        process_search_datagram(
+        process_and_dispatch(
             &source,
             &socket,
             Some(&lo_mcast),
@@ -2559,7 +2799,7 @@ mod tests {
             false,
         );
 
-        process_search_datagram(
+        process_and_dispatch(
             &source,
             &socket,
             None,
@@ -2592,7 +2832,6 @@ mod tests {
         use crate::pvdata::{FieldDesc, PvField};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
-        use tokio::sync::mpsc;
 
         // Claims "MY:PV" only for a requester at 10.0.0.5.
         struct ScopedSource;
@@ -2639,7 +2878,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -2686,7 +2925,6 @@ mod tests {
         use crate::pvdata::{FieldDesc, PvField, ScalarType};
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
-        use tokio::sync::mpsc;
 
         struct PresentSource;
         #[allow(clippy::manual_async_fn)]
@@ -2723,7 +2961,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _name: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }

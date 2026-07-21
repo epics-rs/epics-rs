@@ -1603,7 +1603,10 @@ impl ChannelSource for UpstreamArraySource {
     async fn is_writable(&self, _: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 
@@ -1941,7 +1944,10 @@ impl ChannelSource for RecordingDoublingSource {
     async fn is_writable(&self, _: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
     fn put_get_checked(
@@ -2180,7 +2186,10 @@ impl ChannelSource for PartialReadSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }
@@ -2324,7 +2333,9 @@ impl ChannelSource for MarkedMonitorSource {
         _checked: AccessChecked,
         _ctx: ChannelContext,
         _opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<tokio::sync::mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+    ) -> Option<
+        epics_pva_rs::server_native::MonitorStream<epics_pva_rs::server_native::MonitorUpdate>,
+    > {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         self.updates.lock().unwrap().push(tx);
         Some(rx)
@@ -2335,7 +2346,10 @@ impl ChannelSource for MarkedMonitorSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }
@@ -2448,7 +2462,10 @@ impl ChannelSource for RefusingUpstream {
     async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
         Err(OpError::remote(Self::refusal()))
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }

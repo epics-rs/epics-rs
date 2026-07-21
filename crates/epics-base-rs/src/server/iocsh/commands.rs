@@ -2735,18 +2735,15 @@ record(mbboDirect, "MBD0") {{ }}
     }
 
     /// Read a record's `VAL` as f64 (ai stores it as `Double`).
-    fn ai_val(db: &PvDatabase, ctx: &CommandContext, name: &str) -> f64 {
-        ctx.block_on(async {
-            let rec = db
-                .get_record(name)
-                .await
-                .unwrap_or_else(|| panic!("record '{name}' does not exist"));
-            let r = rec.read().await;
-            match r.record.get_field("VAL") {
-                Some(EpicsValue::Double(d)) => d,
-                other => panic!("unexpected VAL for '{name}': {other:?}"),
-            }
-        })
+    fn ai_val(db: &PvDatabase, _ctx: &CommandContext, name: &str) -> f64 {
+        let rec = db
+            .get_record(name)
+            .unwrap_or_else(|| panic!("record '{name}' does not exist"));
+        let r = rec.read();
+        match r.record.get_field("VAL") {
+            Some(EpicsValue::Double(d)) => d,
+            other => panic!("unexpected VAL for '{name}': {other:?}"),
+        }
     }
 
     /// A `.substitutions` fixture with per-row macros expands to one record
@@ -2868,11 +2865,11 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
 
         // Every field-visible property must match record-for-record.
         for name in ["IOC:AI1", "IOC:AI2"] {
-            ctx_t.block_on(async {
-                let rt = db_t.get_record(name).await.expect("template record");
-                let rr = db_r.get_record(name).await.expect("hand record");
-                let rt = rt.read().await;
-                let rr = rr.read().await;
+            {
+                let rt = db_t.get_record(name).expect("template record");
+                let rr = db_r.get_record(name).expect("hand record");
+                let rt = rt.read();
+                let rr = rr.read();
                 assert_eq!(
                     rt.record.record_type(),
                     rr.record.record_type(),
@@ -2889,7 +2886,7 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
                     "{name}: EGU parity"
                 );
                 assert_eq!(rt.common.udf, rr.common.udf, "{name}: UDF parity");
-            });
+            }
         }
     }
 

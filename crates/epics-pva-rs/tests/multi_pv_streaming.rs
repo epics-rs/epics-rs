@@ -56,7 +56,10 @@ impl ChannelSource for TwoSpeedSource {
     async fn is_writable(&self, _name: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _name: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }

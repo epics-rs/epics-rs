@@ -6,14 +6,23 @@
 //!   [`server_info`], [`op_handle`], [`monitor_control`], [`peers`]. No
 //!   sockets; drives the codec in [`crate::decode`] / [`crate::proto`].
 //!   Compiles for every target, RTEMS included.
-//! * **Async I/O layer** — [`tcp`], [`udp`], [`runtime`]. Built on
-//!   `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
+//! * **Async I/O layer** — [`accept`], [`tcp`], [`udp`], [`runtime`]. Built
+//!   on `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
 //!   None of those cross to `armv7-rtems-eabihf` (§8.1), so this layer is
 //!   host-only; RTEMS gets a blocking thread-per-client driver instead
 //!   (design doc §4, §9 phase 6 item 7), which will sit on the protocol
 //!   layer above. The gate is the target, not a feature: it is not a
 //!   choice a hosted build can make.
+//!
+//! [`accept`] is the TCP side's only socket-bearing module; [`tcp`] and the
+//! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
+//! second (blocking) driver is an addition beside [`accept`] rather than a
+//! `cfg` threaded through the protocol (`doc/pva-rtems-item7-design.md` §6).
+//! (`tcp` itself is still under the host-only gate pending the re-point that
+//! moves the gate to [`accept`] — the owed half named in `4c75e766`.)
 
+#[cfg(not(target_os = "rtems"))]
+pub mod accept;
 pub mod composite;
 pub mod monitor_control;
 pub mod op_handle;
@@ -44,5 +53,6 @@ pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{AddPvError, SharedPV, SharedSource};
 pub use source::{
     ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions,
-    MonitorUpdate, OpError, OpErrorKind, RawMonitorEvent, plain_monitor_updates,
+    MonitorStream, MonitorUpdate, OpError, OpErrorKind, RawMonitorEvent, UpstreamMonitor,
+    plain_monitor_updates,
 };

@@ -1,6 +1,6 @@
-//! TCP listener + per-connection handler.
+//! Per-connection handler.
 //!
-//! For each accepted client we spawn one task that:
+//! For each accepted client [`super::accept`] runs one task that:
 //!
 //! 1. Sends SET_BYTE_ORDER + CONNECTION_VALIDATION request
 //! 2. Reads client's CONNECTION_VALIDATION response (auth)
@@ -9,17 +9,25 @@
 //!    GET_FIELD / DESTROY_REQUEST / DESTROY_CHANNEL).
 //!
 //! Channel state is kept per-connection (a `HashMap<sid, ChannelState>`).
+//!
+//! This module owns no socket. The connection enters through
+//! [`handle_connection_io`], whose reader and writer are
+//! `Box<dyn AsyncRead/AsyncWrite>` trait objects — which driver produced
+//! them (the host accept loop in [`super::accept`], or the blocking
+//! thread-per-client driver coming with RTEMS phase 6 item 7) is not
+//! visible from here.
+//!
+//! No socket type is named anywhere in this file's production scope, and
+//! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::decode::{Frame, PeerRole, try_parse_frame_role};
@@ -36,6 +44,13 @@ use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
+
+// The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
+// these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
+// every existing caller and doc link. Owed when this branch combines with
+// `phase6/pva-rtems-dep-gate`: `accept` is host-only there, so these three
+// names need the same `#[cfg(not(target_os = "rtems"))]` the module gets.
+pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
 // 3b641bed) so a value used as the wrong ID type fails loudly instead of
@@ -1484,31 +1499,58 @@ impl Drop for WatermarkWithdrawOnDrop {
     }
 }
 
-/// Drive a per-op MONITOR gate ([`crate::server_native::source::
+/// Drives a per-op MONITOR gate ([`crate::server_native::source::
 /// MonitorGate`], supplied by the source on its `SubscriptionSeed`) from
-/// this op's executing-state watch. Applies the current state
-/// immediately on spawn — so a STOP that fired before this driver started
-/// is not missed — then re-applies on every edge [`MonitorStartControl`]
-/// publishes, coalescing to the latest executing state (idempotent
-/// `set_active`, so net state always matches `executing`). Runs in its own
-/// task so the hot monitor update loop is untouched; ends when the op tears
-/// down and drops the watch sender (the backing subscriptions are then
-/// removed with the aborted monitor — STOP=disable, teardown=remove).
-fn spawn_monitor_gate_driver(
-    gate: crate::server_native::source::MonitorGate,
-    mut exec_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    tokio::spawn(async move {
-        let mut cur = *exec_rx.borrow_and_update();
-        gate.set_active(cur).await;
-        while exec_rx.changed().await.is_ok() {
-            let desired = *exec_rx.borrow_and_update();
-            if desired != cur {
-                cur = desired;
-                gate.set_active(desired).await;
-            }
+/// this op's executing state.
+///
+/// This used to be a task of its own, watching the same
+/// `tokio::sync::watch` the subscriber loop already watches. It is now
+/// owned by that loop: the loop reads the executing state once per
+/// iteration and wakes on every edge (its `exec_rx.changed()` arm), so it
+/// is already at the exact observation points the driver task duplicated —
+/// the extra task bought a second observer, not a second observation.
+///
+/// Semantics carried over unchanged:
+///
+/// * The **first** application is unconditional (`applied: None`), which is
+///   what made a STOP that fired before the driver started not get missed.
+///   It is issued where the spawn used to be, before the loop is entered.
+/// * Every later application is edge-only, coalescing to the latest
+///   executing state — `set_active` is idempotent, so the net gate state
+///   always matches `executing`.
+/// * No gate (`None`) is the common case — only a QSRV db/group monitor
+///   supplies one — and costs one `Option` check per iteration.
+///
+/// Lifetime: ends with the subscriber. Teardown then removes the backing
+/// subscriptions along with the op (STOP=disable, teardown=remove), so no
+/// final edge is owed after the loop exits — the driver task did not apply
+/// one either; it simply ended when the watch sender dropped.
+struct MonitorGateDriver {
+    gate: Option<crate::server_native::source::MonitorGate>,
+    /// Last state handed to the gate; `None` until the unconditional first
+    /// application, which is what distinguishes "not yet applied" from
+    /// "applied, and it was Idle".
+    applied: Option<bool>,
+}
+
+impl MonitorGateDriver {
+    fn new(gate: Option<crate::server_native::source::MonitorGate>) -> Self {
+        Self {
+            gate,
+            applied: None,
         }
-    });
+    }
+
+    async fn apply(&mut self, executing: bool) {
+        let Some(gate) = &self.gate else {
+            return;
+        };
+        if self.applied == Some(executing) {
+            return;
+        }
+        self.applied = Some(executing);
+        gate.set_active(executing).await;
+    }
 }
 
 /// single owner of one MONITOR op's Executing<->Idle edge.
@@ -1887,9 +1929,10 @@ fn spawn_monitor_subscriber(
     };
 
     // Per-op executing-state watch. `MonitorStartControl` publishes each
-    // Executing<->Idle edge here; the subscriber loop reads it as its emit gate
-    // and (when the source supplies one) the `MonitorGate` driver reads it too.
-    // Starts `false` (Idle) — the first MONITOR START flips it to `true`.
+    // Executing<->Idle edge here and the subscriber loop is its ONLY reader:
+    // the loop uses it both as its emit gate and — via `MonitorGateDriver` —
+    // to drive the source's optional `MonitorGate`. Starts `false` (Idle);
+    // the first MONITOR START flips it to `true`.
     let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
     let start_ctl = Arc::new(MonitorStartControl::new(
         src.clone(),
@@ -1911,11 +1954,12 @@ fn spawn_monitor_subscriber(
         ioid,
         op_id: monitor_op_id,
     };
-    // One receiver clone drives the emit-gate loop; the original drives the
-    // optional `MonitorGate` (QSRV suspend/enable) driver on the decoded path.
-    let loop_exec_rx = monitor_exec_rx.clone();
+    // A single receiver, moved into the subscriber task. The second clone
+    // this used to make belonged to the `MonitorGate` driver task, which the
+    // loop now owns directly.
+    let loop_exec_rx = monitor_exec_rx;
 
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _fin_guard = MonitorFinishGuard {
             tx: mon_fin_tx,
             fin: mon_fin,
@@ -2148,9 +2192,17 @@ fn spawn_monitor_subscriber(
             updates: mut rx,
             on_start: seed_on_start,
         } = seed;
-        if let Some(gate) = seed_on_start {
-            spawn_monitor_gate_driver(gate, monitor_exec_rx);
-        }
+        // Owned by this loop rather than a task of its own; the
+        // unconditional first application happens here, where the spawn
+        // used to be, so a STOP that fired before the subscription opened
+        // is still not missed. `borrow` (not `borrow_and_update`) leaves the
+        // loop's own seen-state alone, so an edge landing between here and
+        // the first iteration is still delivered to `exec_rx.changed()`.
+        let mut gate_driver = MonitorGateDriver::new(seed_on_start);
+        // Bound to a local so the watch `Ref` is dropped before the await —
+        // it is not `Send`, and this future is spawned.
+        let executing_now = *exec_rx.borrow();
+        gate_driver.apply(executing_now).await;
         let mut queue_over_high = false;
         let wm_levels = wm_levels_init;
         let credit = MonitorPipelineCredit {
@@ -2211,6 +2263,12 @@ fn spawn_monitor_subscriber(
         let mut source_open = true;
         loop {
             let executing = *exec_rx.borrow_and_update();
+            // Apply this op's gate from the state we just read. The
+            // `exec_rx.changed()` arm below wakes the loop on every edge, so
+            // this reaches the source's suspend/resume as promptly as the
+            // driver task did — including while the loop is parked waiting
+            // for an update that a suspended upstream will never send.
+            gate_driver.apply(executing).await;
             // The terminal FINISH is Executing-gated, exactly like every DATA
             // frame: pvxs holds both the backlog and the finish until the client
             // is Executing (servermon.cpp:82,142-154). Break — and so send the
@@ -2379,320 +2437,6 @@ impl OpKind {
             OpKind::Process => Command::Process,
             OpKind::Array => Command::Array,
             OpKind::GetField => Command::GetField,
-        }
-    }
-}
-
-/// Run the TCP listener forever. Backwards-compat wrapper that
-/// drops per-peer stats — equivalent to calling
-/// [`run_tcp_server_with_peers`] with an empty registry the caller
-/// can never read.
-pub async fn run_tcp_server(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-) -> PvaResult<()> {
-    run_tcp_server_with_peers(
-        source,
-        bind_addr,
-        config,
-        crate::server_native::peers::PeerRegistry::new(),
-    )
-    .await
-}
-
-/// Run the TCP listener with an externally-shared
-/// [`PeerRegistry`](crate::server_native::PeerRegistry). lets [`crate::server_native::PvaServer::report`]
-/// observe per-connection stats.
-pub async fn run_tcp_server_with_peers(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-) -> PvaResult<()> {
-    let listener = TcpListener::bind(bind_addr).await.map_err(PvaError::Io)?;
-    // Standalone single-listener path (not driven by `PvaServer`): create
-    // and wire the channel invalidator here so a source served this way —
-    // e.g. a PVA gateway — still force-disconnects downstream channels on an
-    // operator `:drop`/`:flush`. `PvaServer`'s multi-listener path creates it
-    // once in `run_pva_server` and shares the one handle across every TCP/UDP
-    // listener; here there is a single listener, so a local handle suffices.
-    let channel_invalidator = ChannelInvalidator::new();
-    source.set_channel_invalidator(channel_invalidator.clone());
-    run_tcp_server_on_listener(source, listener, config, peers, channel_invalidator).await
-}
-
-/// Variant that takes a pre-bound [`TcpListener`]. Lets
-/// [`crate::server_native::PvaServer::start`] perform the bind
-/// synchronously (so the bound port is observable to callers) and
-/// then hand the listener to the spawned accept task. Eliminates
-/// the bind-race window that existed when the spawn-and-bind happened
-/// inside the spawned task — concurrent isolated tests can no longer
-/// have their picked-then-dropped ephemeral ports stolen by a peer.
-pub async fn run_tcp_server_on_listener(
-    source: DynSource,
-    listener: TcpListener,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-    // Server-wide channel invalidator. Each accepted connection holds a
-    // receiver; a source publishes the PV name(s) of any channel that must
-    // be force-disconnected out of band (PVA gateway operator `:drop`/`:flush`).
-    // See [`ChannelSource::set_channel_invalidator`].
-    channel_invalidator: ChannelInvalidator,
-) -> PvaResult<()> {
-    let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
-    debug!(?bind_addr, "TCP listener up");
-    let active = Arc::new(AtomicUsize::new(0));
-
-    #[cfg(feature = "tls")]
-    let tls_acceptor = config
-        .tls
-        .as_ref()
-        .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
-    // Without the `tls` feature there is no rustls type to build an acceptor
-    // from — and none is needed: `TlsServerConfig` is uninhabited, so
-    // `config.tls` is provably `None` and the config handle itself stands in
-    // as the acceptor slot. Same `Option` shape, so everything downstream
-    // (`acceptor.as_ref()`, `.is_some()`, the peek, the match) is untouched.
-    #[cfg(not(feature = "tls"))]
-    let tls_acceptor = config.tls.clone();
-
-    // track per-connection tasks in a JoinSet so they're
-    // aborted as a unit when this accept-loop future is dropped (e.g.
-    // PvaServer::stop() → tcp_handle.abort()). Without this, every
-    // per-conn task ran detached and lingered until its internal
-    // idle_timeout (~45s). The select! arm on `conn_tasks.join_next()`
-    // also reaps completed tasks so the set doesn't accumulate
-    // finished JoinHandles.
-    let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-    loop {
-        let accept_result = tokio::select! {
-            biased;
-            res = listener.accept() => res,
-            // Drain finished connection tasks. Returns None when the
-            // set is empty — that branch resolves immediately, but
-            // `biased` makes the listener arm preferred so we never
-            // starve incoming accepts.
-            Some(_) = conn_tasks.join_next() => continue,
-        };
-        match accept_result {
-            Ok((stream, peer)) => {
-                // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
-                // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
-                // TCP accept callback registers a `ServerConn` with no
-                // ignore-list check (serverconn.cpp:461-467). Applying it
-                // to TCP accepts here turned a discovery filter into a
-                // transport ACL, blocking direct clients that reach the
-                // endpoint via a name server / cached beacon / static
-                // address. The UDP path keeps the filter (`filter_inbound`).
-                let cur = active.fetch_add(1, Ordering::SeqCst);
-                if cur >= config.max_connections {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    warn!(
-                        ?peer,
-                        "rejecting connection: max_connections={}", config.max_connections
-                    );
-                    drop(stream);
-                    continue;
-                }
-                let src = source.clone();
-                let cfg = config.clone();
-                let active_dec = active.clone();
-                let acceptor = tls_acceptor.clone();
-                let peers_for_task = peers.clone();
-                let conn_invalidator = channel_invalidator.clone();
-                conn_tasks.spawn(async move {
-                    stream.set_nodelay(true).ok();
-                    // Enable OS-level TCP keepalive so half-open connections
-                    // (NAT timeout, dead client) are detected within ~30s
-                    // even when the protocol-level Echo path can't fire
-                    // (e.g. peer hasn't initialized control plane yet).
-                    // Defence-in-depth on top of the heartbeat ECHO timer:
-                    // pvxs itself does NOT set SO_KEEPALIVE — it relies on
-                    // libevent's `bufferevent_set_timeouts` for inactivity
-                    // detection. We add OS keepalive (CA-libca style) so a
-                    // pre-handshake half-open peer still gets reaped even
-                    // before the application timer arms.
-                    {
-                        let sock = socket2::SockRef::from(&stream);
-                        let keepalive = socket2::TcpKeepalive::new()
-                            .with_time(std::time::Duration::from_secs(15))
-                            .with_interval(std::time::Duration::from_secs(5));
-                        let _ = sock.set_keepalive(true);
-                        let _ = sock.set_tcp_keepalive(&keepalive);
-                    }
-
-                    // TLS-NAMESERVER: peek the first byte to dispatch
-                    // TLS vs plain PVA on a single port.
-                    //
-                    // TLS ClientHello record type = 0x16 — the TLS
-                    // client sends this IMMEDIATELY after TCP connect
-                    // (client-initiates). Plain PVA clients NEVER send
-                    // a first byte; the server sends SET_BYTE_ORDER first.
-                    //
-                    // Dispatch rule (pvxs uses separate listeners per
-                    // protocol via serverconn.h:193 `isTLS`; we unify):
-                    //   peek Ok(1) && byte == 0x16 → TLS path
-                    //   peek timeout (≤ 100 ms)    → plain PVA path
-                    //   peek Ok(1) && byte != 0x16  → plain PVA path
-                    //   peek Ok(0) / IO error       → drop (peer gone)
-                    //
-                    // 100 ms is enough for ClientHello to arrive (sent
-                    // immediately by TLS stack) while adding negligible
-                    // latency to plain PVA connections.
-                    const PEEK_WINDOW: Duration = Duration::from_millis(100);
-                    let is_tls_client = match acceptor.as_ref() {
-                        None => false,
-                        Some(_) => {
-                            let mut b = [0u8; 1];
-                            match tokio::time::timeout(PEEK_WINDOW, stream.peek(&mut b)).await {
-                                Ok(Ok(1)) => b[0] == 0x16,
-                                Ok(Ok(_)) => {
-                                    debug!(?peer, "peer closed before first byte");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "first-byte peek error: {e}");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                // Timeout → plain PVA client (server initiates).
-                                Err(_) => false,
-                            }
-                        }
-                    };
-
-                    // Anti-downgrade: when the operator requires TLS
-                    // (`disable_plaintext`), refuse a non-TLS peer before it
-                    // can reach the plain code path. pvxs enforces the
-                    // refusal on the CLIENT (it drops a plaintext SEARCH
-                    // reply, client.cpp:944); the Rust server unifies TLS +
-                    // plaintext on each listener via the peek above, so the
-                    // equivalent server-side guarantee lives here. Gated on
-                    // `acceptor.is_some()` so a misconfigured server with no
-                    // TLS identity does not refuse every connection (a server
-                    // cannot be TLS-only without TLS). A TLS ClientHello
-                    // (`is_tls_client`) is served normally below.
-                    if cfg.disable_plaintext && acceptor.is_some() && !is_tls_client {
-                        debug!(
-                            ?peer,
-                            "refusing plaintext connection: disable_plaintext set (TLS required)"
-                        );
-                        active_dec.fetch_sub(1, Ordering::SeqCst);
-                        return;
-                    }
-
-                    // register this connection in the peer registry
-                    // so PvaServer::report() can surface it. Deferred to
-                    // here (post-peek) so the `tls` flag reflects the
-                    // actual protocol, not the server config.
-                    let peer_entry = crate::server_native::peers::PeerEntry::new(is_tls_client);
-                    peers_for_task.insert(peer, peer_entry.clone());
-
-                    let result = match (acceptor, is_tls_client) {
-                        // cap the TLS handshake — a peer
-                        // that completes TCP but stalls during ClientHello
-                        // would otherwise hold a `max_connections` slot
-                        // until OS keepalive reaps it (~30s).
-                        //
-                        // The only arm that names a rustls type. Without the
-                        // `tls` feature the acceptor is `Option<Infallible>`
-                        // and the `_` arm below is already exhaustive.
-                        #[cfg(feature = "tls")]
-                        (Some(a), true) => {
-                            match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    // derive the peer's x509 identity from
-                                    // the *verified* certificate chain before
-                                    // splitting the stream. rustls only
-                                    // exposes `peer_certificates()` on the
-                                    // whole `TlsStream`, and the chain has
-                                    // already passed `WebPkiClientVerifier`,
-                                    // so this is the cryptographically-checked
-                                    // identity (pvxs `fill_credentials`).
-                                    //
-                                    // use trust_roots so that `authority`
-                                    // is populated even when the peer sends a
-                                    // partial chain (leaf-only or leaf+CA),
-                                    // matching pvxs SSL_get0_verified_chain.
-                                    let x509_id = {
-                                        let (_, conn) = tls_stream.get_ref();
-                                        let roots =
-                                            cfg.tls.as_ref().map(|t| t.trust_roots.as_ref());
-                                        conn.peer_certificates().and_then(|chain| match roots {
-                                            Some(r) => {
-                                                crate::auth::x509_credentials_from_chain_with_roots(
-                                                    chain, r,
-                                                )
-                                            }
-                                            None => crate::auth::x509_credentials_from_chain(chain),
-                                        })
-                                    };
-                                    let (r, w) = tokio::io::split(tls_stream);
-                                    handle_connection_io(
-                                        src,
-                                        Box::new(r),
-                                        Box::new(w),
-                                        peer,
-                                        cfg,
-                                        ConnInit {
-                                            peer_entry: peer_entry.clone(),
-                                            x509_identity: x509_id,
-                                            channel_invalidator: conn_invalidator,
-                                        },
-                                    )
-                                    .await
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "TLS handshake failed: {e}");
-                                    Err(PvaError::Io(e))
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        ?peer,
-                                        timeout = ?cfg.tls_handshake_timeout,
-                                        "TLS handshake timed out"
-                                    );
-                                    Err(PvaError::Protocol("TLS handshake timeout".into()))
-                                }
-                            }
-                        }
-                        _ => {
-                            // Plain PVA: no TLS configured, or client sent
-                            // non-TLS bytes (name-server, plain pvxs peer).
-                            let (r, w) = stream.into_split();
-                            handle_connection_io(
-                                src,
-                                Box::new(r),
-                                Box::new(w),
-                                peer,
-                                cfg,
-                                ConnInit {
-                                    peer_entry: peer_entry.clone(),
-                                    x509_identity: None,
-                                    channel_invalidator: conn_invalidator,
-                                },
-                            )
-                            .await
-                        }
-                    };
-                    if let Err(e) = result {
-                        debug!(?peer, "connection ended: {e}");
-                    }
-                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                    // drop the per-peer entry whether the
-                    // connection ended cleanly or via I/O error.
-                    peers_for_task.remove(peer);
-                });
-            }
-            Err(e) => {
-                error!("accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
         }
     }
 }
@@ -3090,8 +2834,9 @@ fn parse_client_credentials(
 /// and TLS-wrapped streams.
 type SrvRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
-/// Per-connection write side. Producers (main read loop, heartbeat,
-/// monitor subscribers) push fully-framed PVA messages into the
+/// Per-connection write side. Producers (the main read loop — including
+/// its heartbeat arm — and the monitor subscribers) push fully-framed
+/// PVA messages into the
 /// channel; a single dedicated writer task drains it in arrival order.
 /// Replaces `Arc<Mutex<SrvWrite>>` so a slow client cannot block other
 /// producers waiting for the lock. The channel is *bounded* —
@@ -3193,23 +2938,23 @@ type CcTx = mpsc::Sender<CreateChannelCompletion>;
 /// split stream to [`handle_connection_io`]: the peer's report entry, the
 /// verified mTLS identity (if any), and the server-wide channel-invalidation
 /// sender. Bundled to keep the IO handler's argument count within budget.
-struct ConnInit {
-    peer_entry: Arc<crate::server_native::peers::PeerEntry>,
+pub(super) struct ConnInit {
+    pub(super) peer_entry: Arc<crate::server_native::peers::PeerEntry>,
     /// x509 identity from the verified TLS peer chain, when this connection
     /// arrived over mutually-authenticated TLS. `None` for plain TCP or TLS
     /// without a client cert. When present it is the authoritative identity
     /// and overrides the CONNECTION_VALIDATION claim — mirrors pvxs
     /// `SSLContext::fill_credentials`.
-    x509_identity: Option<crate::auth::X509Credentials>,
+    pub(super) x509_identity: Option<crate::auth::X509Credentials>,
     /// Server-wide channel invalidator (see
     /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
     /// published PV name force-disconnects every channel this connection
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
-    channel_invalidator: ChannelInvalidator,
+    pub(super) channel_invalidator: ChannelInvalidator,
 }
 
-async fn handle_connection_io(
+pub(super) async fn handle_connection_io(
     source: DynSource,
     mut reader: SrvRead,
     mut writer_raw: SrvWrite,
@@ -3236,7 +2981,7 @@ async fn handle_connection_io(
     //    on a non-blocking socket; without a guard the writer task
     //    would hang and back-pressure both the heartbeat and the
     //    read-side dispatcher (since both push into the same mpsc).
-    //    We wrap `write_all` in `tokio::time::timeout(send_timeout)`
+    //    We wrap `write_all` in `runtime::task::timeout(send_timeout)`
     //    so a stalled write breaks the task, closes the mpsc, and
     //    fails fast. Mirrors the parallel guard in `epics-ca-rs`'s
     //    server-side dispatch wrap (the CA G1 audit fix).
@@ -3244,9 +2989,11 @@ async fn handle_connection_io(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(config.write_queue_depth);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = epics_base_rs::runtime::task::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            match tokio::time::timeout(send_tmo, writer_raw.write_all(&frame)).await {
+            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&frame))
+                .await
+            {
                 Ok(Ok(())) => {
                     // bytes_out counter for PvaServer::report().
                     peer_entry_writer.touch_tx(frame.len());
@@ -3266,17 +3013,39 @@ async fn handle_connection_io(
             }
         }
     });
-    // abort the writer + heartbeat tasks the moment the read
-    // loop returns. Without this, both linger up to `idle_timeout`
-    // (default 45s) emitting ECHOes into a channel nobody is reading
-    // and holding the writer half of the (now-disconnected) socket.
+    // abort the writer task the moment the read loop returns.
+    // Without this it lingers up to `idle_timeout` (default 45s) holding
+    // the writer half of the (now-disconnected) socket.
     // pvxs uses libevent-driven cleanup that shuts everything in one
-    // pass; we rely on tokio JoinHandle::abort() via AbortOnDrop.
+    // pass; we rely on the spawn seam's handle `abort()` via AbortOnDrop.
+    // The heartbeat needs no such guard: it is a deadline arm of this
+    // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
 
-    // Track per-connection liveness for the idle-timeout watchdog and the
-    // server-side echo heartbeat task.
-    let last_rx = Arc::new(AtomicU64::new(now_nanos()));
+    // Per-connection liveness for the idle-timeout watchdog. A plain local,
+    // not an `Arc<AtomicU64>`: the read loop both stamps it (on every frame)
+    // and reads it (in the heartbeat arm), so there is no second owner to
+    // share it with.
+    let mut last_rx = now_nanos();
+
+    // Server-side echo heartbeat as a deadline arm of the read loop rather
+    // than a per-connection task: send ECHO_REQUEST every 15 s, and stop
+    // beating once the peer has been silent for `idle_timeout`.
+    //
+    // `Interval::tick` is cancel-safe — losing the race in `select!` consumes
+    // no tick — so holding the interval across iterations reproduces the
+    // task's fixed 15 s cadence exactly, including tokio's default `Burst`
+    // catch-up if a long dispatch delays a tick.
+    let mut hb_tick = epics_base_rs::runtime::task::interval(Duration::from_secs(15));
+    // `interval` yields its first tick immediately; the task consumed it the
+    // same way, so the first beat lands 15 s in.
+    hb_tick.tick().await;
+    // Latched when the idle watchdog fires or the writer channel closes —
+    // the two conditions that used to `break` the task's loop. Note this
+    // stops the *heartbeat*, not the connection: the task ending never tore
+    // the connection down either (its `JoinHandle` was only ever aborted),
+    // so the existing "closing" wording overstates what happens.
+    let mut hb_stopped = false;
 
     // Outbound byte order as a shared, mutable per-connection cell, seeded
     // from the configured wire order. The read loop latches a new value if
@@ -3284,44 +3053,11 @@ async fn handle_connection_io(
     // conn.cpp:169-188 `sendBE`; old pvAccess accepts it from either peer
     // at any time). `true` = Big. Single writer (the read loop, which also
     // keeps an in-sync local `order` for the synchronous dispatch path it
-    // owns); one reader (the heartbeat task).
+    // owns); the readers are the spawned MONITOR subscriber tasks, which
+    // stamp each frame with the current order via their `order_now()`.
     let out_order = Arc::new(std::sync::atomic::AtomicBool::new(
         config.wire_byte_order.is_big(),
     ));
-
-    // Spawn server-side heartbeat: send ECHO_REQUEST every 15 s; close if
-    // we've been idle for `idle_timeout`.
-    let last_rx_hb = last_rx.clone();
-    let tx_hb = tx.clone();
-    let out_order_hb = out_order.clone();
-    let hb_handle = tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(15));
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let last = last_rx_hb.load(Ordering::SeqCst);
-            let elapsed = now_nanos().saturating_sub(last);
-            if Duration::from_nanos(elapsed) > idle_timeout {
-                warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
-                break;
-            }
-            // Read the current outbound order — the peer may have
-            // re-negotiated it via a mid-stream SET_BYTE_ORDER
-            // (pvxs conn.cpp:169-188).
-            let order_hb = if out_order_hb.load(Ordering::Relaxed) {
-                ByteOrder::Big
-            } else {
-                ByteOrder::Little
-            };
-            let h = PvaHeader::control(true, order_hb, ControlCommand::EchoRequest.code(), 0);
-            let mut buf = Vec::with_capacity(8);
-            h.write_into(&mut buf);
-            if tx_hb.send(buf).await.is_err() {
-                break;
-            }
-        }
-    });
-    let _hb_guard = AbortOnDrop(hb_handle.abort_handle());
 
     // Outbound order owner: this read loop. Mutable so a mid-stream
     // SET_BYTE_ORDER from the peer re-latches it (pvxs conn.cpp:169-188);
@@ -3668,6 +3404,29 @@ async fn handle_connection_io(
                 }
                 continue;
             }
+            _ = hb_tick.tick(), if !hb_stopped => {
+                // Server-side echo heartbeat, formerly its own per-connection
+                // task. Same cadence, same frame, same two stop conditions —
+                // only the owner changed, from a task reading `last_rx` and
+                // `out_order` through shared cells to this loop reading its
+                // own `last_rx` and `order` directly.
+                let elapsed = now_nanos().saturating_sub(last_rx);
+                if Duration::from_nanos(elapsed) > idle_timeout {
+                    warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
+                    hb_stopped = true;
+                    continue;
+                }
+                let h = PvaHeader::control(true, order, ControlCommand::EchoRequest.code(), 0);
+                let mut buf = Vec::with_capacity(8);
+                h.write_into(&mut buf);
+                if tx.send(buf).await.is_err() {
+                    // Writer gone. The loop-top `tx.is_closed()` check
+                    // unwinds the connection on the next iteration; stop
+                    // beating so this arm cannot spin in the meantime.
+                    hb_stopped = true;
+                }
+                continue;
+            }
             frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
                 frame_result?
             }
@@ -3675,7 +3434,7 @@ async fn handle_connection_io(
         // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
-        last_rx.store(now_nanos(), Ordering::SeqCst);
+        last_rx = now_nanos();
         if frame.header.flags.is_control() {
             // A peer may re-negotiate the connection byte order mid-stream
             // with another SET_BYTE_ORDER control frame. pvxs latches
@@ -4614,7 +4373,7 @@ async fn handle_put_get(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -4960,7 +4719,7 @@ async fn handle_process(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -5329,7 +5088,7 @@ async fn handle_channel_array(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
@@ -5463,7 +5222,9 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         let mut chunk = [0u8; 4096];
-        let n = match tokio::time::timeout(op_timeout, reader.read(&mut chunk)).await {
+        let n = match epics_base_rs::runtime::task::timeout(op_timeout, reader.read(&mut chunk))
+            .await
+        {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(PvaError::Io(e)),
             Err(_) => return Err(PvaError::Timeout),
@@ -5618,7 +5379,7 @@ async fn handle_create_channel(
         // resolution and the open callback agree.
         let open_cred = cred.clone();
         let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             for (cid, sid, nm) in batch {
                 let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
                     // Bind the owner that accepted this channel so every
@@ -6941,7 +6702,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let mut exec_fin_guard = ExecFinishGuard {
@@ -7091,7 +6852,7 @@ async fn handle_op(
                     success: false,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let join = tokio::spawn(async move {
+                let join = epics_base_rs::runtime::task::spawn(async move {
                     let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
@@ -7240,7 +7001,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7607,7 +7368,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7835,7 +7596,7 @@ async fn handle_get_field(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
         let _exec_fin_guard = ExecFinishGuard {
@@ -8343,6 +8104,51 @@ mod tests {
     use super::*;
     use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::MonitorStream;
+
+    /// Every task this file spawns for a *connection* — the writer, the MONITOR
+    /// subscriber, the CREATE_CHANNEL resolver, and the seven data-phase
+    /// execs — goes through `runtime::task::spawn`, not `tokio::spawn`
+    /// (RTEMS phase 6 item 5, stage 2). A bare `tokio::spawn` panics on a
+    /// thread with no tokio runtime, which is exactly the thread the blocking
+    /// driver will run a connection on — and it panics at *runtime*, on the
+    /// target, not here. So pin it as source inspection: production scope
+    /// must contain no `tokio::spawn` at all.
+    ///
+    /// Scope is this file, and after the accept loop moved to
+    /// [`super::super::accept`] (item 7 stage A) that is exactly the
+    /// connection scope the name claims. The rule is not *relaxed* for the
+    /// accept module — `accept.rs` carries the same zero-bare-`tokio::spawn`
+    /// assertion in its own tests, because its per-connection task is a
+    /// `JoinSet` method (`conn_tasks.spawn`), not this literal. What
+    /// `accept.rs` is additionally allowed, and this file is not, is the
+    /// non-spawn tokio surface a host socket driver needs: `TcpListener`, the
+    /// two TLS handshake deadlines, the accept-error backoff. Those are item
+    /// 7's to replace wholesale with a blocking driver, so pinning them here
+    /// would pin the wrong thing.
+    #[test]
+    fn connection_scope_spawns_go_through_the_runtime_seam() {
+        let src = include_str!("tcp.rs");
+        // Production scope ends at the first column-0 `#[cfg(test)]`.
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // Fail closed: an earlier `#[cfg(test)]` helper must not shrink the
+        // slice past the connection handler and make this pass vacuously.
+        assert!(
+            prod.contains("async fn handle_connection_io"),
+            "production slice no longer covers the connection handler"
+        );
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::spawn(");
+        let hits = prod.matches(literal).count();
+        assert_eq!(
+            hits, 0,
+            "production scope must spawn through `runtime::task::spawn`; \
+             found {hits} bare `{literal}`"
+        );
+    }
 
     /// a throwaway MONITOR-completion sender for `handle_op`
     /// calls in tests that do not exercise the read-loop owner's removal
@@ -8440,7 +8246,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_watermark(
@@ -12250,7 +12059,7 @@ mod tests {
     struct RawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
     }
 
     #[cfg(test)]
@@ -12273,13 +12082,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12300,7 +12109,7 @@ mod tests {
         let source: DynSource = Arc::new(RawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         channels.insert(
@@ -12465,7 +12274,7 @@ mod tests {
     struct FlipRawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
         gate: epics_base_rs::server::access_security::AccessGate,
     }
 
@@ -12492,13 +12301,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12528,7 +12337,7 @@ mod tests {
         let source: DynSource = Arc::new(FlipRawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
             gate,
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -12671,9 +12480,9 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(4);
-            Some(rx)
+            Some(rx.into())
         }
     }
 
@@ -13413,9 +13222,9 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -15152,7 +14961,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_channel_close(
@@ -15282,7 +15094,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn notify_channel_open(
@@ -16635,7 +16447,7 @@ mod tests {
             async fn is_writable(&self, _: &str) -> bool {
                 true
             }
-            async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -17147,7 +16959,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn process(
@@ -18879,7 +18691,7 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -19258,11 +19070,11 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             // Sender dropped immediately → receiver closed → the subscriber
             // loop sees end-of-stream and the task ends (source close).
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -19365,8 +19177,24 @@ mod tests {
             }
         });
 
-        let (exec_tx, exec_rx) = tokio::sync::watch::channel(false);
-        spawn_monitor_gate_driver(gate, exec_rx);
+        let (exec_tx, mut exec_rx) = tokio::sync::watch::channel(false);
+        // Stand-in for the subscriber loop, reduced to the two things that
+        // matter here: it reads the executing state and applies the gate once
+        // per iteration, and it wakes on every watch edge. The production
+        // loop does exactly this (`let executing = *exec_rx.borrow_and_update()`
+        // then `gate_driver.apply(executing).await`, with an
+        // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
+        // covers the same path end to end through a real MONITOR.
+        let mut gate_driver = MonitorGateDriver::new(Some(gate));
+        tokio::spawn(async move {
+            loop {
+                let executing = *exec_rx.borrow_and_update();
+                gate_driver.apply(executing).await;
+                if exec_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
         let ctl = MonitorStartControl::new(src.clone(), "dut".into(), bfr12_anon_ctx(), exec_tx);
 
         async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
@@ -19398,6 +19226,138 @@ mod tests {
             *starts.lock(),
             vec![true, false, true],
             "notify_monitor_start fires the same edges (only real edges, no initial apply)"
+        );
+    }
+
+    /// A source that hands the subscriber a gate plus an updates stream
+    /// that never produces — so the subscriber loop parks in `rx.recv()`.
+    #[derive(Clone)]
+    struct GatedQuietSource {
+        intro: FieldDesc,
+        gate_log: Arc<parking_lot::Mutex<Vec<bool>>>,
+        /// Keeps the updates channel open; dropping it would end the loop.
+        _keepalive: Arc<mpsc::Sender<crate::server_native::MonitorUpdate>>,
+        keep: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::MonitorUpdate>>>>,
+    }
+    impl crate::server_native::source::ChannelSource for GatedQuietSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            None
+        }
+        async fn subscribe_seeded(
+            &self,
+            _checked: crate::server_native::source::AccessChecked,
+            _ctx: crate::server_native::source::ChannelContext,
+            _opts: crate::server_native::MonitorOptions,
+        ) -> Option<
+            crate::server_native::source::SubscriptionSeed<crate::server_native::MonitorUpdate>,
+        > {
+            let log = self.gate_log.clone();
+            Some(crate::server_native::source::SubscriptionSeed {
+                initial: None,
+                updates: self.keep.lock().take()?.into(),
+                on_start: Some(crate::server_native::source::MonitorGate::new(
+                    move |active| {
+                        let log = log.clone();
+                        async move {
+                            log.lock().push(active);
+                        }
+                    },
+                )),
+            })
+        }
+    }
+
+    /// The gate driver is no longer a task of its own, so a START/STOP edge
+    /// now reaches the source only if the subscriber loop observes it. The
+    /// case that would expose a missed observation is precisely the one
+    /// where nothing else can wake the loop: a monitor with no updates
+    /// flowing, parked in `rx.recv()`. Drive INIT -> START -> STOP against
+    /// such a monitor and require the gate to see the initial Idle plus both
+    /// edges.
+    ///
+    /// Revert-verify: drop the per-iteration `gate_driver.apply(executing)`
+    /// (keeping only the pre-loop application) and the log stalls at
+    /// `[false]`.
+    #[tokio::test]
+    async fn bfr12_gate_reaches_a_parked_monitor() {
+        let intro = three_field_intro();
+        let gate_log = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(4);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: intro.clone(),
+            gate_log: gate_log.clone(),
+            _keepalive: Arc::new(keep_tx),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+
+        let (wire_tx, _wire_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (_join, start_ctl) = spawn_monitor_subscriber(MonitorSubscriberArgs {
+            sid: 1,
+            ioid: 2,
+            pv_name: "dut".into(),
+            intro: intro.clone(),
+            mask: BitSet::with_capacity(intro.total_bits()),
+            tx: ChannelTx::new(
+                wire_tx,
+                crate::server_native::peers::ChannelStat::new("dut".into()),
+            ),
+            src: src.clone(),
+            queue_depth: 4,
+            high_watermark: 0,
+            mon_ctx: bfr12_anon_ctx(),
+            window: None,
+            window_notify: None,
+            filters: Arc::new(Default::default()),
+            monitor_options: Default::default(),
+            wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            monitor_op_id: 7,
+            wm_levels: None,
+            mon_fin_tx,
+            out_order: fixed_out_order(ByteOrder::Little),
+        });
+
+        async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
+            for _ in 0..400 {
+                if log.lock().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("gate log never reached {n} entries: {:?}", log.lock());
+        }
+
+        // Initial Idle, applied where the driver used to be spawned. Wait for
+        // it before the first edge so the watch cannot coalesce the two.
+        wait_len(&gate_log, 1).await;
+        start_ctl.set(true); // START: resume the upstream
+        wait_len(&gate_log, 2).await;
+        start_ctl.set(false); // STOP: suspend it again, loop still parked
+        wait_len(&gate_log, 3).await;
+
+        assert_eq!(
+            *gate_log.lock(),
+            vec![false, true, false],
+            "a parked monitor must still relay initial Idle and both edges to \
+             its source gate"
         );
     }
 
@@ -19693,7 +19653,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -20648,7 +20608,10 @@ mod r14_tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }
@@ -20838,7 +20801,7 @@ mod bfr15_tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }

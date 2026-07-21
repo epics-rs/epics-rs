@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::error::CaResult;
-use crate::server::event_queue::EventReader;
+use crate::server::event_queue::{EventReader, TryRecvError};
 use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 use crate::types::{DbFieldType, EpicsValue};
@@ -366,6 +366,37 @@ impl DbSubscription {
             }
             return Some(event);
         }
+    }
+
+    /// Non-blocking [`Self::next_event`] — the same `ignore_origin` filter,
+    /// no suspension. Delegates to [`EventReader::try_recv`]
+    /// (`event_queue.rs:570`), which this subscription's queue already
+    /// provides; nothing new is queued or gated here.
+    ///
+    /// Exists so a consumer that adapts this stream (PVA's monitor sources)
+    /// can be polled from a blocking drain loop without a reactor — the RTEMS
+    /// backend, `doc/rtems-runtime-portability-design.md` §9 phase 6. A
+    /// skipped `ignore_origin` event does not end the poll: the loop keeps
+    /// taking until it finds a deliverable event or the queue reports empty,
+    /// so a self-origin post cannot be misread as "nothing available".
+    fn try_next_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        loop {
+            let event = self.reader.try_recv()?;
+            if self.ignore_origin != 0 && event.origin == self.ignore_origin {
+                continue;
+            }
+            return Ok(event);
+        }
+    }
+
+    /// Non-blocking [`Self::recv_snapshot`].
+    pub fn try_recv_snapshot(&mut self) -> Result<crate::server::snapshot::Snapshot, TryRecvError> {
+        self.try_next_event().map(|e| e.snapshot)
+    }
+
+    /// Non-blocking [`Self::recv_event`].
+    pub fn try_recv_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        self.try_next_event()
     }
 
     /// Wait for the next value change. Returns the new value as f64.

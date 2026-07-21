@@ -16,12 +16,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::source::{
-    AccessChecked, ChannelInvalidator, ChannelSource, DynSource, OpError, RawMonitorEvent,
+    AccessChecked, ChannelInvalidator, ChannelSource, DynSource, MonitorStream, OpError,
+    RawMonitorEvent,
 };
 
 /// One entry in the registry.
@@ -524,7 +524,7 @@ impl ChannelSource for CompositeSource {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -677,7 +677,7 @@ impl ChannelSource for CompositeSource {
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -690,7 +690,7 @@ impl ChannelSource for CompositeSource {
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -709,7 +709,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -728,7 +728,7 @@ impl ChannelSource for CompositeSource {
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
     > + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
@@ -745,7 +745,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -826,7 +826,7 @@ impl ChannelSource for CompositeSource {
     fn subscribe_raw(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -1107,7 +1107,7 @@ mod tests {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }
@@ -1165,7 +1165,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1259,7 +1259,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1363,7 +1363,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1655,7 +1655,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1836,7 +1836,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1963,7 +1963,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }

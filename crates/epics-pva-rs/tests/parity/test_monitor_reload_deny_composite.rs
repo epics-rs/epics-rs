@@ -20,6 +20,7 @@
 
 #![cfg(test)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -90,19 +91,19 @@ impl ChannelSource for VersionedChildSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let holder = self.tx_holder.clone();
         async move {
             let (tx, rx) = mpsc::channel::<PvField>(8);
             *holder.lock().await = Some(tx);
-            Some(rx)
+            Some(rx.into())
         }
     }
     fn subscribe_checked(
         &self,
         _: AccessChecked,
         _: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         // Delegate to the legacy `subscribe` so we exercise the same
         // tx_holder path. The composite's `subscribe_checked` already
         // re-mints `AccessChecked` against this gate, so the token
@@ -112,7 +113,7 @@ impl ChannelSource for VersionedChildSource {
         async move {
             let (tx, rx) = mpsc::channel::<PvField>(8);
             *holder.lock().await = Some(tx);
-            Some(rx)
+            Some(rx.into())
         }
     }
 }

@@ -299,6 +299,58 @@ pub fn interval(period: Duration) -> Interval {
     crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
+/// The timeout's error — "the deadline elapsed before the future completed".
+/// Hosted this is tokio's own type so `timeout` composes with tokio-aware
+/// callers; the exec backend substitutes a mirror (same Decision-B alias
+/// pattern as `TaskJoinError` — the consumed surface is Debug/Display only).
+#[cfg(tokio_backend)]
+pub use tokio::time::error::Elapsed;
+
+/// Exec-backend mirror of [`tokio::time::error::Elapsed`] (that type has no
+/// public constructor, so the runtime-free `timeout` below cannot return it).
+#[cfg(exec_backend)]
+#[derive(Debug)]
+pub struct Elapsed(());
+
+#[cfg(exec_backend)]
+impl std::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deadline has elapsed")
+    }
+}
+
+#[cfg(exec_backend)]
+impl std::error::Error for Elapsed {}
+
+/// Await `fut`, giving up after `duration` — the seam's only bounded wait.
+///
+/// It belongs here rather than at the call sites for the same reason [`sleep`]
+/// does: a deadline needs a timer, and which timer that is depends on the
+/// backend. Call sites that reach for `tokio::time::timeout` directly pin
+/// themselves to the tokio timer wheel.
+#[cfg(tokio_backend)]
+pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
+    tokio::time::timeout(duration, fut).await
+}
+
+/// RTEMS/exec: the same bounded wait raced against the delayed-callback
+/// timer's [`sleep`] — no tokio timer wheel, no runtime.
+#[cfg(exec_backend)]
+pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
+    let mut sleep = std::pin::pin!(sleep(duration));
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Ok(v));
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(Elapsed(())));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 pub fn runtime_handle() -> tokio::runtime::Handle {
     tokio::runtime::Handle::current()
 }
@@ -562,6 +614,22 @@ mod tests {
         let start = std::time::Instant::now();
         sleep(Duration::from_millis(10)).await;
         assert!(start.elapsed() >= Duration::from_millis(10));
+    }
+
+    // The two halves of `timeout`'s contract. They read as trivial against a
+    // tokio delegation, and that is the point: they are what a later backend
+    // swap has to keep true, on a seam whose whole purpose is to be
+    // reimplemented.
+    #[tokio::test]
+    async fn timeout_yields_the_value_when_the_future_finishes_first() {
+        let r = timeout(Duration::from_secs(30), async { 42 }).await;
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn timeout_elapses_on_a_future_that_never_finishes() {
+        let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        assert!(r.is_err());
     }
 
     #[test]

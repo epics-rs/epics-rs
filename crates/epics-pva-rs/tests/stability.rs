@@ -18,6 +18,7 @@
 
 #![allow(clippy::manual_async_fn)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -257,7 +258,7 @@ impl ChannelSource for MemSource {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let inner = self.inner.clone();
         let name = name.to_string();
         async move {
@@ -266,7 +267,7 @@ impl ChannelSource for MemSource {
             }
             let (tx, rx) = mpsc::channel::<PvField>(64);
             inner.subs.lock().await.entry(name).or_default().push(tx);
-            Some(rx)
+            Some(rx.into())
         }
     }
     fn notify_monitor_start(
@@ -2292,7 +2293,7 @@ impl ChannelSource for GatedArraySource {
     async fn is_writable(&self, _: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
         None
     }
     async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {

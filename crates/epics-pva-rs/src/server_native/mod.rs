@@ -3,9 +3,10 @@
 //! Two layers, split by whether they touch the network:
 //!
 //! * **Protocol / source layer** — [`source`], [`shared_pv`], [`composite`],
-//!   [`server_info`], [`op_handle`], [`monitor_control`], [`peers`]. No
-//!   sockets; drives the codec in [`crate::decode`] / [`crate::proto`].
-//!   Compiles for every target, RTEMS included.
+//!   [`server_info`], [`op_handle`], [`monitor_control`], [`config`],
+//!   [`search`], [`peers`]. No sockets; drives the codec in
+//!   [`crate::decode`] / [`crate::proto`]. Compiles for every target, RTEMS
+//!   included.
 //! * **Async I/O layer** — [`accept`], [`tcp`], [`udp`], [`runtime`]. Built
 //!   on `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
 //!   None of those cross to `armv7-rtems-eabihf` (§8.1), so this layer is
@@ -35,6 +36,9 @@ pub mod op_handle;
 pub mod peers;
 #[cfg(not(target_os = "rtems"))]
 pub mod runtime;
+// SEARCH parse / name-match / response framing. Protocol only — both the UDP
+// responders and the TCP-circuit handler feed it bytes they read themselves.
+pub mod search;
 pub mod server_info;
 pub mod shared_pv;
 pub mod source;

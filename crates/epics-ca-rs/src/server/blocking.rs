@@ -47,21 +47,38 @@
 //! # Scope and what is deferred
 //!
 //! Covered: GET/read, the connection lifecycle (handshake, channel
-//! create/clear), and — as of S1c part (a) — MONITORS. EVENT_ADD / EVENT_CANCEL
-//! are served by dedicated branches (ahead of the allowlist) that share the
-//! async server's [`register_subscription`] / `send_event` parity logic and
-//! hand each subscription's live reader to a second per-client event thread
+//! create/clear), MONITORS (S1c part a), and — as of S1c part (b) — WRITE /
+//! WRITE_NOTIFY. EVENT_ADD / EVENT_CANCEL are served by dedicated branches
+//! (ahead of the allowlist) that share the async server's
+//! [`register_subscription`] / `send_event` parity logic and hand each
+//! subscription's live reader to a second per-client event thread
 //! ([`run_event_task`], the C `dbEvent` `event_task` analogue) instead of
 //! spawning a task per subscription. EVENTS_ON / EVENTS_OFF flow-control the
 //! shared `EventUser` the event thread's readers consult, so gating matches the
 //! async server.
 //!
-//! Still deferred (S1c part b): WRITE / WRITE_NOTIFY. [`command_drives_without_spawn`]
-//! remains a *fail-closed* allowlist for everything not handled by a dedicated
-//! branch — an async (PACT) record's write returns a `ProcessCompletion::Async`
-//! tail that spawns, and the driver cannot tell sync from async records before
-//! processing, so both are refused with a clean CA error rather than driven on
-//! a runtime-less thread.
+//! WRITE / WRITE_NOTIFY (S1c part b) run the shared [`serve_write_head`] — the
+//! SAME SID/type/access gates, payload convert, DB write, trap-write bracket,
+//! and sync/error replies the async server runs (one copy) — driven to the
+//! synchronous head on THIS thread via `park_on`. C `camsgtask` never blocks on
+//! the async put-callback (`dbNotify.c` callDone fires later on a background
+//! thread), so when a record's process cycle goes async the head returns the
+//! completion receiver and the dispatch thread hands it to the event thread
+//! ([`EventTaskControl::WriteComplete`]); the event thread awaits it in its
+//! `select` and writes the deferred WRITE_NOTIFY reply under the SAME send lock,
+//! so the dispatch thread stays responsive and there is ONE owner of async
+//! socket writes. A plain fire-and-forget WRITE is always synchronous (no reply).
+//! [`command_drives_without_spawn`] stays a *fail-closed* allowlist for
+//! everything not handled by a dedicated branch.
+//!
+//! Not yet mirrored for WRITE_NOTIFY on the blocking driver: the async server's
+//! CHANNEL-level put-callback supersede (a second WRITE_NOTIFY on a channel with
+//! one in flight cancels the previous and replies ECA_PUTCBINPROG to it, C
+//! `write_notify_action:1660-1707`). The blocking driver keeps no per-channel
+//! in-flight-put map, so a second WRITE_NOTIFY is instead refused at the RECORD
+//! level (`dbNotify` `S_db_Blocked` → ECA_PUTCBINPROG on the NEW request) — the
+//! new request never displaces the pending one. Same completion correctness; the
+//! supersede-vs-refuse boundary differs and is a later increment.
 //!
 //! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
 //! async branch a READ can reach; it is unreachable for a local record
@@ -96,13 +113,15 @@ use crate::protocol::{
     CA_MINOR_VERSION, CA_PROTO_CLEAR_CHANNEL, CA_PROTO_CLIENT_NAME, CA_PROTO_CREATE_CHAN,
     CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_EVENTS_OFF,
     CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ, CA_PROTO_READ_NOTIFY,
-    CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader, ECA_UNAVAILINSERV, ca_v49,
+    CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
+    CaHeader, ECA_UNAVAILINSERV, ca_v49,
 };
 use crate::server::outbox::{self, OutboxDrain};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
-    SubscriptionDelivery, SubscriptionOutcome, cancel_subscription_reply, dispatch_message,
-    is_peer_disconnect, register_subscription, run_event_task, send_ca_error,
+    SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
+    dispatch_message, is_peer_disconnect, register_subscription, run_event_task, send_ca_error,
+    serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -513,8 +532,9 @@ fn handle_udp_search_blocking(
 /// Read/lifecycle commands whose shared dispatch handler drives to completion
 /// without spawning a task or awaiting genuine network I/O — i.e. the ones
 /// `park_on` can run on a runtime-less thread. This is an ALLOWLIST: it fails
-/// closed, so EVENT_ADD / WRITE / WRITE_NOTIFY (all spawn) and any unknown
-/// command are refused. See the module docs for why those are S1c.
+/// closed. EVENT_ADD / EVENT_CANCEL (S1c part a) and WRITE / WRITE_NOTIFY (S1c
+/// part b) are absent because they have dedicated branches ahead of it, NOT
+/// because they are refused; any genuinely unknown command still is.
 fn command_drives_without_spawn(cmmd: u16) -> bool {
     matches!(
         cmmd,
@@ -830,6 +850,48 @@ fn handle_client_blocking(
                             return Err(e);
                         }
                     }
+                } else if hdr.cmmd == CA_PROTO_WRITE || hdr.cmmd == CA_PROTO_WRITE_NOTIFY {
+                    // Drive the SYNCHRONOUS head of the write on this dispatch
+                    // thread via `park_on` (the DB/PV locks are runtime-agnostic).
+                    // `serve_write_head` is the SAME wire logic the async server
+                    // runs (one copy): SID/type/access gates, payload convert, the
+                    // DB write, the trap-write bracket, and every sync/error reply.
+                    // C `camsgtask` must NOT block on the async put-callback
+                    // completion (`dbNotify.c` callDone fires later on a background
+                    // thread), so an async record returns `AsyncPending` and this
+                    // thread returns at once, staying responsive to further
+                    // commands.
+                    match block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox)) {
+                        // Sync WRITE_NOTIFY reply / fire-and-forget WRITE / any
+                        // error frame is already queued in `outbox`; it flushes at
+                        // the loop top under the send lock.
+                        Ok(Ok(WriteHeadOutcome::Done)) => {}
+                        Ok(Ok(WriteHeadOutcome::AsyncPending(pending))) => {
+                            // The record's process cycle went async. Do NOT park
+                            // this thread on `rx`: hand the completion to the event
+                            // thread, which awaits the oneshot in its `select` and
+                            // writes the deferred WRITE_NOTIFY reply under the SAME
+                            // send lock (single owner of async socket writes). A
+                            // plain WRITE never reaches here (fire-and-forget is
+                            // always synchronous). If the event thread is already
+                            // gone the client is ending — drop the completion.
+                            let _ = ev_tx.send(EventTaskControl::WriteComplete(Box::new(pending)));
+                        }
+                        Ok(Err(e)) => {
+                            // A protocol violation (bad SID/type/payload) queued its
+                            // error frame; ship it, then end the circuit — same rule
+                            // as the async server (RSRV_ERROR).
+                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            return Err(e);
+                        }
+                        Err(_not_blockable) => {
+                            return Err(CaError::Protocol(
+                                "blocking CA driver: WRITE head not blockable in this \
+                                 thread context"
+                                    .into(),
+                            ));
+                        }
+                    }
                 } else if command_drives_without_spawn(hdr.cmmd) {
                     // Drive the shared handler to completion on this thread. No
                     // async runtime is entered, so `block_on_sync` uses `park_on`:
@@ -857,9 +919,9 @@ fn handle_client_blocking(
                         }
                     }
                 } else {
-                    // Not yet supported (writes are S1c part b). Fail closed with a
-                    // clean CA error and keep serving — never a panic or a silent
-                    // drop.
+                    // Not handled by any dedicated branch or the spawn-free
+                    // allowlist. Fail closed with a clean CA error and keep serving
+                    // — never a panic or a silent drop.
                     let _ = send_ca_error(
                         &outbox,
                         &hdr,
@@ -906,7 +968,8 @@ fn handle_client_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_base_rs::types::EpicsValue;
+    use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
+    use epics_base_rs::types::{DbFieldType, EpicsValue};
     use std::net::Ipv4Addr;
 
     /// The RTEMS constraint (S1): the blocking driver must not touch tokio's
@@ -1200,21 +1263,23 @@ mod tests {
         );
     }
 
-    /// The still-unsupported spawning commands (WRITE / WRITE_NOTIFY, S1c part
-    /// b) are refused with a clean CA error, not a panic — the fail-closed
-    /// allowlist. EVENT_ADD / EVENT_CANCEL are NOT in the allowlist either, but
-    /// they are now served by their own dedicated branches ahead of it (S1c
-    /// part a), so their absence here is not a refusal.
+    /// The dedicated-branch commands (EVENT_ADD / EVENT_CANCEL from S1c part a,
+    /// WRITE / WRITE_NOTIFY from S1c part b) are deliberately ABSENT from the
+    /// spawn-free allowlist — they are handled by their own branches ahead of it,
+    /// not refused. The allowlist still fails closed for a genuinely unknown
+    /// command.
     #[test]
-    fn unsupported_command_is_refused_cleanly() {
-        assert!(!command_drives_without_spawn(
-            crate::protocol::CA_PROTO_WRITE
-        ));
-        assert!(!command_drives_without_spawn(
-            crate::protocol::CA_PROTO_WRITE_NOTIFY
-        ));
+    fn dedicated_and_allowlisted_commands_are_classified() {
+        // Handled by dedicated branches, so not spawn-free-allowlisted.
+        assert!(!command_drives_without_spawn(CA_PROTO_WRITE));
+        assert!(!command_drives_without_spawn(CA_PROTO_WRITE_NOTIFY));
+        assert!(!command_drives_without_spawn(CA_PROTO_EVENT_ADD));
+        assert!(!command_drives_without_spawn(CA_PROTO_EVENT_CANCEL));
+        // Driven inline through the shared dispatch handler.
         assert!(command_drives_without_spawn(CA_PROTO_READ_NOTIFY));
         assert!(command_drives_without_spawn(CA_PROTO_CREATE_CHAN));
+        // An unknown command falls through to the fail-closed refusal.
+        assert!(!command_drives_without_spawn(0xEEEE));
     }
 
     /// A UDP VERSION prelude with a valid sequence number
@@ -1959,6 +2024,352 @@ mod tests {
         let upd2 = read_until_cmmd(&mut c2, CA_PROTO_EVENT_ADD);
         assert_eq!(monitor_reply_value(&upd2), 9.0);
         drop(c2);
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    // ---- S1c part (b): WRITE / WRITE_NOTIFY ----
+
+    static ASYNC_ONCE_FIELDS: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
+
+    /// A record whose FIRST `process()` goes async (the device round-trip C holds
+    /// PACT for) and whose next pass completes synchronously — the minimal shape
+    /// that drives a `CA_PROTO_WRITE_NOTIFY` put onto the
+    /// [`WriteHeadOutcome::AsyncPending`] fork. `VAL` is `pp(TRUE)`, so a put to
+    /// it processes the record; the put writes VAL, the process returns
+    /// `AsyncPending`, and the completion fires later on `complete_async_record`
+    /// (C `dbNotifyCompletion`). Mirrors `AsyncOnceRecord` in
+    /// `epics-base-rs/tests/put_notify_defers_on_pact.rs`.
+    struct AsyncOnceRecord {
+        val: f64,
+        pending: bool,
+    }
+
+    impl Record for AsyncOnceRecord {
+        fn record_type(&self) -> &'static str {
+            "asynconce_blk"
+        }
+
+        fn process(&mut self) -> CaResult<ProcessOutcome> {
+            if self.pending {
+                self.pending = false;
+                Ok(ProcessOutcome {
+                    result: RecordProcessResult::AsyncPending,
+                    actions: Vec::new(),
+                    device_did_compute: false,
+                })
+            } else {
+                Ok(ProcessOutcome::complete())
+            }
+        }
+
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" => Some(EpicsValue::Double(self.val)),
+                _ => None,
+            }
+        }
+
+        fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+            match name {
+                "VAL" => match value {
+                    EpicsValue::Double(v) => {
+                        self.val = v;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch("VAL".into())),
+                },
+                _ => Err(CaError::FieldNotFound(name.to_string())),
+            }
+        }
+
+        fn declared_fields(&self) -> &'static [FieldDesc] {
+            ASYNC_ONCE_FIELDS
+        }
+
+        fn process_passive_fields(&self) -> &'static [&'static str] {
+            &["VAL"]
+        }
+    }
+
+    /// A one-record database whose sole record's first process goes async.
+    fn seed_async_db(name: &str) -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        block_on_sync(db.add_record(
+            name,
+            Box::new(AsyncOnceRecord {
+                val: 0.0,
+                pending: true,
+            }),
+        ))
+        .expect("no runtime on test thread")
+        .expect("add_record");
+        db
+    }
+
+    /// A `CA_PROTO_WRITE_NOTIFY` (put-callback) frame for a scalar DBR_DOUBLE.
+    fn write_notify_frame(sid: u32, ioid: u32, dbr_type: u16, value: f64) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
+        h.data_type = dbr_type;
+        h.count = 1;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(8, 1, CA_MINOR_VERSION)
+            .expect("modern peer");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&value.to_be_bytes());
+        f
+    }
+
+    /// A deprecated fire-and-forget `CA_PROTO_WRITE` frame for a scalar
+    /// DBR_DOUBLE (no ioid, no reply expected).
+    fn plain_write_frame(sid: u32, dbr_type: u16, value: f64) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_WRITE);
+        h.data_type = dbr_type;
+        h.count = 1;
+        h.cid = sid;
+        h.available = 0;
+        h.set_payload_size(8, 1, CA_MINOR_VERSION)
+            .expect("modern peer");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&value.to_be_bytes());
+        f
+    }
+
+    /// The DBR_DOUBLE scalar value in a READ_NOTIFY reply (payload after the
+    /// 16-byte header).
+    fn read_notify_value(frame: &[u8]) -> f64 {
+        f64::from_be_bytes([
+            frame[16], frame[17], frame[18], frame[19], frame[20], frame[21], frame[22], frame[23],
+        ])
+    }
+
+    /// The WRITE_NOTIFY completion reply the SHARED path produces for an async
+    /// put on `AsyncOnceRecord`: `serve_write_head` (the sync head → the async
+    /// fork) then `finish_write_notify` (the deferred reply), driven entirely
+    /// in-process against its own db. The async server's WRITE_NOTIFY completion
+    /// task runs these exact functions, so these are the async server's bytes —
+    /// the byte-parity reference. Uses its own db so completing it here does not
+    /// perturb the server under test.
+    fn reference_write_notify_completion(put_val: f64, ioid: u32) -> Vec<u8> {
+        let db = seed_async_db("REF:ASYW");
+        let acf = new_acf();
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        state.apply_connection_identity(peer, None, None);
+        let (outbox, mut drain) = outbox::channel();
+
+        let run = |state: &mut ClientState, frame: Vec<u8>| {
+            let (hdr, hdr_size) =
+                CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
+            let payload = frame[hdr_size..].to_vec();
+            block_on_sync(dispatch_message(
+                &hdr, &payload, state, &db, &outbox, peer, None,
+            ))
+            .unwrap()
+            .unwrap();
+        };
+        run(&mut state, version_frame());
+        run(&mut state, create_chan_frame(0x1234, "REF:ASYW")); // -> sid 1
+
+        // The shared head must fork to AsyncPending for a WRITE_NOTIFY on the
+        // async record.
+        let wn = write_notify_frame(1, ioid, DBR_DOUBLE_MON, put_val);
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&wn, state.client_minor_version()).unwrap();
+        let payload = wn[hdr_size..].to_vec();
+        let outcome = block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox))
+            .expect("blockable")
+            .expect("head ok");
+        let mut p = match outcome {
+            WriteHeadOutcome::AsyncPending(p) => p,
+            WriteHeadOutcome::Done => {
+                panic!("WRITE_NOTIFY on the async record must fork to AsyncPending")
+            }
+        };
+
+        // The device round-trip finishes: C `dbNotifyCompletion` fires the
+        // completion, then the shared tail sends the deferred reply.
+        block_on_sync(db.complete_async_record("REF:ASYW"))
+            .expect("blockable")
+            .expect("completion");
+        let final_status = match block_on_sync(&mut p.rx).expect("blockable") {
+            Ok(()) => p.eca_status,
+            Err(_) => crate::protocol::ECA_PUTFAIL,
+        };
+        crate::server::tcp::finish_write_notify(&mut p.trap_guard, final_status, &p.reply, &outbox)
+            .expect("encode completion");
+
+        while let Some(f) = drain.try_next() {
+            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
+                return f;
+            }
+        }
+        panic!("reference produced no WRITE_NOTIFY completion frame");
+    }
+
+    /// (S1c-b-i) A WRITE_NOTIFY over a real TCP socket, on a record whose process
+    /// cycle goes async, returns the completion reply ONLY after the record
+    /// completes — and byte-identical to the shared head/finish path (= the async
+    /// server's completion bytes).
+    #[test]
+    fn write_notify_async_completion_matches_reference() {
+        let db = seed_async_db("BLK:ASYW");
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:ASYW")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        let ioid = 0x0BAD_F00D;
+        c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, 7.5))
+            .unwrap();
+
+        // No completion reply while the record's chain is still async.
+        c.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let peeked = c.peek(&mut probe);
+        assert!(
+            peeked.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "WRITE_NOTIFY must not reply before the async record completes, got {peeked:?}"
+        );
+
+        // The device round-trip finishes: the event thread ships the completion.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        block_on_sync(db.complete_async_record("BLK:ASYW"))
+            .unwrap()
+            .unwrap();
+        let reply = read_until_cmmd(&mut c, CA_PROTO_WRITE_NOTIFY);
+
+        let ioid_echo = u32::from_be_bytes([reply[12], reply[13], reply[14], reply[15]]);
+        assert_eq!(ioid_echo, ioid, "completion echoes the request ioid");
+
+        // Byte-for-byte parity against the shared head/finish path.
+        let reference = reference_write_notify_completion(7.5, ioid);
+        assert_eq!(
+            reply, reference,
+            "blocking WRITE_NOTIFY completion must be byte-identical to the shared \
+             serve_write_head/finish_write_notify path (= the async server's bytes)"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// (S1c-b-ii) A deprecated fire-and-forget CA_PROTO_WRITE performs the write
+    /// with NO reply frame — the next frame after it is the READ_NOTIFY readback,
+    /// which carries the written value.
+    #[test]
+    fn plain_write_performs_write_with_no_reply() {
+        let db = seed_db(&[("BLK:PW", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:PW")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        // Fire-and-forget WRITE, then a READ_NOTIFY readback pipelined behind it.
+        c.write_all(&plain_write_frame(sid, DBR_DOUBLE_MON, 7.5))
+            .unwrap();
+        let ioid = 0x0000_5A5A;
+        c.write_all(&read_notify_frame(sid, ioid, DBR_DOUBLE_MON))
+            .unwrap();
+
+        // The FIRST frame after the WRITE must be the READ_NOTIFY reply — a plain
+        // WRITE emits no response of its own.
+        let frame = read_one_frame(&mut c);
+        assert_eq!(
+            u16::from_be_bytes([frame[0], frame[1]]),
+            CA_PROTO_READ_NOTIFY,
+            "a fire-and-forget WRITE must emit no reply; the next frame is the READ_NOTIFY readback"
+        );
+        assert_eq!(
+            u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+            ioid,
+            "the readback echoes its own ioid"
+        );
+        assert_eq!(
+            read_notify_value(&frame),
+            7.5,
+            "the plain WRITE reached the record"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// (S1c-b-iii) While a WRITE_NOTIFY is pending (its record chain is still
+    /// async), the dispatch thread stays responsive to further commands: a
+    /// READ_NOTIFY issued before the record completes still gets its reply, and
+    /// the WRITE_NOTIFY completion arrives only once the record settles.
+    #[test]
+    fn dispatch_thread_stays_responsive_while_write_notify_pending() {
+        let db = seed_async_db("BLK:ASYR");
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:ASYR")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        // WRITE_NOTIFY that goes async: no completion yet (the record is PACT).
+        let wn_ioid = 0x0000_9999;
+        c.write_all(&write_notify_frame(sid, wn_ioid, DBR_DOUBLE_MON, 3.0))
+            .unwrap();
+
+        // The dispatch thread did NOT block on the put-callback: a READ_NOTIFY
+        // issued while the WRITE_NOTIFY is still pending gets its reply. (The put
+        // wrote VAL=3.0 before the process went async.)
+        let rd_ioid = 0x0000_0001;
+        c.write_all(&read_notify_frame(sid, rd_ioid, DBR_DOUBLE_MON))
+            .unwrap();
+        let rn = read_until_cmmd(&mut c, CA_PROTO_READ_NOTIFY);
+        assert_eq!(
+            u32::from_be_bytes([rn[12], rn[13], rn[14], rn[15]]),
+            rd_ioid,
+            "the dispatch thread served a READ_NOTIFY while the WRITE_NOTIFY was pending"
+        );
+        assert_eq!(
+            read_notify_value(&rn),
+            3.0,
+            "the READ sees the value the pending put wrote before going async"
+        );
+
+        // Now the record settles: the WRITE_NOTIFY completion arrives.
+        block_on_sync(db.complete_async_record("BLK:ASYR"))
+            .unwrap()
+            .unwrap();
+        let wn = read_until_cmmd(&mut c, CA_PROTO_WRITE_NOTIFY);
+        assert_eq!(
+            u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
+            wn_ioid,
+            "the deferred WRITE_NOTIFY completion echoes its request ioid"
+        );
 
         server.shutdown();
         accept.join().unwrap();

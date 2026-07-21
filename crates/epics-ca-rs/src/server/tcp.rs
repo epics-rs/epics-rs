@@ -407,7 +407,7 @@ struct InFlightPutNotify {
 /// the slot; a put that completes synchronously within the handler
 /// never installs an entry.
 #[derive(Clone, Default)]
-struct PutNotifySlot {
+pub(crate) struct PutNotifySlot {
     inner: Arc<std::sync::Mutex<Option<InFlightPutNotify>>>,
 }
 
@@ -3341,715 +3341,77 @@ pub(crate) async fn dispatch_message(
         }
 
         CA_PROTO_WRITE | CA_PROTO_WRITE_NOTIFY => {
-            let sid = hdr.cid;
-            let ioid = hdr.available;
-            let is_notify = hdr.cmmd == CA_PROTO_WRITE_NOTIFY;
-
-            // DBR_PUT_ACKT (35) and DBR_PUT_ACKS (36) are alarm-acknowledge
-            // writes — payload is a single u16 routed to the record's
-            // ACKT/ACKS field. Handle before the regular DbFieldType
-            // dispatch so we don't reject the type as unsupported.
-            if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT
-                || hdr.data_type == epics_base_rs::types::DBR_PUT_ACKS
-            {
-                let entry = match state.channels.get(&sid) {
-                    Some(e) => e,
-                    None => {
-                        // C `write_action` (camessage.c:736-738) +
-                        // `write_notify_action` (camessage.c:1642-1645):
-                        // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
-                        // `logBadId` emits an ECA_INTERNAL "Bad Resource
-                        // ID" frame (cid=0xFFFFFFFF), flushed before the
-                        // disconnect — same family as the EVENT_ADD bad-SID
-                        // and the matching READ branch below.
-                        send_ca_error(
-                            writer,
-                            hdr,
-                            ECA_INTERNAL,
-                            0xFFFF_FFFF,
-                            "Bad Resource ID",
-                            state.client_minor_version,
-                        )?;
-                        return Err(epics_base_rs::error::CaError::Protocol(format!(
-                            "WRITE (ACKT/ACKS) on unknown SID {} \
-                             (matches C write_action logBadId + RSRV_ERROR)",
-                            sid
-                        )));
-                    }
-                };
-                // Alarm-acknowledge PUTs travel
-                // the same WRITE wire opcodes but pre-fix bypassed
-                // the access_rights check that the regular WRITE
-                // path performs below. ACKT/ACKS mutate alarm-handler
-                // state — a `NoAccess` peer could silence alarms on
-                // any record they could open. Mirror the regular
-                // WRITE gate.
-                // Type-state: alarm-ack PUTs go
-                // through the same gate as regular WRITE. Token's
-                // `require_write` returns the matching ECA code on
-                // denial.
-                let entry_cid = entry.cid;
-                let _write_grant = match state.lookup_access(sid).require_write() {
-                    Ok(g) => g,
-                    Err(denied) => {
-                        if is_notify {
-                            send_put_notify_response(
-                                writer,
-                                hdr.data_type,
-                                hdr.actual_count(),
-                                denied.eca_code(),
-                                ioid,
-                                ReplyContext {
-                                    req_hdr: *hdr,
-                                    client_minor: state.client_minor_version,
-                                },
-                            )?;
-                        } else {
-                            // C `write_action` (`rsrv/camessage.c:741-751`)
-                            // sends `send_err(mp, ECA_NOWTACCESS, client,
-                            // RECORD_NAME(pciu->dbch))` even for the no-
-                            // notify WRITE. DBR_PUT_ACKT/DBR_PUT_ACKS
-                            // travel the same WRITE opcodes, so this
-                            // branch covers alarm-acknowledge PUTs too.
-                            // outer cid is `pciu->cid`.
-                            let audit_pv = match &entry.target {
-                                ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                                ChannelTarget::RecordField { record, field } => {
-                                    format!("{}.{}", record.read().name, field)
-                                }
-                            };
-                            send_ca_error(
-                                writer,
-                                hdr,
-                                denied.eca_code(),
-                                entry_cid,
-                                &audit_pv,
-                                state.client_minor_version,
-                            )?;
-                        }
-                        return Ok(());
-                    }
-                };
-                let value_u16 = if payload.len() >= 2 {
-                    u16::from_be_bytes([payload[0], payload[1]])
-                } else {
-                    0
-                };
-                // C dispatches alarm acknowledgement on the DBR *request type*
-                // inside `dbPut` (`dbAccess.c:1331-1335`), ABOVE the SPC_NOMOD
-                // gate that refuses an ordinary put to ACKT/ACKS — the client
-                // acknowledges through its normal (VAL) channel, and the field
-                // the channel names only feeds the DISP gate. Routing this as a
-                // field put to "ACKT"/"ACKS" would now be refused with
-                // S_db_noMod, exactly as `caput REC.ACKS 2` is.
-                let ack = if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT {
-                    epics_base_rs::server::record::AlarmAck::Transient
-                } else {
-                    epics_base_rs::server::record::AlarmAck::Severity
-                };
-                // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
-                // `write_notify_action`, so it shares the same
-                // per-channel put-callback serialisation as a regular
-                // WRITE_NOTIFY. Supersede any in-flight put-callback on
-                // this channel *before* the alarm-ack side effect — C
-                // cancels the previous `pPutNotify` and replies
-                // ECA_PUTCBINPROG to the superseded request rather than
-                // rejecting this one (`camessage.c:1660-1707`). The
-                // alarm-ack completes synchronously, so it never installs
-                // an entry of its own. The deprecated fire-and-forget
-                // CA_PROTO_WRITE path is not serialised in C.
-                if is_notify {
-                    let prev = entry.put_notify_slot.take();
-                    supersede_put_notify(prev, writer, state.client_minor_version)?;
-                }
-                let result = match &entry.target {
-                    ChannelTarget::RecordField { record, field } => {
-                        let name = record.read().name.clone();
-                        // Alarm-ack puts are immediate in C even for the
-                        // notify variant — `rsrv/camessage.c` writes ACKT/
-                        // ACKS via `dbPutField` and replies straight away,
-                        // never building a putNotify. Neither mode here
-                        // awaits a completion receiver, so park nothing.
-                        db.put_alarm_ack_from_ca(&name, field, ack, value_u16).await
-                    }
-                    ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
-                        "PUT_ACKT/PUT_ACKS only valid on record-backed channels".to_string(),
-                    )),
-                };
-                if is_notify {
-                    let eca = match &result {
-                        Ok(()) => PutStatus::OK,
-                        Err(e) => PutStatus::of_failure(e),
-                    };
-                    send_put_notify_response(
-                        writer,
-                        hdr.data_type,
-                        hdr.actual_count(),
-                        eca.eca(),
-                        ioid,
-                        ReplyContext {
-                            req_hdr: *hdr,
-                            client_minor: state.client_minor_version,
-                        },
-                    )?;
-                } else if let Err(e) = &result {
-                    // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
-                    // DBR_PUT_ACKS must surface put failure via
-                    // CA_PROTO_ERROR per C `write_action`
-                    // (`rsrv/camessage.c:781-789`). Pre-fix the
-                    // non-notify alarm-ack path silently swallowed
-                    // record-side write errors so the libca peer never
-                    // saw the failure.
-                    let audit_pv = match &entry.target {
-                        ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                        ChannelTarget::RecordField { record, field } => {
-                            format!("{}.{}", record.read().name, field)
-                        }
-                    };
-                    let eca = PutStatus::of_failure(e);
-                    send_ca_error(
-                        writer,
-                        hdr,
-                        eca.eca(),
-                        entry_cid,
-                        &audit_pv,
-                        state.client_minor_version,
-                    )?;
-                }
-                return Ok(());
-            }
-
-            // C `write_action` (`rsrv/camessage.c:735-739`) and
-            // `write_notify_action` (`camessage.c:1641-1645`) call
-            // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
-            // path goes through `logBadId` + RSRV_ERROR — emitting the
-            // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
-            // regardless of whether the type is also invalid. Pre-fix
-            // Rust ran the type check first and emitted an ECA_BADTYPE
-            // error frame for the SID+type combo where rsrv sends the
-            // bad-SID ECA_INTERNAL frame instead. Reorder to match C.
-            let entry = match state.channels.get(&sid) {
-                Some(e) => e,
-                None => {
-                    // Same C logBadId + RSRV_ERROR family as the
-                    // ACKT/ACKS branch above and the READ branch: an
-                    // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
-                    // is buffered then flushed ahead of the disconnect.
-                    send_ca_error(
-                        writer,
-                        hdr,
-                        ECA_INTERNAL,
-                        0xFFFF_FFFF,
-                        "Bad Resource ID",
-                        state.client_minor_version,
-                    )?;
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
-                        sid
-                    )));
-                }
-            };
-            // channel-scoped CA_PROTO_ERROR replies must echo
-            // `pciu->cid` (the CLIENT cid the libca peer allocated),
-            // not the server-side SID we received in `hdr.cid`. C
-            // `vsend_err` (`rsrv/camessage.c:160-170`) looks up the
-            // `channel_in_use` and uses its `cid` field for the outer
-            // error header. Captured here as a Copy so the error sites
-            // below can use it after the `entry` borrow ends.
-            let entry_cid = entry.cid;
-            // Clone the per-channel put-callback slot (Arc-backed) so the
-            // supersede gate and the async-completion install below use it
-            // without holding the `entry` borrow across them.
-            let put_notify_slot = entry.put_notify_slot.clone();
-
-            // Resolve the audit-friendly PV name once. Cheap when audit
-            // is off because state.audit() is a single None check.
-            let audit_pv = match &entry.target {
-                ChannelTarget::SimplePv(pv) => pv.name.clone(),
-                ChannelTarget::RecordField { record, field } => {
-                    format!("{}.{}", record.read().name, field)
-                }
-            };
-
-            // The DBR-type gate and the write-access gate run in
-            // OPPOSITE orders for the two write opcodes, and the order is
-            // observable when BOTH fail: a bad type tears the connection
-            // down (RSRV_ERROR), denied access keeps it (RSRV_OK), and
-            // only the gate that runs FIRST reports its error.
-            //
-            // * `write_notify_action` (camessage.c:1647-1656): TYPE first
-            //   (ECA_BADTYPE → RSRV_ERROR/drop), THEN access
-            //   (ECA_NOWTACCESS → RSRV_OK/keep).
-            // * `write_action` (camessage.c:741-766): ACCESS first
-            //   (ECA_NOWTACCESS → RSRV_OK/keep). There is NO standalone
-            //   type pre-check — the type is validated only by
-            //   `caNetConvert` (camessage.c:753) AFTER access passes
-            //   (ECA_BADTYPE → RSRV_ERROR/drop).
-            //
-            // So a deprecated CA_PROTO_WRITE carrying an unsupported DBR
-            // type to a channel the peer cannot write must reply
-            // ECA_NOWTACCESS and KEEP the connection — not ECA_BADTYPE +
-            // drop. Pre-fix Rust ran the type gate first for both
-            // opcodes, inverting `write_action`. Each gate's witness type
-            // (`write_type`, `write_grant`) flows to the write below.
-            //
-            // A type-state WRITE gate: `lookup_access` is the only path
-            // to the cache; the witness ensures the matching ECA code
-            // reaches the wire.
-            let (write_type, write_grant) = if is_notify {
-                let write_type = match DbFieldType::from_u16(hdr.data_type) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        // C `putNotifyErrorReply` (camessage.c:1482-1501)
-                        // preserves `m_dataType`/`m_count` from the
-                        // request, then returns RSRV_ERROR (drop) — a
-                        // peer sending an unsupported DBR has a corrupted
-                        // dispatcher or is probing, so C drops.
-                        send_put_notify_response(
-                            writer,
-                            hdr.data_type,
-                            hdr.actual_count(),
-                            ECA_BADTYPE,
-                            ioid,
-                            ReplyContext {
-                                req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
-                            },
-                        )?;
-                        return Err(epics_base_rs::error::CaError::Protocol(format!(
-                            "WRITE_NOTIFY with unsupported DBR type {} (matches C write_notify_action RSRV_ERROR)",
-                            hdr.data_type
-                        )));
-                    }
-                };
-                let write_grant = match state.lookup_access(sid).require_write() {
-                    Ok(g) => g,
-                    Err(denied) => {
-                        // route through the refinement helper so
-                        // large-array put-callbacks refused by ACF carry
-                        // the extended-form count instead of the u16
-                        // marker.
-                        send_put_notify_response(
-                            writer,
-                            write_type as u16,
-                            hdr.actual_count(),
-                            denied.eca_code(),
-                            ioid,
-                            ReplyContext {
-                                req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
-                            },
-                        )?;
-                        state.audit("caput", &audit_pv, "", "denied");
-                        return Ok(());
-                    }
-                };
-                (write_type, write_grant)
-            } else {
-                // C `write_action` (camessage.c:741-750) emits
-                // `send_err(mp, ECA_NOWTACCESS, ...)` and returns RSRV_OK
-                // (keep) BEFORE any type handling. Without surfacing this
-                // the Rust server dropped denied PROTO_WRITEs silently —
-                // libca's `cac::exception` never fired, so a `caput` from
-                // a read-only peer looked like it had succeeded even
-                // though the value never reached the DB.
-                let write_grant = match state.lookup_access(sid).require_write() {
-                    Ok(g) => g,
-                    Err(denied) => {
-                        send_ca_error(
-                            writer,
-                            hdr,
-                            denied.eca_code(),
-                            entry_cid,
-                            &audit_pv,
-                            state.client_minor_version,
-                        )?;
-                        state.audit("caput", &audit_pv, "", "denied");
-                        return Ok(());
-                    }
-                };
-                // Type validated only after access passes (C
-                // `caNetConvert`, camessage.c:753) — a bad type here is a
-                // protocol violation → RSRV_ERROR/drop.
-                let write_type = match DbFieldType::from_u16(hdr.data_type) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        send_ca_error(
-                            writer,
-                            hdr,
-                            ECA_BADTYPE,
-                            entry_cid,
-                            "bad data type",
-                            state.client_minor_version,
-                        )?;
-                        return Err(epics_base_rs::error::CaError::Protocol(format!(
-                            "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
-                            hdr.data_type
-                        )));
-                    }
-                };
-                (write_type, write_grant)
-            };
-
-            // the write-trap mask of the ACF rule that
-            // authorised this write. C `asTrapWriteWithData`
-            // (`rsrv/camessage.c:768-779`) consults
-            // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
-            // rule with no trap option — is not reported to
-            // put-logging listeners. Pre-fix Rust hard-coded
-            // `rule_was_trap: true` for every accepted write.
-            let rule_was_trap = write_grant.rule_was_trap();
-
-            // Supersede any in-flight put-callback on this channel here —
-            // after the SID/type/access checks and *before* any side
-            // effect (payload conversion, trap-write `BeforeWrite`
-            // dispatch, the database/PV write, or the async device
-            // kickoff). C `write_notify_action`
-            // (`rsrv/camessage.c:1660-1707`) reaches this boundary —
-            // after `rsrvCheckPut` and before `caNetConvert` /
-            // `asTrapWriteWithData` / `dbProcessNotify` — with the
-            // channel's previous `pPutNotify` either already completed or
-            // cancelled (`dbNotifyCancel` + ECA_PUTCBINPROG to the
-            // superseded request). It never rejects the new request.
-            // `supersede_put_notify` does exactly that: it cancels the
-            // prior put-callback's completion-wait and replies
-            // ECA_PUTCBINPROG to the superseded ioid (when this path wins
-            // the response-ownership race), then this put proceeds. The
-            // deprecated fire-and-forget CA_PROTO_WRITE path is not
-            // serialised in C, so it is left untouched.
-            if is_notify {
-                let prev = put_notify_slot.take();
-                supersede_put_notify(prev, writer, state.client_minor_version)?;
-            }
-
-            let count = hdr.actual_count() as usize;
-            // Echo the FULL 32-bit count
-            // (`hdr.actual_count()`); pre-fix used `hdr.count`
-            // which is the 0 marker for extended requests and
-            // therefore lost the count on large array put-callbacks.
-            let write_count = hdr.actual_count();
-            let new_value = match EpicsValue::from_bytes_array(write_type, payload, count) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Same C parity rule as the data_type gate above:
-                    // bad payload bytes (wrong length, malformed wire
-                    // bytes) is a protocol violation → emit error +
-                    // drop the connection. C `caNetConvert` failure
-                    // in `write_action` returns RSRV_ERROR.
-                    if is_notify {
-                        // Same `putNotifyErrorReply` shape.
-                        send_put_notify_response(
-                            writer,
-                            hdr.data_type,
-                            hdr.actual_count(),
-                            ECA_BADTYPE,
-                            ioid,
-                            ReplyContext {
-                                req_hdr: *hdr,
-                                client_minor: state.client_minor_version,
-                            },
-                        )?;
-                    } else {
-                        send_ca_error(
-                            writer,
-                            hdr,
-                            ECA_BADTYPE,
-                            entry_cid,
-                            "bad WRITE payload bytes",
-                            state.client_minor_version,
-                        )?;
-                    }
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
-                        hdr.data_type, count
-                    )));
-                }
-            };
-
-            // Stringify the value once for the audit log; skipped when
-            // audit is off. Use the truncated renderer so a malicious
-            // peer can't pin the dispatch task on `format!`-ing a
-            // peer-controlled array of millions of elements.
-            //
-            // TRAPWRITE listeners also need a string form. We
-            // render once when *either* audit or a trap-write listener
-            // is registered; the truncated form is cheap and lets
-            // listeners avoid touching the raw `EpicsValue`.
-            let trap_listeners_active =
-                epics_base_rs::server::access_security::has_trap_write_listeners();
-            let display_value = if state.audit.is_some() || trap_listeners_active {
-                new_value.display_truncated(64)
-            } else {
-                String::new()
-            };
-
-            // One RAII guard owns this put's BeforeWrite/AfterWrite
-            // pair. `begin` fires BeforeWrite now; the matching
-            // AfterWrite fires from `complete` (the synchronous paths
-            // and the async completion task, once the real status is
-            // known) or — if neither runs because the put was aborted
-            // first, a superseding WRITE_NOTIFY or a client teardown
-            // calling `abort` on the completion task — from the guard's
-            // Drop. This makes the C invariant hold by construction:
-            // every `asTrapWriteWithData` is matched by exactly one
-            // `asTrapWriteAfter` on all rsrv exit paths — completion
-            // (`camessage.c:1400`), still-busy teardown
-            // (`rsrvFreePutNotify`, :1620), and supersede-cancel
-            // (`write_notify_action`, :1700). Pre-fix the AfterWrite was
-            // an explicit dispatch that the abort paths skipped, leaving
-            // a BeforeWrite with no match in the put-log.
-            //
-            // BeforeWrite still sits here (not inside each write arm):
-            // C `asTrapWriteWithData` (`camessage.c:768-779`) fires
-            // before `dbChannel_put`, and narrowing the bracket into the
-            // match arms would not remove the pre-storage over-log
-            // (RecordField pre-rejections happen inside the called
-            // function) without a deeper refactor.
-            let mut trap_guard = trap_listeners_active.then(|| {
-                epics_base_rs::server::access_security::TrapWriteGuard::begin(
-                    epics_base_rs::server::access_security::TrapWriteFields {
-                        pv_name: audit_pv.clone(),
-                        user: state.username.clone(),
-                        host: state.hostname.as_str().to_string(),
-                        peer: state.peer.clone(),
-                        value_str: display_value.clone(),
-                        dbr_type: write_type as u16,
-                        no_elements: write_count,
-                        event_id: epics_base_rs::server::access_security::next_trap_write_event_id(
-                        ),
-                        rule_was_trap,
-                        // C carries no status on the cancelled-put
-                        // `asTrapWriteAfter`; this Rust enrichment marks
-                        // the supersede / teardown tail so listeners can
-                        // tell it from a clean completion.
-                        cancel_status: "cancel".to_string(),
-                    },
-                )
-            });
-
-            // The completion outcome of the synchronous head of this write —
-            // `Sync` (reply inline) vs `Async(handle)` (spawn a completion task
-            // that replies when the record's chain settles). A simple PV and a
-            // fire-and-forget `CA_PROTO_WRITE` are always synchronous.
-            use epics_base_rs::server::record::ProcessCompletion;
-            let write_result: CaResult<ProcessCompletion> = match &entry.target {
-                ChannelTarget::SimplePv(pv) => {
-                    if let Some(hook) = pv.write_hook() {
-                        let ctx = epics_base_rs::server::pv::WriteContext {
-                            user: state.username.clone(),
-                            host: state.hostname.as_str().to_string(),
-                            peer: state.peer.clone(),
-                        };
-                        hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
-                    } else {
-                        pv.set(new_value).await;
-                        Ok(ProcessCompletion::Sync)
-                    }
-                }
-                ChannelTarget::RecordField { record, field } => {
-                    let name = record.read().name.clone();
-                    if is_notify {
-                        db.put_record_field_from_ca(&name, field, new_value).await
-                    } else {
-                        // C `write_action` (`rsrv/camessage.c:781-789`)
-                        // routes CA_PROTO_WRITE through `dbPutField` —
-                        // no putNotify is ever built. Parking a wait-set
-                        // whose receiver this fire-and-forget arm drops
-                        // would occupy the record's notify slot until
-                        // any async processing it starts settles (a
-                        // motor's whole motion), failing every
-                        // legitimate WRITE_NOTIFY on the record with
-                        // ECA_PUTCBINPROG in the meantime.
-                        db.put_record_field_from_ca_no_notify(&name, field, new_value)
-                            .await
-                            .map(|()| ProcessCompletion::Sync)
-                    }
-                }
-            };
-
-            let audit_result = if write_result.is_ok() { "ok" } else { "fail" };
-            state.audit("caput", &audit_pv, &display_value, audit_result);
-
-            // SYNCHRONOUS write paths (no async record completion
-            // pending): fire AfterWrite now with the known status via
-            // the guard. The async path instead hands the guard to the
-            // completion task so AfterWrite reflects real device-side
-            // completion timing (C `write_notify_reply:1400`).
-            let needs_async_after = is_notify && matches!(&write_result, Ok(pc) if pc.is_async());
-            if !needs_async_after {
-                if let Some(guard) = &mut trap_guard {
-                    guard.complete(audit_result);
-                }
-            }
-
-            // C `write_action` (`rsrv/camessage.c:781-789`):
-            // even the deprecated fire-and-forget `CA_PROTO_WRITE`
-            // surfaces a failed `dbChannel_put` to the client via
-            // `send_err(mp, ECA_PUTFAIL, ...)`. Pre-fix Rust dropped
-            // the failure silently for the non-notify path, so a
-            // `caput` against a read-only-by-rule field that bypassed
-            // earlier access checks (e.g. record-side `PutDisabled`)
-            // looked successful to the libca peer even though the
-            // value never reached the DB. is_notify already replies
-            // via WRITE_NOTIFY below.
-            if !is_notify {
-                if let Err(e) = &write_result {
-                    let eca = PutStatus::of_failure(e);
-                    send_ca_error(
-                        writer,
-                        hdr,
-                        eca.eca(),
-                        entry_cid,
-                        &audit_pv,
-                        state.client_minor_version,
-                    )?;
-                }
-            }
-
-            // CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response
-            if is_notify {
-                let eca_status = match &write_result {
-                    Ok(_) => PutStatus::OK,
-                    Err(e) => PutStatus::of_failure(e),
-                }
-                .eca();
-
-                // If async processing started (e.g. motor move), spawn a
-                // background task to await completion and send the response.
-                // This avoids blocking the client handler loop, which would
-                // freeze all camonitor subscriptions on this connection.
-                // `Async(rx)` ⟹ the record's chain is still running: hand the
-                // handle to a completion task. `Sync` and any `Err` ⟹ reply
-                // inline now (an error carries no completion to await).
-                let completion_rx: Option<tokio::sync::oneshot::Receiver<()>> =
-                    write_result.ok().and_then(ProcessCompletion::into_handle);
-
-                if let Some(rx) = completion_rx {
-                    // This put-callback is now async (record processing is
-                    // still running). Mint its response-ownership token:
-                    // whichever of {this completion task, a superseding
-                    // WRITE_NOTIFY} swaps `responded` to `true` first owns
-                    // the single client reply, so the two can never both
-                    // reply for this ioid. The handler installs the
-                    // matching `InFlightPutNotify` into the channel slot
-                    // after the spawn so a later WRITE_NOTIFY can supersede
-                    // it (C `dbNotifyCancel` + ECA_PUTCBINPROG).
+            // Thin caller: the shared wire logic (SID/type/access gates, payload
+            // convert, the DB write, trap-write bracket, sync/error replies) lives
+            // in `serve_write_head` — ONE copy, shared with the blocking RTEMS
+            // driver. Only the async-completion handling differs per front-end:
+            // here the async server spawns a task to await the record's chain and
+            // send the deferred WRITE_NOTIFY reply; the blocking driver hands the
+            // receiver to its event thread. Wire behavior is unchanged.
+            match serve_write_head(hdr, payload, state, db, writer).await? {
+                WriteHeadOutcome::Done => {}
+                WriteHeadOutcome::AsyncPending(pending) => {
+                    // This put-callback is now async (record processing is still
+                    // running). Mint its response-ownership token: whichever of
+                    // {this completion task, a superseding WRITE_NOTIFY} swaps
+                    // `responded` to `true` first owns the single client reply, so
+                    // the two can never both reply for this ioid.
                     let responded = Arc::new(AtomicBool::new(false));
                     let responded_task = responded.clone();
-                    // Clone the outbox handle for the completion task: it
-                    // pushes the deferred WRITE_NOTIFY reply into the same
-                    // per-connection outbox the loop drains — it never
-                    // touches the socket writer directly.
+                    // Clone the outbox handle for the completion task: it pushes the
+                    // deferred reply into the same per-connection outbox the loop
+                    // drains — it never touches the socket writer directly.
                     let outbox_c = writer.clone();
-                    // Hand the guard to the completion task so its
-                    // AfterWrite fires at *real* device-side completion
-                    // via `complete` (C `write_notify_reply:1400`: the
-                    // after-hook fires from the extra-labor task once
-                    // `dbProcessNotify` invokes the done callback).
-                    // Pre-fix Rust dispatched AfterWrite synchronously
-                    // with `status=ok` the moment the put kicked off, so
-                    // caPutLog measured latency=0 and never observed
-                    // device-side PUTFAIL. If the task is aborted before
-                    // it completes — a superseding WRITE_NOTIFY
-                    // (`supersede_put_notify`) or a client teardown
-                    // (`write_notify_tasks` drain) calling `abort` — the
-                    // guard's Drop fires the cancel AfterWrite instead,
-                    // so the put-log stays balanced (C `asTrapWriteAfter`
-                    // on the superseded / torn-down put,
-                    // `camessage.c:1700` / `:1620`).
-                    let mut task_guard = trap_guard.take();
-                    // C keeps the WRITE_NOTIFY request (`mp`) and the client's
-                    // negotiated version alive for the deferred reply; capture
-                    // both by value so the task owns them.
-                    let req_hdr = *hdr;
-                    let client_minor = state.client_minor_version;
+                    let PendingWriteNotify {
+                        rx,
+                        mut trap_guard,
+                        eca_status,
+                        reply,
+                        put_notify_slot,
+                        sid,
+                    } = pending;
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
-                        // matching C EPICS rsrv behavior. RecvError means the
-                        // Sender was dropped without firing — typically because
-                        // record processing aborted. Surface as ECA_PUTFAIL so
-                        // the client doesn't observe a false success.
+                        // matching C rsrv. RecvError means the Sender was dropped
+                        // without firing (processing aborted) — surface as
+                        // ECA_PUTFAIL so the client doesn't observe a false success.
                         let final_status = match rx.await {
                             Ok(()) => eca_status,
                             Err(_) => ECA_PUTFAIL,
                         };
-
-                        // Claim this put-callback's single reply. If a
-                        // superseding WRITE_NOTIFY already won the race it
-                        // sent ECA_PUTCBINPROG for this ioid and aborted
-                        // this task; skip the reply so the client never
-                        // sees two replies for one ioid. Returning here
-                        // drops `task_guard` un-completed, so its Drop
-                        // still fires the cancel AfterWrite for this
-                        // superseded put (C `camessage.c:1700`).
+                        // Claim this put-callback's single reply. If a superseding
+                        // WRITE_NOTIFY already won the race it sent ECA_PUTCBINPROG
+                        // for this ioid and aborted this task; skip the reply.
+                        // Returning here drops `trap_guard` un-completed, so its
+                        // Drop still fires the cancel AfterWrite for this superseded
+                        // put (C `camessage.c:1700`).
                         if responded_task.swap(true, Ordering::AcqRel) {
                             return;
                         }
-
-                        // AfterWrite NOW, after real device-side
-                        // completion. `status` carries "ok" for
-                        // ECA_NORMAL or the ECA-code form otherwise so
-                        // listeners can filter failed puts. `complete`
-                        // disarms the guard so its later Drop is a no-op.
-                        if let Some(guard) = &mut task_guard {
-                            let status_s = if final_status == ECA_NORMAL {
-                                "ok".to_string()
-                            } else {
-                                format!("eca:0x{:04x}", final_status)
-                            };
-                            guard.complete(&status_s);
-                        }
-
-                        let _ = send_put_notify_response(
-                            &outbox_c,
-                            write_type as u16,
-                            write_count,
-                            final_status,
-                            ioid,
-                            ReplyContext {
-                                req_hdr,
-                                client_minor,
-                            },
-                        );
+                        let _ =
+                            finish_write_notify(&mut trap_guard, final_status, &reply, &outbox_c);
                     });
-                    // Publish as the channel's in-flight put-callback so a
-                    // later WRITE_NOTIFY on this channel supersedes it (C
-                    // `dbNotifyCancel` + ECA_PUTCBINPROG). Replaces any
-                    // stale completed entry the slot still held; that
-                    // entry's `responded` is already `true`, so superseding
-                    // it is a harmless no-op.
+                    // Publish as the channel's in-flight put-callback so a later
+                    // WRITE_NOTIFY on this channel supersedes it (C `dbNotifyCancel`
+                    // + ECA_PUTCBINPROG). Replaces any stale completed entry; that
+                    // entry's `responded` is already `true`, so superseding it is a
+                    // harmless no-op.
                     put_notify_slot.install(InFlightPutNotify {
-                        req_hdr: *hdr,
+                        req_hdr: reply.req_hdr,
                         abort: join.abort_handle(),
                         responded,
-                        ioid,
-                        dbr_type: write_type as u16,
-                        count: write_count,
+                        ioid: reply.ioid,
+                        dbr_type: reply.write_type,
+                        count: reply.write_count,
                     });
-                    // Track for connection-scoped cleanup: a stuck
-                    // async record would otherwise pin this task and the
-                    // captured `Outbox` handle forever after the client drops.
-                    // Reap finished handles opportunistically so the Vec
-                    // doesn't grow unbounded over a long-lived connection
-                    // that issues many WRITE_NOTIFYs. The `sid` tag
-                    // also lets `CA_PROTO_CLEAR_CHANNEL` drain only the
-                    // tasks owned by the cleared channel (C parity:
-                    // `rsrvFreePutNotify` per-channel cleanup).
+                    // Track for connection-scoped cleanup: a stuck async record
+                    // would otherwise pin this task and the captured `Outbox`
+                    // handle forever after the client drops. Reap finished handles
+                    // opportunistically; the `sid` tag also lets
+                    // `CA_PROTO_CLEAR_CHANNEL` drain only the cleared channel's
+                    // tasks (C `rsrvFreePutNotify`).
                     state.write_notify_tasks.retain(|(_, h)| !h.is_finished());
                     state.write_notify_tasks.push((sid, join.abort_handle()));
-                } else {
-                    // Synchronous completion — respond immediately
-                    send_put_notify_response(
-                        writer,
-                        write_type as u16,
-                        write_count,
-                        eca_status,
-                        ioid,
-                        ReplyContext {
-                            req_hdr: *hdr,
-                            client_minor: state.client_minor_version,
-                        },
-                    )?;
                 }
             }
         }
@@ -4442,6 +3804,728 @@ pub(crate) async fn dispatch_message(
 
     Ok(())
 }
+/// The shared synchronous head of `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY`.
+///
+/// This is the whole wire path both front-ends run in ONE copy: the SID /
+/// DBR-type / write-access gates (in the C-observable order per opcode), the
+/// alarm-acknowledge (ACKT/ACKS) branch, the payload conversion, the
+/// trap-write bracket, the database/PV write, and every synchronous reply or
+/// error frame. It drives the write to the point C `dbProcessNotify` forks
+/// sync-vs-async and returns that fork as a typed [`WriteHeadOutcome`]:
+///
+/// * [`WriteHeadOutcome::Done`] — fully handled; any reply/error is already
+///   queued to `writer` (sync WRITE_NOTIFY reply, fire-and-forget WRITE,
+///   ACKT/ACKS, and all refusal/error frames).
+/// * [`WriteHeadOutcome::AsyncPending`] — a WRITE_NOTIFY whose record chain is
+///   still running. The caller awaits the [`PendingWriteNotify::rx`] and, when
+///   it fires, sends the deferred reply via [`finish_write_notify`]. The async
+///   server spawns a task for that; the blocking RTEMS driver hands it to its
+///   event thread. The message thread MUST NOT block on `rx` (C `camsgtask`
+///   never blocks on the put-callback).
+///
+/// `state` is borrowed shared: the per-channel `put_notify_slot` is `Arc`-
+/// backed, so the supersede/install of an in-flight put-callback needs no
+/// `&mut`. The async server's connection-scoped bookkeeping
+/// (`write_notify_tasks`, the `responded` token) stays in its arm.
+pub(crate) async fn serve_write_head(
+    hdr: &CaHeader,
+    payload: &[u8],
+    state: &ClientState,
+    db: &Arc<PvDatabase>,
+    writer: &Outbox,
+) -> CaResult<WriteHeadOutcome> {
+    let sid = hdr.cid;
+    let ioid = hdr.available;
+    let is_notify = hdr.cmmd == CA_PROTO_WRITE_NOTIFY;
+
+    // DBR_PUT_ACKT (35) and DBR_PUT_ACKS (36) are alarm-acknowledge
+    // writes — payload is a single u16 routed to the record's
+    // ACKT/ACKS field. Handle before the regular DbFieldType
+    // dispatch so we don't reject the type as unsupported.
+    if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT
+        || hdr.data_type == epics_base_rs::types::DBR_PUT_ACKS
+    {
+        let entry = match state.channels.get(&sid) {
+            Some(e) => e,
+            None => {
+                // C `write_action` (camessage.c:736-738) +
+                // `write_notify_action` (camessage.c:1642-1645):
+                // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
+                // `logBadId` emits an ECA_INTERNAL "Bad Resource
+                // ID" frame (cid=0xFFFFFFFF), flushed before the
+                // disconnect — same family as the EVENT_ADD bad-SID
+                // and the matching READ branch below.
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_INTERNAL,
+                    0xFFFF_FFFF,
+                    "Bad Resource ID",
+                    state.client_minor_version,
+                )?;
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "WRITE (ACKT/ACKS) on unknown SID {} \
+                             (matches C write_action logBadId + RSRV_ERROR)",
+                    sid
+                )));
+            }
+        };
+        // Alarm-acknowledge PUTs travel
+        // the same WRITE wire opcodes but pre-fix bypassed
+        // the access_rights check that the regular WRITE
+        // path performs below. ACKT/ACKS mutate alarm-handler
+        // state — a `NoAccess` peer could silence alarms on
+        // any record they could open. Mirror the regular
+        // WRITE gate.
+        // Type-state: alarm-ack PUTs go
+        // through the same gate as regular WRITE. Token's
+        // `require_write` returns the matching ECA code on
+        // denial.
+        let entry_cid = entry.cid;
+        let _write_grant = match state.lookup_access(sid).require_write() {
+            Ok(g) => g,
+            Err(denied) => {
+                if is_notify {
+                    send_put_notify_response(
+                        writer,
+                        hdr.data_type,
+                        hdr.actual_count(),
+                        denied.eca_code(),
+                        ioid,
+                        ReplyContext {
+                            req_hdr: *hdr,
+                            client_minor: state.client_minor_version,
+                        },
+                    )?;
+                } else {
+                    // C `write_action` (`rsrv/camessage.c:741-751`)
+                    // sends `send_err(mp, ECA_NOWTACCESS, client,
+                    // RECORD_NAME(pciu->dbch))` even for the no-
+                    // notify WRITE. DBR_PUT_ACKT/DBR_PUT_ACKS
+                    // travel the same WRITE opcodes, so this
+                    // branch covers alarm-acknowledge PUTs too.
+                    // outer cid is `pciu->cid`.
+                    let audit_pv = match &entry.target {
+                        ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                        ChannelTarget::RecordField { record, field } => {
+                            format!("{}.{}", record.read().name, field)
+                        }
+                    };
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        denied.eca_code(),
+                        entry_cid,
+                        &audit_pv,
+                        state.client_minor_version,
+                    )?;
+                }
+                return Ok(WriteHeadOutcome::Done);
+            }
+        };
+        let value_u16 = if payload.len() >= 2 {
+            u16::from_be_bytes([payload[0], payload[1]])
+        } else {
+            0
+        };
+        // C dispatches alarm acknowledgement on the DBR *request type*
+        // inside `dbPut` (`dbAccess.c:1331-1335`), ABOVE the SPC_NOMOD
+        // gate that refuses an ordinary put to ACKT/ACKS — the client
+        // acknowledges through its normal (VAL) channel, and the field
+        // the channel names only feeds the DISP gate. Routing this as a
+        // field put to "ACKT"/"ACKS" would now be refused with
+        // S_db_noMod, exactly as `caput REC.ACKS 2` is.
+        let ack = if hdr.data_type == epics_base_rs::types::DBR_PUT_ACKT {
+            epics_base_rs::server::record::AlarmAck::Transient
+        } else {
+            epics_base_rs::server::record::AlarmAck::Severity
+        };
+        // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
+        // `write_notify_action`, so it shares the same
+        // per-channel put-callback serialisation as a regular
+        // WRITE_NOTIFY. Supersede any in-flight put-callback on
+        // this channel *before* the alarm-ack side effect — C
+        // cancels the previous `pPutNotify` and replies
+        // ECA_PUTCBINPROG to the superseded request rather than
+        // rejecting this one (`camessage.c:1660-1707`). The
+        // alarm-ack completes synchronously, so it never installs
+        // an entry of its own. The deprecated fire-and-forget
+        // CA_PROTO_WRITE path is not serialised in C.
+        if is_notify {
+            let prev = entry.put_notify_slot.take();
+            supersede_put_notify(prev, writer, state.client_minor_version)?;
+        }
+        let result = match &entry.target {
+            ChannelTarget::RecordField { record, field } => {
+                let name = record.read().name.clone();
+                // Alarm-ack puts are immediate in C even for the
+                // notify variant — `rsrv/camessage.c` writes ACKT/
+                // ACKS via `dbPutField` and replies straight away,
+                // never building a putNotify. Neither mode here
+                // awaits a completion receiver, so park nothing.
+                db.put_alarm_ack_from_ca(&name, field, ack, value_u16).await
+            }
+            ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
+                "PUT_ACKT/PUT_ACKS only valid on record-backed channels".to_string(),
+            )),
+        };
+        if is_notify {
+            let eca = match &result {
+                Ok(()) => PutStatus::OK,
+                Err(e) => PutStatus::of_failure(e),
+            };
+            send_put_notify_response(
+                writer,
+                hdr.data_type,
+                hdr.actual_count(),
+                eca.eca(),
+                ioid,
+                ReplyContext {
+                    req_hdr: *hdr,
+                    client_minor: state.client_minor_version,
+                },
+            )?;
+        } else if let Err(e) = &result {
+            // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
+            // DBR_PUT_ACKS must surface put failure via
+            // CA_PROTO_ERROR per C `write_action`
+            // (`rsrv/camessage.c:781-789`). Pre-fix the
+            // non-notify alarm-ack path silently swallowed
+            // record-side write errors so the libca peer never
+            // saw the failure.
+            let audit_pv = match &entry.target {
+                ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                ChannelTarget::RecordField { record, field } => {
+                    format!("{}.{}", record.read().name, field)
+                }
+            };
+            let eca = PutStatus::of_failure(e);
+            send_ca_error(
+                writer,
+                hdr,
+                eca.eca(),
+                entry_cid,
+                &audit_pv,
+                state.client_minor_version,
+            )?;
+        }
+        return Ok(WriteHeadOutcome::Done);
+    }
+
+    // C `write_action` (`rsrv/camessage.c:735-739`) and
+    // `write_notify_action` (`camessage.c:1641-1645`) call
+    // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
+    // path goes through `logBadId` + RSRV_ERROR — emitting the
+    // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
+    // regardless of whether the type is also invalid. Pre-fix
+    // Rust ran the type check first and emitted an ECA_BADTYPE
+    // error frame for the SID+type combo where rsrv sends the
+    // bad-SID ECA_INTERNAL frame instead. Reorder to match C.
+    let entry = match state.channels.get(&sid) {
+        Some(e) => e,
+        None => {
+            // Same C logBadId + RSRV_ERROR family as the
+            // ACKT/ACKS branch above and the READ branch: an
+            // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
+            // is buffered then flushed ahead of the disconnect.
+            send_ca_error(
+                writer,
+                hdr,
+                ECA_INTERNAL,
+                0xFFFF_FFFF,
+                "Bad Resource ID",
+                state.client_minor_version,
+            )?;
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
+                sid
+            )));
+        }
+    };
+    // channel-scoped CA_PROTO_ERROR replies must echo
+    // `pciu->cid` (the CLIENT cid the libca peer allocated),
+    // not the server-side SID we received in `hdr.cid`. C
+    // `vsend_err` (`rsrv/camessage.c:160-170`) looks up the
+    // `channel_in_use` and uses its `cid` field for the outer
+    // error header. Captured here as a Copy so the error sites
+    // below can use it after the `entry` borrow ends.
+    let entry_cid = entry.cid;
+    // Clone the per-channel put-callback slot (Arc-backed) so the
+    // supersede gate and the async-completion install below use it
+    // without holding the `entry` borrow across them.
+    let put_notify_slot = entry.put_notify_slot.clone();
+
+    // Resolve the audit-friendly PV name once. Cheap when audit
+    // is off because state.audit() is a single None check.
+    let audit_pv = match &entry.target {
+        ChannelTarget::SimplePv(pv) => pv.name.clone(),
+        ChannelTarget::RecordField { record, field } => {
+            format!("{}.{}", record.read().name, field)
+        }
+    };
+
+    // The DBR-type gate and the write-access gate run in
+    // OPPOSITE orders for the two write opcodes, and the order is
+    // observable when BOTH fail: a bad type tears the connection
+    // down (RSRV_ERROR), denied access keeps it (RSRV_OK), and
+    // only the gate that runs FIRST reports its error.
+    //
+    // * `write_notify_action` (camessage.c:1647-1656): TYPE first
+    //   (ECA_BADTYPE → RSRV_ERROR/drop), THEN access
+    //   (ECA_NOWTACCESS → RSRV_OK/keep).
+    // * `write_action` (camessage.c:741-766): ACCESS first
+    //   (ECA_NOWTACCESS → RSRV_OK/keep). There is NO standalone
+    //   type pre-check — the type is validated only by
+    //   `caNetConvert` (camessage.c:753) AFTER access passes
+    //   (ECA_BADTYPE → RSRV_ERROR/drop).
+    //
+    // So a deprecated CA_PROTO_WRITE carrying an unsupported DBR
+    // type to a channel the peer cannot write must reply
+    // ECA_NOWTACCESS and KEEP the connection — not ECA_BADTYPE +
+    // drop. Pre-fix Rust ran the type gate first for both
+    // opcodes, inverting `write_action`. Each gate's witness type
+    // (`write_type`, `write_grant`) flows to the write below.
+    //
+    // A type-state WRITE gate: `lookup_access` is the only path
+    // to the cache; the witness ensures the matching ECA code
+    // reaches the wire.
+    let (write_type, write_grant) = if is_notify {
+        let write_type = match DbFieldType::from_u16(hdr.data_type) {
+            Ok(t) => t,
+            Err(_) => {
+                // C `putNotifyErrorReply` (camessage.c:1482-1501)
+                // preserves `m_dataType`/`m_count` from the
+                // request, then returns RSRV_ERROR (drop) — a
+                // peer sending an unsupported DBR has a corrupted
+                // dispatcher or is probing, so C drops.
+                send_put_notify_response(
+                    writer,
+                    hdr.data_type,
+                    hdr.actual_count(),
+                    ECA_BADTYPE,
+                    ioid,
+                    ReplyContext {
+                        req_hdr: *hdr,
+                        client_minor: state.client_minor_version,
+                    },
+                )?;
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "WRITE_NOTIFY with unsupported DBR type {} (matches C write_notify_action RSRV_ERROR)",
+                    hdr.data_type
+                )));
+            }
+        };
+        let write_grant = match state.lookup_access(sid).require_write() {
+            Ok(g) => g,
+            Err(denied) => {
+                // route through the refinement helper so
+                // large-array put-callbacks refused by ACF carry
+                // the extended-form count instead of the u16
+                // marker.
+                send_put_notify_response(
+                    writer,
+                    write_type as u16,
+                    hdr.actual_count(),
+                    denied.eca_code(),
+                    ioid,
+                    ReplyContext {
+                        req_hdr: *hdr,
+                        client_minor: state.client_minor_version,
+                    },
+                )?;
+                state.audit("caput", &audit_pv, "", "denied");
+                return Ok(WriteHeadOutcome::Done);
+            }
+        };
+        (write_type, write_grant)
+    } else {
+        // C `write_action` (camessage.c:741-750) emits
+        // `send_err(mp, ECA_NOWTACCESS, ...)` and returns RSRV_OK
+        // (keep) BEFORE any type handling. Without surfacing this
+        // the Rust server dropped denied PROTO_WRITEs silently —
+        // libca's `cac::exception` never fired, so a `caput` from
+        // a read-only peer looked like it had succeeded even
+        // though the value never reached the DB.
+        let write_grant = match state.lookup_access(sid).require_write() {
+            Ok(g) => g,
+            Err(denied) => {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    denied.eca_code(),
+                    entry_cid,
+                    &audit_pv,
+                    state.client_minor_version,
+                )?;
+                state.audit("caput", &audit_pv, "", "denied");
+                return Ok(WriteHeadOutcome::Done);
+            }
+        };
+        // Type validated only after access passes (C
+        // `caNetConvert`, camessage.c:753) — a bad type here is a
+        // protocol violation → RSRV_ERROR/drop.
+        let write_type = match DbFieldType::from_u16(hdr.data_type) {
+            Ok(t) => t,
+            Err(_) => {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADTYPE,
+                    entry_cid,
+                    "bad data type",
+                    state.client_minor_version,
+                )?;
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
+                    hdr.data_type
+                )));
+            }
+        };
+        (write_type, write_grant)
+    };
+
+    // the write-trap mask of the ACF rule that
+    // authorised this write. C `asTrapWriteWithData`
+    // (`rsrv/camessage.c:768-779`) consults
+    // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
+    // rule with no trap option — is not reported to
+    // put-logging listeners. Pre-fix Rust hard-coded
+    // `rule_was_trap: true` for every accepted write.
+    let rule_was_trap = write_grant.rule_was_trap();
+
+    // Supersede any in-flight put-callback on this channel here —
+    // after the SID/type/access checks and *before* any side
+    // effect (payload conversion, trap-write `BeforeWrite`
+    // dispatch, the database/PV write, or the async device
+    // kickoff). C `write_notify_action`
+    // (`rsrv/camessage.c:1660-1707`) reaches this boundary —
+    // after `rsrvCheckPut` and before `caNetConvert` /
+    // `asTrapWriteWithData` / `dbProcessNotify` — with the
+    // channel's previous `pPutNotify` either already completed or
+    // cancelled (`dbNotifyCancel` + ECA_PUTCBINPROG to the
+    // superseded request). It never rejects the new request.
+    // `supersede_put_notify` does exactly that: it cancels the
+    // prior put-callback's completion-wait and replies
+    // ECA_PUTCBINPROG to the superseded ioid (when this path wins
+    // the response-ownership race), then this put proceeds. The
+    // deprecated fire-and-forget CA_PROTO_WRITE path is not
+    // serialised in C, so it is left untouched.
+    if is_notify {
+        let prev = put_notify_slot.take();
+        supersede_put_notify(prev, writer, state.client_minor_version)?;
+    }
+
+    let count = hdr.actual_count() as usize;
+    // Echo the FULL 32-bit count
+    // (`hdr.actual_count()`); pre-fix used `hdr.count`
+    // which is the 0 marker for extended requests and
+    // therefore lost the count on large array put-callbacks.
+    let write_count = hdr.actual_count();
+    let new_value = match EpicsValue::from_bytes_array(write_type, payload, count) {
+        Ok(v) => v,
+        Err(_) => {
+            // Same C parity rule as the data_type gate above:
+            // bad payload bytes (wrong length, malformed wire
+            // bytes) is a protocol violation → emit error +
+            // drop the connection. C `caNetConvert` failure
+            // in `write_action` returns RSRV_ERROR.
+            if is_notify {
+                // Same `putNotifyErrorReply` shape.
+                send_put_notify_response(
+                    writer,
+                    hdr.data_type,
+                    hdr.actual_count(),
+                    ECA_BADTYPE,
+                    ioid,
+                    ReplyContext {
+                        req_hdr: *hdr,
+                        client_minor: state.client_minor_version,
+                    },
+                )?;
+            } else {
+                send_ca_error(
+                    writer,
+                    hdr,
+                    ECA_BADTYPE,
+                    entry_cid,
+                    "bad WRITE payload bytes",
+                    state.client_minor_version,
+                )?;
+            }
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
+                hdr.data_type, count
+            )));
+        }
+    };
+
+    // Stringify the value once for the audit log; skipped when
+    // audit is off. Use the truncated renderer so a malicious
+    // peer can't pin the dispatch task on `format!`-ing a
+    // peer-controlled array of millions of elements.
+    //
+    // TRAPWRITE listeners also need a string form. We
+    // render once when *either* audit or a trap-write listener
+    // is registered; the truncated form is cheap and lets
+    // listeners avoid touching the raw `EpicsValue`.
+    let trap_listeners_active = epics_base_rs::server::access_security::has_trap_write_listeners();
+    let display_value = if state.audit.is_some() || trap_listeners_active {
+        new_value.display_truncated(64)
+    } else {
+        String::new()
+    };
+
+    // One RAII guard owns this put's BeforeWrite/AfterWrite
+    // pair. `begin` fires BeforeWrite now; the matching
+    // AfterWrite fires from `complete` (the synchronous paths
+    // and the async completion task, once the real status is
+    // known) or — if neither runs because the put was aborted
+    // first, a superseding WRITE_NOTIFY or a client teardown
+    // calling `abort` on the completion task — from the guard's
+    // Drop. This makes the C invariant hold by construction:
+    // every `asTrapWriteWithData` is matched by exactly one
+    // `asTrapWriteAfter` on all rsrv exit paths — completion
+    // (`camessage.c:1400`), still-busy teardown
+    // (`rsrvFreePutNotify`, :1620), and supersede-cancel
+    // (`write_notify_action`, :1700). Pre-fix the AfterWrite was
+    // an explicit dispatch that the abort paths skipped, leaving
+    // a BeforeWrite with no match in the put-log.
+    //
+    // BeforeWrite still sits here (not inside each write arm):
+    // C `asTrapWriteWithData` (`camessage.c:768-779`) fires
+    // before `dbChannel_put`, and narrowing the bracket into the
+    // match arms would not remove the pre-storage over-log
+    // (RecordField pre-rejections happen inside the called
+    // function) without a deeper refactor.
+    let mut trap_guard = trap_listeners_active.then(|| {
+        epics_base_rs::server::access_security::TrapWriteGuard::begin(
+            epics_base_rs::server::access_security::TrapWriteFields {
+                pv_name: audit_pv.clone(),
+                user: state.username.clone(),
+                host: state.hostname.as_str().to_string(),
+                peer: state.peer.clone(),
+                value_str: display_value.clone(),
+                dbr_type: write_type as u16,
+                no_elements: write_count,
+                event_id: epics_base_rs::server::access_security::next_trap_write_event_id(),
+                rule_was_trap,
+                // C carries no status on the cancelled-put
+                // `asTrapWriteAfter`; this Rust enrichment marks
+                // the supersede / teardown tail so listeners can
+                // tell it from a clean completion.
+                cancel_status: "cancel".to_string(),
+            },
+        )
+    });
+
+    // The completion outcome of the synchronous head of this write —
+    // `Sync` (reply inline) vs `Async(handle)` (spawn a completion task
+    // that replies when the record's chain settles). A simple PV and a
+    // fire-and-forget `CA_PROTO_WRITE` are always synchronous.
+    use epics_base_rs::server::record::ProcessCompletion;
+    let write_result: CaResult<ProcessCompletion> = match &entry.target {
+        ChannelTarget::SimplePv(pv) => {
+            if let Some(hook) = pv.write_hook() {
+                let ctx = epics_base_rs::server::pv::WriteContext {
+                    user: state.username.clone(),
+                    host: state.hostname.as_str().to_string(),
+                    peer: state.peer.clone(),
+                };
+                hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
+            } else {
+                pv.set(new_value).await;
+                Ok(ProcessCompletion::Sync)
+            }
+        }
+        ChannelTarget::RecordField { record, field } => {
+            let name = record.read().name.clone();
+            if is_notify {
+                db.put_record_field_from_ca(&name, field, new_value).await
+            } else {
+                // C `write_action` (`rsrv/camessage.c:781-789`)
+                // routes CA_PROTO_WRITE through `dbPutField` —
+                // no putNotify is ever built. Parking a wait-set
+                // whose receiver this fire-and-forget arm drops
+                // would occupy the record's notify slot until
+                // any async processing it starts settles (a
+                // motor's whole motion), failing every
+                // legitimate WRITE_NOTIFY on the record with
+                // ECA_PUTCBINPROG in the meantime.
+                db.put_record_field_from_ca_no_notify(&name, field, new_value)
+                    .await
+                    .map(|()| ProcessCompletion::Sync)
+            }
+        }
+    };
+
+    let audit_result = if write_result.is_ok() { "ok" } else { "fail" };
+    state.audit("caput", &audit_pv, &display_value, audit_result);
+
+    // SYNCHRONOUS write paths (no async record completion
+    // pending): fire AfterWrite now with the known status via
+    // the guard. The async path instead hands the guard to the
+    // completion task so AfterWrite reflects real device-side
+    // completion timing (C `write_notify_reply:1400`).
+    let needs_async_after = is_notify && matches!(&write_result, Ok(pc) if pc.is_async());
+    if !needs_async_after {
+        if let Some(guard) = &mut trap_guard {
+            guard.complete(audit_result);
+        }
+    }
+
+    // C `write_action` (`rsrv/camessage.c:781-789`):
+    // even the deprecated fire-and-forget `CA_PROTO_WRITE`
+    // surfaces a failed `dbChannel_put` to the client via
+    // `send_err(mp, ECA_PUTFAIL, ...)`. Pre-fix Rust dropped
+    // the failure silently for the non-notify path, so a
+    // `caput` against a read-only-by-rule field that bypassed
+    // earlier access checks (e.g. record-side `PutDisabled`)
+    // looked successful to the libca peer even though the
+    // value never reached the DB. is_notify already replies
+    // via WRITE_NOTIFY below.
+    if !is_notify {
+        if let Err(e) = &write_result {
+            let eca = PutStatus::of_failure(e);
+            send_ca_error(
+                writer,
+                hdr,
+                eca.eca(),
+                entry_cid,
+                &audit_pv,
+                state.client_minor_version,
+            )?;
+        }
+    }
+
+    // CA_PROTO_WRITE (cmd=4) is fire-and-forget — no response. A
+    // WRITE_NOTIFY replies inline when the write settled synchronously;
+    // when the record's process cycle went async it hands the completion
+    // receiver back to the caller. C `write_notify_action` never blocks
+    // the message thread on the put-callback — completion is delivered
+    // later (`dbNotify.c` callDone on a background thread) — so the
+    // caller decides HOW to await it (async server: a spawned task;
+    // blocking driver: its event thread).
+    if is_notify {
+        let eca_status = match &write_result {
+            Ok(_) => PutStatus::OK,
+            Err(e) => PutStatus::of_failure(e),
+        }
+        .eca();
+        // `Async(rx)` ⟹ the record's chain is still running: return the
+        // handle. `Sync` and any `Err` ⟹ reply inline now (an error
+        // carries no completion to await).
+        let completion_rx = write_result.ok().and_then(ProcessCompletion::into_handle);
+        if let Some(rx) = completion_rx {
+            return Ok(WriteHeadOutcome::AsyncPending(PendingWriteNotify {
+                rx,
+                // Handed on UN-completed so the trap-write AfterWrite
+                // fires at real device-side completion, from whoever
+                // awaits `rx` (C `write_notify_reply:1400`).
+                trap_guard: trap_guard.take(),
+                eca_status,
+                reply: WriteNotifyReply {
+                    write_type: write_type as u16,
+                    write_count,
+                    ioid,
+                    req_hdr: *hdr,
+                    client_minor: state.client_minor_version,
+                },
+                put_notify_slot,
+                sid,
+            }));
+        }
+        // Synchronous completion — respond immediately.
+        send_put_notify_response(
+            writer,
+            write_type as u16,
+            write_count,
+            eca_status,
+            ioid,
+            ReplyContext {
+                req_hdr: *hdr,
+                client_minor: state.client_minor_version,
+            },
+        )?;
+    }
+    Ok(WriteHeadOutcome::Done)
+}
+
+/// Everything the deferred WRITE_NOTIFY completion reply echoes: the framed
+/// type/count, the request ioid, and the request header + negotiated version
+/// (for extended-form promotion). One value so the shared completion tail and
+/// the in-flight-slot install pass a single descriptor rather than five loose
+/// scalars. `Copy` (like the loose scalars it replaces) so it can be captured
+/// by an `async move` completion task and still be read by the in-flight-slot
+/// install afterwards.
+#[derive(Clone, Copy)]
+pub(crate) struct WriteNotifyReply {
+    pub write_type: u16,
+    pub write_count: u32,
+    pub ioid: u32,
+    pub req_hdr: CaHeader,
+    pub client_minor: u16,
+}
+
+/// Send a WRITE_NOTIFY completion reply and fire the deferred trap-write
+/// AfterWrite — the single shared tail both the async server's completion
+/// task and the blocking driver's event thread run once the record's chain
+/// settles. `final_status` is the put's real completion status
+/// (`eca_status` on success, `ECA_PUTFAIL` if the completion sender was
+/// dropped). Keeping this in one place keeps the deferred-reply bytes and the
+/// put-log AfterWrite status identical across both front-ends.
+pub(crate) fn finish_write_notify(
+    trap_guard: &mut Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+    final_status: u32,
+    reply: &WriteNotifyReply,
+    writer: &Outbox,
+) -> CaResult<()> {
+    // AfterWrite at real device-side completion. `status` carries "ok" for
+    // ECA_NORMAL or the ECA-code form otherwise so listeners can filter
+    // failed puts. `complete` disarms the guard so its later Drop is a no-op.
+    if let Some(guard) = trap_guard {
+        let status_s = if final_status == ECA_NORMAL {
+            "ok".to_string()
+        } else {
+            format!("eca:0x{:04x}", final_status)
+        };
+        guard.complete(&status_s);
+    }
+    send_put_notify_response(
+        writer,
+        reply.write_type,
+        reply.write_count,
+        final_status,
+        reply.ioid,
+        ReplyContext {
+            req_hdr: reply.req_hdr,
+            client_minor: reply.client_minor,
+        },
+    )
+}
+
+/// The sync-vs-async fork [`serve_write_head`] returns (C `dbProcessNotify`).
+pub(crate) enum WriteHeadOutcome {
+    /// Fully handled; any reply/error is already queued to the outbox.
+    Done,
+    /// A WRITE_NOTIFY whose record chain is still running; the caller awaits
+    /// the receiver and replies via [`finish_write_notify`].
+    AsyncPending(PendingWriteNotify),
+}
+
+/// One in-flight async `CA_PROTO_WRITE_NOTIFY` handed back by
+/// [`serve_write_head`] for the caller to complete when the record's chain
+/// settles. `put_notify_slot` / `sid` are the async server's connection-scoped
+/// bookkeeping (in-flight-slot install + task tracking); the blocking driver
+/// ignores them and just awaits `rx` on its event thread.
+pub(crate) struct PendingWriteNotify {
+    pub rx: tokio::sync::oneshot::Receiver<()>,
+    pub trap_guard: Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+    pub eca_status: u32,
+    pub reply: WriteNotifyReply,
+    pub put_notify_slot: PutNotifySlot,
+    pub sid: u32,
+}
+
 fn get_full_snapshot(target: &ChannelTarget) -> Option<epics_base_rs::server::snapshot::Snapshot> {
     match target {
         ChannelTarget::SimplePv(pv) => Some(pv.snapshot()),
@@ -5422,6 +5506,13 @@ pub(crate) struct MonitorDelivery {
 pub(crate) enum EventTaskControl {
     Add(Box<MonitorDelivery>),
     Cancel(u32),
+    /// A WRITE_NOTIFY whose record chain went async ([`serve_write_head`]
+    /// returned [`WriteHeadOutcome::AsyncPending`]). The event thread awaits its
+    /// completion receiver alongside the monitor readers and sends the deferred
+    /// reply under the send lock — so the message thread never blocks on the
+    /// put-callback (C `camsgtask`) and there is ONE owner of async socket
+    /// writes (the event thread), never a third writer.
+    WriteComplete(Box<PendingWriteNotify>),
 }
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
@@ -5432,30 +5523,60 @@ enum EventStep {
     Delivered(usize, Option<Box<epics_base_rs::server::pv::MonitorEvent>>),
     /// A control message (`None` = the dispatch thread dropped the sender).
     Control(Option<EventTaskControl>),
+    /// Pending write-completion `idx` fired (`Ok` = the record's chain settled,
+    /// `Err` = the completion sender was dropped → ECA_PUTFAIL).
+    WriteDone(usize, Result<(), tokio::sync::oneshot::error::RecvError>),
 }
 
-/// Await the next event across every active subscription plus the control
-/// channel, in one `select`. C's `event_task` blocks on one semaphore per
-/// `event_user`; here the per-subscription [`EventReader`]s are multiplexed with
+/// Await the next event across every active subscription, every pending
+/// write-completion, and the control channel, in one `select`. C's `event_task`
+/// blocks on one semaphore per `event_user`; here the per-subscription
+/// [`EventReader`]s and the WRITE_NOTIFY completion oneshots are multiplexed with
 /// `select_all`, and the control channel lets the dispatch thread add/cancel
-/// subscriptions and signal shutdown. `EventReader::recv` is cancel-safe, so the
-/// losing futures are simply dropped and rebuilt next cycle.
+/// subscriptions, hand over write completions, and signal shutdown.
+/// `EventReader::recv` is cancel-safe and an unfired oneshot polled by `&mut`
+/// retains its state, so the losing futures are simply dropped and rebuilt next
+/// cycle. An empty collection is stood in for by a never-ready `pending()` so the
+/// `select` shape stays uniform.
 async fn next_event_step(
     subs: &mut [MonitorDelivery],
+    pending_writes: &mut [PendingWriteNotify],
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
 ) -> EventStep {
-    use futures_util::future::{Either, select, select_all};
-    if subs.is_empty() {
-        return EventStep::Control(control.recv().await);
-    }
-    let recvs: Vec<_> = subs.iter_mut().map(|s| Box::pin(s.reader.recv())).collect();
-    let ctrl = control.recv();
-    tokio::pin!(ctrl);
-    match select(select_all(recvs), ctrl).await {
-        Either::Left(((event, idx, _rest), _ctrl)) => {
-            EventStep::Delivered(idx, event.map(Box::new))
+    use futures_util::future::{Either, pending, select, select_all};
+
+    let readers = async {
+        if subs.is_empty() {
+            pending::<(Option<Box<epics_base_rs::server::pv::MonitorEvent>>, usize)>().await
+        } else {
+            let recvs: Vec<_> = subs.iter_mut().map(|s| Box::pin(s.reader.recv())).collect();
+            let (event, idx, _rest) = select_all(recvs).await;
+            (event.map(Box::new), idx)
         }
-        Either::Right((ctrl_msg, _recvs)) => EventStep::Control(ctrl_msg),
+    };
+    let writes = async {
+        if pending_writes.is_empty() {
+            pending::<(Result<(), tokio::sync::oneshot::error::RecvError>, usize)>().await
+        } else {
+            let rxs: Vec<_> = pending_writes
+                .iter_mut()
+                .map(|p| Box::pin(&mut p.rx))
+                .collect();
+            let (res, idx, _rest) = select_all(rxs).await;
+            (res, idx)
+        }
+    };
+    let ctrl = control.recv();
+    tokio::pin!(readers, writes, ctrl);
+
+    match select(select(readers, writes), ctrl).await {
+        Either::Left((Either::Left(((event, idx), _writes)), _ctrl)) => {
+            EventStep::Delivered(idx, event)
+        }
+        Either::Left((Either::Right(((res, idx), _readers)), _ctrl)) => {
+            EventStep::WriteDone(idx, res)
+        }
+        Either::Right((ctrl_msg, _)) => EventStep::Control(ctrl_msg),
     }
 }
 
@@ -5474,6 +5595,14 @@ async fn next_event_step(
 /// override (C `event_add_action` populates `record_type` per event) is applied
 /// here for parity with the async record-field producer loop.
 ///
+/// It is ALSO the single owner of async WRITE_NOTIFY completion writes: the
+/// dispatch thread, forbidden from blocking on a put-callback (C `camsgtask`),
+/// hands each [`PendingWriteNotify`] here via [`EventTaskControl::WriteComplete`];
+/// this thread awaits the completion oneshot in the same `select` and, when it
+/// fires, sends the deferred reply via [`finish_write_notify`] under the send
+/// lock. So there is no third socket writer — monitors and write completions
+/// share this one owner.
+///
 /// `write_frame` writes one complete frame under the send lock; on its first
 /// error (peer gone) the thread exits. It returns when the control sender is
 /// dropped (clean disconnect) so the dispatch thread can join it.
@@ -5484,17 +5613,21 @@ pub(crate) async fn run_event_task<W>(
     W: FnMut(&[u8]) -> std::io::Result<()>,
 {
     let mut subs: Vec<MonitorDelivery> = Vec::new();
-    // Frames are built into a private outbox (reusing the shared `send_event`
-    // builder) then drained to the socket under the send lock.
+    // WRITE_NOTIFYs whose record chain went async, awaiting completion.
+    let mut pending_writes: Vec<PendingWriteNotify> = Vec::new();
+    // Frames are built into a private outbox (reusing the shared `send_event` /
+    // `send_put_notify_response` builders) then drained to the socket under the
+    // send lock.
     let (ev_outbox, mut ev_drain) = crate::server::outbox::channel();
     loop {
-        match next_event_step(&mut subs, &mut control).await {
+        match next_event_step(&mut subs, &mut pending_writes, &mut control).await {
             // Dispatch thread dropped the control sender: clean disconnect.
             EventStep::Control(None) => break,
             EventStep::Control(Some(EventTaskControl::Add(d))) => subs.push(*d),
             EventStep::Control(Some(EventTaskControl::Cancel(id))) => {
                 subs.retain(|s| s.sub_id != id)
             }
+            EventStep::Control(Some(EventTaskControl::WriteComplete(p))) => pending_writes.push(*p),
             // Producer gone (channel cleared / subscription dropped): drop it.
             EventStep::Delivered(idx, None) => {
                 subs.remove(idx);
@@ -5561,6 +5694,36 @@ pub(crate) async fn run_event_task<W>(
                         s.subscription_events_processed
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                }
+            }
+            EventStep::WriteDone(idx, res) => {
+                // A deferred WRITE_NOTIFY's record chain settled. Send its
+                // completion reply under the send lock — the SAME shared tail the
+                // async server's completion task runs (`finish_write_notify`), so
+                // the deferred-reply bytes are identical. `Err` (sender dropped,
+                // e.g. processing aborted) surfaces as ECA_PUTFAIL, matching C
+                // rsrv, so the client never sees a false success.
+                let mut p = pending_writes.remove(idx);
+                let final_status = match res {
+                    Ok(()) => p.eca_status,
+                    Err(_) => ECA_PUTFAIL,
+                };
+                if finish_write_notify(&mut p.trap_guard, final_status, &p.reply, &ev_outbox)
+                    .is_err()
+                {
+                    // Encoding the reply failed (16k-array boundary): the reply
+                    // is unshippable, drop this completion and keep serving.
+                    continue;
+                }
+                let mut peer_gone = false;
+                while let Some(frame) = ev_drain.try_next() {
+                    if write_frame(&frame).is_err() {
+                        peer_gone = true;
+                        break;
+                    }
+                }
+                if peer_gone {
+                    break;
                 }
             }
         }

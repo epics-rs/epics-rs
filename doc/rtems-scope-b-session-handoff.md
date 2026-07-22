@@ -23,13 +23,44 @@ Upstream splits its I/O model **by protocol**: EPICS base's RSRV is
 thread-per-client, pvxs is a libevent reactor. We split **by platform** — one
 sans-io core, a blocking driver on RTEMS and the async driver on hosts.
 
-§5.3 is what that choice is worth, stated at its measured strength and no
-higher: a libevent reactor **does** work on RTEMS 6 once steered away from the
-`poll` backend, so "a reactor cannot run there" is false. What is true is that
-the reference implementation ships an RTEMS-5-era workaround that steers itself
-into a broken backend, and finding that took an interposer and CPU-idle
-attribution. Our backend does not depend on a reactor, so it never meets that
-class of defect. That is the claim to make.
+### There are two axes here, and they are easy to collapse into one
+
+| | CA — EPICS base | PVA — pvxs |
+|---|---|---|
+| **Linux** | thread-per-client, blocking `recv()` | libevent reactor → **epoll** |
+| **RTEMS 6** | thread-per-client, blocking `recv()` | libevent reactor → **kqueue** (once §5.3's one line is removed) |
+| **`epics-rs`, RTEMS 6** | blocking thread-per-client | **blocking thread-per-client** |
+
+- **The protocol axis (columns) is a real design difference.** CA blocks a
+  thread per client; PVA multiplexes in a reactor. Upstream chose that, and it
+  holds on every platform.
+- **The platform axis (rows) is not a design difference at all.** `epoll` and
+  `kqueue` are the *same* libevent reactor with a different backend compiled in.
+  pvxs's source does not name either; libevent picks from what the platform
+  offers. On this RTEMS build the compiled-in candidates are exactly kqueue,
+  poll, select — `EVENT__HAVE_EPOLL` is `#undef`.
+
+Two corrections worth stating explicitly, because both were believed here first:
+
+- **"CA uses kqueue" is false on every platform.** RSRV has *no* multiplexing
+  call at all: `rg '\b(select|poll|kevent|kqueue|epoll_wait)\s*\('` over
+  `modules/database/src/ioc/rsrv/*.c` returns **zero hits**. It spawns a
+  `CAS-client` thread per connection (`caservertask.c:109`) which blocks in
+  `recv()` (`camsgtask.c:71`). That thread pair is what §5.2 measures. libca is
+  the same shape — the single `select()` that greps in `tcpiiu.cpp:2062` is
+  inside `#if 0`, with `osiSockIoctl_t bytesPending` live instead.
+- **"pvxs switched models on RTEMS" is also false.** It is the same reactor; only
+  the backend differs, and the RTEMS wedge of §5.3 happens entirely inside the
+  bottom-right cell.
+
+Our row puts **both** protocols in the left-hand model, which is why the RTEMS
+target never has to choose a reactor backend. §5.3 is what that is worth, stated
+at its measured strength and no higher: a libevent reactor **does** work on
+RTEMS 6 once steered away from the `poll` backend, so "a reactor cannot run
+there" is false. What is true is that the reference implementation ships an
+RTEMS-5-era workaround that steers itself into a broken backend, and finding
+that took an interposer and CPU-idle attribution. Our backend does not depend on
+a reactor, so it never meets that class of defect. That is the claim to make.
 
 ---
 
@@ -269,6 +300,18 @@ thread explicitly below the other (`SCHED_FIFO` 3 vs 1) the starvation vanishes
 Priority separation hides the symptom. Equal-priority single-core `SCHED_FIFO`,
 which `pthread_create` produces by inheritance, is only why it *presents* as a
 hang.
+
+**What else libevent could have used.** From the actual build's
+`bundle/O.RTEMS-xilinx_zynq_a9_qemu/include/event2/event-config.h`, three
+backends are compiled in and no more — `EVENT__HAVE_KQUEUE`,
+`EVENT__HAVE_POLL`, `EVENT__HAVE_SELECT`; `EPOLL`, `DEVPOLL` and `EVENT_PORTS`
+are all `#undef`. kqueue is measured working (table above, plus peer-close
+detection). **The select backend was never tested** — the raw `select(1 udp fd)`
+in the table is a syscall probe, not libevent's select backend, and the fd that
+breaks is the internal notify FIFO, not a socket. If libbsd's `select()` folds
+`POLLERR` into "readable" the way FreeBSD's does, it would spin identically;
+that is a hypothesis, not a result. One `avoid_method("poll")` added to the
+existing probe would settle it.
 
 **Owner: rtems-libbsd.** `poll()` on a valid open non-socket fd must report
 real readiness, not `POLLERR`. libevent deserves a defensive change (prefer

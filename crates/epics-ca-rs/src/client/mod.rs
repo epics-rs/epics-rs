@@ -21,7 +21,10 @@ use std::time::Duration;
 use epics_base_rs::runtime::sync::{broadcast, mpsc, oneshot};
 use parking_lot::Mutex;
 
-use crate::channel::{AccessRights, ChannelInfo};
+// `channel` is `pub(crate)`, but `CaChannel::info` and `CaClient::cainfo`
+// hand both of these back across the crate boundary. Re-exported here, beside
+// the methods that return them, so a caller can name what they were given.
+pub use crate::channel::{AccessRights, ChannelInfo};
 use crate::protocol::*;
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
@@ -387,7 +390,7 @@ use types::*;
 
 // Public re-exports for the CA-130 exception-handler API. Mirror the
 // pattern already used for DiagnosticsSnapshot.
-pub use types::{CaException, CaExceptionHandler, CaExceptionKind, ExceptionSite};
+pub use types::{CaException, CaExceptionHandler, CaExceptionKind, CaOp, ExceptionSite};
 
 /// CA client with persistent channels and auto-reconnection.
 pub struct CaClient {

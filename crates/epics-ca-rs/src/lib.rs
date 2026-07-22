@@ -1,3 +1,11 @@
+// A `pub` type that no downstream path can name is a public API hole: a
+// caller receives the value and cannot write its type, so they cannot store
+// it in a struct, name it in a signature, or implement a trait over it. Three
+// of these were live in this crate and one of them — `ExceptionSite` on the
+// public `CaException` — was found only because a rustdoc link happened to
+// point at it. This lint finds the population instead of the sample, and the
+// crate's `clippy -D warnings` gate turns it into a build failure.
+#![warn(unnameable_types)]
 #![allow(
     clippy::collapsible_if,
     clippy::map_entry,

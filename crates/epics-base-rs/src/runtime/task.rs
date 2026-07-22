@@ -680,10 +680,52 @@ pub fn apply_to_current_thread_under(
     policy: RtPolicy,
     priority: ThreadPriority,
 ) -> PriorityApplied {
+    // Publish the *declared* band before the policy gate, not after it.
+    // What the OS did with the request and what band this thread claims to
+    // be are two different facts: with `RtPolicy::Disabled` (the hosted
+    // default) no scheduler call happens at all, yet a `scan-1` thread is
+    // still an EPICS-63 thread and must still outrank an EPICS-20
+    // `CAS-client` in any wait queue this crate orders itself.
+    DECLARED_BAND.with(|band| band.set(Some(priority.value())));
     match policy {
         RtPolicy::Disabled => PriorityApplied::Disabled,
         RtPolicy::AllowRealtime => apply_priority_impl(priority.value()),
     }
+}
+
+/// The EPICS band a thread reports when it has never declared one.
+///
+/// The lowest representable band, deliberately: an un-banded thread — every
+/// tokio worker on the hosted backend, every test harness thread, the
+/// iocsh script runners that take no band on purpose — must never outrank a
+/// thread that did declare one. Ranking an unknown band above a known one
+/// would make the ordering depend on which threads happened to be banded,
+/// which is the opposite of the property a priority-ordered wait exists for.
+pub(crate) const UNBANDED_EPICS_PRIORITY: u8 = 0;
+
+thread_local! {
+    /// The EPICS band this thread last declared.
+    ///
+    /// Written only by [`apply_to_current_thread_under`], which is the
+    /// single funnel [`enter_ioc_thread`] and [`apply_to_current_thread`]
+    /// both reach the scheduler through. Publishing it there rather than in
+    /// `enter_ioc_thread` alone means a thread cannot be re-banded while
+    /// leaving a stale declaration behind: there is no path that changes a
+    /// thread's band without passing this line.
+    static DECLARED_BAND: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// The EPICS band (`0..=99`) the calling thread declared through
+/// [`enter_ioc_thread`] / [`apply_to_current_thread`], or
+/// [`UNBANDED_EPICS_PRIORITY`] if it never declared one.
+///
+/// Independent of [`PriorityApplied`]: this is what the thread *is* in EPICS
+/// terms, not what the OS scheduler granted. Used by the priority-ordered
+/// record gate (`server::database::record_lock`) to order its waiter queue
+/// on targets where the OS cannot order it for us, so it has to be correct
+/// with the RT switch off as well as on.
+pub(crate) fn current_thread_band() -> u8 {
+    DECLARED_BAND.with(|band| band.get().unwrap_or(UNBANDED_EPICS_PRIORITY))
 }
 
 /// The prologue an IOC thread runs as its first statement, when it takes on
@@ -703,6 +745,11 @@ pub fn apply_to_current_thread_under(
 /// is already named and running. A thread that deliberately takes no EPICS
 /// band — the iocsh script runners — calls [`name_current_thread`] alone
 /// rather than inventing a priority just to be visible.
+///
+/// The band is also *declared* here — [`current_thread_band`] reports it for
+/// the rest of the thread's life — which is what lets this crate's own
+/// priority-ordered waits rank a waiter even on a target, or with an RT
+/// policy, where the OS scheduler never saw the request.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
     apply_to_current_thread(priority)

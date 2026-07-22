@@ -611,15 +611,25 @@ impl PvDatabase {
             // plain `put_pv` to a backing record cannot interleave
             // with an atomic group transaction holding the same gate.
             // Skipped when the caller already owns the gate.
+            //
+            // Held to the `return Ok(())` below, and that is the point: C's
+            // `dbScanLock` covers `dbPut` *including* `dbPutSpecial(paddr, 1)`
+            // and the scan-list move, so the tails below are inside the
+            // exclusion window in C and must be inside it here. Shrinking the
+            // window to end at the value write would re-open exactly the
+            // interleaving `lock_records` exists to close
+            // (`record_lock.rs`, "Rust port"). See
+            // `doc/rtems-priority-locks-design.md` §2, "the semantic question".
             let _record_gate = if acquire_gate {
                 Some(self.lock_record(&canonical_base).await)
             } else {
                 None
             };
             // Scoped guard: everything the put commits happens under this
-            // write guard, which ends (releasing the !Send parking_lot guard)
-            // before the scan-index / special-action awaits below. Yields the
-            // owned outputs those awaits consume.
+            // write guard, which ends (releasing the `!Send` parking_lot
+            // guard) before the tails below, which re-enter the database.
+            // Yields the owned outputs those tails consume. Note this is the
+            // record's DATA lock coming down, not the advisory gate above.
             use crate::server::record::CommonFieldPutResult;
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
@@ -721,11 +731,15 @@ impl PvDatabase {
 
                 (common_result, special_actions)
             };
-            // The record lock is now down (scope ended above) before the
+            // The record DATA lock is now down (scope ended above) before the
             // scan-index update and the `special()` link writes below, which
-            // re-enter the database (they can process their target).
+            // re-enter the database (they can process their target). The
+            // advisory gate is still held — see its comment above.
 
-            // Update scan index if SCAN or PHAS changed
+            // Update scan index if SCAN or PHAS changed. Synchronous as of
+            // step 4, so this half of the tail adds no suspension point to the
+            // gate-held window; C reaches `scanDelete`/`scanAdd` from inside
+            // `dbScanLock` the same way.
             match common_result {
                 CommonFieldPutResult::ScanChanged {
                     old_scan,
@@ -896,15 +910,20 @@ impl PvDatabase {
             // member writes of a QSRV atomic group or a pvalink
             // atomic scan epoch holding `lock_records`. `base` is
             // alias-resolved to the canonical record name so an alias
-            // and its target share one gate. Held until return.
+            // and its target share one gate. Held until return — same
+            // reasoning as `put_pv_inner`'s gate: C's `dbScanLock` covers
+            // `dbPut` including `dbPutSpecial(paddr, 1)` and the scan-list
+            // move, so both tails below stay inside the window
+            // (`doc/rtems-priority-locks-design.md` §2).
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             let _record_gate = self.lock_record(&canonical_base).await;
 
-            // Guarded: the value write + monitor post. The data guard is released
-            // at the block close before the scan-index / special-action awaits
-            // below (parking_lot guards are `!Send`); the advisory `_record_gate`
-            // still holds the processing-exclusion window across the whole helper.
+            // Guarded: the value write + monitor post. The record's DATA guard
+            // is released at the block close before the tails below, which
+            // re-enter the database (`parking_lot` guards are `!Send`); the
+            // advisory `_record_gate` still holds the processing-exclusion
+            // window across the whole helper.
             use crate::server::record::CommonFieldPutResult;
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
@@ -1063,6 +1082,31 @@ impl PvDatabase {
     ///
     /// Must be called with no record lock held: a `WriteDbLink` can process its
     /// target, which re-enters the database.
+    ///
+    /// # Still `async` — the one suspension left in the H1/H2 gate window
+    ///
+    /// `doc/rtems-priority-locks-design.md` §5 step 4 turns the scan-index tail
+    /// synchronous; this tail cannot follow yet, and the two reasons are
+    /// different:
+    ///
+    /// 1. `execute_process_actions` → `write_out_link_value` →
+    ///    `write_db_link_value` (`links.rs:1497`, `:1560`) re-enters
+    ///    `put_pv_already_locked` — i.e. **this function's own caller** — and
+    ///    `process_target`, which is H6. That resolves in step 5 by
+    ///    construction, not here.
+    /// 2. `write_out_link_value` → `write_external_pv` →
+    ///    `LinkSet::put_value` (`links.rs:1612`) is a real `ca://` / `pva://`
+    ///    network suspension, not a lock acquisition. It is also **already a
+    ///    C-parity deviation**: C's `dbCaPutLink` enqueues onto the `dbCa`
+    ///    task and returns, so C never blocks on the network inside
+    ///    `dbScanLock`. Making that call an enqueue onto a dedicated task —
+    ///    which is what closes it — is a change to the link layer, not to this
+    ///    function.
+    ///
+    /// Until both land, the H1/H2 advisory-gate window contains exactly one
+    /// `.await`, and it is this call. The gate is still a `PriorityGate`
+    /// handing out a `Send` guard, so that compiles and is sound; it is what
+    /// blocks the L1 → `PriorityInheritanceMutex` flip, not this step.
     async fn run_special_actions(
         &self,
         record_name: &str,

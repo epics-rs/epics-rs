@@ -427,7 +427,17 @@ sequences — they are in the byte stream the target printed and were left in.
 ### Checksums (verified on both ends)
 
 SHA-256, computed under `~/rtems-cside/` on `192.168.2.128` and again on the
-copy in this repository.
+copy in this repository — and, for the transcript, against the git blob itself
+(`git cat-file -p HEAD:<path> | sha256sum`), not only the working copy.
+
+The RTEMS serial console emits `CR LF`, and this repository's root
+`.gitattributes` sets `* text=auto eol=lf`, which strips every `CR`. The first
+commit of this material did exactly that: the transcript went in as
+`d4277d03…f9bd71` and the checksum below did **not** verify against it. It is
+fixed by `evidence/.gitattributes` (`*.log -text`), so the log is now stored
+byte-for-byte as the target printed it. If a future edit of the attributes file
+re-normalizes it, the row below stops matching — that is the intended alarm, not
+a stale checksum.
 
 | file in this directory | source on the box | sha256 |
 |---|---|---|

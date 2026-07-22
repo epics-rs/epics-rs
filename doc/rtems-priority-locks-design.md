@@ -614,6 +614,19 @@ other nine in the ArcSwap column. **Rejected.**
 So the target type is fixed here and the edit lands in step 4. Step 4's row and
 done-check should be read as covering L8a and L8b as well.
 
+#### Step-3 done-check, as executed
+
+`rg -n "runtime::sync::RwLock" crates/epics-base-rs/src/server/database/mod.rs`
+returns **four** rows, and every one of them is L8a or L8b: the two field
+declarations (`simple_pvs` `:233`, `scan_index` `:248`) and their two
+constructor calls (`:645`, `:651`). It returned **one** row before — the bare
+`use crate::runtime::sync::RwLock;` import — which is §3's own naming trap and
+told you nothing about how many tokio locks the file declares. The import is
+gone and both survivors are spelled in full, so the check now reads the code
+rather than the import list. Nine rows (L8c–L8k) and L9 are converted; the
+remaining eleven `RwLock`/`Mutex` occurrences in the file are
+`parking_lot`/`std`, which were never in scope.
+
 ---
 
 **Ordering note.** Steps 1, 2 and 3 are mutually independent and can run as

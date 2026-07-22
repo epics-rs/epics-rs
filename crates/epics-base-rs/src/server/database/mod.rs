@@ -19,7 +19,6 @@ pub use processing::{AsyncDbHandle, AsyncToken};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
-use crate::runtime::sync::RwLock;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use snapshot::SnapshotCell;
 use std::collections::{BTreeSet, HashMap};
@@ -231,7 +230,7 @@ pub struct CpTarget {
 }
 
 struct PvDatabaseInner {
-    simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
+    simple_pvs: crate::runtime::sync::RwLock<HashMap<String, Arc<ProcessVariable>>>,
     records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
@@ -246,7 +245,7 @@ struct PvDatabaseInner {
     /// C IOC built from the same `.db` file.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
-    scan_index: RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
+    scan_index: crate::runtime::sync::RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
@@ -643,13 +642,13 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
-                simple_pvs: RwLock::new(HashMap::new()),
+                simple_pvs: crate::runtime::sync::RwLock::new(HashMap::new()),
                 external_resolver: ArcSwapOption::empty(),
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 records: parking_lot::RwLock::new(HashMap::new()),
-                scan_index: RwLock::new(HashMap::new()),
+                scan_index: crate::runtime::sync::RwLock::new(HashMap::new()),
                 load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(HashMap::new()),

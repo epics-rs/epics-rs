@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use parking_lot::Mutex as BlockingMutex;
+use crate::runtime::sync::PriorityInheritanceMutex;
 
 use crate::error::CaError;
 use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome, TryRecvError};
@@ -322,15 +322,30 @@ pub struct ProcessVariable {
     /// (`set` / `set_snapshot`) still `.await`s the monitor fan-out, but
     /// drops this guard first.
     pub value: parking_lot::RwLock<EpicsValue>,
-    /// Monitor fan-out list. A BLOCKING `parking_lot`-class mutex, not the
-    /// async one: every emission path runs from a record-processing thread
-    /// with the record's advisory gate held, and C's `db_post_events` likewise
-    /// takes `evUser->lock` — a plain `epicsMutex` — from inside `dbScanLock`
-    /// (`dbEvent.c::db_post_events`). Holding an async mutex here would put a
-    /// suspension point inside that window. Every critical section below is
-    /// bounded list work (`retain` / `push` / `sub.post`), with no I/O and no
-    /// `.await` inside it.
-    pub subscribers: BlockingMutex<Vec<Subscriber>>,
+    /// Monitor fan-out list — **L7** of `doc/rtems-priority-locks-design.md`
+    /// §3.
+    ///
+    /// A BLOCKING mutex, not the async one: every emission path runs from a
+    /// record-processing thread with the record's advisory gate (L1) held, and
+    /// C's `db_post_events` likewise takes `evUser->lock` from inside
+    /// `dbScanLock` (`dbEvent.c::db_post_events`). Holding an async mutex here
+    /// would put a suspension point inside that window. Every critical section
+    /// below is bounded list work (`retain` / `push` / `sub.post`), with no
+    /// I/O and no `.await` inside it.
+    ///
+    /// Specifically a [`PriorityInheritanceMutex`] rather than a plain
+    /// `parking_lot::Mutex`, because `evUser->lock` is an `epicsMutex` and on
+    /// the RTEMS arm every `epicsMutex` is a `PTHREAD_PRIO_INHERIT` pthread
+    /// mutex (`os/posix/osdMutex.c:71-88`, compiled for RTEMS via
+    /// `os/RTEMS-posix/osdMutex.c:8`). It is taken from banded IOC threads on
+    /// both sides — the emitting record-processing thread and a `CAS-client`
+    /// thread running `remove_subscriber` — so a plain mutex here reintroduces
+    /// the inversion L1 was converted to remove. Off the PI targets this is
+    /// `parking_lot::Mutex`, i.e. exactly what it was.
+    ///
+    /// A leaf of the acquisition order (`record_lock.rs` module doc): no other
+    /// lock is taken while it is held.
+    pub subscribers: PriorityInheritanceMutex<Vec<Subscriber>>,
     /// Sticky metadata of the last full-snapshot write. `None` until a
     /// [`Self::set_snapshot`] lands; a value-only [`Self::set`] clears it
     /// back to `None` (a plain value write carries no explicit
@@ -378,7 +393,7 @@ impl ProcessVariable {
         Self {
             name,
             value: parking_lot::RwLock::new(initial),
-            subscribers: BlockingMutex::new(Vec::new()),
+            subscribers: PriorityInheritanceMutex::new(Vec::new()),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
             posted_meta: parking_lot::RwLock::new(None),
             write_hook: parking_lot::RwLock::new(None),

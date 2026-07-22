@@ -40,11 +40,37 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-/// Give the spawned classification task a turn to publish.
-async fn settle() {
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
+/// Wait until the spawned classification task has published `f` on `rec` as
+/// `want`, and fail naming the field if it never does.
+///
+/// This used to be a `settle()` that yielded eight times and hoped. A yield
+/// hands the thread to another task *on the caller's runtime*, and the
+/// classification is not always there: `refresh_link_status` goes through
+/// `schedule_record_init`, which spawns through the runtime seam, and under
+/// `rtems-exec-model` that is a background-executor thread with no relation to
+/// this test's runtime at all. Eight yields then synchronise with nothing, and
+/// which assertion loses the race varied per run — the two tests that failed
+/// feature-ON were not the same two each time.
+///
+/// Waiting on the observable instead is correct on every backend, and at every
+/// call site here it waits for a value the field did NOT already hold — a
+/// transition away from the constructed `[SWAIT_NO_PV; 14]` — so returning
+/// proves the post landed rather than merely agreeing with the default. The one
+/// place where the classified value and the default coincide has no wait at
+/// all, and says so. The whole status batch is applied under a single record
+/// write lock (`post_fields_with_mask`), so observing one field of it means the
+/// rest have landed too.
+async fn settle_until(db: &PvDatabase, rec: &str, f: &str, want: u16) {
+    for _ in 0..400 {
+        if field(db, rec, f).await == Some(EpicsValue::Enum(want)) {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
+    panic!(
+        "{rec}.{f} did not reach {want} before timeout (last {:?})",
+        field(db, rec, f).await
+    );
 }
 
 /// A resolvable name is PV_OK, an unresolvable one is PV_NC, a blank one is
@@ -64,7 +90,7 @@ async fn r9_76_pv_status_classifies_each_link() {
     w.put_field("INBN", EpicsValue::String("NOSUCHREC".into()))
         .unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
-    settle().await;
+    settle_until(&db, "W", "INAV", PV_OK).await;
 
     assert_eq!(
         field(&db, "W", "INAV").await,
@@ -105,7 +131,11 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     db.add_record("W", Box::new(SwaitRecord::default()))
         .await
         .unwrap();
-    settle().await;
+    // No wait here, and it would not be one: `SwaitRecord`'s constructed
+    // `pv_status` is already `[SWAIT_NO_PV; 14]` (swait.rs:211), so the
+    // classification writes NO_PV over NO_PV and there is no transition to
+    // observe. This assertion pins the constructed default; the two waits
+    // below are the ones that pin the classification.
     assert_eq!(
         field(&db, "W", "INAV").await,
         Some(EpicsValue::Enum(NO_PV)),
@@ -115,7 +145,7 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     db.put_pv("W.INAN", EpicsValue::String("SRC".into()))
         .await
         .unwrap();
-    settle().await;
+    settle_until(&db, "W", "INAV", PV_OK).await;
     assert_eq!(
         field(&db, "W", "INAV").await,
         Some(EpicsValue::Enum(PV_OK)),
@@ -125,7 +155,7 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     db.put_pv("W.INAN", EpicsValue::String("".into()))
         .await
         .unwrap();
-    settle().await;
+    settle_until(&db, "W", "INAV", NO_PV).await;
     assert_eq!(
         field(&db, "W", "INAV").await,
         Some(EpicsValue::Enum(NO_PV)),
@@ -158,7 +188,7 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
         .write()
         .put_common_field("OUT", EpicsValue::String("SINK".into()))
         .unwrap();
-    settle().await;
+    settle_until(&db, "W", "DOLV", PV_NC).await;
 
     assert_eq!(
         field(&db, "W", "DOLV").await,
@@ -205,7 +235,7 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
         .write()
         .put_common_field("OUT", EpicsValue::String("SINK".into()))
         .unwrap();
-    settle().await;
+    settle_until(&db, "W", "DOLV", PV_OK).await;
 
     assert_eq!(
         field(&db, "W", "DOLV").await,

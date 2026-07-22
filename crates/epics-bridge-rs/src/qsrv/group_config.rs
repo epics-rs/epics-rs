@@ -59,9 +59,21 @@ pub struct GroupPvDef {
     /// between member writes — is now closed by the
     /// `DBManyLock`-equivalent `PvDatabase::lock_records` advisory
     /// write gates the atomic PUT acquires over every member record.
-    /// This `Mutex` remains only as an internal group-vs-group
+    /// This lock remains only as an internal group-vs-group
     /// serialization aid. See `GroupChannel::put`.
-    pub atomic_write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    ///
+    /// **L33**, `doc/rtems-priority-locks-design.md` §3 / §5 step 6. A
+    /// blocking `PriorityInheritanceMutex`, not a `tokio::sync::Mutex`: it is
+    /// acquired above `PvDatabase::lock_records` (L1) and released after the
+    /// member loop, and every one of those steps — the up-front value
+    /// conversion, `lock_records` itself, the member writes — is synchronous
+    /// since the L1 flip, so the window contains no suspension point. It was
+    /// a tokio lock only for as long as `lock_records` was an `.await`, where
+    /// a `!Send` guard across it would not have compiled at the
+    /// connection-task spawn site. See `record_lock.rs`'s module doc for the
+    /// L33 → L1 → L46 acquisition order this lock heads.
+    pub atomic_write_lock:
+        std::sync::Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
 }
 
 /// A single member within a group PV.
@@ -797,7 +809,9 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         atomic,
         atomic_is_set,
         members,
-        atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        atomic_write_lock: std::sync::Arc::new(
+            epics_base_rs::runtime::sync::PriorityInheritanceMutex::new(()),
+        ),
     };
     // resolve the per-member self-trigger default now that every
     // member of this (single-source) group is known. Re-run after merge.

@@ -1781,16 +1781,16 @@ impl GroupChannel {
             // before `lock_records` is ever requested, so nothing has
             // been locked (or applied) when the atomic PUT aborts. Held
             // for the whole atomic block (`bug4_atomic_put_serializes_on_group_lock`,
-            // `bug4_concurrent_atomic_puts_do_not_interleave`) — it stays
-            // a `tokio::sync::Mutex`, not a `PriorityInheritanceMutex`:
-            // it is held across `lock_records(…).await` itself, which is
-            // still a genuine suspension point until L1 becomes a PI
-            // mutex (design step 4, not yet landed — `record_lock.rs`
-            // module doc). Converting L33 first would hold a `!Send`
-            // guard across that await and fail to compile at the
-            // connection-task spawn site, the exact `!Send` trap H1-H9
-            // exist to avoid.
-            let _atomic_guard = self.def.atomic_write_lock.lock().await;
+            // `bug4_concurrent_atomic_puts_do_not_interleave`).
+            //
+            // A blocking `PriorityInheritanceMutex` since the L1 flip. It was
+            // a `tokio::sync::Mutex` only because its window contained
+            // `lock_records(…).await`; that window is now the conversion
+            // phase, a synchronous `lock_records` and a synchronous member
+            // loop, with zero `.await`s, so the `!Send` guard the connection
+            // task would have rejected is exactly what now proves the
+            // property.
+            let _atomic_guard = self.def.atomic_write_lock.lock();
 
             // Convert all values up-front (DBF-typed), then perform the
             // actual writes in order. A member that only post-processes
@@ -4017,6 +4017,50 @@ mod tests {
 
     // ---- BUG 4: atomic-group PUT serialization ----
 
+    /// A competing owner of `atomic_write_lock` (L33), holding it on a
+    /// dedicated thread until this handle is dropped.
+    ///
+    /// L33 is a blocking lock, so a test's "external holder" cannot be the
+    /// task that also drives the assertions: it would own the lock on the very
+    /// thread the runtime needs in order to poll the PUT that must block on
+    /// it, and "the PUT did not finish" would then be true because nothing
+    /// polled it rather than because the lock excluded it.
+    struct ExternalLockHolder {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ExternalLockHolder {
+        /// Returns once the lock is genuinely held — no sleep-and-hope.
+        fn take(
+            lock: Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+        ) -> ExternalLockHolder {
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let (held, held_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let _guard = lock.lock();
+                held.send(()).expect("holder announces the lock");
+                let _ = release_rx.recv();
+            });
+            held_rx
+                .recv()
+                .expect("the external holder must own the lock");
+            ExternalLockHolder {
+                release: Some(release),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for ExternalLockHolder {
+        fn drop(&mut self) {
+            self.release.take();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     /// Build a two-member atomic group over `A:rec` / `B:rec`,
     /// returning the db and the parsed `GroupPvDef`.
     async fn atomic_group_fixture() -> (Arc<PvDatabase>, GroupPvDef) {
@@ -5087,7 +5131,7 @@ mod tests {
     /// write in between. Pre-fix the atomic branch `.await`-ed each
     /// member write with no cross-write lock, letting a second PUT
     /// interleave and leave the group observably half-applied.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bug4_atomic_put_serializes_on_group_lock() {
         let (db, def) = atomic_group_fixture().await;
         let channel = GroupChannel::new(db.clone(), def.clone());
@@ -5095,15 +5139,17 @@ mod tests {
         // Hold the group's atomic_write_lock — exactly the guard the
         // atomic PUT branch acquires. While held, a `put` on the same
         // group def must not be able to enter the member-write loop.
-        let guard = def.atomic_write_lock.clone().lock_owned().await;
+        let guard = ExternalLockHolder::take(def.atomic_write_lock.clone());
 
         let put_fut = tokio::spawn(async move {
             channel.put(&atomic_put_value(11.0, 22.0)).await.unwrap();
         });
 
-        // The PUT must still be blocked on the lock.
-        let blocked = tokio::time::timeout(Duration::from_millis(150), async {}).await;
-        assert!(blocked.is_ok());
+        // The PUT must still be blocked on the lock. A real sleep, not a
+        // `timeout` around a ready future: the latter never yields, so the
+        // spawned PUT would not have been polled at all and the assertion
+        // below would hold for the wrong reason.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !put_fut.is_finished(),
             "atomic PUT must block while another holder owns atomic_write_lock"
@@ -5337,7 +5383,7 @@ mod tests {
     /// the second cannot start its member-write loop until the first
     /// releases `atomic_write_lock`. With the lock removed the two
     /// `.await`-ing loops would interleave member writes.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn bug4_concurrent_atomic_puts_do_not_interleave() {
         let (db, def) = atomic_group_fixture().await;
 
@@ -5347,17 +5393,16 @@ mod tests {
         // Pre-acquire the lock so PUT #1 blocks deterministically;
         // start both PUTs, then release. They must run strictly
         // serially through the shared lock.
-        let guard = def.atomic_write_lock.clone().lock_owned().await;
+        let guard = ExternalLockHolder::take(def.atomic_write_lock.clone());
         let p1 = tokio::spawn(async move {
             ch1.put(&atomic_put_value(1.0, 1.0)).await.unwrap();
         });
         let p2 = tokio::spawn(async move {
             ch2.put(&atomic_put_value(2.0, 2.0)).await.unwrap();
         });
-        // Neither PUT can proceed while the lock is held externally.
-        tokio::time::timeout(Duration::from_millis(120), async {})
-            .await
-            .ok();
+        // Neither PUT can proceed while the lock is held externally. A real
+        // sleep so both spawned PUTs are genuinely polled first.
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(!p1.is_finished() && !p2.is_finished());
         drop(guard);
 

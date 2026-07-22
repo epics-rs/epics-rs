@@ -161,8 +161,34 @@
 //! database's link-put queue and returns, as C `dbCaPutLink` does
 //! (`dbCa.c:544-631`), so the only lset call left inside the window is the
 //! cached-state `put_admission` probe. See `run_special_actions`' own doc
-//! comment for the exact list. The remaining holders (H4, H6, H7, H8, H9) are
-//! untouched by step 4 and still await freely under the gate.
+//! comment for the exact list.
+//!
+//! **H6, H7, H8 and H9 now hold their gate across zero `.await`s** (§5 steps
+//! 5/6, all landed): H6 (`processing.rs` `process_record_with_links_inner`)
+//! and H8 (`qsrv/group.rs` atomic GET, `lock_group_records_read` hoisted
+//! above the gate) first; H7 (`pvalink/integration.rs`'s atomic scan epoch)
+//! and H9 (`qsrv/group.rs` atomic group PUT) followed once their callee
+//! chains were sync post-H6. Only **H4** (`field_io.rs`
+//! `put_record_field_from_ca_inner`) remains untouched and still awaits
+//! freely under the gate.
+//!
+//! ### L33 — the QSRV atomic-PUT group lock, relative to L1
+//!
+//! `epics-bridge-rs`' `GroupPvDef::atomic_write_lock` (`qsrv/group_config.rs`,
+//! `Arc<tokio::sync::Mutex<()>>`) is a group-vs-group serialization aid, not
+//! one of the locks listed above (it lives in a different crate and has no
+//! nesting relationship with L46/L8a/L8b). It is acquired in
+//! `GroupChannel::put`'s atomic branch **before** `PvDatabase::lock_records`
+//! (L1) — first so a conversion failure in the up-front value-conversion
+//! phase aborts the whole atomic PUT before any member-record gate is even
+//! requested, second so two atomic PUTs to the *same* group serialize before
+//! either reaches L1 at all. It stays a plain `tokio::sync::Mutex`, **not** a
+//! `PriorityInheritanceMutex`: it is held for the whole atomic block, which
+//! means it is held across `lock_records(…).await` itself — genuinely
+//! async today, since L1 has not made the step-4 type flip. Converting L33
+//! first would hold a `!Send` guard across that await and fail to compile at
+//! the connection-task spawn site, the same trap this module's own L1 type
+//! flip is staged around. L33 becomes convertible once L1 does (step 4).
 
 // RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
 

@@ -5,12 +5,24 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
+use epics_pva_rs::client::PvaClient;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use super::config::{LinkDirection, ProcMode, PvaLinkConfig, SevrMode};
 use super::link::{PvaLink, PvaLinkResult};
+
+/// Operation timeout of the IOC-wide pvalink client.
+///
+/// The value every link used to build its own client with, kept explicit
+/// so it does not silently follow `PvaClientBuilder`'s default. pvalink
+/// exposes **no** per-link timeout option (neither does pvxs's
+/// `pvaLinkConfig`), so one client-level timeout is the whole surface; a
+/// per-link timeout, if one is ever added, must be passed to the
+/// per-operation call instead of forking the shared client.
+const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Registry cache key.
 ///
@@ -76,16 +88,28 @@ pub struct ChannelDiag {
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
 /// `(pv_name, pipeline, queue_size, direction)` tuples.
-#[derive(Default)]
 pub struct PvaLinkRegistry {
+    /// The ONE [`PvaClient`] every link opened through this registry
+    /// runs on — the single owner pvxs calls
+    /// `linkGlobal->provider_remote`, built once in `linkGlobal_t::alloc()`
+    /// (`pvxs/ioc/pvalink.h:107`, `pvalink.cpp:51-63`).
+    ///
+    /// The registry, not the link, owns it because the registry is what
+    /// constructs links: [`PvaLink::open`] takes a client and never builds
+    /// one, so "a link owns a client" is not a representable state. All
+    /// links therefore share one `ConnectionPool` (keyed on `SocketAddr`)
+    /// and one search engine — two links to the same upstream IOC cost one
+    /// TCP connection, not two, whatever their `pvRequest` (`Q`, pipeline)
+    /// or direction.
+    client: PvaClient,
     map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
     /// In-flight open dedup. The original
     /// `get_or_open` used a textbook DCL — read-lock → open →
     /// write-lock → DCL drop loser. Two concurrent first-callers
-    /// both reached `PvaLink::open` (which spawns a monitor task
-    /// and a `PvaClient`); the loser's resources cleaned up via
-    /// Drop, but two upstream search/connect round-trips and two
-    /// monitor-task spawns were spent for one user-visible result.
+    /// both reached `PvaLink::open` (which spawns a monitor task);
+    /// the loser's resources cleaned up via Drop, but two upstream
+    /// search/connect round-trips and two monitor-task spawns were
+    /// spent for one user-visible result.
     /// This map carries an `Arc<Notify>` per in-flight open; the
     /// second caller awaits and then reads the cached entry.
     pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
@@ -109,9 +133,31 @@ fn key_of(config: &PvaLinkConfig) -> RegistryKey {
     )
 }
 
+impl Default for PvaLinkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PvaLinkRegistry {
+    /// A registry owning a freshly built IOC-wide client.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_client(PvaClient::builder().timeout(PVALINK_CLIENT_TIMEOUT).build())
+    }
+
+    /// A registry running every link on `client`.
+    ///
+    /// The injection seam for the IOC-wide client, matching pvxs building
+    /// `linkGlobal->provider_remote` from the IOC server's client config
+    /// (`pvxs/ioc/pvalink.cpp:60`) rather than from bare defaults. Tests
+    /// use it to pin the whole registry at one `PvaServer` address.
+    pub fn with_client(client: PvaClient) -> Self {
+        Self {
+            client,
+            map: RwLock::new(HashMap::new()),
+            pending: RwLock::new(HashMap::new()),
+            channel_records: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Record that `record`'s link attached to the channel identified by
@@ -303,7 +349,7 @@ impl PvaLinkRegistry {
             armed: true,
         };
 
-        let result = PvaLink::open(config).await;
+        let result = PvaLink::open(config, self.client.clone()).await;
         let link = Arc::new(result?);
         // Publish to the cache before releasing the pending slot so
         // waiters that wake up see the cached entry immediately.

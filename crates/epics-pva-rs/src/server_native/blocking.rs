@@ -5,13 +5,16 @@
 //! three threads and **no reactor**:
 //!
 //! ```text
-//!   socket --read--> reader thread --Vec<u8> chunks--> ChannelReader
-//!                                                         |
-//!                                    operation thread: block_on_sync(
-//!                                        handle_connection_io(..))
-//!                                                         |
-//!   socket <--write-- writer thread <--framed bytes-- ChannelWriter
+//!   socket --read--> reader pump --Vec<u8> chunks--> ChannelReader
+//!                                                       |
+//!                                  operation thread: block_on_sync(
+//!                                      handle_connection_io(..))
+//!                                                       |
+//!   socket <--write-- writer pump <--framed bytes-- ChannelWriter
 //! ```
+//!
+//! Both pumps and both adapters come from `runtime::blocking_io`; see "the seam
+//! is the byte source" below.
 //!
 //! # The seam is the byte source, not the frame pipeline
 //!
@@ -20,6 +23,16 @@
 //! not a second protocol: every byte still reaches the same parser, the same
 //! `select!`, the same handlers. Nothing in the 21,000-line protocol module is
 //! `cfg`-ed, and the hosted driver is not touched.
+//!
+//! Those implementors are no longer defined here. `ChannelReader` /
+//! `ChannelWriter`, the two pump bodies, the send-deadline loop and the two
+//! thread-lifecycle guards live in
+//! [`epics_base_rs::runtime::blocking_io`](epics_base_rs::runtime::blocking_io),
+//! because the PVA *client* and the CA client need the identical primitive and
+//! `epics-ca-rs` cannot depend on this crate (`doc/calink-rtems-design.md`
+//! §3.3). What remains in this file is what is genuinely server-side: the
+//! accept loop, the [`ConnRegistry`], the UDP search responder, and the
+//! assembly that gives one connection its two pumps.
 //!
 //! Crucially the threads hand over **bytes, not frames** (§1.3). The inbound
 //! type cache, the segment buffer and the channel map stay exactly where they
@@ -74,18 +87,20 @@
 //! | trigger | who wakes | the loop then sees |
 //! |---|---|---|
 //! | client EOF / read error (§4.2a) | nobody — the reader already returned | `Protocol("client closed")` |
-//! | writer death: write error or send deadline (§4.2b) | the writer thread, on its way out | `Protocol("client closed")` |
+//! | writer death: write error or send deadline (§4.2b) | the writer pump, on its way out | `Protocol("client closed")` |
 //! | server stop (§4.2c) | [`ConnRegistry::stop`], walking every live connection | `Protocol("client closed")` |
 //!
-//! [`ConnRegistry`] is that primitive's **single owner**, and the invariant it
-//! enforces is:
+//! The first two are a connection retiring *itself*, and each is performed by
+//! the pump guard that already owns that connection's socket
+//! (`runtime::blocking_io`). The third is the *server-wide* transition, and
+//! [`ConnRegistry`] is its **single owner**:
 //!
 //! > **MUST** every connection served here is registered before either of its
-//! > threads starts and stays registered until both have joined.
-//! > **MUST NOT** any path shut a connection's socket down, or take it out of
-//! > the registry, other than through a handle the registry issued — a
-//! > `ConnWake`, which only `ConnRegistry::register` can construct, or the
-//! > registration guard, whose `Drop` is the only remover.
+//! > pumps starts and stays registered until both have joined.
+//! > **MUST NOT** any path take a connection out of the registry other than
+//! > through the registration guard, whose `Drop` is the only remover; and no
+//! > path outside a connection may reach that connection's socket other than
+//! > through the `ConnWake` that only `ConnRegistry::register` constructs.
 //!
 //! Both halves hold by construction; see [`ConnRegistry`] for how.
 //!
@@ -129,24 +144,24 @@
 // RTEMS-EXEC-MODEL-ALLOW(18): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{
     Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
+use epics_base_rs::runtime::blocking_io::{
+    DEFAULT_READ_CHUNK, PumpSpec, is_socket_timeout, send_tick_for, spawn_reader_pump,
+    spawn_writer_pump,
+};
 use epics_base_rs::runtime::task::spawn_dedicated_thread;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use tokio::io::ReadBuf;
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
@@ -220,24 +235,6 @@ const CHUNK_QUEUE_DEPTH: usize = 1;
 /// so depth 1 gives the task the same backpressure a blocking socket write
 /// would.
 const FRAME_QUEUE_DEPTH: usize = 1;
-
-/// One blocking read, sized to match `read_frame`'s own chunk so the byte
-/// arrival pattern is the hosted one.
-const READ_CHUNK: usize = 4096;
-
-/// How many SO_SNDTIMEO ticks fit inside one send deadline. The socket
-/// timeout only exists to return control to the deadline loop; the deadline
-/// is the real bound (§3.3).
-const SEND_TICKS_PER_DEADLINE: u32 = 4;
-
-/// A blocking socket op hit its `SO_RCVTIMEO`/`SO_SNDTIMEO`.
-///
-/// Same classification CA's blocking driver uses (`epics-ca-rs`
-/// `server/blocking.rs`, `is_read_timeout`): Unix reports the expiry as
-/// `WouldBlock`, some platforms as `TimedOut`.
-fn is_socket_timeout(kind: io::ErrorKind) -> bool {
-    matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-}
 
 // ---------------------------------------------------------------------------
 // Shutdown: the wake handle and the registry that walks them
@@ -384,11 +381,14 @@ impl ConnRegistry {
         self.state().conns.len()
     }
 
-    /// Take ownership of a connection's socket and issue its wake handle.
+    /// Take ownership of a connection's socket, so [`stop`](Self::stop) can
+    /// reach it.
     ///
-    /// Consumes the `Arc` so the caller cannot keep a second route to the
-    /// socket: from here on the only way to shut this connection down is the
-    /// handle on the returned guard.
+    /// The registry's `Arc` is the *server-wide* route to this socket, and the
+    /// only one: a connection's own two pump guards each hold an `Arc` of the
+    /// same descriptor and retire their own thread with it, but neither is
+    /// reachable from outside the connection. So `stop` walking `conns` remains
+    /// the single owner of the server-wide shutdown transition.
     fn register(&self, socket: Arc<TcpStream>) -> ConnRegistration<'_> {
         let wake = ConnWake(socket);
         let (id, stopped) = {
@@ -401,11 +401,7 @@ impl ConnRegistry {
         if stopped {
             wake.wake();
         }
-        ConnRegistration {
-            registry: self,
-            id,
-            wake,
-        }
+        ConnRegistration { registry: self, id }
     }
 
     /// The only remover. Private, and reached only from
@@ -415,455 +411,18 @@ impl ConnRegistry {
     }
 }
 
-/// A connection's registration: its wake handle while it lives, and its
-/// removal from the registry on the way out — every way out, including a panic
-/// unwinding through the driver.
+/// A connection's registration: its presence in the registry while it lives,
+/// and its removal on the way out — every way out, including a panic unwinding
+/// through the driver.
 struct ConnRegistration<'a> {
     registry: &'a ConnRegistry,
     id: u64,
-    wake: ConnWake,
-}
-
-impl ConnRegistration<'_> {
-    /// A clone of the wake handle, for a thread that outlives this borrow, or
-    /// for the guard that owns one — [`WriterGuard`]'s thread wakes the
-    /// connection on its way out (§4.2b), and [`ReaderGuard`] wakes it to
-    /// return a parked `read`.
-    ///
-    /// This is the *only* way to obtain a wake from a registration. There used
-    /// to be a `wake(&self)` beside it, which meant the retiring path could
-    /// wake without holding anything that joins — the shape that let the
-    /// reader leak. Now a wake is only reachable through a guard that joins.
-    fn wake_handle(&self) -> ConnWake {
-        self.wake.clone()
-    }
 }
 
 impl Drop for ConnRegistration<'_> {
     fn drop(&mut self) {
         self.registry.deregister(self.id);
     }
-}
-
-/// Announce a per-connection child thread that did not end normally.
-///
-/// [`ReaderGuard`] and [`WriterGuard`] made both losses below *survivable* —
-/// the connection is torn down and its slot returned however a child ends.
-/// They did not make either loss *visible*, and an IOC that has lost a thread
-/// but reads exactly like a healthy one is what closes here. Two losses reach
-/// this function:
-///
-/// * the thread could not be created at all ([`spawn_child`]) — the
-///   per-connection thread ceiling, and the very condition [`ReaderGuard`]
-///   exists to survive;
-/// * the thread panicked, which the guards' `join()` used to discard with
-///   `let _ =`.
-///
-/// Through `errlog` and not `tracing` alone, for the reason the CA driver's
-/// client refusal is: `errlog_sev_printf` reaches the console whatever the log
-/// configuration — including an RTEMS console whose subscriber is the in-tree
-/// one — and printing it is what a C IOC does. The `tracing` event beside it is
-/// what a hosted operator with a subscriber already reads.
-fn child_thread_lost(role: &str, peer: SocketAddr, what: &str) {
-    epics_base_rs::runtime::log::errlog_sev_printf(
-        epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-        &format!(
-            "PVA connection {peer}: the {role} thread {what}; this connection is \
-             being torn down. Other connections are unaffected."
-        ),
-    );
-    warn!(
-        ?peer,
-        role, what, "blocking PVA server: a per-connection thread was lost"
-    );
-}
-
-/// Spawn one of a connection's two child threads, announcing a failure to
-/// create it before the error propagates.
-///
-/// Both children take the same priority and the same stack class. `Small`:
-/// neither builds anything — the reader's whole frame is a [`READ_CHUNK`]
-/// buffer and a `read`/`send` loop (`reader_thread`), and the writer drains
-/// already-encoded frames from a queue onto the socket (`writer_thread`). The
-/// protocol state machine runs on the connection thread, which is `Big`.
-///
-/// One function rather than two spawn sites so that the failure cannot be
-/// propagated silently from either. This is the path that leaves a reader
-/// running with no writer — exactly what [`ReaderGuard`] was built to survive —
-/// and until now it reached the operator only through the connection thread's
-/// `debug!`, which is below every default filter and below the IOC console
-/// subscriber's threshold.
-fn spawn_child(
-    role: &str,
-    peer: SocketAddr,
-    body: impl FnOnce() + Send + 'static,
-) -> PvaResult<thread::JoinHandle<()>> {
-    spawn_dedicated_thread(
-        format!("PVAS-{role} {peer}"),
-        PVA_SERVER_PRIORITY,
-        StackSizeClass::Small,
-        body,
-    )
-    .map_err(|e| {
-        child_thread_lost(role, peer, &format!("could not be created ({e})"));
-        PvaError::Io(e)
-    })
-}
-
-/// The spawned reader thread, woken and joined on **every** exit path.
-///
-/// # Invariant
-///
-/// MUST: once `reader_thread` has been spawned, it is woken and joined before
-/// [`serve_connection_blocking`] returns — clean return, `?`, or a panic
-/// unwinding out of the connection handler.
-///
-/// # The defect this closes
-///
-/// A writer-spawn failure used to `?` out with the reader already running.
-/// [`ConnRegistration::drop`] deregisters WITHOUT waking — which is right, the
-/// wake belongs to whoever retires the connection — so [`ConnRegistry::stop`]
-/// could no longer reach that reader. It sat parked in `read` behind an
-/// `SO_RCVTIMEO` of `op_timeout` (~64,000 s by default), holding its socket
-/// and its descriptor for the life of the IOC. The `max_connections` slot was
-/// returned correctly, which is exactly what made the leak invisible: the
-/// connection count looked healthy while descriptors drained away.
-///
-/// Owning the handle in a guard, rather than calling cleanup on the error
-/// branch, is what makes the leak unexpressible: there is no way to have
-/// spawned the reader without also holding the value that joins it. The same
-/// applies to the panic path, which no error-branch cleanup could have covered.
-struct ReaderGuard {
-    wake: ConnWake,
-    peer: SocketAddr,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl Drop for ReaderGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            // The reader's `read` is parked behind an effectively-infinite
-            // timeout, so the socket has to be shut to return it. This is the
-            // module's single wake primitive, through the registry-issued
-            // handle — the same one `ConnRegistry::stop` would use.
-            self.wake.wake();
-            // The join result is the only place a panicked reader is ever
-            // reported: `reader_thread` returns `()`, so an `Err` here means it
-            // unwound, and the connection's own error will be a bland
-            // channel-closed rather than the cause. Discarding it left the two
-            // unlinkable.
-            if handle.join().is_err() {
-                child_thread_lost("reader", self.peer, "panicked");
-            }
-        }
-    }
-}
-
-/// The spawned writer thread and the only strong frame sender, retired
-/// together on **every** exit path.
-///
-/// The sender lives here rather than beside the guard because the writer parks
-/// on `frame_rx.recv()` and leaves only when the last strong sender drops.
-/// A guard that joined without dropping the sender would hang; keeping the two
-/// in one value means the order cannot be got wrong, and does not depend on
-/// the declaration order of two separate locals.
-struct WriterGuard {
-    frames: Option<mpsc::Sender<Vec<u8>>>,
-    peer: SocketAddr,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl Drop for WriterGuard {
-    fn drop(&mut self) {
-        // Decisive because it is the only strong sender — the `ChannelWriter`
-        // adapter holds a weak handle. The writer drains what is queued, sees
-        // `None`, and exits; on its way out it wakes the connection (§4.2b).
-        drop(self.frames.take());
-        if let Some(handle) = self.handle.take() {
-            // Same reading as `ReaderGuard`'s: an `Err` is a panicked writer,
-            // and a writer that unwound with frames still queued dropped them.
-            if handle.join().is_err() {
-                child_thread_lost("writer", self.peer, "panicked");
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reader side
-// ---------------------------------------------------------------------------
-
-/// `AsyncRead` over a channel of byte chunks — the blocking driver's stand-in
-/// for the tokio socket read half.
-///
-/// **Cancel-safety** is the whole point of the `cur`/`pos` pair and is why
-/// this type exists at all rather than a channel being read inline. The
-/// hosted `read_frame` is used directly as a `select!` arm and survives losing
-/// that race because its accumulated bytes live *outside* it. This adapter has
-/// the same property: a chunk leaves the channel only when `poll_recv` returns
-/// `Ready`, and a partially-copied chunk stays in `cur`/`pos` across as many
-/// dropped `poll_read` futures as the caller likes. A lost race consumes
-/// nothing.
-pub(super) struct ChannelReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    /// The chunk currently being handed out, and how much of it has gone.
-    cur: Vec<u8>,
-    pos: usize,
-}
-
-impl ChannelReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx,
-            cur: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl tokio::io::AsyncRead for ChannelReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        // No room offered: report "nothing filled" without taking anything
-        // out of the channel. Consuming here would be the one way this
-        // adapter could lose bytes.
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let me = &mut *self;
-        loop {
-            if me.pos < me.cur.len() {
-                let n = (me.cur.len() - me.pos).min(buf.remaining());
-                buf.put_slice(&me.cur[me.pos..me.pos + n]);
-                me.pos += n;
-                if me.pos == me.cur.len() {
-                    me.cur.clear();
-                    me.pos = 0;
-                }
-                return Poll::Ready(Ok(()));
-            }
-            match me.rx.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => {
-                    // An empty chunk is not an EOF marker; skip it rather
-                    // than letting it read as one.
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    me.cur = chunk;
-                    me.pos = 0;
-                }
-                // Every sender gone = the reader thread ended (EOF, read
-                // error, or RCVTIMEO). Zero bytes filled is what `read_frame`
-                // turns into `Protocol("client closed")` — the existing hosted
-                // EOF path, unchanged (§4.2a).
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-/// Blocking read loop. Ends on EOF, read error, or `SO_RCVTIMEO`; dropping
-/// `tx` on the way out is the EOF signal to the operation thread.
-fn reader_thread(sock: Arc<TcpStream>, tx: mpsc::Sender<Vec<u8>>, peer: SocketAddr) {
-    // `impl Read for &TcpStream`: one shared descriptor, no `try_clone`.
-    let mut sock = &*sock;
-    let mut chunk = [0u8; READ_CHUNK];
-    loop {
-        let n = match sock.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if is_socket_timeout(e.kind()) => {
-                debug!(?peer, "blocking reader: receive timeout, ending connection");
-                break;
-            }
-            Err(e) => {
-                debug!(?peer, error = %e, "blocking reader: read failed");
-                break;
-            }
-        };
-        // The house sync-over-async primitive: parks this thread (no runtime
-        // entered) or hands the worker off (hosted). NOT `blocking_send`,
-        // which panics inside a runtime context and would make this same
-        // file unusable from a hosted worker.
-        if !matches!(block_on_sync(tx.send(chunk[..n].to_vec())), Ok(Ok(()))) {
-            break;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Writer side
-// ---------------------------------------------------------------------------
-
-/// Wake slot for a `poll_write` that found the frame channel full. The writer
-/// thread wakes it after each frame it takes, which is the moment room
-/// appears.
-#[derive(Default)]
-struct WriteRoom {
-    waker: Mutex<Option<Waker>>,
-}
-
-impl WriteRoom {
-    fn park(&self, cx: &Context<'_>) {
-        *self.waker.lock().expect("write-room waker poisoned") = Some(cx.waker().clone());
-    }
-
-    fn wake(&self) {
-        let waker = self.waker.lock().expect("write-room waker poisoned").take();
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
-/// `AsyncWrite` over a channel of frames — the blocking driver's stand-in for
-/// the tokio socket write half.
-///
-/// Holds a [`mpsc::WeakSender`], never a strong one, and that is load-bearing
-/// rather than tidiness: this adapter is owned by the connection's writer
-/// task, which is aborted (not joined) when the connection ends, so the moment
-/// its last strong sender drops is not a moment the driver controls. With only
-/// a weak handle here, the driver's own sender is the sole thing keeping the
-/// channel open, and dropping it ends the writer thread deterministically
-/// instead of whenever the runtime gets round to reaping an aborted task.
-pub(super) struct ChannelWriter {
-    tx: mpsc::WeakSender<Vec<u8>>,
-    room: Arc<WriteRoom>,
-}
-
-impl ChannelWriter {
-    fn new(tx: mpsc::WeakSender<Vec<u8>>, room: Arc<WriteRoom>) -> Self {
-        Self { tx, room }
-    }
-}
-
-fn write_closed() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "PVA writer thread has ended")
-}
-
-impl tokio::io::AsyncWrite for ChannelWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let Some(tx) = self.tx.upgrade() else {
-            return Poll::Ready(Err(write_closed()));
-        };
-        // Register interest BEFORE trying, so a take that happens between the
-        // try and the return cannot be missed: either `try_send` sees the room
-        // that take created, or the take's `wake()` finds this waker.
-        self.room.park(cx);
-        match tx.try_send(buf.to_vec()) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(write_closed())),
-        }
-        // `tx` drops here. Nothing in this adapter holds a strong sender
-        // across a suspension, which is what makes the driver's drop decisive.
-    }
-
-    /// Frames are flushed by the writer thread as it takes them; there is no
-    /// buffer here to push.
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// Write one whole frame under a **deadline**, not merely a per-syscall
-/// timeout (§3.3).
-///
-/// The hosted writer bounds `write_all(&frame)` as a unit. Plain SO_SNDTIMEO
-/// bounds each `write` syscall instead, so a client that accepts one byte per
-/// tick never trips it and holds the writer thread indefinitely — the exact
-/// stuck-client hazard the hosted timeout exists to prevent, on a resource (an
-/// OS thread) that is scarcer on RTEMS than a task is on the host. The socket
-/// timeout here is only what returns control to this loop; the deadline is the
-/// bound.
-///
-/// A partial write on expiry needs no repair: the caller ends the writer and
-/// the connection is torn down, so nothing is ever written to this socket
-/// again.
-fn write_frame_deadline(sock: &TcpStream, frame: &[u8], send_timeout: Duration) -> io::Result<()> {
-    // `impl Write for &TcpStream`: rebind so `write`/`flush` have a mutable
-    // place to borrow, without needing `&mut TcpStream` from the caller.
-    let mut sock = sock;
-    let deadline = Instant::now() + send_timeout;
-    let mut off = 0;
-    while off < frame.len() {
-        // Checked at the top so every way round the loop is bounded,
-        // including an `Interrupted` storm.
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "send deadline expired with the frame incomplete",
-            ));
-        }
-        match sock.write(&frame[off..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "peer accepted no bytes",
-                ));
-            }
-            Ok(n) => off += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // A tick with no progress: fall through to the deadline check.
-            Err(e) if is_socket_timeout(e.kind()) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    sock.flush()
-}
-
-/// Drain frames to the socket in order. Ends when the driver drops the last
-/// strong sender, or on the first write error / send-deadline expiry.
-///
-/// Whichever of those ends it, it wakes the connection on the way out (§4.2b).
-/// A dead writer means the connection is over, and the operation loop must not
-/// wait up to a heartbeat period to find that out — but the fix is the socket
-/// shutdown, not a seventh `select!` arm: the reader's `read` then returns 0
-/// and the loop unwinds down the existing EOF path, leaving `tcp.rs` and the
-/// hosted timing alone. See the module docs.
-fn writer_thread(
-    sock: Arc<TcpStream>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    room: Arc<WriteRoom>,
-    wake: ConnWake,
-    send_timeout: Duration,
-    peer: SocketAddr,
-) {
-    // `Ok(None)` = the driver let go of its sender; `Err(_)` = this thread
-    // cannot block here at all. Both end the writer.
-    while let Ok(Some(frame)) = block_on_sync(rx.recv()) {
-        // A slot just opened; let a parked `poll_write` retry.
-        room.wake();
-        if let Err(e) = write_frame_deadline(&sock, &frame, send_timeout) {
-            debug!(?peer, error = %e, "blocking writer: send failed, ending connection");
-            break;
-        }
-    }
-    // Whatever parked the producer, it must not stay parked on a dead writer.
-    room.wake();
-    // Uniform, not special-cased on *why* the writer ended: the only thing
-    // that ends it is the connection being over. On the error paths this is
-    // what retires the connection at once; on the normal path the driver is
-    // already tearing down and repeats the same shutdown a moment later,
-    // harmlessly — every frame this thread was given has been written before
-    // it gets here.
-    wake.wake();
 }
 
 // ---------------------------------------------------------------------------
@@ -912,70 +471,55 @@ pub fn serve_connection_blocking(
         .set_read_timeout(Some(config.op_timeout))
         .map_err(PvaError::Io)?;
     let send_timeout = config.send_timeout;
-    let send_tick = (send_timeout / SEND_TICKS_PER_DEADLINE).max(Duration::from_millis(1));
     stream
-        .set_write_timeout(Some(send_tick))
+        .set_write_timeout(Some(send_tick_for(send_timeout)))
         .map_err(PvaError::Io)?;
 
     // One socket, several handles: the SAME descriptor shared through an
-    // `Arc` by both child threads and the registry, which owns it from here
+    // `Arc` by both pump threads and the registry, which owns it from here
     // on. Registering *before* either thread starts is what closes the window
     // where a thread could be parked on a socket `stop` cannot reach.
     //
-    // Shared, not duplicated: `try_clone` is `fcntl(F_DUPFD_CLOEXEC)`, which
-    // cannot work for a socket on RTEMS 6 — see the same note in
-    // `epics-ca-rs/src/server/blocking.rs::handle_client_blocking` for the
-    // measured failure and the RTEMS/libbsd source that causes it.
-    // `impl Read/Write for &TcpStream` gives both roles with one descriptor.
+    // Shared, not duplicated: see `runtime::blocking_io`'s module docs for the
+    // measured RTEMS/libbsd reason `try_clone` cannot be used here.
     let stream = Arc::new(stream);
     let read_sock = stream.clone();
     let write_sock = stream.clone();
     let registration = registry.register(stream);
 
-    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE_DEPTH);
-    let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
-    let room = Arc::new(WriteRoom::default());
-    let writer_adapter = ChannelWriter::new(frame_tx.downgrade(), room.clone());
-
-    // Both children go through `spawn_child`, which is the seam at
-    // `PVA_SERVER_PRIORITY` — like every other thread in this module, see that
-    // constant for why all of them share one number — plus the announcement a
-    // failure to create either one owes the operator.
+    // Both pumps come from `runtime::blocking_io`, the workspace's one blocking
+    // byte source — the same primitive the PVA *client*'s `connect_blocking`
+    // uses, in `epics-base-rs` rather than here because `epics-ca-rs` cannot
+    // reach this crate (`doc/calink-rtems-design.md` §3.3). They run at
+    // `PVA_SERVER_PRIORITY`, like every other thread in this module; see that
+    // constant for why all of them share one number.
     //
-    // From here on the reader is owned by a guard. Every exit below — the
+    // From here on the reader is owned by its guard. Every exit below — the
     // writer-spawn `?`, and a panic unwinding out of the connection handler —
-    // runs `ReaderGuard::drop`, which wakes and joins it. See that type for the
-    // leak this closes.
-    let reader = ReaderGuard {
-        wake: registration.wake_handle(),
-        peer,
-        handle: Some(spawn_child("reader", peer, move || {
-            reader_thread(read_sock, chunk_tx, peer)
-        })?),
+    // runs `ReaderPumpGuard::drop`, which wakes and joins it.
+    let pump_spec = |role: &str| PumpSpec {
+        thread_name: format!("PVAS-{role} {peer}"),
+        label: format!("PVA connection {peer}"),
+        priority: PVA_SERVER_PRIORITY,
     };
-    let writer_room = room.clone();
-    let writer_wake = registration.wake_handle();
-    let writer = WriterGuard {
-        // The only strong sender moves into the guard, so it cannot be dropped
-        // out of order with the join. `writer_adapter` above already took its
-        // weak handle.
-        frames: Some(frame_tx),
-        peer,
-        handle: Some(spawn_child("writer", peer, move || {
-            writer_thread(
-                write_sock,
-                frame_rx,
-                writer_room,
-                writer_wake,
-                send_timeout,
-                peer,
-            )
-        })?),
-    };
+    let (reader_adapter, reader) = spawn_reader_pump(
+        read_sock,
+        &pump_spec("reader"),
+        DEFAULT_READ_CHUNK,
+        CHUNK_QUEUE_DEPTH,
+    )
+    .map_err(PvaError::Io)?;
+    let (writer_adapter, writer) = spawn_writer_pump(
+        write_sock,
+        &pump_spec("writer"),
+        send_timeout,
+        FRAME_QUEUE_DEPTH,
+    )
+    .map_err(PvaError::Io)?;
 
     let outcome = block_on_sync(handle_connection_io(
         source,
-        Box::new(ChannelReader::new(chunk_rx)),
+        Box::new(reader_adapter),
         Box::new(writer_adapter),
         peer,
         config,
@@ -994,9 +538,6 @@ pub fn serve_connection_blocking(
     // this same reverse-drop order if control never reaches here.
     drop(writer);
     drop(reader);
-    // `room` outlives both, so a producer parked on a full queue is released
-    // by the writer's exit wake rather than left holding a dead waker.
-    drop(room);
     // Both threads are joined; the connection is no longer reachable and its
     // entry goes. This is the only removal path there is.
     drop(registration);
@@ -1531,11 +1072,11 @@ mod tests {
     use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
     use crate::server_native::search::build_search_response_proto;
     use crate::server_native::{SharedPV, SharedSource};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
     use std::net::IpAddr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
     use std::thread;
-    use tokio::io::AsyncReadExt;
+    use std::time::Instant;
 
     /// Source guard for F2: both PVA accept loops back off through
     /// [`AcceptBackoff`], and the count is pinned so a *new* accept loop
@@ -1668,80 +1209,13 @@ mod tests {
         }
     }
 
-    // ── adapter: cancel-safety ──────────────────────────────────────────
-
-    /// §1.5's claim, which the design doc flags as the one thing it reasoned
-    /// about but did not execute: losing a `select!` race must consume
-    /// nothing. `read_frame` is used directly as a `select!` arm, so if this
-    /// adapter dropped bytes on a lost race the failure would be silent and
-    /// intermittent — a truncated frame long after the fact.
-    ///
-    /// Both boundaries of "what was in flight when the race was lost":
-    ///
-    /// * **mid-chunk** — part of a chunk has been handed out and the rest is
-    ///   parked in `cur`/`pos`;
-    /// * **pending** — no chunk has arrived at all, so the poll registered a
-    ///   waker and returned `Pending`.
-    #[tokio::test]
-    async fn channel_reader_loses_no_bytes_when_a_select_race_is_lost() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE_DEPTH);
-        let mut reader = ChannelReader::new(rx);
-
-        // Boundary 1: a partially-consumed chunk survives.
-        tx.send(b"ABCDEFGH".to_vec()).await.expect("chunk queued");
-        let mut small = [0u8; 3];
-        let n = reader.read(&mut small).await.expect("first read");
-        assert_eq!(&small[..n], b"ABC");
-        for _ in 0..4 {
-            let mut buf = [0u8; 8];
-            tokio::select! {
-                biased;
-                // This arm always wins, so the read future below is created
-                // and dropped without ever completing.
-                _ = std::future::ready(()) => {}
-                _ = reader.read(&mut buf) => unreachable!("the ready arm wins under `biased`"),
-            }
-        }
-        let mut rest = [0u8; 8];
-        let n = reader.read(&mut rest).await.expect("read after lost races");
-        assert_eq!(
-            &rest[..n],
-            b"DEFGH",
-            "a lost race must not eat the parked tail of the chunk"
-        );
-
-        // Boundary 2: a poll that returned Pending consumed nothing either.
-        for _ in 0..4 {
-            let mut buf = [0u8; 8];
-            tokio::select! {
-                biased;
-                _ = std::future::ready(()) => {}
-                _ = reader.read(&mut buf) => unreachable!("the ready arm wins under `biased`"),
-            }
-        }
-        tx.send(b"IJKL".to_vec())
-            .await
-            .expect("second chunk queued");
-        let mut after = [0u8; 8];
-        let n = reader
-            .read(&mut after)
-            .await
-            .expect("read after pending races");
-        assert_eq!(
-            &after[..n],
-            b"IJKL",
-            "a chunk must not be taken out of the channel by a poll that returned Pending"
-        );
-
-        // And EOF still reads as EOF once every sender is gone.
-        drop(tx);
-        let mut eof = [0u8; 8];
-        assert_eq!(
-            reader.read(&mut eof).await.expect("eof read"),
-            0,
-            "all senders dropped must surface as a zero-length read"
-        );
-    }
+    // ── adapter and pump tests live with the primitive ──────────────────
+    //
+    // Cancel-safety of `ChannelReader`, the `ChannelWriter` weak-sender rule,
+    // the send-deadline loop and both pump guards are now tested in
+    // `epics_base_rs::runtime::blocking_io`, beside the code they describe.
+    // What stays here is what is server-side: the registry, the accept loop,
+    // and this driver's own assembly and teardown.
 
     // ── end-to-end over a real loopback socket ──────────────────────────
 
@@ -2155,154 +1629,6 @@ mod tests {
         }
     }
 
-    // ── writer: the deadline loop ───────────────────────────────────────
-
-    /// The property §3.3 exists for, stated as the case bare SO_SNDTIMEO gets
-    /// wrong.
-    ///
-    /// The peer here is not silent — it accepts a trickle of bytes, one small
-    /// read per socket-timeout tick, forever. Under plain SO_SNDTIMEO every
-    /// `write` syscall makes progress, so no timeout ever fires and the writer
-    /// thread is held indefinitely. The deadline loop bounds the *frame*, so
-    /// it gives up at `send_timeout` regardless of the dribble.
-    ///
-    /// Mutation-checked: delete the loop's top-of-loop deadline check, leaving
-    /// only the socket timeout, and this test never returns (the run was
-    /// killed at 120 s). That is the whole argument of §3.3, executed.
-    #[test]
-    fn writer_deadline_loop_ends_a_trickling_client() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let (server, _) = listener.accept().expect("accept");
-
-        const SEND_TIMEOUT: Duration = Duration::from_millis(400);
-        let tick = SEND_TIMEOUT / SEND_TICKS_PER_DEADLINE;
-        server.set_write_timeout(Some(tick)).expect("SO_SNDTIMEO");
-        // Small enough that a multi-MiB frame cannot be absorbed by the
-        // kernel buffers, so the writer really does have to wait on the peer.
-        let _ = server.set_nodelay(true);
-
-        let read_total = Arc::new(AtomicUsize::new(0));
-        let counted = read_total.clone();
-        // The trickle keeps a whole 8 MiB frame's worth of bytes in flight, so
-        // it must be told to stop rather than left to drain the socket a byte
-        // at a time once the writer has given up.
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_reader = stop.clone();
-        let trickle = thread::spawn(move || {
-            // One byte per tick: always progress, never a stall long enough
-            // for SO_SNDTIMEO to fire on its own.
-            let mut byte = [0u8; 1];
-            while !stop_reader.load(Ordering::Relaxed) {
-                match client.read(&mut byte) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        counted.fetch_add(n, Ordering::Relaxed);
-                    }
-                }
-                thread::sleep(tick / 2);
-            }
-        });
-
-        let frame = vec![0xA5u8; 8 * 1024 * 1024];
-        let started = Instant::now();
-        let err = write_frame_deadline(&server, &frame, SEND_TIMEOUT)
-            .expect_err("a trickling peer must not be allowed to hold the writer");
-        let elapsed = started.elapsed();
-
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::TimedOut,
-            "the frame deadline is what fires, not a socket error"
-        );
-        assert!(
-            elapsed < SEND_TIMEOUT * 5,
-            "the deadline must bound the whole frame; took {elapsed:?} for a \
-             {SEND_TIMEOUT:?} deadline"
-        );
-        assert!(
-            elapsed >= SEND_TIMEOUT,
-            "the writer must not give up before its deadline; took {elapsed:?}"
-        );
-        assert!(
-            read_total.load(Ordering::Relaxed) > 0,
-            "the peer really was accepting bytes — this is the trickle case, \
-             not a dead-socket case"
-        );
-
-        stop.store(true, Ordering::Relaxed);
-        drop(server);
-        let _ = trickle.join();
-    }
-
-    /// A complete frame to a peer that reads normally still goes out, and the
-    /// deadline does not fire. The negative control for the test above: a
-    /// deadline loop that failed everything would pass that one.
-    #[test]
-    fn writer_deadline_loop_delivers_a_frame_to_a_reading_client() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let (server, _) = listener.accept().expect("accept");
-        server
-            .set_write_timeout(Some(Duration::from_millis(50)))
-            .expect("SO_SNDTIMEO");
-
-        let frame: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
-        let expected = frame.clone();
-        let echo = thread::spawn(move || {
-            let mut got = vec![0u8; expected.len()];
-            client.read_exact(&mut got).expect("client reads the frame");
-            assert_eq!(got, expected, "bytes arrive intact and in order");
-        });
-
-        write_frame_deadline(&server, &frame, Duration::from_secs(5))
-            .expect("a reading peer takes the frame well inside the deadline");
-        echo.join().expect("client thread");
-    }
-
-    // ── writer adapter backpressure ─────────────────────────────────────
-
-    /// `ChannelWriter` holds only a weak sender, so the driver's own sender is
-    /// what keeps the frame channel alive. That is what makes teardown
-    /// deterministic rather than dependent on when an aborted writer task is
-    /// reaped, and it is worth pinning: a future edit that stores a strong
-    /// `Sender` here would still pass every other test in this file while
-    /// reintroducing a teardown that can hang.
-    #[tokio::test]
-    async fn channel_writer_does_not_keep_the_frame_channel_open() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
-        let room = Arc::new(WriteRoom::default());
-        let mut writer = ChannelWriter::new(tx.downgrade(), room.clone());
-
-        {
-            use tokio::io::AsyncWriteExt;
-            writer
-                .write_all(b"frame")
-                .await
-                .expect("first frame queued");
-        }
-        assert_eq!(rx.recv().await.as_deref(), Some(&b"frame"[..]));
-
-        // The adapter is still alive; the driver lets go of its sender.
-        drop(tx);
-        assert!(
-            rx.recv().await.is_none(),
-            "a live ChannelWriter must not keep the channel open once the driver \
-             drops its sender — teardown depends on this"
-        );
-        // And the adapter reports the closure rather than parking forever.
-        {
-            use tokio::io::AsyncWriteExt;
-            let err = writer
-                .write_all(b"late")
-                .await
-                .expect_err("writing after the channel closed must fail");
-            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
-        }
-    }
-
     // ── shutdown: the registry and the wake ─────────────────────────────
     //
     // One case per boundary of the stop transition, not one per story. The
@@ -2340,6 +1666,21 @@ mod tests {
         let client = TcpStream::connect(addr).expect("connect");
         let (server, peer) = listener.accept().expect("accept");
         (client, server, peer)
+    }
+
+    /// One non-blocking `poll_write` on a writer adapter, from a plain `#[test]`
+    /// with no runtime.
+    ///
+    /// The tests below need to ask "has the writer pump ended?" without
+    /// dropping the pump guard — dropping it would shut the socket and so
+    /// answer its own question. A single poll against a no-op waker gives
+    /// `Ready(Err)` exactly when the pump has dropped the frame receiver.
+    fn poll_write_once(
+        adapter: &mut (impl tokio::io::AsyncWrite + Unpin),
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut cx = Context::from_waker(Waker::noop());
+        std::pin::Pin::new(adapter).poll_write(&mut cx, buf)
     }
 
     /// Boundary: nothing registered. `stop` must be a no-op rather than
@@ -2393,7 +1734,11 @@ mod tests {
     /// have to wait for it.
     ///
     /// Mutation-checked: `ConnWake::wake` as a no-op leaves the writer parked
-    /// until its 30 s deadline, well past the 5 s `recv_timeout` here.
+    /// until its 30 s deadline, well past the 5 s bound here.
+    ///
+    /// Driven through the real pump primitive rather than a hand-built thread,
+    /// so what is under test is the registry's reach into a connection assembled
+    /// the way [`serve_connection_blocking`] assembles one.
     #[test]
     fn stop_wakes_a_writer_parked_in_the_deadline_loop() {
         // Kept alive and deliberately never read from: this is the stuck-peer
@@ -2402,43 +1747,56 @@ mod tests {
 
         let registry = ConnRegistry::new();
         let server = Arc::new(server);
-        let registration = registry.register(server.clone());
         let write_sock = server.clone();
-        write_sock
-            .set_write_timeout(Some(Duration::from_millis(250)))
-            .expect("SO_SNDTIMEO");
-
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
+        let _registration = registry.register(server.clone());
         // Far longer than this test may take, so only the wake can explain a
         // prompt exit.
         const DEADLINE: Duration = Duration::from_secs(30);
-        let room = Arc::new(WriteRoom::default());
-        let wake = registration.wake_handle();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let writer = thread::spawn(move || {
-            writer_thread(write_sock, rx, room, wake, DEADLINE, peer);
-            let _ = done_tx.send(());
-        });
+        write_sock
+            .set_write_timeout(Some(send_tick_for(DEADLINE)))
+            .expect("SO_SNDTIMEO");
+
+        let spec = PumpSpec {
+            thread_name: format!("PVAS-writer {peer}"),
+            label: format!("PVA connection {peer}"),
+            priority: PVA_SERVER_PRIORITY,
+        };
+        let (mut adapter, _guard) =
+            spawn_writer_pump(write_sock, &spec, DEADLINE, FRAME_QUEUE_DEPTH).expect("writer pump");
 
         // Bigger than any socket buffer, so the writer really is parked mid
-        // frame rather than done before `stop` runs.
-        tx.try_send(vec![0xA5u8; 8 * 1024 * 1024])
-            .expect("frame queued");
+        // frame rather than done before `stop` runs. The depth-1 queue takes
+        // the whole buffer in one `poll_write`.
+        assert!(
+            matches!(
+                poll_write_once(&mut adapter, &vec![0xA5u8; 8 * 1024 * 1024]),
+                Poll::Ready(Ok(_))
+            ),
+            "the first frame must fit the empty queue without parking"
+        );
         thread::sleep(Duration::from_millis(300));
 
+        // The pump's exit is observed through the adapter, NOT by dropping the
+        // guard: the guard shuts the very same descriptor, so joining it here
+        // would release the writer whether or not `stop` did anything, and the
+        // assertion would pass vacuously. Once the pump ends it drops the frame
+        // receiver, and the adapter's weak sender reports the channel closed.
         let started = Instant::now();
         registry.stop();
-        done_rx
-            .recv_timeout(RETIRE_BOUND)
-            .expect("stop must return a writer parked in the deadline loop");
+        let mut ended = false;
+        while started.elapsed() < RETIRE_BOUND {
+            if matches!(poll_write_once(&mut adapter, b"probe"), Poll::Ready(Err(_))) {
+                ended = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < DEADLINE / 2,
+            ended && elapsed < DEADLINE / 2,
             "the writer must be woken by the shutdown, not released by its own \
-             {DEADLINE:?} deadline; took {elapsed:?}"
+             {DEADLINE:?} deadline; ended={ended} after {elapsed:?}"
         );
-        writer.join().expect("writer thread");
-        drop(tx);
     }
 
     /// Boundary: an operation is registered and not destroyed when `stop`
@@ -2556,50 +1914,52 @@ mod tests {
     /// and the loop unwinds down its existing EOF path. This is what lets
     /// `tcp.rs` stay untouched and the hosted `select!` stay byte-identical.
     ///
-    /// Mutation-checked: delete the `wake.wake()` at the end of
-    /// `writer_thread` and the parked reader here is never released.
+    /// Mutation-checked: delete the socket shutdown at the end of
+    /// `runtime::blocking_io`'s writer pump and the parked reader here is never
+    /// released.
     #[test]
     fn a_writer_that_ends_wakes_a_reader_parked_on_the_socket() {
         // The client stays connected and silent, so the only thing that can
         // return the reader's `read` is a shutdown from this side.
         let (_client, server, peer) = socket_pair();
 
-        let registry = ConnRegistry::new();
         let server = Arc::new(server);
-        let registration = registry.register(server.clone());
 
+        // A bare `read` on the shared descriptor stands in for the reader pump:
+        // using the pump here would bring its own guard, whose drop shuts the
+        // same socket and would answer the question this test is asking.
         let read_sock = server.clone();
         let (read_done, read_result) = std::sync::mpsc::channel();
         let reader = thread::spawn(move || {
+            use std::io::Read;
             let mut buf = [0u8; 64];
             let _ = read_done.send((&*read_sock).read(&mut buf));
         });
         thread::sleep(Duration::from_millis(200));
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
-        let wake = registration.wake_handle();
-        let write_sock = server.clone();
-        let writer = thread::spawn(move || {
-            writer_thread(
-                write_sock,
-                rx,
-                Arc::new(WriteRoom::default()),
-                wake,
-                Duration::from_secs(5),
-                peer,
-            )
-        });
+        let spec = PumpSpec {
+            thread_name: format!("PVAS-writer {peer}"),
+            label: format!("PVA connection {peer}"),
+            priority: PVA_SERVER_PRIORITY,
+        };
+        let (adapter, guard) = spawn_writer_pump(
+            server.clone(),
+            &spec,
+            Duration::from_secs(5),
+            FRAME_QUEUE_DEPTH,
+        )
+        .expect("writer pump");
 
-        // The writer's last strong sender goes: it ends, and on the way out it
-        // wakes the connection.
-        drop(tx);
+        // The pump's last strong sender goes with the guard: it ends, and on the
+        // way out it shuts the socket, waking the reader.
+        drop(adapter);
+        drop(guard);
         let n = read_result
             .recv_timeout(RETIRE_BOUND)
             .expect("a parked reader must be released when the writer ends")
             .expect("the shutdown surfaces as a clean end-of-stream, not an error");
         assert_eq!(n, 0, "the woken read must report end-of-stream");
 
-        writer.join().expect("writer thread");
         reader.join().expect("reader thread");
     }
 
@@ -2685,32 +2045,34 @@ mod tests {
         let registry = ConnRegistry::new();
         let server = Arc::new(server);
 
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
         {
-            let registration = registry.register(server.clone());
-            let read_sock = server.clone();
-            let _reader = ReaderGuard {
-                wake: registration.wake_handle(),
-                peer,
-                handle: Some(thread::spawn(move || {
-                    let mut buf = [0u8; 64];
-                    let _ = (&*read_sock).read(&mut buf);
-                    let _ = done_tx.send(());
-                })),
+            let _registration = registry.register(server.clone());
+            let spec = PumpSpec {
+                thread_name: format!("PVAS-reader {peer}"),
+                label: format!("PVA connection {peer}"),
+                priority: PVA_SERVER_PRIORITY,
             };
+            // An effectively-infinite receive timeout, exactly as `op_timeout`
+            // gives the real driver: only the guard's shutdown can end this
+            // pump.
+            server
+                .set_read_timeout(Some(Duration::from_secs(64_000)))
+                .expect("SO_RCVTIMEO");
+            let (_adapter, _reader) =
+                spawn_reader_pump(server.clone(), &spec, DEFAULT_READ_CHUNK, CHUNK_QUEUE_DEPTH)
+                    .expect("reader pump");
             assert_eq!(registry.live_connections(), 1);
             thread::sleep(Duration::from_millis(200));
-            assert!(
-                done_rx.try_recv().is_err(),
-                "precondition: the reader must be parked in `read`, or this \
-                 test proves nothing"
-            );
             // Stand-in for the writer-spawn `?`: leave the scope with the
-            // reader running and the writer never created.
+            // reader running and the writer never created. Leaving it is what
+            // must wake and join the pump — if it did not, this scope exit
+            // would block until the 64,000 s timeout.
         }
-        done_rx
-            .recv_timeout(RETIRE_BOUND)
-            .expect("a reader spawned before a failed setup must still be woken and joined");
+        assert!(
+            started.elapsed() < RETIRE_BOUND,
+            "a reader spawned before a failed setup must still be woken and joined"
+        );
         assert_eq!(
             registry.live_connections(),
             0,
@@ -2726,73 +2088,30 @@ mod tests {
         let (_client, server, peer) = socket_pair();
         let registry = ConnRegistry::new();
         let server = Arc::new(server);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        server
+            .set_read_timeout(Some(Duration::from_secs(64_000)))
+            .expect("SO_RCVTIMEO");
 
+        let started = Instant::now();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let registration = registry.register(server.clone());
-            let read_sock = server.clone();
-            let _reader = ReaderGuard {
-                wake: registration.wake_handle(),
-                peer,
-                handle: Some(thread::spawn(move || {
-                    let mut buf = [0u8; 64];
-                    let _ = (&*read_sock).read(&mut buf);
-                    let _ = done_tx.send(());
-                })),
+            let _registration = registry.register(server.clone());
+            let spec = PumpSpec {
+                thread_name: format!("PVAS-reader {peer}"),
+                label: format!("PVA connection {peer}"),
+                priority: PVA_SERVER_PRIORITY,
             };
+            let (_adapter, _reader) =
+                spawn_reader_pump(server.clone(), &spec, DEFAULT_READ_CHUNK, CHUNK_QUEUE_DEPTH)
+                    .expect("reader pump");
             panic!("connection handler blew up");
         }));
 
         assert!(panicked.is_err(), "precondition: the closure must panic");
-        done_rx
-            .recv_timeout(RETIRE_BOUND)
-            .expect("a panic unwinding past the reader must still wake and join it");
-        assert_eq!(registry.live_connections(), 0);
-    }
-
-    /// The ordering that a naive guard gets wrong: the writer parks on
-    /// `frame_rx.recv()` and leaves only when the last strong sender drops, so
-    /// a guard that joined *before* dropping the sender would hang forever.
-    ///
-    /// Holding the sender inside [`WriterGuard`] is what makes that
-    /// unexpressible — it cannot be dropped out of order with the join, and
-    /// the ordering does not depend on two locals' declaration order.
-    #[test]
-    fn a_writer_guard_drops_its_sender_before_joining() {
-        let (_client, server, peer) = socket_pair();
-        let registry = ConnRegistry::new();
-        let server = Arc::new(server);
-        let registration = registry.register(server.clone());
-
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
-        let wake = registration.wake_handle();
-        let write_sock = server.clone();
-        let writer = WriterGuard {
-            frames: Some(tx),
-            peer,
-            handle: Some(thread::spawn(move || {
-                writer_thread(
-                    write_sock,
-                    rx,
-                    Arc::new(WriteRoom::default()),
-                    wake,
-                    Duration::from_secs(5),
-                    peer,
-                )
-            })),
-        };
-
-        // Drop off-thread so a guard that hangs fails this test instead of
-        // hanging the whole suite.
-        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            drop(writer);
-            let _ = dropped_tx.send(());
-        });
-        dropped_rx.recv_timeout(RETIRE_BOUND).expect(
-            "WriterGuard::drop must drop the last strong sender before joining; \
-             otherwise the writer stays parked on recv and the join never returns",
+        assert!(
+            started.elapsed() < RETIRE_BOUND,
+            "a panic unwinding past the reader must still wake and join it"
         );
+        assert_eq!(registry.live_connections(), 0);
     }
 
     /// Structural closure, as source: both connection threads are owned by a
@@ -2800,7 +2119,12 @@ mod tests {
     /// that leaked, and it must not come back.
     #[test]
     fn both_connection_threads_are_owned_by_a_joining_guard() {
-        let src = include_str!("blocking.rs");
+        // Scoped to production: a *test* below deliberately spawns a bare
+        // reader thread to stand in for a pump it must not own (owning it
+        // would shut the socket and answer that test's own question). Scanning
+        // the whole file made this guard fire on that, which is a guard
+        // punishing the test that proves the property it is guarding.
+        let src = production_scope(include_str!("blocking.rs"));
         // Comment lines are skipped: the doc comment above names the banned
         // shape on purpose, and this guard is about CODE. A real binding
         // cannot live on a line starting with `//`. (Needles are split for the
@@ -2812,8 +2136,8 @@ mod tests {
         for banned in [
             concat!("let reader = spawn_dedi", "cated_thread("),
             concat!("let writer = spawn_dedi", "cated_thread("),
-            concat!("let reader = spawn_", "child("),
-            concat!("let writer = spawn_", "child("),
+            concat!("let reader = thread::", "spawn("),
+            concat!("let writer = thread::", "spawn("),
         ] {
             let offenders: Vec<&&str> = code.iter().filter(|l| l.contains(banned)).collect();
             assert!(
@@ -2823,167 +2147,18 @@ mod tests {
                  and its descriptor for the life of the IOC"
             );
         }
+        // The guards themselves now live in `epics_base_rs::runtime::blocking_io`
+        // and are tested there; what this file must still get right is binding
+        // BOTH of them, so the `?` and panic paths run their `Drop`. A pump
+        // spawned into `_` would compile and leak.
         for required in [
-            concat!("let reader = Reader", "Guard {"),
-            concat!("let writer = Writer", "Guard {"),
+            concat!("let (reader_adapter, reader) = spawn_reader_", "pump("),
+            concat!("let (writer_adapter, writer) = spawn_writer_", "pump("),
         ] {
             assert!(
                 code.iter().any(|l| l.contains(required)),
-                "connection setup no longer binds `{required}` — both threads \
+                "connection setup no longer binds `{required}` — both pumps \
                  must be owned by a guard that joins them on every exit path"
-            );
-        }
-    }
-
-    /// A subscriber that keeps what was emitted, so a test can assert an
-    /// announcement actually happened.
-    ///
-    /// `errlog_sev_printf` routes through `tracing` on the
-    /// `epics_base_rs::errlog` target *and* to the console fallback; the
-    /// `tracing` half is the observable one from in-process, and installing
-    /// this for the duration of a drop is how these tests read it.
-    #[derive(Clone, Default)]
-    struct CapturedLines(Arc<Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for CapturedLines {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Fields<'a>(&'a mut String);
-            impl tracing::field::Visit for Fields<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write;
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-            let mut line = event.metadata().target().to_string();
-            event.record(&mut Fields(&mut line));
-            self.0.lock().expect("captured lines").push(line);
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    /// Everything emitted on the calling thread while `f` runs.
-    fn lines_while(f: impl FnOnce()) -> Vec<String> {
-        let captured = CapturedLines::default();
-        tracing::subscriber::with_default(captured.clone(), f);
-        let lines = captured.0.lock().expect("captured lines");
-        lines.clone()
-    }
-
-    /// F3 made a lost child *survivable*; this is what makes it *visible*.
-    ///
-    /// `ReaderGuard::drop` joined and threw the result away, so a reader that
-    /// unwound left nothing behind: the connection's own error is a bland
-    /// channel-closed, and the two were unlinkable.
-    #[test]
-    fn a_panicked_reader_is_reported_and_not_discarded() {
-        let (_client, server, peer) = socket_pair();
-        let registry = ConnRegistry::new();
-        let server = Arc::new(server);
-        let registration = registry.register(server.clone());
-
-        let lines = lines_while(|| {
-            let _reader = ReaderGuard {
-                wake: registration.wake_handle(),
-                peer,
-                handle: Some(thread::spawn(|| panic!("reader blew up"))),
-            };
-        });
-
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("epics_base_rs::errlog")
-                    && l.contains("reader thread panicked")),
-            "a panicked reader must reach errlog, which prints whatever the log \
-             configuration is — including an RTEMS console. Captured: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn a_panicked_writer_is_reported_and_not_discarded() {
-        let (_client, _server, peer) = socket_pair();
-        let (frames, _rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE_DEPTH);
-
-        let lines = lines_while(|| {
-            let _writer = WriterGuard {
-                frames: Some(frames),
-                peer,
-                handle: Some(thread::spawn(|| panic!("writer blew up"))),
-            };
-        });
-
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("epics_base_rs::errlog")
-                    && l.contains("writer thread panicked")),
-            "a panicked writer dropped whatever frames were still queued; that \
-             must not be silent. Captured: {lines:?}"
-        );
-    }
-
-    /// The other boundary: an ordinary teardown is not a loss. Every
-    /// connection that ever closes runs these drops, so announcing there
-    /// would bury the real losses on a serial console.
-    #[test]
-    fn a_child_that_ends_cleanly_is_not_announced() {
-        let (_client, server, peer) = socket_pair();
-        let registry = ConnRegistry::new();
-        let server = Arc::new(server);
-        let registration = registry.register(server.clone());
-
-        let lines = lines_while(|| {
-            let _reader = ReaderGuard {
-                wake: registration.wake_handle(),
-                peer,
-                handle: Some(thread::spawn(|| {})),
-            };
-        });
-
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("was lost") || l.contains("panicked")),
-            "an ordinary connection teardown must print nothing: {lines:?}"
-        );
-    }
-
-    /// Structural closure as source, for the one loss no test can force: a
-    /// thread that cannot be created. Both guards and the single spawn site
-    /// must report through the one announcement function.
-    #[test]
-    fn every_child_loss_goes_through_the_announcement() {
-        let prod = production_scope(include_str!("blocking.rs"));
-        assert_eq!(
-            prod.matches(concat!("let _ = han", "dle.join()")).count(),
-            0,
-            "a discarded join result is a panicked child nobody hears about"
-        );
-        for owner in [
-            "impl Drop for ReaderGuard",
-            "impl Drop for WriterGuard",
-            "fn spawn_child(",
-        ] {
-            let at = prod
-                .find(owner)
-                .unwrap_or_else(|| panic!("`{owner}` is gone from this module"));
-            let body = &prod[at..(at + 900).min(prod.len())];
-            assert!(
-                body.contains(concat!("child_thread_", "lost(")),
-                "`{owner}` can lose a per-connection thread without saying so"
             );
         }
     }
@@ -3091,11 +2266,22 @@ mod tests {
         );
         assert_eq!(
             prod.matches("spawn_dedicated_thread(").count(),
-            2,
-            "the per-connection thread, and `spawn_child` for the reader and \
-             the writer — which share one spawn site so that neither can fail \
-             silently"
+            1,
+            "the per-connection operation thread is the only thread this module \
+             still spawns itself; the reader and writer pumps go through \
+             `runtime::blocking_io`, which spawns them through the same seam at \
+             the `PumpSpec` priority this module passes it"
         );
+        // And they really do go through it: a pump spawned any other way would
+        // not be reachable from these two calls.
+        for pump in ["spawn_reader_pump(", "spawn_writer_pump("] {
+            assert_eq!(
+                prod.matches(pump).count(),
+                1,
+                "each connection takes exactly one `{pump}` — the seam that \
+                 applies the priority and the stack class"
+            );
+        }
     }
 
     /// Binding *is* listening: the port is answerable and connectable before

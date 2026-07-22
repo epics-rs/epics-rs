@@ -62,6 +62,53 @@ RTEMS-5-era workaround that steers itself into a broken backend, and finding
 that took an interposer and CPU-idle attribution. Our backend does not depend on
 a reactor, so it never meets that class of defect. That is the claim to make.
 
+### What the blocking-thread model is, and what it does not give you for free
+
+The one-line difference is **who does the waiting**.
+
+- **Blocking thread** — one thread per connection, parked in `recv()`. The
+  *kernel scheduler* is the multiplexer. Application code runs top to bottom;
+  connection state lives on the thread's stack.
+- **`select`/`poll`** — one thread hands the kernel the whole fd list, wakes,
+  and **rescans all N** to find who is ready. O(N), list re-copied per call.
+- **`epoll`/`kqueue`** — the interest set is *registered* once; the kernel
+  returns only what is ready. O(ready). Both are the same idea, Linux's and
+  BSD's; kqueue additionally carries timers, signals and process events on the
+  same queue. Choosing between them is not a design decision — it is whichever
+  one the platform has.
+
+The real dividing line is blocking versus the other three, not select versus
+epoll. With a reactor the connection state cannot live on a stack, because
+there is no per-connection stack — hence state machines, callbacks, async.
+
+**What the blocking model wins, in this project's terms:**
+
+| | blocking thread | reactor |
+|---|---|---|
+| per-connection memory | **1,589,000 B** (§5.6; 97.4 % stack) | a small state object |
+| dependency on OS readiness plumbing | none | total — §5.3 is what that costs |
+| one connection stalls the others | no | yes, for the duration of a callback |
+| priority granularity | per connection | per loop (see §5.9) |
+| priority inheritance possible | yes | **structurally not** (§5.9) |
+
+Memory is the only column where blocking loses, and it loses badly: that
+1.5 MiB is what makes the ceiling of §5.1. Everything else favours it *for an
+IOC*, whose connection count is tens, not tens of thousands. C has run CA this
+way for thirty years — `rg '\b(select|poll|kevent|kqueue|epoll_wait)\s*\('`
+over `modules/database/src/ioc/rsrv/*.c` returns **zero hits**.
+
+**Grep trap, both directions.** The same `rg` over our two blocking drivers
+also returns zero *syscalls* — but it does hit `select!`, which is the tokio
+futures macro, not `select(2)`. And async code is still present: `park_on`
+drives futures inline on the connection thread (13 sites in the CA driver
+alone). "Blocking driver" means no reactor, not no async.
+
+**And the model does not hand you priority for free.** It only makes
+per-connection priority *possible*. Whether it materialises depends on two
+further things — that priorities are actually applied, and that a blocked
+thread is blocked on something the kernel can attribute an owner to. On this
+target neither currently holds. §5.9.
+
 ---
 
 ## 2. Repo state
@@ -204,12 +251,30 @@ deviation and should be documented as one. Note base's own comment at
 `modules/libcom/RTEMS/posix/rtems_config.c:83`: raising the cap past
 `FD_SETSIZE` faults any code calling `select()`, and libca/RSRV do not.
 
-**Raising the cap does not buy much, so do not propose it as a fix.** Measured
-at fd=400 (§5.6): the fd wall stops binding and heap binds instead, at **151
-served** — nine more connections than 142, on a 256 MB guest. The lever that
-would actually move this number is per-connection memory, 97.4 % of which is
-the two thread stacks (§5.2), and §5.2 says C over-provisions those the same way
-we do.
+**There are two separate walls and 142 is not the memory one.** This is worth
+stating flatly because the two are easy to conflate:
+
+| | set by | our guest | if RAM doubles |
+|---|---|---|---|
+| **fd wall** | `MAXIMUM_FILE_DESCRIPTORS − 8` | **142** | unchanged |
+| **memory wall** | free heap ÷ 1,589,000 B | **151** | roughly doubles |
+
+142 is arithmetic, not a memory result: the cap is 150 and the IOC itself holds
+8 descriptors at idle, which §5.7's status PVs confirm directly — `FD_CNT +
+FD_FREE = FD_MAX = 150` on every row, and `FD_FREE` reads exactly **142** at
+zero connections. The errno says the same thing: `ENFILE`, not `ENOMEM`. C's
+numbers are the same arithmetic — stock base stops at 53 from a cap of 64, and
+is 3 behind us at the same cap only because it holds 3 more descriptors itself.
+
+The memory wall was measured separately, on an fd=400 image where the fd wall
+no longer binds: **151 served**, refusals `EAGAIN` (thread creation) rather than
+`ENFILE`, matching `(259,803,736 − 19,880,696)/1,589,000 = 150.99`.
+
+**The effective ceiling is the lower of the two, so raising either alone buys
+almost nothing** — the cap buys 142→151, and more RAM buys nothing at all while
+the cap is 150. The lever that would actually move both is per-connection
+memory, 97.4 % of which is the two thread stacks (§5.2) — and §5.2 says C
+over-provisions those exactly as we do.
 
 ### 5.2 Stack classes — settled, do not reopen
 
@@ -475,6 +540,59 @@ allocator. Verified at fd=400 with 320 held connections and
 and kept accepting. Its only reachable trigger today is the panic arm, which
 *was* driven on a real console.
 
+### 5.9 Priority — the axis where blocking should win, and currently does not
+
+This is the one property the blocking model buys that a reactor cannot, and we
+are not collecting it. Three independent reasons, each measured.
+
+**Why a reactor structurally cannot do priority inheritance.** In a reactor the
+entity waiting on a contended resource is a *callback in a queue*. The kernel
+cannot see it and there is no priority to inherit. pvxs runs every server
+connection on one thread (`PVXTCP`, `server.cpp:388`, `CAServerLow-2` = 18), so
+all connections share one priority and none can preempt another;
+`event_priority_set()` orders the loop's own queue but never preempts a running
+callback. A blocking thread parked in `recv()` has none of these limits — which
+is the whole argument, and it is why the rest of this section matters.
+
+**Reason 1 — RT priority cannot be switched on, on this target.**
+`RtPolicy::current()` reads `EPICS_RS_ALLOW_RT_PRIORITY` (`task.rs:511`,`:550`)
+and defaults to `Disabled`. `POSIX_Init` calls `setenv` **zero** times and there
+is no shell, so there is no way to set it. `sched_calls_made() == 0` is the
+*documented correct* reading for the switch being off, so this is silent.
+
+**Reason 2 — even switched on, it would do nothing.** `apply_priority_impl`'s
+non-Linux arm (`task.rs:769-773`) returns `Unsupported`, because `epics-base-rs`
+links `libc` only on linux (`Cargo.toml:66-67`). The whole pvxs-parity priority
+design (18 / 16 / CaServerLow / −1) therefore has **zero effect on the one
+target that has no other way to set priorities**.
+
+**Reason 3 — the baseline is at the bottom.** The shim lowers the init task to
+`RTEMS_MAXIMUM_PRIORITY - 1` (`rtems_init.c:222`), and RTEMS pthreads inherit
+their creator's priority, so every IOC thread runs just above idle.
+
+**And half the locks would escape priority anyway.** Full table:
+`doc/pi-lock-evaluation.md` (main `3406721d`). `runtime/sync.rs:3` re-exports
+tokio's `Mutex`/`RwLock`, so **14 of 25 shared locks are async locks**. A
+blocking thread reaching one via `block_on_sync` → `park_on` sits in
+`std::thread::park()` (`task.rs:80`): no kernel-visible owner pointer, so no PI
+chain — and tokio's FIFO fair wake replaces C's `RTEMS_PRIORITY` priority-
+ordered queue, so even the *wait order* ignores priority. The worst case is L1,
+the `dbScanLock` analogue (`database/record_lock.rs:70`), which C protects with
+`epicsMutexMustCreate` and PI on (`dbLock.c:86`). It returns an
+`OwnedMutexGuard` **by design** so callers can hold it across awaits
+(`record_lock.rs:110`,`:121`) — which is exactly what blocks converting it.
+
+**The mechanism itself is alive — priorities work when actually set.** §5.3's
+control: giving the libevent loop thread `SCHED_FIFO` 3 against the other's 1
+made the starvation disappear. Not a contradiction of reasons 1-3 — RTEMS
+pthreads inherit, so unset priorities are all equal and therefore inert, while
+explicitly set ones take effect.
+
+**One caution from that same experiment.** With priorities separated, guest idle
+was **0.000074 s of 4.017 s**. Priority divides CPU; it does not create any.
+It hid the symptom and left the defect. Do not reach for priority as a fix for
+something that is burning the core.
+
 ---
 
 ## 6. Four upstream bugs found, none filed
@@ -563,12 +681,59 @@ decides.
 
 ## 8. Next — what to do when the session resumes
 
+### 8.0 The goal: reach C's blocking-thread level
+
+Stated as a checklist, not as prose, so it can be closed rather than discussed.
+**The blocking driver on RTEMS should be indistinguishable from RSRV's thread
+model in every property that matters, and different only where the difference
+is declared and better.** Current state is measured, not assumed:
+
+| property | C — RSRV, measured | us, measured | |
+|---|---|---|---|
+| threads per connection | 2 — `CAS-client` Big, `CAS-event` Medium | CA 2 — Big + Medium | **parity** |
+| stack classes requested | Big + Medium | Big + Medium (§5.2) | **parity** |
+| descriptors per connection | 1 | 1 (§5.7) | **parity** |
+| multiplexing syscalls | 0 | 0 | **parity** |
+| per-thread leak | 0 (raw pthreads) | **128 B** | **gap 1** |
+| thread priority actually applied | *unmeasured on RTEMS* | **0 — dead 3 ways** (§5.9) | **gap 2** |
+| lock wait discipline | `RTEMS_PRIORITY` ordered | tokio FIFO fair | **gap 3** |
+| PI on the scan lock | on — `epicsMutexMustCreate`, `dbLock.c:86` | none — L1 is `park_on`-invisible | **gap 4** |
+| refusal at the ceiling | accept, then **zero bytes**, then FIN | `CA_PROTO_ERROR`/`ECA_ALLOCMEM`, announced on powers of two | **deliberate, better** |
+
+Four gaps, in dependency order — each is only worth doing if the one above it
+is done, because otherwise it is unobservable:
+
+1. **Measure whether C's own thread priorities take effect on RTEMS 6.** This is
+   the missing cell in the table and it is one boot: `rt task` (or equivalent)
+   on the C IOC at a few held connections, reading the actual priorities of
+   `CAS-client` / `CAS-event` / `CAS-TCP`. Until this is known, "reach C's
+   level" has no number. It may turn out C is inert on this target too, in which
+   case gap 2 is parity already and the goal shrinks.
+2. **Make priority applicable at all on RTEMS** — the `Unsupported` arm at
+   `task.rs:769-773` and the `libc`-on-linux-only manifest line
+   (`Cargo.toml:66-67`), then a way to select the policy without `setenv` and
+   without a shell.
+3. **Priority-ordered wait, not FIFO** — a lock whose wait queue respects
+   priority, which tokio's does not offer.
+4. **PI on L1**, the `dbScanLock` analogue. Blocked by design, not by effort:
+   `record_lock.rs:110`,`:121` hand out an `OwnedMutexGuard` so callers can hold
+   it across awaits. Closing this is a structural change to that API, not a
+   swap of lock type, and it needs sign-off.
+
+Separately and independently: **gap 1**, the 128 B/thread leak, is what the
+thread-pool design of §8.4 closes.
+
+**Two things this goal explicitly does not mean.** Not "beat C" — §5.2 settled
+that our stack request already equals C's and that both over-provision ~650×.
+And not "match C's connection count" — we are already 3 *above* C at the same
+fd cap (§5.1), and the remaining distance is BSP configuration, not model.
+
+### 8.1 Do first — record what is already known, before it decays
+
 The measurement phase closed. Everything §5 set out to answer is answered, and
 three of those answers overturned a design belief. **The open work is now
 mostly writing-down and filing, not measuring** — which is exactly the work
 that gets skipped when a session moves machines, so it is listed first.
-
-### 8.1 Do first — record what is already known, before it decays
 
 1. **State the pvxs finding accurately in our own source.** Two files carry the
    design rationale and both currently overclaim, or are about to:

@@ -5,7 +5,7 @@
 //!
 //! This module holds the *pure* half of that contract (mode resolution and the
 //! link-fetch classification); the transition itself is driven by the single
-//! owner [`crate::server::database::PvDatabase::rec_gbl_get_simm`] /
+//! owner `crate::server::database::PvDatabase::rec_gbl_get_simm` /
 //! `rec_gbl_init_simm`, which are the only sites allowed to write SIMM.
 //!
 //! # The link rule the whole contract rests on
@@ -219,7 +219,7 @@ const RECORDS_WITH_SSCN: &[&str] = &[
 /// Whether a record type participates in the SIMM↔SSCN scan swap
 /// (`recGblCheckSimm`). The single source of truth behind
 /// [`crate::server::record::Record::uses_recgbl_simm_helpers`]; see
-/// [`RECORDS_WITH_SSCN`].
+/// `RECORDS_WITH_SSCN`.
 pub fn record_type_has_sscn(record_type: &str) -> bool {
     RECORDS_WITH_SSCN.contains(&record_type)
 }

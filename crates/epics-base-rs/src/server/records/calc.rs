@@ -371,7 +371,7 @@ impl Record for CalcRecord {
     /// `S_db_badField` — so the client's write FAILS while the bad expression
     /// stays stored and RPCL is left empty. calcout/scalcout/acalcout make the
     /// opposite choice (store the status in CLCV, accept the put); both
-    /// dispositions run off the one compile owner, [`calc_compile`].
+    /// dispositions run off the one compile owner, `calc_compile`.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after || !field.eq_ignore_ascii_case("CALC") {
             return Ok(());

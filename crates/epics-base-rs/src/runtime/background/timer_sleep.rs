@@ -38,7 +38,7 @@
 //! timer entry is armed lazily on the **first poll** — a `Sleep` that is
 //! created and dropped without ever being awaited schedules nothing.
 //!
-//! The [`DelayedTimer`] has no cancel handle (C `callbackRequestDelayed` starts
+//! The [`DelayedTimer`](crate::runtime::background::delayed_timer::DelayedTimer) has no cancel handle (C `callbackRequestDelayed` starts
 //! a fire-and-forget `epicsTimer`), so a dropped-before-deadline `Sleep` cannot
 //! un-schedule its entry. Instead [`Sleep`]'s `Drop` clears the stored waker, so
 //! when the orphaned timer callback eventually fires it finds no waker and wakes

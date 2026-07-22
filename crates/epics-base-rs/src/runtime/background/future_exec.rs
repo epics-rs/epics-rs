@@ -8,7 +8,7 @@
 //! tokio runtime, so this module runs each spawned future as a **task object
 //! multiplexed over the [`CallbackPool`](super::callback_executor::CallbackPool)**:
 //!
-//! 1. `spawn` builds a [`Task`] and pushes it onto its band's ring.
+//! 1. `spawn` builds a `Task` and pushes it onto its band's ring.
 //! 2. A band worker pops it and polls it **once**.
 //! 3. `Ready` → the outcome is published and the task is done.
 //! 4. `Pending` → the worker **releases the task and moves on**. The waker
@@ -23,7 +23,7 @@
 //! reactor or a timer wheel — which is precisely the A2 precondition.
 //!
 //! This replaces the original design, where a worker ran
-//! [`park_on_interruptible`](crate::runtime::task::park_on_interruptible) for
+//! `park_on_interruptible` for
 //! the *whole life* of the future and stayed parked between polls. That model
 //! had a structural defect: N concurrent long-lived tails exhausted the band's
 //! N workers, after which every further task on that band starved until one
@@ -71,7 +71,7 @@
 //!
 //! ## Every handle resolves
 //!
-//! [`Shared::finalize`] is the single owner of "this task has an outcome", and
+//! `Shared::finalize` is the single owner of "this task has an outcome", and
 //! it is idempotent. Three paths reach it, covering every way a task can stop
 //! existing: the poll produced `Ready`/cancel/panic; the queued entry was
 //! dropped without ever running (ring full, or the band shut down under it);

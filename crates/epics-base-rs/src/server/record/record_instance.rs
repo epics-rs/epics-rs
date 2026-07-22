@@ -1119,7 +1119,7 @@ impl RecordInstance {
         }
     }
 
-    /// Like [`notify_field_written`] but skips the invalidation when
+    /// Like [`Self::notify_field_written`] but skips the invalidation when
     /// the put did not actually change the field's value. Mirrors
     /// epics-base `faac1df1` — `DBE_PROPERTY` events fire only on
     /// real changes, not on idempotent writes (the C path compares
@@ -1129,7 +1129,7 @@ impl RecordInstance {
     /// `prev` is the value captured BEFORE the put. Callers that
     /// don't need the change-detection (e.g. internal writers that
     /// know the field is non-metadata) can keep using
-    /// [`notify_field_written`].
+    /// [`Self::notify_field_written`].
     // must post EventMask::PROPERTY to all field subscribers when metadata changes
     pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
@@ -1207,7 +1207,7 @@ impl RecordInstance {
     ///
     /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
     ///    `field_list` declares them;
-    /// 2. the record type's **declaration**, resolved by [`Self::field_desc`] —
+    /// 2. the record type's **declaration**, resolved by `Self::field_desc` —
     ///    the vendored `.dbd` whenever one exists, and only for a record type
     ///    that has no `.dbd` at all (`motor`, `optics`, `scaler`, `std`) the
     ///    record's own hand-written table, which for those Tier 3 types
@@ -1885,7 +1885,7 @@ impl RecordInstance {
     /// MARK for a channel it has not read yet (QSRV resolves a group's member
     /// masks once, at monitor start, rather than per event).
     ///
-    /// Same two gates, same owner as [`Self::assign_property_support`]: an
+    /// Same two gates, same owner as `Self::assign_property_support`: an
     /// unknown field supplies nothing.
     pub fn property_support_for_field(&self, field: &str) -> PropertySupport {
         let Some(value) = self.client_field_value(field) else {
@@ -2385,7 +2385,7 @@ impl RecordInstance {
     /// Returns what scan index changes are needed.
     ///
     /// A `DBF_MENU` common field's string is converted by C's runtime
-    /// converter, `dbConvert.c::putStringMenu` — see [`MenuBound::DbPut`].
+    /// converter, `dbConvert.c::putStringMenu` — see `MenuBound::DbPut`.
     pub fn put_common_field(
         &mut self,
         name: &str,
@@ -2562,7 +2562,7 @@ impl RecordInstance {
 
     /// Set a common field value from the `.db` loader, which in C is a
     /// different converter with a different out-of-menu bound
-    /// (`dbStaticRun.c::dbPutStringNum`; see [`MenuBound::DbLoad`]). It is what
+    /// (`dbStaticRun.c::dbPutStringNum`; see `MenuBound::DbLoad`). It is what
     /// lets `field(SSCN,"65535")` — the menuScan "use SCAN" sentinel, out of
     /// the menu's 0-9 range — load, while `caput REC.SSCN 65535` is refused at
     /// runtime exactly as C refuses it.

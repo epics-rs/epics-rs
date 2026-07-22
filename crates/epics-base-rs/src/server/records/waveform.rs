@@ -6,7 +6,7 @@ use crate::server::record::{
 use crate::server::records::count_put;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-/// Which EPICS record-type name an [`ArrayRecord`] reports. The four
+/// Which EPICS record-type name a [`WaveformRecord`] reports. The four
 /// upstream array record types (`waveform`, `aai`, `aao`, `subArray`)
 /// share the same scalar fields and DBR encoding; differentiation is
 /// only at the record-type string and (for `aao`) the output-record
@@ -799,11 +799,11 @@ impl Record for WaveformRecord {
     /// Every rule here decides the count for a record that arrived EMPTY. A
     /// record that arrived WITH elements — an in-process `record()` build that
     /// put VAL before `add_record`, a state C has no path to — keeps them:
-    /// [`Self::prebuilt_nord`] is captured first, and no init rule may discard
+    /// `Self::prebuilt_nord` is captured first, and no init rule may discard
     /// it.
     ///
     /// Pass 1 runs the aao's `fetchValue(prec, 1)` (aaoRecord.c:147) — see
-    /// [`Self::fetch_constant_dol`].
+    /// `Self::fetch_constant_dol`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
             self.fetch_constant_dol();
@@ -916,7 +916,7 @@ impl Record for WaveformRecord {
     /// `VAL`: `get_field("VAL")` serves NORD valid elements, but the channel's
     /// native count is the buffer capacity so a client sizes its buffer right —
     /// C `cvt_dbaddr` `no_elements` vs `get_array_info` `*no_elements = nord`.
-    /// The capacity is the same [`Self::val_capacity`] every array kind
+    /// The capacity is the same `Self::val_capacity` every array kind
     /// advertises: waveform/aai/aao report `nelm` (`waveformRecord.c:183`,
     /// `aaiRecord.c:215`, `aaoRecord.c:219`), subArray reports `malm`
     /// (`subArrayRecord.c:168`). Reporting it only for the waveform kind left
@@ -1383,7 +1383,7 @@ impl Record for WaveformRecord {
     /// `dbGetLink(pinp, ftvl, bptr, 0, &nRequest)` with `nRequest = NELM`).
     /// subArray is the slicing record: its device support asks the link for
     /// `INDX + NELM` elements and subsets them (`devSASoft.c::read_sa`), which
-    /// is [`Self::sa_load_and_subset`] — the same primitive the constant-INP
+    /// is `Self::sa_load_and_subset` — the same primitive the constant-INP
     /// process reload uses, so link delivery and constant reload cannot drift
     /// apart.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {

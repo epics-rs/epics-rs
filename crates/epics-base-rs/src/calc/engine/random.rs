@@ -14,7 +14,7 @@
 //! synApps excludes zero deliberately — `NORMAL_RNDM` takes
 //! `log(local_random())` — and base, which has no `NRNDM`, does not. Every
 //! value of `seed + 1` (≤ 65536) is exact in `float`, so the `f64` arithmetic
-//! in [`local_random`] is bit-identical to C's `float` cast.
+//! in `local_random` is bit-identical to C's `float` cast.
 //!
 //! Two deliberate deviations, both documented:
 //! - base's C seed is a plain file-static `unsigned short` shared by every

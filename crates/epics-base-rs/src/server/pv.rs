@@ -36,7 +36,7 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
 static DROPPED_MONITOR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the cumulative count of dropped monitor events. Intended for
-/// introspection / metrics; see [`DROPPED_MONITOR_EVENTS`] for the
+/// introspection / metrics; see `DROPPED_MONITOR_EVENTS` for the
 /// current wiring status.
 pub fn dropped_monitor_events() -> u64 {
     DROPPED_MONITOR_EVENTS.load(Ordering::Relaxed)
@@ -492,7 +492,7 @@ impl ProcessVariable {
     /// wall-clock now, with `user_tag` = 0. Display / control / enum
     /// metadata is `None` *unless* a proxy installed it via
     /// [`Self::set_metadata`] (the CA / PVA gateway shadowing an
-    /// upstream IOC) — see [`Self::apply_metadata`]. Record-backed
+    /// upstream IOC) — see `Self::apply_metadata`. Record-backed
     /// channels build their snapshot via
     /// `RecordInstance::snapshot_for_field`, which carries the record's
     /// own alarm/metadata. The only path that injects a non-zero alarm
@@ -814,7 +814,7 @@ impl ProcessVariable {
     /// `SimplePv` monitor runs the SAME filter chain as a record-field
     /// monitor instead of the empty default `FilterChain` that
     /// `add_subscriber` installs. Update delivery
-    /// ([`Self::notify_subscribers`] / [`Self::post_alarm`]) already
+    /// (`Self::notify_subscribers` / [`Self::post_alarm`]) already
     /// applies `sub.filters`; this is the missing wiring that populates
     /// it.
     ///

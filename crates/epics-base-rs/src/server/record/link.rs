@@ -713,7 +713,7 @@ fn constant_array_value(inner: &str) -> EpicsValue {
 /// (C passes a NULL units pointer → `S_stdlib_extraneous`), which is what keeps
 /// `"5 PP"` a PV link rather than a constant.
 ///
-/// So this is [`epics_parse_double`] and nothing else — C's ONE
+/// So this is [`crate::runtime::stdlib::epics_parse_double`] and nothing else — C's ONE
 /// `epicsParseDouble`, shared with the CA env-knob parser. A hand-rolled
 /// re-implementation drifted from it on three families, all probed on softIoc
 /// 7.0.10:
@@ -1495,7 +1495,7 @@ fn split_record_field(link_part: &str) -> Option<(&str, String)> {
 /// modifier set first (`:2252`). The OUT-link target-processing decision —
 /// process when the link is explicit ` PP` **or** the destination field is
 /// `.PROC` — lives in the write path
-/// ([`crate::server::database::Database::write_db_link_value`]), matching C
+/// (`PvDatabase::write_db_link_value`), matching C
 /// `dbDbPutValue` (`dbDbLink.c:387-390`).
 pub fn parse_output_link_v2(s: &str) -> ParsedLink {
     parse_link_field(s, LinkFieldType::Out)

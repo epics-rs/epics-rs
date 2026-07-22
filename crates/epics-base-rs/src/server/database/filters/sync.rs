@@ -41,7 +41,7 @@ use super::{FilteredMonitorEvent, SubscriptionFilter};
 use crate::server::recgbl::EventMask;
 
 /// Global named boolean state — the analogue of epics-base `dbState`.
-/// Cloning the `Arc` returned by [`db_state_registry::get_or_create`]
+/// Cloning the `Arc` returned by [`DbStateRegistry::get_or_create`]
 /// is cheap; the underlying `AtomicBool` is shared across all
 /// subscribers and the trigger record's set/clear call sites.
 #[derive(Debug, Default)]

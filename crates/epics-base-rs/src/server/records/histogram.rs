@@ -9,7 +9,7 @@ use crate::types::EpicsValue;
 /// explicitly at `UINT_MAX` (`add_count`: `if (*pdest == UINT_MAX)
 /// *pdest = 0; (*pdest)++;`).
 ///
-/// The counters are `epicsUInt32` here too — [`DbFieldType::ULong`], served
+/// The counters are `epicsUInt32` here too — [`crate::types::DbFieldType::ULong`], served
 /// as an [`EpicsValue::ULongArray`]. The declared type is the one C declares,
 /// and each wire projects it the way C's does, so neither wire needs a
 /// per-record special case:
@@ -367,7 +367,7 @@ impl Record for HistogramRecord {
     /// One owner for the record's three SPC_RESET fields
     /// (`histogramRecord.dbd.pod`: ULIM :183-189, LLIM :190-196, SDEL
     /// :239-244). The SDEL arm re-arms the watchdog through
-    /// [`ProcessAction::ArmWatchdog`] — `special()` has no database handle, so
+    /// [`crate::server::record::ProcessAction::ArmWatchdog`] — `special()` has no database handle, so
     /// the framework performs the `wdogInit` on its behalf, drained
     /// immediately after this returns (`take_special_actions`).
     ///

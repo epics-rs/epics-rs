@@ -386,9 +386,9 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 
 /// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS
 /// severity. `exact_one` selects C's `udf == TRUE` semantics (see
-/// [`udf_alarm_active`]); pass the record's [`Record::udf_alarm_on_exact_one`].
+/// [`udf_alarm_active`]); pass the record's [`crate::server::record::Record::udf_alarm_on_exact_one`].
 ///
-/// `msg` is the record's alarm message ([`Record::udf_alarm_message`]).
+/// `msg` is the record's alarm message ([`crate::server::record::Record::udf_alarm_message`]).
 /// Almost every base record raises UDF via plain
 /// `recGblSetSevr(prec, UDF_ALARM, prec->udfs)`, which forwards a NULL
 /// message and leaves `namsg` EMPTY (`recGbl.c:249-261`) — so `msg` is
@@ -527,7 +527,7 @@ fn get_max_range_values(
 /// C's `recGblGetGraphicDouble` (`recGbl.c:146-153`) — the display limits for a
 /// field the record's own `get_graphic_double` does not list.
 ///
-/// See [`get_max_range_values`] for what `None` means.
+/// See `get_max_range_values` for what `None` means.
 pub fn rec_gbl_get_graphic_double(
     field_type: Option<DbFieldType>,
     is_menu_field: bool,
@@ -539,9 +539,9 @@ pub fn rec_gbl_get_graphic_double(
 /// field the record's own `get_control_double` does not list.
 ///
 /// Identical to [`rec_gbl_get_graphic_double`] by construction, because C's two
-/// helpers are identical bodies over the same [`get_max_range_values`] table.
+/// helpers are identical bodies over the same `get_max_range_values` table.
 ///
-/// See [`get_max_range_values`] for what `None` means.
+/// See `get_max_range_values` for what `None` means.
 pub fn rec_gbl_get_control_double(
     field_type: Option<DbFieldType>,
     is_menu_field: bool,

@@ -115,7 +115,7 @@ pub enum PvEntry {
 /// **Async**, for the same reason [`LinkSet`] is: an external link's value
 /// lives on a tokio runtime, and a sync closure could only reach it through a
 /// blocking bridge that panics on a current-thread runtime. The one caller
-/// ([`PvDatabase::resolve_external_pv`]) is already async.
+/// (`PvDatabase::resolve_external_pv`) is already async.
 pub type ExternalPvResolver = Arc<
     dyn for<'a> Fn(
             &'a str,
@@ -213,7 +213,7 @@ pub type ExistenceGate = Arc<
 /// `get_record` first OR run the canonical-normalisation snippet
 /// at function entry. Direct `inner.records` access is reserved
 /// for the alias-management primitives listed above.
-/// One CP/CPP edge in the [`PvDatabaseInner::cp_links`] index: the record
+/// One CP/CPP edge in the `PvDatabaseInner::cp_links` index: the record
 /// to (re)process when the source record changes.
 ///
 /// `passive_only` distinguishes CPP from CP. C adds the `CA_DBPROCESS`
@@ -680,7 +680,7 @@ impl PvDatabase {
 
     /// Install the by-name subroutine registry, retained for runtime
     /// re-resolution (aSub LFLG=READ / SUBL). Called once at iocInit with the
-    /// IocApp/IocBuilder registry. See [`Self::find_subroutine_named`].
+    /// IocApp/IocBuilder registry. See `Self::find_subroutine_named`.
     pub async fn install_subroutine_registry(
         &self,
         registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
@@ -839,7 +839,7 @@ impl PvDatabase {
     /// Wait for the CA links to local records to report
     /// `is_connected() == true`. Mirrors `dbCa: iocInit wait for local CA
     /// links to connect` (epics-base PR #768/#856). The working set is
-    /// exactly [`Self::external_link_targets`]: only the CA facility's
+    /// exactly `Self::external_link_targets`: only the CA facility's
     /// local-target links — `pva://` links and non-local CA links connect
     /// in the background and are never waited on (pvxs parity).
     ///
@@ -929,7 +929,7 @@ impl PvDatabase {
     }
 
     /// Names of the waited-on CA links (local-target, per
-    /// [`Self::external_link_targets`]) that are opened but not yet
+    /// `Self::external_link_targets`) that are opened but not yet
     /// connected. iocInit calls this after
     /// [`Self::wait_for_external_links`] times out so the
     /// "M/N connected" diagnostic can name the `N-M` it proceeded
@@ -1090,7 +1090,7 @@ impl PvDatabase {
         Ok(())
     }
 
-    /// Add a simple PV that already has a [`WriteHook`] installed.
+    /// Add a simple PV that already has a [`crate::server::pv::WriteHook`] installed.
     ///
     /// Equivalent to `add_pv` followed by `find_pv` + `set_write_hook`,
     /// but the PV is constructed with the hook in place so it is
@@ -1100,7 +1100,7 @@ impl PvDatabase {
     /// `WRITE_NOTIFY` between the two awaits and hit the local
     /// `pv.set()` fallback path before the hook landed.
     ///
-    /// Returns `Err` on duplicate name (see [`add_pv`]).
+    /// Returns `Err` on duplicate name (see [`Self::add_pv`]).
     pub async fn add_pv_with_hook(
         &self,
         name: &str,
@@ -1354,7 +1354,7 @@ impl PvDatabase {
     /// Taking the loaded fields here is what makes C's ordering hold by
     /// construction: there is no window in which the init passes can observe a
     /// record whose `.db` fields have not landed, because the record is not
-    /// reachable until they have. [`RecordInstance::run_init_passes`] is
+    /// reachable until they have. `RecordInstance::run_init_passes` is
     /// crate-private for the same reason — the sink is the only caller.
     pub async fn add_loaded_record(
         &self,

@@ -333,7 +333,7 @@ pub fn set_default(name: &str, value: &str) {
 /// produces a path that only exists in a sibling-checkout layout: under a
 /// registry checkout the sibling is version-suffixed (`ad-core-rs-0.22.1`) and
 /// the path never resolves. To point at another crate's assets, use the dir that
-/// crate exports (e.g. [`ad_core_rs::AD_CORE_DIR`], `motor_rs::MOTOR_IOC_DIR`).
+/// crate exports (e.g. `ad_core_rs::AD_CORE_DIR`, `motor_rs::MOTOR_IOC_DIR`).
 ///
 /// Usage:
 /// ```ignore

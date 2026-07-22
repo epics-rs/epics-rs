@@ -16,7 +16,7 @@
 //! `Mutex`/`Condvar`** and boxed closures instead of C function pointers, so
 //! it carries **no tokio-runtime dependency** and runs on RTEMS
 //! (armv7-rtems-eabihf). The OS thread priority per band is applied
-//! best-effort via the existing [`apply_to_current_thread`] abstraction in
+//! best-effort via the existing [`apply_to_current_thread`](crate::runtime::task::apply_to_current_thread) abstraction in
 //! [`crate::runtime::task`] — this module does **not** duplicate that logic.
 //!
 //! ## Overflow hysteresis (`callback.c:365-374`, `:227`)

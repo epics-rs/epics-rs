@@ -194,7 +194,7 @@ impl AsyncDbHandle {
     }
 
     /// Resolve a link's target field type for the sseq link-status
-    /// diagnostics — see [`PvDatabase::link_target_field_type`]. `None` if
+    /// diagnostics — see `PvDatabase::link_target_field_type`. `None` if
     /// the link is constant / external / unresolvable, or the database is
     /// gone. (Distinct from the free `server::record::link_field_type`,
     /// which returns the link *class* `LinkType`, not the target's type.)
@@ -206,7 +206,7 @@ impl AsyncDbHandle {
     }
 
     /// Schedule a record's link-status classification — see
-    /// [`PvDatabase::schedule_record_init`]. This is the ONE owner every
+    /// `PvDatabase::schedule_record_init`. This is the ONE owner every
     /// record's `refresh_link_status` goes through: during the LOAD phase the
     /// classification is queued for `iocInit` (so it never reads a half-built
     /// database, and its result is final when `iocInit` returns), and on a
@@ -224,7 +224,7 @@ impl AsyncDbHandle {
 
     /// Read a link's value WITHOUT processing its source record — the C
     /// `dbGetLink` semantics. Parses `link` and reads it via
-    /// [`PvDatabase::read_link_value_no_process`]; `None` if the link is
+    /// `PvDatabase::read_link_value_no_process`; `None` if the link is
     /// constant-less / external-unresolvable or the database has been
     /// dropped. Used by module-crate records (e.g. std `throttle` SYNC →
     /// `SINP`→`VAL`) that must pull an input link from `special()` without
@@ -628,11 +628,11 @@ impl PvDatabase {
     /// Driver-callback (`asyn:READBACK`) full-processing entry.
     ///
     /// The single owner of this entry is the I/O Intr wiring
-    /// ([`crate::server::ioc_app::setup_io_intr`] and its `ioc_builder`
+    /// (`crate::server::ioc_app::setup_io_intr` and its `ioc_builder`
     /// twin): the spawned task processes a record because the driver
     /// fired an interrupt callback, not because of a client put / FLNK /
     /// scan. `device_callback = true` tells
-    /// [`Self::process_record_with_links_inner`] that, for an *output*
+    /// `Self::process_record_with_links_inner` that, for an *output*
     /// record, this cycle must READ the callback value back into VAL and
     /// MUST NOT write it to the driver — C `devAsynInt32.c::processBo`
     /// (and `processAo`/`processLongout`/…) take the readback branch when
@@ -1071,7 +1071,7 @@ impl PvDatabase {
     /// count, and returns the oneshot that fires on `dbNotifyCompletion`.
     /// The caller owns when (and whether) to await each receiver, so several
     /// puts can be outstanding at once — unlike
-    /// [`ProcessAction::WriteDbLinkNotify`], which wires the completion
+    /// [`crate::server::record::ProcessAction::WriteDbLinkNotify`], which wires the completion
     /// straight to a single superseding async re-entry token and so allows
     /// only one outstanding put per record. This is the seam C
     /// `calcApp/src/sseqRecord.c` needs to run multiple `WAITn` put-callbacks
@@ -4953,7 +4953,7 @@ impl PvDatabase {
     }
 
     /// Process every holder of an EXTERNAL CP/CPP link to `external_pv` —
-    /// the cross-IOC twin of [`Self::dispatch_cp_targets`]. Called by the
+    /// the cross-IOC twin of `Self::dispatch_cp_targets`. Called by the
     /// calink/pvalink CA monitor callback on every remote change, this is
     /// the Rust equivalent of C `dbCa.c eventCallback` adding
     /// `CA_DBPROCESS` for a CP (or Passive CPP) link (`dbCa.c:993-994`)

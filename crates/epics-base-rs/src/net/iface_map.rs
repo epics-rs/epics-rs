@@ -1,6 +1,6 @@
 //! IPv4 network interface enumeration with periodic refresh.
 //!
-//! Wraps the [`if-addrs`] crate (cross-platform) into an
+//! Wraps the `if-addrs` crate (cross-platform) into an
 //! [`IfaceMap`] keyed by `ifindex`. Built once at startup and
 //! refreshable on demand — multi-NIC environments where interfaces
 //! come and go (USB Ethernet, hot-plug iface) need a fresh snapshot

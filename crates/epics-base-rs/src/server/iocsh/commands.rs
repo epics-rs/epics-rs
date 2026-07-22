@@ -1534,7 +1534,7 @@ fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
 /// of a second raw `split(',')` that would tear a quoted value on an
 /// embedded comma. Callers that defer `$(...)` expansion to their own
 /// `macExpandString` equivalent use these raw split pairs directly and do
-/// NOT run [`parse_macro_string`], which additionally substitutes the
+/// NOT run `parse_macro_string`, which additionally substitutes the
 /// environment eagerly.
 pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
     #[derive(PartialEq, Clone, Copy)]

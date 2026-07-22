@@ -31,19 +31,19 @@ pub fn std_dev(data: &[f64]) -> f64 {
 ///
 /// * **the crossing test is STRICT**, `a[i] < half` (`:946`, `:956`). A sample sitting
 ///   exactly AT half-max is not a crossing, so the walk steps over a half-max plateau
-///   instead of stopping on it. Compiled C, AA=[0,2,4,2,2,0] (half = 2): FWHM is 3,
+///   instead of stopping on it. Compiled C, `AA=[0,2,4,2,2,0]` (half = 2): FWHM is 3,
 ///   where a `<=` test answers 2. The strictness also makes the interpolation safe by
 ///   construction: the loop breaks at the first element BELOW half-max, so its
 ///   neighbour towards the peak is at or above half-max and the denominator cannot be
 ///   zero — the `span == 0` guard the port needed was an artefact of `<=`.
 /// * **no forward crossing means `lastEl`, not "zero width"** (`:953`) — a monotonic
 ///   ramp has its peak at the last element and no descent, so C measures from the
-///   backward crossing to the END of the window. Compiled C, AA=[0,1,2,3,4]: 2.
+///   backward crossing to the END of the window. Compiled C, `AA=[0,1,2,3,4]`: 2.
 /// * **no backward crossing means 0** (`:964`) — likewise a descending ramp measures
-///   from the START. Compiled C, AA=[4,3,2,1,0]: 2.
+///   from the START. Compiled C, `AA=[4,3,2,1,0]`: 2.
 ///
 /// Both fallbacks together are what a FLAT array gets: nothing is strictly below
-/// half-max, so the answer is `lastEl - 0`. Compiled C, AA=[3,3,3,3,3]: 4 — where the
+/// half-max, so the answer is `lastEl - 0`. Compiled C, `AA=[3,3,3,3,3]`: 4 — where the
 /// port's `max == min` early return answered 0.
 pub fn fwhm(buf: &[f64], last_el: i64) -> f64 {
     let Some(&seed) = buf.first() else {

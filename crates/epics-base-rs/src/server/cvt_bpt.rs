@@ -261,7 +261,7 @@ fn standard_index_of(name: &str) -> Option<i16> {
 /// - `tables` is the load-on-demand DATA map (C `bptList`): name -> table,
 ///   populated by [`Self::insert`], first-wins on redefinition.
 /// - the `LINR` index -> name map is the `menuConvert` menu. Its first 12
-///   breakpoint slots (`LINR` 3..=14) are the fixed [`STANDARD_CONVERT_NAMES`];
+///   breakpoint slots (`LINR` 3..=14) are the fixed `STANDARD_CONVERT_NAMES`;
 ///   a loaded table whose name is NOT standard extends the menu in `extra_menu`
 ///   at `LINR_FIRST_USER_TABLE +` load position (C: an IOC adds menuConvert
 ///   choices after the standard ones).

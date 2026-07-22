@@ -260,7 +260,7 @@ impl Record for TransformRecord {
 
     /// The link-status menus (IAV..IPV, OAV..OPV) are served read-only by
     /// `get_field`, but the record owns no WRITE path for them — they are
-    /// `SPC_NOMOD`, derived from the link (see [`Self::is_link_status_field`]).
+    /// `SPC_NOMOD`, derived from the link (see `Self::is_link_status_field`).
     /// The loader's `.dbd`-initial seed and `.db field()` apply both key on this
     /// predicate to decide whether to WRITE a field; answering `false` keeps
     /// them from storing the `.dbd` `initial("1")` over the init-derived

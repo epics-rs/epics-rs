@@ -1082,7 +1082,7 @@ impl Record for SseqRecord {
     }
 
     /// C change-detects neither view of a step's value pair; see
-    /// [`VALUE_PAIR_FIELDS`].
+    /// `VALUE_PAIR_FIELDS`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &VALUE_PAIR_FIELDS
     }

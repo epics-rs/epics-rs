@@ -651,7 +651,7 @@ impl RtPolicy {
 /// Platform support: the OS-scheduler change is wired on Linux, via the
 /// range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
 /// fixed map of `os/RTEMS-score/osdThread.c` inverted into POSIX space (see
-/// [`map_epics_priority_rtems`] — the two maps differ in shape, deliberately).
+/// `map_epics_priority_rtems` — the two maps differ in shape, deliberately).
 /// On other targets the priority enum + API surface still exist but `apply`
 /// reports [`PriorityApplied::Unsupported`] — no band has been measured there.
 ///

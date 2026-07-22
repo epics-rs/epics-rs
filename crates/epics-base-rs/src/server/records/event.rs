@@ -12,7 +12,7 @@ use crate::types::{EpicsValue, PvString};
 /// the record's entire purpose.
 ///
 /// The framework (`processing.rs`) reads `VAL` after `process()` and
-/// routes the event through [`PvDatabase::post_event_named`] — the
+/// routes the event through [`crate::server::database::PvDatabase::post_event_named`] — the
 /// record stays a pure state machine with no direct DB access.
 ///
 /// Manually implements [`Record`] rather than using `#[derive(EpicsRecord)]`

@@ -956,7 +956,7 @@ impl PvDatabase {
 
     /// Ungated remote alarm snapshot for an external (`pva://` /
     /// `ca://`) link — the DB-link inspection counterpart of
-    /// [`Self::external_link_alarm`].
+    /// `Self::external_link_alarm`.
     ///
     /// Where `external_link_alarm` returns the **gated** maximize-severity
     /// contribution folded into the owning record's `LINK_ALARM` (pvxs
@@ -970,7 +970,7 @@ impl PvDatabase {
     ///
     /// `None` when no lset is registered for the scheme, the link is not
     /// connected, or the lset does not track remote alarms. Scheme
-    /// dispatch mirrors [`Self::external_link_alarm`].
+    /// dispatch mirrors `Self::external_link_alarm`.
     pub async fn external_link_alarm_snapshot(
         &self,
         name: &str,
@@ -993,7 +993,7 @@ impl PvDatabase {
 
     /// Remote display / control / valueAlarm metadata for an external
     /// (`pva://` / `ca://`) link, resolved through the registered
-    /// lset's [`LinkSet::link_metadata`] hook.
+    /// lset's [`crate::server::database::LinkSet::link_metadata`] hook.
     ///
     /// This is the DB-link-API entry point that exposes the linked PV
     /// metadata pvxs's pvalink lset surfaces through its
@@ -1001,7 +1001,7 @@ impl PvDatabase {
     /// `pvaGetGraphicLimits` / `pvaGetAlarmLimits` / `pvaGetPrecision`
     /// / `pvaGetUnits` getters
     /// (`pvxs/ioc/pvalink_lset.cpp:700`). Scheme dispatch mirrors
-    /// [`Self::external_link_alarm`]: an explicit `pva://` / `ca://`
+    /// `Self::external_link_alarm`: an explicit `pva://` / `ca://`
     /// prefix selects the lset directly, a bare name tries every
     /// registered lset until one reports metadata.
     ///
@@ -1063,7 +1063,7 @@ impl PvDatabase {
     ///   before the fetch (see the routing contract below). Measured: a
     ///   `calc` `field(INPA,"5")` serves display limits `0/0`.
     /// * **DB link** — `Some(meta)` from the target field, via
-    ///   [`Self::db_link_metadata`].
+    ///   `Self::db_link_metadata`.
     /// * **CA/PVA link** — delegated to the registered lset
     ///   ([`Self::external_link_metadata`]); C installs `dbCa`/`pvalink`'s
     ///   own lset for these, not `dbDb_lset`.
@@ -1073,7 +1073,7 @@ impl PvDatabase {
     ///
     /// `visited` is the caller's chain state and carries C's
     /// `DBLINK_FLAG_VISITED` recursion guard — see
-    /// [`Self::db_link_metadata`].
+    /// `Self::db_link_metadata`.
     ///
     /// # Contract for the routing layer
     ///
@@ -1313,7 +1313,7 @@ impl PvDatabase {
     /// `visited` / `depth` are the caller's processing-chain state — a PP
     /// input link's source is processed *within* that same chain so the
     /// `visited` cycle guard spans the PP hop (see
-    /// [`Self::process_passive_db_source`]).
+    /// `Self::process_passive_db_source`).
     pub async fn read_link_value_soft(
         &self,
         link: &crate::server::record::ParsedLink,
@@ -2626,7 +2626,7 @@ impl PvDatabase {
     /// monitor dispatches under: that monitor is opened through the lset,
     /// which strips the `ca://` / `pva://` scheme first, so its `pv_name`
     /// (passed to [`Self::dispatch_external_cp_targets`]) is the bare PV.
-    /// Stripping the same schemes here — the set [`Self::resolve_external_pv`]
+    /// Stripping the same schemes here — the set `Self::resolve_external_pv`
     /// already knows — guarantees the registry key and the dispatch key can
     /// never diverge. The `target_record` (the local holder) IS alias-resolved
     /// so the dispatch processes the canonical record. CP dominates CPP on a

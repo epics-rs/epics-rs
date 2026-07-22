@@ -90,7 +90,7 @@ pub fn thread_sleep_quantum() -> f64 {
 ///
 /// (`sseqRecord.c:67`, `:197-199`.) The `NINT` cast is to a C `long` (i64),
 /// NOT an f64 round, and the served DLY must reproduce that cast byte-for-byte
-/// — see [`c_long_cast`]. Two boundaries C's cast owns that an `f64::trunc`
+/// — see `c_long_cast`. Two boundaries C's cast owns that an `f64::trunc`
 /// port gets wrong:
 ///
 ///   * **Overflow.** A `dly` large enough that `ticks` rounds past 2^63

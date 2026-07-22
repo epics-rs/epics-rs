@@ -1464,18 +1464,18 @@ fn skip_unknown_top_level_block(
 static AS_CHECK_CLIENT_IP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Read the [`AS_CHECK_CLIENT_IP`] mode.
+/// Read the `AS_CHECK_CLIENT_IP` mode.
 pub fn as_check_client_ip() -> bool {
     AS_CHECK_CLIENT_IP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Set the [`AS_CHECK_CLIENT_IP`] mode. C exposes this as an iocsh
+/// Set the `AS_CHECK_CLIENT_IP` mode. C exposes this as an iocsh
 /// *variable* (`var asCheckClientIP 1`, registered in
 /// `libComRegister.c:476`); this port has no iocsh variable mechanism, so
 /// the closest idiom is the `asCheckClientIP <0|1>` iocsh command that
 /// calls this.
 ///
-/// Ordering is C's: [`hag_members`] reads the flag when the ACF is
+/// Ordering is C's: `hag_members` reads the flag when the ACF is
 /// *parsed*, so — exactly as in C — it must be set **before** `asInit`,
 /// or the HAG entries are stored in the wrong form.
 pub fn set_as_check_client_ip(on: bool) {

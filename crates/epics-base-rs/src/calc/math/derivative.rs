@@ -18,7 +18,7 @@
 use crate::calc::math::fitting;
 
 /// C `deriv` (`calcUtil.c:70-74`) — `nderiv` with `npts = 2`, i.e. a five-point
-/// sliding quadratic fit. Compiled C confirms the identity: for AA=[0,1,10,3,4,5,6,7,20],
+/// sliding quadratic fit. Compiled C confirms the identity: for `AA=[0,1,10,3,4,5,6,7,20]`,
 /// `DERIV(AA)` and `NDERIV(AA,2)` are the same nine numbers.
 pub fn deriv(y: &[f64]) -> Option<Vec<f64>> {
     nderiv(y, 2)

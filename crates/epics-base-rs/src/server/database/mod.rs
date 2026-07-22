@@ -10,6 +10,7 @@ mod links;
 mod processing;
 mod record_lock;
 mod scan_index;
+mod snapshot;
 
 pub use link_set::{
     DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
@@ -20,6 +21,7 @@ pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use snapshot::SnapshotCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -250,13 +252,27 @@ struct PvDatabaseInner {
     /// same-PHAS records preserve database load order. Survives a
     /// `remove_record` + re-`add_record` (the re-add gets a fresh,
     /// higher sequence — matching a fresh `.db` reload).
-    load_order: RwLock<HashMap<String, u64>>,
+    ///
+    /// Read-modify-write cell (`add_loaded_record` inserts, `remove_record`
+    /// removes), so it is a [`SnapshotCell`], not a bare `ArcSwap`: the
+    /// writer gate is what makes insert-then-publish atomic. Both writers
+    /// also hold [`Self::registration_mutex`] today, but the gate keeps the
+    /// RMW correct without depending on that — L46's type changes in step 4.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8c.
+    load_order: SnapshotCell<HashMap<String, u64>>,
     /// Monotonic counter feeding `load_order`.
     load_order_counter: std::sync::atomic::AtomicU64,
     /// CP/CPP link index: maps source_record → target edges to process when
     /// the source changes. Each edge carries the CP-vs-CPP distinction (see
     /// [`CpTarget`]).
-    cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
+    ///
+    /// Read-modify-write cell with **two writers that share no other gate**:
+    /// `register_cp_link` (`links.rs:2596`) takes no
+    /// [`Self::registration_mutex`], `remove_record` (`mod.rs:1533`) does. The
+    /// `RwLock`'s write exclusion was the only thing serialising them, so the
+    /// [`SnapshotCell`] writer gate here is required, not defensive.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8d.
+    cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
     /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
@@ -265,7 +281,12 @@ struct PvDatabaseInner {
     /// only trigger is the calink/pvalink CA monitor callback, which calls
     /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
     /// `dbCa.c:993-994` `eventCallback` adding `CA_DBPROCESS`.
-    external_cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
+    ///
+    /// Read-modify-write cell; sole writer `register_external_cp_link`
+    /// (`links.rs:2647`) merges into an existing edge list, so concurrent
+    /// registrations need the [`SnapshotCell`] writer gate.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8e.
+    external_cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -324,7 +345,15 @@ struct PvDatabaseInner {
     /// `ca://` link resolution. Consulted before the legacy
     /// [`ExternalPvResolver`] in [`Self::resolve_external_pv`].
     /// Mirrors the C-EPICS lset abstraction.
-    link_sets: RwLock<link_set::LinkSetRegistry>,
+    ///
+    /// Read-modify-write cell (`register_link_set` inserts one scheme into
+    /// the existing registry), so it takes the [`SnapshotCell`] writer gate.
+    /// Every reader either resolves one scheme inside a single expression or
+    /// collects the lsets and drops the registry **before** awaiting — the
+    /// deliberate discipline documented at `links.rs:878-881` — so a coherent
+    /// snapshot is what the read paths already assumed.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8i.
+    link_sets: SnapshotCell<link_set::LinkSetRegistry>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -362,7 +391,13 @@ struct PvDatabaseInner {
     /// (copy-on-write via [`PvDatabase::add_breaktables`]) as `dbLoadRecords`
     /// loads more `breaktable(...)` definitions, so build-time and runtime
     /// loads share one registry.
-    breaktable_registry: RwLock<Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
+    ///
+    /// Read-modify-write cell (`add_breaktables` clones the registry, inserts
+    /// and republishes), so it takes the [`SnapshotCell`] writer gate. The
+    /// value was already `Arc`-shared, so the cell replaces the outer lock
+    /// with nothing at all on the read side.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8k.
+    breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
 }
 
 /// Database of all process variables hosted by this server.
@@ -612,13 +647,13 @@ impl PvDatabase {
                 external_resolver: ArcSwapOption::empty(),
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
-                link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
+                link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 records: parking_lot::RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
-                load_order: RwLock::new(HashMap::new()),
+                load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
-                cp_links: RwLock::new(HashMap::new()),
-                external_cp_links: RwLock::new(HashMap::new()),
+                cp_links: SnapshotCell::new(HashMap::new()),
+                external_cp_links: SnapshotCell::new(HashMap::new()),
                 aliases: parking_lot::RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
@@ -629,9 +664,9 @@ impl PvDatabase {
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
                 subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
-                breaktable_registry: RwLock::new(Arc::new(
+                breaktable_registry: SnapshotCell::new(
                     crate::server::cvt_bpt::BreakTableRegistry::new(),
-                )),
+                ),
             }),
         }
     }
@@ -665,19 +700,14 @@ impl PvDatabase {
         // so taking it here closes that TOCTOU window. No `add_breaktables`
         // caller already holds the gate, so this is reentrancy-safe.
         let _gate = self.inner.registration_mutex.lock().await;
-        let snapshot = {
-            let mut guard = self.inner.breaktable_registry.write().await;
-            if tables.is_empty() {
-                return guard.clone();
-            }
-            let mut next = (**guard).clone();
+        if tables.is_empty() {
+            return self.inner.breaktable_registry.load_full();
+        }
+        let snapshot = self.inner.breaktable_registry.update(|next| {
             for table in tables {
                 next.insert(table);
             }
-            let snapshot = Arc::new(next);
-            *guard = snapshot.clone();
-            snapshot
-        };
+        });
         // Re-install into existing records. Snapshot the instance handles
         // under a brief read, then release the map lock BEFORE taking any
         // per-record write lock — collect-then-act, keeping the invariant
@@ -832,18 +862,18 @@ impl PvDatabase {
     /// the legacy [`ExternalPvResolver`]. Subsequent calls for the
     /// same scheme replace the previous binding.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
-        self.inner.link_sets.write().await.register(scheme, lset);
+        self.inner.link_sets.update(|r| r.register(scheme, lset));
     }
 
     /// Look up the lset for `scheme`, if any.
     pub async fn link_set(&self, scheme: &str) -> Option<link_set::DynLinkSet> {
-        self.inner.link_sets.read().await.get(scheme)
+        self.inner.link_sets.load().get(scheme)
     }
 
     /// Snapshot of every registered scheme name. Stable order for
     /// `dbpvxr` dumps.
     pub async fn registered_link_schemes(&self) -> Vec<String> {
-        let mut s = self.inner.link_sets.read().await.schemes();
+        let mut s = self.inner.link_sets.load().schemes();
         s.sort();
         s
     }
@@ -925,10 +955,7 @@ impl PvDatabase {
         // Only the CA facility participates — look it up directly rather
         // than iterating every registered scheme. `has_name_no_resolve`
         // is the `dbChannelTest` twin (target is a local record).
-        let Some(ca_lset) = ({
-            let registry = self.inner.link_sets.read().await;
-            registry.get("ca")
-        }) else {
+        let Some(ca_lset) = self.inner.link_sets.load().get("ca") else {
             return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
@@ -1046,7 +1073,7 @@ impl PvDatabase {
             // No prefix — try every registered lset in turn. The
             // first one with a value for `name` wins. Schemes are
             // single-digit so this is cheap.
-            let registry = self.inner.link_sets.read().await;
+            let registry = self.inner.link_sets.load_full();
             let lsets: Vec<_> = registry
                 .schemes()
                 .iter()
@@ -1069,7 +1096,7 @@ impl PvDatabase {
                 None => None,
             };
         };
-        let lset = self.inner.link_sets.read().await.get(scheme);
+        let lset = self.inner.link_sets.load().get(scheme);
         if let Some(lset) = lset {
             if let Some(v) = lset.get_value(body).await {
                 return Some(v);
@@ -1405,7 +1432,7 @@ impl PvDatabase {
         // loaded so the common case pays no Arc clone. A record created before
         // its table is loaded is re-installed by `add_breaktables`.
         {
-            let snapshot = self.inner.breaktable_registry.read().await.clone();
+            let snapshot = self.inner.breaktable_registry.load_full();
             if !snapshot.is_empty() {
                 instance.record.install_breaktable_registry(snapshot);
             }
@@ -1467,11 +1494,9 @@ impl PvDatabase {
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner
-            .load_order
-            .write()
-            .await
-            .insert(name.to_string(), seq);
+        self.inner.load_order.update(|m| {
+            m.insert(name.to_string(), seq);
+        });
 
         if let Some(list) = scan.scan_list() {
             self.inner
@@ -1545,17 +1570,19 @@ impl PvDatabase {
         }
 
         // 2b) Drop the load-order entry.
-        self.inner.load_order.write().await.remove(name);
+        self.inner.load_order.update(|m| {
+            m.remove(name);
+        });
 
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
         // CP lists may still reference this name).
-        let mut cp = self.inner.cp_links.write().await;
-        cp.remove(name);
-        for targets in cp.values_mut() {
-            targets.retain(|t| t.record != name);
-        }
-        drop(cp);
+        self.inner.cp_links.update(|cp| {
+            cp.remove(name);
+            for targets in cp.values_mut() {
+                targets.retain(|t| t.record != name);
+            }
+        });
 
         // 4) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
@@ -1832,7 +1859,7 @@ impl PvDatabase {
             let records = self.inner.records.read();
             records.keys().cloned().collect()
         };
-        let load_order = self.inner.load_order.read().await;
+        let load_order = self.inner.load_order.load();
         names.sort_by(|a, b| {
             let seq = |n: &String| load_order.get(n).copied().unwrap_or(u64::MAX);
             seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))

@@ -67,14 +67,7 @@ impl PvDatabase {
             // scan-index secondary key stays stable across SCAN/PHAS
             // edits. A record loaded before should always scan before
             // a later-loaded record at the same PHAS.
-            let seq = self
-                .inner
-                .load_order
-                .read()
-                .await
-                .get(name)
-                .copied()
-                .unwrap_or(0);
+            let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
             self.inner
                 .scan_index
                 .write()
@@ -149,7 +142,7 @@ impl PvDatabase {
                 .collect()
         };
         let mut keyed: Vec<_> = {
-            let load_order = self.inner.load_order.read().await;
+            let load_order = self.inner.load_order.load();
             snapshot
                 .into_iter()
                 .map(|(name, rec)| (load_order.get(&name).copied().unwrap_or(0), name, rec))

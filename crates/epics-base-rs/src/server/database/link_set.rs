@@ -357,10 +357,12 @@ pub trait LinkSet: Send + Sync {
 /// Type-erased lset reference held by the [`LinkSetRegistry`].
 pub type DynLinkSet = Arc<dyn LinkSet>;
 
-/// Per-scheme registry. Wrapped in [`tokio::sync::RwLock`] inside
-/// [`super::PvDatabase`] so registration and read-paths are
-/// independently mutable.
-#[derive(Default)]
+/// Per-scheme registry. Held in a snapshot cell inside
+/// [`super::PvDatabase`]: readers take an `Arc` of the whole registry with no
+/// lock, and `register` rebuilds and republishes under the cell's writer gate
+/// (`doc/rtems-priority-locks-design.md` §3 row L8i). `Clone` is what makes
+/// that rebuild possible; it is a per-scheme `Arc` clone, not a deep copy.
+#[derive(Clone, Default)]
 pub struct LinkSetRegistry {
     inner: std::collections::HashMap<String, DynLinkSet>,
 }

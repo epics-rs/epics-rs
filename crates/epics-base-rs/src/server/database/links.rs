@@ -881,7 +881,7 @@ impl PvDatabase {
     /// that registers or unregisters another while resolving cannot deadlock
     /// against the caller.
     async fn registered_link_sets(&self) -> Vec<crate::server::database::DynLinkSet> {
-        let registry = self.inner.link_sets.read().await;
+        let registry = self.inner.link_sets.load();
         registry
             .schemes()
             .iter()
@@ -903,7 +903,7 @@ impl PvDatabase {
             }
             return None;
         };
-        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        let lset = self.inner.link_sets.load().get(scheme)?;
         lset.time_stamp(body).await
     }
 
@@ -940,7 +940,7 @@ impl PvDatabase {
             }
             return None;
         };
-        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        let lset = self.inner.link_sets.load().get(scheme)?;
         let sev = lset.alarm_severity(body).await?;
         Some(LinkAlarm {
             // remote STAT for MSS, else LINK_ALARM.
@@ -987,7 +987,7 @@ impl PvDatabase {
             }
             return None;
         };
-        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        let lset = self.inner.link_sets.load().get(scheme)?;
         lset.remote_alarm(body).await
     }
 
@@ -1023,7 +1023,7 @@ impl PvDatabase {
             }
             return None;
         };
-        let lset = self.inner.link_sets.read().await.get(scheme)?;
+        let lset = self.inner.link_sets.load().get(scheme)?;
         lset.link_metadata(body).await
     }
 
@@ -1628,8 +1628,7 @@ impl PvDatabase {
         let lset = self
             .inner
             .link_sets
-            .read()
-            .await
+            .load()
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
         let result = lset.put_value(body, value, op).await;
@@ -1675,8 +1674,7 @@ impl PvDatabase {
         let lset = self
             .inner
             .link_sets
-            .read()
-            .await
+            .load()
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
         lset.scan_forward(body).await
@@ -2593,24 +2591,24 @@ impl PvDatabase {
         let target = self
             .resolve_alias(target_record)
             .unwrap_or_else(|| target_record.to_string());
-        let mut cp = self.inner.cp_links.write().await;
-        let targets = cp.entry(source).or_default();
-        if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
-            existing.passive_only = existing.passive_only && passive_only;
-        } else {
-            targets.push(super::CpTarget {
-                record: target,
-                passive_only,
-            });
-        }
+        self.inner.cp_links.update(|cp| {
+            let targets = cp.entry(source).or_default();
+            if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
+                existing.passive_only = existing.passive_only && passive_only;
+            } else {
+                targets.push(super::CpTarget {
+                    record: target,
+                    passive_only,
+                });
+            }
+        });
     }
 
     /// Get target edges to process when `source_record` changes (CP/CPP links).
     pub async fn get_cp_targets(&self, source_record: &str) -> Vec<super::CpTarget> {
         self.inner
             .cp_links
-            .read()
-            .await
+            .load()
             .get(source_record)
             .cloned()
             .unwrap_or_default()
@@ -2644,16 +2642,17 @@ impl PvDatabase {
         let target = self
             .resolve_alias(target_record)
             .unwrap_or_else(|| target_record.to_string());
-        let mut cp = self.inner.external_cp_links.write().await;
-        let targets = cp.entry(key.to_string()).or_default();
-        if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
-            existing.passive_only = existing.passive_only && passive_only;
-        } else {
-            targets.push(super::CpTarget {
-                record: target,
-                passive_only,
-            });
-        }
+        self.inner.external_cp_links.update(|cp| {
+            let targets = cp.entry(key.to_string()).or_default();
+            if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
+                existing.passive_only = existing.passive_only && passive_only;
+            } else {
+                targets.push(super::CpTarget {
+                    record: target,
+                    passive_only,
+                });
+            }
+        });
     }
 
     /// Get holder edges to process when the remote PV `external_pv` changes
@@ -2661,8 +2660,7 @@ impl PvDatabase {
     pub async fn get_external_cp_targets(&self, external_pv: &str) -> Vec<super::CpTarget> {
         self.inner
             .external_cp_links
-            .read()
-            .await
+            .load()
             .get(external_pv)
             .cloned()
             .unwrap_or_default()
@@ -2676,8 +2674,7 @@ impl PvDatabase {
     pub async fn external_cp_pv_names(&self) -> Vec<String> {
         self.inner
             .external_cp_links
-            .read()
-            .await
+            .load()
             .keys()
             .cloned()
             .collect()

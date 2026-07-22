@@ -627,6 +627,65 @@ rather than the import list. Nine rows (L8c–L8k) and L9 are converted; the
 remaining eleven `RwLock`/`Mutex` occurrences in the file are
 `parking_lot`/`std`, which were never in scope.
 
+### §5.4 addendum — what the L1 flip cost on the hosted backend (measured)
+
+Written by the panel that executed steps 5–6's type flip (L1, L33, L7). It is
+the first *measured* number anywhere in this document; §6's "nothing was
+measured" still stands for every claim about the target.
+
+**Host.** 96-core Linux, shared, load average 2–7 during the runs. Default
+`cargo` build, so `PriorityInheritanceMutex` is its `parking_lot::Mutex` arm:
+this measures blocking-vs-async, **not** PI-vs-no-PI, and the box has no RT
+policy to invert.
+
+**Load.** `PvDatabase::put_record_field_from_ca` — one `dbScanLock`/`dbPut`/
+`dbScanUnlock` bracket per call — driven from N tokio tasks on an 8-worker
+multi-threaded runtime, 160 000 puts per measurement, three runs per point,
+medians below. `contended` = every task writes one `ai` record; `disjoint` =
+one record per task. The harness compiles unchanged against both commits
+(`put_record_field_from_ca` is an `async fn` on both), so the only difference
+is the gate's internals.
+
+| writers | contended, `a00d90ba` (async gate) | contended, after the flip | Δ |
+|---|---|---|---|
+| 1 | 356 k put/s | 373 k put/s | **+4.8 %** |
+| 2 | 168 k put/s | 239 k put/s | **+42 %** |
+| 4 | 168 k put/s | 71 k put/s | **−58 %** |
+| 8 | 189 k put/s | 68 k put/s | **−64 %** |
+
+`disjoint` shows no attributable change at any width (medians 355–580 k before,
+374–440 k after; run-to-run spread on this host exceeds the difference).
+`epics-ca-rs`' `e2e_caput_warm` — the heaviest existing end-to-end put
+benchmark — cannot resolve a 10 % effect here (251–325 µs before, 252–517 µs
+after, overlapping) and in any case its IOC serves *simple PVs*, which take no
+record gate at all, so it is reported only as evidence that nothing gross
+happened end to end.
+
+**The −64 % is real and is the cost of the design, not a defect.** The shape
+says where it comes from: the flip is *faster* uncontended and at two writers,
+and only turns over once the number of blocked waiters exceeds a couple. A
+blocked waiter is now an OS thread parked in the mutex — one futex sleep/wake
+and one context switch per handoff — where the async gate could hand ownership
+to another task on a worker's own run queue and never enter the kernel. This is
+precisely the trade §2 Option A was chosen on: only a blocking lock has a
+kernel-visible owner to inherit priority from, and C's `dbScanLock` is that
+blocking lock.
+
+Three bounds on how much it should worry a reader:
+
+* It needs ≥4 writers on **one** record with no think time between puts. Spread
+  the same load across records and it disappears.
+* It is a *hosted-executor* pathology. The RTEMS backend has no tokio worker
+  pool on the CA/PVA paths — a blocked CA thread there is just a blocked CA
+  thread, which is what C does.
+* The harness's per-put work is a bare `VAL` write, so lock overhead is ~100 %
+  of it. A put that converts, posts monitors and drives links dilutes it.
+
+**Not established:** whether the same shape holds on target, where the waiters
+are banded threads and the mutex is a real PI mutex. That belongs to step 7
+alongside the latency regression, and until it is run, the target-side cost of
+this flip is unmeasured in both directions.
+
 ---
 
 **Ordering note.** Steps 1, 2 and 3 are mutually independent and can run as
@@ -646,8 +705,10 @@ the dependency structure above. Step 2 of the evaluation's list is now
 
 ## §6 What this design does not establish
 
-* **Nothing was measured.** Static analysis plus the two supplied target-header
-  facts. Every latency claim is structural.
+* **Nothing was measured *on target*.** Static analysis plus the two supplied
+  target-header facts. Every latency claim is structural. §5.4 adds one hosted
+  throughput measurement of the L1 flip; it says nothing about the target,
+  where the lock is a real PI mutex and the waiters are banded threads.
 * **The `scan-N` bands are UNVERIFIED on target.** They postdate the
   2026-07-22 boot recorded in `doc/rtems-priority-on-target-measurement.md`.
   The predicted values (`scan-1` → posix 119) follow from `task.rs:1120-1154`

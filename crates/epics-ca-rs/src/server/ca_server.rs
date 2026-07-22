@@ -1369,16 +1369,17 @@ fn tls_paths_from_env() -> Option<TlsPaths> {
 fn audit_from_env() -> Option<crate::audit::AuditLogger> {
     if let Some(path) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT_FILE") {
         if !path.is_empty() {
-            // Open the file synchronously; tokio's `spawn_blocking` would
-            // be cleaner but `from_parts` is sync.
+            // Opened synchronously because this runs during server
+            // construction, before any runtime is guaranteed. The handle stays
+            // a `std::fs::File`: `AuditSink` writes it through the filesystem
+            // seam, so no runtime is needed here or at any later write.
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
             {
                 Ok(f) => {
-                    let async_file = tokio::fs::File::from_std(f);
-                    let sink = crate::audit::AuditSink::File(tokio::sync::Mutex::new(async_file));
+                    let sink = crate::audit::AuditSink::File(crate::audit::AuditFile::from_std(f));
                     return Some(crate::audit::AuditLogger::new(sink));
                 }
                 Err(e) => {

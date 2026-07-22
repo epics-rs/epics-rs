@@ -139,6 +139,101 @@ pub fn install_console_subscriber() -> bool {
     tracing::subscriber::set_global_default(ConsoleSubscriber).is_ok()
 }
 
+/// Set once by [`install_panic_hook`], so a second call cannot chain the hook
+/// onto itself and print every panic twice.
+static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One line saying what a panic on this thread costs the IOC.
+///
+/// A function, and a pure one, because the *consequence* is the part `std`'s
+/// default hook does not print and the part nobody can infer from a serial
+/// console. `std` says a thread panicked and where; it does not say whether the
+/// IOC is still serving.
+///
+/// The two arms are genuinely different outcomes on the target. The RTEMS build
+/// defaults to `panic = "unwind"`, so:
+///
+/// * on the entry thread the unwind leaves `main`, and the image is finished;
+/// * on any other thread — a CA client thread, a PVA connection thread, the
+///   status pusher — only that thread dies. The IOC keeps listening, keeps
+///   answering searches, and quietly no longer does whatever that thread did.
+///   That is the state this line exists to make visible, because it looks
+///   exactly like a healthy IOC from outside.
+fn panic_announcement(thread: Option<&str>, location: &str, payload: &str) -> String {
+    let thread = thread.unwrap_or("<unnamed>");
+    let consequence = if thread == "main" {
+        "the IOC's entry thread is unwinding: the image is going down, and every \
+         connection it serves with it"
+    } else {
+        "that thread is gone and nothing restarts it; the IOC keeps listening and \
+         keeps answering searches, so from outside it still looks healthy"
+    };
+    format!("panic on thread `{thread}` at {location}: {payload} -- {consequence}")
+}
+
+/// The panic payload as text — the message a `panic!`/`assert!` carried.
+fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Route panics through `errlog`, in addition to whatever `std` already does.
+///
+/// Call it once, in an IOC's `main`, next to [`install_console_subscriber`].
+///
+/// # Why an IOC needs this and a program does not
+///
+/// `std`'s default hook writes to stderr, which on the target is the serial
+/// console, so a panic is not *invisible* without this. Two things are missing
+/// from it, and both matter more on an IOC than in a program:
+///
+/// 1. **It says nothing about what still works.** A panic on a per-connection
+///    thread kills that thread and leaves the IOC listening, answering searches
+///    and serving every other client — indistinguishable from health, from
+///    outside, forever. The line this emits states which of the two outcomes
+///    this was.
+/// 2. **It is not on the errlog.** Every other diagnostic an IOC produces goes
+///    through `errlog`, and a panic is the most severe thing that can happen to
+///    one. Routing it there puts it in the same stream, at
+///    [`ErrlogSevEnum::Fatal`], for whatever is reading that stream.
+///
+/// # It chains rather than replaces
+///
+/// The previously installed hook — `std`'s default, unless an application put
+/// its own in — still runs, after this one. That keeps the payload, the
+/// location and the `RUST_BACKTRACE` note, none of which this reproduces, and
+/// it means installing this can only *add* output. The errlog line goes first
+/// on purpose: on a slow serial console the summary should not be behind a
+/// backtrace that may not finish printing.
+///
+/// Returns `false` when it was already installed, having changed nothing.
+pub fn install_panic_hook() -> bool {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    if PANIC_HOOK_INSTALLED.swap(true, AtomicOrdering::AcqRel) {
+        return false;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = match info.location() {
+            Some(l) => format!("{}:{}", l.file(), l.line()),
+            None => "an unknown location".to_string(),
+        };
+        let thread = std::thread::current();
+        errlog_sev_printf(
+            ErrlogSevEnum::Fatal,
+            &panic_announcement(thread.name(), &location, &panic_payload(info)),
+        );
+        previous(info);
+    }));
+    true
+}
+
 /// Error-message severity — C `errlogSevEnum` (`errlog.h:49-53`).
 ///
 /// Ordered `Info < Minor < Major < Fatal`; the discriminants match the
@@ -467,6 +562,75 @@ mod tests {
         assert!(errlog_sev_printf(ErrlogSevEnum::Major, "loud"));
         assert!(errlog_sev_printf(ErrlogSevEnum::Fatal, "loud"));
         errlog_set_sev_to_log(ErrlogSevEnum::Minor);
+    }
+    /// The distinction the whole hook exists for. A panic on a worker thread
+    /// leaves an IOC that still listens and still answers searches, which is
+    /// indistinguishable from health from outside; the announcement has to say
+    /// so, because nothing else will.
+    #[test]
+    fn a_worker_panic_says_the_ioc_is_still_up_and_no_longer_whole() {
+        let line = panic_announcement(
+            Some("CAS-client-3"),
+            "blocking.rs:412",
+            "index out of bounds",
+        );
+        assert!(line.contains("CAS-client-3"), "{line}");
+        assert!(line.contains("blocking.rs:412"), "{line}");
+        assert!(line.contains("index out of bounds"), "{line}");
+        assert!(
+            line.contains("keeps listening"),
+            "a worker panic must say the IOC survives it, or the console reads \
+             like the IOC died when it did not: {line}"
+        );
+        assert!(
+            !line.contains("going down"),
+            "a worker panic must not claim the image is finished: {line}"
+        );
+    }
+
+    /// The other outcome, which is the opposite claim and must not be confused
+    /// with it: the RTEMS build unwinds, so a panic that leaves `main` ends the
+    /// image.
+    #[test]
+    fn an_entry_thread_panic_says_the_image_is_finished() {
+        let line = panic_announcement(Some("main"), "rtems-ca-ioc.rs:118", "iocInit failed");
+        assert!(
+            line.contains("going down"),
+            "a panic out of the entry thread ends the image, and the console is \
+             the only place that can say so: {line}"
+        );
+        assert!(!line.contains("keeps listening"), "{line}");
+    }
+
+    /// RTEMS threads that were not named through `thread::Builder` have no
+    /// name, and the line must still identify itself rather than render an
+    /// empty pair of backticks.
+    #[test]
+    fn an_unnamed_thread_is_still_named_something() {
+        let line = panic_announcement(None, "x.rs:1", "boom");
+        assert!(line.contains("<unnamed>"), "{line}");
+        assert!(
+            line.contains("keeps listening"),
+            "an unnamed thread is not the entry thread — std names that one \
+             `main` — so it takes the worker consequence: {line}"
+        );
+    }
+
+    /// Installing twice must not chain the hook onto itself: that prints every
+    /// panic once per install, and the second copy looks like a second panic.
+    ///
+    /// Restores the default hook afterwards so a `cargo test` run — which,
+    /// unlike `cargo nextest`, shares one process across tests — is not left
+    /// with this one.
+    #[test]
+    #[serial]
+    fn the_panic_hook_installs_once() {
+        assert!(install_panic_hook(), "the first install takes effect");
+        assert!(
+            !install_panic_hook(),
+            "a second install must be refused, not chained onto the first"
+        );
+        let _ = std::panic::take_hook();
     }
 }
 

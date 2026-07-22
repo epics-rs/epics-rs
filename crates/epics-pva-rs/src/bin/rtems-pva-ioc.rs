@@ -166,6 +166,15 @@ mod ioc {
         //      with an identical, empty console.
         epics_base_rs::runtime::log::install_console_subscriber();
 
+        // (0c) …and make a panic say what it costs. `std`'s default hook
+        //      already writes to this console; what is missing from it is the
+        //      consequence. A panic on a per-connection thread kills that
+        //      thread and leaves the IOC listening and answering searches —
+        //      indistinguishable from health from outside, forever. The hook
+        //      chains rather than replaces, so the payload, the location and
+        //      the backtrace note all survive.
+        epics_base_rs::runtime::log::install_panic_hook();
+
         // (1) C `callbackInit` (callback.c:286). Idempotent.
         background_init();
 
@@ -527,6 +536,26 @@ mod tests {
             prod.contains(":PVA_CONN_CNT"),
             "the PVA connection count is gone — this is the one status value \
              `rtems-ca-ioc` cannot publish, because it starts no PVA server"
+        );
+    }
+
+    /// A panic on a per-connection thread kills that thread and leaves the IOC
+    /// listening, answering searches and serving every other client — from
+    /// outside, indistinguishable from health, forever. `std`'s default hook
+    /// says a thread panicked; it does not say that. Dropping this call would
+    /// restore exactly the silent-degradation shape the console subscriber
+    /// above exists to remove.
+    #[test]
+    fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("install_panic_", "hook()")),
+            "this entry point installs no panic hook, so a panicking worker \
+             thread leaves an IOC that still looks healthy from the network"
         );
     }
 }

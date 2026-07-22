@@ -140,6 +140,16 @@ mod ioc {
         //      `errlogPrintf` cannot be silenced this way; neither may ours.
         epics_base_rs::runtime::log::install_console_subscriber();
 
+        // (0c) …and make a panic say what it costs. `std`'s default hook
+        //      already writes to this console, so a panic is not invisible
+        //      without this; what is missing from it is the consequence. A
+        //      panic on a per-client thread kills that thread and leaves the
+        //      IOC listening, answering searches and serving every other
+        //      client — indistinguishable from health from outside, forever.
+        //      The hook chains rather than replaces, so the payload, the
+        //      location and the backtrace note all survive.
+        epics_base_rs::runtime::log::install_panic_hook();
+
         // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
         //     timer and scanOnce worker exist before any record can defer a
         //     tail into them. Idempotent.
@@ -380,6 +390,26 @@ mod tests {
             !prod.contains(concat!("let _stat", "us = ")),
             "this entry point does not hold the status-PV handle, and must not \
              start pretending it needs to"
+        );
+    }
+
+    /// A panic on a per-connection thread kills that thread and leaves the IOC
+    /// listening, answering searches and serving every other client — from
+    /// outside, indistinguishable from health, forever. `std`'s default hook
+    /// says a thread panicked; it does not say that. Dropping this call would
+    /// restore exactly the silent-degradation shape the console subscriber
+    /// above exists to remove.
+    #[test]
+    fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("install_panic_", "hook()")),
+            "this entry point installs no panic hook, so a panicking worker \
+             thread leaves an IOC that still looks healthy from the network"
         );
     }
 }

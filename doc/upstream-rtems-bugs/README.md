@@ -746,6 +746,20 @@ zero source patches while bring-up continued.
 
 ---
 
+## Measurements taken on the box, which are **not** upstream bugs
+
+* [`measurement-c-thread-priority-on-rtems-6.md`](measurement-c-thread-priority-on-rtems-6.md)
+  — **added 2026-07-22, after the recovery.** Does EPICS base's own thread
+  ladder take effect on RTEMS 6? Measured: **yes**, on one boot of
+  `cioc-fd64.exe` (stock 64-descriptor base configuration, zero base source
+  patches). Closes handoff §8.0 gap 1. It also establishes, by measurement
+  rather than by reading `configure/toolchain.c`, that an RTEMS 6 build of base
+  uses the **POSIX** arm's linear map, and records where libbsd's own threads
+  sit relative to `CAS-TCP`. Its evidence is the complete unedited console
+  transcript in `evidence/`, and its drivers are in `repro/priority/`. Unlike
+  everything else in this directory, this file and its evidence were produced
+  by *running* the box rather than by copying from it.
+
 ## Also recovered, and NOT an upstream bug
 
 * [`evidence/FINDING-3-per-connection-heap.md`](evidence/FINDING-3-per-connection-heap.md)
@@ -790,18 +804,23 @@ ever unified; this work deliberately did not edit it. Numbering follows handoff
 ```
 doc/upstream-rtems-bugs/
 ├── README.md     this file — all four bugs, plus these appendices
-├── evidence/     four markdown artefacts recovered byte-for-byte, unedited
+├── measurement-c-thread-priority-on-rtems-6.md   handoff §8.0 gap 1, measured on a boot 2026-07-22
+├── evidence/     four markdown artefacts recovered byte-for-byte, unedited, plus
+│   │             one console log produced by *running* the box rather than copying from it
 │   ├── FINDING-1-libevent-poll-spin.md        bug 1 (and the pvxs consequence)
 │   ├── FINDING-2-base-rtems-fsimage-null.md   bug 4
 │   ├── FINDING-3-per-connection-heap.md       not a bug; carries its own retraction
-│   └── DEVIATIONS.md                          declared deviations; sole original home of bug 3
+│   ├── DEVIATIONS.md                          declared deviations; sole original home of bug 3
+│   │                                          (re-copied 2026-07-22 with its session-3 section)
+│   └── c-thread-priority-boot-console-2026-07-22.log   the priority boot's whole console
 ├── patches/      the one-line change to each modified upstream file
 │   ├── RTEMS.cmake.orig            pristine upstream file (1,781 B), verbatim
 │   ├── pvxs-RTEMS.cmake.diff       bug 3, one line
 │   └── pvxs-evhelper.cpp.diff      bug 2, one line, ±8 lines of context
 └── repro/
     ├── fsbug/    bug 4 — the 12-line application that faults unpatched base at boot
-    └── probe/    bugs 1-2 — the poll-spin probe and its --wrap=poll link flag
+    ├── probe/    bugs 1-2 — the poll-spin probe and its --wrap=poll link flag
+    └── priority/ the four host-side CA load drivers behind the priority measurement
 ```
 
 **Reproducer notes.** `repro/fsbug/` is a `PROD_IOC` whose entire application
@@ -829,6 +848,9 @@ build.
 * Boot logs, the `ceiling*.py` drivers, `boot-*.sh`, and the `cioc`/`pioc`
   application trees. These back handoff §5.1/§5.6/§5.7 rather than these four
   bugs, and were out of scope — **they are still single-copy on the box.**
+  (Partial exception since 2026-07-22: the *one* boot log and the *four* drivers
+  behind the priority measurement are now in `evidence/` and `repro/priority/`.
+  `ceiling*.py`, `boot-*.sh` and the application trees remain single-copy.)
 
 **Beyond the originally requested set.** `repro/probe/` was recovered although
 the recovery brief listed only the `fsbug` sources, because FINDING-1's
@@ -846,12 +868,20 @@ checksummed against the same `diff -u` run piped through `sha256sum` on the box.
 **These sums are the reason `evidence/` must not be edited** — reflowing or
 renaming any of those four files breaks verification against the source of truth.
 
+**One row changed on 2026-07-22 after the recovery.** `evidence/DEVIATIONS.md`
+was re-copied from the box once the priority measurement had appended its
+"Session 3 additions" section to the box's file, so the row below is
+`bcd3a3ed…b00b44` and no longer the recovered `8c3d8109…fbb440`. The earlier
+content is unchanged; the new section is appended after it. The files added by
+that measurement carry their own checksum table, in
+[`measurement-c-thread-priority-on-rtems-6.md`](measurement-c-thread-priority-on-rtems-6.md).
+
 | file in this directory | source on the box | sha256 |
 |---|---|---|
 | `evidence/FINDING-1-libevent-poll-spin.md` | `FINDING-1-libevent-poll-spin.md` | `ed161ccb162b361e381ea85cbbb094b1d3d20866791e9935e20f7804af2255d6` |
 | `evidence/FINDING-2-base-rtems-fsimage-null.md` | `FINDING-2-base-rtems-fsimage-null.md` | `2ad0e20893c5a45a75ed4b0e4a8c3f1d3726683cc3388a233de9c13788d73222` |
 | `evidence/FINDING-3-per-connection-heap.md` | `FINDING-3-per-connection-heap.md` | `18c9fd69a48efc7123a959770fea6e48744bde3a7553a6c8235d5a31f21f02ff` |
-| `evidence/DEVIATIONS.md` | `DEVIATIONS.md` | `8c3d81090549ef740af7cb05e836dbab41ba4d43cbd4e9eebcdea8c9a0fbb440` |
+| `evidence/DEVIATIONS.md` | `DEVIATIONS.md` | `bcd3a3ede844cda8ff8296d6e424e57b3f804d4d71f463340328f8769ab00b44` |
 | `patches/RTEMS.cmake.orig` | `patches/RTEMS.cmake.orig` | `8c66cd3b8cd51d6153d37f00f95d4db7dd406a9d12bf908a87251620c365280b` |
 | `patches/pvxs-RTEMS.cmake.diff` | generated: `diff -u patches/RTEMS.cmake.orig pvxs/bundle/cmake/Platform/RTEMS.cmake` | `3a9adff2382b1ca5a03a70e97a1d49e1e3f489a9414371712e2138b931836210` |
 | `patches/pvxs-evhelper.cpp.diff` | generated: `diff -u -U8 patches/evhelper.cpp.orig pvxs/src/evhelper.cpp` | `90303375b1857a54c605edc6ab373f50834f25da6e050b9a73c10e0406053c0d` |

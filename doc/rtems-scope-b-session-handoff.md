@@ -817,7 +817,9 @@ known — measured on a boot, or read out of the source:
 | multiplexing syscalls | 0 | 0 | **parity** |
 | per-thread leak | 0 (raw pthreads) | **128 B** | **gap 1** |
 | thread priority requested | `PTHREAD_EXPLICIT_SCHED` at creation, every thread | every thread, via `enter_ioc_thread` (§5.9 census) | **parity in source** |
-| thread priority *observed on target* | *unmeasured* | **measured** — `SCHED_FIFO`, `posix = 56 + epics` on every thread | **gap 2 CLOSED for us**, still open for C |
+| thread priority *observed on target* | **measured 2026-07-22** — live, 18 distinct levels over 26 threads; `CAS-client` posix 51 / core 204, `CAS-event` 49/206, `CAS-TCP` 46/209, `CAS-UDP` 41/214 | **measured 2026-07-22** — `SCHED_FIFO`, `posix = 56 + epics` on every thread; `CAS-client` 76/179, `CAS-event` 75/180, `CAS-TCP` 74/181, `CAS-UDP` 72/183 | **gaps 1 and 2 CLOSED** — same EPICS numbers on both sides, the whole divergence is the map |
+| EPICS → POSIX map | `(int)(epics × 2.53 + 1)`, range min 1 / max 254 — reproduces all 20 measured rows with no residual; the score arm's `199 − epics` matches none | `posix = 56 + epics` — confirmed on all 8 threads | **deliberate deviation**, now measured on both sides rather than assumed |
+| scan/callback band vs libbsd | **7 threads above `_BSD` (100), `scan-1` (EPICS 63 → core 95) above `IRQS` (96)** — measured | cannot happen: map image is core `100..=199`, and the most urgent live thread (`cbHigh`) is core 128 — measured | **deliberate, better** |
 | lock wait discipline | `RTEMS_PRIORITY` ordered | tokio FIFO fair | **gap 3** |
 | PI on the scan lock | on — `epicsMutexMustCreate`, `dbLock.c:86` | none — L1 is `park_on`-invisible | **gap 4** |
 | refusal at the ceiling | accept, then **zero bytes**, then FIN | `CA_PROTO_ERROR`/`ECA_ALLOCMEM`, announced on powers of two | **deliberate, better** |
@@ -825,12 +827,35 @@ known — measured on a boot, or read out of the source:
 Four gaps, in dependency order — each is only worth doing if the one above it
 is done, because otherwise it is unobservable:
 
-1. **Measure whether C's own thread priorities take effect on RTEMS 6.** Still
-   the missing cell for the C column, and still one boot: `rt task` (or
-   equivalent) on the C IOC at a few held connections, reading the actual
-   priorities of `CAS-client` / `CAS-event` / `CAS-TCP`. Until this is known,
-   "reach C's level" has no number. It may turn out C is inert on this target
-   too, in which case gap 2 shrinks to a self-consistency check.
+1. ~~**Measure whether C's own thread priorities take effect on RTEMS 6.**~~
+   **DONE 2026-07-22 — write-up and full console transcript at
+   [`doc/upstream-rtems-bugs/measurement-c-thread-priority-on-rtems-6.md`](upstream-rtems-bugs/measurement-c-thread-priority-on-rtems-6.md).**
+   **C is not inert**, so gap 2 does *not* shrink to a self-consistency check —
+   there is a concrete thing to match. One boot of `cioc-fd64.exe` (stock
+   64-descriptor base configuration, zero base source patches), read with
+   `epicsThreadShowAll 1` (whose `OSSPRI` column is a live
+   `pthread_getschedparam` readback) and `rt stackuse` / `rt top`:
+
+   * `CAS-client` posix **51** / RTEMS core **204**, `CAS-event` **49**/**206**,
+     `CAS-TCP` **46**/**209**, `CAS-beacon` **44**/211 (core derived),
+     `CAS-UDP` **41**/**214** — `rsrv`'s ladder in the right order, no
+     collapsing.
+   * The map is the **POSIX** arm's linear one, decided by measurement, not
+     assumed: `OSD priority range min: 1 max 254` is printed by the listing, and
+     `(int)(osi × 2.53 + 1)` reproduces all 20 measured rows exactly.
+   * `rpri = 255 − osspri` on all fourteen threads where both were read.
+   * `_main_` sits at core **254**, confirming `rtems_init.c:1038` from the
+     target side; note base's own listing shows it as `OSSPRI 0`, because its
+     `epicsThreadOSD.tid` is 0 and the readback is skipped.
+   * libbsd: `IRQS` **96**, `TIME` **98**, every `_BSD` worker **100**, i.e. the
+     whole network stack outranks every CA server thread by 109+ levels — but
+     seven of base's scan/callback threads land *above* `_BSD`, and `scan-1`
+     (EPICS 63 → core 95) lands above `IRQS`. That is the measured form of the
+     hazard `map_epics_priority_rtems`'s doc comment predicts from source.
+
+   Not covered by it: nothing on our side was booted (that is gap 2), and the
+   two guests are separate instances of the same BSP — so no claim needing a
+   single shared boot is supported.
 2. **Measure ours, on the same boot. DONE, 2026-07-22 — every expected value
    confirmed.** `doc/rtems-priority-on-target-measurement.md` has the reading,
    the method and the raw console output; `doc/rtems-priority-probe.patch` is

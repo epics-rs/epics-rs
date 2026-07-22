@@ -40,7 +40,24 @@ cd "$REPO_ROOT"
 
 TARGET="armv7-rtems-eabihf"
 # `-Zbuild-std` is required: there is no prebuilt std for this triple.
-COMMON=(+nightly check --no-default-features -Zbuild-std=std,panic_abort --target "$TARGET")
+#
+# `--locked` is load-bearing, not hygiene. This gate's whole claim is "the
+# dependency set in this tree compiles for RTEMS", and without `--locked`
+# cargo is free to re-resolve mid-run and answer about a *different* set,
+# leaving the new resolution behind as a working-tree `M Cargo.lock` that the
+# operator never asked for. That is exactly how an image build and this gate
+# come to disagree: an image needs a patched `libc`
+# (`[patch.crates-io]`, see the refusal messages in
+# `crates/epics-rtems-boot/src/lib.rs`), adding one rewrites the lock, and a
+# gate that silently accepts the rewrite reports on a resolution nobody
+# committed. With `--locked` that divergence is a named error instead.
+#
+# Not done, and why: pinning `libc` in the committed lock was considered and
+# is measured to buy nothing — under `--precise 0.2.188` BOTH layout refusals
+# still fire, byte for byte, as they do at 0.2.186. No published `libc`
+# satisfies the predicates; the one that does is the unmerged fork, and which
+# fork lands is not this script's decision.
+COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort --target "$TARGET")
 
 # The crates that must compile for the target.
 CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot)

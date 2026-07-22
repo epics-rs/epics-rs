@@ -1325,6 +1325,16 @@ pub async fn pvalink_link_set_install(
 ///     .run_with_script_and_runner("st.cmd", run_ca_pva_qsrv_ioc)
 ///     .await
 /// ```
+///
+/// Host-only. Both servers it starts are themselves RTEMS-gated in their own
+/// crates — `epics_ca_rs::server::CaServer` (`server/mod.rs`) and
+/// `epics_pva_rs::server::PvaServer` (`server/mod.rs`) are each behind
+/// `cfg(not(target_os = "rtems"))`, because the target runs the blocking
+/// thread-per-client drivers instead of the async reactor front ends. This
+/// function is the last caller that had not followed; without this gate it is
+/// the entire remainder of the target build (measured: 2 errors, both E0433).
+/// The target's equivalent entry point is `epics-pva-rs`'s `rtems-pva-ioc`.
+#[cfg(not(target_os = "rtems"))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
 ) -> epics_base_rs::error::CaResult<()> {

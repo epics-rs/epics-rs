@@ -292,12 +292,22 @@ impl Drop for MonitorAbort {
 }
 
 impl PvaLink {
-    /// Open a link against the configured PV.
+    /// Open a link against the configured PV, using the caller's
+    /// [`PvaClient`].
     ///
     /// For INP+monitor links, this also spawns a background monitor task.
-    pub async fn open(config: PvaLinkConfig) -> PvaLinkResult<Self> {
-        let client = PvaClient::builder().timeout(Duration::from_secs(5)).build();
-
+    ///
+    /// The client is **injected, never built here**. pvxs holds exactly
+    /// one `client::Context` for the whole IOC —
+    /// `linkGlobal->provider_remote`, built once in `linkGlobal_t::alloc()`
+    /// (`pvxs/ioc/pvalink.h:107`, `pvalink.cpp:51-63`) — and every
+    /// `pvaLinkChannel` runs on it. A client built per link would give each
+    /// link its own `ConnectionPool` (keyed on `SocketAddr`) and its own
+    /// search engine, so N links to one upstream IOC would open N TCP
+    /// connections instead of one. [`super::registry::PvaLinkRegistry`] is
+    /// the single owner of that client and passes a clone here; that is why
+    /// this signature takes one rather than calling `PvaClient::builder()`.
+    pub async fn open(config: PvaLinkConfig, client: PvaClient) -> PvaLinkResult<Self> {
         let latest = Arc::new(Mutex::new(None));
         let disconnect_time: Arc<Mutex<Option<(i64, i32)>>> = Arc::new(Mutex::new(None));
         let scan_overrun = Arc::new(ScanOverrun::default());
@@ -3285,7 +3295,12 @@ mod tests {
             monitor: true,
             ..PvaLinkConfig::defaults_for("BUG2:NOPV", LinkDirection::Inp)
         };
-        let link = PvaLink::open(cfg).await.expect("open INP monitor link");
+        let link = PvaLink::open(
+            cfg,
+            PvaClient::builder().timeout(Duration::from_secs(1)).build(),
+        )
+        .await
+        .expect("open INP monitor link");
         assert!(
             link.monitor_connected.is_some(),
             "INP+monitor link must install the live-connection flag"

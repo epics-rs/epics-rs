@@ -9,11 +9,17 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
-//! use epics_bridge_rs::pvalink::{PvaLink, PvaLinkConfig};
+//! The IOC-wide [`PvaClient`](epics_pva_rs::client::PvaClient) lives on
+//! the [`PvaLinkRegistry`] (pvxs `linkGlobal->provider_remote`), so links
+//! are opened through it rather than constructed directly — every link
+//! then shares one connection pool and one search engine.
 //!
-//! let cfg = PvaLinkConfig::parse("pva://OTHER:IOC:TEMP")?;
-//! let link = PvaLink::open(cfg).await?;
+//! ```ignore
+//! use epics_bridge_rs::pvalink::{LinkDirection, PvaLinkConfig, PvaLinkRegistry};
+//!
+//! let registry = PvaLinkRegistry::new();
+//! let cfg = PvaLinkConfig::parse("pva://OTHER:IOC:TEMP", LinkDirection::Inp)?;
+//! let link = registry.get_or_open(cfg).await?;
 //! let value = link.read().await?;
 //! ```
 

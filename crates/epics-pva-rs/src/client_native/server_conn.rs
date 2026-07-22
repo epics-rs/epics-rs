@@ -30,7 +30,14 @@ use std::time::Duration;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+// NOT `use tokio::net::TcpStream`. An unconditional import is resolved whether
+// or not anything reaches the item, so on `armv7-rtems-eabihf` — where
+// `tokio::net` does not exist — one import line was an E0432 that poisoned this
+// whole module, and rustc then suppressed every downstream error in code naming
+// its items. That is what made `ops_v2.rs` report zero errors for the target
+// without that zero meaning anything (`doc/pvalink-rtems-design.md` §1.2, §6
+// item 1). Both remaining uses sit inside `cfg` blocks that the target does not
+// compile, so they name the type by full path and the module resolves cleanly.
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
@@ -319,7 +326,7 @@ pub(crate) async fn dial_pva(
     {
         // The hosted transport has no per-frame write bound to apply.
         let _ = write_deadline;
-        let stream = timeout(connect_timeout, TcpStream::connect(target))
+        let stream = timeout(connect_timeout, tokio::net::TcpStream::connect(target))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
@@ -396,7 +403,7 @@ impl ServerConn {
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
+        let stream = timeout(conn.op_timeout, tokio::net::TcpStream::connect(target))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;

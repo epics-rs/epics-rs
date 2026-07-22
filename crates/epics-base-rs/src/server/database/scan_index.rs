@@ -19,7 +19,17 @@ impl PvDatabase {
     /// stale scan-index entry pointing at a wrong scan rate. The
     /// live-read makes the index strictly reflect the record's
     /// current state at insert time.
-    pub async fn update_scan_index(
+    ///
+    /// **Synchronous.** It had exactly two suspension points and neither was a
+    /// real one: the `registration_mutex` acquisition (L46) and two
+    /// `scan_index` write acquisitions (L8b) — both awaited before step 4.
+    /// Both are blocking PI mutexes now, so the whole scan-index update is a
+    /// bounded critical
+    /// section — which is what lets it run *inside* the L1 record-gate window
+    /// without putting an `.await` there. C reaches `scanAdd`/`scanDelete`
+    /// (`dbScan.c:241-330`) the same way, from inside `dbPut` under
+    /// `dbScanLock`. `doc/rtems-priority-locks-design.md` §5 step 4.
+    pub fn update_scan_index(
         &self,
         name: &str,
         old_scan: ScanType,
@@ -27,21 +37,17 @@ impl PvDatabase {
         old_phas: i16,
         _new_phas: i16,
     ) {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         let _ = old_phas; // entry matched by name; PHAS not needed.
         // 1) Remove the OLD entry the caller knew about — even if
         // remove_record already swept it. Match by record name so a
         // stale PHAS / load_order does not leave a phantom entry.
-        {
-            let mut index = self.inner.scan_index.write().await;
-            if let Some(list) = old_scan.scan_list() {
-                if let Some(set) = index.get_mut(&list) {
-                    set.retain(|(_, _, n)| n != name);
-                    if set.is_empty() {
-                        index.remove(&list);
-                    }
-                }
-            }
+        if let Some(list) = old_scan.scan_list() {
+            self.inner
+                .scan_index
+                .bucket(list)
+                .lock()
+                .retain(|(_, _, n)| n != name);
         }
         // 2) Look up the LIVE record under the mutex. If concurrent
         // remove+re-add replaced the Arc with a fresh one whose
@@ -70,10 +76,8 @@ impl PvDatabase {
             let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
             self.inner
                 .scan_index
-                .write()
-                .await
-                .entry(list)
-                .or_default()
+                .bucket(list)
+                .lock()
                 .insert((cur_phas, seq, name.to_string()));
         }
     }
@@ -87,13 +91,17 @@ impl PvDatabase {
         let Some(list) = scan_type.scan_list() else {
             return Vec::new();
         };
+        // One bucket's lock, held for the clone only and released before the
+        // caller's processing loop — C `scanList` (`dbScan.c:1007-1051`) holds
+        // `psl->lock` for the cursor step alone and releases it around every
+        // `dbProcess`. Neither holds its lock across processing.
         self.inner
             .scan_index
-            .read()
-            .await
-            .get(&list)
-            .map(|s| s.iter().map(|(_, _, name)| name.clone()).collect())
-            .unwrap_or_default()
+            .bucket(list)
+            .lock()
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect()
     }
 
     /// Get all record names whose `PINI` is **exactly** `mode`.

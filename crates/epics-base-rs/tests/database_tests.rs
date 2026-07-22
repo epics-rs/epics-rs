@@ -2259,7 +2259,7 @@ async fn test_phas_scan_order() {
             } = result
             {
                 drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p).await;
+                db.update_scan_index(name, old_scan, new_scan, p, p);
             }
         }
     }
@@ -2860,7 +2860,7 @@ async fn test_phas_change_updates_scan_index() {
             } = result
             {
                 drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p).await;
+                db.update_scan_index(name, old_scan, new_scan, p, p);
             }
         }
     }
@@ -2877,8 +2877,7 @@ async fn test_phas_change_updates_scan_index() {
         } = result
         {
             drop(inst);
-            db.update_scan_index("REC_A", scan, scan, old_phas, new_phas)
-                .await;
+            db.update_scan_index("REC_A", scan, scan, old_phas, new_phas);
         }
     }
     let names = db.records_for_scan(ScanType::Sec1).await;
@@ -8862,6 +8861,144 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     .expect("process_record_with_links_already_locked must not dead-lock under a held epoch");
     res.expect("owner-path processing of an owned member must succeed");
     assert!(visited.contains("MR_R5_OWNED"));
+}
+
+// ---------------------------------------------------------------------
+// The scan-index tail is INSIDE the advisory-gate window
+// (`doc/rtems-priority-locks-design.md` §2 / §5 step 4).
+//
+// `update_scan_index` is synchronous as of step 4, which is what lets the
+// scan-list move stay inside the exclusion window C's `dbScanLock` has it
+// in. These are boundary cases of one invariant — *the move is committed
+// before `put_pv` returns, and is not observable to a party the window
+// excludes* — not scenarios: the SCAN branch, the PHAS branch, and the
+// held-epoch boundary.
+// ---------------------------------------------------------------------
+
+/// Boundary: `CommonFieldPutResult::ScanChanged`. The record has left its
+/// old scan list and joined the new one at the instant `put_pv` returns —
+/// no sleep, no `yield_now`, nothing that could let a deferred update land
+/// in between. Verified to fail when the tail is deferred out of the window
+/// (`tokio::spawn`ing the `update_scan_index` call makes this and the PHAS
+/// test below fail while the epoch test still passes).
+#[tokio::test]
+async fn scan_move_is_committed_when_put_pv_returns() {
+    let db = PvDatabase::new();
+    db.add_record("SIW_SCAN", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.put_pv("SIW_SCAN.SCAN", EpicsValue::String("1 second".into()))
+        .await
+        .unwrap();
+    assert!(
+        db.records_for_scan(ScanType::Sec1)
+            .await
+            .contains(&"SIW_SCAN".to_string()),
+        "the record must be in the 1-second list the moment put_pv returns"
+    );
+
+    db.put_pv("SIW_SCAN.SCAN", EpicsValue::String("2 second".into()))
+        .await
+        .unwrap();
+    assert!(
+        !db.records_for_scan(ScanType::Sec1)
+            .await
+            .contains(&"SIW_SCAN".to_string()),
+        "the old bucket must be swept in the same window, not later"
+    );
+    assert!(
+        db.records_for_scan(ScanType::Sec2)
+            .await
+            .contains(&"SIW_SCAN".to_string()),
+        "the record must be in the 2-second list the moment put_pv returns"
+    );
+}
+
+/// Boundary: `CommonFieldPutResult::PhasChanged`. A PHAS put reorders the
+/// bucket rather than moving the record between buckets, and that reorder
+/// is likewise complete when `put_pv` returns.
+#[tokio::test]
+async fn phas_reorder_is_committed_when_put_pv_returns() {
+    let db = PvDatabase::new();
+    for name in ["SIW_PHAS_A", "SIW_PHAS_B"] {
+        db.add_record(name, Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.put_pv(
+            &format!("{name}.SCAN"),
+            EpicsValue::String("1 second".into()),
+        )
+        .await
+        .unwrap();
+    }
+    // Equal PHAS: load order decides, so A precedes B.
+    assert_eq!(
+        db.records_for_scan(ScanType::Sec1).await,
+        vec!["SIW_PHAS_A".to_string(), "SIW_PHAS_B".to_string()]
+    );
+
+    // Raising A's PHAS must have reordered the bucket by the time the put
+    // returns — PHAS is the primary sort key.
+    db.put_pv("SIW_PHAS_A.PHAS", EpicsValue::Short(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.records_for_scan(ScanType::Sec1).await,
+        vec!["SIW_PHAS_B".to_string(), "SIW_PHAS_A".to_string()],
+        "the PHAS reorder must be visible the moment put_pv returns"
+    );
+}
+
+/// Boundary: a `lock_records` epoch holding the record's gate excludes the
+/// whole put, scan move included. While the epoch is held the put cannot
+/// complete AND no move is observable; the instant the put returns, it is.
+///
+/// What it pins, exactly: that the SCAN put still enters through the
+/// advisory gate. Verified by removing the `lock_record` from
+/// `put_pv_inner` — this fails, the two above still pass. It does **not**
+/// distinguish a window shrunk *mid-put* (a gate dropped after the value
+/// write but before the tail): the put still has to take the gate to
+/// start, so it still runs entirely after the epoch releases. Catching
+/// that needs a probe inside the put and is not attempted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_move_cannot_land_inside_a_held_epoch() {
+    let db = PvDatabase::new();
+    db.add_record("SIW_EPOCH", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let epoch = db.lock_records(["SIW_EPOCH"]).await;
+
+    let db2 = db.clone();
+    let done = Arc::new(AtomicU32::new(0));
+    let done2 = done.clone();
+    let h = tokio::spawn(async move {
+        db2.put_pv("SIW_EPOCH.SCAN", EpicsValue::String("1 second".into()))
+            .await
+            .unwrap();
+        done2.store(1, Ordering::SeqCst);
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        0,
+        "put_pv must block on the gate the epoch holds"
+    );
+    assert!(
+        db.records_for_scan(ScanType::Sec1).await.is_empty(),
+        "no scan-list move may be observable while the epoch owns the record"
+    );
+
+    drop(epoch);
+    h.await.unwrap();
+    assert_eq!(done.load(Ordering::SeqCst), 1);
+    assert!(
+        db.records_for_scan(ScanType::Sec1)
+            .await
+            .contains(&"SIW_EPOCH".to_string()),
+        "the move must be complete as soon as the put returns"
+    );
 }
 
 /// a CA link carries its `MS`/`NMS`/`MSI`/`MSS` modifier in

@@ -229,8 +229,65 @@ pub struct CpTarget {
     pub passive_only: bool,
 }
 
+/// The scan index — one independently locked bucket per [`ScanList`].
+///
+/// C's shape (`dbScan.c`): `scan_list` carries its own `epicsMutexId lock`
+/// (`:75`) and `scanList` / `addToList` / `deleteFromList` take only that
+/// one list's lock, so two periodic rates never wait on each other. The port
+/// used to hold a single `RwLock` over the whole `ScanList → bucket` map,
+/// which is coarser than C on the highest-contention path in the database.
+///
+/// There is no lock over the table itself, and that is structural rather than
+/// an optimisation: the set of scan lists is fixed by `menuScan`
+/// ([`ScanList::ALL`]), so the table is fully populated at construction and
+/// never mutated. A bucket is reached by [`ScanList::slot`], a total index —
+/// there is no absent-bucket case for a caller to handle, and therefore no
+/// path on which a lookup could take the wrong lock.
+///
+/// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b.
+struct ScanIndex {
+    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>>;
+        ScanList::COUNT],
+}
+
+impl ScanIndex {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| {
+                crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new())
+            }),
+        }
+    }
+
+    /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
+    fn bucket(
+        &self,
+        list: ScanList,
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>> {
+        &self.buckets[list.slot()]
+    }
+}
+
 struct PvDatabaseInner {
-    simple_pvs: crate::runtime::sync::RwLock<HashMap<String, Arc<ProcessVariable>>>,
+    /// The simple-PV directory — C's `dbPvdLib.c` process-variable directory,
+    /// whose per-bucket `epicsMutexId lock` (`:30`, created `:119`) is taken
+    /// for both `dbPvdFind` (`:123-136`) and `dbPvdAdd` (`:150-162`). C has no
+    /// reader-writer primitive anywhere in the IOC
+    /// (`rg pthread_rwlock epics-base/modules/` → zero hits), so a PI mutex is
+    /// not a demotion against C — it *is* C's construction.
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8a.
+    ///
+    /// **Every reader MUST bind the lookup result in a statement of its own**
+    /// (`let pv = …lock().get(name).cloned();`) rather than reading the map in
+    /// an `if let` scrutinee. The guard is `!Send`, and an `if let` scrutinee
+    /// temporary lives to the end of the `if let` *body* — so the scrutinee
+    /// form keeps the guard alive across any `.await` the body makes and turns
+    /// the enclosing `async fn` into a `!Send` future at its `tokio::spawn`
+    /// site. The rule is uniform across all 17 read sites, not applied only to
+    /// the ones that await today, so a new `.await` in an existing body cannot
+    /// re-open it.
+    simple_pvs:
+        crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
     records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
@@ -245,7 +302,16 @@ struct PvDatabaseInner {
     /// C IOC built from the same `.db` file.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
-    scan_index: crate::runtime::sync::RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
+    ///
+    /// **One lock per scan list, not one lock over the index.** C has one
+    /// `epicsMutexId lock` per `scan_list` (`dbScan.c:75`, created `:527`,
+    /// `:604`, `:908`) and never serialises two rates against each other. A
+    /// single map-wide lock would serialise the seven periodic threads (bands
+    /// 60–66) that C runs independently, on the one path where both ends of
+    /// the contention pair are banded — see
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b. See
+    /// [`ScanIndex`].
+    scan_index: ScanIndex,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
@@ -306,7 +372,21 @@ struct PvDatabaseInner {
     /// peek atomic with the target-map insert, eliminates the
     /// scan-index race, and lets `remove_*` purge dangling aliases
     /// without a second pass.
-    registration_mutex: tokio::sync::Mutex<()>,
+    ///
+    /// `doc/rtems-priority-locks-design.md` §3 row L46. This gate is taken
+    /// **inside** the L1 record-gate window on the SCAN-put path
+    /// (`scan_index.rs:30`, reached from `field_io.rs`'s `update_scan_index`
+    /// calls), so it converts with L8a/L8b rather than after them — leaving it
+    /// async while the locks nested under it are blocking is the worst of both.
+    /// The acquisition-order MUST rule that governs the nesting is in
+    /// `record_lock.rs`'s module doc.
+    ///
+    /// **No holder may `.await` while holding it.** The guard is `!Send`, so
+    /// the compiler enforces this at every `tokio::spawn` site; the eight
+    /// holders were audited before the conversion and the only suspension
+    /// points any of them had were acquisitions of `simple_pvs` and
+    /// `scan_index`, both blocking now.
+    registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
     /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
@@ -642,19 +722,19 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
-                simple_pvs: crate::runtime::sync::RwLock::new(HashMap::new()),
+                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
                 external_resolver: ArcSwapOption::empty(),
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 records: parking_lot::RwLock::new(HashMap::new()),
-                scan_index: crate::runtime::sync::RwLock::new(HashMap::new()),
+                scan_index: ScanIndex::new(),
                 load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(HashMap::new()),
                 external_cp_links: SnapshotCell::new(HashMap::new()),
                 aliases: parking_lot::RwLock::new(HashMap::new()),
-                registration_mutex: tokio::sync::Mutex::new(()),
+                registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
@@ -698,7 +778,7 @@ impl PvDatabase {
         // holds this gate across its whole body (registry read + map insert),
         // so taking it here closes that TOCTOU window. No `add_breaktables`
         // caller already holds the gate, so this is reentrancy-safe.
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         if tables.is_empty() {
             return self.inner.breaktable_registry.load_full();
         }
@@ -837,13 +917,14 @@ impl PvDatabase {
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
         let record_path = filters::split_channel_name(name).record_path;
-        if !self
+        // Own statement: the `!Send` guard must be down before the gate's
+        // `.await` below (see the `simple_pvs` field doc).
+        let known = self
             .inner
             .simple_pvs
-            .read()
-            .await
-            .contains_key(record_path.as_str())
-        {
+            .lock()
+            .contains_key(record_path.as_str());
+        if !known {
             return false;
         }
         !gate(record_path, peer).await
@@ -1125,14 +1206,10 @@ impl PvDatabase {
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -1190,8 +1267,8 @@ impl PvDatabase {
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
@@ -1200,11 +1277,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -1218,12 +1291,12 @@ impl PvDatabase {
     /// "already registered as an alias" even though its target is
     /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        self.inner.simple_pvs.write().await.remove(name)
+        self.inner.simple_pvs.lock().remove(name)
     }
 
     /// Enter the LOAD phase: records are being created and the database is not
@@ -1408,8 +1481,8 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
@@ -1500,10 +1573,8 @@ impl PvDatabase {
         if let Some(list) = scan.scan_list() {
             self.inner
                 .scan_index
-                .write()
-                .await
-                .entry(list)
-                .or_default()
+                .bucket(list)
+                .lock()
                 .insert((phas, seq, name.to_string()));
         }
         Ok(())
@@ -1513,8 +1584,13 @@ impl PvDatabase {
     /// three namespaces. Caller MUST hold `registration_mutex` so the
     /// peek-then-insert sequence is atomic — without that, two tasks
     /// can both see the name as free and race the insert.
-    async fn check_name_free(&self, name: &str) -> CaResult<()> {
-        let kind = if self.inner.simple_pvs.read().await.contains_key(name) {
+    ///
+    /// Synchronous: all three namespaces are blocking locks now, so this peek
+    /// makes no suspension point inside the `registration_mutex` hold — which
+    /// is what lets that gate become a `PriorityInheritanceMutex` whose `!Send`
+    /// guard may not cross an `.await`.
+    fn check_name_free(&self, name: &str) -> CaResult<()> {
+        let kind = if self.inner.simple_pvs.lock().contains_key(name) {
             Some("simple PV")
         } else if self.inner.records.read().contains_key(name) {
             Some("record")
@@ -1544,7 +1620,7 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
         let removed = self.inner.records.write().remove(name);
         let Some(rec_arc) = removed else {
@@ -1559,13 +1635,11 @@ impl PvDatabase {
         // name only — PHAS and load_order are not needed and may be
         // stale relative to the entry actually present.
         if let Some(list) = scan.scan_list() {
-            let mut idx = self.inner.scan_index.write().await;
-            if let Some(set) = idx.get_mut(&list) {
-                set.retain(|(_, _, n)| n != name);
-                if set.is_empty() {
-                    idx.remove(&list);
-                }
-            }
+            self.inner
+                .scan_index
+                .bucket(list)
+                .lock()
+                .retain(|(_, _, n)| n != name);
         }
 
         // 2b) Drop the load-order entry.
@@ -1608,8 +1682,14 @@ impl PvDatabase {
         let record_path = filters::split_channel_name(name).record_path;
         let (base, _field) = parse_pv_name(&record_path);
 
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(record_path.as_str()) {
-            return Some(PvEntry::Simple(pv.clone()));
+        let simple = self
+            .inner
+            .simple_pvs
+            .lock()
+            .get(record_path.as_str())
+            .cloned();
+        if let Some(pv) = simple {
+            return Some(PvEntry::Simple(pv));
         }
         if let Some(rec) = self.inner.records.read().get(base) {
             return Some(PvEntry::Record(rec.clone()));
@@ -1638,13 +1718,13 @@ impl PvDatabase {
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
             )));
         }
-        self.check_name_free(alias).await?;
+        self.check_name_free(alias)?;
         self.inner
             .aliases
             .write()
@@ -1689,8 +1769,7 @@ impl PvDatabase {
         if self
             .inner
             .simple_pvs
-            .read()
-            .await
+            .lock()
             .contains_key(record_path.as_str())
         {
             return true;
@@ -1782,10 +1861,7 @@ impl PvDatabase {
 
     /// Look up a simple PV by name (backward-compatible).
     pub async fn find_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
-            return Some(pv.clone());
-        }
-        None
+        self.inner.simple_pvs.lock().get(name).cloned()
     }
 
     /// Get a record Arc by name. Alias-aware (epics-base PR #336):
@@ -1896,7 +1972,7 @@ impl PvDatabase {
 
     /// Get all simple PV names.
     pub async fn all_simple_pv_names(&self) -> Vec<String> {
-        self.inner.simple_pvs.read().await.keys().cloned().collect()
+        self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
 

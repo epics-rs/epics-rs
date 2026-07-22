@@ -1264,8 +1264,7 @@ async fn install_record_defs(
                             phas,
                         }) => {
                             ctx.db()
-                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas)
-                                .await;
+                                .update_scan_index(&def.name, old_scan, new_scan, phas, phas);
                         }
                         Ok(CommonFieldPutResult::PhasChanged {
                             scan,
@@ -1273,8 +1272,7 @@ async fn install_record_defs(
                             new_phas,
                         }) => {
                             ctx.db()
-                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas)
-                                .await;
+                                .update_scan_index(&def.name, scan, scan, old_phas, new_phas);
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {

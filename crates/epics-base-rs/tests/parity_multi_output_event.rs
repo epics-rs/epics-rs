@@ -179,10 +179,8 @@ async fn event_scan_routes_by_event_number() {
         inst.common.evnt = "7".to_string();
     }
     // Register the Event scan-index entries.
-    db.update_scan_index("REC5", ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
-    db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
+    db.update_scan_index("REC5", ScanType::Passive, ScanType::Event, 0, 0);
+    db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0);
 
     // Post event 5 — only REC5 should process. We detect processing via
     // the record's timestamp moving off its never-processed value, which

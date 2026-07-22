@@ -2,9 +2,10 @@
 //!
 //! The integration plan:
 //!
-//! 1. `PvaLinkResolver` owns a [`PvaLinkRegistry`] (PvaLink cache) and a
-//!    [`tokio::runtime::Handle`] so the synchronous resolver closure can
-//!    submit `block_on(...)` work to a real runtime.
+//! 1. `PvaLinkResolver` owns a [`PvaLinkRegistry`] (PvaLink cache); the
+//!    synchronous resolver closure submits background work through the
+//!    `epics_base_rs::runtime::task` spawn seam — `tokio::spawn` on the host,
+//!    the callback pool on the RTEMS target where no tokio runtime exists.
 //! 2. [`install_pvalink_resolver`] hooks the resolver into the database via
 //!    `PvDatabase::set_external_resolver`. Records with `INP=@pva://...`
 //!    will then resolve through the registry instead of returning `None`.
@@ -21,6 +22,7 @@
 
 use std::sync::Arc;
 
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
     ExternalPvResolver, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
 };
@@ -32,12 +34,14 @@ use super::config::{LinkDirection, PvaLinkConfig};
 use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent, ScanOverrun};
 use super::registry::PvaLinkRegistry;
 
-/// Resolver wrapping a [`PvaLinkRegistry`] and a tokio runtime handle.
-/// Cheap to clone — both fields are `Arc`-backed.
+/// Resolver wrapping a [`PvaLinkRegistry`]. Cheap to clone — every field is
+/// `Arc`-backed. Background work is submitted through the
+/// `epics_base_rs::runtime::task` spawn seam, so the resolver holds no tokio
+/// runtime handle of its own (the seam picks tokio or the callback pool by
+/// target).
 #[derive(Clone)]
 pub struct PvaLinkResolver {
     registry: Arc<PvaLinkRegistry>,
-    handle: tokio::runtime::Handle,
     /// Counter incremented on every successful link read. Used by
     /// `pvalinkrefdiff` to report "links touched since last call". Wraps
     /// at u64::MAX.
@@ -156,11 +160,16 @@ struct ScanTarget {
     passive_only: bool,
 }
 
+impl Default for PvaLinkResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PvaLinkResolver {
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
+    pub fn new() -> Self {
         Self {
             registry: Arc::new(PvaLinkRegistry::new()),
-            handle,
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             link_options: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -418,7 +427,7 @@ impl PvaLinkResolver {
         let scan_overrun = link.scan_overrun();
         // field is now per-ScanTarget (not shared across all
         // targets). `run_notify_forwarder` reads each target's own field.
-        self.handle.spawn(run_notify_forwarder(
+        task::spawn(run_notify_forwarder(
             key,
             rx,
             scan_targets,
@@ -803,7 +812,7 @@ impl PvaLinkResolver {
             // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
             // `monorder`); `default_inp_cfg` would discard them.
             let registry = resolver.registry.clone();
-            resolver.handle.spawn(async move {
+            task::spawn(async move {
                 let _ = registry.get_or_open(cfg).await;
             });
             None
@@ -823,11 +832,8 @@ impl PvaLinkResolver {
 /// for every loaded DB record that carries a JSON-object pvalink with
 /// options. pvxs equivalent: options live on the `jlink` struct for
 /// the lifetime of the link (pvalink_jlif.cpp).
-pub async fn install_pvalink_resolver(
-    db: &Arc<PvDatabase>,
-    handle: tokio::runtime::Handle,
-) -> PvaLinkResolver {
-    let resolver = PvaLinkResolver::new(handle);
+pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
+    let resolver = PvaLinkResolver::new();
     // B3: give the resolver the DB handle so the scan-on-update
     // forwarder can process owning records.
     resolver.attach_database((**db).clone());
@@ -1392,7 +1398,7 @@ impl LinkSet for PvaLinkResolver {
             // Never opened. Stage the open off the record thread (C's
             // `CA_CONNECT`) and refuse this cycle.
             let registry = self.registry.clone();
-            self.handle.spawn(async move {
+            task::spawn(async move {
                 let _ = registry.get_or_open(cfg).await;
             });
             return Err(format!("pvalink forward link '{name}' is not open yet"));
@@ -1401,7 +1407,7 @@ impl LinkSet for PvaLinkResolver {
             return Err(format!("pvalink forward link '{name}' is not connected"));
         }
         // Staged, signalled, returned — `dbCa.c:622-624`.
-        self.handle.spawn(async move {
+        task::spawn(async move {
             if let Err(e) = link.scan_forward().await {
                 eprintln!("pvalink forward link scan failed: {e}");
             }
@@ -2546,7 +2552,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         resolver.attach_database(db);
 
         // A connected, already-open CP monitor variant for SRC.
@@ -2594,7 +2600,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         resolver.attach_database(db);
 
         let cfg = PvaLinkConfig {
@@ -2906,7 +2912,7 @@ mod tests {
     /// target and retains its parsed options (B2 `sevr` included).
     #[tokio::test]
     async fn b3_open_link_for_record_registers_scan_target() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         // proc=CP → scan_on_update; sevr=MS exercised together.
         let _ = resolver
             .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", "MY:REC")
@@ -2930,7 +2936,7 @@ mod tests {
     /// register a scan target — only CP/CPP fan out.
     #[tokio::test]
     async fn b3_non_cp_link_registers_no_scan_target() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         let _ = resolver
             .open_link_for_record("pva://OTHER:PV?proc=NPP", "REC2")
             .await;
@@ -2942,7 +2948,7 @@ mod tests {
     /// key is the full query-bearing string, not the bare PV name.
     #[tokio::test]
     async fn b2_open_link_retains_sevr_mode() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         let _ = resolver.open_link("pva://A:PV?sevr=MSI").await;
         // look up by the full link string (with query) — that is the key.
         let cfg = resolver.inp_cfg_for("A:PV?sevr=MSI").clone();
@@ -2960,7 +2966,7 @@ mod tests {
     /// `link_names → is_connected` identity contract still holds.
     #[tokio::test]
     async fn fr15_link_names_reports_opened_inp_pvs_queryable_by_is_connected() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // A connected INP link (for_test seeds a cached value, so
         // is_connected() reads true), a pending INP link (no value yet),
@@ -3153,7 +3159,7 @@ mod tests {
     #[tokio::test]
     async fn b4_local_link_rejects_non_local_pv() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let r = resolver
             .open_link("pva://NOT:A:LOCAL:RECORD?local=true")
             .await;
@@ -3166,7 +3172,7 @@ mod tests {
     #[tokio::test]
     async fn b4_non_local_link_to_remote_pv_is_allowed() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         // No `local` option → open is not gated (it will just never
         // connect, which is fine for this assertion).
         let r = resolver.open_link("pva://SOME:REMOTE:PV").await;
@@ -3184,7 +3190,7 @@ mod tests {
         db.add_pv("LOCAL:SIMPLE:PV", EpicsValue::Double(3.0))
             .await
             .unwrap();
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let r = resolver.open_link("pva://LOCAL:SIMPLE:PV?local=true").await;
         assert!(
             r.is_ok(),
@@ -3206,7 +3212,7 @@ mod tests {
         db.add_record("REC", Box::new(AiRecord::new(1.0)))
             .await
             .unwrap();
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         for name in [
             "pva://REC?local=true",      // bare record (dbChannelTest "x")
             "pva://REC.?local=true",     // trailing dot → default field ("x.")
@@ -3236,7 +3242,7 @@ mod tests {
         db.add_record("REC", Box::new(AiRecord::new(1.0)))
             .await
             .unwrap();
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let bad_field = resolver.open_link("pva://REC.NOSUCH?local=true").await;
         assert!(
             matches!(bad_field, Err(PvaLinkError::NotLocal(_))),
@@ -3260,7 +3266,7 @@ mod tests {
     #[tokio::test]
     async fn b4_local_out_link_rejects_non_local_pv() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let r = resolver
             .open_out_link("pva://NOT:A:LOCAL:RECORD?local=true", None)
             .await;
@@ -3276,7 +3282,7 @@ mod tests {
     #[tokio::test]
     async fn b4_local_json_out_link_rejects_non_local_pv() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let r = resolver
             .open_json_out_link(
                 "NOT:A:LOCAL:RECORD",
@@ -3302,7 +3308,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn b4_local_out_put_value_rejects_non_local_pv() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         let r = LinkSet::put_value(
             &resolver,
             "pva://NOT:A:LOCAL:RECORD?local=true",
@@ -3325,7 +3331,7 @@ mod tests {
     #[tokio::test]
     async fn b4_local_out_link_rejected_even_after_non_local_sibling_opened() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         // Non-local sibling opens fine and caches the shared owner.
         let opened = resolver.open_out_link("pva://SHARED:REMOTE:PV", None).await;
         assert!(
@@ -3358,7 +3364,7 @@ mod tests {
         db.add_record("REC", Box::new(AiRecord::new(1.0)))
             .await
             .unwrap();
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         for name in [
             "pva://REC.NAME$?local=true",          // CA long-string modifier
             "pva://REC.{}?local=true",             // empty filter → default field
@@ -3412,7 +3418,7 @@ mod tests {
             "group PV must be registered in the provider"
         );
 
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         resolver.attach_qsrv_provider(provider);
 
         // local=true link to the QSRV group composite PV — accepted.
@@ -3497,7 +3503,7 @@ mod tests {
         // Part 3: the integration layer wires the structured options
         // exactly as install_pvalink_resolver's pre-scanner does for a
         // loaded record carrying this PvaJson link.
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         let _ = resolver
             .open_json_link_for_record(&j.pv, &j.options, "MY:RECORD")
             .await;
@@ -3588,7 +3594,7 @@ mod tests {
 
         // Part 3: the integration layer registers options + scan target
         // for a suffix link exactly as it does for a query-bearing one.
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
         let _ = resolver
             .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
             .await;
@@ -3637,7 +3643,7 @@ mod tests {
     ///   pvxs/ioc/pvalink_link.cpp:91 — `root = lchan->root[fieldName]`
     #[tokio::test]
     async fn br_r27_pvalink_cache_separates_per_link_options() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Link A: read sub-field "alarm.severity", CPP (scan on passive).
         let link_a = "pva://TARGET:PV?field=alarm.severity&proc=CPP";
@@ -3715,7 +3721,7 @@ mod tests {
     async fn br_json_links_same_pv_distinct_options_do_not_collide() {
         use epics_base_rs::server::record::pvajson_identity_key;
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Link A: read "alarm.severity", CPP (scan on passive).
         let opts_a: Vec<(String, JlinkValue)> = vec![
@@ -3793,7 +3799,7 @@ mod tests {
     /// though both arrive through the JSON identity-key boundary.
     #[tokio::test]
     async fn br_json_distinct_q_variants_do_not_collapse() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         let opts_q1: Vec<(String, JlinkValue)> = vec![
             ("proc".to_string(), JlinkValue::Str("CP".to_string())),
@@ -3847,7 +3853,7 @@ mod tests {
     async fn br_json_out_links_same_pv_distinct_options_do_not_collide() {
         use epics_base_rs::server::record::pvajson_identity_key;
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         let opts_a: Vec<(String, JlinkValue)> =
             vec![("field".to_string(), JlinkValue::Str("a.b".to_string()))];
@@ -3880,7 +3886,7 @@ mod tests {
     /// connection is awaited independently.
     #[tokio::test]
     async fn br128_distinct_q_variants_do_not_collapse() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Same PV, CP scan, but different queue depths → two variants.
         let _ = resolver
@@ -3948,7 +3954,7 @@ mod tests {
     /// link satisfying both reads and CP scans for the pipelined one.
     #[tokio::test]
     async fn br37_pipeline_variant_opens_its_own_monitor() {
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Default variant (no query options) and a pipelined Q=1 variant
         // of the SAME PV, both CP so each registers a scan target.
@@ -4006,7 +4012,7 @@ mod tests {
     #[tokio::test]
     async fn b4_local_gate_without_qsrv_still_rejects_remote() {
         let db = Arc::new(PvDatabase::new());
-        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = install_pvalink_resolver(&db).await;
         // No attach_qsrv_provider call.
         let r = resolver
             .open_link("pva://NO:QSRV:REMOTE:PV?local=true")
@@ -4210,7 +4216,7 @@ mod tests {
             .push(("timeStamp".into(), PvField::Structure(ts)));
         let cached = PvField::Structure(root);
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Seed the registry with a cached INP link whose own config
         // is the bare default: NMS, time=false, field="value".
@@ -4372,7 +4378,7 @@ mod tests {
             PvaServer::isolated(std::sync::Arc::new(source)).expect("test PVA server starts");
         let addr = server.tcp_addr();
 
-        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        let resolver = PvaLinkResolver::new();
 
         // Seed the registry with a pinned-client OUT link under the
         // exact key `put_value` will look up for the bare PV name, so

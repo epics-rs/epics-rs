@@ -3,7 +3,8 @@
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// (1 live-upstream monitor test gated out feature-ON below; §4.2, stage 3.)
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -730,6 +731,12 @@ mod tests {
     ///
     /// The client is pinned at the test server's address, so this
     /// exercises the connection pool without any UDP search.
+    // Drives two live pvalink monitor subscriptions to a real upstream server;
+    // the link's monitor task now spawns onto the reactor-less callback pool
+    // under `rtems-exec-model`, where the client's `tokio::net` transport
+    // cannot run. Reactor-dependent — gated out feature-ON
+    // (doc/pvalink-rtems-design.md §4.2, stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage0_distinct_link_variants_share_one_upstream_connection() {
         use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};

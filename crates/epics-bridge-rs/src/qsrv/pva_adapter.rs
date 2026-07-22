@@ -1416,8 +1416,7 @@ pub async fn pvalink_link_set_install(
     }
     #[cfg(feature = "pvalink")]
     {
-        let resolver =
-            crate::pvalink::install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = crate::pvalink::install_pvalink_resolver(&db).await;
         crate::pvalink::register_pvalink_commands(resolver)
     }
     #[cfg(not(feature = "pvalink"))]

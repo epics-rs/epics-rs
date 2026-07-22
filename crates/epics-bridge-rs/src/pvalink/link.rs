@@ -10,6 +10,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::CacheAction;
 use epics_pva_rs::client_native::ops_v2::PutLeaf;
@@ -283,7 +284,7 @@ struct StagedPut {
     block: bool,
 }
 
-struct MonitorAbort(tokio::task::AbortHandle);
+struct MonitorAbort(TaskAbortHandle);
 
 impl Drop for MonitorAbort {
     fn drop(&mut self) {
@@ -350,7 +351,7 @@ impl PvaLink {
             // backoff. Pre-fix this ran `pvmonitor` exactly once, so
             // a single IOC restart froze the cached value forever and
             // `is_connected()` stayed true.
-            let join = tokio::spawn(async move {
+            let join = task::spawn(async move {
                 let mut backoff = Duration::from_millis(250);
                 let max_backoff = Duration::from_secs(30);
                 loop {
@@ -472,7 +473,7 @@ impl PvaLink {
             // option-less subscription — so the server sees the pvalink
             // atomic/pipeline/queue negotiation on the OUT liveness path.
             let request = monitor_request(&config);
-            let join = tokio::spawn(async move {
+            let join = task::spawn(async move {
                 let mut backoff = Duration::from_millis(250);
                 let max_backoff = Duration::from_secs(30);
                 loop {

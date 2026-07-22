@@ -581,7 +581,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// True iff `name` should be answered to a SEARCH from `requester`.
     ///
     /// pvxs exposes the requester endpoint to a source's `onSearch` as
-    /// [`Search::source()`] — filled from `msg.replyDest` for UDP
+    /// `Search::source()` — filled from `msg.replyDest` for UDP
     /// (server.cpp:674-704) and from the established TCP peer for
     /// circuit search (serverchan.cpp:197-222) — so a source can scope
     /// advertisement by requester (claim a PV only for a local subnet,
@@ -1772,7 +1772,7 @@ pub enum MonitorStream<T> {
 /// The name is public because it appears in a public enum variant, but the
 /// inner kind is private, so no caller outside this module can build one — and
 /// therefore cannot build a [`MonitorStream::Mapped`] either. The single
-/// construction site is [`MonitorStream::map_plain`].
+/// construction site is `MonitorStream::map_plain`.
 pub struct PlainMonitor(PlainMonitorKind);
 
 enum PlainMonitorKind {

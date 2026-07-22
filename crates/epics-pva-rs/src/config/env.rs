@@ -77,7 +77,7 @@ pub fn expand_dollar_vars(input: &str) -> String {
 /// process environment when `name` isn't already set, OR replaces the
 /// existing value when `replace_existing` is true. Returns the number of
 /// variables that were actually written. Keys are written verbatim with
-/// no validation — caller is responsible for using real EPICS_PVA[S]_*
+/// no validation — caller is responsible for using real `EPICS_PVA[S]_*`
 /// names.
 pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool) -> usize {
     let mut applied = 0usize;
@@ -550,7 +550,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 
 /// The single owner of every PVA timeout/period env double, reproducing
 /// pvxs `parse_timeout` (`config.cpp:211-227`): parse with `parseTo<double>`
-/// ([`parse_double_pvxs`]), then REJECT a value that is non-finite, negative,
+/// (`parse_double_pvxs`), then REJECT a value that is non-finite, negative,
 /// or above `double(time_t::max)` — logging and leaving the destination at
 /// its default rather than saturating it. (This is deliberately unlike
 /// `epics-ca-rs`'s `envGetDoubleConfigParam`, which is epics-base's clamp
@@ -562,7 +562,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 /// `EPICS_PVA_CONN_TMO=1e300` passed the filter and aborted every client
 /// and server at startup. The range gate here makes that unrepresentable —
 /// a value that survives is always convertible to a `Duration`, including
-/// after the 4/3 `tmoScale` its owners apply ([`TIMEOUT_SECS_MAX`]).
+/// after the 4/3 `tmoScale` its owners apply (`TIMEOUT_SECS_MAX`).
 ///
 /// Zero is rejected here rather than passed through as pvxs does, because
 /// every caller's default is what pvxs's `enforceTimeout` (`config.cpp:373-391`)
@@ -668,7 +668,7 @@ pub fn server_broadcast_port() -> u16 {
 /// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
 /// bare name-server token to `host:0`. The server bind port keeps zero —
 /// see [`pvas_server_port`]. An explicit `host:0` in a name-server list is
-/// likewise normalized to this effective port by [`resolve_token_addr`]
+/// likewise normalized to this effective port by `resolve_token_addr`
 /// (pvxs `split_addr_into` `config.cpp:167-168`), so both the bare token and
 /// `host:0` resolve to `5075`.
 pub fn server_port() -> u16 {
@@ -1097,7 +1097,7 @@ fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
 /// Empty = bind to 0.0.0.0 (default behaviour). DNS hostnames resolve
 /// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
-/// [`resolve_intf_addr_list`].
+/// `resolve_intf_addr_list`.
 pub fn list_intf_addresses() -> Vec<IpAddr> {
     std::env::var("EPICS_PVA_INTF_ADDR_LIST")
         .ok()
@@ -1432,7 +1432,7 @@ fn enforce_timeout(tmo: &mut f64) {
 /// bound echo to range [1, 15]".
 ///
 /// SINGLE OWNER of "effective TCP timeout → echo period". Both the
-/// env-derived [`crate::client_native::heartbeat_interval`] and the
+/// env-derived [`crate::client_native::server_conn::heartbeat_interval`] and the
 /// per-connection heartbeat task (which uses the builder-supplied
 /// `tcp_timeout`) derive their cadence here, so a connection cannot echo on
 /// a different clock than the API says it does.
@@ -1566,7 +1566,7 @@ pub struct Config {
     /// any port from that IP).
     pub ignore_addrs: Vec<(IpAddr, u16)>,
     /// Effective (`4/3`-scaled) TCP idle timeout, seconds. `expand()`
-    /// clamps it to the pvxs bounds via [`enforce_timeout`].
+    /// clamps it to the pvxs bounds via `enforce_timeout`.
     pub tcp_timeout: f64,
 }
 

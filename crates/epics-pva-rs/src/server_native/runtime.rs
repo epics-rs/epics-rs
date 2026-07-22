@@ -553,7 +553,7 @@ impl PvaServer {
     ///
     /// The one server method whose *return type* is a client — so it is the
     /// one that gates with the client (design doc §9 phase 6, item 2). Use
-    /// [`Self::bound_tcp_addr`] on a server-only build; that is what this
+    /// [`Self::tcp_addr`] on a server-only build; that is what this
     /// hands the builder anyway.
     #[cfg(feature = "client")]
     pub fn client_config(&self) -> crate::client_native::context::PvaClient {

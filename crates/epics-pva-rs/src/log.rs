@@ -76,7 +76,7 @@ pub(crate) fn log_env_base() -> Option<String> {
 }
 
 /// Build an `EnvFilter` reload-layer pair seeded from the standard log env
-/// vars via [`log_env_base`] (`PVXS_LOG`, then `EPICS_PVA_LOG`, then
+/// vars via `log_env_base` (`PVXS_LOG`, then `EPICS_PVA_LOG`, then
 /// `RUST_LOG`), defaulting to `"info"` when none is set.
 ///
 /// Returns the wrapped layer (install into your subscriber) and a
@@ -158,7 +158,7 @@ pub fn set_log_filter(spec: &str) -> Result<(), LogFilterError> {
 /// Set a single target's level. Mirrors pvxs `logger_level_set(name,
 /// Level)`. Internally builds an `EnvFilter` of the form
 /// `"<base>,<target>=<level>"` where `<base>` is the same env-derived
-/// spec [`init_filter`] seeds from ([`log_env_base`]: `PVXS_LOG`, then
+/// spec [`init_filter`] seeds from (`log_env_base`: `PVXS_LOG`, then
 /// `EPICS_PVA_LOG`, then `RUST_LOG`), or `"info"` when none is set.
 pub fn set_log_level(target: &str, level: LevelFilter) -> Result<(), LogFilterError> {
     let base = log_env_base().unwrap_or_else(|| "info".to_string());

@@ -11,7 +11,7 @@
 //! Channel state is kept per-connection (a `HashMap<sid, ChannelState>`).
 //!
 //! This module owns no socket. The connection enters through
-//! [`handle_connection_io`], whose reader and writer are
+//! `handle_connection_io`, whose reader and writer are
 //! `Box<dyn AsyncRead/AsyncWrite>` trait objects — which driver produced
 //! them (the host accept loop in [`super::accept`], or the blocking
 //! thread-per-client driver coming with RTEMS phase 6 item 7) is not

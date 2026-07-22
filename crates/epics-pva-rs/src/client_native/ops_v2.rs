@@ -820,7 +820,7 @@ pub async fn op_put_raw(
 /// rest; a lone `[...]` token is the JSON-array `value=[...]` shortcut;
 /// a scalar `.value` takes exactly one token (more than one is an
 /// error, matching upstream's "Can't assign multiple values to
-/// scalar"). Token classification is deferred to [`op_put_inner_build`]
+/// scalar"). Token classification is deferred to `op_put_inner_build`
 /// because the array-vs-scalar decision needs the prototype.
 pub async fn op_put_tokens(
     channel: &Arc<Channel>,
@@ -5032,7 +5032,7 @@ fn build_put_value_mode(
 }
 
 /// One leaf of a multi-field PUT assignment. The leaf kind is explicit
-/// so the single delta owner ([`build_field_delta`]) places each value
+/// so the single delta owner (`build_field_delta`) places each value
 /// the right way: a [`PutLeaf::Str`] is parsed against the target
 /// descriptor by the CLI parser, while a [`PutLeaf::Typed`] is assigned
 /// as pvData with no `Display`/parse round trip — so a typed scalar
@@ -5044,7 +5044,7 @@ fn build_put_value_mode(
 /// sibling-field PUT path.
 pub enum PutLeaf {
     /// CLI/text leaf, parsed against the target descriptor by
-    /// [`build_put_value_for_path`].
+    /// `build_put_value_for_path`.
     Str(String),
     /// Already-typed pvData leaf, assigned directly into the selected
     /// descriptor leaf.

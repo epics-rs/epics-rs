@@ -96,7 +96,7 @@ impl TimeoutPolicy {
     }
 
     /// The operation timeout to hand the Duration-based client builder.
-    /// `Forever` maps to [`Self::FOREVER_SENTINEL`].
+    /// `Forever` maps to `Self::FOREVER_SENTINEL`.
     pub fn op_timeout(self) -> Duration {
         match self {
             TimeoutPolicy::Finite(d) => d,

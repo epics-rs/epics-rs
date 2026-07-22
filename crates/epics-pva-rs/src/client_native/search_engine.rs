@@ -268,7 +268,7 @@ pub const MULTI_SERVER_WINDOW: Duration = Duration::from_millis(200);
 /// A client's `addressList` is "addresses to which search requests will be
 /// sent" (client.h:1011) — UDP SEARCH **targets**, datagrams sent to each
 /// address on the broadcast port — NOT TCP name servers (those are a separate
-/// `Config::nameServers`, client.h:1024-1027 → [`PvaClientBuilder::name_servers`]).
+/// `Config::nameServers`, client.h:1024-1027 → [`crate::client_native::context::PvaClientBuilder::name_servers`]).
 /// An entry keeps its multicast modifiers ([`crate::config::Endpoint`]) so a
 /// `224.0.2.3@iface` target joins the right group.
 #[derive(Debug, Clone)]
@@ -292,7 +292,7 @@ pub struct ClientSearchConfig {
 
 impl ClientSearchConfig {
     /// Seed from the `EPICS_PVA_*` environment — the default a
-    /// [`PvaClientBuilder`] starts from. The address list is parsed against
+    /// [`crate::client_native::context::PvaClientBuilder`] starts from. The address list is parsed against
     /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
     pub fn from_env() -> Self {
         let broadcast_port = crate::config::env::broadcast_port();

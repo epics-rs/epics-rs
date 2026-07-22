@@ -452,7 +452,7 @@ impl ChannelSource for CompositeSource {
     /// the channel dispatches every later operation to the source that
     /// accepted it, instead of re-resolving the registry per operation.
     /// Selection uses `has_pv_checked` — the same credentialed find as
-    /// [`Self::resolve_checked`] — so the owner is chosen under the
+    /// `Self::resolve_checked` — so the owner is chosen under the
     /// downstream peer's identity. Descends through a nested composite
     /// to its leaf owner so the bound source is always terminal.
     ///

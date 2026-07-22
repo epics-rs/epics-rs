@@ -202,7 +202,7 @@ impl PvaServer {
     /// handle's `report()` names the TCP/UDP ports the kernel actually
     /// assigned, so a caller that must not guess a port (or probe one and
     /// re-bind it later — a PVA search-port collision is silent, see
-    /// [`crate::server_native::udp::bind_udp`]) can learn them the only way
+    /// `crate::server_native::udp::bind_udp`) can learn them the only way
     /// that is race-free. `epics-oracle-rs`'s differential harness boots its
     /// Rust PVA side through here.
     pub async fn run_reporting(

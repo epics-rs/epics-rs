@@ -491,7 +491,7 @@ impl SharedPV {
     /// server's current time when the client's PUT marked neither the
     /// timeStamp field nor any of its children (`sharedpv.cpp:113-121`).
     /// A client-supplied (marked) timeStamp is preserved. See
-    /// [`Self::fill_mailbox_timestamp`].
+    /// `Self::fill_mailbox_timestamp`.
     pub fn build_mailbox() -> Self {
         let pv = Self::new();
         pv.inner.lock().put_policy = PutPolicy::Mailbox;
@@ -517,7 +517,7 @@ impl SharedPV {
     }
 
     /// Declare the type and seed the initial value, transitioning the
-    /// PV from [`PvState::Closed`] to [`PvState::Open`].
+    /// PV from `PvState::Closed` to `PvState::Open`.
     ///
     /// Returns `Err` if the PV is already open. pvxs `sharedpv.cpp:357-358`
     /// throws `"close() first"` when `impl->current` is already set, so a
@@ -1495,7 +1495,7 @@ impl super::source::ChannelSource for SharedSource {
     /// Single-seed MONITOR: atomically capture the current value as the
     /// connect-time seed and register an **updates-only** subscriber via
     /// [`SharedPV::subscribe_seeded`], returning both as one
-    /// [`SubscriptionSeed`]. The default impl would subscribe (the
+    /// [`super::source::SubscriptionSeed`]. The default impl would subscribe (the
     /// prepend path) and ALSO seed via `get_value` — the double-seed
     /// PVA-RS closes; overriding here keeps the seed atomic with
     /// registration (no gap-duplicate) and updates-only.
@@ -1635,7 +1635,7 @@ impl super::source::ChannelSource for SharedSource {
     /// Override default no-op: route the channel-detach edge to the named
     /// `SharedPV` so it can fire `on_last_disconnect` on the last channel
     /// leaving (pvxs `sharedpv.cpp:278-296`). Mirror of
-    /// [`Self::notify_channel_open`].
+    /// [`super::source::ChannelSource::notify_channel_open`].
     fn notify_channel_close(&self, name: &str, _ctx: &super::source::ChannelContext) {
         let pv = self.pvs.lock().get(name).cloned();
         if let Some(p) = pv {

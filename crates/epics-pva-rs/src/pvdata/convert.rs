@@ -93,7 +93,7 @@ enum Store<'a> {
 
 /// pvxs `Kind` (`data.h:140-147`) — the type code's class nibble
 /// (`code & 0xe0`), which is what a source's `switch(fld.type().kind())`
-/// dispatches on. Distinct from [`Store`]: `Int32A` is `Kind::Integer` but
+/// dispatches on. Distinct from `Store`: `Int32A` is `Kind::Integer` but
 /// `StoreType::Array`, which is exactly why an array-typed
 /// `record._options.DBE` reaches pvxs's `fld.as<uint8_t>()` and throws
 /// (`ioc/singlesource.cpp:134-136`).

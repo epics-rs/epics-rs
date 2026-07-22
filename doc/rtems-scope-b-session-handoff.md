@@ -809,7 +809,7 @@ known — measured on a boot, or read out of the source:
 | multiplexing syscalls | 0 | 0 | **parity** |
 | per-thread leak | 0 (raw pthreads) | **128 B** | **gap 1** |
 | thread priority requested | `PTHREAD_EXPLICIT_SCHED` at creation, every thread | every thread, via `enter_ioc_thread` (§5.9 census) | **parity in source** |
-| thread priority *observed on target* | **measured 2026-07-22** — live, 11 distinct levels; `CAS-client` posix 51 / core 204, `CAS-event` 49/206, `CAS-TCP` 46/209, `CAS-UDP` 41/214 | *unmeasured* | **gap 1 closed; gap 2 — one boot** |
+| thread priority *observed on target* | **measured 2026-07-22** — live, 18 distinct levels over 26 threads; `CAS-client` posix 51 / core 204, `CAS-event` 49/206, `CAS-TCP` 46/209, `CAS-UDP` 41/214 | *unmeasured* | **gap 1 closed; gap 2 — one boot** |
 | scan/callback band vs libbsd | **7 threads above `_BSD` (100), `scan-1` above `IRQS` (96)** — measured | cannot happen: map image is core `100..=199` | **deliberate, better** |
 | lock wait discipline | `RTEMS_PRIORITY` ordered | tokio FIFO fair | **gap 3** |
 | PI on the scan lock | on — `epicsMutexMustCreate`, `dbLock.c:86` | none — L1 is `park_on`-invisible | **gap 4** |

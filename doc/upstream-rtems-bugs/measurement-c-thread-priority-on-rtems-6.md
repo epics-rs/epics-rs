@@ -87,12 +87,17 @@ RTEMShost> epicsThreadShowAll 1
 OSD priority range min: 1 max 254, memory not locked
 ```
 
-Eleven distinct live levels across nineteen named threads. **The failure mode
-§8.0 warned about — "all IOC threads equal at the baseline" — does not occur.**
+Twenty-seven rows; twenty-six carry a live readback (`_main_` does not, see §4),
+and they hold **eighteen distinct priority levels**: 26, 41, 44, 46, 49, 51,
+127, 150, 152, 155, 157, 160, 162, 165, 167, 170, 178, 180. Only two values are
+shared — `errlog`/`taskwd` at 26 and `cbMedium`/`scan-0.5` at 162, both because
+their OSI priorities are equal. **The failure mode §8.0 warned about — "all IOC
+threads equal at the baseline" — does not occur.**
 
-The identical block with **zero** connections is at transcript lines 234-255:
-same nineteen minus the eight per-connection threads, same numbers. So the
-ladder is set at `iocInit`, not by anything the load did.
+The same block with **zero** connections is at transcript lines 234-255: the
+same nineteen rows minus the eight per-connection threads (sixteen distinct
+levels), same numbers. So the ladder is set at `iocInit`, not by anything the
+load did.
 
 ---
 
@@ -323,7 +328,7 @@ Nothing in this measurement contradicts that comment; it confirms it.
 
 | property | C — RSRV, **measured this boot** | us, predicted from `map_epics_priority_rtems` (unmeasured by this panel) |
 |---|---|---|
-| priorities distinct per role | yes, 11 live levels | yes by construction |
+| priorities distinct per role | yes, 18 live levels over 26 threads | yes by construction |
 | ladder order `client > event > TCP > beacon > UDP` | yes | yes (76/75/74/73/72 posix) |
 | `CAS-client` | posix 51 / core 204 | posix 76 / core 179 |
 | `CAS-TCP` | posix 46 / core 209 | posix 74 / core 181 |

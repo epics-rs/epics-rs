@@ -21,9 +21,15 @@ target. Hosted (Linux) behaviour unchanged throughout.
 
 Upstream splits its I/O model **by protocol**: EPICS base's RSRV is
 thread-per-client, pvxs is a libevent reactor. We split **by platform** — one
-sans-io core, a blocking driver on RTEMS and the async driver on hosts. §5.3
-below is the measurement that turned this from a defensible choice into the
-only available one.
+sans-io core, a blocking driver on RTEMS and the async driver on hosts.
+
+§5.3 is what that choice is worth, stated at its measured strength and no
+higher: a libevent reactor **does** work on RTEMS 6 once steered away from the
+`poll` backend, so "a reactor cannot run there" is false. What is true is that
+the reference implementation ships an RTEMS-5-era workaround that steers itself
+into a broken backend, and finding that took an interposer and CPU-idle
+attribution. Our backend does not depend on a reactor, so it never meets that
+class of defect. That is the claim to make.
 
 ---
 
@@ -167,6 +173,13 @@ deviation and should be documented as one. Note base's own comment at
 `modules/libcom/RTEMS/posix/rtems_config.c:83`: raising the cap past
 `FD_SETSIZE` faults any code calling `select()`, and libca/RSRV do not.
 
+**Raising the cap does not buy much, so do not propose it as a fix.** Measured
+at fd=400 (§5.6): the fd wall stops binding and heap binds instead, at **151
+served** — nine more connections than 142, on a 256 MB guest. The lever that
+would actually move this number is per-connection memory, 97.4 % of which is
+the two thread stacks (§5.2), and §5.2 says C over-provisions those the same way
+we do.
+
 ### 5.2 Stack classes — settled, do not reopen
 
 C rsrv on the identical target, `rt stackuse` at 139 held connections:
@@ -216,39 +229,73 @@ forbids one specific substitution — swapping the POSIX table for the RTEMS-
 RTEMS 6 build compiles (`configure/toolchain.c:31-36`: `__RTEMS_MAJOR__>=5` ⟹
 `OS_API = posix`).
 
-### 5.3 pvxs builds on RTEMS 6 but does not run
+### 5.3 pvxs on RTEMS 6 — root-caused, and it works after one line
 
-pvxs cross-builds after one build-system patch
-(`bundle/cmake/Platform/RTEMS.cmake:28`, remove `-specs bsp_specs`, which
-RTEMS 6 no longer installs — pvxs's RTEMS support is written for RTEMS 5).
-`libpvxs.a`, `libpvxsIoc.a`, `softIocPVX` and ~40 test executables all link.
+This section was rewritten twice. **Both earlier versions were wrong, and the
+panel that wrote them retracted them under measurement.** The wrong versions
+are kept because they are what a fresh reader will otherwise re-derive.
 
-**It wedges at 100 % CPU during `pioc_registerRecordDeviceDriver` and never
-reaches `iocInit`:**
+> **Wrong v1:** "pvxs does not run on RTEMS 6." → It does.
+> **Wrong v2:** "`event_base_loop` on a secondary pthread busy-spins." → On a
+> secondary pthread the loop is fine. The thread was never the variable.
+
+**The actual defect: libevent's `poll` backend never blocks on this BSP, on
+any thread**, because `poll()` returns `POLLERR` immediately on libevent's
+internal notify descriptor. Measured with `-Wl,--wrap=poll` around one 4.000 s
+loop (probe binary only; libevent and pvxs untouched):
+
+| backend | `poll()` calls in 4 s | guest IDLE |
+|---|---:|---:|
+| raw `poll()` | 1 | 97.9 % |
+| libevent kqueue | 0 | 97.7 % |
+| libevent **poll** | **148,081** | **33.6 %** |
+
+The caller sees a correct 4 s block; the loop thread burns the core for all of
+it. The descriptor, isolated with no libevent involved:
 
 ```
-INFO: PVXS QSRV2 is loaded, permitted, and ENABLED.     <- last line, forever
-gdb: clock_gettime → evutil_gettime_monotonic_ → event_base_loop
-     → pvxs::impl::evbase::Pvt::run → epicsThreadCallEntryPoint
+pipe() -> fd 56   [IMFS FIFO]   poll(POLLIN,1000ms) rv=1 revents=0x8 in 0.0002s  <- POLLERR
+socketpair()-> 58 [unix socket] poll(POLLIN,1000ms) rv=0 revents=0x0 in 1.0058s  <- blocks
+udp socket -> 55                poll(POLLIN,1000ms) rv=0 revents=0x0 in 1.0106s  <- blocks
 ```
 
-Isolated to ~90 lines of C with **no pvxs code**. Everything individually
-works — poll, kqueue, timers, socketpair, notify sockets, and on the **main**
-thread the identical loop blocks for exactly 2.000 s. The one change that
-breaks it is running `event_base_loop()` on a **secondary pthread**: it
-busy-spins and starves the whole system. Upstream's own `testev` hangs at
-`test_call` on the guest.
+`evutil_make_internal_pipe_()` prefers `pipe()` over `socketpair()`, and
+`pipe()` here is an RTEMS IMFS FIFO, which libbsd's `poll()` flags as an error
+instead of waiting on.
 
-**Consequence: there is no working pvAccess server on RTEMS 6 to deviate
-from.** Our blocking thread-per-connection PVA backend is not a compromise
-against an available reactor — on this target it is the only thing that runs.
-This belongs wherever the design rationale is written down; nobody reading the
-code today would know it.
+**The priority hypothesis was tested and rejected as the cause.** With the loop
+thread explicitly below the other (`SCHED_FIFO` 3 vs 1) the starvation vanishes
+— but guest IDLE is 0.000074 s of 4.017 s. The core is still fully consumed.
+Priority separation hides the symptom. Equal-priority single-core `SCHED_FIFO`,
+which `pthread_create` produces by inheritance, is only why it *presents* as a
+hang.
 
-Root cause **not** determined. Candidates: rtems-libbsd thread registration,
-and RTEMS single-core equal-priority scheduling (testable by giving the loop
-thread a different priority — if the spin disappears it is starvation-shaped,
-not a broken primitive).
+**Owner: rtems-libbsd.** `poll()` on a valid open non-socket fd must report
+real readiness, not `POLLERR`. libevent deserves a defensive change (prefer
+`socketpair()` on RTEMS — measured to work). pvxs is the victim but holds the
+one-line workaround: `src/evhelper.cpp:183`
+`#ifdef __rtems__ event_config_avoid_method(conf,"kqueue")`, written for
+"libbsd circa RTEMS 5.1", is what steers it into the broken backend.
+
+**With that one line commented out and nothing else changed, pvxs serves on
+RTEMS 6:** `iocRun: All initialization complete`; `pvxinfo` returns full
+NTScalar introspection; `pvxget PIOC:AI1` → `1.25`; `pvxput` then `pvxget` →
+`7.5`; `pvxmonitor` streams from a 0.1 s scan record. And the RTEMS-5.1 reason
+for the workaround does not reproduce — `SIGKILL`ing a monitor client (no FIN)
+is detected under kqueue: `connection to Client … closed by peer`.
+
+**What this means for our design rationale — state it accurately, not
+conveniently.** Our blocking thread-per-connection PVA backend is *not* "the
+only thing that runs on RTEMS", which is what the previous version of this
+document claimed and what a brief already told a panel to write into the code.
+A libevent reactor does work on RTEMS 6 once steered to `kqueue`. The honest
+claim is narrower and still real: **the reference implementation ships an
+RTEMS-5-era workaround that makes it unusable on RTEMS 6 today**, and it took a
+`--wrap=poll` interposer and CPU-idle attribution to find that. Our backend
+avoids the whole class by not depending on a reactor. Write that, not the
+stronger version.
+
+Full write-up on the box: `~/rtems-cside/FINDING-1-libevent-poll-spin.md`.
 
 ### 5.4 The `libc` time defect is ours alone — clean control
 
@@ -299,40 +346,139 @@ Verification tooling: use **pvxs**, not our own client, against our own server.
 GUID. Default Delta output omits the top-level struct id, so it cannot
 demonstrate the served type.
 
-### 5.6 Memory
+### 5.6 Memory — flat on both stacks, and raising the fd cap is not worth it
 
-Ours: 1,589,554 B per connection = Big 1,048,576 + Medium 524,288 + 16,690 B
-non-stack. One model reproduces three runs (2 MiB default → 4,210,440;
-`RUST_MIN_STACK=262144` → 540,036).
+> **Wrong version, recorded:** "C's non-stack heap grows non-linearly, ~8 KB at
+> 53 connections and ~42 KB at 139." That was arithmetic across two different
+> builds and two different boots. The panel retracted it. There is no growth.
 
-C's non-stack heap **grows non-linearly**: ~8 KB/conn at 53 connections, ~42
-KB/conn at 139. At fd=150 the C IOC is down to 5.6 MB free at 139 connections —
-within ~3 of memory-bound as well as fd-bound. Cause not measured; libbsd
-mbuf/zone growth is the candidate. **If it is shared, raising the descriptor
-cap walks into a memory wall rather than buying connections** — which is why
-nobody should propose raising it until our own sweep (25/50/100/140) is done.
+C, one boot, four marks, reproduced across two boots to 0.1 MiB:
+
+| connections | heap free | incremental per connection |
+|---:|---:|---:|
+| 0 | 219.7 MiB | – |
+| 53 | 138.0 MiB | 1,616,383 B |
+| 100 | 65.6 MiB | 1,615,251 B |
+| 139 | 5.6 MiB | 1,613,183 B |
+
+Ours, fd cap raised to 400: 1,588,393 / 1,589,254 / 1,588,876 / 1,589,431 B at
+25 / 50 / 100 / 140 connections — **spread 1,038 B, 0.065 %.** An independent
+derivation from the ramp gives 1,589,013.
+
+**Both stacks are flat and they agree.** `netstat -m` is byte-identical at 100
+and 139 connections; diffing every UMA zone over 86 connections accounts for
+1,654 B — 3.9 % of the residual. C's residual above the stacks is ~42.4 KB at
+*every* count, and **77 % of it is rsrv's pair of 16 KB buffers**
+(`caservertask.c:1284,:1287`, `MAX_TCP=16384` measured on target).
+
+**97.4 % of per-connection cost is the two thread stacks** — the ones measured
+at 2,024 B and 380 B used (§5.2).
+
+**Raising the descriptor cap is not worth proposing on this guest.** At fd=400
+the fd ceiling stops binding and memory binds at **151 served**, by two
+independent derivations (300 attempted with 149 refused; and
+(259,803,736 − 19,880,696)/1,589,000 = 150.99). Refusals are `EAGAIN`, announced
+on powers of two. So the cap buys **9 connections, 142 → 151**, and then the
+256 MB guest is out of heap.
+
+Repeat fill-and-drain is safe: residual ~300 B per connection across two
+cycles, consistent with the known 128 B-per-`std::thread` RTEMS leak across two
+threads. C reuses rather than leaks too — `casr 4` shows free-lists holding
+4,773,576 B after 139 connections close; the 227 MiB is parked, not returned.
+
+Scope limit, stated: these are VERSION-handshake holds with no channels or
+subscriptions, so this measures the connection object, not per-channel state.
+
+### 5.7 The IOC's own status PVs predict the ceiling exactly
+
+`rtems-pva-ioc` publishes devIocStats-named PVs through a one-second pusher
+thread (a `ReadHook` would not work — it is GET-only, so `camonitor` on a
+hook-backed PV never updates). Verified with `caget` **and** `camonitor`: 23
+updates each in 22 s, values actually moving.
+
+| held | FD_CNT | FD_FREE | CA_CONN_CNT | MEM_FREE |
+|---:|---:|---:|---:|---:|
+| 0 | 8 | **142** | 0 | 241,199,000 |
+| 100 | 108 | 42 | 100 | 82,313,800 |
+| 141 | 149 | 1 | 141 | 17,148,200 |
+| 142 | *unreadable* | — | — | — |
+
+`FD_CNT + FD_FREE = FD_MAX = 150` at every row, one descriptor per connection,
+and **`FD_FREE` at idle is numerically the ceiling.** A console-less operator
+can watch it count down.
+
+Two caveats that operator must be told, both measured:
+
+- **The instrument dies at the wall.** At 142 held, `caget` returns nothing — a
+  CA client needs a descriptor and there are none. You can see the wall coming;
+  you cannot read anything once you hit it.
+- **`CA_REFUSED_CNT` is the wrong alarm for this wall.** It stayed **0** through
+  the entire ramp. The fd wall is an `accept` failure (ENFILE) that happens
+  before a client object exists, so it never reaches the refusal counter.
+  `FD_FREE` is the only published number that sees it.
+
+Timestamps read `2014-04-14` — no RTC on target, so they are the RTEMS epoch
+base, not wall clock.
+
+### 5.8 `child_thread_lost`'s spawn arm is unreachable by construction
+
+Not "undriven" — unreachable. The PVA connection thread is `Big` (1 MiB) and is
+spawned **first, at the accept site**; `spawn_child` (reader/writer, 256 KiB
+each) runs from inside `serve_connection_blocking`, which only executes if that
+1 MiB allocation succeeded. Reaching `blocking.rs:483` therefore needs a heap
+where 1 MiB allocates but 256 KiB does not — impossible in a single-heap
+allocator. Verified at fd=400 with 320 held connections and
+`free.largest=505,144`: the parent spawn failed cleanly, the guest stayed alive
+and kept accepting. Its only reachable trigger today is the panic arm, which
+*was* driven on a real console.
 
 ---
 
-## 6. Two upstream bugs found, neither filed
+## 6. Four upstream bugs found, none filed
 
-**EPICS base — boot crash on a documented configuration.** `rtems_init.c`
-documents `epicsRtemsFSImage = NULL` as "no FS image provided, but none is
-needed" and returns 0; that path leaves `argv[1] == NULL` and `POSIX_Init`
-calls `set_directory(argv[1])` → `strrchr`. The guest dies before `main()`:
+All four are characterised well enough to file. Filing them is the highest-
+value unstarted work in this session — three of the four are other people's
+bugs that block anyone doing EPICS on RTEMS 6, not just us.
 
-```
-*** FATAL *** fatal source: 9 (RTEMS_FATAL_SOURCE_EXCEPTION)
-PC = strchr   newlib/libc/string/strchr.c:100
-```
+1. **rtems-libbsd — `poll()` returns `POLLERR` on a valid IMFS FIFO.** §5.3.
+   The root cause of the pvxs wedge. Evidence: `-Wl,--wrap=poll` counts,
+   CPU-idle attribution, and a three-descriptor discrimination test showing
+   `pipe()` fails where `socketpair()` and a UDP socket both block correctly.
 
-**pvxs — RTEMS support targets RTEMS 5.** `-specs bsp_specs` in its cmake
-platform file; RTEMS 6 does not install that file (`-qrtems` alone is what base
-uses).
+2. **pvxs — the RTEMS kqueue avoidance is an RTEMS-5.1 leftover that makes it
+   unusable on RTEMS 6.** `src/evhelper.cpp:183`. Removing it yields a fully
+   working PVA IOC, and the peer-close behaviour it was written to work around
+   does not reproduce. This is a one-line fix with an end-to-end demonstration
+   behind it.
 
-Plus the `event_base_loop`-on-a-secondary-pthread spin (§5.3), which is
-upstream-grade and whose owner among rtems-libbsd / libevent / pvxs is not yet
-determined.
+3. **pvxs — RTEMS support targets RTEMS 5 in the build system too.**
+   `bundle/cmake/Platform/RTEMS.cmake:28` passes `-specs bsp_specs`; RTEMS 6
+   does not install that file (`-qrtems` alone is what base uses). Without
+   removing it, nothing compiles.
+
+4. **EPICS base — boot crash on its own documented configuration.** Reproduced
+   on **unpatched** base with a 12-line application. Fault: `R0 = 0x00000000`,
+   `R1 = 0x2f` (`'/'`), `PC` → `strchr`, `newlib/libc/string/strchr.c:100`,
+   reached from `strrchr`; `main()` never entered. Chain, all in
+   `modules/libcom/RTEMS/posix/rtems_init.c`:
+
+   | line | what |
+   |---|---|
+   | 948 | `char *argv[3] = { NULL, NULL, NULL };` |
+   | 216-217 | the `epicsRtemsFSImage==NULL` branch returns `0` **without assigning `argv[1]`** — every other success path assigns it (224, 256, 315, 339, 366, 411) |
+   | 238 | `initialize_local_filesystem` treats hook-returns-0 as success |
+   | 1164 | `set_directory(argv[1])` with `argv[1] == NULL` |
+   | 471 | `cp = strrchr(commandline, '/');` → fault. The guard at 472 handles "no slash", not "no string". |
+
+   Fix: assign `argv[1] = "/"` in the NULL branch at 216-217 (keeps the
+   invariant where it is established) **and** make the consumer total —
+   `cp = commandline ? strrchr(commandline,'/') : NULL;`. Both are cheap; doing
+   both leaves no faulting configuration. Write-up and reproducer on the box at
+   `~/rtems-cside/FINDING-2-base-rtems-fsimage-null.md` and `~/rtems-cside/fsbug/`.
+
+Plus the Rust `libc` defects of §5.4, which are already filed as #5307/#5308 —
+see §7 for why those are blocked on something other than their technical
+content.
 
 ---
 
@@ -372,34 +518,86 @@ decides.
 
 ---
 
-## 8. Open work
+## 8. Next — what to do when the session resumes
 
-**bring-up** — verify against the real `rtems-pva-ioc` rather than the probe:
-`pvxlist -i` and `pvxlist <addr>` (the `9df6ed99` fix), and the status PVs by
-**both** `caget` and `camonitor` — the one-second pusher exists precisely
-because `ReadHook` is GET-only and a monitor on a hook-backed PV never updates.
-Then: do the IOC's own `FD_CNT`/`FD_MAX` predict the externally measured 142?
-Memory sweep at 25/50/100/140. A raised-fd-cap image, which answers both
-whether `child_thread_lost`'s spawn-failure arm becomes reachable (it needs
-~170; `accept` currently fails with ENFILE before a connection object exists)
-and where memory really binds.
+The measurement phase closed. Everything §5 set out to answer is answered, and
+three of those answers overturned a design belief. **The open work is now
+mostly writing-down and filing, not measuring** — which is exactly the work
+that gets skipped when a session moves machines, so it is listed first.
 
-**C-side** — root-cause §5.3. Write up the base boot crash as a filable report.
-Measure what scales the non-stack per-connection heap.
+### 8.1 Do first — record what is already known, before it decays
 
-**w1** — remaining workspace rustdoc warnings (~209 across other crates, same
-four lints, array/unit-in-prose family dominates). `server::outbox` is a `pub
-mod` with no public item — a public-API removal, so propose rather than do.
+1. **State the pvxs finding accurately in our own source.** Two files carry the
+   design rationale and both currently overclaim, or are about to:
+   `crates/epics-pva-rs/src/server_native/blocking.rs:5-40` and
+   `crates/epics-ca-rs/src/server/blocking.rs:1-11`. The claim to write is §5.3's
+   narrow one — *the reference implementation ships an RTEMS-5-era workaround
+   that makes it unusable on RTEMS 6 today* — **not** "a reactor cannot run on
+   RTEMS". A brief already told a panel to write the strong version; if it
+   landed, correct it.
+2. **Document the fd deviation in-tree.** Our guest configures 150 descriptors;
+   stock base ships 64 (`modules/libcom/RTEMS/posix/rtems_config.c:83`). That is
+   our deviation and it is currently recorded nowhere but this file. Include the
+   §5.1 measurement and the fd=400 result, so the next person does not re-run
+   a 300-connection ramp to learn that the cap buys nine connections.
+3. **Fix the two `scripts/rtems-check.sh` defects.** It leaves `M Cargo.lock`
+   behind, and `--no-default-features` silently drops `epics-rtems-boot`'s
+   `_RTEMS_LIBC_TIME_LAYOUT` guard from coverage. The second is the same class
+   as the `--lib` miss that started this: the gate stayed green while a real
+   image build hard-failed with `error[E0080]: evaluation panicked: RTEMS libc
+   layout bug`. A gate that cannot fail on a known-broken configuration is not
+   a gate.
 
-**Unstarted, designed** — the RTEMS thread pool
-(`scratchpad/rtems-thread-pool-design.md`). It closes the 128 B/thread leak and
-makes EAGAIN admission server-owned. **It does not raise the ceiling by one
-connection** — a pooled thread cannot serve two *concurrent* connections, since
-each receiver blocks in `recv()` for the connection's life, so N connections
-still hold 2N stacks. Checkout must be of a **pair** (PVA: a triple) atomically,
+### 8.2 File the upstream reports (§6)
+
+In value order. Each already has its evidence; what is missing is the prose,
+and per §7 the prose must be handwritten.
+
+1. **rtems-libbsd `poll()`/`POLLERR` on an IMFS FIFO** — the root cause. Blocks
+   every libevent-based program on RTEMS 6, not only pvxs.
+2. **pvxs `evhelper.cpp:183`** — the one-line removal, with the end-to-end
+   serving IOC as the demonstration and the non-reproduction of the RTEMS-5.1
+   peer-close behaviour as the safety argument.
+3. **EPICS base `set_directory(NULL)` boot crash** — reproducer and fix both in
+   hand at `~/rtems-cside/fsbug/`.
+4. **pvxs `RTEMS.cmake:28` `-specs bsp_specs`** — trivial, and nothing compiles
+   without it.
+
+### 8.3 Awaiting the user, not an agent (see §7)
+
+- Merge of `integration/rtems-scope-b` — 149 commits, never pushed.
+- libc #5307 / #5308 rework. **Do not write PR prose, do not push any libc
+  branch.** The `unused import: crate::prelude::*` fix exists unpushed on three
+  branches and belongs in whatever the user files.
+- `server::outbox`: every item inside is already `pub(crate)`, so the module can
+  be `pub(crate) mod`. It is a public-module removal, hence a proposal.
+
+### 8.4 Code work that is designed but unstarted
+
+**The RTEMS thread pool** (`scratchpad/rtems-thread-pool-design.md`). It closes
+the 128 B-per-`std::thread` leak and makes EAGAIN admission server-owned.
+**It does not raise the ceiling by one connection** — a pooled thread cannot
+serve two *concurrent* connections, since each receiver blocks in `recv()` for
+the connection's life, so N connections still hold 2N stacks. Design
+constraints, all load-bearing: check out a **pair** (PVA: a triple) atomically,
 `catch_unwind` **inside** the RAII guards, never respawn a lost worker. Blocked
-on one target check: whether `pthread_setname_np` is safe on an already-running
-RTEMS thread.
+on one target check — whether `pthread_setname_np` is safe on an
+already-running RTEMS thread.
+
+**Remaining hygiene populations**, all counted, none urgent: ~176 workspace
+rustdoc warnings (same four lints, array/unit-in-prose dominates); 23
+unnameable-type sites (`motor-rs/src/fields.rs` 13, `asyn-rs` 7,
+`epics-bridge-rs/src/pvalink` 3); `tokio::fs` outside `ca`; ~20 `tokio::time`
+sites in `epics-ca-rs`.
+
+### 8.5 Deliberately not next
+
+- **Cutting the stack classes.** Settled against in §5.2 by measuring C.
+- **Raising the fd cap as a ceiling fix.** §5.1 / §5.6: it buys nine.
+- **Re-measuring per-connection memory.** Flat on both stacks, agreeing to
+  0.065 %. The one thing genuinely not measured is per-*channel* and
+  per-*subscription* state — §5.6's scope limit — which is a new question, not
+  a re-run.
 
 ---
 
@@ -416,6 +614,23 @@ RTEMS thread.
   for. Grep the behaviour.
 - **Sampling can miss the entire population.** A 1 Hz stack sampler caught zero
   live connection threads in 54 reports. Report at thread exit instead.
+- **A plausible root cause survives until something counts it.** §5.3 was
+  root-caused wrongly twice — "pvxs doesn't run on RTEMS 6", then
+  "`event_base_loop` on a secondary pthread busy-spins" — and both readings were
+  consistent with every symptom available at the time. What killed them was a
+  `-Wl,--wrap=poll` interposer and CPU-idle attribution: 148,081 calls in 4 s
+  against 1 for raw `poll()`. When a hypothesis explains the symptom but you
+  cannot state a number that would refute it, you do not have the cause yet.
+- **Test the hypothesis you are about to act on, even when it works.** Giving
+  the loop thread a lower `SCHED_FIFO` priority made the starvation vanish —
+  and left guest idle at 0.000074 s of 4.017 s. It fixed the *presentation*.
+  Shipping it would have closed the investigation on the wrong owner.
+- **Do not do arithmetic across two builds or two boots.** "C's heap grows
+  non-linearly, 8 KB at 53 and 42 KB at 139" was subtraction between different
+  images and different boots. One boot with four marks showed it flat to 0.1 %.
+  Same failure shape as reading a stale log: `boot-pva.sh` once killed only
+  `pvaprobe.exe`, so a re-boot silently failed on port forwarding and the panel
+  read the *previous* boot's output as the new result.
 - **`-Zbuild-std` has a stale-std fingerprint** — changing `libc` recompiles
   `libc` in ~1 s and leaves `libstd-*.rlib` untouched. `cargo clean --target`
   first, and prove the swap with a `const _: () = assert!(…)`.

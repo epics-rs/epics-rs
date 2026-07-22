@@ -21,9 +21,10 @@ impl PvDatabase {
     /// current state at insert time.
     ///
     /// **Synchronous.** It had exactly two suspension points and neither was a
-    /// real one: `registration_mutex.lock().await` (L46) and two
-    /// `scan_index.write().await` acquisitions (L8b). Both are blocking PI
-    /// mutexes now, so the whole scan-index update is a bounded critical
+    /// real one: the `registration_mutex` acquisition (L46) and two
+    /// `scan_index` write acquisitions (L8b) — both awaited before step 4.
+    /// Both are blocking PI mutexes now, so the whole scan-index update is a
+    /// bounded critical
     /// section — which is what lets it run *inside* the L1 record-gate window
     /// without putting an `.await` there. C reaches `scanAdd`/`scanDelete`
     /// (`dbScan.c:241-330`) the same way, from inside `dbPut` under

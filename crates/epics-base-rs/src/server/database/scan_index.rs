@@ -27,7 +27,7 @@ impl PvDatabase {
         old_phas: i16,
         _new_phas: i16,
     ) {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         let _ = old_phas; // entry matched by name; PHAS not needed.
         // 1) Remove the OLD entry the caller knew about — even if
         // remove_record already swept it. Match by record name so a

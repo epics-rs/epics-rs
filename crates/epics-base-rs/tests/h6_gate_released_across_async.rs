@@ -19,6 +19,8 @@
 //! 3. the completion re-entry RE-TAKES the gate, so it serialises against a
 //!    concurrent holder rather than racing it.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

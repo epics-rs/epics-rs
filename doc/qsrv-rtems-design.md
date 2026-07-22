@@ -15,8 +15,10 @@ against the **post-round** shape and marked POST-ROUND where it differs.
 The RTEMS target IOC must serve `Q:group` PVs. Today `epics-bridge-rs` is
 outside the RTEMS closure entirely: it is absent from
 `scripts/rtems-check.sh`'s `CRATES`, and the crate carries **zero**
-`target_os = "rtems"` / `rtems-exec-model` predicates (measured: `rg -n
-'rtems' crates/epics-bridge-rs/src` returns nothing). `rtems-pva-ioc`
+RTEMS predicates (measured: `rg -n 'target_os = "rtems"|rtems-exec-model|
+rtems_boot_linked|exec_backend' crates/epics-bridge-rs` returns nothing;
+the only `rtems` string anywhere in the crate is a doc-comment
+cross-reference at `qsrv/group.rs:861`). `rtems-pva-ioc`
 serves single-record PVs through `PvDatabaseSource`
 (`crates/epics-pva-rs/src/bin/rtems-pva-ioc.rs`, step 3).
 
@@ -49,9 +51,10 @@ So the shape of the work is:
 
 * **QSRV itself type-checks for `armv7-rtems-eabihf` as it stands.**
   `group.rs`, `group_config.rs`, `pvif.rs`, `provider.rs`, `channel.rs`,
-  `monitor.rs`, `iocsh.rs`, `trap_write.rs` — 19.6k of the 21k lines —
-  produce not one error. The blockers are three manifest lines and one
-  host-only function.
+  `iocsh.rs`, `monitor.rs`, `trap_write.rs` — 17,842 of qsrv's 21,013
+  lines — produce not one error, and neither does the rest of
+  `pva_adapter.rs` outside one ~135-line function. The blockers are
+  three manifest lines and that function.
 * **pvalink is blocked behind a project that does not exist.** It needs
   `epics_pva_rs::client` / `client_native`, and that module tree does not
   compile for RTEMS: 47 errors, 20 of them in `client_native/udp.rs` and
@@ -75,10 +78,11 @@ hardware.
 
 Every number below is a `rg` count over the file split at its **first
 column-0 `#[cfg(test)]`**, so "prod" excludes in-file test modules. That
-split matters more here than anywhere else in the workspace: 152 of the
-crate's 153 `#[tokio::test]` sites in `qsrv`+`pvalink` are *below* that
-line, and counting them as production work would triple the apparent
-size of the port.
+split matters more here than anywhere else in the workspace: **all**
+152 (POST-ROUND 153) `#[tokio::test]` sites in `qsrv`+`pvalink` fall
+below that line — the production splits contain zero — so counting the
+raw whole-file figures as production work overstates the port by roughly
+threefold.
 
 Raw whole-file counts (the "~151 / ~140 tokio refs" figure in the brief)
 are reproduced for cross-reference, but they are not the work list.

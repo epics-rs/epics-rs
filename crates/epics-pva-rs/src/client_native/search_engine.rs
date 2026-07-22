@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Interval, interval};
 use tracing::{debug, warn};
@@ -2952,8 +2952,22 @@ async fn ns_run_once(
         handshake_timeout,
     } = params;
     let handshake_timeout = *handshake_timeout;
-    let stream = TcpStream::connect(ns_addr).await?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    // The same dial `ServerConn::connect` uses — one seam, two callers. A
+    // name-server connection is an ordinary PVA TCP circuit (pvxs only flips
+    // `nameserver = true` after `Connection::build()`), so it has no business
+    // choosing its own transport: on RTEMS it must be the blocking pump, and a
+    // second `TcpStream::connect` here would be a second place to remember
+    // that.
+    //
+    // `handshake_timeout` serves as both bounds because it is the only one an
+    // NS circuit is configured with: it has no `ConnConfig`, no heartbeat and
+    // no `tcp_timeout`. Note this adds a connect deadline the previous bare
+    // `TcpStream::connect(ns_addr).await` did not have — an unreachable name
+    // server used to park this future on the OS's connect timeout.
+    let (mut reader, mut writer) =
+        super::server_conn::dial_pva(ns_addr, handshake_timeout, handshake_timeout)
+            .await
+            .map_err(std::io::Error::other)?;
 
     let mut rx_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];

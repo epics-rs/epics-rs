@@ -10,6 +10,8 @@
 //! ReadDbLink`, which delivers the link target's NATIVE `EpicsValue`; `sseq`
 //! preserves a string in `STRn` (byte-exact) instead of coercing to `DOn`.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 

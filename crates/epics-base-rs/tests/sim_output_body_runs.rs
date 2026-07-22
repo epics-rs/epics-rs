@@ -18,6 +18,8 @@
 //!   * `bo` HIGH: the momentary reset arms and (on the timer reprocess) drives
 //!     the simulated output back to 0.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

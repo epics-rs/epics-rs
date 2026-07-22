@@ -15,6 +15,8 @@
 //! same trailing-text tolerance the dbCommon parse gate keeps. Only an
 //! out-of-integer-range magnitude is refused.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::int64in::Int64inRecord;

@@ -26,6 +26,8 @@
 //!     cleared it on the first cycle merely because VAL (still its initial 0)
 //!     was not NaN.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::swait::SwaitRecord;

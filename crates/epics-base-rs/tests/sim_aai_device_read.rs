@@ -14,6 +14,8 @@
 //! took the OUTPUT redirect and wrote its VAL array OUT to its DBF_INLINK SIOL
 //! (direction inverted). Classifying it as an input pins the correct SIOL read.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

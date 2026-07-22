@@ -33,6 +33,8 @@
 //! `1e308*10` → `st=-1 d=inf`; `ACOS(2)` → `st=-1 d=nan`; `1/0` → `st=-1 d=0`
 //! (nothing written).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

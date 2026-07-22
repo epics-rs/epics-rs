@@ -15,6 +15,8 @@
 //! keep the current behavior: return `Err` and process NOTHING, matching C
 //! `dbPutField` (dbAccess.c:1263 processes only when `dbPut` status==0).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

@@ -17,6 +17,8 @@
 //! IVOA=Set_output_to_IVOV. Severity is the framework's — the record may not
 //! re-derive it from a private flag.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

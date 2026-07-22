@@ -11,6 +11,8 @@
 //! chain went async. A fully synchronous chain drains the wait-set inside
 //! processing and returns `Ok(None)`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;

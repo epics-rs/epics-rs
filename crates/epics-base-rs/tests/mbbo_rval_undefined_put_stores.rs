@@ -24,6 +24,8 @@
 //! unconditionally and clobbered RVAL to 0; opting mbbo into the framework's
 //! undefined-skip mirrors C's `goto CONTINUE`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::mbbo::MbboRecord;

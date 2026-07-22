@@ -9,6 +9,8 @@
 //!   - modules/database/test/ioc/db/dbDbLinkTest.c
 //!   - modules/database/test/ioc/db/dbPutGetTest.c
 
+// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::record::FieldDeclaration;

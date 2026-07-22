@@ -85,6 +85,8 @@
 //!   [`MemUsage::total`](epics_rtems_boot::stats::MemUsage::total), arithmetic
 //!   on the two numbers the kernel actually reported.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;

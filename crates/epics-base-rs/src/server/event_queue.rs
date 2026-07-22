@@ -77,6 +77,8 @@
 //!   its last delivery (pre-existing deliberate deviation, 446e0d4a); the
 //!   surviving *value* is C's.
 
+// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Mutex;

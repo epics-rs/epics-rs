@@ -18,6 +18,8 @@
 //! as the swait/scalcout ODLY tests do) so the assertions are deterministic and
 //! do not race the real timer (`SDLY = 100s` makes it unfireable here).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

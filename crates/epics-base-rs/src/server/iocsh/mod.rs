@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 mod access_commands;
 mod commands;
 mod core_commands;

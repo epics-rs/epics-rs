@@ -26,6 +26,8 @@
 //! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving the same
 //! record definitions over CA.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

@@ -15,6 +15,8 @@
 //! (link path), On-Change hash across successive scalar updates, and the OUT
 //! target's received type.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

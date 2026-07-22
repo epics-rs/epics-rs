@@ -36,6 +36,8 @@
 //! HG.MDEL  DBF_SHORT      HG.MCNT  DBF_SHORT
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue};

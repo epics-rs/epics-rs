@@ -83,6 +83,12 @@ libc = "0.2"
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and three copies of a
+# 300-line audit is how three copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
 tempfile = "3"
 serial_test = "3"

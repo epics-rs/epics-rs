@@ -16,6 +16,8 @@
 //! model the field at all, so a caget fell through to that same `.dbd` initial),
 //! and neither refused the seed. This drives the whole path through the loader.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;

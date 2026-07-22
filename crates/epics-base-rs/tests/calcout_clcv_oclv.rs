@@ -11,6 +11,8 @@
 //!
 //! Fields are DBF_LONG (calcoutRecord.dbd.pod:729,1049; sCalcoutRecord.dbd:75,438).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;

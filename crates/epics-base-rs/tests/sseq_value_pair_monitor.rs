@@ -25,6 +25,8 @@
 //! with `DBE_VALUE|DBE_LOG`, unconditionally — an archiver on `STR1` logged a
 //! sample on every `caput DO1` that changed nothing.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 

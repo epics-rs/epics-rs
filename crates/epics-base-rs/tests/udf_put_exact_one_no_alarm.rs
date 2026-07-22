@@ -14,6 +14,8 @@
 //! `rec_gbl_check_udf` tested `udf != 0` (truthy) for every record. Verified
 //! against the C source (not the running oracle) per the panel's constraints.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::bo::BoRecord;

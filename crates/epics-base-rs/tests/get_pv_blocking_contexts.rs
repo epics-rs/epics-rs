@@ -15,6 +15,8 @@
 //!   database lock we are about to await. The old code called `block_in_place`,
 //!   which panics there.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;

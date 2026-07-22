@@ -31,6 +31,8 @@
 //!   - sCalcout/aCalcout NON-numeric inputs, which C's `fieldIndex <= INPL`
 //!     guard excludes -> no re-seed
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;

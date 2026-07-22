@@ -21,6 +21,8 @@
 //! UDF -1/255` → C=-1, port=1); this is verified against the C source, not the
 //! running oracle, per the panel's constraints.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ProcessCompletion;

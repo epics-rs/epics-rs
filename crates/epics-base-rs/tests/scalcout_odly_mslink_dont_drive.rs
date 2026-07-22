@@ -18,6 +18,8 @@
 //! severity is NOT lost, and neutralizing the gate drives the target to OVAL,
 //! proving the suppression is the gate's doing.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

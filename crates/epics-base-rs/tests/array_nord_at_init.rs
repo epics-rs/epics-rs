@@ -41,6 +41,8 @@
 //! (NELM == 1 / NELM > 1) — the two axes that decide which of the three rules
 //! above is the one that answers.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;

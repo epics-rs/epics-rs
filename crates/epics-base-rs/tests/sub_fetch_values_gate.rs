@@ -27,6 +27,8 @@
 //!
 //! `aSubRecord.c` (fetch 277-289, process 216-218) has the identical shape.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

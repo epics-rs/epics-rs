@@ -31,6 +31,8 @@
 //! non-calc initial, to show the rule is the loader's and not a calc special
 //! case.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 

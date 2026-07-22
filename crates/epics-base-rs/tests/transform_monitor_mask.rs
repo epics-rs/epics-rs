@@ -25,6 +25,8 @@
 //! folded in by `dbGetLink`), so the same cycle both moves A and raises the
 //! severity.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

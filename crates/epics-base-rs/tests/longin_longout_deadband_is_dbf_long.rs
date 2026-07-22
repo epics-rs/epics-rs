@@ -15,6 +15,8 @@
 //! boundary is RANGE, not fractionality — `strtol` trailing-text tolerance keeps
 //! `"5volts"` -> `5`. Mirrors the int64in/int64out Cause B fix (commit 224d5ad5).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::longin::LonginRecord;

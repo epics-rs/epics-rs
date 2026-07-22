@@ -35,6 +35,8 @@
 //! in `menu_common_field_scan_pini.rs`. `caput` sends a numeric put for an enum
 //! channel whose text matches no choice, which is the row measured above.)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::ScanType;
 use epics_base_rs::types::EpicsValue;

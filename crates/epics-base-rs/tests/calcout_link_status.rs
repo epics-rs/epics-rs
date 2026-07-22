@@ -19,6 +19,8 @@
 //!     holds its `CON` default until the first process re-points it through
 //!     `check_alarms`.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 

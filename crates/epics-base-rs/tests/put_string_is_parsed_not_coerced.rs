@@ -46,6 +46,8 @@
 //! The cases are the invariant BOUNDARIES of the row — at-limit, just-over,
 //! just-under, unparseable, empty — not a narrative.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;

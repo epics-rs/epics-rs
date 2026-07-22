@@ -41,6 +41,8 @@
 //! `TSEL`/`SDIS`/`FLNK` — while a real DB link and an empty link still
 //! round-trip verbatim.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;

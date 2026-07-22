@@ -15,6 +15,8 @@
 //! hysteresis band on the way back down (which is what LALM is for); and the
 //! IVOA gate the C ordering exists to feed.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

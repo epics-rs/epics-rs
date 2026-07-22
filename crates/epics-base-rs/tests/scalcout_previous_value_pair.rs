@@ -15,6 +15,8 @@
 //! the previous cycle's result only when nothing wrote VAL in between — and a
 //! `prev_sval` that nothing read.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

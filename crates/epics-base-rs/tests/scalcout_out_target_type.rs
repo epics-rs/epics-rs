@@ -19,6 +19,8 @@
 //! tests in `records::scalcout`. This file proves the framework owner feeds it
 //! the real target metadata end to end.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

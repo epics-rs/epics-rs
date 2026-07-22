@@ -23,6 +23,8 @@
 //! Boundaries: constant array INP vs unset INP vs real DB INP; before-first-
 //! process vs after; NORD and UDF on each.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

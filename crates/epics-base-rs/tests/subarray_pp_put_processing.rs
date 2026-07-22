@@ -11,6 +11,8 @@
 //! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving these exact
 //! records over CA.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 

@@ -26,6 +26,8 @@
 //! The full link-shape table is `tests/array_nord_at_init.rs`; this file keeps
 //! the NELM boundary (NELM==1 vs NELM>1) per kind, with no record processed.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;

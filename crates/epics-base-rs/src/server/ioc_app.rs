@@ -22,6 +22,8 @@
 //!     .await
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

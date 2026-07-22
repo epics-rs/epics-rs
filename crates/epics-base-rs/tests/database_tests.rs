@@ -1,4 +1,6 @@
 #![allow(unused_imports, clippy::all)]
+// RTEMS-EXEC-MODEL-ALLOW(212): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

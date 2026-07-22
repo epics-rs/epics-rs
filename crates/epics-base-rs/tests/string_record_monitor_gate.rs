@@ -39,6 +39,8 @@
 //! C compares strings, never a `to_f64()` deadband. The port emitted one VAL
 //! event per subscriber per cycle for all three.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;

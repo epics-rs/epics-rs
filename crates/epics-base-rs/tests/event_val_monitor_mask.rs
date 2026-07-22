@@ -18,6 +18,8 @@
 //! The port gave VAL the framework default `DBE_VALUE | DBE_LOG`, so a
 //! `DBE_LOG`-only archiver was sent the event name on every process.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

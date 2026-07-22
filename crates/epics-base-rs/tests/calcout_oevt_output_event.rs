@@ -14,6 +14,8 @@
 //! because the OUT write and its event are both suppressed (C execOutput
 //! `nsev >= INVALID` → `break`, no `postEvent`).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

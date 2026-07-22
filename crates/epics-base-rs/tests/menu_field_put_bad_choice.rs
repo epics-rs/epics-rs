@@ -20,6 +20,8 @@
 //! string became `to_f64().unwrap_or(0.0) as u16`, i.e. **menu index 0**. So
 //! `caput FAN.SELM Bogus` silently selected `All`.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::fanout::FanoutRecord;

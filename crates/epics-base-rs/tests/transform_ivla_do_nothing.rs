@@ -21,6 +21,8 @@
 //! Before the fix the port used IVLA only as a per-channel calc-error policy,
 //! so this cycle recomputed CLCB and drove OUTB.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

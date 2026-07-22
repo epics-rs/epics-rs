@@ -22,6 +22,8 @@
 //! `recGblResetAlarms` does. That is what makes an `MS` consumer inherit
 //! INVALID from a source that has not processed yet.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};

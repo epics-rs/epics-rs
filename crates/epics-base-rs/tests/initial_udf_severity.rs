@@ -27,6 +27,8 @@
 //! consumer inherited NOTHING from a not-yet-processed source — the IOC-startup
 //! ordering case MS exists for.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 

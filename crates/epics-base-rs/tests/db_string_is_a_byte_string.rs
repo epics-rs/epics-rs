@@ -20,6 +20,8 @@
 //!     dbgf X1.VAL -> "h\xffz"     stored: h, 0xFF, z   (3 bytes)
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

@@ -7,6 +7,8 @@
 //! the Rust udf was VAL-based only (`value_is_undefined` default), so OCAL→NaN
 //! drove NaN to the OUT link with NO_ALARM — a silent-wrong-value divergence.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

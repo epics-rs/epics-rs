@@ -14,6 +14,8 @@
 //! `can_device_write()`, so a "not INVALID" assertion alone would pass even
 //! when nothing is printed.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};

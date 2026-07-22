@@ -44,6 +44,8 @@
 //! runs the IOC anyway, leaving the record with a link that never reads or
 //! writes. The port refuses the load — the dead link is the illegal state.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

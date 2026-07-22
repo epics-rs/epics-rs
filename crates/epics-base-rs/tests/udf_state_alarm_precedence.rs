@@ -19,6 +19,8 @@
 //! after), so the equal-severity UDF could not displace STATE and STAT came out
 //! STATE. Verified against the C source, not the running oracle.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::bo::BoRecord;

@@ -8,6 +8,8 @@
 //! put_accepted C=true, port=false, 6 put classes). The fix makes the declared
 //! `DBF_STRING` type win over the name-based menu.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 

@@ -40,6 +40,8 @@
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

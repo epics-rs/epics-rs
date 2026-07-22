@@ -13,6 +13,8 @@
 //! Boundaries: Never vs Every Time (the OUT target moves / does not move), and
 //! the unnamed-index catch-all.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

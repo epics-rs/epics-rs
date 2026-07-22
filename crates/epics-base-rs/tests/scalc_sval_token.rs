@@ -24,6 +24,8 @@
 //! which takes no `psresult`, and the numeric `postfix()` element table has no
 //! SVAL token — so neither C nor the port has an SVAL in swait.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::calc::{

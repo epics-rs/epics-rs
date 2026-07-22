@@ -27,6 +27,8 @@
 //! epoch. ao/bo/longout stamp UNCONDITIONALLY in their `if (!pact)` block, so
 //! they are NOT in this family and must keep stamping while undefined.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::runtime::general_time::epics_epoch;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;

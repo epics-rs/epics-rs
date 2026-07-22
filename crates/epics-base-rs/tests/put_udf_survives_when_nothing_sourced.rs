@@ -20,6 +20,8 @@
 //! record type, so a UDF-put-driven cycle on stringin/lsi/aSub clobbered the
 //! client's `UDF=1` back to 0.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

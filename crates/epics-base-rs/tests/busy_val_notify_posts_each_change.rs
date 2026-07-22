@@ -15,6 +15,8 @@
 //! posted only the first event (VAL=1 "Busy") instead of C's three
 //! (Busy → Illegal_Value(2) → Illegal_Value(3)).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;

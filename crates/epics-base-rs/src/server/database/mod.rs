@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
+
 use std::future::Future;
 
 pub mod db_access;

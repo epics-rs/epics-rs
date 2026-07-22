@@ -19,6 +19,8 @@
 //! `std::env::set_var` is race-free here: nextest runs each `#[test]` in its own
 //! process, so the variable set below is private to this test's process.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

@@ -22,6 +22,8 @@
 //! array this cycle", which is what an aCalcout-driven waveform client waits on;
 //! a second identical process must therefore not go silent.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -22,6 +22,8 @@
 //! Pre-fix the port enforced `read_only` only on the CA route, so the OUT link
 //! truncated NELM (and the data with it) and the writer stayed NO_ALARM.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;

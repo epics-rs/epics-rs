@@ -26,6 +26,8 @@
 //! record(ai,"R4"){field(SIML,"SRC0")}    (no MS)                  -> NO_ALARM
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

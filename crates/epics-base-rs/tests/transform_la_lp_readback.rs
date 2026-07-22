@@ -26,6 +26,8 @@
 //! window between cycles — which is exactly what a `caget .LA` is for. The port
 //! did not serve the fields at all: `caget TR.LA` failed.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -8,6 +8,8 @@
 //!
 //! Mirrors the data carried by pvxs `IfaceMap::Current` (src/iface.cpp).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -25,6 +25,8 @@
 //! records over CA. Its loader rejects the INP form with
 //! `ERROR: histogram record 'H:INP' doesn't have a field 'INP'`.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;

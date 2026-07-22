@@ -20,6 +20,8 @@
 //! `field(SSCN,"65535")` — menuScan's out-of-range "use SCAN" sentinel — load
 //! from a `.db` while `caput REC.SSCN 65535` is refused at runtime.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{RecordInstance, ScanType, SimModeScan};

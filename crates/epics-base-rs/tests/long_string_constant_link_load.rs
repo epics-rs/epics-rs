@@ -31,6 +31,8 @@
 //! record(lsi,"L4"){field(INP,"5")}                 VAL ""          LEN 1  UDF 0
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use crate::error::{CaError, CaResult};

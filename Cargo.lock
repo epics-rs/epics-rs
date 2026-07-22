@@ -1006,6 +1006,7 @@ dependencies = [
  "if-addrs",
  "libc",
  "parking_lot",
+ "rtems-exec-gate",
  "rustyline",
  "serde_json",
  "serial_test",

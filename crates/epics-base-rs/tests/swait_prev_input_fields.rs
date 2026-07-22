@@ -17,6 +17,8 @@
 //! LA, both with `monitor_mask | DBE_VALUE` — the mask R9-72 gave A. The port
 //! had no LA..LL fields at all.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -15,6 +15,8 @@
 //! on DOLV; see `r9_76_dol_fetch_does_not_wait_for_the_classification_task` for
 //! why gating on it would be wrong.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -12,6 +12,8 @@
 //! compress with N=4, fed one sample per cycle, must fire its FLNK exactly
 //! once over four cycles — on the 4th, when the average is emitted.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

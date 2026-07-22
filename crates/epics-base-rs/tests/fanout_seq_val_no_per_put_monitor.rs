@@ -30,6 +30,8 @@
 //! (the in-process subscribe seam emits no connect snapshot, so every event
 //! here would be an over-post) while VAL still stores the last put.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;

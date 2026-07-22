@@ -28,6 +28,8 @@
 //! any path where that completion is not delivered, a step waiting forever on a
 //! put that was never made.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 

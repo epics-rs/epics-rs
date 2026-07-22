@@ -27,6 +27,8 @@
 //! catch-all `_ => clear_histogram(); cmd = 0`, so an over-max CMD read back as
 //! 0/"Read" — the divergence this test pins.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::types::EpicsValue;

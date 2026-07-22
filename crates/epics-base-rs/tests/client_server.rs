@@ -15,6 +15,8 @@
 //! in independently).
 #![cfg(feature = "ca-server-tls-test")]
 
+// RTEMS-EXEC-MODEL-ALLOW(10): not built by default - this file is behind the `ca-server-tls-test` feature.
+
 use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Duration;

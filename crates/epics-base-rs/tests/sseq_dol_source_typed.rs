@@ -17,6 +17,8 @@
 //! One test per boundary of that switch, plus the failed-store path the read
 //! owner used to discard silently.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 

@@ -64,6 +64,8 @@
 //! exactly as `dbScanLock` is a layer above the record's own field
 //! storage.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

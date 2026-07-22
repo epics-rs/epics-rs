@@ -28,6 +28,8 @@
 //! (`dbAccess.c:1263-1264`) processes only when `dbPut` returned 0, so the
 //! fire-and-forget path does NOT process a rejected put. The port mirrors both.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

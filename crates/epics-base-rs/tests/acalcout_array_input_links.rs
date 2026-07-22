@@ -15,6 +15,8 @@
 //!     destination: `dbGetLink(..., DBR_DOUBLE, pvalue, 0, 0)`)
 //!   * scalar source -> scalar field, unchanged (negative control)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

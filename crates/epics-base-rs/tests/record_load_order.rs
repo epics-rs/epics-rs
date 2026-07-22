@@ -15,6 +15,8 @@
 //! two different orders — one boot succeeding, the next failing with "opcuaItem
 //! record ... is not loaded yet".
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

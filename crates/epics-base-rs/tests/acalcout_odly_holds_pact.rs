@@ -14,6 +14,8 @@
 //! carries a `ReprocessAfter`) — so a foreign `dbProcess` during the delay
 //! bails at the PACT entry guard instead of firing the deferred OUT early.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

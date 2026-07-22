@@ -13,6 +13,8 @@
 //! `write_out_link_value`'s single-raise invariant. SIOL now goes through the
 //! put owner like every other OUT link.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

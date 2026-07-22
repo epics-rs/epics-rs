@@ -15,6 +15,8 @@
 //! `LNK0..LNKF` are `DBF_FWDLINK` (`dbScanFwdLink`), driving no value and
 //! raising no put alarm.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

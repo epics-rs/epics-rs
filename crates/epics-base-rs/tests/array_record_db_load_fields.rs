@@ -16,6 +16,8 @@
 //! framework's async-simulation delay (`processing.rs` reads it through
 //! `get_field("SDLY")`, defaulting an absent field to -1.0 = synchronous).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;

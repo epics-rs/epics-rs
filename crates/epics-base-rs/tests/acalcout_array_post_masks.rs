@@ -32,6 +32,8 @@
 //! DBE_LOG`: one event instead of two, and the AMASK event carrying an alarm bit
 //! C never puts on it.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

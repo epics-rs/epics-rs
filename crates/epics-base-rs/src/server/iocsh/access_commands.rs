@@ -11,6 +11,8 @@
 //! activated by `asInit`. The C flow is identical: `asSetFilename`
 //! has "no immediate effect", `asInit` does the (re)load.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Mutex;
 
 use super::registry::*;

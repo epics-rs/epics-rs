@@ -23,6 +23,8 @@
 //! process path, where C erases the alarm; recorded as a CBUG-F12 allowlist
 //! row.)
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;

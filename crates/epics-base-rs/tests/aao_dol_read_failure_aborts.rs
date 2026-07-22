@@ -31,6 +31,8 @@
 //! Boundaries: dead DOL vs live DOL; OUT target written / not written; FLNK
 //! fired / not fired; pending alarm vs committed alarm.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

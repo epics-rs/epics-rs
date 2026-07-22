@@ -14,6 +14,8 @@
 //! disconnected INPx source re-drove its OUTx with the last good value where C
 //! drives 0.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

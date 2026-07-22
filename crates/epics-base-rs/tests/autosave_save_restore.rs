@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::PvString;
 

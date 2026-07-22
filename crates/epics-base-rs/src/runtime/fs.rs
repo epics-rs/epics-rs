@@ -35,6 +35,8 @@
 //! interleave between the steps; the same sequence in one closure makes one
 //! hop and keeps the durability ordering where a reader can see it.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::io;
 use std::path::{Path, PathBuf};
 

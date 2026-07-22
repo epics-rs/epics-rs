@@ -28,6 +28,8 @@
 //! folded a record's OWN committed severity back into its pending alarm, which
 //! `recGblResetAlarms` then re-committed: a self-sustaining latch.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 

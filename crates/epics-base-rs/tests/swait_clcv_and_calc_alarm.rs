@@ -22,6 +22,8 @@
 //! per-cycle fact cannot outlive its cycle: a gated or simulated cycle, which
 //! runs no `calcPerform`, raises nothing.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -17,6 +17,8 @@
 //! a record type that does not declare the field, so a record driving its own
 //! link is not driven twice per cycle).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

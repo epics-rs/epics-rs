@@ -24,6 +24,8 @@
 //! vs after a client put (sseq `SELL`), a constant with no init seed at all
 //! (compress `INP`), and the real-link owner path that must keep delivering.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

@@ -25,6 +25,8 @@
 //! `NotSimulated` before SIMM was even read whenever SIML and SIOL were both
 //! empty, so the idiom was a complete no-op on every record type.
 
+// RTEMS-EXEC-MODEL-ALLOW(15): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

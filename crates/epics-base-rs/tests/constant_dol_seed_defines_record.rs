@@ -26,6 +26,8 @@
 //! record(stringout,"SO3"){field(DOL,"1.50")} VAL="1.50"  UDF=0
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;

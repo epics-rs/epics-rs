@@ -12,6 +12,8 @@
 //! bodies: `put_pv` (`dbPutLink` route, via `put_pv_already_locked`)
 //! and `put_pv_and_post` (gateway/sequencer route).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

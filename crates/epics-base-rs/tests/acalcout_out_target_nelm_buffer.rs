@@ -24,6 +24,8 @@
 //! - external target, metadata count > 1    → array buffer
 //! - external target, no metadata (C failed dbCaGetNelements) → scalar
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 

@@ -24,6 +24,8 @@
 //! post fires on any class, and the alarm bits alone are a class, so a
 //! transform that went INVALID was firing a `.VAL` monitor C never sends.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

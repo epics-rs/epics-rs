@@ -31,6 +31,8 @@
 //! single owner in `process_record_with_links_inner`, and every output path
 //! (OUT, SIOL, the generic multi-output pairs, dfanout's push) consumes it.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

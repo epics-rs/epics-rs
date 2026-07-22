@@ -32,6 +32,8 @@
 //! record(ai,"A1"){}   (a type that DOES clear)               UDF 0  NO_ALARM NO_ALARM
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

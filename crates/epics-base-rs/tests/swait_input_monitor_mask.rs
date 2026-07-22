@@ -22,6 +22,8 @@
 //! a field posts that field `DBE_VALUE | DBE_LOG` on its own, which is a
 //! different post from `monitor()`'s.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

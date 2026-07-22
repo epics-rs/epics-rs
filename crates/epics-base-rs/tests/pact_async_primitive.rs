@@ -8,6 +8,8 @@
 //! `modules/database/src/ioc/db/callback.c` (delayed re-entry) and
 //! `dbNotify.c` (put-notify wait-set / completion).
 
+// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;

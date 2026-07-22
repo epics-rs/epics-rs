@@ -26,6 +26,8 @@
 //! drains the in-flight set before finishing.
 #![allow(clippy::all)]
 
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};

@@ -10,6 +10,8 @@
 //! spurious OVAL monitor on a non-output cycle (D3). The fix gates the OVAL
 //! write on the record's `cached_should_output`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

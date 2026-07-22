@@ -3,6 +3,8 @@
 //! event-record routing, and UDF-on-NaN.
 #![allow(clippy::all)]
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

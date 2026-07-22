@@ -18,6 +18,8 @@
 //! and `DTYP` fell through to the numeric arm and received OVAL. The class is
 //! now settled at target resolution (`OutTarget::puts_as_string`).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

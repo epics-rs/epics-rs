@@ -20,6 +20,8 @@
 //! Boundaries: constant array DOL vs constant scalar DOL vs real link DOL; and
 //! closed_loop vs supervisory (C returns before the load in supervisory).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

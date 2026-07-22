@@ -19,6 +19,8 @@
 //! backoff is a different policy with different semantics. This
 //! module is exclusively for the sliding-window pattern.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::time::{Duration, Instant};
 
 /// Policy: at most `max_restarts` attempts inside `window`,

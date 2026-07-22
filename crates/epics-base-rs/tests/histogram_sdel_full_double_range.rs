@@ -15,6 +15,8 @@
 //! arms, behaviourally identical to C's never-firing callback), so the store
 //! itself is accepted across the whole double range.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::histogram::HistogramRecord;

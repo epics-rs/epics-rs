@@ -19,6 +19,8 @@
 //! and `monitor_always_post = (true, false)`, encoding "value class always,
 //! archive class never".
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;

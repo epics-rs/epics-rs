@@ -19,6 +19,8 @@
 //! `udp_collector.cpp:561-567` (forward send), `evhelper.cpp:519-585`
 //! (mcast option setters).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 

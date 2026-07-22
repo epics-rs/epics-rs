@@ -9,6 +9,8 @@
 //! merely that processing leaves the records un-alarmed — a no-alarm-only test
 //! would pass even if the device never ran.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

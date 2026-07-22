@@ -15,6 +15,8 @@
 //! generalization of the swait PACT fix; motor's notify carries no
 //! `ReprocessAfter` and so is untouched.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

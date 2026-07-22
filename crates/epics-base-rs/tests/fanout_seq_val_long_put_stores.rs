@@ -15,6 +15,8 @@
 //! `c_parse::put_string` Long row, which stores the value and range-checks it
 //! exactly as C's `epicsParseInt32` does.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::fanout::FanoutRecord;

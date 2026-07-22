@@ -26,6 +26,8 @@
 //! Boundaries: SIOL read failed vs succeeded; UDF set vs UDF alarm raised; the
 //! three unconditional kinds vs subArray.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

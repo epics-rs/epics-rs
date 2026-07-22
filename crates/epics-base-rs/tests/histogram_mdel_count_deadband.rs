@@ -31,6 +31,8 @@
 //! MCNT:      0   2   0   2      <- zeroed by the post on cycle 4
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

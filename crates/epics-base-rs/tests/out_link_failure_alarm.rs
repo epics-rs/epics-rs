@@ -16,6 +16,8 @@
 //! boundary of the put owner: local DB target, external `ca://` target, SIOL
 //! simulated output, and the recovery cycle.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 

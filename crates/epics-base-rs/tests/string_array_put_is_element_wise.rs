@@ -37,6 +37,8 @@
 //! caput -a WD 3 1.5 2.5 3.5 -> WD = 1.5 2.5 3.5 NORD = 3
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};

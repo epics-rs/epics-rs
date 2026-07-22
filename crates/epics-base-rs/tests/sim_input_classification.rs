@@ -7,6 +7,8 @@
 //! wrote VAL OUT to SIOL (direction inverted, simulation defeated). These tests
 //! pin the corrected input direction.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

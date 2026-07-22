@@ -19,6 +19,8 @@
 //! Ground truth captured live from softIoc 7.0.10.1-DEV on this host
 //! (`caput -c`, one fresh `record(mbboDirect,"X"){}` per case).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

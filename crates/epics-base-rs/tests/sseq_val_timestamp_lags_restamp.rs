@@ -22,6 +22,8 @@
 //! "now" instead of the pre-update time the differential oracle observed from
 //! C's QSRV2 monitor.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;

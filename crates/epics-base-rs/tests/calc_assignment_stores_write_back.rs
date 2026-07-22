@@ -21,6 +21,8 @@
 //! accumulates across cycles; it is visible to the second pass of the same
 //! cycle (calcout CALC → OCAL, transform channel → channel).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;

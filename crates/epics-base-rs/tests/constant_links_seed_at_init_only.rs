@@ -20,6 +20,8 @@
 //! Pre-fix the port re-applied the constant on every process, so the caput was
 //! destroyed on the next scan and A read 0 before the first process.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::printf::PrintfRecord;

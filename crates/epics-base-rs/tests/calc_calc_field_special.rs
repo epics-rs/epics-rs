@@ -10,6 +10,8 @@
 //! return `Ok(())` — the client saw a successful write and the record silently
 //! kept an uncompilable expression.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;

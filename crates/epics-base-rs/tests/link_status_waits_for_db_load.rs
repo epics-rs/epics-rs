@@ -27,6 +27,8 @@
 //! DBF_STRING:         "Local PV"
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::time::Duration;
 

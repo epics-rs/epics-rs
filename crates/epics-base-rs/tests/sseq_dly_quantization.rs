@@ -25,6 +25,8 @@
 //! `epicsThreadSleepQuantum()` is `1/sysconf(_SC_CLK_TCK)` = 0.01 s on Linux
 //! and macOS, and `NINT(f) = (long)(f > 0 ? f+0.5 : f-0.5)` (sseqRecord.c:67).
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::runtime::time::thread_sleep_quantum;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::sseq::SseqRecord;

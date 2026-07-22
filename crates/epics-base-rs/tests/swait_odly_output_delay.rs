@@ -19,6 +19,8 @@
 //! scalcout ODLY test does) so the assertion is deterministic and does not race
 //! the real timer (ODLY=100s makes the timer unfireable here).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

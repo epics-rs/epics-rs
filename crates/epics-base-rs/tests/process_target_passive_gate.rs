@@ -26,6 +26,8 @@
 //! epics> dbgf ASY.PUTF      DBF_UCHAR: 0
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;

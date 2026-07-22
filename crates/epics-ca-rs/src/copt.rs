@@ -27,7 +27,7 @@
 //!
 //! [`CTool::get_matches`] therefore REFUSES to run a command whose options
 //! are not all declared `ArgAction::Append` (value options) or
-//! `ArgAction::Count` (flags) — see [`assert_repeatable`]. The check fires on
+//! `ArgAction::Count` (flags) — see `assert_repeatable`. The check fires on
 //! every invocation, so a newly declared option cannot silently re-open the
 //! family; and the resolvers here take the whole occurrence list, so
 //! "last wins" is the only shape a caller can express.
@@ -52,7 +52,7 @@
 //! — the single owner of the loop's exit — replays them in that position order
 //! and only up to the first terminal option, then performs it. `-h` and `-V`
 //! are therefore ORDINARY repeatable options in every tool's spec
-//! ([`assert_repeatable`] now rejects clap's Help/Version actions outright), and
+//! (`assert_repeatable` now rejects clap's Help/Version actions outright), and
 //! no resolver may write to stderr directly.
 //!
 //! The loop's THIRD exit is the getopt error — `case '?'` / `case ':'` — and it
@@ -803,14 +803,14 @@ impl CTool {
     /// clap's exit 2.
     ///
     /// clap TERMINATES nothing here. `-h`/`-V` are ordinary options
-    /// ([`assert_repeatable`] rejects the Help/Version actions) and a usage
+    /// (`assert_repeatable` rejects the Help/Version actions) and a usage
     /// error is held in the returned [`Parsed`]; both are performed by
     /// [`Scan::finish`] at their place in the getopt order, so the warnings C
     /// prints ahead of them survive (R13-26, R14-18).
     ///
     /// This is the only entry point the binaries use, so a new option cannot
     /// re-introduce an exit-2 path by being declared through the derive — nor
-    /// a non-repeatable option, which [`assert_repeatable`] rejects here.
+    /// a non-repeatable option, which `assert_repeatable` rejects here.
     pub fn get_matches(self, cmd: clap::Command) -> Parsed {
         self.get_matches_from(cmd, std::env::args_os())
     }

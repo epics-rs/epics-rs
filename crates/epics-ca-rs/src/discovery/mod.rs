@@ -57,7 +57,7 @@ pub const CA_SERVICE_TYPE: &str = "_epics-ca._tcp";
 
 /// Trait every discovery backend implements. The CA client polls
 /// `discover()` once at startup; long-lived backends can also feed
-/// updates via [`subscribe`].
+/// updates via [`Backend::subscribe`].
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
     /// Return all IOCs currently known to this backend. Called once

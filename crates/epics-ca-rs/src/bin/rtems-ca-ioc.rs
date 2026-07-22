@@ -14,12 +14,12 @@
 //!    completion (put-callback tails, ODLY re-processing) runs on those std
 //!    threads rather than on a tokio runtime.
 //! 2. **Database** — a small in-process database built through the ordinary
-//!    [`IocBuilder`], driven to completion with
+//!    [`epics_base_rs::server::ioc_builder::IocBuilder`], driven to completion with
 //!    [`block_on_sync`](epics_base_rs::runtime::task::block_on_sync). On a
 //!    plain thread with no runtime entered that selects `park_on`: the thread
 //!    polls the build future and parks between polls. `build()` awaits only
 //!    runtime-agnostic in-process locks, so nothing here needs a reactor.
-//! 3. **CA front-end** — [`BlockingCaServer`]: the TCP accept loop (C
+//! 3. **CA front-end** — [`epics_ca_rs::server::blocking::BlockingCaServer`]: the TCP accept loop (C
 //!    `CAS-TCP`, `caservertask.c:62`) and the UDP name-search responder (C
 //!    `CAS-UDP`, `cast_server.c:113`), each on its own `std::thread`, with one
 //!    blocking thread per accepted client (C `camsgtask`).

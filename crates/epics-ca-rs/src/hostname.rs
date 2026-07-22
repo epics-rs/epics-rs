@@ -16,7 +16,7 @@
 //!   connected `cainfo`; must never run on a task that other channels'
 //!   progress depends on, since an IP with no PTR record stalls for the
 //!   resolver's full timeout.
-//! * [`cached_name`] is libca's `hostNameCache` + the process-wide
+//! * `cached_name` is libca's `hostNameCache` + the process-wide
 //!   `ipAddrToAsciiEngine` singleton (`hostNameCache.cpp`,
 //!   `ipAddrToAsciiEngine.cpp`) — it NEVER blocks: it answers from the cache,
 //!   and on a miss it answers with the dotted IP and resolves in the

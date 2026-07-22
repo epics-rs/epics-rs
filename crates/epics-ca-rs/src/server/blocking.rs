@@ -4,7 +4,7 @@
 //! mirrors C `rsrv`'s I/O model — one blocking OS thread per accepted TCP
 //! client (C `camsgtask`, `camsgtask.c:41`), reading with a blocking `recv`
 //! (`camsgtask.c:71`) and writing every reply on that same thread — instead
-//! of the async `tokio` reactor that [`crate::server::tcp::handle_client`]
+//! of the async `tokio` reactor that `crate::server::tcp::handle_client`
 //! uses. It exists so the CA server can run on RTEMS, where `tokio`'s I/O
 //! reactor (`mio`) does not build, over plain `std::net` blocking BSD sockets
 //! (which DO build for `armv7-rtems-eabihf`, and work on hosted Unix too — so
@@ -13,7 +13,7 @@
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
 //! the analogue of C's `CAS-UDP` thread (`cast_server`, `cast_server.c:113`):
 //! a blocking `std::net::UdpSocket` `recv_from` loop that drives the shared
-//! [`crate::server::udp::parse_search_datagram`] decode on the thread (again
+//! `crate::server::udp::parse_search_datagram` decode on the thread (again
 //! via [`block_on_sync`] / `park_on`) and `sendto`s the reply, so a SEARCH
 //! reply is byte-identical to the async responder. The socket is bound with
 //! raw `libc` ([`bind_udp_search`]) so its `SO_REUSEADDR`/`SO_REUSEPORT`
@@ -24,7 +24,7 @@
 //! # What it reuses
 //!
 //! The wire logic is NOT reimplemented. This driver constructs the shared
-//! [`ClientState`] and drives the shared [`dispatch_message`] — the exact
+//! `ClientState` and drives the shared `dispatch_message` — the exact
 //! per-command handlers the async server runs — to completion on the client
 //! thread via [`block_on_sync`]. With no async runtime entered on this
 //! thread, `block_on_sync` selects `park_on`: it polls the handler future and
@@ -41,7 +41,7 @@
 //! `camsgtask` command thread and the `CAS-event` monitor thread
 //! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<Arc<TcpStream>>>` write
 //! handle. Both writers now exist (S1c): the client thread draining command
-//! replies AND the per-client event thread ([`run_event_task`]) writing
+//! replies AND the per-client event thread (`run_event_task`) writing
 //! monitor updates lock this same mutex, so the two never interleave a frame.
 //!
 //! # Scope and what is deferred
@@ -50,25 +50,25 @@
 //! create/clear), MONITORS (S1c part a), and — as of S1c part (b) — WRITE /
 //! WRITE_NOTIFY. EVENT_ADD / EVENT_CANCEL are served by dedicated branches
 //! (ahead of the allowlist) that share the async server's
-//! [`register_subscription`] / `send_event` parity logic and hand each
+//! `register_subscription` / `send_event` parity logic and hand each
 //! subscription's live reader to a second per-client event thread
-//! ([`run_event_task`], the C `dbEvent` `event_task` analogue) instead of
+//! (`run_event_task`, the C `dbEvent` `event_task` analogue) instead of
 //! spawning a task per subscription. EVENTS_ON / EVENTS_OFF flow-control the
 //! shared `EventUser` the event thread's readers consult, so gating matches the
 //! async server.
 //!
-//! WRITE / WRITE_NOTIFY (S1c part b) run the shared [`serve_write_head`] — the
+//! WRITE / WRITE_NOTIFY (S1c part b) run the shared `serve_write_head` — the
 //! SAME SID/type/access gates, payload convert, DB write, trap-write bracket,
 //! and sync/error replies the async server runs (one copy) — driven to the
 //! synchronous head on THIS thread via `park_on`. C `camsgtask` never blocks on
 //! the async put-callback (`dbNotify.c` callDone fires later on a background
 //! thread), so when a record's process cycle goes async the head returns the
 //! completion receiver and the dispatch thread hands it to the event thread
-//! ([`EventTaskControl::WriteComplete`]); the event thread awaits it in its
+//! (`EventTaskControl::WriteComplete`); the event thread awaits it in its
 //! `select` and writes the deferred WRITE_NOTIFY reply under the SAME send lock,
 //! so the dispatch thread stays responsive and there is ONE owner of async
 //! socket writes. A plain fire-and-forget WRITE is always synchronous (no reply).
-//! [`command_drives_without_spawn`] stays a *fail-closed* allowlist for
+//! `command_drives_without_spawn` stays a *fail-closed* allowlist for
 //! everything not handled by a dedicated branch.
 //!
 //! Not yet mirrored for WRITE_NOTIFY on the blocking driver: the async server's
@@ -372,7 +372,7 @@ impl BlockingCaServer {
     /// [`shutdown`](Self::shutdown) is requested. Blocks; run it on its own
     /// `std::thread` (a real IOC runs it alongside [`serve`](Self::serve)).
     /// Analogue of the C `CAS-UDP` thread (`cast_server`, `cast_server.c:113`).
-    /// Bind `socket` with [`bind_udp_search`](Self::bind_udp_search).
+    /// Bind `socket` with [`bind_udp_search`].
     ///
     /// Scope: name-search reply only. No beacons, no multicast /
     /// broadcast-secondary socket. Same-source FIONREAD coalescing IS applied

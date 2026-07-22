@@ -124,7 +124,7 @@ pub(super) fn apply_long_string_mode(
 
 /// Run an IOC with the Channel Access protocol.
 ///
-/// This is the standard protocol runner for [`IocApplication::run`].
+/// This is the standard protocol runner for [`epics_base_rs::server::ioc_app::IocApplication::run`].
 /// It creates a [`CaServer`] from the provided configuration and
 /// starts the CA server with an interactive iocsh shell.
 ///

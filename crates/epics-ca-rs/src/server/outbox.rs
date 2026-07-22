@@ -16,7 +16,7 @@
 //! construction*: the raw socket writer becomes private to ONE owner, the
 //! connection loop. Every emit site — request→reply handlers, the monitor
 //! producers, put-notify completion — instead PUSHES a fully-framed
-//! `Vec<u8>` into the [`Outbox`]. The connection loop is the sole draining
+//! `Vec<u8>` into the `Outbox`. The connection loop is the sole draining
 //! owner: it pulls framed bytes in arrival order and is the only code that
 //! ever touches the socket.
 //!
@@ -28,10 +28,10 @@
 //!
 //! - MUST: the socket writer is owned by exactly one task (the connection
 //!   loop) and no other code writes the socket directly.
-//! - Every producer holds only an [`Outbox`] handle and can do nothing but
+//! - Every producer holds only an `Outbox` handle and can do nothing but
 //!   `push` a complete frame; it cannot observe or mutate the socket.
 //!
-//! A frame handed to [`Outbox::push`] MUST be a complete, independently
+//! A frame handed to `Outbox::push` MUST be a complete, independently
 //! valid CA wire message (header + padded payload). The drain concatenates
 //! frames back-to-back into the socket buffer, so a partial frame would
 //! mis-align every following message. All server senders already build one

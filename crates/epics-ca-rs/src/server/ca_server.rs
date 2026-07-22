@@ -509,7 +509,7 @@ impl CaServer {
     }
 
     /// Construct a CaServer from pre-populated parts.
-    /// Used by [`ioc_app::IocApplication`] after st.cmd execution and
+    /// Used by [`epics_base_rs::server::ioc_app::IocApplication`] after st.cmd execution and
     /// device support wiring. `tcp_port` carries the optional split-port
     /// TCP override (`EPICS_CAS_SERVER_PORT`); pass `None` to share the
     /// UDP discovery port with the TCP listener.
@@ -763,7 +763,7 @@ impl CaServer {
     }
 
     /// Subscribe to connection lifecycle events. Returns a broadcast
-    /// receiver that receives [`ServerConnectionEvent::Connected`] /
+    /// receiver that receives [`crate::server::tcp::ServerConnectionEvent::Connected`] /
     /// `Disconnected` for each accepted client.
     ///
     /// Idempotent: calling multiple times shares the same broadcast sender.

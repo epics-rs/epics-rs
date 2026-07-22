@@ -35,11 +35,20 @@ use epics_base_rs::error::CaResult;
 /// every other client of the server flag `ShortPeriod` beacon anomalies (R6-30,
 /// pinned by `tests/beacon_ramp_connect.rs`).
 ///
-/// `signer` is an opt-in Ed25519 [`signed_beacon::SignedBeaconEmitter`]
-/// that emits a companion datagram immediately after each beacon so
-/// clients with a configured keyring can authenticate the server
-/// identity. C clients ignore the companion (unknown command); the
-/// regular beacon stream is unchanged.
+// The `signer` paragraph is gated on the same feature as the parameter it
+// describes. Without `cap-tokens` there is no `signer` argument, so an
+// ungated paragraph documented an argument the built function does not have
+// — and its link to the equally gated `SignedBeaconEmitter` was the crate's
+// last unresolved intra-doc link on a default-feature build.
+#[cfg_attr(
+    feature = "cap-tokens",
+    doc = "",
+    doc = "`signer` is an opt-in Ed25519 [`crate::server::signed_beacon::SignedBeaconEmitter`]",
+    doc = "that emits a companion datagram immediately after each beacon so",
+    doc = "clients with a configured keyring can authenticate the server",
+    doc = "identity. C clients ignore the companion (unknown command); the",
+    doc = "regular beacon stream is unchanged."
+)]
 pub async fn run_beacon_emitter(
     server_port: u16,
     beacon_addrs: Vec<SocketAddr>,

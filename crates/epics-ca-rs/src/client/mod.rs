@@ -387,7 +387,7 @@ use types::*;
 
 // Public re-exports for the CA-130 exception-handler API. Mirror the
 // pattern already used for DiagnosticsSnapshot.
-pub use types::{CaException, CaExceptionHandler, CaExceptionKind};
+pub use types::{CaException, CaExceptionHandler, CaExceptionKind, ExceptionSite};
 
 /// CA client with persistent channels and auto-reconnection.
 pub struct CaClient {
@@ -2927,8 +2927,9 @@ impl CaChannel {
     ///
     /// The receiver is bounded (16); slow consumers see
     /// `RecvError::Lagged` and should re-subscribe after polling
-    /// the current state via [`Self::access_rights`] /
-    /// [`Self::is_connected`].
+    /// the current state via [`Self::info`] — its `access_rights` field
+    /// carries the current rights, and its `Err(CaError::Disconnected)` IS
+    /// the disconnected state.
     pub fn connection_events(&self) -> broadcast::Receiver<ConnectionEvent> {
         self.conn_tx.subscribe()
     }

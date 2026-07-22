@@ -224,7 +224,7 @@ struct Args {
 
     /// C's `reqElems` (`sscanf("%d")`, `caget.c:447-453`). `0` — including
     /// `-# 0` and an unscannable `-#` — is C's "not specified", i.e. ALL
-    /// elements. Resolved by [`CTool::req_elems_int`].
+    /// elements. Resolved by [`epics_ca_rs::copt::Scan::req_elems_int`].
     #[arg(
         short = '#',
         long = "max-elements",
@@ -281,7 +281,7 @@ struct Args {
     /// getopt option TAKING AN ARGUMENT (`caget.c:398` `"...#:d:0:w:..."`),
     /// so it is `-0` with an attached or separate `<base>` — never a
     /// `--0x`-style flag, which no C script can pass. Repeats are folded by
-    /// [`CTool::base`], which keeps C's "last VALID wins" rule.
+    /// [`epics_ca_rs::copt::Scan::base`], which keeps C's "last VALID wins" rule.
     #[arg(
         short = '0',
         value_name = "BASE",

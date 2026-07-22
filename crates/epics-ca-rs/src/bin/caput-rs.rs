@@ -232,7 +232,7 @@ struct Args {
     /// otherwise exits 2 on the unknown flag.
     ///
     /// Held as a raw `String` so a non-numeric argument reproduces C's
-    /// `sscanf`-failure warning ([`Args::warn_bad_element_count`]) instead of
+    /// `sscanf`-failure warning ([`Args::scan_dead_element_count`]) instead of
     /// clap's own parse error.
     #[arg(
         short = '#',
@@ -616,7 +616,7 @@ enum WriteValue {
     },
     /// A scalar ENUM value written by name. The server resolves it
     /// against the record's menu — see `CaChannel::put_string`. Carried as
-    /// a byte-preserving [`PvString`] so a non-UTF-8 escape survives.
+    /// a byte-preserving [`epics_ca_rs::PvString`] so a non-UTF-8 escape survives.
     EnumString(epics_ca_rs::PvString),
     /// An ENUM waveform written by name — each element a `DBR_STRING`
     /// the server resolves against the record's menu. See
@@ -786,10 +786,10 @@ fn raw_from_escaped(s: &str) -> Vec<u8> {
 /// `rem = 40`, then NUL-terminates — epicsString.c:55-118).
 const DBR_STRING_PAYLOAD_MAX: usize = 39;
 
-/// `raw_from_escaped` decoded into a byte-preserving [`PvString`] for the
+/// `raw_from_escaped` decoded into a byte-preserving [`epics_ca_rs::PvString`] for the
 /// DBR_STRING / ENUM-by-name put paths. The common escapes (`\n`, `\t`,
 /// `\\`, …) decode to ASCII; a high-byte `\xNN` reaches the wire as its
-/// literal byte — `EpicsValue::String` now carries raw bytes ([`PvString`]),
+/// literal byte — `EpicsValue::String` now carries raw bytes ([`epics_ca_rs::PvString`]),
 /// matching C's byte buffer with no UTF-8 lossy fixup.
 ///
 /// The decoded byte run is truncated to [`DBR_STRING_PAYLOAD_MAX`] bytes, the

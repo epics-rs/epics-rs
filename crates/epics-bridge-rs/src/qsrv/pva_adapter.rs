@@ -1325,6 +1325,26 @@ pub async fn pvalink_link_set_install(
 ///     .run_with_script_and_runner("st.cmd", run_ca_pva_qsrv_ioc)
 ///     .await
 /// ```
+///
+/// Host-only, and it needs the full `qsrv` selection.
+///
+/// Two independent requirements, so two clauses, and both are load-bearing:
+///
+/// * `not(target_os = "rtems")` — both servers this starts are themselves
+///   RTEMS-gated in their own crates. `epics_ca_rs::server::CaServer` and
+///   `epics_pva_rs::server::PvaServer` are each behind
+///   `cfg(not(target_os = "rtems"))`, because the target runs the blocking
+///   thread-per-client drivers instead of the async reactor front ends. This
+///   function was the last caller that had not followed.
+/// * `feature = "qsrv"` — `epics-ca-rs` is a dependency of `qsrv`, not of
+///   `qsrv-core`. Gating on the target alone would compile this body in a
+///   host `--features qsrv-core` build, where the crate is not linked at all
+///   (E0433 on `epics_ca_rs`). A feature whose validity depended on which
+///   target you pointed it at would be exactly the dual meaning the
+///   `qsrv-core` split exists to avoid.
+///
+/// The target's equivalent entry point is `epics-pva-rs`'s `rtems-pva-ioc`.
+#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
 ) -> epics_base_rs::error::CaResult<()> {
@@ -2026,6 +2046,13 @@ mod tests {
     /// the loop on the doc claim that wire-faithful round-tripping
     /// now works — the previous unit tests only validated the
     /// `ChannelSource` contract.
+    ///
+    /// The only test in this module that needs a PVA *client*
+    /// (`PvaServer::client_config` is behind `epics-pva-rs/client`), so it is
+    /// the only one gated on the full `qsrv` selection rather than
+    /// `qsrv-core`. Everything else here drives the `ChannelSource` surface
+    /// directly and runs in either.
+    #[cfg(feature = "qsrv")]
     #[tokio::test]
     async fn pva_server_serves_canonical_union_array_descriptor_over_wire() {
         use std::time::Duration;

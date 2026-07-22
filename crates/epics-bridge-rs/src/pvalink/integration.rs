@@ -93,7 +93,7 @@ pub struct PvaLinkResolver {
     /// rejects a group-PV link with `NotLocal`. `None` for a
     /// pvalink-only deployment with no QSRV, where group-PV locality
     /// is simply unavailable. Wired via [`Self::with_qsrv_provider`].
-    #[cfg(feature = "qsrv")]
+    #[cfg(feature = "qsrv-core")]
     qsrv: Arc<parking_lot::RwLock<Option<Arc<crate::qsrv::BridgeProvider>>>>,
 }
 
@@ -166,7 +166,7 @@ impl PvaLinkResolver {
             db: Arc::new(parking_lot::RwLock::new(None)),
             scan_targets: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             forwarders: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            #[cfg(feature = "qsrv")]
+            #[cfg(feature = "qsrv-core")]
             qsrv: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -191,14 +191,14 @@ impl PvaLinkResolver {
     /// Optional: a pvalink-only deployment never calls this, and
     /// group-PV locality is then simply unavailable (a `local` link
     /// must target a record or simple PV, as before).
-    #[cfg(feature = "qsrv")]
+    #[cfg(feature = "qsrv-core")]
     pub fn attach_qsrv_provider(&self, provider: Arc<crate::qsrv::BridgeProvider>) {
         *self.qsrv.write() = Some(provider);
     }
 
     /// Builder form of [`Self::attach_qsrv_provider`] — wires the
     /// QSRV provider and returns `self` for chaining at IOC assembly.
-    #[cfg(feature = "qsrv")]
+    #[cfg(feature = "qsrv-core")]
     pub fn with_qsrv_provider(self, provider: Arc<crate::qsrv::BridgeProvider>) -> Self {
         self.attach_qsrv_provider(provider);
         self
@@ -477,14 +477,14 @@ impl PvaLinkResolver {
         let pv_name = &cfg.pv_name;
         // `mut` is only consumed by the QSRV fallthrough below; gate it so
         // a `qsrv`-less build does not warn unused_mut.
-        #[cfg(feature = "qsrv")]
+        #[cfg(feature = "qsrv-core")]
         let mut is_local = self.is_local_in_db(pv_name).await;
-        #[cfg(not(feature = "qsrv"))]
+        #[cfg(not(feature = "qsrv-core"))]
         let is_local = self.is_local_in_db(pv_name).await;
         // QSRV group / single composite PVs: only checked when a QSRV
         // provider is wired. `hosts_pv` covers both the group registry and
         // the provider's single-channel name set.
-        #[cfg(feature = "qsrv")]
+        #[cfg(feature = "qsrv-core")]
         if !is_local {
             let provider = self.qsrv.read().clone();
             if let Some(provider) = provider {
@@ -3379,7 +3379,7 @@ mod tests {
     /// `attach_qsrv_provider`, the gate also accepts any name the
     /// provider hosts. The control case — a `local=true` link to a
     /// genuinely remote-only PV — must still be rejected.
-    #[cfg(feature = "qsrv")]
+    #[cfg(feature = "qsrv-core")]
     #[tokio::test]
     async fn b4_local_link_accepts_qsrv_group_pv() {
         use crate::qsrv::BridgeProvider;
@@ -4000,7 +4000,7 @@ mod tests {
     /// `local` gate keeps its record / simple-PV behaviour — group-PV
     /// locality is simply unavailable, and a link to a non-local PV
     /// is still rejected. Guards the optionality of the QSRV handle.
-    #[cfg(feature = "qsrv")]
+    #[cfg(feature = "qsrv-core")]
     #[tokio::test]
     async fn b4_local_gate_without_qsrv_still_rejects_remote() {
         let db = Arc::new(PvDatabase::new());

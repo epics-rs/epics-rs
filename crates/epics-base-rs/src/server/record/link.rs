@@ -268,6 +268,24 @@ pub struct DbLink {
     pub monitor_switch: MonitorSwitch,
 }
 
+impl DbLink {
+    /// The channel name this link addresses: `record` for a default-`VAL`
+    /// link, `record.FIELD` otherwise.
+    ///
+    /// This is the string C keeps verbatim in `plink->value.pv_link.pvname`
+    /// and hands to `dbChannelCreate` (`dbDbLink.c:94`) and, when that fails,
+    /// to `dbCaAddLink` (`dbLink.c:129`) — so the DB-link target name and the
+    /// CA channel name a non-local target falls through to are the same
+    /// string by construction, not by two sites agreeing to build it alike.
+    pub fn channel_name(&self) -> String {
+        if self.field == "VAL" {
+            self.record.clone()
+        } else {
+            format!("{}.{}", self.record, self.field)
+        }
+    }
+}
+
 /// A Channel Access / PV Access external link to a remote PV.
 ///
 /// carries the parsed `MS`/`NMS`/`MSI`/`MSS` maximize-

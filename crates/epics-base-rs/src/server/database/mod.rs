@@ -1074,6 +1074,16 @@ impl PvDatabase {
     /// list — works across record types as long as they expose link
     /// strings via [`Record::get_field`].
     ///
+    /// `parsed` is the **post-`dbInitLink`** view, not the bare parse: each
+    /// link is mapped through [`PvDatabase::db_init_link_locality`], so a
+    /// `Db` link naming a record this IOC does not have is reported as the
+    /// `Ca` link C's `dbDbInitLink` → `dbCaAddLink` fallthrough makes it
+    /// (`dbLink.c:117-129`, `dbDbLink.c:94-96`). Every consumer — the CP
+    /// setup, the init open pass, `dbcaxr`, the pvalink install scan — then
+    /// sees one consistent answer to "is this link local or external"
+    /// instead of each re-deriving it. `link_string` is still the verbatim
+    /// field text.
+    ///
     /// Returns an empty Vec when the record doesn't exist.
     pub fn record_link_fields(
         &self,
@@ -1115,10 +1125,18 @@ impl PvDatabase {
         // is the single owner of "which fields on a record are links",
         // shared by `setup_cp_links` (CA CP/CPP) and the pvalink install
         // scan (PVA CP/CPP).
-        push("INP", &inst.common.inp, LinkFieldType::In, &mut out);
-        push("OUT", &inst.common.out, LinkFieldType::Out, &mut out);
-        push("TSEL", &inst.common.tsel, LinkFieldType::In, &mut out);
-        push("SDIS", &inst.common.sdis, LinkFieldType::In, &mut out);
+        //
+        // The field list itself comes from `COMMON_LINK_FIELDS`, the one
+        // owner of "which `dbCommon` fields are links and under which C link
+        // type" — `FLNK` present here but absent from that list (or vice
+        // versa) is exactly the divergence that left external forward links
+        // un-opened at init.
+        for (field, ftype) in crate::server::record::record_instance::COMMON_LINK_FIELDS {
+            let Some(raw) = inst.common_link_text(field) else {
+                continue;
+            };
+            push(field, raw, ftype, &mut out);
+        }
         // Record-specific multi-input links (INPA..INPL for
         // calc/calcout/sel/sub) and the CP-capable input link fields
         // (DOL family, NVL, SELL, SGNL).
@@ -1133,6 +1151,18 @@ impl PvDatabase {
             if let Some(EpicsValue::String(s)) = inst.record.get_field(field) {
                 push(field, &s.as_str_lossy(), LinkFieldType::In, &mut out);
             }
+        }
+        // Apply C `dbInitLink`'s locality fallthrough once, here, so no
+        // consumer re-derives it. Done after dropping the record-instance
+        // guard: the locality query reads the database's record map, and
+        // this is the only place that would otherwise hold an instance lock
+        // across it.
+        drop(inst);
+        for entry in &mut out {
+            entry.2 = self.db_init_link_locality(std::mem::replace(
+                &mut entry.2,
+                crate::server::record::ParsedLink::None,
+            ));
         }
         out
     }

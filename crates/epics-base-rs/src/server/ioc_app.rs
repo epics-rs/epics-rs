@@ -901,6 +901,16 @@ impl IocApplication {
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
+        // C `dbInitLink`'s locality decision, committed once for the whole
+        // database now that every record has loaded: a `Db` link naming a
+        // record this IOC does not have becomes a `Ca` link
+        // (`dbLink.c:117-129` falling through `dbDbInitLink`'s
+        // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
+        // for C's reason — `initPVLinks` initialises links before anything
+        // consumes them — and it is a one-shot: C guards re-entry with
+        // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:95-101`), so a record added
+        // later at runtime does not un-convert a link already made external.
+        db.initialize_link_locality().await;
         db.setup_cp_links().await;
         // Open the rest of the external links at init, as C does. Every
         // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`

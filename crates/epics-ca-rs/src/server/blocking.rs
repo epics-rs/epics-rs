@@ -5,10 +5,24 @@
 //! client (C `camsgtask`, `camsgtask.c:41`), reading with a blocking `recv`
 //! (`camsgtask.c:71`) and writing every reply on that same thread — instead
 //! of the async `tokio` reactor that `crate::server::tcp::handle_client`
-//! uses. It exists so the CA server can run on RTEMS, where `tokio`'s I/O
-//! reactor (`mio`) does not build, over plain `std::net` blocking BSD sockets
-//! (which DO build for `armv7-rtems-eabihf`, and work on hosted Unix too — so
-//! this whole driver is host-compiled and host-tested).
+//! uses. Two separate reasons for that, easy to collapse into one and worth
+//! keeping apart:
+//!
+//! * **Parity.** C `rsrv` is thread-per-client on *every* platform, not only
+//!   on an RTOS — `rg '\b(select|poll|kevent|kqueue|epoll_wait)\s*\('` over
+//!   `modules/database/src/ioc/rsrv/*.c` returns zero hits across all seven
+//!   files. This driver is that model, so it is what CA looks like
+//!   everywhere, not an RTEMS-shaped deviation.
+//! * **Build.** `tokio`'s I/O reactor (`mio`) does not build for
+//!   `armv7-rtems-eabihf`: `mio` has epoll/kqueue/IOCP selectors only, and
+//!   rust-lang/libc's newlib/RTEMS bindings declare neither. That is a
+//!   Rust-bindings gap, **not** evidence that a reactor cannot run on RTEMS —
+//!   the BSP's own `kqueue` is measured serving a libevent reactor on RTEMS 6
+//!   (`doc/rtems-scope-b-session-handoff.md` §5.3).
+//!
+//! Plain `std::net` blocking BSD sockets DO build for `armv7-rtems-eabihf`,
+//! and work on hosted Unix too — so this whole driver is host-compiled and
+//! host-tested.
 //!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
 //! the analogue of C's `CAS-UDP` thread (`cast_server`, `cast_server.c:113`):

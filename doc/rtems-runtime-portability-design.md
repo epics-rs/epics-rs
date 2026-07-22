@@ -44,9 +44,19 @@ top-level `src/unix/mod.rs`):
 - **Absent:** `kqueue`/`kevent`/`EVFILT`, `epoll_*`. None appear anywhere in
   the RTEMS/newlib bindings.
 
-So RTEMS can do blocking sockets and `poll()`/`select()` readiness today, but
-**cannot** host mio's epoll/kqueue backends. mio also has no `poll`/`select`
-backend. That is the whole reason tokio-as-is does not run on RTEMS.
+So from Rust, RTEMS can do blocking sockets and `poll()`/`select()` readiness
+today, but declares nothing mio's epoll/kqueue selectors could bind to. mio
+also has no `poll`/`select` backend. That is the whole reason tokio-as-is does
+not run on RTEMS.
+
+**Correction (2026-07-22).** An earlier version of that sentence read "RTEMS
+… **cannot** host mio's epoll/kqueue backends", which states a *platform*
+limit from a *bindings* fact. The absence audited above is in rust-lang/libc's
+newlib/RTEMS module, not in the OS: RTEMS 6 + libbsd has a working `kqueue`,
+and §5.3 of `doc/rtems-scope-b-session-handoff.md` measures a libevent reactor
+serving PVA end to end on this same BSP through it. "tokio-as-is does not build
+for RTEMS" is true and is what this section supports. "A reactor cannot run on
+RTEMS" is false, and nothing in this document should be read as asserting it.
 
 Consequence: of the five target platforms, **four already run on tokio+mio**
 (FreeBSD via the same kqueue backend as macOS). The genuine gap is exactly
@@ -88,11 +98,33 @@ Local source: `/home/stevek/work/epics-modules/pvxs/src/`.
   `bufferevent`s (`conn.cpp`, `serverchan.cpp`).
 - The readiness backend is chosen by libevent
   (`event_base_new_with_config` `evhelper.cpp:185`;
-  `event_config_avoid_method("kqueue")` on some platforms `evhelper.cpp:183`).
+  `event_config_avoid_method(conf, "kqueue")` under `#ifdef __rtems__`,
+  `evhelper.cpp:183`).
 
 → PVA is reactor-based **even in C++**. "sync thread-per-client" does **not**
-fit it. Its RTEMS path is a `select`-backed reactor (libevent itself has a
-select backend), not a collapse to blocking threads.
+fit it, on any platform.
+
+**Correction (2026-07-22).** An earlier version of that arrow continued: "Its
+RTEMS path is a `select`-backed reactor (libevent itself has a select backend),
+not a collapse to blocking threads." The second half stands; the first half is
+wrong, and §5.3 of `doc/rtems-scope-b-session-handoff.md` is the measurement:
+
+- The `#ifdef __rtems__` guard avoids `kqueue` only, and what this build
+  actually lands on is **`poll`** — of the compiled-in backends
+  (`EVENT__HAVE_KQUEUE`, `_POLL`, `_SELECT`; `EPOLL`/`DEVPOLL`/`EVENT_PORTS`
+  all `#undef`). libevent's *select* backend was never tested here.
+- That `poll` backend never blocks on this BSP: `poll()` returns `POLLERR`
+  immediately on libevent's internal notify FIFO, so one 4.000 s loop issues
+  148,081 `poll()` calls against 1 for a raw `poll()`, guest idle 33.6 %
+  against 97.9 %. The comment on the guard dates it to "libbsd circa
+  RTEMS 5.1"; it is what makes pvxs unusable on RTEMS 6 today.
+- With that one line removed and nothing else changed, pvxs serves on RTEMS 6
+  under `kqueue` — `pvxinfo`, `pvxget`, `pvxput`, `pvxmonitor` all end to end.
+
+So the honest form of this section's consequence is: pvxs's RTEMS path is the
+*same* reactor it runs everywhere, wedged into a broken backend by a stale
+workaround. Our blocking driver avoids that class by not depending on a
+reactor — not because a reactor cannot run there.
 
 ---
 

@@ -43,6 +43,25 @@
 //! hosted behaviour is unchanged — and the reader/writer threads and both
 //! adapters are exercised for real either way.
 //!
+//! # What "no reactor" is worth — at its measured strength, and no higher
+//!
+//! Not that a reactor cannot run on RTEMS. It can: a libevent reactor serves
+//! PVA on RTEMS 6 once steered to `kqueue`, measured end to end
+//! (`doc/rtems-scope-b-session-handoff.md` §5.3). The claim that survives
+//! measurement is narrower and still real — **the reference implementation
+//! ships an RTEMS-5-era workaround that makes it unusable on RTEMS 6 today**.
+//! pvxs `src/evhelper.cpp:183` carries `#ifdef __rtems__
+//! event_config_avoid_method(conf, "kqueue")`, written for "libbsd circa
+//! RTEMS 5.1", and it steers libevent onto the `poll` backend, which never
+//! blocks on this BSP: `poll()` returns `POLLERR` immediately on libevent's
+//! internal notify FIFO, so one 4.000 s loop issues 148,081 `poll()` calls
+//! against 1 for a raw `poll()`, with guest idle 33.6 % against 97.9 %.
+//! Finding that took a `--wrap=poll` interposer and CPU-idle attribution.
+//!
+//! This driver does not depend on a reactor, so it never meets that class of
+//! defect — which is a different statement from being the only thing that can
+//! run there, and the weaker one is the true one.
+//!
 //! # Shutdown: one wake primitive, three triggers
 //!
 //! A thread cannot be aborted the way the hosted accept loop aborts a task in

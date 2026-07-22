@@ -32,16 +32,12 @@ impl PvDatabase {
         // 1) Remove the OLD entry the caller knew about — even if
         // remove_record already swept it. Match by record name so a
         // stale PHAS / load_order does not leave a phantom entry.
-        {
-            let mut index = self.inner.scan_index.write().await;
-            if let Some(list) = old_scan.scan_list() {
-                if let Some(set) = index.get_mut(&list) {
-                    set.retain(|(_, _, n)| n != name);
-                    if set.is_empty() {
-                        index.remove(&list);
-                    }
-                }
-            }
+        if let Some(list) = old_scan.scan_list() {
+            self.inner
+                .scan_index
+                .bucket(list)
+                .lock()
+                .retain(|(_, _, n)| n != name);
         }
         // 2) Look up the LIVE record under the mutex. If concurrent
         // remove+re-add replaced the Arc with a fresh one whose
@@ -70,10 +66,8 @@ impl PvDatabase {
             let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
             self.inner
                 .scan_index
-                .write()
-                .await
-                .entry(list)
-                .or_default()
+                .bucket(list)
+                .lock()
                 .insert((cur_phas, seq, name.to_string()));
         }
     }
@@ -87,13 +81,17 @@ impl PvDatabase {
         let Some(list) = scan_type.scan_list() else {
             return Vec::new();
         };
+        // One bucket's lock, held for the clone only and released before the
+        // caller's processing loop — C `scanList` (`dbScan.c:1007-1051`) holds
+        // `psl->lock` for the cursor step alone and releases it around every
+        // `dbProcess`. Neither holds its lock across processing.
         self.inner
             .scan_index
-            .read()
-            .await
-            .get(&list)
-            .map(|s| s.iter().map(|(_, _, name)| name.clone()).collect())
-            .unwrap_or_default()
+            .bucket(list)
+            .lock()
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect()
     }
 
     /// Get all record names whose `PINI` is **exactly** `mode`.

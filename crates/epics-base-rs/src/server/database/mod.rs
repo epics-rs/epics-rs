@@ -229,6 +229,45 @@ pub struct CpTarget {
     pub passive_only: bool,
 }
 
+/// The scan index — one independently locked bucket per [`ScanList`].
+///
+/// C's shape (`dbScan.c`): `scan_list` carries its own `epicsMutexId lock`
+/// (`:75`) and `scanList` / `addToList` / `deleteFromList` take only that
+/// one list's lock, so two periodic rates never wait on each other. The port
+/// used to hold a single `RwLock` over the whole `ScanList → bucket` map,
+/// which is coarser than C on the highest-contention path in the database.
+///
+/// There is no lock over the table itself, and that is structural rather than
+/// an optimisation: the set of scan lists is fixed by `menuScan`
+/// ([`ScanList::ALL`]), so the table is fully populated at construction and
+/// never mutated. A bucket is reached by [`ScanList::slot`], a total index —
+/// there is no absent-bucket case for a caller to handle, and therefore no
+/// path on which a lookup could take the wrong lock.
+///
+/// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b.
+struct ScanIndex {
+    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>>;
+        ScanList::COUNT],
+}
+
+impl ScanIndex {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| {
+                crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new())
+            }),
+        }
+    }
+
+    /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
+    fn bucket(
+        &self,
+        list: ScanList,
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>> {
+        &self.buckets[list.slot()]
+    }
+}
+
 struct PvDatabaseInner {
     /// The simple-PV directory — C's `dbPvdLib.c` process-variable directory,
     /// whose per-bucket `epicsMutexId lock` (`:30`, created `:119`) is taken
@@ -263,7 +302,16 @@ struct PvDatabaseInner {
     /// C IOC built from the same `.db` file.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
-    scan_index: crate::runtime::sync::RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
+    ///
+    /// **One lock per scan list, not one lock over the index.** C has one
+    /// `epicsMutexId lock` per `scan_list` (`dbScan.c:75`, created `:527`,
+    /// `:604`, `:908`) and never serialises two rates against each other. A
+    /// single map-wide lock would serialise the seven periodic threads (bands
+    /// 60–66) that C runs independently, on the one path where both ends of
+    /// the contention pair are banded — see
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b. See
+    /// [`ScanIndex`].
+    scan_index: ScanIndex,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
@@ -666,7 +714,7 @@ impl PvDatabase {
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
                 records: parking_lot::RwLock::new(HashMap::new()),
-                scan_index: crate::runtime::sync::RwLock::new(HashMap::new()),
+                scan_index: ScanIndex::new(),
                 load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: SnapshotCell::new(HashMap::new()),
@@ -1511,10 +1559,8 @@ impl PvDatabase {
         if let Some(list) = scan.scan_list() {
             self.inner
                 .scan_index
-                .write()
-                .await
-                .entry(list)
-                .or_default()
+                .bucket(list)
+                .lock()
                 .insert((phas, seq, name.to_string()));
         }
         Ok(())
@@ -1575,13 +1621,11 @@ impl PvDatabase {
         // name only — PHAS and load_order are not needed and may be
         // stale relative to the entry actually present.
         if let Some(list) = scan.scan_list() {
-            let mut idx = self.inner.scan_index.write().await;
-            if let Some(set) = idx.get_mut(&list) {
-                set.retain(|(_, _, n)| n != name);
-                if set.is_empty() {
-                    idx.remove(&list);
-                }
-            }
+            self.inner
+                .scan_index
+                .bucket(list)
+                .lock()
+                .retain(|(_, _, n)| n != name);
         }
 
         // 2b) Drop the load-order entry.

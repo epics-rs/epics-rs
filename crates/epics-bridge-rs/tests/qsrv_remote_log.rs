@@ -15,6 +15,8 @@
 
 #![cfg(feature = "qsrv")]
 
+// RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the feature-ON suite.
+
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;

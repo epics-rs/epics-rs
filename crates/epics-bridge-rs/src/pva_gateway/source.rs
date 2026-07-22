@@ -8,6 +8,8 @@
 //! through a per-entry tokio broadcast channel so multiple downstream
 //! clients share one upstream subscription.
 
+// RTEMS-EXEC-MODEL-ALLOW(24): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;

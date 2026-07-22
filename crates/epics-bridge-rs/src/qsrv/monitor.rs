@@ -11,6 +11,8 @@
 //! Tracks overflow events via a counter, corresponding to C++ BaseMonitor's
 //! `inoverflow` flag and overflow BitSet.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

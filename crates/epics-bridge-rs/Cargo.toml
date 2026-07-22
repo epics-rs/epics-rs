@@ -37,6 +37,19 @@ default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
 # with no features at all compiles `error`/`convert`/`lib.rs` and nothing else,
 # which is a green that proves nothing.
 qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
+# Host-selectable RTEMS execution model — passthrough to
+# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` and `epics-pva-rs`
+# declare it. Routes the `runtime::task` seam to the std-thread background
+# executor on a hosted target, which is what compiles `rtems-pva-ioc`'s real
+# entry point off RTEMS so it can be linted and tested here. OFF by default.
+#
+# It is NOT what selects the executor on the target: `armv7-rtems-eabihf`
+# reaches the same backend through `target_os = "rtems"`, so
+# `scripts/rtems-check.sh` does not pass this feature. Declaring it here buys
+# the *host* half — and with it the `rtems-exec-gate` census below, which is
+# the price of the feature and the reason it landed as its own stage
+# (doc/qsrv-rtems-design.md §6.3, §7 stage 4).
+rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is
@@ -265,5 +278,11 @@ required-features = ["qsrv-core"]
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and four copies of a
+# 300-line audit is how four copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 serial_test = "3"
 tempfile = "3"

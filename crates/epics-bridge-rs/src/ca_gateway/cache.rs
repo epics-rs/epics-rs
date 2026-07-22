@@ -26,6 +26,8 @@
 //!      │   Dead   │                last subscriber leaves             │
 //!      └──────────┘◄──────────────────────────────────────────────────┘
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

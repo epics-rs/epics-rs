@@ -21,6 +21,8 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
+// RTEMS-EXEC-MODEL-ALLOW(18): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

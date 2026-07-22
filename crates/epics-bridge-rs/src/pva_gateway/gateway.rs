@@ -6,6 +6,8 @@
 //! that downstream clients connect to, and route every server op
 //! through the cache.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+
 use std::sync::Arc;
 use std::time::Duration;
 

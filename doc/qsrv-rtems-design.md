@@ -770,6 +770,16 @@ Measured: `rg -n 'RTEMS-EXEC-MODEL-ALLOW' crates/epics-bridge-rs` returns
 `rtems-exec-model`, **250 sites** (POST-ROUND 251) are unaccounted for and the gate fails
 closed — by design.
 
+> **POST-STAGE-4 — this table is a subset, and the total is wrong.** The
+> real bill is **392 sites across 33 files**, not 250. The table above
+> counts only `qsrv` + `pvalink` and omits both gateway modules:
+> `ca_gateway` carries 72 sites and `pva_gateway` 92 (68 in-module plus
+> the 24 in `tests/pva_gateway.rs`, which the table did list but under
+> the wrong subtotal). Of the qsrv+pvalink half the table is off by one
+> — `src/pvalink/link.rs` measured **24**, not 23. The classification as
+> built is in §9.13; the numbers here are left as written so the
+> estimate and the measurement can be compared.
+
 Three consequences:
 
 1. **Declaring the feature is not free and must be its own stage.** The
@@ -892,7 +902,7 @@ step 4, not here.
 (the compiler is what proves no guard crosses an `.await`), `cargo
 nextest run -p epics-bridge-rs`.
 
-### Stage 4 — `rtems-exec-model` feature + the 250-site census (large)
+### Stage 4 — `rtems-exec-model` feature + the 250-site census (large) — **DONE** (see §9.13)
 
 Declare `rtems-exec-model = ["epics-base-rs/rtems-exec-model"]` on
 `epics-bridge-rs`, add the `rtems-exec-gate` dev-dep and
@@ -903,6 +913,13 @@ decision, and the tool fails closed on any miss.
 
 *Gate:* `cargo nextest run -p epics-bridge-rs --features rtems-exec-model`
 green, and the census test itself.
+
+As built: **392** sites, not 250 — §6.3's table omitted both gateway
+modules. The "smallest by risk" prediction held: one classification
+needed more than a marker (eight tests that host a real async CA server),
+and no production defect surfaced. §9.8's owed restoration — the
+host compile of `rtems-pva-ioc`'s `mod ioc` — was discharged in the same
+stage.
 
 ### Stage 5 — pvalink on RTEMS (blocked, large, not scheduled)
 
@@ -1131,7 +1148,7 @@ Two consequences worth stating:
   feature set, which is why `clippy --workspace --all-targets` is green
   over both.
 
-### 9.5 Feature-ON census: unchanged, and the suite is green
+### 9.5 Feature-ON census: unchanged, and the suite is green — **superseded by §9.13**
 
 §6.3's 250-site bill is stage 4's and nothing in stage 1 touched it.
 `epics-bridge-rs` still declares no `rtems-exec-model` feature, carries
@@ -1139,6 +1156,10 @@ no `rtems-exec-gate` dev-dep and no `RTEMS-EXEC-MODEL-ALLOW` markers, so
 the census gates nothing for this crate yet. Recorded for stage 4's
 baseline: at `79cbcc81` `cargo nextest run -p epics-bridge-rs` is
 **674 tests, 674 passed, 0 skipped**.
+
+All three "still" clauses were made false by stage 4 (§9.13): the feature
+is declared, the dev-dep is in, and 33 files carry markers. The 250 is
+wrong as well — it was 392.
 
 ### 9.6 What stage 1 did *not* do — settled by stage 2
 
@@ -1225,7 +1246,7 @@ Three consequences that are easy to miss, all measured:
 
    Recorded at both the manifest and the gate so it is not re-derived.
 
-### 9.8 The accepted cost: the IOC body is not host-compiled until stage 4
+### 9.8 The accepted cost: the IOC body is not host-compiled until stage 4 — **DISCHARGED in stage 4**
 
 The moved binary's `ioc` module was gated
 `any(target_os = "rtems", feature = "rtems-exec-model")`. In its new home
@@ -1253,6 +1274,15 @@ Stage 4 restores both by declaring `rtems-exec-model` on
 `epics-bridge-rs` (with the census it owes) and widening this predicate
 back to the `any(...)` form. Until then this is the one place in the
 workspace where an RTEMS entry point is not host-selectable.
+
+**Done in `fdc4319c`.** The predicate is
+`any(target_os = "rtems", feature = "rtems-exec-model")` again on both
+`mod ioc` and `main`, and the five `mod ioc` unit tests run on a host
+under `--features rtems-exec-model`. `mod demo_db` took the same widening
+*plus* its existing `test` arm, so the built-in database stays checked by
+the default host selection with no feature flag — that arm was the one
+thing this section's cost did not take away, and it was not given up to
+buy the rest back.
 
 ### 9.9 What stage 2 changed, against §7's four steps
 
@@ -1518,3 +1548,165 @@ exit 0 in both configurations after each commit; full-workspace
 the target: stage 3 is a `!Send`-guard reduction, so the RTEMS evidence in
 §9.11 stands as-is and was not re-run on hardware. §8's open items are
 untouched.
+
+### 9.13 Stage 4 as built — the census is 392, not 250
+
+Stage 4 landed as `fdc4319c` (feature + §9.8 restoration), `1ee76e6f`
+(the eight gated tests) and `811112ee` (the 392-site census and the gate
+that checks it), on top of the stage-3 merge `bbc43b54`.
+
+#### The number
+
+§6.3 estimated ~250. Measured by the tool itself — declare the feature,
+add `tests/rtems_exec_model_gate.rs`, and read the failure, which
+enumerates every unaccounted site with its line numbers:
+
+| module | files | sites |
+|---|---:|---:|
+| `src/qsrv/` | 7 | 85 |
+| `src/pvalink/` | 4 | 69 |
+| `src/ca_gateway/` | 10 | 72 |
+| `src/pva_gateway/` | 6 | 68 |
+| **in-crate subtotal** | **27** | **294** |
+| `tests/` (6 files) | 6 | 98 |
+| **total** | **33** | **392** |
+
+The estimate was not slightly low, it was scoped wrong: it enumerated
+`qsrv` + `pvalink` only and left both gateway modules out entirely —
+140 of the 392 sites. Within the half it did enumerate it was off by
+one (`pvalink/link.rs` is 24, the table said 23), so the qsrv+pvalink
+in-crate figure is 154 against the predicted 153.
+
+The lesson is worth keeping because it will recur: §6.3's table was built
+from a `#[tokio::test]` grep over the *modules the design was reasoning
+about*, and the crate is bigger than the design's subject. Running the
+tool is the measurement; a hand-scoped grep is a guess with a table
+around it.
+
+#### The classification
+
+| class | sites | files | accounting |
+|---|---:|---:|---|
+| checked — run and pass feature-ON | 292 | 26 | option 4, reason `checked - these run and pass in the feature-ON suite.` |
+| not built feature-ON by default | 92 | 7 | option 4, reason `not built feature-ON by default - ... behind the pva-gateway feature.` |
+| reactor-dependent, gated out | 8 | 1 | option 3, per-test `#[cfg(not(feature = "rtems-exec-model"))]` |
+| real defect, fixed at source | 0 | 0 | — |
+| **total** | **392** | **33** | |
+
+Per-file, the "checked" 292: `qsrv/` 85 (`group.rs` 27,
+`pva_adapter.rs` 21, `provider.rs` 20, `channel.rs` 9, `monitor.rs` 5,
+`trap_write.rs` 2, `iocsh.rs` 1); `pvalink/` 69 (`integration.rs` 38,
+`link.rs` 24, `registry.rs` 5, `iocsh.rs` 2); `ca_gateway/` 64 of its 72
+(`upstream.rs` 5 after gating, `stats.rs` 10, `downstream.rs` 9,
+`server.rs` 9, `command.rs` 8, `control.rs` 7, `pvlist.rs` 6,
+`cache.rs` 4, `putlog.rs` 4, `beacon.rs` 2); `tests/` 74
+(`testqgroup.rs` 31, `testqsingle.rs` 24, `qsrv_remote_log.rs` 16,
+`acf_access_control_contexts.rs` 2, `pvalink_seam.rs` 1).
+
+"Checked" is a measurement, not a courtesy. `cargo nextest run -p
+epics-bridge-rs --features rtems-exec-model` runs **681 tests, all
+passing**, and the census test runs inside that same selection, so a
+count bumped without running the test still fails there. Every `src` file
+carrying a "checked" marker has tests in the feature-ON binary list, and
+every integration file's feature-ON test count equals its declared count
+exactly.
+
+#### The one classification that needed more than a marker
+
+`ca_gateway/upstream.rs` has 13 sites. Eight fail feature-ON, five pass,
+and the split is not arbitrary: the eight are exactly the eight whose
+bodies contain `CaServer::builder()`, i.e. that host a real in-process
+**async** CA server and drive it with `server.run()`. That server reaches
+the network through the `runtime::task` seam, which feature-ON is the
+std-thread executor — no tokio reactor — so its first `tokio::net` call
+panics on a `cbMedium` worker:
+
+```
+thread 'cbMedium' panicked at epics-ca-rs/src/server/tcp.rs:1273:22:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+and the test then fails on `ensure_subscribed`'s
+`upstream PV did not connect`. The five that pass use a *dead* port with
+nothing bound (`dead_upstream()`), so no server is ever started.
+
+This is the feature behaving as specified, not a defect. `ca-gateway` is
+not in the RTEMS closure — `scripts/rtems-check.sh` builds `qsrv-core` —
+and the target's CA front-end is `BlockingCaServer`, which takes no part
+in this path. So the eight take option 3, the shape `epics-ca-rs`'s
+`two_priorities_open_two_circuits` already uses for the identical cause.
+
+Family closed before editing, per the fixes-from-reported-defects rule:
+anchor `rg 'CaServer::builder|CaServer::new' crates/epics-bridge-rs/{src,tests}`
+returns exactly those eight sites plus two prose mentions in
+`ca_gateway/server.rs`. No other test in the crate hosts an async CA
+server. The `use epics_ca_rs::server::CaServer` import took the same
+predicate — feature-ON it would otherwise be an unused import under
+`-D warnings`.
+
+#### The 92 `pva-gateway` sites, and the break behind them
+
+`src/pva_gateway/` (68) and `tests/pva_gateway.rs` (24) take option 4's
+*second* permitted reason: the file does not build or run in that
+configuration. `pva-gateway` is not in the crate's default feature set,
+so the gate command does not compile it at all.
+
+Independently — and this is §9.9's last open item, unchanged by this
+stage — the feature does not compile in *any* selection right now:
+`cargo check -p epics-bridge-rs --all-targets --features pva-gateway`
+produces **72** `cannot find type MonitorStream` errors in
+`pva_gateway/{control,middleware}.rs`. Measured at `fdc4319c` with and
+without `rtems-exec-model`, identically, so it is neither caused nor
+worsened here. The census markers deliberately state the *stable* reason
+(behind a non-default feature) rather than the transient one, so they
+stay true once that break is fixed — at which point whoever fixes it owes
+a run of `--features rtems-exec-model,pva-gateway` and, if those 92 pass,
+a promotion of the seven markers to `checked`.
+
+#### Feature-ON suite arithmetic
+
+681 tests feature-ON against 683 in the default selection. The delta is
+exactly accounted for: **+1** census gate, **+5** `mod ioc` unit tests
+that `fdc4319c` restored to the host, **−8** gated above.
+
+#### No new red was treated as a flake
+
+The eight failures reproduced identically across two independent runs,
+fail in ~50 ms with a named panic rather than a timeout, and are
+partitioned by a source-level property (`CaServer::builder` present or
+absent) rather than by scheduling. Nothing here matches the
+shared-fixture race shape the exec backend is known to expose — that
+shape was watched for and did not appear.
+
+#### Gates
+
+`cargo fmt --all`. `cargo clippy -p epics-bridge-rs --all-targets --
+-D warnings` in all three configurations — default, `--no-default-features
+--features qsrv-core` (the target's selection), and
+`--features rtems-exec-model` — each exit 0. `cargo nextest run -p
+epics-bridge-rs` 683/683; `cargo nextest run -p epics-bridge-rs
+--features rtems-exec-model` 681/681 including the census test.
+`./scripts/rtems-check.sh` exit 0 in both configurations. Full workspace:
+`cargo clippy --workspace --all-targets -- -D warnings` exit 0,
+`cargo nextest run --workspace` 10103 passed / 2 skipped. The three
+sibling census gates (`epics-base-rs`, `epics-ca-rs`, `epics-pva-rs`,
+each `-p <crate> --features rtems-exec-model`) still pass, so the shared
+tool was not perturbed.
+
+Naming the feature-ON selections explicitly is not ceremony:
+`--workspace --all-targets` compiles a `#![cfg(feature = "...")]` test
+file *away*, so a green workspace run says nothing about the census.
+`-p epics-bridge-rs --features rtems-exec-model` is the only invocation
+that runs it.
+
+#### Not done here
+
+* The `pva-gateway` `MonitorStream` break (72 errors) is untouched —
+  pre-existing, and out of this stage's scope by construction: it is not
+  in the RTEMS closure and not reachable from any configuration this
+  stage's gates build.
+* Nothing was re-measured on the target. Stage 4 changes no production
+  code path — the only production-side edit is a widened `cfg` predicate
+  on an entry point whose RTEMS arm is byte-identical — so §9.11's
+  hardware evidence stands and §8's open items are untouched.
+* Stage 5 (pvalink on RTEMS) remains blocked on a blocking PVA client.

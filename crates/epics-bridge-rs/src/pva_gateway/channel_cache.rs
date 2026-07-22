@@ -23,6 +23,8 @@
 //! entry. See `UpstreamEntry::is_retained` for the full rationale and
 //! the (Low) cost of the narrowing.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

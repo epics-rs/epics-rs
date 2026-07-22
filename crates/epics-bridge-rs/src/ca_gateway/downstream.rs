@@ -20,6 +20,8 @@
 //! subscribes to a known set of upstream PVs at startup. It is not
 //! required for lazy resolution to work.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 

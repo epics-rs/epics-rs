@@ -17,6 +17,8 @@
 //! pvxs equivalent: `ioc/pvalink.cpp` + `pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
+// RTEMS-EXEC-MODEL-ALLOW(38): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{

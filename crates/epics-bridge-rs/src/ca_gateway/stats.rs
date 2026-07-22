@@ -89,6 +89,8 @@
 //! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
 //! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
 
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};

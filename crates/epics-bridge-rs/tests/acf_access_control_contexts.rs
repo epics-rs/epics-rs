@@ -18,6 +18,8 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::parse_acf;

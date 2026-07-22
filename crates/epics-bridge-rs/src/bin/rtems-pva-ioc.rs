@@ -101,35 +101,36 @@
 //! it stays compiled and linted in the default test set, but refuses to run
 //! rather than silently starting the runtime it exists to avoid.
 //!
-//! The predicate is `target_os = "rtems"` **alone**, which is where it differs
-//! from `rtems-ca-ioc`'s `any(target_os = "rtems", feature =
-//! "rtems-exec-model")`. `epics-bridge-rs` does not declare
-//! `rtems-exec-model`: declaring it is design stage 4, and it arrives with a
-//! ~250-site `rtems-exec-gate` census bill (§6.3) that must be paid, not
-//! dodged by adding the feature name without the accounting. Naming a feature
-//! this crate does not have would be a dangling predicate — three
-//! `unexpected_cfg` warnings, and an arm no configuration can select.
+//! The predicate is `any(target_os = "rtems", feature = "rtems-exec-model")`,
+//! the same one `rtems-ca-ioc` carries. It was narrowed to `target_os =
+//! "rtems"` alone for one stage — `epics-bridge-rs` did not yet declare
+//! `rtems-exec-model`, and naming a feature the crate does not have is a
+//! dangling predicate: `unexpected_cfg` warnings and an arm no configuration
+//! can select. Stage 4 declared the feature *with* the `rtems-exec-gate`
+//! census it owes (§6.3) rather than dodging the bill by adding the name
+//! alone, so the `any(...)` form is back and the body below is host-compiled,
+//! host-linted and host-tested under `--features rtems-exec-model`.
 //!
-//! The cost, stated so stage 4 picks it up: the body below is **not** compiled
-//! on a host today, so its only compile coverage is `scripts/rtems-check.sh`
-//! (both configurations), and the `mod ioc` unit tests below it do not run on
-//! a host. Stage 4 restores both by declaring the feature and widening this
-//! predicate back. The four source-text guards at the bottom of the file are
-//! outside `mod ioc` and are unaffected — they run in every host test pass.
+//! Coverage today, in full: `scripts/rtems-check.sh` compiles it for the
+//! target in both configurations; the host feature-ON selection compiles it
+//! and runs the `mod ioc` unit tests; the source-text guards at the bottom of
+//! the file are outside `mod ioc` and run in every host test pass, featured or
+//! not.
 
 use std::process::ExitCode;
 
 /// The built-in database, kept **outside** `mod ioc` deliberately.
 ///
-/// It is data, not RTEMS code, and it is the one part of this binary a host
-/// can check for real: `mod ioc` does not compile on a host until stage 4, so
-/// a typo inside the `info(Q:group, …)` bodies below would otherwise reach a
-/// reader as a silent "no such PV" on a serial console with no shell to ask.
+/// It is data, not RTEMS code, and it is the part of this binary the *default*
+/// host selection can check for real — with no feature flag, so a typo inside
+/// the `info(Q:group, …)` bodies below cannot reach a reader as a silent "no
+/// such PV" on a serial console with no shell to ask, even in a test pass that
+/// never selects `rtems-exec-model`.
 /// The `test` arm of the predicate is what lets the guard at the bottom of
-/// this file parse it and build the group for real; the `rtems` arm is the
-/// production use. On a host non-test build it is compiled away, so it is
-/// never dead code.
-#[cfg(any(target_os = "rtems", test))]
+/// this file parse it and build the group for real; the `rtems` and
+/// `rtems-exec-model` arms are the production use. On a host non-test build
+/// with the feature off it is compiled away, so it is never dead code.
+#[cfg(any(target_os = "rtems", feature = "rtems-exec-model", test))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -164,7 +165,7 @@ mod demo_db {
     );
 }
 
-#[cfg(target_os = "rtems")]
+#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -615,19 +616,19 @@ mod ioc {
     }
 }
 
-#[cfg(target_os = "rtems")]
+#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(any(target_os = "rtems", feature = "rtems-exec-model")))]
 fn main() -> ExitCode {
     eprintln!(
         "rtems-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf`. The host-selectable \
-         `rtems-exec-model` build of this binary arrives with design stage 4, \
-         which is what declares that feature on `epics-bridge-rs`."
+         Build it for `armv7-rtems-eabihf`, or on a host select \
+         `--features rtems-exec-model`, which routes the `runtime::task` seam to \
+         the same std-thread executor the target uses."
     );
     ExitCode::FAILURE
 }

@@ -27,6 +27,8 @@
 //! therefore collapse to a single action, and a burst of different flags
 //! runs in main-loop order, not client write order.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

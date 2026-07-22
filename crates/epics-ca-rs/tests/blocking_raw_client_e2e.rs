@@ -266,8 +266,12 @@ fn blocking_server_accepts_a_second_circuit_after_the_first_closes() {
 fn blocking_server_answers_a_raw_udp_search() {
     let db = seed_db(&[("RAW:UDP", EpicsValue::Double(1.0))]);
     let server = Arc::new(
-        BlockingCaServer::bind("127.0.0.1:0", db, Arc::new(tokio::sync::RwLock::new(None)))
-            .expect("bind ephemeral loopback port"),
+        BlockingCaServer::bind(
+            "127.0.0.1:0",
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+        )
+        .expect("bind ephemeral loopback port"),
     );
     let tcp_port = server.tcp_port();
 
@@ -372,8 +376,12 @@ fn blocking_server_answers_a_raw_udp_search() {
 fn a_udp_search_leads_to_a_working_tcp_circuit() {
     let db = seed_db(&[("RAW:BOTH", EpicsValue::Double(3.25))]);
     let server = Arc::new(
-        BlockingCaServer::bind("127.0.0.1:0", db, Arc::new(tokio::sync::RwLock::new(None)))
-            .expect("bind ephemeral loopback port"),
+        BlockingCaServer::bind(
+            "127.0.0.1:0",
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+        )
+        .expect("bind ephemeral loopback port"),
     );
     let resp = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind responder");
     let resp_addr = resp.local_addr().unwrap();

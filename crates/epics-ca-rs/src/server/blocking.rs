@@ -124,7 +124,6 @@ use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
 
@@ -145,11 +144,12 @@ use crate::server::tcp::{
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
-/// The ACF handle type [`ClientState::new`] expects. `tokio::sync::RwLock` is
-/// a runtime-agnostic lock (it needs no reactor — another thread's release
-/// wakes a waiter), so it is sound to acquire under `park_on` and builds for
-/// RTEMS. It is NOT `tokio`'s socket/timer/spawn machinery.
-type SharedAcf = Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>;
+/// The ACF handle type [`ClientState::new`] expects. Lock-free: a check takes
+/// an `Arc` snapshot of the policy and never blocks, so a `CAS-client` thread
+/// at EPICS 20 cannot hold an operator reload — or any higher-priority
+/// checker — off while it is preempted. See
+/// `doc/rtems-priority-locks-design.md` §3 row L9.
+type SharedAcf = epics_base_rs::server::access_security::AcfCell;
 
 /// The EPICS priority the TCP accept loop runs at.
 ///
@@ -1457,7 +1457,7 @@ mod tests {
         let taken = held.local_addr().expect("held addr");
 
         let db = Arc::new(PvDatabase::new());
-        let acf: SharedAcf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf: SharedAcf = epics_base_rs::server::access_security::new_acf_cell(None);
         // `expect_err` would need `Debug` on the server type; match instead.
         let msg = match BlockingCaServer::bind(taken, db, acf) {
             Ok(_) => panic!("binding an occupied port must fail"),
@@ -1698,8 +1698,8 @@ mod tests {
 
     /// The RTEMS constraint (S1): the blocking driver must not touch tokio's
     /// async net/timer/spawn machinery — those don't build for RTEMS and
-    /// cannot be driven by `park_on`. `tokio::sync` (locks) IS allowed and is
-    /// referenced by the `SharedAcf` alias. This is a static guard: if a
+    /// cannot be driven by `park_on`. `tokio::sync` (locks) IS allowed — the
+    /// `mpsc` channels this file uses are one. This is a static guard: if a
     /// future edit reaches for an async socket/timer/spawn or suspends a
     /// future directly instead of driving it via `park_on`, the test fails at
     /// compile-time-embedded source inspection. (Comments in this file
@@ -1737,7 +1737,7 @@ mod tests {
     }
 
     fn new_acf() -> SharedAcf {
-        Arc::new(tokio::sync::RwLock::new(None))
+        epics_base_rs::server::access_security::new_acf_cell(None)
     }
 
     /// Read exactly one whole CA frame (header + declared payload) so the

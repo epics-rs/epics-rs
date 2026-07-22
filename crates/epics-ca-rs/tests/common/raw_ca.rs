@@ -66,8 +66,12 @@ pub fn start_server(
     db: Arc<PvDatabase>,
 ) -> (Arc<BlockingCaServer>, SocketAddr, thread::JoinHandle<()>) {
     let server = Arc::new(
-        BlockingCaServer::bind("127.0.0.1:0", db, Arc::new(tokio::sync::RwLock::new(None)))
-            .expect("bind ephemeral loopback port"),
+        BlockingCaServer::bind(
+            "127.0.0.1:0",
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+        )
+        .expect("bind ephemeral loopback port"),
     );
     let addr = server.local_addr().expect("local_addr");
     let srv = server.clone();

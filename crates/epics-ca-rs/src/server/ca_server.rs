@@ -278,7 +278,7 @@ impl CaServerBuilder {
     /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
         #[cfg(feature = "experimental-rust-tls")]
         let tls = self.tls.and_then(|t| match t {
             crate::tls::TlsConfig::Server(arc) => Some(Arc::new(std::sync::RwLock::new(arc))),
@@ -410,10 +410,11 @@ pub struct CaServer {
     /// `start()` that subscribes to `conn_events`. Surfaced via
     /// [`Self::stats`] and the `casr` iocsh command.
     stats: Arc<ServerStats>,
-    /// Active access security configuration. Wrapped in `RwLock` so
-    /// `reload_acf` can swap it without restarting the server. Access
-    /// checks acquire a read lock; reload acquires write.
-    acf: Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
+    /// Active access security configuration. A lock-free snapshot cell so
+    /// `reload_acf` can swap it without restarting the server: an access
+    /// check takes an `Arc` of the policy and never blocks, and a reload
+    /// publishes a new one without waiting for in-flight checks.
+    acf: epics_base_rs::server::access_security::AcfCell,
     /// Path the ACF was originally loaded from, retained so the no-arg
     /// `reload_acf()` knows which file to re-read. None when the server
     /// was built via the in-memory `acf(config)` setter.
@@ -542,7 +543,7 @@ impl CaServer {
             tcp,
             udp,
             stats,
-            acf: Arc::new(tokio::sync::RwLock::new(acf)),
+            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
             acf_source_path: std::sync::Mutex::new(None),
             acf_reload_tx,
             autosave_config,
@@ -619,7 +620,7 @@ impl CaServer {
     /// without holding the full `&self` borrow.
     pub(crate) async fn reload_acf_inner(
         path: &str,
-        acf: &Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
+        acf: &epics_base_rs::server::access_security::AcfCell,
         reload_tx: &tokio::sync::broadcast::Sender<()>,
     ) -> CaResult<()> {
         // std::fs::read_to_string blocks the worker thread on slow
@@ -632,10 +633,7 @@ impl CaServer {
             .map_err(|e| CaError::Io(std::io::Error::other(e)))?
             .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
-        {
-            let mut guard = acf.write().await;
-            *guard = Some(parsed);
-        }
+        acf.store(Some(Arc::new(parsed)));
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
@@ -1213,7 +1211,7 @@ impl CaServer {
                     let acf = acf_clone.clone();
                     let reload_tx = acf_reload_tx_clone.clone();
                     tokio::spawn(async move {
-                        *acf.write().await = Some(cfg);
+                        acf.store(Some(Arc::new(cfg)));
                         let _ = reload_tx.send(());
                     });
                     Ok(())

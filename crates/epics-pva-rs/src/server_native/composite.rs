@@ -1173,7 +1173,7 @@ mod tests {
             }
         }
 
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let resolver: epics_base_rs::server::access_security::AsgAslResolver =
             Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let inner1 = Arc::new(VersionedSrc {
@@ -1371,7 +1371,7 @@ mod tests {
             }
         }
 
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let resolver: epics_base_rs::server::access_security::AsgAslResolver =
             Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let inner_a = Arc::new(VersionedSrc {

@@ -12435,7 +12435,7 @@ mod tests {
 
         // Permissive at subscribe: the anonymous peer may READ.
         let permissive = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf");
-        let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(permissive)));
+        let cell = epics_base_rs::server::access_security::new_acf_cell(Some(permissive));
         let version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let resolver: AsgAslResolver =
             std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
@@ -12493,7 +12493,7 @@ mod tests {
              }\n",
         )
         .expect("acf");
-        *cell.write().await = Some(deny);
+        cell.store(Some(std::sync::Arc::new(deny)));
         version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -12556,7 +12556,7 @@ mod tests {
                  }\n",
             )
             .expect("acf parse");
-            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
             let resolver: AsgAslResolver =
                 std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
             Self {
@@ -17038,7 +17038,7 @@ mod tests {
                  }\n",
             )
             .expect("acf parse");
-            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
             // Resolve every PV to ASG DEFAULT, ASL 1 — so the
             // ASL-1-scoped WRITE rule applies.
             let resolver: AsgAslResolver =

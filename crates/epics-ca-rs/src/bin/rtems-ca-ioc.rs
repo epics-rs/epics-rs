@@ -169,7 +169,7 @@ mod ioc {
         //     value, as under a C IOC (caservertask.c:491-499). No ACF is
         //     configured, so access control is the permissive default.
         let port = cas_server_port();
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let db_for_status = db.clone();
         let db_for_names = db.clone();
         let server = match BlockingCaServer::bind((Ipv4Addr::UNSPECIFIED, port), db, acf) {

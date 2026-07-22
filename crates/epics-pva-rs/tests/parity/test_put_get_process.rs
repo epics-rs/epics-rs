@@ -543,7 +543,7 @@ impl DenySource {
     fn new() -> Self {
         // READ-only ASG: every peer reads, none writes.
         let cfg = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf parse");
-        let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let cell = epics_base_rs::server::access_security::new_acf_cell(Some(cfg));
         let resolver: AsgAslResolver =
             Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         Self {

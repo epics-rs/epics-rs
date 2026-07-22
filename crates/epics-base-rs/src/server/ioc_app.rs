@@ -902,6 +902,17 @@ impl IocApplication {
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
         db.setup_cp_links().await;
+        // Open the rest of the external links at init, as C does. Every
+        // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
+        // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
+        // C IOC's first scan finds an already-connecting channel.
+        // `setup_cp_links` above covers only the CP/CPP subset; without this
+        // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
+        // link pays one cold scan cycle to stage its own open. Runs here — the
+        // same init phase, after link parsing and before scan start — and
+        // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
+        // non-local CP holders is already visible to the enumeration.
+        db.setup_external_link_opens().await;
 
         // Phase 2b.5: wait for the CA links to local records to connect
         // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit

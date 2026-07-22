@@ -1,0 +1,297 @@
+//! Open-at-init parity with C `dbInitLink` → `dbCaAddLink`.
+//!
+//! C reference. `dbInitLink` (`dbLink.c:95-143`) runs per record link at
+//! iocInit. Any `PV_LINK` that is not resolvable as a local DB link reaches
+//! `dbCaAddLinkCallbackOpt`, which stages `addAction(pca, CA_CONNECT)`
+//! (`dbCa.c:389-417`) on the `dbCaTask`. That call sits *above* the
+//! `dbfType` switch, so `DBF_INLINK`, `DBF_OUTLINK` and `DBF_FWDLINK` are
+//! all opened, and it is independent of the `CP`/`CPP` modifier, so plain
+//! links are opened exactly like CP ones. A C IOC therefore reaches its
+//! first scan with every external channel already connecting.
+//!
+//! `PvDatabase::setup_external_link_opens` is that pass. It enumerates link
+//! fields through `record_link_fields` — the same single owner
+//! `setup_cp_links` uses — and stages each external link through
+//! `stage_external_link_open_by_name`, i.e. the same `LinkPutQueue` owner
+//! that consumes `connect_link`. Nothing here opens a channel inline.
+
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::records::ao::AoRecord;
+use epics_base_rs::server::records::calc::CalcRecord;
+use epics_base_rs::types::EpicsValue;
+
+/// An lset whose cache is filled ONLY by `connect_link`, counting the names
+/// it was asked to connect. Models a monitor-fed resolver: the value appears
+/// because the open created a subscription, not because anyone read.
+struct CountingLset {
+    cache: parking_lot::Mutex<Option<EpicsValue>>,
+    opened: parking_lot::Mutex<Vec<String>>,
+    network_reads: Arc<AtomicUsize>,
+}
+
+impl CountingLset {
+    fn new(reads: &Arc<AtomicUsize>) -> Arc<Self> {
+        Arc::new(Self {
+            cache: parking_lot::Mutex::new(None),
+            opened: parking_lot::Mutex::new(Vec::new()),
+            network_reads: Arc::clone(reads),
+        })
+    }
+
+    fn opened_names(&self) -> Vec<String> {
+        let mut v = self.opened.lock().clone();
+        v.sort();
+        v
+    }
+}
+
+#[async_trait::async_trait]
+impl LinkSet for CountingLset {
+    async fn is_connected(&self, _: &str) -> bool {
+        self.cache.lock().is_some()
+    }
+
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.network_reads.fetch_add(1, Ordering::SeqCst);
+        self.connect_link(name).await;
+        self.cache.lock().clone()
+    }
+
+    async fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        self.cache.lock().clone()
+    }
+
+    async fn connect_link(&self, name: &str) {
+        self.opened.lock().push(name.to_string());
+        *self.cache.lock() = Some(EpicsValue::Double(12.5));
+    }
+}
+
+async fn add_ai(db: &PvDatabase, name: &str, inp: &str) {
+    db.add_record(name, Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record(name).expect("just added");
+    let mut inst = rec.write();
+    inst.put_common_field("INP", EpicsValue::String(inp.into()))
+        .unwrap();
+    inst.common.udf = 0;
+}
+
+async fn add_ao(db: &PvDatabase, name: &str, out: &str) {
+    db.add_record(name, Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record(name).expect("just added");
+    let mut inst = rec.write();
+    inst.put_common_field("OUT", EpicsValue::String(out.into()))
+        .unwrap();
+    inst.common.udf = 0;
+}
+
+async fn process(db: &PvDatabase, name: &str) {
+    let mut visited = HashSet::new();
+    db.process_record_with_links(name, &mut visited, 0)
+        .await
+        .unwrap();
+}
+
+async fn val_of(db: &PvDatabase, name: &str) -> Option<f64> {
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
+    inst.record.val().and_then(|v| v.to_f64())
+}
+
+/// Boundary — a plain (non-CP) external INP link. `dbInitLink` does not
+/// consult the `CP`/`CPP` modifier before calling `dbCaAddLink`, so this
+/// link is opened at init like any other. The port must therefore stage it
+/// in the iocInit pass, NOT on the first scan's cache miss: the observable
+/// consequence is that scan 1 already reads a warm cache.
+#[tokio::test]
+async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    // No `CP` / `CPP` modifier — `setup_cp_links` ignores this link entirely.
+    add_ai(&db, "AI_PLAIN", "ca://REMOTE:IN").await;
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 1, "the plain external INP link must be staged");
+    db.sync_external_link_puts().await;
+
+    assert_eq!(
+        lset.opened_names(),
+        vec!["REMOTE:IN".to_string()],
+        "the work owner opened the link at init, before any record scan"
+    );
+
+    // The parity payoff: no cold cycle. Pre-fix, scan 1 missed the cache,
+    // staged the open, and left the record at its prior value.
+    process(&db, "AI_PLAIN").await;
+    assert_eq!(
+        val_of(&db, "AI_PLAIN").await,
+        Some(12.5),
+        "the first scan of a link opened at init reads a warm cache"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the record thread must never reach the network-capable get_value"
+    );
+}
+
+/// Boundary — an OUT-only external link. `dbCaAddLink` is reached from
+/// `dbInitLink` above the `dbfType` switch (`dbLink.c:118-130`), so C opens
+/// `DBF_OUTLINK` channels at init too; only the `pvlOptInpNative` /
+/// `pvlOptFWD` flags below it are direction-specific.
+#[tokio::test]
+async fn out_only_external_link_is_opened_at_init() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ao(&db, "AO_PLAIN", "ca://REMOTE:OUT").await;
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 1, "an OUT-only external link must be staged");
+    db.sync_external_link_puts().await;
+    assert_eq!(
+        lset.opened_names(),
+        vec!["REMOTE:OUT".to_string()],
+        "C's open-at-init is direction-agnostic"
+    );
+}
+
+/// Boundary — record-specific input link fields (`INPA..`) go through the
+/// same `record_link_fields` enumeration, so an external `INPA` is opened
+/// at init exactly like `INP`. This is the property that would break if the
+/// pass grew its own field list instead of reusing the CP pass's owner.
+#[tokio::test]
+async fn record_specific_input_link_fields_are_opened_at_init() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("CALC1", Box::new(CalcRecord::new("A+B")))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("CALC1").expect("just added");
+        let mut inst = rec.write();
+        inst.record
+            .put_field("INPA", EpicsValue::String("ca://REMOTE:A".into()))
+            .unwrap();
+        inst.record
+            .put_field("INPB", EpicsValue::String("ca://REMOTE:B".into()))
+            .unwrap();
+    }
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 2, "both INPA and INPB must be staged");
+    db.sync_external_link_puts().await;
+    assert_eq!(
+        lset.opened_names(),
+        vec!["REMOTE:A".to_string(), "REMOTE:B".to_string()],
+    );
+}
+
+/// Boundary — a local link stages nothing. C's `dbInitLink` resolves it via
+/// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:118-124`);
+/// a `CONSTANT` link returns even earlier (`dbLink.c:101-104`). Neither may
+/// consume the link queue's one-shot open.
+#[tokio::test]
+async fn local_and_constant_links_stage_nothing() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("LOCAL_TGT", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    add_ai(&db, "AI_LOCAL", "LOCAL_TGT").await; // plain DB link
+    add_ai(&db, "AI_CONST", "3.5").await; // CONSTANT link
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 0, "no external link exists in this database");
+    db.sync_external_link_puts().await;
+    assert!(
+        lset.opened_names().is_empty(),
+        "a local or constant link must not open an external channel, got {:?}",
+        lset.opened_names()
+    );
+    assert_eq!(db.external_link_opens_completed(), 0);
+}
+
+/// Boundary — the CP path is not double-staged. `setup_cp_links` already
+/// warms external CP/CPP links, and this pass re-visits the same fields.
+/// Both derive the queue key from the same boundary name, and `stage_open`
+/// is once-per-key and terminal (`link_put_queue.rs:346-369`), so the link
+/// is connected exactly once: C stages one `CA_CONNECT` per link and libca
+/// owns every retry from then on.
+#[tokio::test]
+async fn external_cp_link_already_warmed_is_not_staged_again() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ai(&db, "AI_CP", "ca://REMOTE:CP CP").await;
+
+    db.setup_cp_links().await; // warms it through resolve_external_pv
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(
+        staged, 0,
+        "the CP pass already staged this link's open; the init pass must not \
+         stage a second one"
+    );
+    db.sync_external_link_puts().await;
+
+    assert_eq!(
+        lset.opened_names(),
+        vec!["REMOTE:CP".to_string()],
+        "exactly one connect, from exactly one staged open"
+    );
+    assert_eq!(
+        db.external_link_opens_completed(),
+        1,
+        "the work owner completed one open, not two"
+    );
+}
+
+/// Boundary — no link set registered. The queue's open state is terminal,
+/// so staging against an empty lset list would mark the link `Done` and burn
+/// its one connect: a link set installed later (the `AfterCaLinkInit`
+/// installers run before this pass, but a test or a late installer may not
+/// have) would then never be asked to open it. The gate keeps the link
+/// stageable.
+#[tokio::test]
+async fn no_link_set_registered_stages_nothing_and_leaves_the_link_openable() {
+    let db = PvDatabase::new();
+    add_ai(&db, "AI_NOLSET", "ca://REMOTE:IN").await;
+
+    assert_eq!(
+        db.setup_external_link_opens().await,
+        0,
+        "no lset addresses this link yet, so nothing may be staged"
+    );
+
+    // Register the lset afterwards: the link must still be stageable.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    db.register_link_set("ca", lset.clone()).await;
+    assert_eq!(db.setup_external_link_opens().await, 1);
+    db.sync_external_link_puts().await;
+    assert_eq!(lset.opened_names(), vec!["REMOTE:IN".to_string()]);
+}

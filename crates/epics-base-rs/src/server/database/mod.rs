@@ -1167,52 +1167,17 @@ impl PvDatabase {
     pub(crate) async fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
-        // dispatch in record/link.rs).
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            // No prefix — try every registered lset in turn. The
-            // first one with a value for `name` wins. Schemes are
-            // single-digit so this is cheap.
-            let registry = self.inner.link_sets.load_full();
-            let lsets: Vec<_> = registry
-                .schemes()
-                .iter()
-                .filter_map(|s| registry.get(s))
-                .collect();
-            drop(registry);
-            let any_lset = !lsets.is_empty();
-            for lset in lsets {
-                if let Some(v) = lset.get_cached_value(name).await {
-                    return Some(v);
-                }
-            }
-            if any_lset {
-                self.stage_external_link_open(link_put_queue::LinkTarget::Any, name);
-            }
-            // Fall through to legacy resolver.
-            let resolver = self
-                .inner
-                .external_resolver
-                .load_full()
-                .map(|r| (*r).clone());
-            return match resolver {
-                Some(r) => r(name).await,
-                None => None,
-            };
-        };
-        let lset = self.inner.link_sets.load().get(scheme);
-        if let Some(lset) = lset {
+        // dispatch in record/link.rs). `Any` tries every registered
+        // lset in turn; the first one with a cached value wins.
+        let (target, body) = Self::split_external_link_name(name);
+        for lset in link_put_queue::resolve_lsets(&self.inner, &target) {
             if let Some(v) = lset.get_cached_value(body).await {
                 return Some(v);
             }
-            self.stage_external_link_open(
-                link_put_queue::LinkTarget::Scheme(scheme.to_string()),
-                body,
-            );
         }
+        self.stage_external_link_open_by_name(name);
+        // Fall through to legacy resolver, which is addressed with the
+        // caller's string verbatim (scheme prefix and all).
         let resolver = self
             .inner
             .external_resolver
@@ -1224,18 +1189,55 @@ impl PvDatabase {
         }
     }
 
+    /// Split an external link's boundary name
+    /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
+    /// work-queue target plus the name the lset is addressed with.
+    ///
+    /// Single owner of the `ca://` / `pva://` prefix convention: the
+    /// cache-miss stage in [`Self::resolve_external_pv`] and the iocInit
+    /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
+    /// the same [`link_put_queue::LinkKey`] from the same link, or the
+    /// queue's once-per-link open would fire twice under two spellings.
+    fn split_external_link_name(name: &str) -> (link_put_queue::LinkTarget, &str) {
+        if let Some(rest) = name.strip_prefix("pva://") {
+            (link_put_queue::LinkTarget::Scheme("pva".to_string()), rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            (link_put_queue::LinkTarget::Scheme("ca".to_string()), rest)
+        } else {
+            (link_put_queue::LinkTarget::Any, name)
+        }
+    }
+
+    /// Stage the open of the external link named `name` — the boundary
+    /// form of [`Self::stage_external_link_open`], which splits the
+    /// scheme prefix and applies the "an lset must exist" gate.
+    ///
+    /// The gate matters because the queue's open state is terminal: an
+    /// open staged while no lset is registered would be serviced against
+    /// an empty lset list and marked `Done`, burning the link's one and
+    /// only connect. Returns true when this call is the one that staged
+    /// it (false when already staged, or when no lset addresses it).
+    pub(crate) fn stage_external_link_open_by_name(&self, name: &str) -> bool {
+        let (target, body) = Self::split_external_link_name(name);
+        if link_put_queue::resolve_lsets(&self.inner, &target).is_empty() {
+            return false;
+        }
+        self.stage_external_link_open(target, body)
+    }
+
     /// Single owner of the "this external link needs opening" transition —
     /// C `dbCaAddLink`'s `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`).
     ///
     /// Every caller routes through here so the open runs on the link work
-    /// owner and nowhere else; no path may call `LinkSet::open_link`
-    /// directly from a record-processing thread. Cheap and idempotent: the
-    /// queue drops a repeat stage for a link it has already opened.
-    pub(crate) fn stage_external_link_open(
-        &self,
-        target: link_put_queue::LinkTarget,
-        name: &str,
-    ) -> bool {
+    /// owner and nowhere else; no path may call
+    /// [`link_set::LinkSet::connect_link`] directly from a record-processing
+    /// thread. Cheap and idempotent: the queue drops a repeat stage for a
+    /// link it has already opened.
+    ///
+    /// Private to the `database` module, and reached only through
+    /// [`Self::stage_external_link_open_by_name`], so no caller can skip the
+    /// scheme split or the lset gate and mint a `LinkKey` of its own shape.
+    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &str) -> bool {
         self.inner
             .link_puts
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));

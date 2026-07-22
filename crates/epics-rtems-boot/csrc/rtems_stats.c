@@ -52,7 +52,10 @@
  * the bring-up box hit first: at 142 concurrent CA connections the 143rd was
  * refused by the libbsd socket zone, derived from this cap. So this pair is
  * the most predictive thing the IOC can publish about how close it is to
- * refusing clients.
+ * refusing clients — and MEASURED, it is the *only* one that sees this wall:
+ * CA_REFUSED_CNT stayed 0 through the whole ramp, because an accept-time
+ * ENFILE happens before a client object exists. Cap, walls and the operator
+ * consequences: doc/rtems-fd-ceiling-deviation.md.
  */
 int epics_rtems_boot_fd_usage(uint32_t *used, uint32_t *max) {
   uint32_t i;

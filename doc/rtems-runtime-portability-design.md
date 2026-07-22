@@ -691,6 +691,20 @@ These were reasoned from source/library presence, **not** compiled:
   task, heartbeat and gate driver are select arms, not tasks). The budget
   still needs measuring, but the per-connection multiplier is now bounded by
   design rather than by workload.
+  **Narrowed 2026-07-22 by measurement on the box:** the *connection* ceiling
+  is now known. Two walls bind — the descriptor cap (142 CA connections
+  served, #143 refused with `ENFILE`) and heap (151 served on an image whose
+  cap was raised to 400, refused with `EAGAIN` on thread creation) — so the
+  effective ceiling is 142 and raising the cap alone buys nine. Full record,
+  including how our cap deviates (we run base's *score*-arm 150 on a target
+  where base compiles the *POSIX* arm and runs 64), how to override it without
+  a source edit, and what an operator can watch:
+  **`doc/rtems-fd-ceiling-deviation.md`**. *Inferred, not
+  separately measured:* neither observed refusal was an RTEMS object-table
+  exhaustion, and `CONFIGURE_UNLIMITED_OBJECTS` is set
+  (`csrc/rtems_config.c`), so the configured task limit was not the binding
+  constraint in these runs — but the task count itself was still never
+  counted, and that is what stays open here.
 - ~~The `rtems-exec-model` feature-ON full `epics-ca-rs` suite is red.~~
   **CLOSED 2026-07-21 (`aea5d73d`): the suite is now a usable gate — 569
   tests, exit 0 on four consecutive runs** (three by the implementer, one by

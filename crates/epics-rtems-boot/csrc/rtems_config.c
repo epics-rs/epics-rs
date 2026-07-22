@@ -110,7 +110,15 @@ extern void *POSIX_Init(void *argument);
  * across epics-base-rs, epics-ca-rs and epics-pva-rs returns zero hits, because
  * this port is blocking thread-per-connection with no reactor anywhere. Base's
  * own score arm sets 150 (`score/rtems_config.c:36`), so that is the value
- * taken here.
+ * taken here — 150 is base's own number, not one invented for this shim.
+ *
+ * But base does not compile both arms. configure/toolchain.c:32-35 selects
+ * OS_API = posix when __RTEMS_MAJOR__ >= 5, and RTEMS/Makefile:15 (`SRC_DIRS +=
+ * ../$(OS_API)`) with :27 pulls rtems_config.c out of the arm that selected.
+ * So an RTEMS 6 build of base compiles the POSIX arm, and the ceiling base
+ * ACTUALLY RUNS WITH on this target is 64. The deviation is which arm's number
+ * we run, not the number: we run the score arm's 150 where base runs the POSIX
+ * arm's 64.
  *
  * This is the binding constraint on concurrent clients: one connection is one
  * descriptor however many threads serve it.
@@ -124,8 +132,51 @@ extern void *POSIX_Init(void *argument);
  * The FD_SETSIZE worry is settled too, and does not bind: newlib's
  * sys/select.h:33-34 takes the __rtems__ arm and defines FD_SETSIZE 256
  * (confirmed by preprocessing with the real BSP include path), so 150 is under
- * the ceiling even for a library that does call select().
- * Overridable from the build so the box can bisect it without a source edit.
+ * the ceiling even for a library that does call select(). That measurement is
+ * the load-bearing half — it holds whatever our own code does, and only a cap
+ * above 256 would re-open the question. Do not re-litigate it.
+ *
+ * THE VALUE BELOW IS NOT HARD-CODED. The #ifndef wrapper is deliberate: any
+ * -D CONFIGURE_MAXIMUM_FILE_DESCRIPTORS=N reaching this file's compile line
+ * wins, so the box can bisect the ceiling without a source edit. The fd=400
+ * image whose memory-wall number appears below is an image with a different
+ * cap; this wrapper is the route by which one exists.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS IS A DEVIATION: we run base's score-arm 150 on a target where base
+ * itself compiles the POSIX arm and runs 64 (see the arm selection above).
+ * Full record, with every measurement: `doc/rtems-fd-ceiling-deviation.md`.
+ * ---------------------------------------------------------------------------
+ *
+ * MEASURED on the bring-up box, identical driver (raw CA TCP, version
+ * handshake, one CA_PROTO_CREATE_CHAN, "served" only on reply 18):
+ *
+ *   stock EPICS base, cap 64        -> 53 served, #54 refused
+ *   base rebuilt at our cap 150     -> 139 served, #140 refused
+ *   epics-rs, cap 150               -> 142 served, #143 refused
+ *
+ * Same console line and same errno on both stacks — "[zone: socket]
+ * kern.ipc.maxsockets limit reached" / "CAS: Client accept ERROR: Too many
+ * open files in system" (ENFILE). C is 3 lower at the same cap only because it
+ * holds 3 more descriptors itself at idle, not because it serves worse.
+ *
+ * TWO WALLS, and 142 is not the memory one:
+ *
+ *   fd wall     = MAXIMUM_FILE_DESCRIPTORS - 8 = 142   (unchanged by more RAM)
+ *   memory wall = free heap / 1,589,000 B     = 151   (roughly doubles w/ RAM)
+ *
+ * The 8 is what the IOC itself holds at idle; the status PVs confirm it
+ * (FD_CNT + FD_FREE = FD_MAX = 150 on every row, FD_FREE = 142 at zero
+ * connections), and so does the errno being ENFILE rather than ENOMEM. The
+ * effective ceiling is the LOWER of the two, so raising either one alone buys
+ * almost nothing.
+ *
+ * DO NOT RE-RUN THE 300-CONNECTION RAMP TO FIND THIS OUT: it was already run on
+ * an image with this cap at 400, where the fd wall no longer binds. Memory then
+ * binds at 151 served, with EAGAIN (thread creation) refusals instead of
+ * ENFILE, by two independent derivations (300 attempted / 149 refused, and
+ * (259,803,736 - 19,880,696)/1,589,000 = 150.99). So raising this cap buys
+ * NINE connections, 142 -> 151, and then the 256 MB guest is out of heap.
  */
 #ifndef CONFIGURE_MAXIMUM_FILE_DESCRIPTORS
 #define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 150

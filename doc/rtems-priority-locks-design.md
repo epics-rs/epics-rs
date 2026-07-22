@@ -318,8 +318,8 @@ reachable from any banded RTEMS thread.
 |---|---|---|---|---|---|
 | **L1** | per-record advisory write gate | `record_lock.rs:85` map → `Arc<tokio::sync::Mutex<()>>` (`:72`, `:101`) | `scan-N` `scan.rs:121`→`:166`; `scanOnce`; `CAS-client` `ca blocking.rs:1244`; `PVAS-conn` `pva blocking.rs:976` | **PI** | §2. The whole design. |
 | **L7** | `ProcessVariable::subscribers` | `pv.rs:325` `Mutex<Vec<Subscriber>>`, import `pv.rs:6` = tokio | `CAS-client` `ca blocking.rs:1216`, `:1334` (`block_on_sync(pv.remove_subscriber(…))`) | **PI** | Critical sections at `pv.rs:629`, `:776`, `:834`, `:842` are `Vec` push/retain; none contains an `.await`. Converts by type swap once the callers stop being `async fn` — same `!Send` constraint as §1.3. |
-| **L8a** | `simple_pvs` | `database/mod.rs:231` | every put/get path, e.g. `field_io.rs:595`, `:877`, `:2182` | **PI** (RwLock) | Read on the CA write hot path. Needs the PI-RwLock decision (§5 step 3). |
-| **L8b** | `scan_index` | `database/mod.rs:246` | `scan-N` via `records_for_scan` (`scan.rs:163`); written by `update_scan_index` (`scan_index.rs:35`) | **PI** (RwLock) | Both ends banded; the highest-contention L8 row. |
+| **L8a** | `simple_pvs` | `database/mod.rs:231` | every put/get path, e.g. `field_io.rs:595`, `:877`, `:2182` | **PI** (mutex) | Read on the CA write hot path. **§5.3 addendum: decided — single `PriorityInheritanceMutex`; PI RwLock rejected (no POSIX protocol, no C analogue). Converts in step 4.** |
+| **L8b** | `scan_index` | `database/mod.rs:246` | `scan-N` via `records_for_scan` (`scan.rs:163`); written by `update_scan_index` (`scan_index.rs:35`) | **PI** (mutex) | Both ends banded; the highest-contention L8 row. **§5.3 addendum: decided — one `PriorityInheritanceMutex` per `ScanList` bucket (C `scan_list.lock` shape). Converts in step 4.** |
 | **L8c** | `load_order` | `database/mod.rs:252` | record add/remove | **ArcSwap** | Written at `mod.rs:1528` (`remove_record`) — **not** init-only, so the invalidating condition is runtime record removal. |
 | **L8d** | `cp_links` | `database/mod.rs:258` | processing, every CP fan-out | **ArcSwap** | Writes at `links.rs:2596` (link registration, init) and `mod.rs:1533` (`remove_record`, runtime). Condition as L8c. |
 | **L8e** | `external_cp_links` | `database/mod.rs:267` | same | **ArcSwap** | Write at `links.rs:2647`. |
@@ -473,11 +473,148 @@ carries a **done-check** that is a command or an observation, not a judgement.
 |---|---|---|---|---|
 | **1** | **RTEMS arm for `PriorityInheritanceMutex`.** §4: local `extern "C"` `rtems_pi` module in `runtime/sync.rs`, three-way cfg (§4.4), probe-and-fall-back (§4.3 note 1), `is_pi_mutex_active()` updated. No call sites added. | Nothing below can be verified on target until the type is real there. Independent of the L1 decision, so it can start immediately. | **S** | `./scripts/rtems-check.sh` exit 0 **and** a target boot prints the PI line. On host: `cargo nextest run -p epics-base-rs runtime::sync` green with the existing two tests, plus a new test asserting `is_pi_mutex_active()` matches the cfg on each arm. |
 | **2** | **Option C — priority-ordered async gate for L1.** Replace `tokio::sync::Mutex<()>` in `RecordLockRegistry` (`record_lock.rs:85`, `:101`) with a gate whose waiter queue orders by the waiter's EPICS band, read from a thread-local set by `enter_ioc_thread`. **API unchanged** — still `async fn lock_record`, still hands out a `Send` guard, so **zero callers change**. | Closes **gap 3** for the one lock that matters, without waiting on the XL step 5. It is the only step that improves anything before H6 lands. | **M** | A test in `record_lock.rs` that parks three waiters at bands 20/63/70 on a held gate, releases it, and asserts wake order 70, 63, 20 — failing on `main` (which is FIFO), passing after. The five existing tests at `:203-332` stay green unchanged. |
-| **3** | **Decide the PI RwLock question, and remove the six ArcSwap rows.** `PriorityInheritanceMutex` is mutex-only (`sync.rs:27`); L8a/L8b are `RwLock`s. Either add a PI RwLock or demote them, with the read-concurrency cost stated. In the same change convert L8c–L8k (`ArcSwap`/`OnceLock`, §3) — that removes **nine** rows from the table rather than reclassifying them. | Shrinks the surface steps 4–6 apply to, and answers a question step 4 would otherwise be blocked on. Structural: it deletes locks. | **M** | `rg -n "runtime::sync::RwLock" crates/epics-base-rs/src/server/database/mod.rs` returns **2** rows (L8a, L8b), down from 11. `cargo nextest run -p epics-base-rs` green. |
-| **4** | **L1 + L46 → PI, and write down the acquisition order.** Convert `RecordLockRegistry::gates` (`record_lock.rs:85`) and `registration_mutex` (`database/mod.rs:288`) **together** (§3 cross-check), make `lock_record`/`lock_records` synchronous, and convert the two free holders **H3** (`field_io.rs:1165`) and **H5** (`field_io.rs:2198`). State the L1 → L46 → L8b order as a MUST rule in `record_lock.rs`'s module doc, with the single owner named. | The gate type change is the point of the whole exercise; H3/H5 prove the new API before the hard holders touch it. | **M** | `cargo nextest run -p epics-base-rs -p epics-bridge-rs` green. `is_pi_mutex_active()` true on the RTEMS build. A test that a second `lock_record` on a held gate from another thread does not return until release (the blocking analogue of `lock_record_excludes_same_record`, `record_lock.rs:211`). |
+| **3** | **Decide the PI RwLock question, and remove the six ArcSwap rows.** `PriorityInheritanceMutex` is mutex-only (`sync.rs:27`); L8a/L8b are `RwLock`s. Either add a PI RwLock or demote them, with the read-concurrency cost stated. In the same change convert L8c–L8k (`ArcSwap`/`OnceLock`, §3) — that removes **nine** rows from the table rather than reclassifying them. **DECIDED — see §5.3 addendum:** demote both to `PriorityInheritanceMutex` (L8b sharded per `ScanList`); the PI-RwLock option is rejected with evidence; the *conversion* of L8a/L8b moves to step 4 because it cannot land before step 1 and must land with L46. | Shrinks the surface steps 4–6 apply to, and answers a question step 4 would otherwise be blocked on. Structural: it deletes locks. | **M** | `rg -n "runtime::sync::RwLock" crates/epics-base-rs/src/server/database/mod.rs` returns **2** rows (L8a, L8b), down from 11. `cargo nextest run -p epics-base-rs` green. |
+| **4** | **L1 + L46 → PI, and write down the acquisition order.** Convert `RecordLockRegistry::gates` (`record_lock.rs:85`), `registration_mutex` (`database/mod.rs:288`) **and — per the §5.3 addendum — L8a `simple_pvs` (`:231`) and L8b `scan_index` (`:246`)** **together** (§3 cross-check), make `lock_record`/`lock_records` synchronous, and convert the two free holders **H3** (`field_io.rs:1165`) and **H5** (`field_io.rs:2198`). State the L1 → L46 → L8b order as a MUST rule in `record_lock.rs`'s module doc, with the single owner named. | The gate type change is the point of the whole exercise; H3/H5 prove the new API before the hard holders touch it. | **M** | `cargo nextest run -p epics-base-rs -p epics-bridge-rs` green. `is_pi_mutex_active()` true on the RTEMS build. A test that a second `lock_record` on a held gate from another thread does not return until release (the blocking analogue of `lock_record_excludes_same_record`, `record_lock.rs:211`). |
 | **5** | **H6 — `process_record_with_links_inner`.** The XL step. Lift the L1-held region out of the async body: after step 3 most of the 37 awaits are no longer awaits, and the genuinely suspending ones (`:1710`, `:3347`) must move outside the window — which is what C does, `dbProcess` releasing at `PACT`. | Every remaining holder is blocked on this one. It is also the only step where the port can end up *wrong* rather than merely unconverted. | **XL** | `process_record_with_links` compiles as `fn`, not `async fn`. `cargo nextest run --workspace` green — in particular `epics-base-rs/tests/database_tests.rs:8793-8865` (the two `lock_records`-epoch exclusion tests) unchanged and passing. `./scripts/rtems-check.sh` exit 0. |
 | **6** | **The remaining holders, in dependency order.** **H8** (`group.rs:861`, hoist `lock_group_records_read` above the gate — **S**, independent of H6, can be done any time after step 4). Then **H1**/**H2** (`field_io.rs:611`/`:895`, with the §2 semantic decision signed off). Then **H4** (`field_io.rs:1392`), **H7** (`integration.rs:1060`), **H9** (`group.rs:1722`) — all blocked on step 5. Then **L33** (`qsrv/group_config.rs:64`), which inherits L1's decision verbatim. | Mechanical once step 5 lands; splitting them keeps each panel task reviewable. | **L** total | `rg -n "OwnedMutexGuard" crates/` returns **zero** production hits. `cargo nextest run --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` green. |
 | **7** | **Make it reachable and measurable.** Wire the startup report (§4.4 note 2) — `is_pi_mutex_active()` gets its first caller. Add an on-target latency regression: hold L1 from a `CAS-client`-band thread, contend from a `scan-N`-band thread, run a mid-band thread in between, and fail when the high-priority waiter is delayed beyond a stated bound. Re-measure the thread census on target (the §0-finding-4 `scan-N` bands are UNVERIFIED). | Without it, steps 1–6 are unfalsifiable and §8.0 gaps 3/4 cannot be *closed*, only claimed. | **M** | The regression **fails** on a build with the PI arm disabled and **passes** with it enabled — both runs on target, both recorded, as `doc/rtems-priority-on-target-measurement.md` records the band readback. |
+
+### §5.3 addendum — the PI RwLock decision (step-3 panel, worktree `VVK0HDQKKZ-pi-step3-arcswap-2013e606-1` @ `d58a31b3`)
+
+Written by the panel that executed step 3. Everything below was read in that
+worktree; the C citations are `/home/stevek/work/epics-base` @ `669a25697`, the
+same reference this document's Provenance names.
+
+**Decision.** L8a `simple_pvs` and L8b `scan_index` become
+`PriorityInheritanceMutex`, **not** a reader-writer lock and **not** `ArcSwap`.
+L8b becomes **one PI mutex per `ScanList` bucket**, not one lock over the map.
+The conversion itself is **deferred to step 4** and is listed there, not done in
+step 3 — see "why not now" below. The step-3 panel converted only L8c–L8k and
+L9.
+
+#### Option 1 — add a PI RwLock. **REJECTED.**
+
+*There is no priority protocol for a pthread rwlock, on any POSIX platform.*
+
+* glibc `/usr/include/pthread.h` declares the entire `pthread_rwlockattr_*`
+  family and it is six functions: `_init` `:1078`, `_destroy` `:1082`,
+  `_getpshared` `:1086`, `_setpshared` `:1092`, `_getkind_np` `:1097`,
+  `_setkind_np` `:1103`. There is no `_setprotocol`. By contrast
+  `pthread_mutexattr_setprotocol` is declared at `:913` and
+  `PTHREAD_PRIO_NONE`/`_INHERIT`/`_PROTECT` at `:84`.
+  `rg -n 'rwlockattr_setprotocol' /usr/include/` returns **zero hits**.
+* The pinned libc fork declares `pthread_rwlockattr_init` /
+  `pthread_rwlockattr_destroy` and nothing else, for all `unix`
+  (`src/unix/mod.rs:1422-1423`). So §4.3's escape hatch (i) — "declare it
+  locally, the symbol exists at link time" — has nothing to declare: the
+  function does not exist in any libc, it is not merely undeclared in Rust.
+* This is structural, not an API oversight. PI works by boosting **the owner**.
+  A read-held rwlock has N owners and the kernel tracks none of them, so there
+  is no thread to boost. That is why POSIX defines the protocol on mutexes
+  only.
+* **UNVERIFIED on the RTEMS target.** This host has no RTEMS sysroot
+  (Provenance), so the target's newlib `pthread.h` was not read; the claim
+  asserted here is the POSIX-level and libc-level one. It does not change the
+  decision, because option 1 also fails the parity test below independently.
+
+#### The parity test — C has no reader-writer lock anywhere
+
+* `rg -n 'pthread_rwlock' /home/stevek/work/epics-base/modules/` → **zero
+  hits**. `modules/libcom/src/osi/` ships `epicsMutex`, `epicsEvent` and
+  `epicsSpin`; there is no reader-writer primitive in the C IOC at all.
+* Both of our two rows have a named C analogue and **both are `epicsMutex`**:
+
+  | our lock | C analogue | C lock | taken for read at | taken for write at |
+  |---|---|---|---|---|
+  | **L8a** `simple_pvs` | process-variable directory, `dbPvdLib.c` | `epicsMutexId lock` per hash bucket, `:30`, created `:119` | `dbPvdFind` `:123-136` | `dbPvdAdd` `:150-162` |
+  | **L8b** `scan_index` | `scan_list.lock`, `dbScan.c:75`, created `:527`, `:604`, `:908` | `epicsMutexId` | `scanList` `:1007-1051` | `addToList` / `deleteFromList` `:1082-1123` |
+
+  On RTEMS 6 both are POSIX PI mutexes (§0 finding 2). So "demote to a PI
+  mutex" is not a downgrade against C — it **is** C's construction.
+
+#### Read-concurrency cost, quantified
+
+**L8a `simple_pvs` — 14 production read sites**, all reached from banded
+threads: `field_io.rs:493`, `:595`, `:790`, `:804`, `:826`, `:851`, `:877`,
+`:2182`; `mod.rs:801`, `:1473`, `:1565`, `:1645`, `:1739`, `:1853`.
+
+* *Who reads concurrently:* one `CAS-client-blocking <peer>` thread per CA TCP
+  connection, one `PVAS-conn` per PVA connection, the UDP search responders via
+  `has_name_from` (`mod.rs:1645`), and the scan/callback bands through the put
+  paths. On the RTEMS target that population is bounded in the **single digits**
+  by the 2 MiB-per-thread stack ceiling (~5 CA / ~3 PVA connections), not by the
+  lock.
+* *Critical section:* one `HashMap::get` plus an `Arc::clone` at 13 of the 14
+  sites. The exception is `all_simple_pv_names` (`mod.rs:1853`), which clones
+  every key and is reached only from iocsh dumps.
+* *Cost of demotion:* ≤ ~10 threads serialise on an O(1) section. C serialises
+  the same lookup at a **finer** grain (per hash bucket) than our single
+  map-wide lock, so the port is already coarser than C here and the demotion
+  does not make it coarser still. **Accepted.**
+
+**L8b `scan_index` — read through `records_for_scan` (`scan_index.rs:93`).**
+
+* *Who reads concurrently:* one periodic thread per rate, at most 7 (`scan-10`
+  … `scan-0.1`, bands 60–66, `scan.rs:44-50`), calling from `scan.rs:163`; plus
+  `scan_event.rs:123`, the I/O-Intr sweep (`ioc_app.rs:1419`) and iocsh
+  (`commands.rs:633`, `:643`, `:986`, `:989`). Each reads **once per tick**
+  (10 s … 0.1 s).
+* *Critical section:* `get(&list)` plus a clone of that bucket's names into a
+  `Vec<String>` — O(n) in one scan list, once per tick, released **before** the
+  processing loop. C's `scanList` (`dbScan.c:1007-1051`) does the same thing
+  differently: it holds `psl->lock` only for the cursor step and releases it
+  around every `dbProcess`. Neither holds its lock across processing.
+* *The real cost, and it is not a PI question:* C has **one lock per scan
+  list**; we have **one lock over the whole index map**. Demoting to a single
+  map-wide mutex would serialise 7 periodic threads that C never serialises
+  against each other — a structural mismatch we would be introducing, on the
+  one path where both ends are banded (§3 calls L8b "the highest-contention L8
+  row"). **Therefore L8b converts to one `PriorityInheritanceMutex` per
+  `ScanList` bucket**, which is C's shape and removes the cross-rate contention
+  entirely. L8a stays a single lock because its section is O(1); sharding it
+  the way `dbPvdLib` shards is a measured follow-up, not a prerequisite.
+
+#### Why not `ArcSwap`, the disposition the other nine rows get
+
+Both are read-mostly, but both have runtime writers whose cost under a
+whole-snapshot rebuild is quadratic:
+
+* `simple_pvs` writers are `add_pv` (`mod.rs:1082`), `add_pv_with_hooks_full`
+  (`:1147`) and `remove_simple_pv` (`:1175`). The CA gateway registers a shadow
+  simple PV **per client search**, at runtime — so this is not an init-only
+  cell, and a full-map rebuild per registration is O(n²) over gateway warm-up.
+* `scan_index` writers are `update_scan_index` (`scan_index.rs:30`) on every
+  SCAN/PHAS put, plus `add_loaded_record` (`mod.rs:1455`) and `remove_record`
+  (`:1523`). `add_loaded_record` runs once per record at load, so a rebuild per
+  add is O(n²) over database load.
+
+That write cost is exactly why §3 puts these two rows in the PI column and the
+other nine in the ArcSwap column. **Rejected.**
+
+#### Why the conversion is not done in step 3 — three blockers, all in step 4's scope
+
+1. **`PriorityInheritanceMutex` has no RTEMS arm until step 1** (§4.1: on
+   RTEMS it is `parking_lot::Mutex` and `is_pi_mutex_active()` is `false`).
+   Converting first spends the read concurrency on the target and buys no PI.
+2. **Two read sites hold the `simple_pvs` guard across an `.await`** —
+   `field_io.rs:595` and `:2182`, both `if let Some(pv) = …read().await.get(name)
+   { pv.set(value).await; … }`, where `pv` borrows out of the guard so the guard
+   is live across the await. A `parking_lot`/pthread guard there is `!Send`,
+   which makes those `async fn`s `!Send` futures and fails at the `tokio::spawn`
+   sites — §1.3's blocker, verbatim. Fixable with `.cloned()` and an explicit
+   drop, but that is a call-site edit, not a type swap.
+3. **The nesting rule is L46's.** Every `scan_index` write is taken *inside*
+   `registration_mutex` (`scan_index.rs:30`, `mod.rs:1365`, `:1503`), and
+   `simple_pvs`' writes likewise (`mod.rs:1082`, `:1147`, `:1175`). Converting
+   L8a/L8b while L46 stays tokio nests a blocking lock inside an async one on
+   the SCAN-put path — the combination §3's cross-check already names "the worst
+   of both". They must convert **with** L1 + L46, under the one written
+   acquisition order step 4 owns.
+
+So the target type is fixed here and the edit lands in step 4. Step 4's row and
+done-check should be read as covering L8a and L8b as well.
+
+---
 
 **Ordering note.** Steps 1, 2 and 3 are mutually independent and can run as
 three parallel panels. Step 4 needs 1 and 3. Step 5 needs 4. Step 6's H8 needs

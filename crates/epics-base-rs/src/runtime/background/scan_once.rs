@@ -107,6 +107,17 @@ impl Inner {
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "scanOnce worker";
 
+/// The scanOnce worker's EPICS band — `epicsThreadPriorityScanLow +
+/// nPeriodic` (`dbScan.c:776`), where `nPeriodic` is the number of periodic
+/// scan rates. C sizes it from menuScan at `scanInit`; here the same count is
+/// `server::scan::PERIODIC_SCANS.len()`, so the two cannot drift apart.
+/// 60 + 7 = 67: scanOnce preempts every periodic scan thread, as in C.
+fn scan_once_priority() -> ThreadPriority {
+    ThreadPriority::Custom(
+        ThreadPriority::ScanLow.value() + crate::server::scan::PERIODIC_SCANS.len() as u8,
+    )
+}
+
 /// Port of `onceTask` (`dbScan.c:700-730`): wait on the wake event, drain the
 /// ring, run each queued tail.
 fn once_loop(inner: &Inner) {
@@ -180,9 +191,12 @@ impl ScanOnceQueue {
             .stack_size(StackSizeClass::Big.bytes())
             .spawn(move || {
                 // dbScan.c:776 — priority `epicsThreadPriorityScanLow + nPeriodic`.
-                // With no periodic scan lists wired this increment, `nPeriodic`
-                // is 0, so the band is exactly ScanLow.
-                let _ = enter_ioc_thread(ThreadPriority::ScanLow);
+                // `nPeriodic` is the number of periodic scan rates (menuScan's
+                // seven periodic choices; `server::scan::PERIODIC_SCANS` here),
+                // so scanOnce preempts every periodic scan thread: 60 + 7 = 67.
+                // Measured on the C IOC on RTEMS 6: scanOnce OSIPRI 67
+                // (doc/upstream-rtems-bugs/measurement-c-thread-priority-on-rtems-6.md).
+                let _ = enter_ioc_thread(scan_once_priority());
                 // Losing this thread stops every FLNK/scanOnce tail in the
                 // IOC while records still accept writes.
                 run_facility_loop(
@@ -244,6 +258,19 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// `dbScan.c:776` — scanOnce runs at `ScanLow + nPeriodic`, above every
+    /// periodic scan thread. Measured on the C IOC on RTEMS 6 as OSIPRI 67;
+    /// this pins ours to the same number and to the periodic-rate count, so
+    /// adding or removing a rate moves both sides together.
+    #[test]
+    fn scan_once_band_is_scanlow_plus_n_periodic() {
+        assert_eq!(
+            scan_once_priority().value(),
+            ThreadPriority::ScanLow.value() + crate::server::scan::PERIODIC_SCANS.len() as u8
+        );
+        assert_eq!(scan_once_priority().value(), 67);
+    }
 
     /// Boundary: a queued tail that panics. `dbProcess` runs inside it, so
     /// before this one bad record stopped every FLNK and every `scanOnce` in

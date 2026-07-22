@@ -10,7 +10,12 @@ pub struct ScanScheduler {
 }
 
 /// All periodic scan types and their corresponding ScanType.
-const PERIODIC_SCANS: &[ScanType] = &[
+///
+/// `pub(crate)`: the scanOnce worker's priority is defined by C as
+/// `epicsThreadPriorityScanLow + nPeriodic` (`dbScan.c:776`), so
+/// `runtime::background::scan_once` needs this slice's length — one
+/// source of truth for "how many periodic rates exist".
+pub(crate) const PERIODIC_SCANS: &[ScanType] = &[
     ScanType::Sec01,
     ScanType::Sec02,
     ScanType::Sec05,

@@ -152,17 +152,21 @@ use crate::error::{PvaError, PvaResult};
 /// say) would be a design decision needing its own justification, not a
 /// default.
 ///
-/// This sits below CA's server threads — `CaServerLow` = 20 for a client
+/// This sits below CA's per-client threads — `CaServerLow` = 20 for a client
 /// connection and 19 for its event thread — which is the upstream ordering
-/// for an IOC serving both protocols. pvxs puts its UDP search collector
-/// lower still, at `CaServerLow-4` = 16 (`udp_collector.cpp:93`), so a SEARCH
-/// flood cannot starve established connections; that one arrives with the
-/// blocking UDP responder.
+/// for an IOC serving both protocols. It is level with CA's own accept loop,
+/// which takes the same `CaServerLow-2` from `caservertask.c`'s ladder
+/// (`epics_ca_rs::server::blocking`'s `CAS_TCP_PRIORITY`); pvxs puts its UDP
+/// search collector lower still, at `CaServerLow-4` = 16
+/// (`udp_collector.cpp:93`), where CA's name-search responder also sits, so a
+/// SEARCH flood cannot starve established connections.
 ///
-/// Applying it is opt-in and best effort (`EPICS_RS_ALLOW_RT_PRIORITY`), and
-/// on RTEMS the platform arm reports `Unsupported` today — the call sites are
-/// what matter, so that bring-up is a scheduler change and not a hunt for
-/// every thread spawn.
+/// Applying it is best effort and gated on `EPICS_RS_ALLOW_RT_PRIORITY`,
+/// which defaults **on** for RTEMS and off for hosted targets
+/// (`runtime::task::DEFAULT_POLICY`). On RTEMS the platform arm really does
+/// call `pthread_setschedparam`, and the number is load-bearing there: RTEMS
+/// pthreads inherit `POSIX_Init`'s priority, so a thread that does not take a
+/// band runs one level above idle rather than "at the default".
 const PVA_SERVER_PRIORITY: ThreadPriority = ThreadPriority::Custom(18);
 
 /// The EPICS priority the UDP SEARCH responder runs at — deliberately **not**

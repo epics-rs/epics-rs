@@ -1034,6 +1034,7 @@ dependencies = [
  "epics-rtems-boot",
  "parking_lot",
  "regex",
+ "rtems-exec-gate",
  "serde",
  "serde_json",
  "serial_test",

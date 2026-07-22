@@ -401,7 +401,7 @@ fn spawn_db_monitor_updates(
     mut monitor: super::group::AnyMonitor,
 ) -> mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate> {
     let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
-    tokio::spawn(async move {
+    epics_base_rs::runtime::task::spawn(async move {
         loop {
             // Park on poll() but stay responsive to downstream teardown.
             // An all-const / quiet monitor now *parks* in poll() (it no
@@ -835,7 +835,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 OpenedMonitor::Native(rx) => Some(rx.into()),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
-                    tokio::spawn(async move {
+                    epics_base_rs::runtime::task::spawn(async move {
                         loop {
                             // See `spawn_db_monitor_updates`: park on poll()
                             // but tear down on downstream drop so a quiet /
@@ -1131,7 +1131,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let mut monitor = channel.create_monitor().await.ok()?;
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
-            tokio::spawn(async move {
+            epics_base_rs::runtime::task::spawn(async move {
                 // Legacy ctx-less path: plain values, marked set dropped
                 // (the marked-aware cooked entry is `subscribe_checked_opts_marked`).
                 loop {

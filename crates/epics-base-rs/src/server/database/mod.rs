@@ -230,7 +230,25 @@ pub struct CpTarget {
 }
 
 struct PvDatabaseInner {
-    simple_pvs: crate::runtime::sync::RwLock<HashMap<String, Arc<ProcessVariable>>>,
+    /// The simple-PV directory — C's `dbPvdLib.c` process-variable directory,
+    /// whose per-bucket `epicsMutexId lock` (`:30`, created `:119`) is taken
+    /// for both `dbPvdFind` (`:123-136`) and `dbPvdAdd` (`:150-162`). C has no
+    /// reader-writer primitive anywhere in the IOC
+    /// (`rg pthread_rwlock epics-base/modules/` → zero hits), so a PI mutex is
+    /// not a demotion against C — it *is* C's construction.
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8a.
+    ///
+    /// **Every reader MUST bind the lookup result in a statement of its own**
+    /// (`let pv = …lock().get(name).cloned();`) rather than reading the map in
+    /// an `if let` scrutinee. The guard is `!Send`, and an `if let` scrutinee
+    /// temporary lives to the end of the `if let` *body* — so the scrutinee
+    /// form keeps the guard alive across any `.await` the body makes and turns
+    /// the enclosing `async fn` into a `!Send` future at its `tokio::spawn`
+    /// site. The rule is uniform across all 17 read sites, not applied only to
+    /// the ones that await today, so a new `.await` in an existing body cannot
+    /// re-open it.
+    simple_pvs:
+        crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
     records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
@@ -642,7 +660,7 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
-                simple_pvs: crate::runtime::sync::RwLock::new(HashMap::new()),
+                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
                 external_resolver: ArcSwapOption::empty(),
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
@@ -837,13 +855,14 @@ impl PvDatabase {
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
         let record_path = filters::split_channel_name(name).record_path;
-        if !self
+        // Own statement: the `!Send` guard must be down before the gate's
+        // `.await` below (see the `simple_pvs` field doc).
+        let known = self
             .inner
             .simple_pvs
-            .read()
-            .await
-            .contains_key(record_path.as_str())
-        {
+            .lock()
+            .contains_key(record_path.as_str());
+        if !known {
             return false;
         }
         !gate(record_path, peer).await
@@ -1126,13 +1145,9 @@ impl PvDatabase {
     /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -1191,7 +1206,7 @@ impl PvDatabase {
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
@@ -1200,11 +1215,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -1223,7 +1234,7 @@ impl PvDatabase {
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        self.inner.simple_pvs.write().await.remove(name)
+        self.inner.simple_pvs.lock().remove(name)
     }
 
     /// Enter the LOAD phase: records are being created and the database is not
@@ -1409,7 +1420,7 @@ impl PvDatabase {
         load: RecordLoad,
     ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
@@ -1513,8 +1524,13 @@ impl PvDatabase {
     /// three namespaces. Caller MUST hold `registration_mutex` so the
     /// peek-then-insert sequence is atomic — without that, two tasks
     /// can both see the name as free and race the insert.
-    async fn check_name_free(&self, name: &str) -> CaResult<()> {
-        let kind = if self.inner.simple_pvs.read().await.contains_key(name) {
+    ///
+    /// Synchronous: all three namespaces are blocking locks now, so this peek
+    /// makes no suspension point inside the `registration_mutex` hold — which
+    /// is what lets that gate become a `PriorityInheritanceMutex` whose `!Send`
+    /// guard may not cross an `.await`.
+    fn check_name_free(&self, name: &str) -> CaResult<()> {
+        let kind = if self.inner.simple_pvs.lock().contains_key(name) {
             Some("simple PV")
         } else if self.inner.records.read().contains_key(name) {
             Some("record")
@@ -1608,8 +1624,14 @@ impl PvDatabase {
         let record_path = filters::split_channel_name(name).record_path;
         let (base, _field) = parse_pv_name(&record_path);
 
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(record_path.as_str()) {
-            return Some(PvEntry::Simple(pv.clone()));
+        let simple = self
+            .inner
+            .simple_pvs
+            .lock()
+            .get(record_path.as_str())
+            .cloned();
+        if let Some(pv) = simple {
+            return Some(PvEntry::Simple(pv));
         }
         if let Some(rec) = self.inner.records.read().get(base) {
             return Some(PvEntry::Record(rec.clone()));
@@ -1644,7 +1666,7 @@ impl PvDatabase {
                 "alias target '{target}' is not a registered record"
             )));
         }
-        self.check_name_free(alias).await?;
+        self.check_name_free(alias)?;
         self.inner
             .aliases
             .write()
@@ -1689,8 +1711,7 @@ impl PvDatabase {
         if self
             .inner
             .simple_pvs
-            .read()
-            .await
+            .lock()
             .contains_key(record_path.as_str())
         {
             return true;
@@ -1782,10 +1803,7 @@ impl PvDatabase {
 
     /// Look up a simple PV by name (backward-compatible).
     pub async fn find_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
-            return Some(pv.clone());
-        }
-        None
+        self.inner.simple_pvs.lock().get(name).cloned()
     }
 
     /// Get a record Arc by name. Alias-aware (epics-base PR #336):
@@ -1896,7 +1914,7 @@ impl PvDatabase {
 
     /// Get all simple PV names.
     pub async fn all_simple_pv_names(&self) -> Vec<String> {
-        self.inner.simple_pvs.read().await.keys().cloned().collect()
+        self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
 

@@ -490,7 +490,8 @@ impl PvDatabase {
         let field = field.to_ascii_uppercase();
 
         // Check simple PVs first (exact match)
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             return Ok(pv.get());
         }
 
@@ -591,8 +592,11 @@ impl PvDatabase {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
-        // Check simple PVs first
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
+        // Check simple PVs first. The lookup is its own statement so the
+        // `!Send` directory guard is down before `pv.set(…).await` — see the
+        // `simple_pvs` field doc in `database/mod.rs`.
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.set(value).await;
             return Ok(());
         }
@@ -787,7 +791,8 @@ impl PvDatabase {
     /// PVs — those carry their own `common.sevr/stat` in record
     /// processing.
     pub async fn post_alarm(&self, name: &str, severity: u16, status: u16) -> CaResult<()> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.post_alarm(severity, status).await;
             return Ok(());
         }
@@ -801,7 +806,8 @@ impl PvDatabase {
     /// `DBR_TIME_*` frame. Returns `ChannelNotFound` for record-backed PVs
     /// (those carry their own alarm engine and are not shadow PVs).
     pub async fn put_pv_and_post_snapshot(&self, name: &str, snapshot: Snapshot) -> CaResult<()> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.set_snapshot(snapshot).await;
             return Ok(());
         }
@@ -823,7 +829,8 @@ impl PvDatabase {
     /// Returns `ChannelNotFound` for record-backed PVs — those own their own
     /// metadata via record processing and are not gateway shadow PVs.
     pub async fn set_pv_metadata(&self, name: &str, snapshot: &Snapshot) -> CaResult<()> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.set_metadata(metadata_from_snapshot(snapshot));
             return Ok(());
         }
@@ -848,7 +855,8 @@ impl PvDatabase {
     ///
     /// Returns `ChannelNotFound` for record-backed PVs.
     pub async fn post_pv_property(&self, name: &str, snapshot: Snapshot) -> CaResult<()> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.set_metadata(metadata_from_snapshot(&snapshot));
             pv.post_property(snapshot).await;
             return Ok(());
@@ -874,7 +882,8 @@ impl PvDatabase {
         // notify-subscribers fan-out internally so all we need here is
         // to delegate. The `origin` tag is a no-op for simple PVs
         // because they don't yet plumb origin through `set`.
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             let _ = origin; // simple PVs don't currently honor origin tagging
             pv.set(value).await;
             return Ok(());
@@ -2179,7 +2188,8 @@ impl PvDatabase {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
+        let simple = self.inner.simple_pvs.lock().get(name).cloned();
+        if let Some(pv) = simple {
             pv.set(value).await;
             return Ok(());
         }

@@ -559,10 +559,31 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
 mod tests {
     use super::*;
 
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
     fn key(name: &str) -> LinkKey {
         LinkKey {
             target: LinkTarget::Scheme("ca".to_string()),
             name: name.to_string(),
+        }
+    }
+
+    /// Read a completion out of its receiver with no runtime at all.
+    ///
+    /// The resolutions these tests assert — supersession and teardown — are
+    /// performed *synchronously*, inside `stage_put` and inside `Drop`, so
+    /// the receiver is `Ready` on its first poll and no reactor is involved.
+    /// Polling by hand rather than `.await`ing says exactly that: `Pending`
+    /// means the completion was left unresolved, which is the invariant
+    /// under test, and it fails here instead of hanging. It also keeps both
+    /// tests running under `--features rtems-exec-model` and adds no site to
+    /// this file's RTEMS-EXEC-MODEL-ALLOW census.
+    fn resolved(rx: tokio::sync::oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
+        let mut rx = std::pin::pin!(rx);
+        match rx.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(out) => out.expect("completion resolved, not dropped"),
+            Poll::Pending => panic!("completion was left unresolved"),
         }
     }
 
@@ -634,17 +655,16 @@ mod tests {
     /// newer put supersedes it. C overwrites `pca->putCallback`
     /// (`dbCa.c:614-621`) and the earlier callback never fires; we resolve it
     /// with an error instead, so no pending put loses its classification.
-    #[tokio::test]
-    async fn superseded_completion_is_resolved_not_dropped() {
+    #[test]
+    fn superseded_completion_is_resolved_not_dropped() {
         let q = LinkPutQueue::default();
         let rx = q
             .stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Async)
             .expect("Async put yields a completion");
         q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Async);
 
-        let out = rx.await.expect("completion resolved, not dropped");
         assert!(
-            out.unwrap_err().contains("superseded"),
+            resolved(rx).unwrap_err().contains("superseded"),
             "a superseded completion must say so"
         );
     }
@@ -652,16 +672,15 @@ mod tests {
     /// Boundary: tearing the queue down resolves every pending completion.
     /// The `Drop` on `PutCompletion` is what makes this hold on *every* exit
     /// path, not just this one.
-    #[tokio::test]
-    async fn teardown_resolves_pending_completions() {
+    #[test]
+    fn teardown_resolves_pending_completions() {
         let q = LinkPutQueue::default();
         let rx = q
             .stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Async)
             .expect("Async put yields a completion");
         drop(q);
-        let out = rx.await.expect("completion resolved by teardown");
         assert!(
-            out.is_err(),
+            resolved(rx).is_err(),
             "a torn-down pending put must not report success"
         );
     }

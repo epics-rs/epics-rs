@@ -88,6 +88,36 @@ pub fn is_pi_mutex_active() -> bool {
     }
 }
 
+/// Print, once at boot, which lock protocol this process actually obtained.
+///
+/// C's counterpart is `epicsMutexShowAll`, which reports "PI is/is not
+/// enabled" (`os/posix/osdMutex.c:199-205`) — but that is an iocsh command,
+/// and the RTEMS target has no iocsh. So this is an `eprintln!` from the boot
+/// path, deliberately not a `tracing` event: a subscriber can be absent,
+/// installed late, or filtered, and a diagnostic that reports whether a
+/// guarantee exists must not itself depend on one.
+///
+/// **Two facts on one line, because either alone is misleading.** Priority
+/// inheritance on the record gate needs *both* the probe to have returned
+/// `PTHREAD_PRIO_INHERIT` ([`is_pi_mutex_active`]) *and* the contending
+/// threads to carry distinct scheduling priorities, which is
+/// [`RtPolicy::AllowRealtime`](crate::runtime::task::RtPolicy::AllowRealtime)
+/// — with the RT switch off every thread is one priority and PI has nothing
+/// to inherit (`server::database::record_lock`'s module doc states the same
+/// pair). Printing "PI enabled" beside a disabled RT policy would claim an
+/// ordering the process does not have.
+pub fn report_lock_protocol() {
+    let pi = if is_pi_mutex_active() {
+        "PI is enabled"
+    } else {
+        "PI is not enabled"
+    };
+    eprintln!(
+        "epics-rs: lock protocol: {pi}, RT scheduling {:?}",
+        crate::runtime::task::RtPolicy::current()
+    );
+}
+
 /// The RTEMS priority-protocol surface, declared here rather than taken from
 /// `libc`.
 ///

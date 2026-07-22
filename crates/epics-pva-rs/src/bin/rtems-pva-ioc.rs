@@ -175,6 +175,13 @@ mod ioc {
         //      the backtrace note all survive.
         epics_base_rs::runtime::log::install_panic_hook();
 
+        // (0d) …and say which lock protocol the process got. C prints the
+        //      same fact from `epicsMutexShowAll`; we have no iocsh to ask,
+        //      so it goes on the console at boot. Before any thread that can
+        //      take a record gate exists, so the line cannot be read as a
+        //      report about a process that already ran without it.
+        epics_base_rs::runtime::sync::report_lock_protocol();
+
         // (1) C `callbackInit` (callback.c:286). Idempotent.
         background_init();
 

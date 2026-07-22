@@ -840,6 +840,18 @@ impl GroupChannel {
         // recursive-read deadlock. So the atomic path resolves every
         // member against the pre-acquired guards and never re-locks.
         if atomic {
+            // Resolve every member's backing record handle BEFORE the gate is
+            // taken. `lock_group_records_read` takes no per-record lock and
+            // reads nothing the gate protects: it looks the names up in the
+            // database's own `records`/`aliases` maps and clones the `Arc`s
+            // (`database/mod.rs:1801-1807`), which are mutated only under
+            // `registration_mutex` (`mod.rs:1411`, `:1547`), never under the
+            // per-record advisory gate. Hoisting it above the gate therefore
+            // leaves the gate-held region below with zero `.await`s, which is
+            // what lets that gate become a blocking priority-inheritance lock
+            // (`doc/rtems-priority-locks-design.md` §1.1 H8, §5 step 6).
+            let member_guards = lock_group_records_read(&self.db, &self.def.members).await;
+
             // C-parity: pvxs's `onGet` takes `DBManyLocker G(group.value.lock)`
             // — the SAME `DBManyLock` the atomic PUT holds
             // (`groupsource.cpp:492` onGet vs `:621` onPutGroup). Take the
@@ -851,16 +863,15 @@ impl GroupChannel {
             // `field_io.rs:630`). Every writer takes the advisory gate before
             // its `RwLock` write guard, so while this GET owns the gate set no
             // writer can hold any member's write guard — the incremental
-            // read-guard acquisition in `lock_group_records_read` becomes
-            // uncontended and consistent. Without this gate that incremental
-            // acquisition left a window: a write-preferring writer could update
+            // read-guard acquisition below becomes uncontended and consistent.
+            // Without this gate that incremental acquisition left a window: a
+            // write-preferring writer could update
             // a later-sorted member between this GET's read of an earlier one,
             // yielding a torn snapshot (B updated, A stale) that defeats the
             // `atomic` flag — the GET-side twin of the PUT-side BR-R15 gap.
             let member_records = group_member_record_names(&self.db, &self.def.members).await;
             let _many_guard = self.db.lock_records(&member_records).await;
 
-            let member_guards = lock_group_records_read(&self.db, &self.def.members).await;
             // Acquire every backing record's read guard synchronously, in the
             // sorted order `member_guards` already carries. The advisory
             // `_many_guard` gate (held above over the same set) keeps every writer

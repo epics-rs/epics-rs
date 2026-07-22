@@ -950,9 +950,13 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 ///
 /// So EPICS 0 → posix 56 → core 199, EPICS 99 → posix 155 → core 100, and
 /// anything above 99 clamps to posix 155. Every value is inside the guest's
-/// settable `[1, 254]`, and the image is collision-free with libbsd by
-/// construction rather than by tuning — see
-/// `rtems_priority_map_stays_below_the_libbsd_network_band`.
+/// settable `[1, 254]`. **Measured on target**, core 100 is also where
+/// libbsd's own twelve default-band worker threads sit, so the map's most
+/// urgent reachable value *ties* libbsd's default band there rather than
+/// staying strictly below it — a boundary tie by construction, not a
+/// collision-free image. It is still strictly below `IRQS`(96)/`TIME`(98);
+/// see `rtems_priority_map_stays_below_the_libbsd_network_band`, which
+/// asserts the non-strict `core >= 100` this tie actually produces.
 #[cfg(any(target_os = "rtems", test))]
 fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
@@ -1914,7 +1918,7 @@ mod tests {
     /// |------|--------|
     /// | 96   | libbsd `IRQS` (interrupt server) |
     /// | 98   | libbsd `TIME` |
-    /// | 100  | libbsd default — eleven further network threads |
+    /// | 100  | libbsd default — twelve further network threads |
     /// | 254  | DHCP, outside the band |
     /// | 255  | idle, `RTEMS_MAXIMUM_PRIORITY` |
     ///
@@ -1928,7 +1932,7 @@ mod tests {
     fn rtems_priority_map_stays_below_the_libbsd_network_band() {
         /// libbsd's most urgent network thread on the measured guest.
         const LIBBSD_IRQS_CORE: i32 = 96;
-        /// libbsd's default band; eleven of its threads sit here.
+        /// libbsd's default band; twelve of its threads sit here.
         const LIBBSD_DEFAULT_CORE: i32 = 100;
         // The guest's settable SCHED_FIFO range.
         const POSIX_MIN: i32 = 1;

@@ -674,7 +674,7 @@ with `Duration::from_secs(5)` (`link.rs:297`); if any config path wants a
 per-link timeout it must move to the per-operation call, not the client.
 Check before, not after.
 
-### Stage 1 — a search engine that runs with no UDP socket (medium, host-testable)
+### Stage 1 — a search engine that runs with no UDP socket (medium, host-testable) — **DONE** (see §8)
 
 Change `run_engine`'s `search_socket: AsyncUdpV4` (`search_engine.rs:1109`)
 to an `Option`, and make every UDP arm of the `select!` degrade to
@@ -1010,3 +1010,187 @@ reports `left: 2, right: 1`.
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo test --doc -p epics-bridge-rs` | 0 run, 3 ignored (all `ignore`d examples) |
 | `tests/pva_gateway.rs` | **did not run** — see §7.5 |
+
+---
+
+## 8. Stage 1 as built — where reality deviated from §5
+
+Stage 1 landed as `1d9170b3` on top of `e9dda2b6`. The sum type matched §5;
+four of §5's statements did not survive contact, and one pre-existing
+C-parity defect surfaced and was fixed at source.
+
+### 8.1 The variant holds a bundle, not a socket — and it holds the beacons too
+
+§5 wrote the type as `SearchTransport::{Udp(AsyncUdpV4, …), NameServersOnly}`.
+What the `…` had to absorb is larger than "the search socket plus a bit":
+
+```
+SearchTransport::Udp(Box<UdpTransport>)
+    search_socket        AsyncUdpV4          beacon_socket      Option<AsyncUdpV4>
+    search_socket_v6     Option<Arc<..>>     beacon_socket_v6   Option<Arc<..>>
+    extra_targets        Vec<SocketAddr>     client_interfaces  Vec<Ipv4Addr>
+    broadcast_port       u16                 auto_addr_list     bool
+    response_port        u16                 response_port_v6   u16
+SearchTransport::NameServersOnly            (no fields)
+```
+
+The test is whether a field can outlive the socket it describes. Every one
+of these fails it: `extra_targets` and `client_interfaces` are UDP SEARCH
+destinations and UDP egress constraints, `broadcast_port`/`auto_addr_list`
+are the knobs that compute those destinations, and the two response ports
+are `local_addr()` read back from the sockets themselves. Leaving any of
+them beside the variant would have reproduced, one level up, exactly the
+"present but unusable" split the sum type exists to close.
+
+The **beacon** sockets are the consequential inclusion, and it is what
+makes the gate's "bound **no** UDP socket" literally true rather than
+"bound no UDP *search* socket". They are not dead in a name-servers-only
+configuration the way the search sockets provably are: with
+`auto_addr_list` off and an empty `addr_list`, `search_targets()` returns
+an empty list (`search_targets_empty_when_auto_off_and_no_extras`), so a
+UDP SEARCH is never transmitted and no reply can arrive — but a beacon
+listener on `broadcast_port` would still receive. Folding them in
+therefore **costs** beacon-driven fast reconnect (`poke`) and `discover()`
+events. That is a real semantic loss, and it is why the choice is
+**explicit** rather than derived (§8.2).
+
+`Box` on the payload variant: without it `SearchTransport` is as large as
+`UdpTransport` everywhere, including in the `NameServersOnly` case that
+carries nothing (`clippy::large_enum_variant`).
+
+### 8.2 The selection is an explicit entry point, not derived from config
+
+§5's gate reads as though "`addr_list` empty + auto-address-list off +
+name servers present" should *derive* `NameServersOnly`. It was not
+wired that way, and deliberately.
+
+Deriving it would silently drop the beacon sockets (§8.1) for every host
+client that already runs in that configuration today — losing
+beacon-driven fast reconnect for users who never asked for it. So the
+selection is `SearchEngine::spawn_name_servers_only(…)`, a fourth entry
+point beside `spawn` / `spawn_with_config` / `spawn_with_auth`, whose
+signatures are unchanged. `ClientSearchConfig` gained no field, so no
+public struct-literal breaks.
+
+Consequences worth stating plainly:
+
+* **No production caller selects it yet.** Stage 1 builds the capability;
+  the RTEMS mount (stage 4) is what will choose it. That is the staging
+  §5 asked for, not an oversight.
+* **`PvaClient` cannot select it.** There is no `PvaClientBuilder` knob —
+  that would be a `context.rs` change, and §5 scoped stage 1 to
+  `search_engine.rs` and no other file. The gate therefore drives
+  `SearchEngine` directly, which is where PV *resolution* lives.
+* If the main worker wants auto-derivation instead, the beacon question
+  above is the decision to make first — it is a behaviour change, not a
+  refactor.
+
+### 8.3 The `[u8]` cascade did not surface anything — and §1.2 predicts that
+
+§5's stated risk: "Expect the arm-shape change to surface real type errors
+the cascade was hiding. That is the point." It surfaced **none**. The host
+build was clean on the first compile after the arm conversion, and stayed
+clean through `--all-targets`.
+
+This is not luck, and §1.2 already contains the reason: the 18 `E0277`s
+are "inference fallout inside `run_engine`'s `select!` after
+`use tokio::net::{TcpStream, UdpSocket}` failed" — i.e. artefacts of a
+*target-only* poisoned import. On the host those imports resolve, so
+there was never a hidden host error for the change to expose. The risk was
+correctly identified as real for the target and is still unretired: it
+will be re-measured when the RTEMS arm actually compiles this file
+(stage 2+), not here.
+
+### 8.4 A pvxs clause was missing, and stage 1 walked straight into it
+
+`spawn_inner` warned "no search destinations … All searches will time
+out" on `extra_targets.is_empty() && addr_list.is_empty() && !auto_on`.
+pvxs gates the same warning on `searchDest.empty() && **nameServers.empty()**`
+(`client.cpp:633`) — both clauses.
+
+Our port carried only the first. A client with TCP name servers, an empty
+`addr_list` and `AUTO_ADDR_LIST=NO` was therefore told every search would
+time out while it was about to resolve every one of them over TCP — and
+that is precisely the stage-1 configuration, so the defect would have
+been emitted by the new path on every spawn. Fixed at source rather than
+worked around: the warning now lives in `spawn_inner` where both the
+transport and the name-server list are in scope, and fires only when
+neither can reach anything.
+
+One deliberate behavioural edge came with it: the condition is now
+evaluated *after* the `addr_list` → `extra_targets` merge rather than
+before. The two differ only when the address list held IPv6 entries on a
+host with no v6 socket — those are dropped (with their own warning), and
+the client genuinely has no destination left, so the warning now fires
+where it previously stayed silent. That is the more correct answer.
+
+### 8.5 Deviation from pvxs, recorded
+
+pvxs always binds its search sockets (`client.cpp:578-590`) and a beacon
+listener per interface (`:638-650`), in every configuration.
+`NameServersOnly` binds nothing. This is an intentional deviation for the
+RTEMS target (§4.2) and is documented on
+`SearchEngine::spawn_name_servers_only`, including the cost (no beacons,
+hence no beacon-driven fast reconnect and no `discover()`). No host
+default changes: every existing entry point still takes the UDP path.
+
+### 8.6 Collateral simplification
+
+Folding the destination policy into the transport removed two types and
+two free functions rather than adding to them:
+
+| removed | absorbed by |
+|---|---|
+| `struct UdpSearchParams` | `UdpTransport` fields |
+| `struct SearchDestinations<'a>` | `UdpTransport` fields |
+| `async fn broadcast(socket, socket_v6, …, dests, errs)` | `UdpTransport::broadcast(&self, …)` |
+| `async fn recv_from_v6_opt(…) -> Option<Result<…>>` | `recv_from_v6(…) -> Result<…>` (parks instead of yielding `None`) |
+
+`run_engine` lost 6 parameters (13 → 7) and `flush_initial_searches` 4
+(10 → 6); both dropped their `#[allow(clippy::too_many_arguments)]`. The
+two v6 `select!` arms lost their `if let Some(Ok(…))` double-unwrap,
+because a parked arm never yields at all — the same shape the four UDP
+arms now share.
+
+Net `search_engine.rs`: +590 / −361. §5 estimated "~120 lines"; the
+larger figure is the two struct definitions, their doc comments, the six
+transport methods and the gate test, not extra machinery.
+
+### 8.7 The census, and the two pre-existing RTEMS-gate warnings
+
+`search_engine.rs` carries `RTEMS-EXEC-MODEL-ALLOW(N)`; the new
+`#[tokio::test]` took it from 16 to 17. The bump is not self-certifying —
+`tests/rtems_exec_model_gate.rs` runs *inside* the feature-ON suite — so
+it was verified there: `cargo nextest run -p epics-pva-rs --features
+rtems-exec-model` gives 1382 passed, with both
+`stage1_name_servers_only_resolves_without_binding_udp` and
+`every_reactor_dependent_test_is_accounted_for` passing.
+
+`./scripts/rtems-check.sh` stays exit 0. Its two known `epics-pva-rs`
+warnings are unchanged in count and identity — `tcp.rs:1407` (deprecated
+`fetch_update`) and `server_native/search_engine.rs:501` (dead `Origin`
+variants). Both live in `server_native/`, which this stage does not
+touch; neither was silently fixed nor worsened. Note that §5's brief
+cited the `Origin` warning as `search_engine.rs:501` without a directory
+— it is the **server**-side file of that name, not the client one this
+stage rewrote.
+
+### 8.8 The gate as measured
+
+The "no UDP socket" assertion is made twice on purpose: structurally
+(`NameServersOnly` is a fieldless variant, so no socket can be held) and
+at runtime (`bound_udp_addrs()` must be empty). The runtime half is
+guarded against being a tautology — the same test first builds a UDP
+transport from the *same* environment and asserts it *does* bind, so an
+empty list is a property of the variant and not of the test's config.
+
+| gate | result |
+|---|---|
+| `stage1_name_servers_only_resolves_without_binding_udp` | pass — resolves via TCP NS, binds 0 UDP sockets |
+| `cargo nextest run -p epics-pva-rs` | 1389 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1382 passed, 0 failed, 2 skipped |
+| `cargo clippy -p epics-pva-rs --all-targets -- -D warnings` | clean |
+| `cargo nextest run --workspace` | 10105 passed, 0 failed, 2 skipped |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --doc -p epics-pva-rs` | 1 passed, 15 ignored |
+| `./scripts/rtems-check.sh` | exit 0, 2 pre-existing warnings unchanged |

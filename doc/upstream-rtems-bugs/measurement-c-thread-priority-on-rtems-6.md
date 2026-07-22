@@ -420,9 +420,12 @@ tail -f cioc.log                             # console; iocsh input goes to the 
 
 The drivers are copied into this repository at
 [`repro/priority/`](repro/priority) — `hold.py` (first listing, no load),
-`hold3.py` (the unthrottled one from §8), `hold5.py`, `hold6.py`. They are
-host-side raw-CA-socket drivers using the same connect method as `ceiling.py`;
-nothing in them is compiled into or linked against the target image.
+`hold2.py` (second pass: 4 connections, `rt top` with `A` and `+` so the idle
+CAS-* rows are not truncated), `hold3.py` (the unthrottled one from §8),
+`hold4.py` (the workaround for hold3's starve: all 4 connections established
+before any load is applied), `hold5.py`, `hold6.py`. They are host-side
+raw-CA-socket drivers using the same connect method as `ceiling.py`; nothing
+in them is compiled into or linked against the target image.
 
 `rt top` is interactive and refreshes until a key arrives; the drivers exit it
 by writing a bare newline into the console fifo. It also clears the screen with
@@ -448,7 +451,9 @@ a stale checksum.
 |---|---|---|
 | `evidence/c-thread-priority-boot-console-2026-07-22.log` | `cioc.log` (also kept as `log/cioc-priority-2026-07-22.log`) | `b1dfd048fbb66908002cb3b45dc186170aef632739701fb3c3efa95b7e949e50` |
 | `repro/priority/hold.py` | `hold.py` | `b1c4c95241c6fe98e60cba161fd021da7ec951e8feb7509588282c595c4575cc` |
+| `repro/priority/hold2.py` | `hold2.py` | `f0528844deb487f035f698bc5792ff21f77d0175d8d9cc7a2ddc33df53c0b690` |
 | `repro/priority/hold3.py` | `hold3.py` | `e517aabaa707d128d40742df27d26656d1e652c0fbbf77c7a3162ebee04ac5ab` |
+| `repro/priority/hold4.py` | `hold4.py` | `658f32d12d4323465d9c4db5e347a32f295ee2714615ce360bebd4952f115154` |
 | `repro/priority/hold5.py` | `hold5.py` | `bd932c91d3b85e33692143175bbad46dc64293c36d68cae26cd6a5a7a0b35aed` |
 | `repro/priority/hold6.py` | `hold6.py` | `fede38cb191eac8bdd67b257f4a655c45e0dff79df742a0370f564a489bed575` |
 | `evidence/DEVIATIONS.md` (now includes "Session 3 additions") | `DEVIATIONS.md` | `bcd3a3ede844cda8ff8296d6e424e57b3f804d4d71f463340328f8769ab00b44` |

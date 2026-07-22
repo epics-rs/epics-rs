@@ -820,7 +820,7 @@ doc/upstream-rtems-bugs/
 └── repro/
     ├── fsbug/    bug 4 — the 12-line application that faults unpatched base at boot
     ├── probe/    bugs 1-2 — the poll-spin probe and its --wrap=poll link flag
-    └── priority/ the four host-side CA load drivers behind the priority measurement
+    └── priority/ the six host-side CA load drivers behind the priority measurement
 ```
 
 **Reproducer notes.** `repro/fsbug/` is a `PROD_IOC` whose entire application
@@ -848,7 +848,7 @@ build.
 * Boot logs, the `ceiling*.py` drivers, `boot-*.sh`, and the `cioc`/`pioc`
   application trees. These back handoff §5.1/§5.6/§5.7 rather than these four
   bugs, and were out of scope — **they are still single-copy on the box.**
-  (Partial exception since 2026-07-22: the *one* boot log and the *four* drivers
+  (Partial exception since 2026-07-22: the *one* boot log and the *six* drivers
   behind the priority measurement are now in `evidence/` and `repro/priority/`.
   `ceiling*.py`, `boot-*.sh` and the application trees remain single-copy.)
 

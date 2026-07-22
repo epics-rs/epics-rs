@@ -17,8 +17,35 @@
 //!    [`block_on_sync`](epics_base_rs::runtime::task::block_on_sync), which on
 //!    a plain thread with no runtime entered selects `park_on`.
 //! 3. **PVA front-end** — [`BlockingPvaServer`](epics_pva_rs::server_native::blocking::BlockingPvaServer) over a
-//!    [`PvDatabaseSource`](epics_pva_rs::server::PvDatabaseSource): the TCP accept loop on one thread, the UDP
-//!    name-search responder on another.
+//!    [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource) carrying two sources: the
+//!    [`PvDatabaseSource`](epics_pva_rs::server::PvDatabaseSource) as `qsrvSingle` at order 0 and the QSRV
+//!    bridge as `qsrvGroup` at order 1. The TCP accept loop runs on one
+//!    thread, the UDP name-search responder on another.
+//!
+//! # Why this binary lives in `epics-bridge-rs`
+//!
+//! It started in `epics-pva-rs` and served single records only. Serving
+//! `Q:group` PVs means mounting QSRV, QSRV lives in `epics-bridge-rs`, and
+//! `epics-bridge-rs` already depends on `epics-pva-rs` — so the mount cannot
+//! be made from the other side without a cyclic package dependency, which
+//! cargo rejects outright (measured; doc/qsrv-rtems-design.md §9.7). The
+//! binary moved down-graph to the crate that can see every source it
+//! composes. That is also the C layering: QSRV sits above pvxs and base.
+//!
+//! It is still exactly **one** target PVA IOC, which is the point — one copy
+//! of the source-text guards at the bottom of this file, one `STATUS_PREFIX`,
+//! and no extra `-Zbuild-std` build in the portability gate.
+//!
+//! # `pva://` record links do not resolve on this target
+//!
+//! A C IOC linked against pvxs gets pvalink through `pvalink_enable()`
+//! (`ioc/iochooks.cpp:495`), so `INP=@pva://...` resolves. This one does not,
+//! and cannot yet: pvalink is a PVA *client*, there is no blocking/sans-io PVA
+//! client driver, and standing one up is a measured 47 compile errors over a
+//! 23,881-line `client_native` tree (design §3.4, stage 5). The startup banner
+//! says so out loud rather than leaving an operator to discover that a link
+//! silently never connects — the failure mode is indistinguishable from a slow
+//! remote IOC from the record's side.
 //!
 //! # The server is reachable with the UDP responder down, deliberately
 //!
@@ -52,26 +79,47 @@
 //! `EPICS_PVA_SERVER_PORT` > 5075 for TCP; `EPICS_PVAS_BROADCAST_PORT` >
 //! `EPICS_PVA_BROADCAST_PORT` > 5076 for the search port).
 //!
-//! Any command-line arguments are taken as `.db` file paths and loaded in
-//! order (the `dbLoadRecords` equivalent for a target with no iocsh). With no
-//! arguments a small built-in database is loaded, so the binary is runnable
-//! standalone on a bare target.
+//! Command-line arguments are this target's st.cmd, because it has no iocsh:
+//! an argument ending in `.json` is a `dbLoadGroup` group-definition file,
+//! anything else is a `.db` record file. Both are applied in order (the
+//! `dbLoadRecords` / `dbLoadGroup` equivalents). With no arguments a small
+//! built-in database is loaded, so the binary is runnable standalone on a bare
+//! target. Records carrying `info(Q:group, ...)` need no `.json` at all — that
+//! source is read straight off the database.
+//!
+//! QSRV2 answers to `PVXS_QSRV_ENABLE` / `EPICS_IOC_IGNORE_SERVERS=qsrv2` here
+//! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`);
+//! the decision is printed at startup.
 //!
 //! There is no shutdown command: like a C IOC on RTEMS this runs until the
 //! board is reset. The interactive iocsh is host-only, so it is not wired here.
 //!
 //! # Build configurations
 //!
-//! Same predicate as `rtems-ca-ioc`: the real entry point is compiled when the
-//! `runtime::task` seam is on its **executor** backend — `target_os = "rtems"`
-//! or the host-selectable `rtems-exec-model` feature. Under the hosted default
-//! it is still built, so it stays compiled and linted in the default test set,
-//! but refuses to run rather than silently starting the runtime it exists to
-//! avoid.
+//! The real entry point is compiled when the `runtime::task` seam is on its
+//! **executor** backend. Under the hosted default the file is still built, so
+//! it stays compiled and linted in the default test set, but refuses to run
+//! rather than silently starting the runtime it exists to avoid.
+//!
+//! The predicate is `target_os = "rtems"` **alone**, which is where it differs
+//! from `rtems-ca-ioc`'s `any(target_os = "rtems", feature =
+//! "rtems-exec-model")`. `epics-bridge-rs` does not declare
+//! `rtems-exec-model`: declaring it is design stage 4, and it arrives with a
+//! ~250-site `rtems-exec-gate` census bill (§6.3) that must be paid, not
+//! dodged by adding the feature name without the accounting. Naming a feature
+//! this crate does not have would be a dangling predicate — three
+//! `unexpected_cfg` warnings, and an arm no configuration can select.
+//!
+//! The cost, stated so stage 4 picks it up: the body below is **not** compiled
+//! on a host today, so its only compile coverage is `scripts/rtems-check.sh`
+//! (both configurations), and the `mod ioc` unit tests below it do not run on
+//! a host. Stage 4 restores both by declaring the feature and widening this
+//! predicate back. The four source-text guards at the bottom of the file are
+//! outside `mod ioc` and are unaffected — they run in every host test pass.
 
 use std::process::ExitCode;
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(target_os = "rtems")]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -83,11 +131,14 @@ mod ioc {
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::ioc_app::GroupLoadRequest;
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
+    use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
     use epics_pva_rs::server::PvDatabaseSource;
     use epics_pva_rs::server_native::blocking::{BlockingPvaServer, bind_udp_search};
+    use epics_pva_rs::server_native::composite::CompositeSource;
     use epics_pva_rs::server_native::config::PvaServerConfig;
 
     /// The built-in database loaded when no `.db` file is given on the command
@@ -108,7 +159,38 @@ mod ioc {
     /// an operator's screens should not have to know which one booted.
     const STATUS_PREFIX: &str = "RTEMS";
 
-    /// Load the database: every command-line argument is a `.db` file path
+    /// Split the command line into record files and group-definition files.
+    ///
+    /// This target has no iocsh, so argv *is* st.cmd and this is the whole
+    /// command language: `.json` means `dbLoadGroup`, anything else means
+    /// `dbLoadRecords`. Split by suffix rather than by a flag because the C
+    /// commands are distinguished by which file you hand them too, and a flag
+    /// would be a spelling this IOC invented.
+    ///
+    /// A function so it is testable: getting it wrong routes a group file into
+    /// the record parser, and the resulting error names a `.json` file as bad
+    /// `.db` syntax — a diagnostic that sends the reader to the wrong file.
+    fn split_load_args(args: &[String]) -> (Vec<String>, Vec<GroupLoadRequest>) {
+        let mut db_files = Vec::new();
+        let mut group_files = Vec::new();
+        for arg in args {
+            if arg.ends_with(".json") {
+                group_files.push(GroupLoadRequest {
+                    filename: arg.clone(),
+                    // No macro syntax on this command line. `dbLoadGroup`'s
+                    // second argument is macro text, and the target has no
+                    // shell to supply it; an empty string is what the host
+                    // command records when it is omitted.
+                    macros: String::new(),
+                });
+            } else {
+                db_files.push(arg.clone());
+            }
+        }
+        (db_files, group_files)
+    }
+
+    /// Load the database: every record-file argument is a `.db` file path
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
     /// when there are none.
     fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
@@ -186,7 +268,8 @@ mod ioc {
         background_init();
 
         // (2) The database.
-        let db_files: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let (db_files, group_files) = split_load_args(&args);
         let db = match load_database(&db_files) {
             Ok(db) => db,
             Err(e) => {
@@ -197,13 +280,64 @@ mod ioc {
         let db_for_names = db.clone();
         let db_for_status = db.clone();
 
+        // (2b) The QSRV mount: the enable decision, the provider, and the
+        //      group set, finalized. C runs the equivalent at
+        //      `initHookAfterInitDatabase` — after the database exists, before
+        //      the source is registered (`ioc/iochooks.cpp:343-366`). The
+        //      ordering is structural rather than remembered: `build_qsrv_mount`
+        //      finalizes the groups before it returns the store that exposes
+        //      them, so the `add_source` below cannot run early.
+        //
+        //      `None` for the ACF: this entry point loads no access-security
+        //      file. Passing `None` leaves the provider on `AllowAllAccess`,
+        //      which is what an IOC with no ACF means on the CA side too.
+        let mount: QsrvMount = match block_on_sync(build_qsrv_mount(&db, None, &group_files)) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!(
+                    "rtems-pva-ioc: the QSRV mount needs a plain thread with no runtime entered"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.
+        //
+        //     `PvaServerConfig::default().with_env()` and NOT a hand-built
+        //     struct: `bind` stamps the GUID from `random_guid` at
+        //     construction, and a config assembled field-by-field would ship
+        //     the all-zero GUID a freshly-`Default`ed value carries — which
+        //     degrades silently on every consumer.
         let config = PvaServerConfig::default().with_env();
         let (tcp_port, udp_port, bind_ip) = (config.tcp_port, config.udp_port, config.bind_ip);
-        let source = Arc::new(PvDatabaseSource::new(db));
+
+        //     Two sources under one server, with pvxs's own names and orders:
+        //     `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and
+        //     `qsrvGroup` at 1 (`ioc/groupsourcehooks.cpp:219`), "lower order
+        //     first". Single records resolve on the database source; a group
+        //     PV is not in the database under its own name, so it falls
+        //     through to the QSRV store. The status PVs registered below are
+        //     ordinary records, so they answer from order 0.
+        let composite = CompositeSource::new();
+        if let Err(e) =
+            composite.add_source("qsrvSingle", Arc::new(PvDatabaseSource::new(db.clone())), 0)
+        {
+            eprintln!("rtems-pva-ioc: cannot register the single-record source: {e}");
+            return ExitCode::FAILURE;
+        }
+        // Only when QSRV2 is enabled, matching pvxs calling `group_enable()`
+        // solely inside `if(enableQ)` (`ioc/iochooks.cpp:492-496`). Disabled,
+        // the IOC still serves every single record — it just answers no group.
+        if mount.enabled {
+            if let Err(e) = composite.add_source("qsrvGroup", mount.store.clone(), 1) {
+                eprintln!("rtems-pva-ioc: cannot register the QSRV group source: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+
         let server =
-            match BlockingPvaServer::bind(SocketAddr::new(bind_ip, tcp_port), source, config) {
+            match BlockingPvaServer::bind(SocketAddr::new(bind_ip, tcp_port), composite, config) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     // Not "cannot bind": `BlockingPvaServer::bind` also calls
@@ -322,6 +456,26 @@ mod ioc {
             names.len(),
             guid_hex(server.guid()),
         );
+        println!(
+            "rtems-pva-ioc: QSRV2 {} — sources: qsrvSingle(0){}",
+            if mount.enabled { "ENABLED" } else { "disabled" },
+            if mount.enabled {
+                ", qsrvGroup(1)"
+            } else {
+                " only (set PVXS_QSRV_ENABLE=YES for groups)"
+            },
+        );
+        // Said at every boot, not only when a link is configured: this IOC
+        // cannot detect that a `pva://` link exists — the resolver that would
+        // see one is the thing that is missing. An operator whose `INP=@pva://`
+        // never connects has no other way to learn it is unimplemented rather
+        // than slow, so the gap is stated unconditionally. Remove this line in
+        // design stage 5, together with the pvalink mount it describes.
+        println!(
+            "rtems-pva-ioc: NOTE pva:// record links do NOT resolve on this target — pvalink \
+             needs a blocking PVA client, which does not exist yet (design stage 5). \
+             An INP/OUT of the form @pva://... will never connect. ca:// links are unaffected."
+        );
         for name in &names {
             println!("rtems-pva-ioc: {name}");
         }
@@ -390,21 +544,52 @@ mod ioc {
                 "the no-UDP line must name the TCP-only path"
             );
         }
+
+        /// `.json` arguments are group files, everything else is a record
+        /// file. Routing a group file into the record parser produces an error
+        /// naming a `.json` file as bad `.db` syntax, which sends the reader to
+        /// the wrong file on a target with no shell to re-run anything.
+        #[test]
+        fn json_arguments_load_as_groups_and_the_rest_as_records() {
+            let args = vec![
+                "/pv/ioc.db".to_string(),
+                "/pv/groups.json".to_string(),
+                "/pv/more.db".to_string(),
+            ];
+            let (db_files, group_files) = split_load_args(&args);
+            assert_eq!(db_files, vec!["/pv/ioc.db", "/pv/more.db"]);
+            assert_eq!(group_files.len(), 1, "the .json argument is the group file");
+            assert_eq!(group_files[0].filename, "/pv/groups.json");
+            assert!(
+                group_files[0].macros.is_empty(),
+                "this command line has no macro syntax, matching dbLoadGroup with \
+                 its second argument omitted"
+            );
+        }
+
+        /// No arguments at all must still be a runnable IOC: neither kind of
+        /// file, and the built-in demo database downstream.
+        #[test]
+        fn an_empty_command_line_loads_neither_kind_of_file() {
+            let (db_files, group_files) = split_load_args(&[]);
+            assert!(db_files.is_empty() && group_files.is_empty());
+        }
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(target_os = "rtems")]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(target_os = "rtems", feature = "rtems-exec-model")))]
+#[cfg(not(target_os = "rtems"))]
 fn main() -> ExitCode {
     eprintln!(
         "rtems-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf`, or on a host with \
-         `--features rtems-exec-model`."
+         Build it for `armv7-rtems-eabihf`. The host-selectable \
+         `rtems-exec-model` build of this binary arrives with design stage 4, \
+         which is what declares that feature on `epics-bridge-rs`."
     );
     ExitCode::FAILURE
 }

@@ -91,7 +91,24 @@ declare -A CRATE_FEATURES=(
 # Binaries built for the target, as `crate:bin` pairs.
 BINS=(
     epics-ca-rs:rtems-ca-ioc
-    epics-pva-rs:rtems-pva-ioc
+    # `rtems-pva-ioc` is an `epics-bridge-rs` binary, not an `epics-pva-rs` one.
+    # It moved when it grew a QSRV group source: the mount needs the bridge, and
+    # `epics-pva-rs` cannot depend on the bridge without a cyclic package
+    # dependency, which cargo rejects outright (measured — see
+    # doc/qsrv-rtems-design.md §9.7). It is still the only target PVA binary, so
+    # this stays one entry, not two.
+    #
+    # It carries `required-features = ["qsrv-core"]`, which the loop below
+    # supplies from CRATE_FEATURES. That combination is safe here and was
+    # measured, because the manifest comment the binary arrived with warned the
+    # opposite: an unmet `required-features` makes cargo silently SKIP the
+    # target for the plural forms (`--bins`, `--all-targets`), but an explicit
+    # `--bin NAME` — which is what this loop issues — is a hard error:
+    #   error: target `qsrv-rs` in package `epics-bridge-rs` requires the
+    #          features: `qsrv-bin`
+    # So a future edit that drops the feature selection fails loudly rather than
+    # passing vacuously.
+    epics-bridge-rs:rtems-pva-ioc
 )
 
 # Binaries in the crates above that are deliberately NOT built for the target.
@@ -134,8 +151,9 @@ HOST_ONLY=(
     # the target selection does not carry, so none is even reachable under
     # `--features qsrv-core`. `qsrv-rs` additionally needs `clap`,
     # `tracing-subscriber` and `run_ca_pva_qsrv_ioc` — the last of which is
-    # `#[cfg(not(target_os = "rtems"))]`. The target's QSRV mount is
-    # `epics-pva-rs:rtems-pva-ioc`, already in BINS, not a sixth binary here.
+    # `#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]`. The crate's
+    # SIXTH binary, `rtems-pva-ioc`, is the target's QSRV mount and is in BINS
+    # above, not here.
     #
     # Spelled with underscores because the census computes its pairs from
     # `basename src/bin/*.rs .rs`, and the bridge's `[[bin]]` entries give
@@ -260,8 +278,17 @@ for config in "${CONFIGS[@]}"; do
     for pair in "${BINS[@]}"; do
         crate="${pair%%:*}"
         bin="${pair##*:}"
-        log "== [$config] $crate --bin $bin"
-        if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin"; then
+        # Same per-crate feature selection the `--lib` loop above applies, and
+        # for the same reason: `COMMON` carries `--no-default-features`, so a
+        # binary whose crate needs a feature to expose the modules it uses would
+        # otherwise be built in a configuration nobody ships. For
+        # `epics-bridge-rs:rtems-pva-ioc` the feature is also `required-features`,
+        # so omitting it here does not quietly build the wrong thing — it fails
+        # the run outright, which is the direction this gate wants to fail in.
+        feats=()
+        [[ -n "${CRATE_FEATURES[$crate]:-}" ]] && feats=(--features "${CRATE_FEATURES[$crate]}")
+        log "== [$config] $crate --bin $bin ${feats[*]-}"
+        if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin" ${feats[@]+"${feats[@]}"}; then
             failed+=("[$config] $crate --bin $bin")
         fi
     done

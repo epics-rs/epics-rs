@@ -124,6 +124,11 @@ dual-gateway-bin = [
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# The RTEMS boot shim for `rtems-pva-ioc`. Empty on every non-RTEMS target, so
+# this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
+# one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
+# the IOC's `main`. Same reasoning as `epics-ca-rs`.
+epics-rtems-boot = { workspace = true }
 async-trait = "0.1"
 # Refcounted byte buffer for the raw-frame fan-out path (F-G12).
 bytes = "1"
@@ -222,6 +227,42 @@ required-features = ["pva-gateway-bin"]
 name = "dual-gateway-rs"
 path = "src/bin/dual_gateway_rs.rs"
 required-features = ["dual-gateway-bin"]
+
+# The RTEMS PVA+QSRV IOC entry point — the workspace's one target PVA binary.
+# It lives here rather than in `epics-pva-rs`, where it started, because
+# mounting the QSRV group source needs `epics-bridge-rs` and `epics-pva-rs`
+# cannot depend on the bridge without a cyclic package dependency (measured;
+# doc/qsrv-rtems-design.md §9.7).
+#
+# `required-features` IS correct here, unlike on `epics-ca-rs`'s `rtems-ca-ioc`
+# — but for a reason worth stating, because the manifest comment this binary
+# arrived with claimed the opposite. That comment warned that a
+# `required-features` gate makes cargo silently *skip* the target, turning the
+# RTEMS gate into a vacuous pass. Measured on this toolchain, that is true only
+# for the plural forms (`--bins`, `--all-targets`); an explicit `--bin NAME`
+# with the feature unmet is a hard error:
+#
+#   $ cargo check -p epics-bridge-rs --no-default-features --bin qsrv-rs
+#   error: target `qsrv-rs` in package `epics-bridge-rs` requires the features: `qsrv-bin`
+#
+# `scripts/rtems-check.sh` builds it by explicit `--bin`, so an unfeatured
+# invocation fails loudly rather than passing vacuously. The gate additionally
+# passes `qsrv-core` per-bin, so the covered configuration is the real one.
+#
+# The gate is `qsrv-core` and not `qsrv`: this is a server, so it needs neither
+# `epics-pva-rs/client` nor `epics-ca-rs`, and `qsrv` would drag in `pvalink`,
+# which does not build for the target at all (§3.4).
+[[bin]]
+name = "rtems-pva-ioc"
+path = "src/bin/rtems-pva-ioc.rs"
+required-features = ["qsrv-core"]
+
+# `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
+# `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
+# table is evaluated against the HOST, so a `cfg(target_os = "rtems")` one
+# would never match.
+[build-dependencies]
+epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3"

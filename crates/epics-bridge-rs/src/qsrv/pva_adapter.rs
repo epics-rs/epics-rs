@@ -1310,9 +1310,24 @@ pub struct QsrvMount {
 /// `None` leaves the provider on `AllowAllAccess`; passing the same config
 /// the CA server got is what keeps the two protocols on one policy, which
 /// is the documented configuration trap on the host side.
+///
+/// `group_files` carries `dbLoadGroup` requests the caller obtained by some
+/// route other than the iocsh command — which on the RTEMS target is the
+/// only route there is, because the target has no iocsh and therefore
+/// nothing ever pushes onto the base startup queue
+/// [`take_group_load_requests`](epics_base_rs::server::ioc_app::take_group_load_requests)
+/// drains. The target's command line *is* its st.cmd, so a `.json`
+/// argument becomes a `GroupLoadRequest` here and reaches exactly the same
+/// loader the host's `dbLoadGroup` feeds. The host runner passes an empty
+/// slice: its files are already on that queue. Keeping this a parameter of
+/// the one owner — rather than letting the target apply group files to the
+/// provider itself — is what preserves the ordering guarantee below; a
+/// caller that loaded groups on its own would necessarily do it after the
+/// store already existed.
 pub async fn build_qsrv_mount(
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
     acf: Option<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    group_files: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) -> QsrvMount {
     // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
     // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before standing
@@ -1338,7 +1353,7 @@ pub async fn build_qsrv_mount(
     // Gated on the QSRV2 enable decision, matching pvxs only adding the group
     // source when `enable2()` is true.
     if enabled {
-        load_qsrv_groups(&provider, db).await;
+        load_qsrv_groups(&provider, db, group_files).await;
     }
 
     QsrvMount {
@@ -1455,7 +1470,10 @@ pub async fn run_ca_pva_qsrv_ioc(
     let QsrvMount {
         store,
         enabled: qsrv2_on,
-    } = build_qsrv_mount(&db, config.acf.clone()).await;
+        // Empty `group_files`: this runner's `dbLoadGroup` requests already sit
+        // on the base startup queue, put there by the iocsh command during
+        // st.cmd. The parameter exists for the target IOC, which has no iocsh.
+    } = build_qsrv_mount(&db, config.acf.clone(), &[]).await;
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
     // Handles were stored in the global registry during st.cmd execution.
@@ -1550,7 +1568,13 @@ pub async fn run_ca_pva_qsrv_ioc(
 ///  1. DB `info(Q:group, ...)` records (`loadConfigFromDb`) — every record
 ///     carrying the tag contributes its group definition.
 ///  2. Queued `dbLoadGroup` files (`loadConfigFiles`) — drained from the
-///     base startup queue ([`take_group_load_requests`]) in st.cmd order.
+///     base startup queue ([`take_group_load_requests`]) in st.cmd order,
+///     followed by `extra` (the caller-supplied requests described on
+///     [`build_qsrv_mount`]). On the host exactly the first list is
+///     populated; on the RTEMS target, which has no iocsh to run the
+///     command, exactly the second is. They are the same request type
+///     applied by the same loader, so a group file behaves identically
+///     whichever route it arrived by.
 ///  3. `process_groups()` — validate/resolve trigger references
 ///     (`resolveTriggerReferences` / `createGroups`).
 ///
@@ -1561,6 +1585,7 @@ pub async fn run_ca_pva_qsrv_ioc(
 async fn load_qsrv_groups(
     provider: &Arc<BridgeProvider>,
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
+    extra: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) {
     use epics_base_rs::server::ioc_app::take_group_load_requests;
 
@@ -1577,8 +1602,12 @@ async fn load_qsrv_groups(
         }
     }
 
-    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order.
-    for req in take_group_load_requests() {
+    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order,
+    //    then the caller's own requests. Exactly one of the two lists is
+    //    non-empty in practice — the queue on a host with an iocsh, `extra`
+    //    on the target without one — so the concatenation order is not a
+    //    behaviour choice, it just keeps one loop over one request type.
+    for req in take_group_load_requests().iter().chain(extra) {
         match super::iocsh::apply_group_file(provider, &req.filename, &req.macros) {
             Ok(total) => {
                 tracing::info!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
@@ -3087,7 +3116,11 @@ mod tests {
 
         // Runner single-owner build into the SERVED provider, before serving.
         let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), true));
-        load_qsrv_groups(&provider, &db).await;
+        // `&[]`: this case drives the base startup queue (the real
+        // `dbLoadGroup` command ran above), which is the host route. The
+        // caller-supplied list is the target's route and is exercised by
+        // `rtems-pva-ioc`'s own tests.
+        load_qsrv_groups(&provider, &db, &[]).await;
         let store = Arc::new(QsrvPvStore::new(provider));
 
         // Both pvxs group sources are served by the same store/provider.

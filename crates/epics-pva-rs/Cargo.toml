@@ -10,11 +10,9 @@ repository.workspace = true
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
-# The RTEMS boot shim for `rtems-pva-ioc`. Empty on every non-RTEMS target, so
-# this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
-# one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
-# the IOC's `main`. Same reasoning as `epics-ca-rs`.
-epics-rtems-boot = { workspace = true }
+# No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
+# is a dependency of whichever package owns one, and `rtems-pva-ioc` moved to
+# `epics-bridge-rs` (doc/qsrv-rtems-design.md §9.7).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -196,13 +194,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
 ] }
 
-# `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
-# `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
-# table is evaluated against the HOST, so a `cfg(target_os = "rtems")` one
-# would never match.
-[build-dependencies]
-epics-rtems-boot = { workspace = true }
-
 [dev-dependencies]
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared `rtems-exec-model` test-gating census, called by
@@ -259,12 +250,7 @@ required-features = ["client"]
 name = "mshim-rs"
 path = "src/bin/mshim-rs.rs"
 
-# The RTEMS PVA IOC entry point. Deliberately NOT given `required-features`,
-# for the same reason `epics-ca-rs`'s `rtems-ca-ioc` is not: it must be built
-# by a bare `cargo check --bin rtems-pva-ioc --target armv7-rtems-eabihf`, and
-# a `required-features` gate would make cargo silently *skip* the target
-# instead, turning the RTEMS gate into a vacuous pass. It needs no `client`:
-# it is a server.
-[[bin]]
-name = "rtems-pva-ioc"
-path = "src/bin/rtems-pva-ioc.rs"
+# `rtems-pva-ioc` used to be declared here. It moved to `epics-bridge-rs` when
+# it grew a QSRV group source: the mount needs the bridge, and this package
+# cannot depend on the bridge without a cyclic package dependency (measured —
+# doc/qsrv-rtems-design.md §9.7). This package now produces no target binary.

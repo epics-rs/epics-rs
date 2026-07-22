@@ -1477,8 +1477,10 @@ impl PvDatabase {
         // so a non-local target returns right after the remote write.
         // OUTPUT-side twin of the `read_db_link_value` locality fallback.
         if !self.has_name_no_resolve(&link.record).await {
-            let op = Self::external_put_op(src.notify);
-            if let Err(e) = self.write_external_pv(&target_name, value, op).await {
+            if let Err(e) = self
+                .write_external_pv(&target_name, value, src.notify)
+                .await
+            {
                 eprintln!("OUT-link write to external PV '{target_name}' failed: {e}");
                 return true;
             }
@@ -1598,24 +1600,31 @@ impl PvDatabase {
     ///   `CA_PUT` / `ca_array_put` (`dbCa.c:1228-1231`), and it is the whole
     ///   point of the queue: record processing no longer suspends on a
     ///   `ca://`/`pva://` round trip inside the record's advisory write gate.
-    /// * For [`LinkPutOp::Async`] the call still awaits — that is the
-    ///   completion flavour, C's `CA_PUT_CALLBACK` / `ca_array_put_callback`
-    ///   whose `putComplete` drives the originating record's completion
-    ///   (`dbCa.c:1232-1236`, `:1056-1074`). It awaits the queue owner's
-    ///   result rather than performing the network write itself, so the
-    ///   network op has moved off the record thread in both flavours; only
-    ///   the *waiting* remains, and only where a put-notify chain requires it.
+    /// * `Ok(())` for [`LinkPutOp::Async`] too — the completion flavour, C's
+    ///   `CA_PUT_CALLBACK` / `ca_array_put_callback` whose `putComplete`
+    ///   drives the originating record's completion (`dbCa.c:1232-1236`,
+    ///   `:1056-1074`). `dbCaPutLinkCallback` stores the callback in
+    ///   `pca->putCallback`, calls `addAction` and **returns**
+    ///   (`dbCa.c:614-624`); what keeps the put-notify chain outstanding is
+    ///   the RECORD staying active, not a held lock. So this call joins the
+    ///   source record's [`NotifyWaitSet`] (C `dbNotifyAdd`) before staging
+    ///   and hands the completion receiver to a spawned waiter that `leave`s
+    ///   the set when the queue owner resolves it (C `dbNotifyCompletion`).
+    ///   Nothing is awaited here — the record's advisory write gate is
+    ///   released at the end of this cycle exactly as it is for a plain put.
     ///
-    /// `op` carries the delivery semantics the lset must honour:
-    /// [`LinkPutOp::Async`] when the write is part of a put-notify /
-    /// blocking-put chain (mirrors C `dbPutLinkAsync` / pvxs
-    /// `pvaPutValueAsync`), [`LinkPutOp::Plain`] otherwise.
+    /// `src_notify` is the source record's put-completion wait-set. Its
+    /// presence is what selects [`LinkPutOp::Async`] over
+    /// [`LinkPutOp::Plain`] — see [`Self::external_put_op`], the single
+    /// owner of that mapping — and it is also the thing the completion is
+    /// reported through, so the two cannot disagree.
     pub(crate) async fn write_external_pv(
         &self,
         name: &str,
         value: EpicsValue,
-        op: LinkPutOp,
+        src_notify: Option<&Arc<NotifyWaitSet>>,
     ) -> Result<(), String> {
+        let op = Self::external_put_op(src_notify);
         use super::link_put_queue::{LinkKey, LinkTarget};
         use super::link_set::PutAdmission;
 
@@ -1680,11 +1689,32 @@ impl PvDatabase {
         match self.inner.link_puts.stage_put(key, value, op) {
             // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:622-624`).
             None => Ok(()),
-            // `dbCaPutLinkCallback`: the completion route. The owner resolves
-            // this when its `put_value` returns, as `putComplete` does.
-            Some(rx) => rx
-                .await
-                .unwrap_or_else(|_| Err("external link put completion channel closed".to_string())),
+            // `dbCaPutLinkCallback`: the completion route. C stores the
+            // callback and returns (`dbCa.c:614-624`); `putComplete`
+            // (`dbCa.c:1056-1074`) fires it later from the CA task. The
+            // record-side counterpart of that callback is the put-notify
+            // wait-set: join it now (C `dbNotifyAdd`) and let a spawned
+            // waiter leave it when the owner resolves the completion (C
+            // `dbNotifyCompletion`). The source record's own count is still
+            // held by the cycle that issued this write, so the set cannot
+            // drain between staging and joining.
+            //
+            // The returned status stays the STAGING status, never the
+            // network status — `dbCaPutLinkCallback` returns the conversion
+            // status and reports wire failures only through the task
+            // (`dbCa.c:1240-1244`), and `dbPutLink`'s `setLinkAlarm` gate
+            // therefore alarms on refusal to stage (`dbLink.c:434-448`).
+            Some(rx) => {
+                if let Some(waitset) = src_notify {
+                    let waitset = waitset.clone();
+                    waitset.enter();
+                    crate::runtime::task::spawn(async move {
+                        let _ = rx.await;
+                        waitset.leave();
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2043,8 +2073,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                let op = Self::external_put_op(src.notify);
-                match self.write_external_pv(&name, value, op).await {
+                match self.write_external_pv(&name, value, src.notify).await {
                     Ok(()) => false,
                     Err(e) => {
                         eprintln!("OUT-link write to external PV '{name}' failed: {e}");

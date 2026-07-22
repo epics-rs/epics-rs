@@ -139,6 +139,22 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64, notify: bool) 
     }
 }
 
+/// `add_ao` with a put-notify wait-set whose completion receiver is handed
+/// BACK, so a test can observe when the chain settles. The leaked-receiver
+/// variant above is for tests that only inspect the write itself.
+async fn add_ao_notify(
+    db: &PvDatabase,
+    name: &str,
+    out: &str,
+    val: f64,
+) -> epics_base_rs::runtime::sync::oneshot::Receiver<()> {
+    add_ao(db, name, out, val, false).await;
+    let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    let rec = db.get_record(name).expect("just added");
+    rec.write().notify = Some(NotifyWaitSet::new(tx));
+    rx
+}
+
 async fn set_val(db: &PvDatabase, name: &str, val: f64) {
     let rec = db.get_record(name).expect("record exists");
     rec.write()
@@ -334,27 +350,64 @@ async fn per_link_put_ordering_is_preserved() {
     assert_eq!(db.external_link_puts_coalesced(), 0);
 }
 
-/// Boundary — the completion flavour still completes, successfully. A record
-/// in a put-notify chain issues `LinkPutOp::Async`; C `dbCaPutLinkCallback`
-/// stages it with `putCallback` set and `putComplete` (`dbCa.c:1056-1074`)
-/// resolves it later. So the write must be observable with NO `dbCaSync`
-/// barrier: the record itself waited for the completion.
+/// Boundary — the completion flavour does NOT hold the record thread either.
+///
+/// C `dbCaPutLinkCallback` stores `pca->putCallback`, calls `addAction` and
+/// RETURNS (`dbCa.c:614-624`), identically to the plain flavour; what keeps a
+/// put-notify chain outstanding is the RECORD staying active, not the record
+/// thread parking on the wire. `putComplete` (`dbCa.c:1056-1074`) later fires
+/// the callback — `dbCaCallbackProcess` → `dbLinkAsyncComplete`
+/// (`dbCa.c:317-322`) — which is what settles the chain.
+///
+/// So: `process()` must return while `put_value` is still blocked, and the
+/// source record's `NotifyWaitSet` must stay unsettled until the completion
+/// resolves. On the pre-H6 shape `process()` awaited the completion, so this
+/// test would deadlock on the gate rather than fail an assertion.
 #[tokio::test]
-async fn async_put_completion_fires_without_a_sync_barrier() {
-    let writes = Arc::new(Mutex::new(Vec::new()));
-    let db = PvDatabase::new();
-    db.register_link_set("ca", Arc::new(RecordingLset::connected(&writes)))
-        .await;
+async fn async_put_completion_is_reported_through_the_notify_chain() {
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
 
-    add_ao(&db, "AO_NOTIFY", "ca://REMOTE:OUT", 9.0, true).await;
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "ca",
+        Arc::new(GateLset {
+            gated: "REMOTE:OUT".to_string(),
+            completed: Arc::clone(&completed),
+            entered,
+            release: Arc::clone(&release),
+        }),
+    )
+    .await;
+
+    let mut notify_rx = add_ao_notify(&db, "AO_NOTIFY", "ca://REMOTE:OUT", 9.0).await;
     process(&db, "AO_NOTIFY").await;
 
+    // The record thread is back with the wire write still in flight.
     assert_eq!(
-        writes.lock().unwrap().as_slice(),
-        [(9.0, LinkPutOp::Async)],
-        "a completion-flavour put is already done when process() returns — no \
-         barrier needed (C putComplete, dbCa.c:1056-1074)"
+        entered_rx.recv().await,
+        Some(9.0),
+        "the completion-flavour write reached put_value on the queue owner"
     );
+    assert!(
+        completed.lock().unwrap().is_empty(),
+        "the wire write has NOT completed, yet process() already returned — \
+         C `dbCaPutLinkCallback` stages and returns (dbCa.c:614-624)"
+    );
+    assert!(
+        notify_rx.try_recv().is_err(),
+        "the put-notify chain is still outstanding: the record stays active \
+         until putComplete (dbCa.c:1056-1074), which is what the external put \
+         joined the wait-set for"
+    );
+
+    release.add_permits(1);
+    db.sync_external_link_puts().await;
+    assert_eq!(completed.lock().unwrap().as_slice(), [9.0]);
+    notify_rx
+        .await
+        .expect("the completion settles the put-notify chain");
     assert_eq!(
         alarm_of(&db, "AO_NOTIFY").await,
         (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
@@ -362,18 +415,22 @@ async fn async_put_completion_fires_without_a_sync_barrier() {
     );
 }
 
-/// Boundary twin — a completion flavour whose WIRE write fails must carry the
-/// failure back to the waiting record. This is the one place a wire-level
-/// failure is still the caller's status, and it is so in C too: `putComplete`
-/// runs `pca->putCallback`, which for `dbCaPutAsync` is `dbCaCallbackProcess`
-/// → `dbLinkAsyncComplete` (`dbCa.c:317-322`), driving the originating
-/// record's completion path.
+/// Boundary twin — a completion flavour whose WIRE write fails does NOT alarm
+/// the source record; it settles the chain and goes to errlog.
+///
+/// C's `putComplete` reads `pca->putCallback` and calls it, discarding
+/// `arg.status` entirely (`dbCa.c:1056-1074`) — the callback runs whether the
+/// remote accepted the put or not. The wire status reaches the operator on the
+/// task instead (`errlogPrintf`, `dbCa.c:1238-1244`, below the
+/// `CA_PUT`/`CA_PUT_CALLBACK` fork so it covers both flavours). The record's
+/// own alarm comes from the STAGING gate (`dbCa.c:558-561` →
+/// `dbLink.c:434-448` `setLinkAlarm`), which this write passed.
 ///
 /// If the queue owner ever dropped a completion instead of resolving it, this
 /// test would hang rather than fail — which is why `PutCompletion` resolves on
 /// `Drop` as well as on the success path.
 #[tokio::test]
-async fn async_put_failure_reaches_the_waiting_record() {
+async fn async_put_wire_failure_settles_the_chain_without_alarming() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
     db.register_link_set(
@@ -386,20 +443,24 @@ async fn async_put_failure_reaches_the_waiting_record() {
     )
     .await;
 
-    add_ao(&db, "AO_NOTIFY_ERR", "ca://REMOTE:OUT", 4.0, true).await;
+    let notify_rx = add_ao_notify(&db, "AO_NOTIFY_ERR", "ca://REMOTE:OUT", 4.0).await;
     process(&db, "AO_NOTIFY_ERR").await;
+    db.sync_external_link_puts().await;
 
     assert_eq!(
         writes.lock().unwrap().len(),
         1,
         "the write was attempted on the wire"
     );
+    notify_rx.await.expect(
+        "a failed wire write still settles the chain — C putComplete \
+                 discards arg.status and calls the callback regardless",
+    );
     assert_eq!(
         alarm_of(&db, "AO_NOTIFY_ERR").await,
-        (alarm_status::LINK_ALARM, AlarmSeverity::Invalid),
-        "the completion resolved Err, so the waiting record alarms — the \
-         completion route keeps the failure visible that the fire-and-forget \
-         route deliberately drops to errlog (dbCa.c:1240-1244)"
+        (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+        "the record's alarm comes from the staging gate, not the wire status \
+         (dbCa.c:558-561 / dbLink.c:434-448)"
     );
 }
 

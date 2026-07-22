@@ -673,6 +673,12 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited, 0)
         .await
         .unwrap();
+    // The completion flavour stages and returns like the plain one (C
+    // `dbCaPutLinkCallback`, `dbCa.c:614-624`), so the wire write is observed
+    // through the `dbCaSync` barrier. This test asserts the OP FLAVOUR, not
+    // the timing — the timing boundary is
+    // `external_link_put_enqueue::async_put_completion_is_reported_through_the_notify_chain`.
+    db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
     assert_eq!(

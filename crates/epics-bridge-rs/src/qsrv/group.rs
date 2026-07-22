@@ -643,7 +643,7 @@ async fn lock_group_records_read(
 /// set. Names are resolved through the alias map so the gate key
 /// matches the one a direct CA/PVA write would take in
 /// `put_record_field_from_ca` / `put_pv` / `process_record`.
-async fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> Vec<String> {
+fn group_member_record_names(db: &PvDatabase, members: &[GroupMember]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for m in members {
         if m.channel.is_empty() {
@@ -878,7 +878,7 @@ impl GroupChannel {
             // a later-sorted member between this GET's read of an earlier one,
             // yielding a torn snapshot (B updated, A stale) that defeats the
             // `atomic` flag — the GET-side twin of the PUT-side BR-R15 gap.
-            let member_records = group_member_record_names(&self.db, &self.def.members).await;
+            let member_records = group_member_record_names(&self.db, &self.def.members);
             let _many_guard = self.db.lock_records(&member_records).await;
 
             // Acquire every backing record's read guard synchronously, in the
@@ -1177,7 +1177,7 @@ impl GroupChannel {
     /// through the same `client_field_value` projection as the descriptor
     /// path above; `declared_field_type` covers the fields that carry no
     /// value at all, and `Double` only when the record/field is unknown.
-    async fn member_dbf_type(&self, member: &GroupMember) -> DbFieldType {
+    fn member_dbf_type(&self, member: &GroupMember) -> DbFieldType {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
 
@@ -1288,7 +1288,7 @@ impl GroupChannel {
     /// storage pvxs writes with `putLongString` when the incoming leaf is a
     /// string (`dbChannelFinalFieldType == DBR_CHAR && value is String`,
     /// iocsource.cpp:601-606).
-    async fn member_is_char_array(&self, member: &GroupMember) -> bool {
+    fn member_is_char_array(&self, member: &GroupMember) -> bool {
         let (record_name, field_name) =
             epics_base_rs::server::database::parse_pv_name(&member.channel);
         let Some(rec) = self.db.get_record(record_name) else {
@@ -1306,7 +1306,7 @@ impl GroupChannel {
     /// conversions (e.g. ScalarValue::Long → EpicsValue::Double).
     ///
     /// For arrays and structures, falls back to `pv_field_to_epics`.
-    async fn convert_member_value(
+    fn convert_member_value(
         &self,
         member: &GroupMember,
         pv_field: &epics_pva_rs::pvdata::PvField,
@@ -1323,12 +1323,12 @@ impl GroupChannel {
             // typed scalar conversion below would instead try to parse the
             // whole string as one integer and reject the PUT.
             PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::String(s))
-                if self.member_is_char_array(member).await =>
+                if self.member_is_char_array(member) =>
             {
                 Some(pvif::long_string_put_image(s))
             }
             PvField::Scalar(sv) => {
-                let target = self.member_dbf_type(member).await;
+                let target = self.member_dbf_type(member);
                 // A non-numeric string bound for a numeric member yields
                 // `None` here, which the caller treats as an unconvertible
                 // member and rejects the whole group PUT (pvxs `parseTo<T>`
@@ -1343,9 +1343,101 @@ impl GroupChannel {
         }
     }
 
+    /// `IOCSource::doPostProcessing` (`iocsource.cpp:397-403`) — the single
+    /// owner of "does this group member's PUT process its backing record?".
+    /// Shared by [`Self::post_process_member_already_locked`] (atomic PUT)
+    /// and [`Self::post_process_member`] (non-atomic PUT): same decision,
+    /// different lock discipline below it.
+    ///
+    /// C asks three questions, in order: is the bound field the record's
+    /// `PROC`; did the client force processing (`record._options.process=true`);
+    /// otherwise, is the field `pp(TRUE)` on a `SCAN=Passive` record (and the
+    /// client neither forced nor inhibited). Only then `dbProcess`.
+    ///
+    /// The port used to process a `+type:"proc"` member's record
+    /// UNCONDITIONALLY — every group PUT, whatever the member's field, whatever
+    /// the record's SCAN, even under `process=false` (R18-30). The gate is not
+    /// specific to `proc` members: it is the gate for every member whose write
+    /// did not go through `dbPutField` — which is `proc` (no value to write) and
+    /// the `changing`-but-unwritable members (Meta, R17-37). One owner, so a
+    /// second such member class cannot re-open it.
+    fn member_process_it(
+        &self,
+        record_name: &str,
+        field_name: &str,
+        process: super::channel::ProcessMode,
+    ) -> bool {
+        use super::channel::ProcessMode;
+        match process {
+            // `forceProcessing == True` — process regardless of field and SCAN.
+            ProcessMode::Force => true,
+            // `forceProcessing == False` — C's `doPostProcessing` still honors
+            // `pfield == &precord->proc`: a PROC-bound member processes even
+            // under process=false, because the disjunction's first term does
+            // not consult `forceProcessing`.
+            ProcessMode::Inhibit => field_name.eq_ignore_ascii_case("PROC"),
+            // `forceProcessing == Unset` — the record's own rule, asked of the
+            // database (`PROC`, or `pp(TRUE)` on a Passive record).
+            ProcessMode::Passive => self.db.put_drives_processing(record_name, field_name),
+        }
+    }
+
+    /// [`Self::member_process_it`], applied — the atomic-PUT entry. This
+    /// transaction already owns every member-record gate via `lock_records`
+    /// (the gate `Mutex` is not reentrant), so the transition below MUST use
+    /// the `_already_locked` entry. Synchronous: after
+    /// `doc/rtems-priority-locks-design.md` H6, `put_driven_process_already_locked`
+    /// is a plain `fn`, so this reaches the end of the atomic PUT's
+    /// `lock_records` window with zero `.await`s (§1.1 H9, §5 step 6).
+    fn post_process_member_already_locked(
+        &self,
+        member: &GroupMember,
+        process: super::channel::ProcessMode,
+    ) -> BridgeResult<()> {
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+        if !self.member_process_it(record_name, field_name, process) {
+            return Ok(());
+        }
+        // The DECISION is the group's (pvxs asks it in `doPostProcessing`); the
+        // TRANSITION is the database's. `put_driven_process` is its declared
+        // single owner — C `dbPutField:1264-1277` and pvxs
+        // `iocsource.cpp:404-419` split identically on PACT: an async-active
+        // record takes `rpro = TRUE` and is NOT processed (`recGblFwdLink`
+        // re-queues it when the device round trip lands), an idle one takes
+        // `putf = TRUE` and processes. Reaching for `process_record_with_links`
+        // here instead set neither flag and dropped a group PUT into
+        // `dbProcess`'s own PACT guard — the LCNT bump and the SCAN_ALARM /
+        // INVALID after MAX_LOCK that C's `doPostProcessing` exists to avoid,
+        // while losing the deferred reprocess: two rapid group PUTs to a Passive
+        // async output wrote one value to the device where C writes both.
+        self.db
+            .put_driven_process_already_locked(record_name)
+            .map_err(|e| BridgeError::PutRejected(e.to_string()))
+    }
+
+    /// [`Self::member_process_it`], applied — the non-atomic-PUT entry. No
+    /// member gate is held here, so the transition takes the
+    /// gate-acquiring `put_driven_process`.
+    async fn post_process_member(
+        &self,
+        member: &GroupMember,
+        process: super::channel::ProcessMode,
+    ) -> BridgeResult<()> {
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+        if !self.member_process_it(record_name, field_name, process) {
+            return Ok(());
+        }
+        self.db
+            .put_driven_process(record_name)
+            .await
+            .map_err(|e| BridgeError::PutRejected(e.to_string()))
+    }
+
     /// Apply one ordinary (value) group-member write under the
-    /// requested [`ProcessMode`], the single owner of the tri-state →
-    /// write mapping for group member application. Mirrors pvxs
+    /// requested [`super::channel::ProcessMode`], the single owner of the
+    /// tri-state → write mapping for group member application. Mirrors pvxs
     /// `putGroupField` → `IOCSource::put` + `doPostProcessing(
     /// forceProcessing)` (groupsource.cpp:563-571, iocsource.cpp:
     /// 397-420), which preserves the full `TriState forceProcessing`
@@ -1361,91 +1453,86 @@ impl GroupChannel {
     ///   (`forceProcessing == Unset`).
     /// - `Inhibit` (process=false): raw-write the field, no processing.
     ///
-    /// `already_locked` selects the gate-holding variants for the
-    /// atomic PUT (which owns every member gate via `lock_records`; the
-    /// gate `Mutex` is not reentrant) vs the gate-acquiring variants for
-    /// the non-atomic per-member path.
-    /// `IOCSource::doPostProcessing` (`iocsource.cpp:397-403`) — the single
-    /// owner of "does this group member's PUT process its backing record?".
+    /// Split into an already-locked entry (atomic PUT, this transaction owns
+    /// every member gate via `lock_records`; the gate `Mutex` is not
+    /// reentrant) and a gate-acquiring entry (non-atomic per-member path) —
+    /// same tri-state mapping, different lock discipline.
     ///
-    /// C asks three questions, in order: is the bound field the record's
-    /// `PROC`; did the client force processing (`record._options.process=true`);
-    /// otherwise, is the field `pp(TRUE)` on a `SCAN=Passive` record (and the
-    /// client neither forced nor inhibited). Only then `dbProcess`.
-    ///
-    /// The port used to process a `+type:"proc"` member's record
-    /// UNCONDITIONALLY — every group PUT, whatever the member's field, whatever
-    /// the record's SCAN, even under `process=false` (R18-30). The gate is not
-    /// specific to `proc` members: it is the gate for every member whose write
-    /// did not go through `dbPutField` — which is `proc` (no value to write) and
-    /// the `changing`-but-unwritable members (Meta, R17-37). One owner, so a
-    /// second such member class cannot re-open it.
-    async fn post_process_member(
+    /// Bracket this member's backing write with the EPICS `asTrapWrite`
+    /// put-logging hook. pvxs builds one `SecurityLogger` per group field
+    /// (groupsource.cpp:594-602), so each member value write emits its own
+    /// Before/After pair (a `proc` hook writes no value and is not routed
+    /// here). The member `grant` gates emission; `dbr_type` is the value's
+    /// final field type — `convert_member_value` already typed it to the
+    /// member DBF.
+    fn apply_member_value_already_locked(
         &self,
-        member: &GroupMember,
+        record_name: &str,
+        field_name: &str,
+        value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
-        already_locked: bool,
+        grant: super::provider::WriteGrant,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
-        let (record_name, field_name) =
-            epics_base_rs::server::database::parse_pv_name(&member.channel);
-        let process_it = match process {
-            // `forceProcessing == True` — process regardless of field and SCAN.
-            ProcessMode::Force => true,
-            // `forceProcessing == False` — C's `doPostProcessing` still honors
-            // `pfield == &precord->proc`: a PROC-bound member processes even
-            // under process=false, because the disjunction's first term does
-            // not consult `forceProcessing`.
-            ProcessMode::Inhibit => field_name.eq_ignore_ascii_case("PROC"),
-            // `forceProcessing == Unset` — the record's own rule, asked of the
-            // database (`PROC`, or `pp(TRUE)` on a Passive record).
-            ProcessMode::Passive => self.db.put_drives_processing(record_name, field_name).await,
+        let pv_name = format!("{record_name}.{field_name}");
+        let meta = super::trap_write::TrapWriteMeta {
+            pv_name: &pv_name,
+            user: &self.access.user,
+            host: &self.access.host,
+            peer: &self.access.host,
+            dbr_type: value.dbr_type() as u16,
         };
-        if !process_it {
-            return Ok(());
-        }
-        // The DECISION is the group's (pvxs asks it in `doPostProcessing`); the
-        // TRANSITION is the database's. `put_driven_process` is its declared
-        // single owner — C `dbPutField:1264-1277` and pvxs
-        // `iocsource.cpp:404-419` split identically on PACT: an async-active
-        // record takes `rpro = TRUE` and is NOT processed (`recGblFwdLink`
-        // re-queues it when the device round trip lands), an idle one takes
-        // `putf = TRUE` and processes. Reaching for `process_record_with_links`
-        // here instead set neither flag and dropped a group PUT into
-        // `dbProcess`'s own PACT guard — the LCNT bump and the SCAN_ALARM /
-        // INVALID after MAX_LOCK that C's `doPostProcessing` exists to avoid,
-        // while losing the deferred reprocess: two rapid group PUTs to a Passive
-        // async output wrote one value to the device where C writes both.
-        //
-        // `_already_locked` inside an atomic PUT — that transaction owns every
-        // member-record gate via `lock_records`, and the gate `Mutex` is not
-        // reentrant.
-        if already_locked {
-            self.db.put_driven_process_already_locked(record_name)
-        } else {
-            self.db.put_driven_process(record_name).await
-        }
-        .map_err(|e| BridgeError::PutRejected(e.to_string()))
+        // Synchronous bracket: after H6 every `_already_locked` callee below
+        // is a plain `fn`, so this reaches the end of the atomic PUT's
+        // `lock_records` window with zero `.await`s
+        // (`doc/rtems-priority-locks-design.md` §1.1 H9, §5 step 6).
+        super::trap_write::put_with_trap_already_locked(grant, meta, value, |value| {
+            let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
+            match process {
+                ProcessMode::Inhibit => {
+                    let pv = format!("{record_name}.{field_name}");
+                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                }
+                ProcessMode::Passive => {
+                    // Group member puts never await completion — use the
+                    // fire-and-forget entry so no put-notify wait-set is
+                    // parked on the member record (a dropped receiver
+                    // would occupy its notify slot until async
+                    // processing settles).
+                    self.db
+                        .put_record_field_from_ca_no_notify_already_locked(
+                            record_name,
+                            field_name,
+                            value,
+                        )
+                        .map_err(to_err)?;
+                }
+                ProcessMode::Force => {
+                    let pv = format!("{record_name}.{field_name}");
+                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    let mut visited = std::collections::HashSet::new();
+                    self.db
+                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                        .map_err(to_err)?;
+                }
+            }
+            Ok(())
+        })
     }
 
+    /// [`Self::apply_member_value_already_locked`]'s gate-acquiring twin —
+    /// the non-atomic per-member path. No member gate is held here, so every
+    /// write below takes the gate-acquiring entry and the trap bracket
+    /// awaits it.
     async fn apply_member_value(
         &self,
         record_name: &str,
         field_name: &str,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
-        already_locked: bool,
         grant: super::provider::WriteGrant,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
-        // Bracket this member's backing write with the EPICS
-        // `asTrapWrite` put-logging hook. pvxs builds one
-        // `SecurityLogger` per group field (groupsource.cpp:594-602), so
-        // each member value write emits its own Before/After pair (a
-        // `proc` hook writes no value and is not routed here). The
-        // member `grant` gates emission; `dbr_type` is the value's final
-        // field type — `convert_member_value` already typed it to the
-        // member DBF.
         let pv_name = format!("{record_name}.{field_name}");
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
@@ -1459,53 +1546,22 @@ impl GroupChannel {
             match process {
                 ProcessMode::Inhibit => {
                     let pv = format!("{record_name}.{field_name}");
-                    if already_locked {
-                        self.db.put_pv_already_locked(&pv, value)
-                    } else {
-                        self.db.put_pv(&pv, value).await
-                    }
-                    .map_err(to_err)?;
+                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
-                    // Group member puts never await completion — use the
-                    // fire-and-forget entry so no put-notify wait-set is
-                    // parked on the member record (a dropped receiver
-                    // would occupy its notify slot until async
-                    // processing settles).
-                    if already_locked {
-                        self.db.put_record_field_from_ca_no_notify_already_locked(
-                            record_name,
-                            field_name,
-                            value,
-                        )
-                    } else {
-                        self.db
-                            .put_record_field_from_ca_no_notify(record_name, field_name, value)
-                            .await
-                    }
-                    .map_err(to_err)?;
+                    self.db
+                        .put_record_field_from_ca_no_notify(record_name, field_name, value)
+                        .await
+                        .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
-                    if already_locked {
-                        self.db.put_pv_already_locked(&pv, value)
-                    } else {
-                        self.db.put_pv(&pv, value).await
-                    }
-                    .map_err(to_err)?;
+                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
-                    if already_locked {
-                        self.db.process_record_with_links_already_locked(
-                            record_name,
-                            &mut visited,
-                            0,
-                        )
-                    } else {
-                        self.db
-                            .process_record_with_links(record_name, &mut visited, 0)
-                            .await
-                    }
-                    .map_err(to_err)?;
+                    self.db
+                        .process_record_with_links(record_name, &mut visited, 0)
+                        .await
+                        .map_err(to_err)?;
                 }
             }
             Ok(())
@@ -1714,43 +1770,35 @@ impl GroupChannel {
         if atomic {
             // atomic PUT — `DBManyLock`-equivalent exclusion.
             //
-            // pvxs builds a `DBManyLock` over every group-member
-            // record (`groupconfigprocessor.cpp:1165`
-            // `initialiseDbLocker`) and takes a `DBManyLocker` across
-            // the whole atomic PUT member loop
-            // (`groupsource.cpp:569`). Because `DBManyLock` locks the
-            // same `dbCommon::lock` mutexes that a plain `dbPutField`
-            // takes via `dbScanLock`, a direct CA/PVA write to a
-            // backing member record cannot interleave with the
-            // atomic group transaction.
-            //
-            // The Rust equivalent: `PvDatabase::lock_records` over
-            // every member record acquires the per-record advisory
-            // write gates (`dbScanLock` analogue) in canonical sorted
-            // order. The plain write path
-            // (`put_record_field_from_ca` / `put_pv` /
-            // `process_record`) takes the same gate, so a direct
-            // backing-record write now blocks until this atomic PUT
-            // completes — closing the gap the previous
-            // `atomic_write_lock`-only design left open.
-            //
-            // The member writes below MUST use the `_already_locked`
-            // helper variants: this transaction already owns every
-            // member-record gate, and the per-record gate `Mutex` is
-            // not reentrant.
-            let member_records = group_member_record_names(&self.db, &self.def.members).await;
-            let _many_guard = self.db.lock_records(&member_records).await;
-
-            // `atomic_write_lock` is retained as an internal aid so
-            // two PUTs through the *same* group PV also serialize
-            // even before either reaches `lock_records` (e.g. the
-            // up-front value-conversion phase).
+            // `atomic_write_lock` (L33) is acquired FIRST, above and
+            // outside `lock_records` (L1) — see
+            // `doc/rtems-priority-locks-design.md` §1.1 H9 / §5 step 6
+            // and the acquisition-order note in `record_lock.rs`'s module
+            // doc. It is retained as an internal aid so two PUTs through
+            // the *same* group PV also serialize even before either
+            // reaches `lock_records`, including the up-front
+            // value-conversion phase below: a conversion failure returns
+            // before `lock_records` is ever requested, so nothing has
+            // been locked (or applied) when the atomic PUT aborts. Held
+            // for the whole atomic block (`bug4_atomic_put_serializes_on_group_lock`,
+            // `bug4_concurrent_atomic_puts_do_not_interleave`) — it stays
+            // a `tokio::sync::Mutex`, not a `PriorityInheritanceMutex`:
+            // it is held across `lock_records(…).await` itself, which is
+            // still a genuine suspension point until L1 becomes a PI
+            // mutex (design step 4, not yet landed — `record_lock.rs`
+            // module doc). Converting L33 first would hold a `!Send`
+            // guard across that await and fail to compile at the
+            // connection-task spawn site, the exact `!Send` trap H1-H9
+            // exist to avoid.
             let _atomic_guard = self.def.atomic_write_lock.lock().await;
 
             // Convert all values up-front (DBF-typed), then perform the
             // actual writes in order. A member that only post-processes
             // (`proc` trigger, or a changing member with no writable leaf)
-            // carries no value.
+            // carries no value. Synchronous: `convert_member_value` and its
+            // callees (`member_is_char_array`, `member_dbf_type`) do not
+            // await anything, so this whole phase runs, and can fail,
+            // before any member-record gate is even requested.
             let mut writes: Vec<(
                 &GroupMember,
                 MemberPutAction,
@@ -1779,7 +1827,7 @@ impl GroupChannel {
                         // the all-or-nothing guarantee holds.
                         let pv_field = get_nested_field(value, &member.field_name)
                             .expect("classifier returned Write only for a supplied field");
-                        match self.convert_member_value(member, &pv_field).await {
+                        match self.convert_member_value(member, &pv_field) {
                             Some(v) => Some(v),
                             None => {
                                 return Err(BridgeError::PutRejected(format!(
@@ -1794,6 +1842,35 @@ impl GroupChannel {
                 writes.push((member, action, epics_val));
             }
 
+            // pvxs builds a `DBManyLock` over every group-member
+            // record (`groupconfigprocessor.cpp:1165`
+            // `initialiseDbLocker`) and takes a `DBManyLocker` across
+            // the whole atomic PUT member loop
+            // (`groupsource.cpp:569`). Because `DBManyLock` locks the
+            // same `dbCommon::lock` mutexes that a plain `dbPutField`
+            // takes via `dbScanLock`, a direct CA/PVA write to a
+            // backing member record cannot interleave with the
+            // atomic group transaction.
+            //
+            // The Rust equivalent: `PvDatabase::lock_records` over
+            // every member record acquires the per-record advisory
+            // write gates (`dbScanLock` analogue) in canonical sorted
+            // order. The plain write path
+            // (`put_record_field_from_ca` / `put_pv` /
+            // `process_record`) takes the same gate, so a direct
+            // backing-record write now blocks until this atomic PUT
+            // completes — closing the gap the previous
+            // `atomic_write_lock`-only design left open.
+            //
+            // The member writes below MUST use the `_already_locked`
+            // helper variants: this transaction already owns every
+            // member-record gate, and the per-record gate `Mutex` is
+            // not reentrant. From here to the end of this block is
+            // synchronous — zero `.await`s reached while `_many_guard`
+            // is held (`doc/rtems-priority-locks-design.md` §1.1 H9).
+            let member_records = group_member_record_names(&self.db, &self.def.members);
+            let _many_guard = self.db.lock_records(&member_records).await;
+
             for (member, action, val) in writes {
                 let (record_name, field_name) =
                     epics_base_rs::server::database::parse_pv_name(&member.channel);
@@ -1804,7 +1881,7 @@ impl GroupChannel {
                         // straight to `doPostProcessing` (groupsource.cpp:568),
                         // which decides whether the record actually processes.
                         // The gate lives in one owner — never inline here.
-                        self.post_process_member(member, opts.process, true).await?;
+                        self.post_process_member_already_locked(member, opts.process)?;
                     }
                     MemberPutAction::Write => {
                         // `_already_locked` — this atomic PUT owns every
@@ -1813,18 +1890,16 @@ impl GroupChannel {
                         // gates `asTrapWrite` emission for this write.
                         let epics_val =
                             val.expect("classifier returned Write, so a value was converted");
-                        self.apply_member_value(
+                        self.apply_member_value_already_locked(
                             record_name,
                             field_name,
                             epics_val,
                             opts.process,
-                            true,
                             member_grants
                                 .get(member.channel.as_str())
                                 .copied()
                                 .unwrap_or_default(),
-                        )
-                        .await?;
+                        )?;
                     }
                     MemberPutAction::Skip => continue,
                 }
@@ -1855,8 +1930,7 @@ impl GroupChannel {
                         // member always processes". The non-atomic path holds no
                         // member gate, so the owner takes the gate-acquiring
                         // entry.
-                        self.post_process_member(member, opts.process, false)
-                            .await?;
+                        self.post_process_member(member, opts.process).await?;
                     }
                     MemberPutAction::Write => {
                         // Nested-aware lookup (matches read-side
@@ -1872,7 +1946,7 @@ impl GroupChannel {
                         // that into a remote error (groupsource.cpp:665),
                         // distinct from the "No fields changed" reply (:656)
                         // which fires only when nothing putable was marked.
-                        let epics_val = match self.convert_member_value(member, &pv_field).await {
+                        let epics_val = match self.convert_member_value(member, &pv_field) {
                             Some(v) => v,
                             None => {
                                 return Err(BridgeError::PutRejected(format!(
@@ -1891,7 +1965,6 @@ impl GroupChannel {
                             field_name,
                             epics_val,
                             opts.process,
-                            false,
                             member_grants
                                 .get(member.channel.as_str())
                                 .copied()
@@ -5053,6 +5126,73 @@ mod tests {
             ) => {
                 assert_eq!(va, 11.0);
                 assert_eq!(vb, 22.0);
+            }
+            other => panic!("unexpected member values: {other:?}"),
+        }
+    }
+
+    /// H9 boundary: an unconvertible member value must abort the atomic
+    /// PUT in the up-front conversion phase, BEFORE `lock_records` (L1)
+    /// is ever requested (`doc/rtems-priority-locks-design.md` §1.1 H9,
+    /// the hoist this restructure performs).
+    ///
+    /// Proven by pre-holding, on THIS task, the exact member-record gate
+    /// set the atomic PUT would need. If the conversion-failure path ran
+    /// AFTER acquiring `lock_records`, `channel.put` would try to
+    /// re-acquire a gate this same (un-spawned) task already holds —
+    /// which can never be released — and the surrounding timeout would
+    /// fire. It returns promptly instead, proving the abort happens
+    /// strictly before `lock_records` is reached.
+    #[tokio::test]
+    async fn h9_atomic_put_conversion_failure_aborts_before_gate() {
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        let (db, def) = atomic_group_fixture().await;
+        let channel = GroupChannel::new(db.clone(), def.clone());
+
+        let _held = db.lock_records(["A:rec", "B:rec"]).await;
+
+        // "a" -> a non-numeric string. `A:rec.VAL` is DBF_DOUBLE
+        // (`AiRecord`), so `convert_member_value` must reject it.
+        let mut value = PvStructure::new("structure");
+        value.fields.push((
+            "a".into(),
+            PvField::Scalar(ScalarValue::String("not-a-number".into())),
+        ));
+        value
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(22.0))));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), channel.put(&value))
+            .await
+            .expect(
+                "atomic PUT with an unconvertible member must abort in the \
+                 up-front conversion phase, not block trying to (re-)acquire \
+                 the member-record gate this test already holds",
+            );
+
+        assert!(
+            result.is_err(),
+            "an unconvertible member value must reject the whole atomic PUT"
+        );
+
+        // Neither member was touched — the write-loop phase never ran.
+        match (
+            db.get_pv("A:rec.VAL").unwrap(),
+            db.get_pv("B:rec.VAL").unwrap(),
+        ) {
+            (
+                epics_base_rs::types::EpicsValue::Double(va),
+                epics_base_rs::types::EpicsValue::Double(vb),
+            ) => {
+                assert_eq!(
+                    va, 0.0,
+                    "conversion failure must abort before any member write"
+                );
+                assert_eq!(
+                    vb, 0.0,
+                    "conversion failure must abort before any member write"
+                );
             }
             other => panic!("unexpected member values: {other:?}"),
         }

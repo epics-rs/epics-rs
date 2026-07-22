@@ -592,7 +592,7 @@ impl PvDatabase {
     /// unconditionally. `false` for an unknown record — there is nothing to
     /// process. Force (`record._options.process=true`) is the caller's term
     /// and is not asked about here; see `put_drives_processing_of`.
-    pub async fn put_drives_processing(&self, record_name: &str, field: &str) -> bool {
+    pub fn put_drives_processing(&self, record_name: &str, field: &str) -> bool {
         let field_upper = field.to_ascii_uppercase();
         let Some(rec) = self.get_record(record_name) else {
             return false;

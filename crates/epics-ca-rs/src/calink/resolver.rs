@@ -726,6 +726,29 @@ impl LinkSet for CaLinkResolver {
         self.link_for(name).await?.value()
     }
 
+    /// C `dbCaGetLink` (`dbCa.c:448-535`): copy out of the buffer the CA
+    /// monitor keeps fresh, never open and never wait. Here that buffer is
+    /// [`CaLink::value`], refreshed by [`run_monitor`] on every subscription
+    /// event (the `eventCallback` analogue, `dbCa.c:925`).
+    ///
+    /// The difference from [`Self::get_value`] is the missing
+    /// [`Self::link_for`] fallback (`resolver.rs:452-457`), which opens the
+    /// channel and awaits the subscription round trip. That open now happens
+    /// on the database's link work owner via [`Self::connect_link`].
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        let name = strip_ca_scheme(name);
+        let link = self.links.read().get(name).cloned()?;
+        link.value()
+    }
+
+    /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:735-800`): create the
+    /// channel and its monitor. Runs on the link work owner, so the
+    /// `subscribe` round trip inside `open` is off the record thread.
+    async fn connect_link(&self, name: &str) {
+        let name = strip_ca_scheme(name);
+        let _ = self.open(name).await;
+    }
+
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
     /// return -1;` (`dbCa.c:558-561`), answered from cached state: the links
     /// map plus the `CaLink::connected` flag the connection watcher owns

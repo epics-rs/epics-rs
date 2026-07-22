@@ -233,7 +233,47 @@ pub trait LinkSet: Send + Sync {
     /// Read the current value of `name`. Returns None when the
     /// upstream isn't yet connected or the lset has no cache for
     /// this name.
+    ///
+    /// MAY perform I/O (open the channel, issue a one-shot GET). It is
+    /// therefore called only from the database's link work owner task —
+    /// the record-processing path uses [`Self::get_cached_value`].
     async fn get_value(&self, name: &str) -> Option<EpicsValue>;
+
+    /// Read `name` from cached, monitor-fed state ONLY — the
+    /// record-processing read. C `dbCaGetLink` (`dbCa.c:448-535`) copies
+    /// out of `pca->pgetNative`, the buffer the CA monitor callback
+    /// (`eventCallback`, `dbCa.c:925`) keeps fresh on the `dbCaTask`; it
+    /// never opens a channel and never waits on the wire. Returns None
+    /// when the link has no cached value yet, which is C returning -1 for
+    /// `!pca->isConnected` (`dbCa.c:459-464`) — the reading record takes
+    /// LINK/INVALID for that cycle.
+    ///
+    /// MUST NOT perform I/O.
+    ///
+    /// Default: delegate to [`Self::get_value`], which preserves the
+    /// pre-queue behaviour for an lset that has no separate cache. Every
+    /// lset whose `get_value` can open a channel or issue a network GET
+    /// MUST override, or the record thread suspends on the network again.
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_value(name).await
+    }
+
+    /// Open (subscribe / connect) `name` so later
+    /// [`Self::get_cached_value`] reads have a cache to serve — C
+    /// `dbCaAddLink` (`dbCa.c:735-800`), which stages a `CA_CONNECT`
+    /// action whose `ca_create_channel` + `ca_add_array_event` run on the
+    /// `dbCaTask`, not on the caller.
+    ///
+    /// **Called from the database's link work owner task**, so it MAY
+    /// block on the network. Idempotent: the owner may call it again for
+    /// a link that is already open or still connecting.
+    ///
+    /// Default: drive the lset's own lazy open by reading through
+    /// [`Self::get_value`] and discarding the result — correct for every
+    /// existing lset, and it runs off the record-processing thread.
+    async fn connect_link(&self, name: &str) {
+        let _ = self.get_value(name).await;
+    }
 
     /// Non-blocking admission gate for an OUT-link write, asked on the
     /// record-processing thread *before* the write is staged onto the

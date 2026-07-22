@@ -1180,6 +1180,48 @@ impl LinkSet for PvaLinkResolver {
         pvfield_to_epics_value(&value)
     }
 
+    /// C `dbCaGetLink` (`dbCa.c:448-535`) — the monitor-fed cache only.
+    /// This is [`Self::get_value`]'s fast path (`integration.rs:1155-1166`)
+    /// without the `get_or_open` + `read_with_field` slow path, so the
+    /// record-processing read cannot suspend on a PVA connect or GET round
+    /// trip. pvxs reads the same way: `pvaGetValue` serves the monitor
+    /// snapshot the channel task refreshed (`pvalink_lset.cpp:199-236`).
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let full = strip_scheme(name)?;
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let link = self
+            .registry
+            .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
+        let value = link.try_read_cached_with_field(&cfg.field)?;
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pvfield_to_epics_value(&value)
+    }
+
+    /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:735-800`): open the monitor so
+    /// later cached reads have something to serve. Runs on the database's
+    /// link work owner, never on a record-processing thread.
+    async fn connect_link(&self, name: &str) {
+        if !self.is_enabled() {
+            return;
+        }
+        let Some(full) = strip_scheme(name) else {
+            return;
+        };
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let _ = self.registry.get_or_open(self.inp_cfg_for(full)).await;
+    }
+
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
     /// return -1;` (`dbCa.c:558-561`), answered from cached state only — the
     /// database asks this on the record-processing thread, inside the

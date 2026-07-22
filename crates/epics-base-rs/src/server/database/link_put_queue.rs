@@ -144,20 +144,43 @@ enum LinkState {
     InFlightRestaged(StagedPut),
 }
 
+/// Per-link OPEN state — C's `CA_CONNECT` action, staged once per link by
+/// `dbCaAddLink` (`dbCa.c:735-800`) and serviced on the `dbCaTask`
+/// (`ca_create_channel` + `ca_add_array_event`).
+///
+/// `Done` is terminal on purpose: C stages exactly one `CA_CONNECT` per link
+/// and libca owns every reconnection attempt from then on. Re-staging on each
+/// cache miss would turn a down remote into one connect attempt per record
+/// scan.
+#[derive(PartialEq, Eq, Debug)]
+enum OpenState {
+    Queued,
+    InFlight,
+    Done,
+}
+
 #[derive(Default)]
 struct QueueInner {
     links: HashMap<LinkKey, LinkState>,
     ready: VecDeque<LinkKey>,
+    opens: HashMap<LinkKey, OpenState>,
+    ready_opens: VecDeque<LinkKey>,
     /// Number of staged values a later put on the same link overwrote — the
     /// counterpart of C's `pca->nNoWrite` (`dbCa.c:611-612`). Diagnostic.
     coalesced: u64,
     /// Number of writes the owner has completed. Diagnostic.
     completed: u64,
+    /// Number of link opens the owner has completed. Diagnostic.
+    opened: u64,
 }
 
 impl QueueInner {
     fn is_idle(&self) -> bool {
         self.links.is_empty()
+            && !self
+                .opens
+                .values()
+                .any(|s| matches!(s, OpenState::Queued | OpenState::InFlight))
     }
 }
 
@@ -320,9 +343,68 @@ impl LinkPutQueue {
         }
     }
 
+    /// Stage the OPEN of `key` — C `dbCaAddLink`'s
+    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`). Idempotent and
+    /// terminal: a link that has ever been staged is never staged again, so a
+    /// record scanning at 10 Hz against a down remote produces one connect
+    /// attempt, not ten per second. Reconnection is the lset's job, as it is
+    /// libca's in C.
+    ///
+    /// Returns true when this call is the one that staged it.
+    pub(crate) fn stage_open(&self, key: LinkKey) -> bool {
+        let staged = {
+            let mut inner = self.inner.lock();
+            if inner.opens.contains_key(&key) {
+                false
+            } else {
+                inner.opens.insert(key.clone(), OpenState::Queued);
+                inner.ready_opens.push_back(key);
+                true
+            }
+        };
+        if staged {
+            self.work.notify_one();
+        }
+        staged
+    }
+
+    /// Owner-only: take the next link to open, `Queued` → `InFlight`.
+    fn take_ready_open(&self) -> Option<LinkKey> {
+        let mut inner = self.inner.lock();
+        loop {
+            let key = inner.ready_opens.pop_front()?;
+            match inner.opens.get_mut(&key) {
+                Some(state @ OpenState::Queued) => {
+                    *state = OpenState::InFlight;
+                    return Some(key);
+                }
+                // Only `Queued` is ever in the deque.
+                _ => continue,
+            }
+        }
+    }
+
+    /// Owner-only: the open for `key` returned. `InFlight` → `Done`.
+    fn finish_open(&self, key: LinkKey) {
+        let wake_idle = {
+            let mut inner = self.inner.lock();
+            inner.opened += 1;
+            inner.opens.insert(key, OpenState::Done);
+            inner.is_idle()
+        };
+        if wake_idle {
+            self.idle.notify_waiters();
+        }
+    }
+
     /// True when nothing is staged and nothing is in flight.
     pub(crate) fn is_idle(&self) -> bool {
         self.inner.lock().is_idle()
+    }
+
+    /// Number of link opens the owner has completed. Diagnostic.
+    pub(crate) fn opened_count(&self) -> u64 {
+        self.inner.lock().opened
     }
 
     /// Number of staged values a later put on the same link overwrote — C's
@@ -386,6 +468,21 @@ async fn owner_loop(
         notified.as_mut().enable();
         {
             let Some(q) = queue.upgrade() else { return };
+            // Opens first: a pending open is what a blocked cached read is
+            // waiting on, and C services `CA_CONNECT` on the same task ahead
+            // of that link's other actions (`dbCa.c:1198-1225`).
+            while let Some(key) = q.take_ready_open() {
+                let Some(inner) = db.upgrade() else { return };
+                let lsets = resolve_lsets(&inner, &key.target);
+                drop(inner);
+                let q2 = q.clone();
+                crate::runtime::task::spawn(async move {
+                    for lset in &lsets {
+                        lset.connect_link(&key.name).await;
+                    }
+                    q2.finish_open(key);
+                });
+            }
             while let Some((key, staged)) = q.take_ready() {
                 let Some(inner) = db.upgrade() else { return };
                 let lsets = resolve_lsets(&inner, &key.target);

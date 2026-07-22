@@ -1294,6 +1294,32 @@ where
 /// (RTEMS always; on the host a caller that is itself outside a runtime) the
 /// thread simply runs without one, which is exactly right for a future whose
 /// awaits are all runtime-agnostic.
+///
+/// # A current-thread ambient is not inherited, and that is the rule
+///
+/// [`RuntimeHandle::try_current`] answers two different questions with one
+/// value: *"am I running on this runtime's thread"* and *"has this thread
+/// merely entered this handle"*. [`block_on_sync`] cannot distinguish them, so
+/// it must assume the first and refuse to park under a `CurrentThread` flavor —
+/// correct on that runtime's own thread, where parking halts the task that
+/// would wake you, and wrong on a dedicated thread, where it halts nothing.
+///
+/// So the dual meaning is removed here, at the one place a dedicated thread's
+/// context is decided, rather than left for `block_on_sync` to guess: a
+/// `CurrentThread` ambient is **not** inherited, and the thread runs with no
+/// runtime — the `park_on` arm, which is sound for it and is the only arm RTEMS
+/// ever takes.
+///
+/// Nothing is lost by declining it. What inheriting buys is stated above —
+/// `spawn` and the timer inside `block_on_sync` — and under a `CurrentThread`
+/// ambient `block_on_sync` returns `Err(NotBlockable)`, so every one of those
+/// powers is unreachable anyway. Inheriting it can only convert a thread that
+/// would have worked into one that cannot block at all. Measured as exactly
+/// that: the PVA client's blocking byte pumps
+/// (`runtime::blocking_io::spawn_pump`) are dedicated threads whose bodies are
+/// pure `tokio::sync` channel traffic, and every `#[tokio::test]` that drives
+/// one is `CurrentThread` by default — inheritance made the reader pump exit on
+/// its first chunk and the connection read as "server closed during handshake".
 #[cfg(tokio_backend)]
 pub fn spawn_dedicated_thread<F>(
     name: String,
@@ -1304,7 +1330,9 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    let ambient = tokio::runtime::Handle::try_current().ok();
+    let ambient = tokio::runtime::Handle::try_current()
+        .ok()
+        .filter(|h| h.runtime_flavor() != RuntimeFlavor::CurrentThread);
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
@@ -1481,6 +1509,52 @@ mod tests {
             value,
             Some(7),
             "a spawn and a timer must both work on the dedicated thread"
+        );
+        joined.join().expect("dedicated thread joined");
+    }
+
+    /// The third boundary, and the one that was missing: a **current-thread**
+    /// ambient runtime.
+    ///
+    /// The two neighbours below and above cover "multi-thread ambient" and "no
+    /// ambient". This is the case between them, and inheriting the handle there
+    /// is what made `block_on_sync` return `NotBlockable` on a thread that was
+    /// perfectly able to park — silently, since every caller reads the refusal
+    /// as "the connection ended". `#[tokio::test]` is `CurrentThread` by
+    /// default, so this is also the flavor most of the workspace's tests hand a
+    /// dedicated thread.
+    ///
+    /// The assertion is on `block_on_sync` succeeding, not on the absence of a
+    /// handle, because being able to block is the property the thread is spawned
+    /// for; how that is arranged is this function's business.
+    #[tokio::test]
+    async fn a_dedicated_thread_can_block_under_a_current_thread_ambient() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joined = spawn_dedicated_thread(
+            "dedicated-current-thread-ambient".into(),
+            ThreadPriority::Low,
+            StackSizeClass::Small,
+            move || {
+                // A runtime-agnostic await, the only kind a parking thread may
+                // use — and the exact shape both blocking-io pumps run.
+                let (ctx, crx) = tokio::sync::mpsc::channel::<u32>(1);
+                let outcome = block_on_sync(async move {
+                    ctx.send(9u32).await.expect("send into a depth-1 channel");
+                    let mut crx = crx;
+                    crx.recv().await
+                });
+                let _ = tx.send(outcome.ok().flatten());
+            },
+        )
+        .expect("dedicated thread spawned");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the dedicated thread must complete, not panic"),
+            Some(9),
+            "a dedicated thread must be able to park under a current-thread \
+             ambient runtime; inheriting that handle makes block_on_sync \
+             refuse and every pump built on it exit at once"
         );
         joined.join().expect("dedicated thread joined");
     }

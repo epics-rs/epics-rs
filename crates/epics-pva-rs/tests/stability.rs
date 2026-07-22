@@ -18,7 +18,8 @@
 
 #![allow(clippy::manual_async_fn)]
 
-// RTEMS-EXEC-MODEL-ALLOW(31): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the feature-ON suite.
+// (5 live client↔server monitor tests gated out feature-ON above; stage 3.)
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
@@ -28,9 +29,10 @@ use tokio::sync::{Mutex, mpsc};
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{
-    ChannelSource, OpError, PvaServer, PvaServerConfig, SharedPV, SharedSource,
-};
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+// Used only by the gated live client↔server monitor tests (stage 3).
+#[cfg(not(feature = "rtems-exec-model"))]
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 // ── A tiny in-memory ChannelSource we can pump events into ───────────
 
@@ -94,6 +96,9 @@ impl MemSource {
 
     /// snapshot the ordered start/stop edges recorded for a
     /// PV by [`ChannelSource::notify_monitor_start`].
+    // Only consumers are the gated live-monitor tests, so it carries the same
+    // predicate — otherwise dead code feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn monitor_starts(&self, name: &str) -> Vec<bool> {
         self.inner
             .monitor_starts
@@ -551,6 +556,7 @@ async fn p5_monitor_pipeline_does_not_drop() {
 /// Poll the recorded on_start edges for `name` until at least `want_len`
 /// have landed (bounded ~2 s), then return them. Avoids fixed-sleep
 /// flakiness for the "at least N edges" assertions.
+#[cfg(not(feature = "rtems-exec-model"))]
 async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<bool> {
     for _ in 0..100 {
         let s = source.monitor_starts(name);
@@ -567,6 +573,10 @@ async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<boo
 /// `on_start(false)` without tearing the op down; MONITOR RESUME fires
 /// `on_start(true)` once; DESTROY (handle drop) fires the terminal
 /// `on_start(false)`. Mirrors pvxs `servermon.cpp:677-683` onStart edges.
+// Live client ↔ server monitor over `tokio::net`; the client's connection
+// tasks route through the reactor-less callback pool under `rtems-exec-model`.
+// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
     let source = Arc::new(MemSource::new());
@@ -619,6 +629,10 @@ async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
 /// `MonitorStartControl::drop` sees `executing == false` and stays
 /// silent — closing the dual-fire edge the single-owner design exists
 /// to prevent.
+// Live client ↔ server monitor over `tokio::net`; the client's connection
+// tasks route through the reactor-less callback pool under `rtems-exec-model`.
+// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
     let source = Arc::new(MemSource::new());
@@ -655,6 +669,10 @@ async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
 /// while paused (squash) and deliver it on resume — not drop it (the
 /// pre-fix floor-drop). Mirrors pvxs queue-while-Idle +
 /// drain-on-START.
+// Live client ↔ server monitor over `tokio::net`; the client's connection
+// tasks route through the reactor-less callback pool under `rtems-exec-model`.
+// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     let source = Arc::new(MemSource::new());
@@ -757,6 +775,10 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
 /// `client::Context` whose `connByAddr` reuses one connection per server
 /// (clientconn.cpp:44-56). Before the CLI fix, two PVs on the same IOC
 /// opened two clients and could open two connections.
+// Live client ↔ server monitor over `tokio::net`; the client's connection
+// tasks route through the reactor-less callback pool under `rtems-exec-model`.
+// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
     let source = Arc::new(MemSource::new());
@@ -2199,6 +2221,10 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
 /// and has no second server-side GET seed.
 ///
 /// Pre-fix: two `1.0` frames at START. Post-fix: exactly one.
+// Live client ↔ server monitor over `tokio::net`; the client's connection
+// tasks route through the reactor-less callback pool under `rtems-exec-model`.
+// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
     let pv = SharedPV::new();

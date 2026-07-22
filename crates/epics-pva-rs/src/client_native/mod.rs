@@ -36,3 +36,59 @@ pub use operation::PvaOperation;
 /// (design doc §9 phase 6, item 2); this keeps `client_native::decode::…`
 /// resolving for existing callers.
 pub use crate::decode;
+
+#[cfg(test)]
+mod spawn_seam_guard {
+    /// Every task the native client spawns in production goes through
+    /// `epics_base_rs::runtime::task::spawn`, not `tokio::spawn` — the
+    /// client-side twin of `server_native::tcp`'s
+    /// `connection_scope_spawns_go_through_the_runtime_seam`
+    /// (doc/pvalink-rtems-design.md §4.1, stage 3).
+    ///
+    /// A bare `tokio::spawn` panics on a thread with no tokio runtime, which is
+    /// exactly the thread the blocking client (`ServerConn::connect_blocking`,
+    /// stage 2) runs on for the RTEMS target — and it panics at *runtime*, on
+    /// the target, not here. So this pins it as source inspection: the
+    /// production scope of every `client_native` module must contain no
+    /// `tokio::spawn` at all.
+    ///
+    /// The scan covers the whole client rather than one file because, unlike
+    /// the server's single per-connection handler, the client spreads its
+    /// spawns across `context`/`operation`/`ops_v2`/`server_conn`/`udp`/
+    /// `search_engine` (§4.1's table). Each file's production slice ends at its
+    /// first column-0 `#[cfg(test)]`, and each is fenced with a positive anchor
+    /// so a moved `#[cfg(test)]` cannot shrink the slice into a vacuous pass.
+    #[test]
+    fn client_scope_spawns_go_through_the_runtime_seam() {
+        // (file source, an anchor that must survive in the production slice).
+        let files: &[(&str, &str)] = &[
+            (include_str!("context.rs"), "impl PvaClient"),
+            (
+                include_str!("operation.rs"),
+                "impl<T: Send + 'static> PvaOperation<T>",
+            ),
+            (include_str!("ops_v2.rs"), "impl SubscriptionHandle"),
+            (include_str!("server_conn.rs"), "impl ServerConn"),
+            (include_str!("udp.rs"), "async fn recv_loop"),
+            (include_str!("search_engine.rs"), "async fn run_engine"),
+        ];
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::spawn(");
+        for (src, anchor) in files {
+            let prod = match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            };
+            assert!(
+                prod.contains(anchor),
+                "production slice no longer covers `{anchor}` — the guard would pass vacuously"
+            );
+            let hits = prod.matches(literal).count();
+            assert_eq!(
+                hits, 0,
+                "client production scope must spawn through \
+                 `runtime::task::spawn`; found {hits} bare `{literal}` near `{anchor}`"
+            );
+        }
+    }
+}

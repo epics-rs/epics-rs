@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::timeout;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tracing::debug;
 
 use crate::codec::PvaCodec;
@@ -511,7 +511,7 @@ pub(crate) async fn ensure_active_with_op_timeout(
     if let Some(active) = channel.try_get_active() {
         return Ok(active);
     }
-    match tokio::time::timeout(op_timeout, channel.ensure_active()).await {
+    match epics_base_rs::runtime::task::timeout(op_timeout, channel.ensure_active()).await {
         Ok(result) => result,
         Err(_) => Err(PvaError::Timeout),
     }
@@ -1961,7 +1961,7 @@ impl SubscriptionState {
 /// level.
 pub struct SubscriptionHandle {
     state: Arc<SubscriptionState>,
-    task: Option<tokio::task::JoinHandle<PvaResult<()>>>,
+    task: Option<epics_base_rs::runtime::task::TaskHandle<PvaResult<()>>>,
 }
 
 impl SubscriptionHandle {
@@ -2339,7 +2339,7 @@ where
                 }
                 debug!(pv = %channel.pv_name, err = %e,
                     "raw monitor reconnect failed; retrying in 500ms");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -2364,7 +2364,7 @@ where
                 ) {
                     return Ok(());
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(200)).await;
             }
             // Both end the subscription for good — no resubscribe. They differ
             // only in what already happened to the circuit: `Fatal` closed it
@@ -2459,7 +2459,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = tokio::spawn(async move {
+    let task = epics_base_rs::runtime::task::spawn(async move {
         loop {
             if state_for_task
                 .stop
@@ -2478,7 +2478,8 @@ where
                     }
                     debug!(pv = %channel.pv_name, err = %e,
                         "raw monitor reconnect failed; retrying in 500ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500))
+                        .await;
                     continue;
                 }
             };
@@ -2503,7 +2504,8 @@ where
                     ) {
                         return Ok(());
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(200))
+                        .await;
                 }
                 // Both end the subscription for good — no resubscribe. They differ
                 // only in what already happened to the circuit: `Fatal` closed it
@@ -2808,7 +2810,7 @@ where
                     return Ok(());
                 }
                 debug!(pv = %channel.pv_name, err = %e, "monitor reconnect failed; retrying in 500ms");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -2833,7 +2835,7 @@ where
                 ) {
                     return Ok(());
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(200)).await;
             }
             // Both end the subscription for good — no resubscribe. They differ
             // only in what already happened to the circuit: `Fatal` closed it
@@ -2871,7 +2873,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = tokio::spawn(async move {
+    let task = epics_base_rs::runtime::task::spawn(async move {
         loop {
             if state_for_task
                 .stop
@@ -2889,7 +2891,8 @@ where
                         return Ok(());
                     }
                     debug!(pv = %channel.pv_name, err = %e, "monitor reconnect failed; retrying in 500ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500))
+                        .await;
                     continue;
                 }
             };
@@ -2923,7 +2926,8 @@ where
                     ) {
                         return Ok(());
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(200))
+                        .await;
                 }
                 // Both end the subscription for good — no resubscribe. They differ
                 // only in what already happened to the circuit: `Fatal` closed it
@@ -2974,7 +2978,7 @@ where
                     return Ok(());
                 }
                 debug!(pv = %channel.pv_name, err = %e, "monitor reconnect failed; retrying in 500ms");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -3027,7 +3031,7 @@ where
                 ) {
                     return Ok(());
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(200)).await;
             }
             // Both end the subscription for good — no resubscribe. They differ
             // only in what already happened to the circuit: `Fatal` closed it

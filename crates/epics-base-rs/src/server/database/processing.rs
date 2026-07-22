@@ -214,10 +214,11 @@ impl AsyncDbHandle {
     /// is gone.
     pub fn schedule_record_init(
         &self,
+        record: &str,
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         if let Some(db) = self.db() {
-            db.schedule_record_init(init);
+            db.schedule_record_init(record, init);
         }
     }
 

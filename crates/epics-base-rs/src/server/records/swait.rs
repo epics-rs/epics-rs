@@ -373,10 +373,9 @@ impl SwaitRecord {
         let token = link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
-        sched.schedule_record_init(async move {
-            // Let `add_record` finish registering this record before the init
-            // post (this task may be spawned from `set_async_context`).
-            tokio::task::yield_now().await;
+        // The parking key; `rec_name` itself moves into the future below.
+        let init_key = rec_name.clone();
+        sched.schedule_record_init(&init_key, async move {
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(links.len());
             for (i, link) in links.iter().enumerate() {
                 let status = classify_swait_pv(&handle, link);

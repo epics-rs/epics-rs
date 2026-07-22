@@ -961,11 +961,9 @@ impl SseqRecord {
         let token = link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
-        sched.schedule_record_init(async move {
-            // Let `add_record` finish registering this record before the
-            // init post (this task may be spawned from `set_async_context`,
-            // which runs just before the record is inserted into the map).
-            tokio::task::yield_now().await;
+        // The parking key; `name` itself moves into the future below.
+        let init_key = name.clone();
+        sched.schedule_record_init(&init_key, async move {
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
             for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
                 let (dol_status, dol_ft) = classify_link(&handle, dol, LinkRole::Input);

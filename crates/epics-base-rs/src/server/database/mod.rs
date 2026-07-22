@@ -288,6 +288,12 @@ struct PvDatabaseInner {
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
     /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
     init_phase: std::sync::Mutex<DbInitPhase>,
+    /// Record inits parked because the record they classify is not registered
+    /// yet — see [`PvDatabase::schedule_record_init`]. Keyed by record name and
+    /// released by [`PvDatabase::add_loaded_record`] the moment that name lands
+    /// in `records`, which is what makes "the init observes a registered
+    /// record" hold by construction rather than by scheduler timing.
+    record_init_waiting: std::sync::Mutex<HashMap<String, Vec<RecordInit>>>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -597,6 +603,7 @@ impl PvDatabase {
                 aliases: parking_lot::RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
+                record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -1219,17 +1226,71 @@ impl PvDatabase {
     /// would do it has not been polled. Before any load, and once `iocInit` has
     /// run, it is spawned at once — which is what a runtime `special()` link
     /// re-point needs.
+    ///
+    /// # `record` is what the init classifies, and it must exist first
+    ///
+    /// A record's first classification is issued from `set_async_context`,
+    /// which [`Self::add_loaded_record`] calls *before* it inserts the record
+    /// into `records` — the handle has to exist for `run_init_passes` to use
+    /// it. So on the spawn-at-once paths the init would race its own record's
+    /// registration and could post fields for a record the database does not
+    /// have yet.
+    ///
+    /// This used to be papered over by starting each such future with a
+    /// `tokio::task::yield_now()`, on the assumption that yielding hands the
+    /// thread back to the in-progress `add_record`. That assumption holds only
+    /// on a current-thread runtime: on a multi-thread one the yield can return
+    /// before the insert lands, and under `rtems-exec-model` the init runs on
+    /// the background executor's own thread, where a yield is not a
+    /// synchronisation with `add_record` at all — it is nothing. The tests that
+    /// read a link-status field right after `add_record` therefore failed by
+    /// timing, with a different test failing per run.
+    ///
+    /// Now the ordering is a property of the data: an init naming a record that
+    /// is not registered is *parked* under that name, and the only thing that
+    /// can release it is the insert of that name. No yield, no window, and the
+    /// same code path on every backend.
     pub(crate) fn schedule_record_init(
         &self,
+        record: &str,
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        if !self.inner.records.read().contains_key(record) {
+            self.inner
+                .record_init_waiting
+                .lock()
+                .unwrap()
+                .entry(record.to_string())
+                .or_default()
+                .push(Box::pin(init));
+            return;
+        }
+        self.dispatch_record_init(Box::pin(init));
+    }
+
+    /// Queue or spawn an init whose record is known to be registered.
+    fn dispatch_record_init(&self, init: RecordInit) {
         let mut phase = self.inner.init_phase.lock().unwrap();
         match &mut *phase {
-            DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
+            DbInitPhase::Loading(queued) => queued.push(init),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
                 crate::runtime::task::spawn(init);
             }
+        }
+    }
+
+    /// Release every init parked for `record` — called by the one site that
+    /// registers the name, immediately after the insert that makes it real.
+    fn release_record_inits(&self, record: &str) {
+        let parked = self
+            .inner
+            .record_init_waiting
+            .lock()
+            .unwrap()
+            .remove(record);
+        for init in parked.into_iter().flatten() {
+            self.dispatch_record_init(init);
         }
     }
 
@@ -1373,6 +1434,10 @@ impl PvDatabase {
             name.to_string(),
             Arc::new(parking_lot::RwLock::new(instance)),
         );
+        // The record is reachable from this line on, so anything its
+        // `set_async_context` parked above may now run. This is the only
+        // release site because this is the only site that registers the name.
+        self.release_record_inits(name);
 
         // Assign a monotonic load-order sequence — the scan-index
         // secondary sort key, so same-PHAS records keep load order.

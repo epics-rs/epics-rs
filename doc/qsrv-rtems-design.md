@@ -808,7 +808,8 @@ Each stage names its own gate. No stage depends on a later one.
 
 ### Stage 1 — manifest: get the bridge into the RTEMS closure (small) — **DONE**
 
-Landed as `c1456c0c` / `5680834f` / `a6ae5e9b` on top of `32cc7847`.
+Landed as `c1456c0c` / `5680834f` / `a6ae5e9b` / `79cbcc81` on top of
+`32cc7847`.
 Read §9 before trusting the sub-steps below: step (2) was reduced and
 one blocker the probes could not see was added.
 
@@ -992,9 +993,11 @@ Everything here is a claim this document could not settle from source.
 ## 9. Stage 1 as built — where reality deviated from the probes
 
 Stage 1 landed as `c1456c0c` (base) / `5680834f` (bridge) / `a6ae5e9b`
-(gate) on top of `32cc7847`. Three of §7 stage 1's five sub-steps were
-byte-accurate against the probes. Two were not, and one blocker was
-invisible to every probe.
+(gate) / `79cbcc81` (feature fix) on top of `32cc7847`. Two of §7 stage 1's
+five sub-steps were byte-accurate against the probes. Two needed
+correction, one blocker was invisible to every probe, and one whole
+configuration — `qsrv-core` on a *host* — no probe could reach, because
+every probe named the target triple.
 
 ### 9.1 A blocker the probes could not see: L33 is no longer a tokio mutex
 
@@ -1074,16 +1077,63 @@ host selection resolves byte-identically. The two `#![cfg(feature =
 "qsrv")]` *test* files were deliberately left alone: they drive
 `PvaClient`, which only `qsrv` restores.
 
-### 9.4 Feature-ON census: unchanged, and the suite is green
+### 9.4 The gate the probes could not run: `qsrv-core` on a *host*
+
+Every probe in §0 ran against `armv7-rtems-eabihf`, so none of them could
+see that the first version of the runner gate —
+`#[cfg(not(target_os = "rtems"))]`, exactly as §7 stage 1 step 4
+specifies — left `qsrv-core` compiling **only** for RTEMS:
+
+```
+$ cargo check -p epics-bridge-rs --no-default-features --features qsrv-core
+error[E0433]: failed to resolve: use of unresolved module or
+              unlinked crate `epics_ca_rs`
+   --> src/qsrv/pva_adapter.rs:1437
+```
+
+On a host the predicate is true, so the body compiles in a build where
+`epics-ca-rs` is not linked. That is §2.2c's rejected option 2 reached by
+accident: a feature whose validity depends on which target you point it
+at. Fixed in `79cbcc81` by naming both requirements —
+`#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]`, since `qsrv`
+is what carries `dep:epics-ca-rs` — on the definition and on the
+`qsrv::mod` re-export, so the two cannot drift. One in-file test needed
+the same treatment (`PvaServer::client_config` is behind
+`epics-pva-rs/client`).
+
+**§7 stage 1 step 4 is therefore wrong as written**: the predicate is not
+`not(target_os = "rtems")` but the conjunction. Any later stage adding a
+host-only item to `qsrv` must state the feature clause too.
+
+Two consequences worth stating:
+
+* `--features qsrv-core --all-targets` is now a real host configuration
+  and compiles clean. It is **not** clean under `-D warnings`, and
+  deliberately so: the three §2.5 dead-code warnings become errors there.
+  This is why the gate runs `cargo check` and not clippy — the warnings
+  are stage 2's work list, and §2.5 forbids `#[allow(dead_code)]`.
+* Two **pre-existing** compile breaks in the crate were found while
+  sweeping the other feature selections, both untouched by stage 1 and
+  both left alone (verified byte-identical at `32cc7847`):
+  `pva_gateway/{control,middleware}.rs` use `MonitorStream` without
+  importing it, so `--features pva-gateway` (and `all-bridges`,
+  `pva-gateway-bin`, `dual-gateway-bin`) do not compile at all; and
+  `tests/acf_access_control_contexts.rs` + `tests/testqsingle.rs` carry
+  no `#![cfg(feature = "qsrv")]` header, so any selection without the
+  qsrv module fails on them. Neither is reachable from the default
+  feature set, which is why `clippy --workspace --all-targets` is green
+  over both.
+
+### 9.5 Feature-ON census: unchanged, and the suite is green
 
 §6.3's 250-site bill is stage 4's and nothing in stage 1 touched it.
 `epics-bridge-rs` still declares no `rtems-exec-model` feature, carries
 no `rtems-exec-gate` dev-dep and no `RTEMS-EXEC-MODEL-ALLOW` markers, so
 the census gates nothing for this crate yet. Recorded for stage 4's
-baseline: at `a6ae5e9b` `cargo nextest run -p epics-bridge-rs` is
+baseline: at `79cbcc81` `cargo nextest run -p epics-bridge-rs` is
 **674 tests, 674 passed, 0 skipped**.
 
-### 9.5 What stage 1 did *not* do
+### 9.6 What stage 1 did *not* do
 
 No behaviour changed and no serving path was mounted. `rtems-pva-ioc`
 still serves single-record PVs only; `CompositeSource` is untouched;

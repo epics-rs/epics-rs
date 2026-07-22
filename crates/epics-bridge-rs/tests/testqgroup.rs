@@ -4,6 +4,12 @@
 //! Loads a JSON group config containing two member records, exercises
 //! [`GroupChannel`] get/put, and verifies the atomic semantics that
 //! pvxs's qsrv promises.
+//!
+//! `qsrv-core` and not `qsrv`: this file reaches only `epics_bridge_rs::qsrv`,
+//! which is what `qsrv-core` selects, and never the `PvaClient` that `qsrv`
+//! additionally restores. Naming the wider feature would gate the file out of
+//! the target's own selection for no reason.
+#![cfg(feature = "qsrv-core")]
 
 use std::sync::Arc;
 

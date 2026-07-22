@@ -44,9 +44,7 @@ use epics_pva_rs::server_native::{
 /// delivered.
 struct VersionedChildSource {
     gate: AccessGate,
-    acf_cell: Arc<
-        tokio::sync::RwLock<Option<epics_base_rs::server::access_security::AccessSecurityConfig>>,
-    >,
+    acf_cell: epics_base_rs::server::access_security::AcfCell,
     tx_holder: Arc<Mutex<Option<mpsc::Sender<PvField>>>>,
 }
 
@@ -122,7 +120,7 @@ impl ChannelSource for VersionedChildSource {
 
 impl VersionedChildSource {
     fn new() -> Arc<Self> {
-        let acf_cell = Arc::new(tokio::sync::RwLock::new(None));
+        let acf_cell = epics_base_rs::server::access_security::new_acf_cell(None);
         let resolver: AsgAslResolver =
             Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         Arc::new(VersionedChildSource {
@@ -184,7 +182,7 @@ ASG(DEFAULT) {
 "#,
         )
         .expect("acf parse");
-        *driver_child.acf_cell.write().await = Some(deny_cfg);
+        driver_child.acf_cell.store(Some(Arc::new(deny_cfg)));
         driver_child.gate.bump_acl_version();
 
         // Push one event AFTER the policy flip. tcp.rs's recv loop

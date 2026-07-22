@@ -111,7 +111,7 @@ async fn blocking_rtems_server_serves_real_ca_client_end_to_end() {
     //     real 5064 — workspace rule). Both served on dedicated std::threads,
     //     so `block_on_sync` inside them selects `park_on` (no tokio runtime is
     //     entered on these threads).
-    let acf = Arc::new(tokio::sync::RwLock::new(None));
+    let acf = epics_base_rs::server::access_security::new_acf_cell(None);
     let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), acf).unwrap());
     let tcp_port = server.tcp_port();
 

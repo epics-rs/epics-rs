@@ -73,7 +73,7 @@ impl PvaServerBuilder {
 
     pub async fn build(self) -> CaResult<PvaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
         Ok(PvaServer {
             db,
             port: self.port,
@@ -98,7 +98,7 @@ pub struct PvaServer {
     /// ChannelSource via `run_with_source` must install ACF
     /// themselves.
     ///
-    /// `RwLock`-wrapped so [`Self::reload_acf_from`] can
+    /// A lock-free snapshot cell, so [`Self::reload_acf_from`] can
     /// swap the policy at runtime (mirrors `CaServer::reload_acf`).
     /// All `PvDatabaseSource` ACF check sites pick the latest
     /// policy on their next read.
@@ -129,7 +129,7 @@ impl PvaServer {
         Self {
             db,
             port: Some(port),
-            acf: Arc::new(tokio::sync::RwLock::new(acf)),
+            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
@@ -138,13 +138,15 @@ impl PvaServer {
 
     /// Reload the Access Security policy from a `.acf` file. Mirrors
     /// `CaServer::reload_acf_from`. Parses the file off the async
-    /// runtime (blocking IO; small file) and then swaps the AcfCell
-    /// under a write guard so in-flight ACF checks finish under the
-    /// old policy and subsequent checks see the new one.
+    /// runtime (blocking IO; small file) and then publishes the new
+    /// policy into the AcfCell. An in-flight ACF check finishes under the
+    /// policy it started with — it holds that `Arc` for its whole body — and
+    /// subsequent checks see the new one. Unlike the `RwLock` this replaced,
+    /// the reload does not wait for in-flight checks to finish.
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
         let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
-        *self.acf.write().await = Some(cfg);
+        self.acf.store(Some(std::sync::Arc::new(cfg)));
         // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
@@ -161,7 +163,7 @@ impl PvaServer {
     /// server to unrestricted PUT/GET/MONITOR mode). Mirrors the
     /// negative form of `reload_acf_from`.
     pub async fn clear_acf(&self) {
-        *self.acf.write().await = None;
+        self.acf.store(None);
         self.acl_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }

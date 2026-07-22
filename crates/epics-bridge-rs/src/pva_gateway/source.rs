@@ -336,7 +336,7 @@ pub struct GatewayChannelSource {
     /// `check_access_method` BEFORE the upstream forward, so the
     /// gateway can deny clients that the upstream IOC would also
     /// deny (or apply site-local policy on top of the upstream
-    /// rules). Wrapped in an AcfCell so policy may be hot-swapped
+    /// rules). Held in an AcfCell so policy may be hot-swapped
     /// at runtime via `set_acf`. None means pass-through (legacy
     /// behaviour) — pvxs `pva2pva` parity for sites
     /// that delegate all ACL to upstream.
@@ -410,7 +410,7 @@ fn upstream_op_error(e: epics_pva_rs::error::PvaError) -> OpError {
 
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
         Self {
@@ -473,14 +473,14 @@ impl GatewayChannelSource {
     /// disables gateway-level enforcement and falls back to
     /// pass-through (upstream IOC remains the sole authority).
     pub async fn set_acf(&self, cfg: Option<AccessSecurityConfig>) {
-        *self.acf.write().await = cfg;
+        self.acf.store(cfg.map(std::sync::Arc::new));
         // bump the gate's ACL generation — see comment on
         // `set_asg_resolver`.
         self.gate.bump_acl_version();
     }
 
     // the `acf_cell()` accessor was removed. It
-    // returned a clone of the inner `Arc<RwLock<Option<...>>>` so an
+    // returned a clone of the inner `AcfCell` so an
     // external coordinator (e.g. a multi-source PvaServer) could
     // hot-swap the policy by writing the cell directly — but that
     // path bypassed `gate.bump_acl_version()`, leaving monitor
@@ -505,10 +505,9 @@ impl GatewayChannelSource {
     /// in a non-test build is `self.gate`.
     #[cfg(test)]
     async fn acl_level(&self, pv: &str, ctx: &ChannelContext) -> AccessLevel {
-        let guard = self.acf.read().await;
-        match *guard {
+        match self.acf.load_full() {
             None => AccessLevel::ReadWrite,
-            Some(ref cfg) => {
+            Some(cfg) => {
                 // read-lock the resolver cell; the closure
                 // runs while the read lock is held so the swap is
                 // serialized vs. in-flight evaluations. The closure

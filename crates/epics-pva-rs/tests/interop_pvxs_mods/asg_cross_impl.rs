@@ -52,7 +52,7 @@ ASG(DEFAULT) {
 }
 "#;
     let acf = parse_acf(acf_body).expect("parse acf");
-    let cell = Arc::new(tokio::sync::RwLock::new(Some(acf)));
+    let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
     let resolver: epics_base_rs::server::access_security::AsgAslResolver =
         Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
     let gate = AccessGate::required(cell, resolver);

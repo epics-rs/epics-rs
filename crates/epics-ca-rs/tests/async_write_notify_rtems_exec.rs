@@ -212,7 +212,7 @@ async fn async_write_notify_completion_runs_on_background_executor() {
     let db = build_async_db(capture.clone()).await;
 
     // (2) BlockingCaServer front-end on ephemeral 127.0.0.1 ports (never 5064).
-    let acf = Arc::new(tokio::sync::RwLock::new(None));
+    let acf = epics_base_rs::server::access_security::new_acf_cell(None);
     let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), acf).unwrap());
     let tcp_port = server.tcp_port();
 

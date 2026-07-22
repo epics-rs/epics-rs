@@ -15,21 +15,18 @@ use crate::server_native::source::SourceRead;
 use crate::server_native::{ChannelSource, OpError};
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
-use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{EpicsValue, WallTime};
-use tokio::sync::RwLock;
 
-/// Shared, mutable ACF cell. Changed from
-/// `Arc<Option<AccessSecurityConfig>>` to `Arc<RwLock<...>>` so
-/// `PvaServer::reload_acf_from` can swap the policy at runtime
-/// (mirrors `CaServer::reload_acf`). All `PvDatabaseSource` ACF
-/// check sites acquire a read guard; the `/reload-acf` introspection
-/// endpoint and any future site-policy SIGHUP handler acquire a
-/// write guard via `PvaServer::reload_acf_from`.
-pub type AcfCell = Arc<RwLock<Option<AccessSecurityConfig>>>;
+/// Shared, mutable ACF cell — an alias for the base type, so the PVA server,
+/// the CA server and the gateway all share one cell type. Lock-free:
+/// `PvaServer::reload_acf_from` (and the `/reload-acf` introspection endpoint
+/// behind it) publishes a new policy, and every `PvDatabaseSource` ACF check
+/// takes an `Arc` snapshot rather than a read guard. See
+/// `doc/rtems-priority-locks-design.md` §3 row L9.
+pub type AcfCell = epics_base_rs::server::access_security::AcfCell;
 
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
@@ -46,7 +43,7 @@ pub struct PvDatabaseSource {
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let gate = Self::build_gate(db.clone(), acf, None);
         Self { db, gate }
     }
@@ -2323,7 +2320,7 @@ ASG(SECURE) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Allowed: admin from lab-pc1 — must succeed.
@@ -2379,7 +2376,7 @@ ASG(LOCKED) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // alice gets a value back.
@@ -2419,7 +2416,7 @@ ASG(LOCKED) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         let rx = source
@@ -2451,7 +2448,7 @@ ASG(SECURE) {
 "#,
         )
         .unwrap();
-        let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
+        let cell: AcfCell = epics_base_rs::server::access_security::new_acf_cell(Some(lockdown));
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
@@ -2485,7 +2482,7 @@ ASG(SECURE) {
 "#,
         )
         .unwrap();
-        *cell.write().await = Some(permissive);
+        cell.store(Some(Arc::new(permissive)));
 
         // Second put: succeeds under the new policy.
         source
@@ -2548,7 +2545,7 @@ ASG(LOCKED) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Allowed peer: gate mints a ReadWrite/Read token → source
@@ -3060,7 +3057,7 @@ ASG(DEFAULT) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Locked: WRITE rule skipped (record_asl 3 > rule.level 2),

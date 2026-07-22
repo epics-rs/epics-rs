@@ -135,7 +135,7 @@ impl ControlSource {
     /// proxied namespace uses, NOT a host/account allow-list. Without
     /// this the writable surface stays closed (every RPC denied).
     pub fn with_control_acf(mut self, cfg: AccessSecurityConfig) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(Some(cfg)));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(Some(cfg));
         self.control_gate = Some(AccessGate::required(acf, Self::control_asg_resolver()));
         self
     }

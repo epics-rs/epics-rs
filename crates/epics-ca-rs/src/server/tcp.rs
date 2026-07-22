@@ -629,7 +629,7 @@ pub(crate) struct ClientState {
     /// can pin write access to certs minted by a specific CA.
     /// Empty for plaintext peers.
     auth_authority: String,
-    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf: epics_base_rs::server::access_security::AcfCell,
     /// record database, for resolving ACF `INP*` links to live
     /// values when evaluating CALC-gated rules in `compute_access`.
     db: Arc<PvDatabase>,
@@ -754,7 +754,7 @@ impl HostIdentity {
 
 impl ClientState {
     pub(crate) fn new(
-        acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+        acf: epics_base_rs::server::access_security::AcfCell,
         tcp_port: u16,
         db: Arc<PvDatabase>,
     ) -> Self {
@@ -970,8 +970,8 @@ impl ClientState {
                     };
                     return (bits, false);
                 }
-                let guard = self.acf.read().await;
-                if let Some(ref acf_cfg) = *guard {
+                let policy = self.acf.load_full();
+                if let Some(ref acf_cfg) = policy {
                     // Simple PVs have no per-record ASL field; treat
                     // them as ASL=0 so the most-restrictive rule
                     // applies. Matches the C IOC's behaviour for
@@ -1029,8 +1029,8 @@ impl ClientState {
                 // the cached access_rights skipped the ACF check
                 // entirely. Now ACF runs first; the read-only flag
                 // only strips the WRITE bit from the result.
-                let guard = self.acf.read().await;
-                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = *guard {
+                let policy = self.acf.load_full();
+                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = policy {
                     // Thread the per-record ASL so
                     // `RULE(N, …)` gates correctly. PR #641: method/
                     // authority for mTLS rules. CALC rules are
@@ -1222,7 +1222,7 @@ fn announce_tcp_port(configured: u16, bound: u16) {
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
     bound: BoundTcp,
-    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf: epics_base_rs::server::access_security::AcfCell,
     acf_reload_tx: broadcast::Sender<()>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
@@ -1362,7 +1362,7 @@ async fn accept_loop(
     intf: std::net::Ipv4Addr,
     actual_port: u16,
     db: Arc<PvDatabase>,
-    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf: epics_base_rs::server::access_security::AcfCell,
     acf_reload_tx: broadcast::Sender<()>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     audit: Option<crate::audit::AuditLogger>,
@@ -1686,7 +1686,7 @@ async fn handle_client<S>(
     stream: S,
     peer: SocketAddr,
     db: Arc<PvDatabase>,
-    acf: Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+    acf: epics_base_rs::server::access_security::AcfCell,
     mut acf_reload_rx: broadcast::Receiver<()>,
     tcp_port: u16,
     initial_hostname: Option<String>,
@@ -6943,7 +6943,7 @@ mod multi_nic_listener_tests {
     /// process env (caller manages it).
     async fn start_listener() -> (u16, tokio::task::JoinHandle<()>) {
         let db = Arc::new(PvDatabase::new());
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (acf_reload_tx, _) = broadcast::channel::<()>(4);
         let drain = Arc::new(AtomicBool::new(false));
         let bound = bind_tcp_listeners(0).await.expect("listener bound");
@@ -7120,7 +7120,7 @@ mod pre_v49_peer_tests {
         tokio::task::JoinHandle<CaResult<()>>,
     ) {
         let db = Arc::new(PvDatabase::new());
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let peer: SocketAddr = "127.0.0.1:55987".parse().unwrap();
@@ -7431,7 +7431,7 @@ mod extended_header_split_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_extended_header_waits_not_disconnects() {
         let db = Arc::new(PvDatabase::new());
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
 
         let (client_io, server_io) = tokio::io::duplex(256);
@@ -7651,7 +7651,7 @@ mod oversize_request_tests {
         );
 
         let db = Arc::new(PvDatabase::new());
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let peer: SocketAddr = "127.0.0.1:55124".parse().unwrap();
@@ -7936,7 +7936,7 @@ mod non_graceful_disconnect_teardown_tests {
         db.add_record("longstr:rec", Box::new(StringinRecord::new("hello")))
             .await
             .expect("add stringin record");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -7997,7 +7997,7 @@ mod non_graceful_disconnect_teardown_tests {
         db.add_pv("longstr:simple", EpicsValue::String("hi".into()))
             .await
             .expect("add string pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -8054,7 +8054,7 @@ mod non_graceful_disconnect_teardown_tests {
         db.add_pv("num:simple", EpicsValue::Double(1.0))
             .await
             .expect("add double pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -8110,7 +8110,7 @@ mod non_graceful_disconnect_teardown_tests {
         db.add_pv("teardown:test:pv", EpicsValue::Double(1.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, mut conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -8210,7 +8210,7 @@ mod non_graceful_disconnect_teardown_tests {
         db.add_pv("teardown:test:pv2", EpicsValue::Double(1.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, mut conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -8386,7 +8386,7 @@ mod write_gate_order_tests {
             .await
             .expect("add pv");
         let cfg = parse_acf("ASG(DEFAULT) { RULE(0, READ) }").expect("parse acf");
-        let acf = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(Some(cfg));
         let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
 
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -8592,7 +8592,7 @@ mod deprecated_read_autosize_tests {
         db.add_pv("rd:arr", EpicsValue::DoubleArray(elems))
             .await
             .expect("add array pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
 
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -8767,7 +8767,7 @@ mod deprecated_read_autosize_tests {
         )
         .await
         .expect("add waveform record");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (client_io, server_io) = tokio::io::duplex(4096);
         let peer: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
@@ -9464,7 +9464,7 @@ mod bfr7_event_context_filter_tests {
         broadcast::Receiver<ServerConnectionEvent>,
         broadcast::Sender<()>,
     ) {
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -9638,7 +9638,7 @@ mod r46_zero_mask_event_add_tests {
         db.add_pv("r46:pv", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -9768,7 +9768,7 @@ mod r46_zero_mask_event_add_tests {
         db.add_pv("r46:pv", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -9882,7 +9882,7 @@ mod r46_zero_mask_event_add_tests {
         db.add_pv("r46:pv", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -10043,7 +10043,7 @@ mod r46_zero_mask_event_add_tests {
         db.add_pv("a41:pv", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 
@@ -10133,7 +10133,7 @@ mod r46_zero_mask_event_add_tests {
         db.add_pv("a41:pv", EpicsValue::Double(0.0))
             .await
             .expect("add pv");
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
         let (conn_tx, _conn_rx) = broadcast::channel::<ServerConnectionEvent>(64);
 

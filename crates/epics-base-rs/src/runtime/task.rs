@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
 
 use std::future::Future;
 use std::sync::Arc;

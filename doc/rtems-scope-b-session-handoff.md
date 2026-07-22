@@ -696,9 +696,17 @@ made the starvation disappear. That experiment is now the *supporting* evidence
 rather than a caveat: it shows the kernel honours an explicitly set band, which
 is exactly the path `enter_ioc_thread` takes.
 
-**What is still unmeasured is whether it takes effect for us on target.** No
-boot has been taken since `52784cb4`. Everything above is source truth, not a
-task listing — see §8.0 gap 2 for the exact reading to take.
+**It takes effect on target. MEASURED, 2026-07-22.** A boot of `rtems-ca-ioc`
+from `scope-b-priority` (`e89599431`) with two CA clients held, reading every
+thread's band back from the kernel with `pthread_getschedparam` rather than
+trusting what `enter_ioc_thread` returned, gives `SCHED_FIFO` and exactly
+`posix = 56 + epics` on every banded thread: `CAS-client` 76, `CAS-event` 75,
+`CAS-TCP` 74, `CAS-UDP` 72, `scanOnce` 116, `cbTimer` 126, `status-pv` 66,
+`cbLow`/`cbMedium`/`cbHigh` 115/120/127, against `main` at posix 1 (core 254).
+Neither failure mode §8.0 named applies — the threads are not all equal at the
+baseline, and the absolute values are the intended ones, not merely the right
+spread. Full listing, the libbsd band, and the raw console output:
+`doc/rtems-priority-on-target-measurement.md`.
 
 **One caution from that same experiment.** With priorities separated, guest idle
 was **0.000074 s of 4.017 s**. Priority divides CPU; it does not create any.
@@ -809,7 +817,7 @@ known — measured on a boot, or read out of the source:
 | multiplexing syscalls | 0 | 0 | **parity** |
 | per-thread leak | 0 (raw pthreads) | **128 B** | **gap 1** |
 | thread priority requested | `PTHREAD_EXPLICIT_SCHED` at creation, every thread | every thread, via `enter_ioc_thread` (§5.9 census) | **parity in source** |
-| thread priority *observed on target* | *unmeasured* | *unmeasured* | **gap 2 — one boot** |
+| thread priority *observed on target* | *unmeasured* | **measured** — `SCHED_FIFO`, `posix = 56 + epics` on every thread | **gap 2 CLOSED for us**, still open for C |
 | lock wait discipline | `RTEMS_PRIORITY` ordered | tokio FIFO fair | **gap 3** |
 | PI on the scan lock | on — `epicsMutexMustCreate`, `dbLock.c:86` | none — L1 is `park_on`-invisible | **gap 4** |
 | refusal at the ceiling | accept, then **zero bytes**, then FIN | `CA_PROTO_ERROR`/`ECA_ALLOCMEM`, announced on powers of two | **deliberate, better** |
@@ -823,23 +831,28 @@ is done, because otherwise it is unobservable:
    priorities of `CAS-client` / `CAS-event` / `CAS-TCP`. Until this is known,
    "reach C's level" has no number. It may turn out C is inert on this target
    too, in which case gap 2 shrinks to a self-consistency check.
-2. **Measure ours, on the same boot.** No longer a code task — the code landed
-   (`52784cb4`, `ad9440e4`, `d3dbb785`, and the `CAS-TCP`/`CAS-UDP` banding on
-   this branch); what is missing is a reading. Boot `rtems-ca-ioc`, hold a
-   couple of clients, and take an RTEMS task listing. Expected, if the chain
-   works end to end: every thread appears **by name** (`ad9440e4` publishes
-   names through `pthread_setname_np`, so a nameless listing means the naming
-   half failed), and the POSIX priorities are `56 + epics` —
-   `CAS-client` 76, `CAS-event` 75, `CAS-TCP` 74, `CAS-UDP` 72, `scanOnce` 116,
-   `cbTimer` 126, `status-pv` 66 — against `main`, which the shim sets with the
-   *classic* API to core 254, i.e. POSIX 1.
-   Two specific failure modes to distinguish, because they look alike from
-   outside: *all* IOC threads equal at the baseline means the policy or the
-   `pthread_setschedparam` arm is not firing at all; the right *spread* but at
-   unexpected absolute values means the map is off, not the mechanism. Also
-   record where libbsd's own threads land relative to 74 — a `CAS-TCP` that
-   outranks the network stack is a new problem, and that band was never
-   measured.
+2. **Measure ours, on the same boot. DONE, 2026-07-22 — every expected value
+   confirmed.** `doc/rtems-priority-on-target-measurement.md` has the reading,
+   the method and the raw console output; `doc/rtems-priority-probe.patch` is
+   the temporary instrumentation, which is **not** merged (one of its lines
+   trips `only_the_prologue_reaches_the_banding_call`, which pins the literal
+   source shape of `enter_ioc_thread`'s delegation). Three things came out of
+   it that were not in the prediction:
+   - **libbsd is far above us, not below.** `IRQS` core 96, `TIME` core 98,
+     twelve network/daemon threads at core 100; `CAS-TCP` is core 181 and our
+     most urgent live thread (`cbHigh`) is core 128. The hazard this row
+     existed to check for — a `CAS-TCP` outranking the network stack — is
+     absent, by 81 levels.
+   - **The naming half works, but the classic listing is blind to it.**
+     `rtems_object_get_name` returns empty for every POSIX thread we create,
+     which under the reading written here would have looked like a failure.
+     `pthread_getname_np` on the thread and `_Thread_Get_name` in the listing
+     both return the names. Do not read "nameless in `rtems_object_get_name`"
+     as "the naming half failed".
+   - **"Collision-free with libbsd by construction" is loose prose.** libbsd's
+     default band is core 100 and the map's most urgent reachable value is also
+     core 100 (EPICS 99). It is a tie, not a strict separation; the test
+     asserts `core >= 100` and is correct. No live thread reaches it.
 3. **Priority-ordered wait, not FIFO** — a lock whose wait queue respects
    priority, which tokio's does not offer. **Not started; needs the user's
    sign-off before anyone begins.** Scope, so the decision has something to be

@@ -10,7 +10,7 @@ use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ValueDescMismatch, value_matches_descriptor,
@@ -191,14 +191,23 @@ fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> Cl
 pub struct QsrvPvStore {
     provider: Arc<BridgeProvider>,
     /// Native PVA PVs (e.g., NTNDArray from NDPluginPva).
-    pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    ///
+    /// [`parking_lot::RwLock`], matching [`PvaPvHandle`]'s own interior
+    /// state (`latest`, `subscribers`): every critical section here is a
+    /// name→handle `contains_key` / `get(..).cloned()` / `insert` with no
+    /// I/O in it, so the async lock this used to be bought nothing and cost
+    /// a PI-invisible wait on the serve path (doc/qsrv-rtems-design.md §5,
+    /// L-B). The guard is `!Send`, and every source method below returns
+    /// `impl Future<..> + Send`, so holding one across an `.await` is a
+    /// compile error rather than a review finding.
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
 }
 
 impl QsrvPvStore {
     pub fn new(provider: Arc<BridgeProvider>) -> Self {
         Self {
             provider,
-            pva_pvs: Arc::new(RwLock::new(HashMap::new())),
+            pva_pvs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -213,11 +222,10 @@ impl QsrvPvStore {
     /// carries its canonical descriptor (set at [`PvaPvHandle::new`]),
     /// which gates every producer [`PvaPvHandle::post`] — so a registered
     /// PV only ever serves descriptor-valid values, by construction.
-    pub async fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
-        self.pva_pvs
-            .write()
-            .await
-            .insert(pv_name.to_string(), handle);
+    /// Synchronous: the whole body is one `parking_lot` write guard over a
+    /// `HashMap::insert`, with nothing to await.
+    pub fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
+        self.pva_pvs.write().insert(pv_name.to_string(), handle);
     }
 
     /// Legacy ctx-less channel path — used only by the default
@@ -284,11 +292,11 @@ enum OpenedMonitor {
 /// `getScalarValue`) and leaves `value.choices` to the property set.
 async fn read_marks(
     provider: &Arc<BridgeProvider>,
-    pva_pvs: &Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: &Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
     name: &str,
     value: &PvField,
 ) -> Option<Vec<String>> {
-    if pva_pvs.read().await.contains_key(name) {
+    if pva_pvs.read().contains_key(name) {
         return None;
     }
     let paths = match provider.servable_group(name).await {
@@ -325,7 +333,7 @@ async fn read_marks(
 /// exact same native-PVA / channel / DBE / queue-depth resolution.
 async fn open_monitor(
     provider: Arc<BridgeProvider>,
-    pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
     opts: epics_pva_rs::server_native::MonitorOptions,
@@ -334,7 +342,7 @@ async fn open_monitor(
         return None;
     }
     let name = checked.pv_name().to_string();
-    if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
+    if let Some(handle) = pva_pvs.read().get(&name).cloned() {
         // Frames arrive only through `PvaPvHandle::post`, which validates
         // against the canonical descriptor before fanout (pvxs
         // `SharedPV::post`), so the monitor stream can never carry a
@@ -486,7 +494,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let Some(PvField::Structure(req)) = pv_request else {
                 return Ok(());
             };
-            if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
+            // Split from the `||` this used to be: an `if` condition keeps
+            // its temporaries alive to the end of the condition, so a sync
+            // guard on the left would still be live across the
+            // `is_servable_group` await on the right.
+            if pva_pvs.read().contains_key(&name) {
+                return Ok(());
+            }
+            if provider.is_servable_group(&name).await {
                 return Ok(());
             }
             // R10-37: this hook IS pvxs's `onSubscribe` DBE read, so it owns
@@ -523,7 +538,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // — they are always readable. The snapshot is descriptor-valid
             // by construction (every write went through
             // `PvaPvHandle::post`), so serve it directly.
-            if let Some(handle) = pva_pvs.read().await.get(&name).cloned()
+            if let Some(handle) = pva_pvs.read().get(&name).cloned()
                 && let Some(value) = handle.current_value()
             {
                 return Some(value);
@@ -784,7 +799,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return Err(OpError::failed(format!(
                     "PROCESS not supported for native PVA PV '{name}' (no processing chain)"
                 )));
@@ -998,7 +1013,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             let mut names = provider.channel_list().await;
-            for key in pva_pvs.read().await.keys() {
+            for key in pva_pvs.read().keys() {
                 if !names.contains(key) {
                     names.push(key.clone());
                 }
@@ -1013,7 +1028,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return true;
             }
             provider.channel_find(&name).await
@@ -1031,7 +1046,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // pva_pvs — the BridgeProvider has no record for them, so
             // self.channel() would return None and the descriptor
             // would be lost. Probe the PVA registry first.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
                 // Prefer the canonical descriptor supplied at registration
                 // (wire-faithful for `UnionArray` and other types that
                 // `PvField::descriptor` cannot losslessly reconstruct).
@@ -1051,7 +1066,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned()
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned()
                 && let Some(value) = handle.current_value()
             {
                 return Some(value);
@@ -1106,7 +1121,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // PVA-plugin PVs (NTNDArray cache from NDPluginPva) as
             // read-only — they're produced server-side, not driven by
             // downstream PUTs.
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return false;
             }
             provider.is_writable(&name).await
@@ -1124,7 +1139,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // list; `add_subscriber` appends a tx (reaping any already-
             // dropped receivers) so the plugin's `post()` fans out into
             // the PVA server.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
                 return Some(handle.add_subscriber().into());
             }
             let channel = self.channel(&name_owned).await?;
@@ -1480,7 +1495,7 @@ pub async fn run_ca_pva_qsrv_ioc(
     let pva_pvs = take_registered_pva_pvs();
     for (pv_name, handle) in pva_pvs {
         tracing::info!(pv = %pv_name, "registering native PVA PV");
-        store.register_pva_pv(&pv_name, handle).await;
+        store.register_pva_pv(&pv_name, handle);
     }
 
     // ── External links (`calink` + `pvalink`) ──
@@ -1714,7 +1729,7 @@ mod tests {
         handle
             .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
             .expect("descriptor-less post accepted");
-        store.register_pva_pv("NATIVE:PV", handle).await;
+        store.register_pva_pv("NATIVE:PV", handle);
         assert!(
             store.has_pv("NATIVE:PV").await,
             "native PVA PV stays served even when QSRV2 DB serving is off"
@@ -1771,7 +1786,7 @@ mod tests {
         handle
             .post(value)
             .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:UARR", handle).await;
+        store.register_pva_pv("TEST:UARR", handle);
 
         let got = store.get_introspection("TEST:UARR").await.unwrap();
         assert_eq!(got, canonical, "supplied descriptor must round-trip");
@@ -1797,7 +1812,7 @@ mod tests {
         })]);
         let handle = PvaPvHandle::new(None);
         handle.post(value).expect("descriptor-less post accepted");
-        store.register_pva_pv("TEST:UARR_LOSSY", handle).await;
+        store.register_pva_pv("TEST:UARR_LOSSY", handle);
 
         let got = store.get_introspection("TEST:UARR_LOSSY").await.unwrap();
         assert_eq!(
@@ -1847,7 +1862,7 @@ mod tests {
             PvField::Structure(s)
         };
         handle.post(good.clone()).expect("good post accepted");
-        store.register_pva_pv("TEST:NTS", handle.clone()).await;
+        store.register_pva_pv("TEST:NTS", handle.clone());
 
         assert_eq!(
             store.get_value("TEST:NTS").await,
@@ -1984,7 +1999,7 @@ mod tests {
             .post(bad)
             .expect_err("descriptor-mismatched first post must be rejected");
 
-        store.register_pva_pv("TEST:NTS:EMPTY", handle).await;
+        store.register_pva_pv("TEST:NTS:EMPTY", handle);
         assert_eq!(
             store.get_value("TEST:NTS:EMPTY").await,
             None,
@@ -2171,7 +2186,7 @@ mod tests {
         handle
             .post(value)
             .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:WIRE:UARR", handle).await;
+        store.register_pva_pv("TEST:WIRE:UARR", handle);
 
         let server =
             PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");

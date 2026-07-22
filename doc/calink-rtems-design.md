@@ -1025,7 +1025,7 @@ two tracks distinguishable in cross-references.
 Everything else is independent, and the two tracks' stage 1s (search-without-UDP)
 touch different crates and can run concurrently.
 
-### Stage C1 — a CA search engine that runs with no UDP socket (medium, host-testable)
+### Stage C1 — a CA search engine that runs with no UDP socket (medium, host-testable) — **DONE** (see §8)
 
 Replace `run_search_engine`'s unconditional `AsyncUdpV4::bind` (`search.rs:507`)
 with a `SearchTransport::{Udp(AsyncUdpV4, …), NameServersOnly}` sum type, so
@@ -1295,3 +1295,154 @@ Everything here is a claim this document could **not** settle.
     revision. Not a defect in this design, but it means a reader cannot
     navigate from calink to C by line number, and no citation in this
     document is inherited from those comments without re-measurement.
+
+---
+
+## 8. Stage C1 as built — where reality deviated from §6
+
+Stage C1 landed as `800857e7` on top of `8535d998`. The sum type matched
+§6, and the CA-specific claims §4 made about it held. Five points did not
+survive contact with the compiler untouched, and the feature-ON gate
+diverged from the sibling in a way the two protocols' spawn seams predict.
+
+### 8.1 The variant holds the destinations and the diagnostics, not just the socket
+
+§6 wrote the type as `SearchTransport::{Udp(AsyncUdpV4, …), NameServersOnly}`.
+The membership test is the sibling's (`doc/pvalink-rtems-design.md` §8.1):
+a field belongs in the variant iff it cannot outlive the socket it
+describes. Three did, beyond the socket bundle itself:
+
+```
+SearchTransport::Udp(Box<UdpTransport>)
+    socket                 AsyncUdpV4
+    addr_list              Vec<AddrEntry>                 // UDP SEARCH destinations
+    send_errors            HashMap<SocketAddr, ErrorKind> // libca _lastError suppression
+    prev_drops_per_iface   HashMap<Ipv4Addr, u32>         // SO_RXQ_OVFL transition log
+SearchTransport::NameServersOnly                          // no fields
+```
+
+`addr_list` was previously a `run_search_engine` parameter threaded through
+`fire_searches` / `process_bucket` by reference; it is a list of UDP SEARCH
+destinations (CA never opens a TCP circuit to an `EPICS_CA_ADDR_LIST` entry —
+only to an `EPICS_CA_NAME_SERVERS` one), so it moved inside. `send_errors`
+keys its suppression by those same destinations, and `prev_drops_per_iface`
+keys by the receiving NIC of the bound bundle; both were function-local state
+in the old `run_search_engine` and both moved in. Leaving any of them outside
+would have reproduced, one level up, the "present but unusable" split the sum
+type exists to close.
+
+This is smaller than PVA's `UdpTransport` (§4.3 predicted it): CA has no v6
+sockets, no beacon sockets, no `response_port` fields — a `CA_PROTO_SEARCH`
+reply returns to the datagram source, so no response port is ever stamped
+(§4.4), and there is no beacon listener to fold in. So the CA variant has
+none of the "beacons cost fast-reconnect" tension the PVA one carried
+(`doc/pvalink-rtems-design.md` §8.1): `NameServersOnly` loses UDP search and
+nothing else, because there was nothing else on the UDP socket to lose.
+
+`Box` on the payload variant for the same reason PVA needed it: without it
+`SearchTransport` is as large as `UdpTransport` in the `NameServersOnly` case
+that carries nothing (`clippy::large_enum_variant`).
+
+### 8.2 The selection is an explicit entry point, not derived from config
+
+Identical decision to the sibling (`doc/pvalink-rtems-design.md` §8.2), same
+reasoning. `name_servers_only_search_engine(…)` is a second free function
+beside `run_search_engine`, not a config-derived branch. Deriving
+`NameServersOnly` from "`addr_list` empty + `AUTO_ADDR_LIST=NO`" would drop
+UDP search for every host client already in that configuration — including
+one that expects a later `AddAddress` / discovery event to add a destination.
+So the address-list mutations (`AddAddress` / `RemoveAddress` /
+`SetAddressList`) are not errors on a `NameServersOnly` engine; they are
+logged at debug and dropped, because their target — a UDP SEARCH destination
+list — does not exist on that variant.
+
+Consequences worth stating plainly, matching the sibling:
+
+* **No production caller selects it yet.** Stage C1 builds the capability;
+  the RTEMS mount (stage C5) is what will choose it. `name_servers_only_search_engine`
+  therefore carries a conditional `expect(dead_code)` that is live in every
+  configuration except the host test that exercises it.
+* The refusal is load-bearing: `SearchTransport::name_servers_only` returns
+  `Err(CaError::InvalidValue)` on an empty `EPICS_CA_NAME_SERVERS`, because
+  an engine with no UDP socket and no name server can reach nothing. The
+  free function returns the engine *future* rather than running it, so that
+  error is observed by the caller before any task is spawned.
+
+### 8.3 The `[u8]` cascade did not surface anything on the host — and §1.3 predicts that
+
+§6's stated risk: "Expect the arm-shape change to surface real type errors
+the cascade was hiding." On the host it surfaced **none** — the first compile
+after the arm conversion was clean. This is the sibling's §8.3 result for the
+same reason: the 13-error `[u8]` cascade at `search.rs:592` is inference
+fallout from a *target-only* poisoned import (`AsyncUdpV4` is
+`#[cfg(not(target_os = "rtems"))]`), so on the host there was never a hidden
+error for the change to expose. The risk is real for the target and stays
+unretired — it is re-measured when the RTEMS arm actually compiles this file
+(stage C2+), not here.
+
+### 8.4 The feature-ON gate diverges from PVA — because the CA name-server spawn does
+
+The sibling's stage-1 gate (`stage1_name_servers_only_resolves_without_binding_udp`)
+runs and passes under `--features rtems-exec-model` (`doc/pvalink-rtems-design.md`
+§8.7). The CA equivalent **cannot**, and the reason is a real protocol-port
+difference, not a test artefact:
+
+* PVA spawns its `ns_task` and its engine with **`tokio::spawn`**
+  (`search_engine.rs:752`, `:1406`) — the real tokio runtime, whose I/O
+  reactor drives the name-server `TcpStream`.
+* CA spawns `run_nameserver_connection` with
+  **`epics_base_rs::runtime::task::spawn`** (`search.rs:556`) — §4.2 recorded
+  it as "already on the spawn seam", which under the exec backend routes the
+  task onto the `cbMedium` band. That band worker has no tokio I/O reactor, so
+  `TcpStream::connect` panics there (`there is no reactor running`).
+
+So the CA gate's *resolution* half — which dials a mock TCP name server — is
+per-test `#[cfg(not(feature = "rtems-exec-model"))]`. Making
+`run_nameserver_connection` drive real sockets under the exec backend is
+Stage C2 (the blocking byte source) / C3 (the spawn seam), not this stage.
+The *structural* half of the claim — that `NameServersOnly` can hold no UDP
+socket — is a property of the type and is additionally asserted by
+`name_servers_only_drops_address_list_mutations`, which runs in **both**
+configurations.
+
+This is the first concrete instance of the §4.2 note that the CA name-server
+path being "on the spawn seam" is a host fact whose target behaviour is
+Stage C2/C3's to establish — and it means the CA and PVA stage-1s are *not*
+byte-for-byte the same exercise under feature-ON, though they are on the host.
+
+### 8.5 The census marker, and the two pre-existing RTEMS-gate warnings
+
+`search.rs` carries `RTEMS-EXEC-MODEL-ALLOW(N)`. The change added one
+end-to-end `#[tokio::test]` (`stage_c1_…`, per-test gated off under the
+feature, so **not** counted) and converted one existing `#[test]`
+(`add_then_remove_address_round_trip`) to `#[tokio::test]` because the
+destination list now lives inside `UdpTransport`, whose construction binds a
+socket and needs a reactor. Net ungated count 4 → 5; the marker moved `4 → 5`
+with a note that the sixth site is gated. Verified inside the feature-ON
+suite: `cargo nextest run -p epics-ca-rs --features rtems-exec-model` gives
+608 passed, `every_reactor_dependent_test_is_accounted_for` among them.
+
+`./scripts/rtems-check.sh` stays exit 0. Its two known warnings are unchanged
+in count and identity and both live in **`epics-pva-rs`** — `tcp.rs:1407`
+(deprecated `fetch_update`) and `server_native/search_engine.rs:501` (dead
+`Origin` variants). This stage touches only `epics-ca-rs/src/client/search.rs`,
+whose `client` module is `#[cfg(not(target_os = "rtems"))]`, so it contributes
+nothing to the RTEMS-target compile at all — C1 has zero target footprint by
+construction, which is exactly what §1.4 said the search-without-UDP capability
+would have until C2 brings the client into the target build.
+
+### 8.6 The gate as measured
+
+| gate | result |
+|---|---|
+| `stage_c1_name_servers_only_resolves_without_binding_udp` | pass — resolves via TCP NS, `bound_udp_addrs()` empty, UDP-transport control non-empty |
+| `name_servers_only_drops_address_list_mutations` | pass — runs in both feature configs |
+| `name_servers_only_refuses_empty_name_server_list` | pass |
+| `cargo nextest run -p epics-ca-rs` | 724 passed, 0 skipped |
+| `cargo nextest run -p epics-ca-rs --features rtems-exec-model` | 608 passed, 0 skipped (census gate green) |
+| `cargo clippy -p epics-ca-rs --all-targets -- -D warnings` | clean |
+| `cargo clippy -p epics-ca-rs --all-targets --features rtems-exec-model -- -D warnings` | clean |
+| `cargo test --doc -p epics-ca-rs` | 0 passed, 4 ignored |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo nextest run --workspace` | 10115 passed, 2 skipped |
+| `./scripts/rtems-check.sh` | exit 0, 2 pre-existing `epics-pva-rs` warnings unchanged |

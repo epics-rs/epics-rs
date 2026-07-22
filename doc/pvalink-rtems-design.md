@@ -646,7 +646,7 @@ gate, and no stage depends on a later one. Stage 0 and stage 1 have **no
 RTEMS dependency at all** and can land in any order relative to stages
 2–4.
 
-### Stage 0 — one client for the whole IOC (small, host-only) — *do this first*
+### Stage 0 — one client for the whole IOC (small, host-only) — **DONE** (see §7)
 
 Hoist `PvaClient` out of `PvaLink::open` (`link.rs:297`) into
 `PvaLinkResolver`/`PvaLinkRegistry`, matching pvxs's single
@@ -889,5 +889,124 @@ Everything here is a claim this document could **not** settle.
    transport-erased as the PVA client (which has `DynRead`/`DynWrite`
    already) was **not** measured. §3.3's "share the primitive" argument
    assumes it is at least close; that assumption is untested.
-9. **Per-link timeouts under a shared client.** Stage 0's risk note. No
-   config path was audited for one.
+9. ~~**Per-link timeouts under a shared client.** Stage 0's risk note. No
+   config path was audited for one.~~ **SETTLED by stage 0 — §7.2.** The
+   audit found no per-link timeout path, in this tree or in pvxs.
+
+---
+
+## 7. Stage 0 as built — where reality deviated from §5
+
+Stage 0 landed as `aac14a1b` (the hoist) / `1bc49a6d` (the gate) on top of
+`8c305c37`. The change itself matched §5; three of its statements did not
+survive contact.
+
+### 7.1 The owner is `PvaLinkRegistry` alone, not "`PvaLinkResolver`/`PvaLinkRegistry`"
+
+§5 named both. Only one can own the client without re-opening the dual
+meaning the stage exists to close: the registry is what *constructs*
+links (`registry.rs` `get_or_open` → `PvaLink::open`), so the client has
+to reach `open` from there. `PvaLinkResolver` owns exactly one
+`PvaLinkRegistry` and needed no change at all — `PvaLinkResolver::new`
+is untouched, and so is every production caller including
+`install_pvalink_resolver`.
+
+Consequently the predicted `integration.rs` edits did not happen: the
+change is `link.rs` (signature + the deleted builder), `registry.rs`
+(the `client` field, `new`/`with_client`, the one call site) and a
+`mod.rs` doc example. §5's "~40 lines across `link.rs`, `registry.rs`,
+`integration.rs`" was right on size, wrong on the third file.
+
+### 7.2 The risk is closed: there is no per-link timeout path
+
+§5 asked for this check *before*, not after. Result, stated either way as
+required:
+
+* `PvaLinkConfig` (`config.rs:139-219`) has **no** timeout member, and no
+  `timeout` token appears anywhere in the option parser — neither in the
+  `?key=value` query form nor in the pvxs-parity JSON longhand.
+* pvxs's `pvaLinkConfig` has no timeout option either; the only
+  `timeout` strings under `pvxs/ioc/pvalink*` are `testAbort` messages in
+  the test harness (`pvalink.cpp:141`, `:178`).
+* The per-link `Duration::from_secs(5)` was **already** the
+  `PvaClientBuilder::new()` default (`client_native/context.rs:161`), so
+  sharing changes no operation's deadline. It is now
+  `PVALINK_CLIENT_TIMEOUT` in `registry.rs`, written explicitly rather
+  than inherited, so a later change to the client-library default cannot
+  silently move pvalink's.
+
+Nothing had to move to the per-operation call. If a per-link timeout is
+ever added it still must, and the constant's doc comment says so.
+
+### 7.3 `share_udp` is moot for pvalink, and the single client is not yet pvxs's
+
+§2.4 flagged that pvalink never calls `share_udp(true)`. With one client
+per IOC there is nothing left to share *within* pvalink: the one client
+lazily spawns one `SearchEngine` (`context.rs:379-380`) and every link
+resolves through it. `share_udp` now only matters for an IOC that also
+runs a second client — a `pva_gateway` upstream, say — which is a
+different question from this stage's.
+
+What the single client does **not** yet match is pvxs's *provenance*.
+pvxs builds `linkGlobal->provider_remote` from
+`ioc::server().clientConfig()` (`pvalink.cpp:60`) — the IOC server's own
+address list, ports and TLS. `PvaLinkRegistry::new()` builds from bare
+`PvaClient::builder()`, i.e. the process environment, which is what every
+link did before and so is not a regression. `with_client` is the seam
+that closes it; wiring the IOC server's config into it is left out of
+stage 0 deliberately, because it changes discovery behaviour and belongs
+with the stage 4 mount.
+
+### 7.4 The `#[cfg(test)]` doubles still build clients, and that is deliberate
+
+The anchor sweep (`PvaClient::builder`) found two surviving construction
+sites inside `link.rs`: `for_test` (`:1501`) and
+`for_test_with_monitor_flag` (`:1560`). They are not part of the defect
+family and were left alone:
+
+* they are `#[cfg(test)]`, so no production path can reach them — the
+  invariant "a link never builds a client" holds by compilation for
+  every shipped build;
+* their links deliberately face **no server**. Several tests drive real
+  `write`/`flush_scratch` calls through them and assert on the resulting
+  disconnect, which needs a short (1 s) timeout and an isolated channel
+  cache. Folding them onto one shared test client would couple those
+  tests through that cache for no resource saving — nothing connects.
+
+`for_test_with_client` (`:1531`) is unchanged and remains the
+inject-a-live-client double.
+
+### 7.5 One gate could not run: `tests/pva_gateway.rs`
+
+§5 lists it as a stage 0 gate ("both drive the client"). It is
+`#![cfg(feature = "pva-gateway")]`, which is **not** in the crate's
+default feature set, so `cargo nextest run --workspace` compiles and runs
+**zero** tests from it — it contributed nothing to this stage's evidence.
+It also cannot be enabled today: `cargo check -p epics-bridge-rs
+--features pva-gateway` fails with five pre-existing
+`cannot find type MonitorStream` errors in `src/pva_gateway/control.rs`
+and `src/pva_gateway/middleware.rs`, files stage 0 does not touch. That
+break is unrelated to this stage and is left as-is.
+
+`tests/pvalink_seam.rs` — the other named gate — does run, and passes.
+
+### 7.6 The gate as measured
+
+`server.report().peer_count` stands in for §5's `active_connections()`:
+the two are the same quantity under two names, the latter belonging to
+the *blocking* server (`server_native/blocking.rs:1156`), which the test
+IOC is not.
+
+The gate is proved sensitive, not merely green: the same assertion with
+each link on its own registry (hence its own client — the pre-fix shape)
+reports `left: 2, right: 1`.
+
+| gate | result |
+|---|---|
+| `stage0_distinct_link_variants_share_one_upstream_connection` | pass (`peer_count == 1`); pre-fix shape gives 2 |
+| `cargo nextest run -p epics-bridge-rs` | 684 passed, 0 failed |
+| `cargo nextest run --workspace` | 10104 passed, 0 failed, 2 skipped |
+| `cargo clippy -p epics-bridge-rs --all-targets -- -D warnings` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --doc -p epics-bridge-rs` | 0 run, 3 ignored (all `ignore`d examples) |
+| `tests/pva_gateway.rs` | **did not run** — see §7.5 |

@@ -750,4 +750,88 @@ mod tests {
              thread leaves an IOC that still looks healthy from the network"
         );
     }
+
+    /// The QSRV group source is mounted, under pvxs's names and orders.
+    ///
+    /// This is the whole reason the binary moved crates. A regression that
+    /// dropped the second `add_source` would leave an IOC that still boots,
+    /// still serves every single record, still answers searches and still
+    /// passes every other guard here — and silently serves no `Q:group` PV at
+    /// all. There is no shell on the target to notice.
+    #[test]
+    fn the_group_source_is_mounted_at_the_pvxs_order() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n    #[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("add_", "source(\"qsrvSingle\"")),
+            "the single-record source is gone; single-record PVs would stop resolving"
+        );
+        assert!(
+            prod.contains(concat!("add_", "source(\"qsrvGroup\"")),
+            "the QSRV group source is not mounted — this binary would boot, serve \
+             single records, and answer no Q:group PV, with no shell to say so"
+        );
+        // pvxs `singlesourcehooks.cpp:159` / `groupsourcehooks.cpp:219`: the
+        // orders are the resolution order, and swapping them changes which
+        // source answers a name both could claim.
+        let single = prod
+            .find(concat!("add_", "source(\"qsrvSingle\""))
+            .expect("the single source call site");
+        let group = prod
+            .find(concat!("add_", "source(\"qsrvGroup\""))
+            .expect("the group source call site");
+        assert!(
+            single < group,
+            "qsrvSingle must be registered at the lower order, as in pvxs"
+        );
+        assert!(
+            prod.contains(concat!("build_qsrv_", "mount(")),
+            "the group set must be built through the shared mount owner, which is \
+             what finalizes it before the store exposing it exists"
+        );
+    }
+
+    /// The startup banner states the pvalink gap.
+    ///
+    /// A `pva://` link on this target never connects, and the IOC cannot
+    /// detect that one was configured — the resolver that would see it is the
+    /// missing piece. So the only place an operator can learn this is the
+    /// boot console, unconditionally. Design stage 5 removes both the gap and
+    /// this guard.
+    #[test]
+    fn the_banner_states_that_pva_links_do_not_resolve() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n    #[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains("pva:// record links do NOT resolve"),
+            "the boot banner no longer warns that pva:// links are unimplemented on \
+             this target; an operator's INP=@pva://... would silently never connect"
+        );
+    }
+
+    /// The server config comes from the constructor that fills the GUID.
+    ///
+    /// `BlockingPvaServer::bind` stamps the GUID from `random_guid`; a config
+    /// assembled field-by-field from `PvaServerConfig::default()` without
+    /// `with_env` — or a struct literal — ships the all-zero GUID, which
+    /// degrades silently on every consumer rather than failing.
+    #[test]
+    fn the_config_is_built_through_with_env() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n    #[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("PvaServerConfig::default().with_", "env()")),
+            "the PVA server config must come from `PvaServerConfig::default().with_env()`; \
+             a hand-built config ships GUID 0"
+        );
+    }
 }

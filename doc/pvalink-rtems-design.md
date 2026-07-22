@@ -702,7 +702,7 @@ Make the absence *structural*, not a runtime branch: a
 already fragile. Expect the arm-shape change to surface real type errors
 the cascade was hiding. That is the point.
 
-### Stage 2 — `ServerConn::connect_blocking` (medium)
+### Stage 2 — `ServerConn::connect_blocking` (medium) — **DONE** (see §9)
 
 Add a third constructor beside `connect` (`server_conn.rs:219`) and
 `connect_tls` (`:243`) that:
@@ -852,6 +852,13 @@ Everything here is a claim this document could **not** settle.
    Established by source-text census only (§0, §1.2). rustc suppresses
    downstream errors after a poisoned import, so 47 is a lower bound and
    these four files reporting zero is not proof. Stage 2's gate settles it.
+   **PARTLY SETTLED by stage 2 — §9.7.** The count is now **28**, all of
+   them UDP. ~~`ops_v2.rs`~~ is settled: it is at zero, it names nothing
+   from `search_engine`/`udp`, and `server_conn` — the one poisoned module
+   it depended on — now compiles for the target, so nothing is left to
+   suppress it. `context.rs` and `channel.rs` are **still open**: both are
+   at zero too, but both name `search_engine::SearchEngine`, which the 7
+   remaining UDP errors still poison. The UDP stage settles those two.
 2. **pvalink's own RTEMS error surface is unmeasured, and unmeasurable
    today.** `cargo +nightly check … -p epics-bridge-rs --features
    qsrv-core,pvalink --target armv7-rtems-eabihf` stops at the dependency:
@@ -882,7 +889,12 @@ Everything here is a claim this document could **not** settle.
    visibility change (`pub(super)` → shared module). Whether they carry
    `server_native`-specific assumptions in their back-pressure accounting
    (`room`, `frame_tx.downgrade()`, `blocking.rs:938`, `:2267-2292`) is
-   unread.
+   unread. **SETTLED by stage 2 — §9.1.** They did carry one, and it was
+   not in the back-pressure accounting: both pumps took a registry-issued
+   `ConnWake`, i.e. the server's *authority to end a connection*. Both now
+   derive it from the `Arc<TcpStream>` each already held. The destination
+   was also wrong — `epics-base-rs`, not a module inside `epics-pva-rs`,
+   or `epics-ca-rs` could not have called it.
 8. **The CA client's identical seam.** `epics-ca-rs/src/client/transport.rs:12`
    names `tokio::net::TcpStream` on one line, same as
    `server_conn.rs:33`. Whether the CA client is otherwise as
@@ -1194,3 +1206,208 @@ empty list is a property of the variant and not of the test's config.
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo test --doc -p epics-pva-rs` | 1 passed, 15 ignored |
 | `./scripts/rtems-check.sh` | exit 0, 2 pre-existing warnings unchanged |
+
+---
+
+## 9. Stage 2 as built — where reality deviated from §5
+
+Stage 2 landed as `8024b175` (the byte source promoted into
+`epics-base-rs`) plus seven commits: `5d19cd7f`, `9dc71482`, `e3fddcc2`,
+`d2f21489`, `3ae270ae`, `2c5155c6`, `573166ce`.
+
+### 9.1 The primitive went to `epics-base-rs`, not "a module both drivers use"
+
+§5 said *"promote those two adapters out of `server_native` into a module
+both drivers use"*, which reads as a move within `epics-pva-rs`. Measured,
+that destination is wrong: `epics-ca-rs` does not depend on
+`epics-pva-rs` and must not — the only crate depending on both is
+`epics-bridge-rs`, which sits *above* them. A primitive promoted inside
+`epics-pva-rs` is one the CA client structurally cannot call, so the next
+CA increment writes a third copy, which is what "one seam, two callers"
+exists to prevent. `doc/calink-rtems-design.md` §3.3 measured this and
+names `epics-base-rs`; `runtime::blocking_io` is where it landed.
+
+What was entangled with the server turned out to be the *authority to end
+a connection*, not the plumbing: both pumps took a registry-issued
+`ConnWake`. Both now derive it from the `Arc<TcpStream>` each already
+held, so they retire themselves with no registry type, and `ConnRegistry`
+keeps exactly the authority it had — the server-wide stop.
+
+### 9.2 The seam is `dial_pva`, and the third constructor is not how RTEMS reaches it
+
+§5 describes one new constructor. As built there are two entry points
+with different jobs, because "one seam, two callers" and "a third
+constructor" are different requirements:
+
+* `dial_pva` — the client's **one** TCP dial. `ServerConn::connect` and
+  `ns_run_once` both come through it, and it selects the transport at
+  compile time (`target_os = "rtems"` or `--cfg pva_blocking_client`).
+  This is what actually puts the client on the target.
+* `ServerConn::connect_blocking` — the third constructor beside `connect`
+  and `connect_tls`, always blocking regardless of `cfg`.
+
+Keeping both is deliberate. The forced-on suite rebuilds the crate with
+`dial_pva` selecting the blocking transport, so what it exercises is
+`connect`; nothing in it ever calls `connect_blocking`, and a `--cfg` no
+manifest can set is not something a default build can be argued from. So
+the constructor carries its own test on an ordinary host build
+(`connect_blocking_completes_the_same_handshake_as_connect`), asserting
+that the two transports are interchangeable **at runtime** rather than
+one replacing the other at build time.
+
+### 9.3 `spawn_dedicated_thread` had to be fixed first, and it is a real defect
+
+Not anticipated by §5, and it blocked the stage's own gate. Under
+`--cfg pva_blocking_client` the suite failed 10 tests, all reporting
+*"server closed during handshake"*.
+
+`spawn_dedicated_thread` entered whatever ambient tokio handle the caller
+was running under. `block_on_sync` read that handle back through
+`Handle::try_current()`, saw a `CurrentThread` flavor, and returned
+`Err(NotBlockable)` — so the reader pump's first
+`block_on_sync(tx.send(..))` failed, the pump broke out of its loop, and
+the closed channel read as EOF. `#[tokio::test]` is `CurrentThread` by
+default, so this was every test that drove a pump.
+
+The dual meaning is in `try_current()`: it answers both *"am I running on
+this runtime's thread"* and *"has this thread merely entered this handle"*
+with one value. `block_on_sync` cannot distinguish them, so it must assume
+the first and refuse — correct on the runtime's own thread, where parking
+halts the task that would wake you, and wrong on a dedicated thread, where
+it halts nothing.
+
+Fixed at the one place a dedicated thread's context is decided, rather
+than by teaching `block_on_sync` to guess: a `CurrentThread` ambient is
+not inherited. Nothing is lost, because what inheriting buys —
+`spawn` and the timer *inside* `block_on_sync` — is unreachable when
+`block_on_sync` never returns `Ok`. Inheriting could only convert a
+thread that would have worked into one that cannot block.
+
+Boundary coverage was two of three: multi-thread ambient and no ambient
+each had a test; the case between them had none. It has one now. This is
+**not** a test-only fix — a hosted caller of `connect_blocking` on a
+current-thread runtime hit it in production shape.
+
+### 9.4 Two bounds, because one duration cannot do both jobs
+
+The blocking transport needs deadlines the hosted one does not, and the
+first cut gave both to `op_timeout`. That is wrong in the direction that
+looks harmless:
+
+* **`SO_RCVTIMEO`.** `reader_pump` ends the connection when its receive
+  timeout expires, so a finite value there is an *idle-disconnect bound*.
+  An idle PVA circuit is supposed to be silent between echoes (15 s), with
+  `tcp_timeout` (40 s) the only thing entitled to call it dead — so
+  `op_timeout` made every circuit quieter than one operation
+  self-destruct. It keeps `PumpConfig`'s effectively-infinite default;
+  what ends a parked reader is `ReaderPumpGuard`'s `shutdown`, driven by
+  the cancellation token the heartbeat already fires. The regression test
+  is the 2.5 s idle assertion in
+  `connect_blocking_completes_the_same_handshake_as_connect`.
+* **The one-whole-frame write deadline.** This one has no hosted
+  counterpart at all — only on the blocking side is a write a parked
+  thread something has to be entitled to reclaim
+  (`blocking_io::write_frame_deadline`). `connect` passes `tcp_timeout`,
+  the connection's own liveness bound, so the pump can never end a circuit
+  the protocol would still consider alive. **Recorded as a deviation:** a
+  frame that cannot reach the wire within `tcp_timeout` ends a blocking
+  connection and would not end a hosted one. It is not removable — a
+  blocking write with no deadline holds its thread forever — so the choice
+  is only *which* bound, and any value is a deviation.
+
+`ns_run_once` passes `handshake_timeout` for both, because it is the only
+bound an NS circuit is configured with: no `ConnConfig`, no heartbeat, no
+`tcp_timeout`. That also adds a connect deadline the bare
+`TcpStream::connect(ns_addr).await` did not have — an unreachable name
+server used to park that future on the OS's connect timeout.
+
+### 9.5 The forcing mechanism
+
+`--cfg pva_blocking_client`, declared in `epics-pva-rs/build.rs`
+(`cargo::rustc-check-cfg`) and emitted by nobody:
+
+```
+RUSTFLAGS="--cfg pva_blocking_client" cargo nextest run -p epics-pva-rs
+```
+
+A cargo feature was the obvious alternative and is the wrong tool:
+features unify across the graph, so any crate in a workspace build
+enabling it would silently move every other crate's PVA client onto the
+blocking transport. A runtime env var would ship the switch in release
+binaries, where an operator setting it changes the transport of a
+production IOC. A `--cfg` no manifest can turn on reaches neither — it
+exists only for a build someone typed the flag for, the same mechanism
+`scripts/rtems-check.sh` uses for `rtems_boot_linked`.
+
+### 9.6 The gate is a ratchet, because the literal reading is vacuous
+
+§5 asks for `rtems-check.sh` with this crate's target selection *extended
+to include `client`*. Taken literally — adding `client` to
+`CRATE_FEATURES` — the whole gate goes red, because every remaining
+client error is UDP and §4.2 stages that work **after** this one,
+deliberately. Stages 3–5 all extend the green gate, so turning it red for
+work nobody has started reports nothing.
+
+The count is the artefact, so the selection is measured rather than built,
+and pinned (`PVA_CLIENT_TARGET_ERRORS`) so it cannot drift unobserved in
+either direction: more is the regression; fewer is someone doing the work
+and not lowering the number, fatal for the same reason the binary census
+is bidirectional — a bound nobody updates stops being a measurement.
+
+### 9.7 §1.2's "47 is a lower bound", settled
+
+| point | errors |
+|---|---:|
+| before stage 1 | **47** (29 primary + an 18-error `[u8]` cascade) |
+| after stages 1 and 2 | **29** (cascade gone with `search_engine`'s `TcpStream`) |
+| after `server_conn`'s unconditional `tokio::net` import was removed | **28** |
+
+All 28 are UDP — `udp.rs` 20, `search_engine.rs` 7, `search.rs` 1 —
+newlib/`libc` gaps, `socket2`, `if-addrs` and `AsyncUdpV4`.
+
+The last step is worth stating on its own. `use tokio::net::TcpStream`
+sat at module scope in `server_conn.rs` while both remaining uses were
+already inside `cfg` blocks the target does not compile. An import is
+resolved whether or not anything reaches the item, so that one line was
+an E0432 poisoning the whole module — and rustc suppresses downstream
+errors in code naming a poisoned module's items, which is exactly why 47
+had to be reported as a lower bound.
+
+**§5's named risk did not materialise.** `ops_v2.rs` is at zero, it names
+nothing from `search_engine`/`udp`, and `server_conn` — the one poisoned
+module it depended on — is now clean, so that zero is a real result.
+**§6 item 1 is settled for `ops_v2.rs`.** It is *not* settled for
+`channel.rs` and `context.rs`: both are also at zero, but both still name
+`search_engine::SearchEngine`, so their zeros stay suppressed until the
+UDP stage lands.
+
+### 9.8 A stale census marker from step 1
+
+`8024b175` moved the pump, guard and deadline-loop tests out of
+`server_native/blocking.rs` into `runtime::blocking_io` but left that
+file's `RTEMS-EXEC-MODEL-ALLOW` at 18 against 16 actual sites, so
+`every_reactor_dependent_test_is_accounted_for` had been failing
+feature-ON since that commit. Corrected to 16. The marker's whole purpose
+is that it is *not* self-certifying, so a stale one is worse than a
+missing one.
+
+### 9.9 The two pre-existing RTEMS-gate warnings
+
+Unchanged in count and identity: `server_native/tcp.rs:1407` (deprecated
+`fetch_update`) and `server_native/search_engine.rs:501` (dead `Origin`
+variants). Both are in `server_native/`; neither was silently fixed nor
+worsened. As §8.7 notes, the second is the **server**-side file of that
+name, not the client one this stage changed.
+
+### 9.10 The gate as measured
+
+| gate | result |
+|---|---|
+| `epics-pva-rs` suite, blocking transport **forced on** (`--cfg pva_blocking_client`) | **1380 passed, 0 failed, 2 skipped** |
+| `connect_blocking_completes_the_same_handshake_as_connect` (default build) | pass — verified by mutation: fails at 2.5 s if the reader pump is given a finite receive timeout |
+| `a_dedicated_thread_can_block_under_a_current_thread_ambient` | pass — verified by mutation: `None != Some(9)` without the fix |
+| `cargo nextest run -p epics-pva-rs -p epics-base-rs` | 4900 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1374 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-base-rs --features rtems-exec-model` | 3520 passed, 0 failed |
+| `cargo clippy -p epics-pva-rs -p epics-base-rs --all-targets -- -D warnings` | clean, in both the default and the forced-on configuration |
+| `./scripts/rtems-check.sh` | exit 0; client probe 28, 2 pre-existing warnings unchanged |

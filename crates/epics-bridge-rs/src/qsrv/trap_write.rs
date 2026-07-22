@@ -33,6 +33,8 @@
 //! the access layer; this helper reads only that flag and never
 //! re-derives the trap mask at the emission site.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::access_security::{self, TrapWriteFields, TrapWriteGuard};
 use epics_base_rs::types::EpicsValue;
 

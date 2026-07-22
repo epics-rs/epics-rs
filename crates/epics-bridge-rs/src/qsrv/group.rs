@@ -4,6 +4,8 @@
 //! A group PV combines fields from multiple EPICS database records
 //! into a single PvStructure.
 
+// RTEMS-EXEC-MODEL-ALLOW(27): checked - these run and pass in the feature-ON suite.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;

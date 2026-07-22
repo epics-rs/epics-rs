@@ -3,6 +3,8 @@
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 

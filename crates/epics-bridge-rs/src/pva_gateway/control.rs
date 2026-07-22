@@ -48,6 +48,8 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
+// RTEMS-EXEC-MODEL-ALLOW(16): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, AsgAslResolver};

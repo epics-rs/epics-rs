@@ -43,6 +43,8 @@
 //! [`PutLogLine::TrapWrite`] writes the C default valueless line,
 //! [`PutLogLine::AllWrites`] writes the value/old/outcome audit line.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 /// Which client writes the put log records. Selected by the write hook
 /// from gateway configuration; see the module docs for the per-mode line
 /// format.

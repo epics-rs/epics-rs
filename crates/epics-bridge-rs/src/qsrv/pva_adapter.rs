@@ -6,6 +6,8 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
+// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the feature-ON suite.
+
 use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};

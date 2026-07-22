@@ -46,6 +46,8 @@
 //!   sees only global (`FROM`-less) DENY rules — a host-targeted deny
 //!   must not remove a PV that is still admissible for other hosts.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::path::Path;
 
 use regex::Regex;

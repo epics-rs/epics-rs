@@ -3,6 +3,8 @@
 //! Uses our own [`crate::pvdata`] types, so only native types appear in the
 //! public surface.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;

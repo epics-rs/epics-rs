@@ -107,6 +107,8 @@
 //! SEARCH to this server's port is answered; one that relies on being told we
 //! exist is not, yet.
 
+// RTEMS-EXEC-MODEL-ALLOW(18): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{

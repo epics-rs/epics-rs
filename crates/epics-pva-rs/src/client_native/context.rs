@@ -15,6 +15,8 @@
 //! Public API stays compatible with the previous shape so existing callers
 //! (pvget-rs, pvput-rs, pvmonitor-rs, pvinfo-rs) keep working.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

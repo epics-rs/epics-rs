@@ -3,6 +3,8 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;

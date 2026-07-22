@@ -19,6 +19,8 @@
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;

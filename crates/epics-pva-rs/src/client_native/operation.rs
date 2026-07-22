@@ -17,6 +17,8 @@
 //! The handle is constructed from any future that returns
 //! `PvaResult<T>`.
 
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::time::Duration;
 

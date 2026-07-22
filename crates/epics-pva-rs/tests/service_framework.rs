@@ -2,6 +2,8 @@
 //! an in-process server with a service that exposes two RPC
 //! methods, then drives them via `PvaClient::pvrpc`.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;

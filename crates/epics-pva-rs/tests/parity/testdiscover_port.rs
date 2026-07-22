@@ -7,6 +7,8 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(3): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use std::time::Duration;
 
 use epics_pva_rs::client_native::search_engine::{Discovered, SearchEngine};

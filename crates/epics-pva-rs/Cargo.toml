@@ -204,6 +204,12 @@ windows-sys = { version = "0.59", features = [
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and three copies of a
+# 300-line audit is how three copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"

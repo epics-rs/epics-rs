@@ -44,6 +44,8 @@
 //! receiver is not owned by this type, so the external consumer must
 //! call [`MonitorControlOp::note_consumed`] to decrement `pending`.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

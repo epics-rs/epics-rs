@@ -17,6 +17,8 @@
 //!
 //! SKIPped if either `c++` or the pvxs headers are absent.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{pvxs_arch, pvxs_lib_dir};
 
 use epics_pva_rs::pvdata::{PvField, ScalarValue};

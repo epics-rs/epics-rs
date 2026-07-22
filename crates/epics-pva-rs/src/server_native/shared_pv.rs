@@ -22,6 +22,8 @@
 //! pipeline window. We don't yet wire them into the wire-level
 //! ackCount but the API is in place for callers to set them.
 
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,

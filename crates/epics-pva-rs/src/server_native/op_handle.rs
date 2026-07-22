@@ -28,6 +28,8 @@
 //! [`super::source::ChannelContext`] and drained by the connection into
 //! IOID-tagged `CMD_MESSAGE` frames before the operation's reply.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -18,6 +18,8 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
+// RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

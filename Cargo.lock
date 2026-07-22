@@ -1072,6 +1072,7 @@ dependencies = [
  "proptest",
  "rand_core 0.6.4",
  "rcgen",
+ "rtems-exec-gate",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
@@ -1149,6 +1150,7 @@ dependencies = [
  "parking_lot",
  "pkcs5",
  "rcgen",
+ "rtems-exec-gate",
  "rustls 0.23.39",
  "rustls-pemfile",
  "serde_json",
@@ -3211,6 +3213,10 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rtems-exec-gate"
+version = "0.0.0"
 
 [[package]]
 name = "rumqttc"

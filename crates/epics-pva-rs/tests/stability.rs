@@ -18,6 +18,8 @@
 
 #![allow(clippy::manual_async_fn)]
 
+// RTEMS-EXEC-MODEL-ALLOW(31): checked - these run and pass in the feature-ON suite.
+
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;

@@ -3,6 +3,8 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
+// RTEMS-EXEC-MODEL-ALLOW(28): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use tokio::sync::mpsc;

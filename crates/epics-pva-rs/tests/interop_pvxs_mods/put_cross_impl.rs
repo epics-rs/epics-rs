@@ -12,6 +12,8 @@
 //!     either side's PUT request encoder / response decoder would
 //!     silently desync without this check.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{PVXGET, PVXPUT, pvxs_command, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};

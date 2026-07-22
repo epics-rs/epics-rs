@@ -14,6 +14,8 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use epics_pva_rs::server_native::MonitorStream;
 use std::path::PathBuf;
 use std::process::Stdio;

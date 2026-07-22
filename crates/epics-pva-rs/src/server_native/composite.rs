@@ -14,6 +14,8 @@
 //! `rpc`, `is_writable`, `get_introspection`). `list_pvs()` is the
 //! union of every source's PV list.
 
+// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

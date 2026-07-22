@@ -18,6 +18,8 @@
 //! the full window let the server window drain to 0 and stalled ~1 RTT
 //! every `pipeline_size` updates.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;

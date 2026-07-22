@@ -19,6 +19,8 @@
 //! [`crate::client_native::ops_v2::op_monitor_handle`] for the loop that
 //! re-issues INIT/START on each new server conn.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

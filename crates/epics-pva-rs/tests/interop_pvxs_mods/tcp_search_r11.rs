@@ -15,6 +15,8 @@
 //! socket. That gives us byte-exact validation of the handler
 //! without pulling in pvxs as a build dep.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use std::io::Read;
 use std::time::Duration;
 

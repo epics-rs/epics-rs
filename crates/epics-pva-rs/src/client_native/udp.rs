@@ -36,6 +36,8 @@
 //! destination, which is all the fan-out predicate needs. This keeps the
 //! receive core independent of the wire codec.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

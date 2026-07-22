@@ -18,6 +18,8 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;

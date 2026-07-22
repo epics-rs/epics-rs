@@ -1,5 +1,7 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
+// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 

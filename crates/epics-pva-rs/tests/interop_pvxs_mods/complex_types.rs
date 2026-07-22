@@ -20,6 +20,8 @@
 //!
 //! SKIPped if `pvxget` not found.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::pv_builders::{PvBuild, complex_pv_matrix, encode_pv_fixture};
 use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
 

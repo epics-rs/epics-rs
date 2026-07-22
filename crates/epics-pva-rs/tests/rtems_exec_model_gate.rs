@@ -11,9 +11,9 @@
 #![cfg(feature = "rtems-exec-model")]
 
 /// A floor, not the current count: it exists to turn a scan that silently finds
-/// nothing — a moved directory, a renamed manifest — into a failure. 117 files
+/// nothing — a moved directory, a renamed manifest — into a failure. 170 files
 /// at the time of writing.
-const MIN_FILES: usize = 100;
+const MIN_FILES: usize = 150;
 
 #[test]
 fn every_reactor_dependent_test_is_accounted_for() {

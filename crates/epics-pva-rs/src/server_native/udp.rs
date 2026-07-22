@@ -4,6 +4,8 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

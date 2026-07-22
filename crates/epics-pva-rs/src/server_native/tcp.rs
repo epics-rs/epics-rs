@@ -20,6 +20,8 @@
 //! No socket type is named anywhere in this file's production scope, and
 //! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
+// RTEMS-EXEC-MODEL-ALLOW(94): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

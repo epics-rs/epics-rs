@@ -40,6 +40,8 @@
 //! a user that wants to own `server` must register at an explicit order
 //! `< -1`.
 
+// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::types::PvString;

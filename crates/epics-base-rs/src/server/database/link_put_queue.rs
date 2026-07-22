@@ -500,8 +500,13 @@ async fn owner_loop(
     }
 }
 
-/// The lsets a write may be offered to, in order.
-fn resolve_lsets(inner: &super::PvDatabaseInner, target: &LinkTarget) -> Vec<DynLinkSet> {
+/// The lsets a write (or an open) may be offered to, in order. Single owner
+/// of the target → lset mapping, shared with `PvDatabase::resolve_external_pv`
+/// so a link's cached read and its staged open address the same lsets.
+pub(super) fn resolve_lsets(
+    inner: &super::PvDatabaseInner,
+    target: &LinkTarget,
+) -> Vec<DynLinkSet> {
     let registry = inner.link_sets.load();
     match target {
         LinkTarget::Scheme(s) => registry.get(s).into_iter().collect(),

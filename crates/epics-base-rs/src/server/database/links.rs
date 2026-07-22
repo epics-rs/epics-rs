@@ -2910,6 +2910,64 @@ impl PvDatabase {
             );
         }
     }
+
+    /// Open every external link in the database at iocInit — C
+    /// `dbInitLink` (`dbLink.c:95-143`) hands EVERY non-local `PV_LINK` to
+    /// `dbCaAddLinkCallbackOpt`, which stages a `CA_CONNECT` action
+    /// (`dbCa.c:389-417`) for the `dbCaTask` to service. A C IOC therefore
+    /// reaches its first scan with every external channel already connecting.
+    ///
+    /// Two properties come straight from the C:
+    ///
+    /// * **Direction-agnostic.** `dbInitLink` reaches `dbCaAddLink` for
+    ///   `DBF_INLINK`, `DBF_OUTLINK` and `DBF_FWDLINK` alike (`dbLink.c:118`
+    ///   onwards; the `dbfType` check below it only sets `pvlOptInpNative` /
+    ///   `pvlOptFWD`). An OUT-only external link is opened at init too.
+    /// * **Every link field, not just the CP/CPP subset.**
+    ///   [`Self::setup_cp_links`] warms only CP/CPP links, because those have
+    ///   a chicken-and-egg problem a lazy open cannot solve (a Passive holder
+    ///   is never scanned, so its monitor is never created). Every other
+    ///   external link would otherwise wait for its first cache miss to stage
+    ///   the open — one cold scan cycle per link that C does not spend.
+    ///
+    /// The field enumeration is [`super::PvDatabase::record_link_fields`], the
+    /// same single owner `setup_cp_links` uses, so "what is a link field"
+    /// cannot diverge between the two passes. Staging goes through
+    /// [`super::PvDatabase::stage_external_link_open_by_name`] →
+    /// `stage_external_link_open`, so the connect still runs on the link work
+    /// owner and never on a record-processing thread; nothing here calls
+    /// `LinkSet::connect_link` directly.
+    ///
+    /// Idempotent against `setup_cp_links`: the queue's open state is
+    /// per-[`super::link_put_queue::LinkKey`] and terminal, and both passes
+    /// derive the key from the same boundary name, so a CP link already warmed
+    /// above is not staged a second time.
+    ///
+    /// Returns the number of links this pass staged.
+    pub async fn setup_external_link_opens(&self) -> usize {
+        let names = self.all_record_names().await;
+        let mut staged = 0usize;
+        for record_name in &names {
+            for (_field, _raw, parsed) in self.record_link_fields(record_name) {
+                // `external_pv_name` is `Some` exactly for the external
+                // variants (`Ca` / `Pva` / `PvaJson`) and carries the key the
+                // link set is addressed with. A local `Db` link, a
+                // `Constant`, a hardware link and a `lnkCalc` link all report
+                // `None` — C's `dbDbInitLink` / `dbConstInitLink` /
+                // `dbJLinkInit` paths, none of which reach `dbCaAddLink`.
+                let Some(pv) = parsed.external_pv_name() else {
+                    continue;
+                };
+                if self.stage_external_link_open_by_name(&pv) {
+                    staged += 1;
+                }
+            }
+        }
+        if staged > 0 {
+            eprintln!("iocInit: {staged} external link opens staged");
+        }
+        staged
+    }
 }
 
 #[cfg(test)]

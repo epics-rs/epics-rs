@@ -5227,8 +5227,7 @@ impl PvDatabase {
             phas,
         } = result
         {
-            self.update_scan_index(&name, old_scan, new_scan, phas, phas)
-                .await;
+            self.update_scan_index(&name, old_scan, new_scan, phas, phas);
         }
     }
 

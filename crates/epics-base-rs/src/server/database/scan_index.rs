@@ -19,7 +19,16 @@ impl PvDatabase {
     /// stale scan-index entry pointing at a wrong scan rate. The
     /// live-read makes the index strictly reflect the record's
     /// current state at insert time.
-    pub async fn update_scan_index(
+    ///
+    /// **Synchronous.** It had exactly two suspension points and neither was a
+    /// real one: `registration_mutex.lock().await` (L46) and two
+    /// `scan_index.write().await` acquisitions (L8b). Both are blocking PI
+    /// mutexes now, so the whole scan-index update is a bounded critical
+    /// section — which is what lets it run *inside* the L1 record-gate window
+    /// without putting an `.await` there. C reaches `scanAdd`/`scanDelete`
+    /// (`dbScan.c:241-330`) the same way, from inside `dbPut` under
+    /// `dbScanLock`. `doc/rtems-priority-locks-design.md` §5 step 4.
+    pub fn update_scan_index(
         &self,
         name: &str,
         old_scan: ScanType,

@@ -2259,7 +2259,7 @@ async fn test_phas_scan_order() {
             } = result
             {
                 drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p).await;
+                db.update_scan_index(name, old_scan, new_scan, p, p);
             }
         }
     }
@@ -2860,7 +2860,7 @@ async fn test_phas_change_updates_scan_index() {
             } = result
             {
                 drop(inst);
-                db.update_scan_index(name, old_scan, new_scan, p, p).await;
+                db.update_scan_index(name, old_scan, new_scan, p, p);
             }
         }
     }
@@ -2877,8 +2877,7 @@ async fn test_phas_change_updates_scan_index() {
         } = result
         {
             drop(inst);
-            db.update_scan_index("REC_A", scan, scan, old_phas, new_phas)
-                .await;
+            db.update_scan_index("REC_A", scan, scan, old_phas, new_phas);
         }
     }
     let names = db.records_for_scan(ScanType::Sec1).await;

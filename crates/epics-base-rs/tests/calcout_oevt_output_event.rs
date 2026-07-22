@@ -70,8 +70,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         inst.common.scan = ScanType::Event;
         inst.common.evnt = evnt.to_string();
     }
-    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
+    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
 
 /// Poll until `cond` holds — the OEVT post is spawned (like

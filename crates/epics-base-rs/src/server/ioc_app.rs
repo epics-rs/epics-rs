@@ -1261,8 +1261,7 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
         phas,
     } = result
     {
-        db.update_scan_index(name, old_scan, new_scan, phas, phas)
-            .await;
+        db.update_scan_index(name, old_scan, new_scan, phas, phas);
     }
     eprintln!("scanAdd: I/O Intr not valid ({reason}), {name} set to Passive");
 }
@@ -1413,8 +1412,7 @@ mod io_intr_scan_add_tests {
             let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
         }
-        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0)
-            .await;
+        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
         assert_eq!(
             db.records_for_scan(ScanType::IoIntr).await,
             vec!["NODEV".to_string()],
@@ -1469,8 +1467,7 @@ mod io_intr_scan_add_tests {
             inst.common.scan = ScanType::IoIntr;
             inst.device = Some(Box::new(NoIntrDevice));
         }
-        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0)
-            .await;
+        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
 
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");

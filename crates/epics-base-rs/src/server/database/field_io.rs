@@ -732,16 +732,14 @@ impl PvDatabase {
                     new_scan,
                     phas,
                 } => {
-                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas)
-                        .await;
+                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas);
                 }
                 CommonFieldPutResult::PhasChanged {
                     scan: s,
                     old_phas,
                     new_phas,
                 } => {
-                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas)
-                        .await;
+                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas);
                 }
                 CommonFieldPutResult::NoChange => {}
             }
@@ -1024,16 +1022,14 @@ impl PvDatabase {
                     new_scan,
                     phas,
                 } => {
-                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas)
-                        .await;
+                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas);
                 }
                 CommonFieldPutResult::PhasChanged {
                     scan: s,
                     old_phas,
                     new_phas,
                 } => {
-                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas)
-                        .await;
+                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas);
                 }
                 CommonFieldPutResult::NoChange => {}
             }
@@ -1999,16 +1995,14 @@ impl PvDatabase {
                 new_scan,
                 phas,
             } => {
-                self.update_scan_index(record_name, old_scan, new_scan, phas, phas)
-                    .await;
+                self.update_scan_index(record_name, old_scan, new_scan, phas, phas);
             }
             crate::server::record::CommonFieldPutResult::PhasChanged {
                 scan: s,
                 old_phas,
                 new_phas,
             } => {
-                self.update_scan_index(record_name, s, s, old_phas, new_phas)
-                    .await;
+                self.update_scan_index(record_name, s, s, old_phas, new_phas);
             }
             crate::server::record::CommonFieldPutResult::NoChange => {}
         }

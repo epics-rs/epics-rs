@@ -156,12 +156,28 @@ via a dev-dependency; `cargo check` never links on any selector
 it makes cargo silently *skip* the target — a worse failure than the one being
 closed.
 
-Two known nits, unfixed: it leaves `M Cargo.lock` behind (a linking build needs
-`cargo update -p libc --precise 0.2.188`), and its comments do not disclose
-that `--no-default-features` excludes `epics-rtems-boot`'s
-`_RTEMS_LIBC_TIME_LAYOUT` guard from coverage. The second is not a nit — it is
-the same class as the `--lib` miss: `cargo check` stayed green while an image
-build hard-failed on that guard.
+**Both known defects are closed, and the second one's diagnosis above was
+wrong.** Recorded because the wrong cause is the more plausible-looking one:
+
+* The guard was never excluded by `--no-default-features`. `epics-rtems-boot`
+  declares no `[features]` at all, so that flag cannot reach it — and the flag
+  is load-bearing for an unrelated reason that must not be undone
+  (`epics-pva-rs`'s default `tls` drags `ring` → `getrandom 0.2`, which
+  `compile_error!`s on the target). What excluded the guard is `cfg(all(
+  target_os = "rtems", rtems_boot_linked))`, and `rtems_boot_linked` is emitted
+  by `epics-rtems-boot/build.rs` **only when `RTEMS_BSP_PREFIX` is set** — i.e.
+  never on a machine without a BSP, which is every machine this gate was
+  written for. The axis missed was not *what* is compiled but *which
+  configuration*. The gate now compiles both (`CONFIGS=(portability image)`,
+  the image one selected with `RUSTFLAGS=--cfg rtems_boot_linked`, no source
+  cfg touched), and the image pass is fatal.
+* `M Cargo.lock` was not the script's doing. Measured: a full run at
+  `7a88c6a8` leaves the tree clean. The rewrite comes from the
+  `[patch.crates-io] libc` a linking build needs, and the old gate exited **0**
+  while accepting it — reporting on a resolution nobody committed. `--locked`
+  makes that a named error. Pinning `libc` was measured and rejected: under
+  `--precise 0.2.188` **both** layout refusals still fire, identical to
+  0.2.186. No published `libc` satisfies the predicates.
 
 ---
 
@@ -748,13 +764,26 @@ that gets skipped when a session moves machines, so it is listed first.
    our deviation and it is currently recorded nowhere but this file. Include the
    §5.1 measurement and the fd=400 result, so the next person does not re-run
    a 300-connection ramp to learn that the cap buys nine connections.
-3. **Fix the two `scripts/rtems-check.sh` defects.** It leaves `M Cargo.lock`
-   behind, and `--no-default-features` silently drops `epics-rtems-boot`'s
-   `_RTEMS_LIBC_TIME_LAYOUT` guard from coverage. The second is the same class
-   as the `--lib` miss that started this: the gate stayed green while a real
-   image build hard-failed with `error[E0080]: evaluation panicked: RTEMS libc
-   layout bug`. A gate that cannot fail on a known-broken configuration is not
-   a gate.
+3. ~~**Fix the two `scripts/rtems-check.sh` defects.**~~ **DONE** — see §2 for
+   both, including the correction that the guard was hidden by
+   `rtems_boot_linked`, not by `--no-default-features`.
+
+   **One consequence needs a decision, and it is not an agent's.** The image
+   configuration is now compiled and its failure is fatal, so
+   `./scripts/rtems-check.sh` is **RED on the committed tree** — six red
+   targets, all `[image]`, twelve `error[E0080]`, both layout refusals. That is
+   the true state of the workspace: with a stock `libc` it cannot build a
+   bootable image, and §2's "gates green at that tip" was the report the
+   refusals exist to prevent. It goes green the moment a `libc` carrying the
+   documented workaround is patched in — demonstrated, both configurations,
+   exit 0 — so it is blocked on the §7 `libc` decision and on nothing else.
+
+   The alternative — tolerating "the two refusals we already know about" and
+   exiting 0 — was considered and **rejected by measurement**: the incident
+   §7 records (a branch missing the `time_t` widening) fires exactly *one* of
+   the two, so an allowlist admits it. Verified: with the socket fix present
+   and the time widening dropped, the gate is red with 6 time refusals and 0
+   socket refusals.
 
 ### 8.2 File the upstream reports (§6)
 

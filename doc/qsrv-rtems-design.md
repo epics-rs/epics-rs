@@ -1,6 +1,8 @@
 # QSRV + pvalink on the RTEMS execution model
 
-**Status:** design. No production code changed by this document.
+**Status:** design; **stage 1 implemented** (see §7 stage 1, and §9 for
+every place reality deviated from what the probes predicted). Stages 2–5
+unimplemented.
 **Base:** `integration/rtems-scope-b` tip `9965bbd6`, plus the landed
 `pi-h7-h9-l33` round (`e8b6cd50` / `6db95afc` / `5d46ce3b`) — every count
 below that touches `qsrv/group.rs` or `pvalink/integration.rs` is stated
@@ -626,7 +628,7 @@ complete rather than selective.)
 
 | id | site | type | held across `.await`? | verdict |
 |---|---|---|---|---|
-| **L33** | `qsrv/group_config.rs:64` `GroupPvDef::atomic_write_lock: Arc<tokio::sync::Mutex<()>>` (constructed `:800`) | `tokio::sync::Mutex` | **yes** — post-H9 it is acquired *before* `PvDatabase::lock_records` and therefore held across `lock_records(…).await` | **TBD → resolved by the landed round: stays `tokio::sync::Mutex` for now.** `5d46ce3b` states it directly: "It stays a plain `tokio::sync::Mutex`, **not** a `PriorityInheritanceMutex`: it is held for the whole atomic block, which means it is held across `lock_records(…).await` itself — genuinely async today, since L1 has not made the step-4 type flip. Converting L33 first would hold a `!Send` guard across that await and fail to compile at the connection-task spawn site… L33 becomes convertible once L1 does (step 4)." So: **blocked on L1's step-4 type flip, not on this work.** No action in any stage of §7. |
+| **L33** | **STALE — see §9.1.** At `32cc7847` this is already `Arc<PriorityInheritanceMutex<()>>` (`qsrv/group_config.rs:76`); the flip landed between this document's base `9965bbd6` and stage 1, and it is what produced stage 1's one unpredicted blocker. The row below describes the pre-flip shape. ~~`qsrv/group_config.rs:64` `GroupPvDef::atomic_write_lock: Arc<tokio::sync::Mutex<()>>` (constructed `:800`)~~ | `tokio::sync::Mutex` | **yes** — post-H9 it is acquired *before* `PvDatabase::lock_records` and therefore held across `lock_records(…).await` | **TBD → resolved by the landed round: stays `tokio::sync::Mutex` for now.** `5d46ce3b` states it directly: "It stays a plain `tokio::sync::Mutex`, **not** a `PriorityInheritanceMutex`: it is held for the whole atomic block, which means it is held across `lock_records(…).await` itself — genuinely async today, since L1 has not made the step-4 type flip. Converting L33 first would hold a `!Send` guard across that await and fail to compile at the connection-task spawn site… L33 becomes convertible once L1 does (step 4)." So: **blocked on L1's step-4 type flip, not on this work.** No action in any stage of §7. |
 | **L-A** | `qsrv/provider.rs:641` `BridgeProvider::record_cache: tokio::sync::RwLock<HashMap<String, (NtType, DbFieldType)>>` (constructed `:746`) | `tokio::sync::RwLock` | **needs checking** — it is a pure memo of `(NtType, DbFieldType)` per record name | **→ `parking_lot::RwLock`.** It guards a `HashMap` insert/lookup with no I/O inside the critical section, which is the exact profile the rest of `BridgeProvider` already uses (`groups`, `access_cell`, `base_group_defs`, `group_files` are all `parking_lot::RwLock` — `provider.rs:628, 647, 656, 668`). Being the one tokio lock in a struct whose four siblings are `parking_lot` is itself the tell. Converting removes a PI-invisible wait from the GET/PUT hot path and removes four `.await`s. **Precondition:** confirm no `.await` occurs while a guard is live (a `!Send` guard across an await fails to compile at the connection-task spawn site — the same trap L33 documents), which the compiler will state for us. |
 | **L-B** | `qsrv/pva_adapter.rs:194` `QsrvPvStore::pva_pvs: Arc<tokio::sync::RwLock<HashMap<String, PvaPvHandle>>>` (imported `:13`, threaded through `:287`, `:328`) | `tokio::sync::RwLock` | read-only on the serve path (`:337` `pva_pvs.read().await.get(..).cloned()`) | **→ `parking_lot::RwLock`, or `arc-swap`.** Same profile: a name→handle map, cloned out immediately, no I/O under the guard. Note `PvaPvHandle`'s own interior state is *already* `parking_lot::Mutex` (`:49`, `:50`), so the outer tokio lock is the odd one out. `arc-swap` (already a dependency, `Cargo.toml:107`) is the better fit if registration is rare and lookup is hot — but that is an optimisation, and `parking_lot` is the structural fix. |
 | **L-C** | `pvalink/registry.rs:10` `use tokio::sync::Notify`; used at `:89-91` (`pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>`), `:234`, `:257` (`tokio::pin!(notified)`), `:284` | `tokio::sync::Notify` | **yes, by construction** — the whole point is "park until another task finishes opening this link" | **keep.** `Notify` is runtime-agnostic (it is a waker list, not a reactor primitive) and `park_on` names it as allowed. The single-flight pattern it implements — one opener, N waiters — is the correct shape and has no cheaper synchronous equivalent. It is PI-invisible, which matters only if a high-priority thread can wait behind a low-priority opener; on RTEMS today it cannot, because **pvalink is not in the RTEMS closure at all** (§3.4). Revisit when it is. |
@@ -804,7 +806,12 @@ it, matching the other three crates.
 
 Each stage names its own gate. No stage depends on a later one.
 
-### Stage 1 — manifest: get the bridge into the RTEMS closure (small)
+### Stage 1 — manifest: get the bridge into the RTEMS closure (small) — **DONE**
+
+Landed as `c1456c0c` / `5680834f` / `a6ae5e9b` on top of `32cc7847`.
+Read §9 before trusting the sub-steps below: step (2) was reduced and
+one blocker the probes could not see was added.
+
 
 *Size:* ~40 lines of `Cargo.toml`, 2 lines of `cfg` in `src/`, 6 lines of
 `scripts/rtems-check.sh`.
@@ -947,17 +954,29 @@ Everything here is a claim this document could not settle from source.
    ≥ 250. UNVERIFIED whether `tests/pva_gateway.rs`'s 24 sites count at
    all, given the module is feature-gated out of the RTEMS selection
    (§6.3.3).
-7. **`scripts/rtems-check.sh` census spelling.** The census derives its
-   pairs from `basename src/bin/*.rs .rs` — underscores — while the
-   `[[bin]]` names use hyphens (§6.2). UNVERIFIED against a real run;
-   the script will say which on the first invocation.
+7. ~~**`scripts/rtems-check.sh` census spelling.**~~ **VERIFIED (stage 1,
+   `a6ae5e9b`): underscores.** The census pairs are
+   `epics-bridge-rs:ca_gateway_rs`, `:dual_gateway_rs`, `:dual_ioc_rs`,
+   `:pva_gateway_rs`, `:qsrv_rs`, exactly as the mechanical reading of
+   `basename src/bin/*.rs .rs` predicted. Hyphens fail the run with both
+   an "unclassified" and a "stale" complaint at once, as anticipated.
 8. **The bridge's `Instant::now()` deadline loop
    (`pvalink/integration.rs:725`, `:730`, `:733`).** Only reachable once
    pvalink is on the target (stage 5), but worth recording now: the
    target clock is 1-second-quantized, which makes a 50 ms poll
    meaningless there. Whatever the pvalink stage does, it should not
    assume sub-second deadlines are expressible.
-9. **The referenced design docs are not in this repository.**
+9. **The bridge's four `#[cfg(unix)]` sites.** RTEMS satisfies
+   `cfg(unix)`, so a bare `#[cfg(unix)]` arm silently hands the target a
+   Linux-shaped path. Checked for stage 1: all four are in
+   `ca_gateway/server.rs` (`:37`, `:1273`, `:1362`) and the live one
+   reaches `tokio::signal::unix` (`:1287`). None is in the target's
+   graph — `ca-gateway` is not selected by `qsrv-core`. Recorded as a
+   *bounded* trap rather than a silent one: the RTEMS tokio table drops
+   the `signal` feature, so if `ca_gateway` were ever selected for the
+   target this would be an unresolved-import error rather than a wrong
+   path taken quietly. It is still the arm to fix first if that changes.
+10. **The referenced design docs are not in this repository.**
    `doc/rtems-priority-locks-design.md` and `doc/pi-lock-evaluation.md`
    are cited by the H7/H9/L33 commit messages
    (`e8b6cd50`, `6db95afc`, `5d46ce3b`) and by
@@ -967,3 +986,107 @@ Everything here is a claim this document could not settle from source.
    text (which reproduces it verbatim in `record_lock.rs`) rather than
    from §1.1/§5 of the design doc. If those docs exist elsewhere, §5's
    L33 row should be re-checked against them.
+
+---
+
+## 9. Stage 1 as built — where reality deviated from the probes
+
+Stage 1 landed as `c1456c0c` (base) / `5680834f` (bridge) / `a6ae5e9b`
+(gate) on top of `32cc7847`. Three of §7 stage 1's five sub-steps were
+byte-accurate against the probes. Two were not, and one blocker was
+invisible to every probe.
+
+### 9.1 A blocker the probes could not see: L33 is no longer a tokio mutex
+
+**Predicted:** probe C, "0 errors, 3 warnings". **Measured at
+`32cc7847`:** *1 error*, and not in any file §2.5 names:
+
+```
+error[E0277]: `epics_base_rs::runtime::sync::pi_mutex::PiMutex<()>`
+              doesn't implement `Debug`
+   --> crates/epics-bridge-rs/src/qsrv/group_config.rs:75
+```
+
+Cause: §5's L33 row is **stale**. Between this document's base
+(`9965bbd6`) and `32cc7847`, `GroupPvDef::atomic_write_lock` was flipped
+from `Arc<tokio::sync::Mutex<()>>` to
+`Arc<PriorityInheritanceMutex<()>>`. Probe C measured a tree where it was
+still tokio, so the error could not appear.
+
+The defect it exposed is not in the bridge. `PriorityInheritanceMutex<T>`
+is one type alias with three `cfg` arms: `parking_lot::Mutex<T>` on the
+non-RT fallback, `pi_mutex::PiMutex<T>` on the two PI arms. The fallback
+implements `Debug`; the PI arms did not. So **any** `#[derive(Debug)]`
+struct holding one compiles on a developer's box and fails for
+`armv7-rtems-eabihf` — and `GroupPvDef` (`#[derive(Debug, Clone)]`) is
+simply the first such struct in the workspace. `server::pv`,
+`database::mod`'s buckets and `record_lock`'s gate all hold a
+`PriorityInheritanceMutex` *without* deriving `Debug`, which is why the
+gap survived until the bridge entered the gate.
+
+Fixed at the alias (`c1456c0c`), not at the derive site, so the next such
+struct cannot reopen it — `PiMutex<T: Debug>: Debug`, via `try_lock` and
+not `lock`, matching `parking_lot` (a blocking `Debug` deadlocks the
+moment anything formats a structure while the lock is held). The file's
+own guard comment already stated the rule for auto traits ("keeps the two
+arms' auto traits identical"); this extends it to the named ones.
+`PiMutexGuard` deliberately did **not** get one: no struct stores a guard
+and derives `Debug`, so that would be speculative API.
+
+With the base fix in place, probe C's prediction holds exactly: **0
+errors, 3 warnings**, and the three warnings are the three §2.5 names
+(`Qsrv2Decision`'s fields, `qsrv2_enabled`, `load_qsrv_groups` — the last
+now at `pva_adapter.rs:1490`, moved by the gating comment).
+
+### 9.2 `epics-ca-rs` was not spelled out — §2.2a reduced
+
+§2.2a says to spell out **both** `epics-pva-rs` and `epics-ca-rs` with
+`default-features = false`. Only `epics-pva-rs` was, and the reason is a
+consequence of adopting §2.2c's option 1 properly rather than a shortcut.
+
+The probes reached `epics-ca-rs` because they ran `--features qsrv`,
+which carries `dep:epics-ca-rs`. `qsrv-core` does not: the crate's *only*
+`epics_ca_rs` reference in `qsrv` is at `pva_adapter.rs:1427`, inside
+`run_ca_pva_qsrv_ioc`, so the dependency belongs to the host runner and
+moves to `qsrv` with it. Under the target selection `epics-ca-rs` is not
+in the graph at all. Its `default` list is also empty, so
+`default-features = false` would drop nothing even if it were.
+
+Spelling it out anyway would have bought no coverage and cost a second
+place where a hand-written `version = "0.24.0"` can drift from the
+workspace table. Left inherited, with the reason stated at the entry.
+
+### 9.3 §6.1's caveat is the whole story — the feature map is mandatory
+
+§6.1 raised the featureless-green risk as a caveat. Measured, it is not a
+caveat but the entry's central requirement: `COMMON` carries
+`--no-default-features`, the `qsrv` module is behind
+`#[cfg(feature = "qsrv-core")]`, and a featureless build of the bridge
+type-checks `error`, `convert` and `lib.rs` — **0** of the 11,281
+production lines. The per-crate `CRATE_FEATURES` map (§6.1's "honest
+shape") is what makes the entry mean anything, and it is what shipped.
+
+`qsrv-core` is also what §2.2c's option 1 requires the `#[cfg]`s to say:
+every `#[cfg(feature = "qsrv")]` in `src/` was renamed to
+`feature = "qsrv-core"` (14 sites across `lib.rs`, `qsrv/mod.rs`,
+`pvalink/integration.rs`). Because `qsrv` is a strict superset, every
+host selection resolves byte-identically. The two `#![cfg(feature =
+"qsrv")]` *test* files were deliberately left alone: they drive
+`PvaClient`, which only `qsrv` restores.
+
+### 9.4 Feature-ON census: unchanged, and the suite is green
+
+§6.3's 250-site bill is stage 4's and nothing in stage 1 touched it.
+`epics-bridge-rs` still declares no `rtems-exec-model` feature, carries
+no `rtems-exec-gate` dev-dep and no `RTEMS-EXEC-MODEL-ALLOW` markers, so
+the census gates nothing for this crate yet. Recorded for stage 4's
+baseline: at `a6ae5e9b` `cargo nextest run -p epics-bridge-rs` is
+**674 tests, 674 passed, 0 skipped**.
+
+### 9.5 What stage 1 did *not* do
+
+No behaviour changed and no serving path was mounted. `rtems-pva-ioc`
+still serves single-record PVs only; `CompositeSource` is untouched;
+`qsrv2_enabled` and `load_qsrv_groups` are still dead on the target,
+which is precisely §3.3's work list. The three dead-code warnings are
+left standing on purpose.

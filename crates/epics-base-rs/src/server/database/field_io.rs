@@ -1083,30 +1083,41 @@ impl PvDatabase {
     /// Must be called with no record lock held: a `WriteDbLink` can process its
     /// target, which re-enters the database.
     ///
-    /// # Still `async` — the one suspension left in the H1/H2 gate window
+    /// # Still `async` — but no longer a network suspension
     ///
     /// `doc/rtems-priority-locks-design.md` §5 step 4 turns the scan-index tail
-    /// synchronous; this tail cannot follow yet, and the two reasons are
-    /// different:
+    /// synchronous; this tail cannot follow yet. There used to be two reasons;
+    /// one is closed:
     ///
-    /// 1. `execute_process_actions` → `write_out_link_value` →
-    ///    `write_db_link_value` (`links.rs:1497`, `:1560`) re-enters
+    /// 1. **Open.** `execute_process_actions` → `write_out_link_value` →
+    ///    `write_db_link_value` (`links.rs`) re-enters
     ///    `put_pv_already_locked` — i.e. **this function's own caller** — and
     ///    `process_target`, which is H6. That resolves in step 5 by
     ///    construction, not here.
-    /// 2. `write_out_link_value` → `write_external_pv` →
-    ///    `LinkSet::put_value` (`links.rs:1612`) is a real `ca://` / `pva://`
-    ///    network suspension, not a lock acquisition. It is also **already a
-    ///    C-parity deviation**: C's `dbCaPutLink` enqueues onto the `dbCa`
-    ///    task and returns, so C never blocks on the network inside
-    ///    `dbScanLock`. Making that call an enqueue onto a dedicated task —
-    ///    which is what closes it — is a change to the link layer, not to this
-    ///    function.
+    /// 2. **Closed.** `write_out_link_value` → `write_external_pv` no longer
+    ///    calls `LinkSet::put_value` from this thread. It stages the write on
+    ///    the database's link-put queue and returns, exactly as C
+    ///    `dbCaPutLink` stages into `pca->pputNative`, calls `addAction` and
+    ///    returns (`dbCa.c:544-631`); the `ca://` / `pva://` round trip runs
+    ///    on the queue's owner task, C's `dbCaTask` (`dbCa.c:1226-1248`). See
+    ///    [`super::link_put_queue`].
     ///
-    /// Until both land, the H1/H2 advisory-gate window contains exactly one
-    /// `.await`, and it is this call. The gate is still a `PriorityGate`
-    /// handing out a `Send` guard, so that compiles and is sound; it is what
-    /// blocks the L1 → `PriorityInheritanceMutex` flip, not this step.
+    /// So the awaits left in this chain, with the gate held, are:
+    ///
+    /// * the H6 re-entry of reason 1 (a lock acquisition and a process
+    ///   cycle, not I/O);
+    /// * `LinkSet::put_admission` inside `write_external_pv` — a cached-state
+    ///   probe both production lsets answer from a map lookup plus an atomic,
+    ///   which is C's `if (!pca->isConnected …)` (`dbCa.c:558-561`);
+    /// * for a **put-notify / blocking-put** chain only
+    ///   ([`LinkPutOp::Async`](super::LinkPutOp::Async)), the await on the
+    ///   queue owner's completion — C's `CA_PUT_CALLBACK` route, where the
+    ///   originating record is likewise held until `putComplete` fires
+    ///   (`dbCa.c:1232-1236`, `:1056-1074`). A plain OUT write awaits nothing.
+    ///
+    /// The gate is still a `PriorityGate` handing out a `Send` guard, so that
+    /// compiles and is sound; reason 1 is what blocks the
+    /// L1 → `PriorityInheritanceMutex` flip, not this step.
     async fn run_special_actions(
         &self,
         record_name: &str,

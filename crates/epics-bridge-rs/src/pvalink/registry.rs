@@ -167,6 +167,29 @@ impl PvaLinkRegistry {
         self.map.read().get(&key).cloned()
     }
 
+    /// Exact OUT lookup — the write-direction twin of [`Self::try_get_inp`].
+    ///
+    /// The registry keys on direction, so an OUT link's shared channel owner
+    /// is a *different* entry from the INP one for the same PV. A caller
+    /// asking "is the write path up?" must therefore look here: the INP
+    /// lookup answers `None` for a perfectly healthy OUT-only channel.
+    /// An OUT channel tracks its connection through its own liveness monitor
+    /// (`PvaLink::open`'s OUT arm), which is what `is_connected()` reads.
+    pub fn try_get_out(
+        &self,
+        pv_name: &str,
+        pipeline: bool,
+        queue_size: usize,
+    ) -> Option<Arc<PvaLink>> {
+        let key: RegistryKey = (
+            pv_name.to_string(),
+            pipeline,
+            queue_size,
+            LinkDirection::Out,
+        );
+        self.map.read().get(&key).cloned()
+    }
+
     /// Get an existing link or open a new one. Concurrent calls
     /// for the same key share one [`PvaLink::open`] invocation;
     /// the second caller awaits via `pending` and reads the

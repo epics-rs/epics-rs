@@ -156,10 +156,13 @@
 //! (`put_pv_and_post_with_origin`) windows each contain **exactly one**
 //! `.await`, and it is the same one in both: `run_special_actions`. The
 //! scan-index tail that used to sit beside it is synchronous now. That last
-//! await is not removable here — it re-enters H1/H6 and it reaches a real
-//! `ca://`/`pva://` network write; see `run_special_actions`' own doc comment
-//! for both branches. The remaining holders (H4, H6, H7, H8, H9) are untouched
-//! by step 4 and still await freely under the gate.
+//! await is not removable here — it re-enters H1/H6. It no longer reaches a
+//! `ca://`/`pva://` network write: `write_external_pv` stages the write on the
+//! database's link-put queue and returns, as C `dbCaPutLink` does
+//! (`dbCa.c:544-631`), so the only lset call left inside the window is the
+//! cached-state `put_admission` probe. See `run_special_actions`' own doc
+//! comment for the exact list. The remaining holders (H4, H6, H7, H8, H9) are
+//! untouched by step 4 and still await freely under the gate.
 
 // RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
 

@@ -189,6 +189,12 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
         .await
         .unwrap();
 
+    // A plain OUT put is staged on the link-put queue and the record returns
+    // — C `dbCaPutLink` does the same (`dbCa.c:622-624`), and the wire write
+    // happens on the `dbCaTask`. `dbCaSync` (`dbCa.c:1191-1194`) is the
+    // barrier that makes it observable.
+    db.sync_external_link_puts().await;
+
     assert_eq!(
         puts.lock().unwrap().as_slice(),
         ["REMOTE:OUT"],

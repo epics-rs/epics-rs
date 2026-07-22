@@ -94,6 +94,40 @@ pub enum LinkPutOp {
     Async,
 }
 
+/// Whether an external OUT link will accept a staged write right now —
+/// the answer to C `dbCaPutLinkCallback`'s first gate:
+///
+/// ```c
+/// if (!pca->isConnected || !pca->hasWriteAccess) {
+///     epicsMutexUnlock(pca->lock);
+///     return -1;
+/// }
+/// ```
+/// (`dbCa.c:558-561`).
+///
+/// Answered from cached state only: it runs on a record-processing thread
+/// inside the record's advisory write gate, which is exactly where C never
+/// touches the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutAdmission {
+    /// The lset tracks this link and its channel is up — stage the write.
+    /// C's fall-through to `addAction` (`dbCa.c:622`).
+    Connected,
+    /// The lset tracks this link and the channel is DOWN. C refuses the put
+    /// with `-1` and stages nothing (`dbCa.c:558-561`); the caller raises the
+    /// owning record's LINK/INVALID through `dbPutLink`'s `setLinkAlarm`
+    /// (`dbLink.c:434-448`).
+    Disconnected,
+    /// The lset has never opened this link, so it cannot answer. C cannot
+    /// reach this state: `dbCaAddLink` opens every CA link at record-init
+    /// time (`dbCa.c` `addAction(pca, CA_CONNECT)`), so by the first
+    /// `dbCaPutLink` the `caLink` always exists. Our lsets open lazily on
+    /// first use instead, so the write is staged and the lset's own
+    /// `put_value` performs the open — dropping it would mean an OUT link
+    /// that never opens and therefore never connects.
+    Unopened,
+}
+
 /// Remote display / control / valueAlarm metadata snapshot for a
 /// link, as exposed by pvxs's pvalink lset metadata getters.
 ///
@@ -199,7 +233,70 @@ pub trait LinkSet: Send + Sync {
     /// Read the current value of `name`. Returns None when the
     /// upstream isn't yet connected or the lset has no cache for
     /// this name.
+    ///
+    /// MAY perform I/O (open the channel, issue a one-shot GET). It is
+    /// therefore called only from the database's link work owner task —
+    /// the record-processing path uses [`Self::get_cached_value`].
     async fn get_value(&self, name: &str) -> Option<EpicsValue>;
+
+    /// Read `name` from cached, monitor-fed state ONLY — the
+    /// record-processing read. C `dbCaGetLink` (`dbCa.c:448-535`) copies
+    /// out of `pca->pgetNative`, the buffer the CA monitor callback
+    /// (`eventCallback`, `dbCa.c:925`) keeps fresh on the `dbCaTask`; it
+    /// never opens a channel and never waits on the wire. Returns None
+    /// when the link has no cached value yet, which is C returning -1 for
+    /// `!pca->isConnected` (`dbCa.c:459-464`) — the reading record takes
+    /// LINK/INVALID for that cycle.
+    ///
+    /// MUST NOT perform I/O.
+    ///
+    /// Default: delegate to [`Self::get_value`], which preserves the
+    /// pre-queue behaviour for an lset that has no separate cache. Every
+    /// lset whose `get_value` can open a channel or issue a network GET
+    /// MUST override, or the record thread suspends on the network again.
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_value(name).await
+    }
+
+    /// Open (subscribe / connect) `name` so later
+    /// [`Self::get_cached_value`] reads have a cache to serve — C
+    /// `dbCaAddLink` (`dbCa.c:735-800`), which stages a `CA_CONNECT`
+    /// action whose `ca_create_channel` + `ca_add_array_event` run on the
+    /// `dbCaTask`, not on the caller.
+    ///
+    /// **Called from the database's link work owner task**, so it MAY
+    /// block on the network. Idempotent: the owner may call it again for
+    /// a link that is already open or still connecting.
+    ///
+    /// Default: drive the lset's own lazy open by reading through
+    /// [`Self::get_value`] and discarding the result — correct for every
+    /// existing lset, and it runs off the record-processing thread.
+    async fn connect_link(&self, name: &str) {
+        let _ = self.get_value(name).await;
+    }
+
+    /// Non-blocking admission gate for an OUT-link write, asked on the
+    /// record-processing thread *before* the write is staged onto the
+    /// database's link-put queue — C `dbCaPutLinkCallback`'s
+    /// `if (!pca->isConnected || !pca->hasWriteAccess) return -1;`
+    /// (`dbCa.c:558-561`).
+    ///
+    /// MUST NOT perform I/O. It is the one lset call left inside the
+    /// record's advisory write gate, and the whole point of the queue is
+    /// that nothing there touches the network.
+    ///
+    /// Default: derive from [`Self::is_connected`], which the trait already
+    /// documents as answerable "without blocking". An lset whose OUT links
+    /// live in a different cache than its INP links (pvalink keys its
+    /// registry on direction) MUST override, or every OUT write to a
+    /// perfectly healthy channel is refused.
+    async fn put_admission(&self, name: &str) -> PutAdmission {
+        if self.is_connected(name).await {
+            PutAdmission::Connected
+        } else {
+            PutAdmission::Disconnected
+        }
+    }
 
     /// Write `value` to `name` with the delivery semantics named by
     /// `op` ([`LinkPutOp::Plain`] for a fire-and-forget put,
@@ -207,6 +304,10 @@ pub trait LinkSet: Send + Sync {
     /// blocking-put chain). Returns Err with a human-readable reason
     /// on failure (denied, type-mismatch, no-such-pv, etc.). Default
     /// impl rejects all writes — read-only lsets keep the default.
+    ///
+    /// **Called from the database's link-put owner task, never from a
+    /// record-processing thread** — this is the `dbCaTask` half of the
+    /// split (`dbCa.c:1226-1248`), so it may block on the network.
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let _ = (name, value, op);
         Err("link set is read-only".into())

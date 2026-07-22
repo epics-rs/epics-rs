@@ -5,6 +5,7 @@ use std::future::Future;
 pub mod db_access;
 mod field_io;
 pub mod filters;
+mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
@@ -13,7 +14,8 @@ mod scan_index;
 mod snapshot;
 
 pub use link_set::{
-    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
+    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
+    RemoteAlarm,
 };
 pub use processing::{AsyncDbHandle, AsyncToken};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
@@ -433,6 +435,12 @@ struct PvDatabaseInner {
     /// snapshot is what the read paths already assumed.
     /// `doc/rtems-priority-locks-design.md` §3 row L8i.
     link_sets: SnapshotCell<link_set::LinkSetRegistry>,
+    /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
+    /// Record processing stages a write here and returns; the queue's single
+    /// owner task performs the `ca://`/`pva://` network write off the
+    /// record's advisory write gate, exactly as `dbCaTask` does
+    /// (`dbCa.c:1158-1333`). See [`link_put_queue`].
+    link_puts: Arc<link_put_queue::LinkPutQueue>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -727,6 +735,7 @@ impl PvDatabase {
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
+                link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
                 records: parking_lot::RwLock::new(HashMap::new()),
                 scan_index: ScanIndex::new(),
                 load_order: SnapshotCell::new(HashMap::new()),
@@ -1141,6 +1150,20 @@ impl PvDatabase {
     /// may be the bare PV name (in which case `pva://` is assumed
     /// when an lset is registered for that scheme) or a fully
     /// scheme-prefixed string.
+    ///
+    /// # Cached read, then a staged open — C `dbCaGetLink`
+    ///
+    /// This is the record-processing read, so it reads the lset's
+    /// monitor-fed cache ([`LinkSet::get_cached_value`]) and never the
+    /// network: C `dbCaGetLink` (`dbCa.c:448-535`) copies out of
+    /// `pca->pgetNative`, which the CA monitor callback keeps fresh on the
+    /// `dbCaTask`, and returns -1 while the link is down (`dbCa.c:459-464`).
+    ///
+    /// A miss stages the link's OPEN on the same work queue the OUT writes
+    /// use — C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:735-800`) — and returns
+    /// `None` for this cycle. C's open happens at record init rather than at
+    /// first read, but in both designs the connect runs on the link task and
+    /// the reading record takes LINK/INVALID until the cache is warm.
     pub(crate) async fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
@@ -1160,10 +1183,14 @@ impl PvDatabase {
                 .filter_map(|s| registry.get(s))
                 .collect();
             drop(registry);
+            let any_lset = !lsets.is_empty();
             for lset in lsets {
-                if let Some(v) = lset.get_value(name).await {
+                if let Some(v) = lset.get_cached_value(name).await {
                     return Some(v);
                 }
+            }
+            if any_lset {
+                self.stage_external_link_open(link_put_queue::LinkTarget::Any, name);
             }
             // Fall through to legacy resolver.
             let resolver = self
@@ -1178,9 +1205,13 @@ impl PvDatabase {
         };
         let lset = self.inner.link_sets.load().get(scheme);
         if let Some(lset) = lset {
-            if let Some(v) = lset.get_value(body).await {
+            if let Some(v) = lset.get_cached_value(body).await {
                 return Some(v);
             }
+            self.stage_external_link_open(
+                link_put_queue::LinkTarget::Scheme(scheme.to_string()),
+                body,
+            );
         }
         let resolver = self
             .inner
@@ -1191,6 +1222,33 @@ impl PvDatabase {
             Some(r) => r(name).await,
             None => None,
         }
+    }
+
+    /// Single owner of the "this external link needs opening" transition —
+    /// C `dbCaAddLink`'s `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`).
+    ///
+    /// Every caller routes through here so the open runs on the link work
+    /// owner and nowhere else; no path may call `LinkSet::open_link`
+    /// directly from a record-processing thread. Cheap and idempotent: the
+    /// queue drops a repeat stage for a link it has already opened.
+    pub(crate) fn stage_external_link_open(
+        &self,
+        target: link_put_queue::LinkTarget,
+        name: &str,
+    ) -> bool {
+        self.inner
+            .link_puts
+            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
+        self.inner.link_puts.stage_open(link_put_queue::LinkKey {
+            target,
+            name: name.to_string(),
+        })
+    }
+
+    /// Number of external-link opens the work owner has completed —
+    /// diagnostic twin of [`Self::external_link_puts_completed`].
+    pub fn external_link_opens_completed(&self) -> u64 {
+        self.inner.link_puts.opened_count()
     }
 
     /// Add a simple PV with an initial value.

@@ -552,6 +552,11 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     db.process_record_with_links("AO_PVAOUT", &mut visited, 0)
         .await
         .unwrap();
+    // Staged on the link-put queue and returned, as C `dbCaPutLink` does
+    // (`dbCa.c:622-624`); `dbCaSync` (`dbCa.c:1191-1194`) is the barrier
+    // that makes the wire write observable. The `Async` twin below needs
+    // no barrier: a put-notify put still awaits its completion.
+    db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
     assert_eq!(
@@ -2086,6 +2091,11 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
     db.process_record_with_links("TEST_AO_NL", &mut visited, 0)
         .await
         .unwrap();
+
+    // Staged on the link-put queue and returned, as C `dbCaPutLink` does
+    // (`dbCa.c:622-624`); `dbCaSync` (`dbCa.c:1191-1194`) is the barrier
+    // that makes the wire write observable.
+    db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
     assert_eq!(

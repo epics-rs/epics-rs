@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{ExternalPvResolver, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    ExternalPvResolver, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+};
 use epics_base_rs::server::record::{JlinkValue, PVAJSON_IDENTITY_SEP, pvajson_identity_key};
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
@@ -1176,6 +1178,99 @@ impl LinkSet for PvaLinkResolver {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pvfield_to_epics_value(&value)
+    }
+
+    /// C `dbCaGetLink` (`dbCa.c:448-535`) — the monitor-fed cache only.
+    /// This is [`Self::get_value`]'s fast path (`integration.rs:1155-1166`)
+    /// without the `get_or_open` + `read_with_field` slow path, so the
+    /// record-processing read cannot suspend on a PVA connect or GET round
+    /// trip. pvxs reads the same way: `pvaGetValue` serves the monitor
+    /// snapshot the channel task refreshed (`pvalink_lset.cpp:199-236`).
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let full = strip_scheme(name)?;
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        let link = self
+            .registry
+            .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
+        let value = link.try_read_cached_with_field(&cfg.field)?;
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pvfield_to_epics_value(&value)
+    }
+
+    /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:735-800`): open the monitor so
+    /// later cached reads have something to serve. Runs on the database's
+    /// link work owner, never on a record-processing thread.
+    async fn connect_link(&self, name: &str) {
+        if !self.is_enabled() {
+            return;
+        }
+        let Some(full) = strip_scheme(name) else {
+            return;
+        };
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let _ = self.registry.get_or_open(self.inp_cfg_for(full)).await;
+    }
+
+    /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
+    /// return -1;` (`dbCa.c:558-561`), answered from cached state only — the
+    /// database asks this on the record-processing thread, inside the
+    /// record's advisory write gate.
+    ///
+    /// Looks up the **OUT** registry variant, not the INP one
+    /// [`LinkSet::is_connected`] uses: the registry keys on direction, so an
+    /// OUT-only channel is invisible to `try_get_inp` and the trait's default
+    /// gate (derived from `is_connected`) would refuse every OUT write to a
+    /// healthy channel. An OUT `PvaLink` tracks its connection through its
+    /// own liveness monitor — pvxs runs a monitor on every channel, INP and
+    /// OUT alike, to maintain `lchan->connected`
+    /// (`pvalink_channel.cpp:342-363`), and gates the write on
+    /// `valid() = connected && root` (`pvalink_lset.cpp:609`).
+    ///
+    /// A link never opened reports `Unopened` so the write is still staged
+    /// and `put_value`'s lazy `get_or_open` performs the open; pvxs opens at
+    /// link-init instead, so it never sees this state.
+    async fn put_admission(&self, name: &str) -> PutAdmission {
+        if !self.is_enabled() {
+            // `put_value` would reject it — refuse at the gate so the owning
+            // record alarms in this cycle, as a `-1` from C does.
+            return PutAdmission::Disconnected;
+        }
+        let Some(full) = strip_scheme(name) else {
+            // A `ca://` name reaching the pva lset: `put_value` rejects it.
+            return PutAdmission::Disconnected;
+        };
+        let bare = link_pv_name(full);
+        if full != bare {
+            lazy_register_out_opts(&self.out_link_options, full);
+        }
+        let cfg = self.out_cfg_for(full);
+        // pvxs gates the write on `if(!self->retry && !self->valid())`
+        // (`pvalink_lset.cpp:609`): a `retry` link deliberately skips the
+        // connection gate and queues for replay on reconnect. Refusing it
+        // here would delete that whole mechanism, so a retry link is always
+        // admitted and `flush_scratch` owns its disconnect handling.
+        if cfg.retry {
+            return PutAdmission::Connected;
+        }
+        match self
+            .registry
+            .try_get_out(bare, cfg.pipeline, cfg.queue_size)
+        {
+            None => PutAdmission::Unopened,
+            Some(link) if link.is_connected() => PutAdmission::Connected,
+            Some(_) => PutAdmission::Disconnected,
+        }
     }
 
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {

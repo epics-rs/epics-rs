@@ -72,7 +72,8 @@ mod ioc {
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_builder::IocBuilder;
-    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs};
+    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
+    use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
 
     /// The built-in database loaded when no `.db` file is given on the command
@@ -86,10 +87,14 @@ mod ioc {
 
     /// The namespace the status PVs are published under, matching [`DEMO_DB`]'s.
     ///
+    /// This plays `$(IOCNAME)`'s role in devIocStats' templates — the whole
+    /// name is `<prefix>:<upstream leaf>`, one colon, upstream's spelling on
+    /// the right.
+    ///
     /// A constant because this binary has no configuration surface — there is
     /// no iocsh and no `.cmd` on the target. It follows that two of these IOCs
-    /// on one subnet publish the same three names and a client's SEARCH would
-    /// be answered by both; the fix when that day comes is to take the prefix
+    /// on one subnet publish the same names and a client's SEARCH would be
+    /// answered by both; the fix when that day comes is to take the prefix
     /// from the environment the way `cas_server_port` takes the port, and this
     /// note is here so the next reader does not have to rediscover why.
     const STATUS_PREFIX: &str = "RTEMS";
@@ -181,44 +186,40 @@ mod ioc {
         //      numbers are the only way to ask the IOC how it is doing from
         //      anywhere but the serial console — and the console is
         //      write-only. See `status_pv`'s module docs for why this is a
-        //      pusher and not a read hook, and why free heap is absent.
+        //      pusher and not a read hook, and why the names are devIocStats'.
         //
-        //      `PVA:CONNS` is NOT here, and not because it is expensive:
+        //      `PVA_CONN_CNT` is NOT here, and not because it is expensive:
         //      `BlockingPvaServer::active_connections` is already public and
         //      would be one more `StatusPv`. This binary starts no PVA server
         //      (step (3) is the CA front-end and nothing else), so publishing
         //      it would publish a constant zero — a number that reads like
-        //      "no PVA clients" when it means "no PVA server". It belongs to
-        //      whatever entry point owns a `BlockingPvaServer`, as one line.
+        //      "no PVA clients" when it means "no PVA server". `rtems-pva-ioc`
+        //      is the entry point that owns a `BlockingPvaServer`, and it
+        //      publishes it there.
         //
-        //      Registered after `bind` so `CA:CONNS` reads the server that is
-        //      already listening, and before the accept thread starts so the
-        //      first client cannot find them missing.
+        //      Registered after `bind` so `CA_CONN_CNT` reads the server that
+        //      is already listening, and before the accept thread starts so
+        //      the first client cannot find them missing.
         let started = Instant::now();
         let conns_server = server.clone();
-        if let Err(e) = serve_status_pvs(
-            db_for_status,
-            vec![
-                // The ceiling number. Measured on target: 142 concurrent, the
-                // 143rd refused by the libbsd socket zone with ENFILE.
-                StatusPv::new(format!("{STATUS_PREFIX}:CA:CONNS"), move || {
-                    conns_server.active_connections() as f64
-                }),
-                // Climbs only when a client was turned away. Process-wide and
-                // monotonic, so a client can tell "never happened" from
-                // "happened and stopped".
-                StatusPv::new(format!("{STATUS_PREFIX}:CA:REFUSED"), || {
-                    refused_clients() as f64
-                }),
-                // The one value none of the others gives: a reset. Without it
-                // a client cannot tell a board reboot from a network blip,
-                // because both look like a reconnect. Seconds, which is also
-                // this target's clock resolution.
-                StatusPv::new(format!("{STATUS_PREFIX}:UPTIME"), move || {
-                    started.elapsed().as_secs() as f64
-                }),
-            ],
-        ) {
+        let mut status = target_status_pvs(STATUS_PREFIX, started);
+        status.extend([
+            // devIocStats' `@ca_connections` (ioc.template:82-94). The ceiling
+            // number: measured on target at 142 concurrent, the 143rd refused
+            // by the libbsd socket zone with ENFILE.
+            StatusPv::new(format!("{STATUS_PREFIX}:CA_CONN_CNT"), move || {
+                EpicsValue::Double(conns_server.active_connections() as f64)
+            }),
+            // No upstream counterpart: devIocStats counts CA clients and CA
+            // connections but never refusals. Named in the shape of the ones
+            // that do exist rather than a different one. Climbs only when a
+            // client was turned away; process-wide and monotonic, so a client
+            // can tell "never happened" from "happened and stopped".
+            StatusPv::new(format!("{STATUS_PREFIX}:CA_REFUSED_CNT"), || {
+                EpicsValue::Double(refused_clients() as f64)
+            }),
+        ]);
+        if let Err(e) = serve_status_pvs(db_for_status, status) {
             eprintln!("rtems-ca-ioc: cannot register the status PVs: {e}");
             return ExitCode::FAILURE;
         }
@@ -341,8 +342,12 @@ mod tests {
     /// The target has no shell, so an IOC that publishes no status PVs can only
     /// be asked how it is doing by reading a write-only serial console. Each of
     /// these answers a question nothing else on the box answers: how close the
-    /// connection ceiling is, whether anyone has been turned away, and whether
-    /// the board rebooted.
+    /// connection ceiling is, and whether anyone has been turned away.
+    ///
+    /// The descriptor, heap and uptime values are NOT checked here — they come
+    /// from `target_status_pvs`, which owns their names and has its own test
+    /// pinning them. Restating them here would be a second copy of the naming
+    /// rule, which is the thing that function exists to prevent.
     #[test]
     fn the_entry_point_publishes_its_status() {
         let src = include_str!("rtems-ca-ioc.rs");
@@ -355,7 +360,12 @@ mod tests {
             "the entry point registers no status PVs; on a target with no iocsh \
              that leaves `caget` with nothing to ask"
         );
-        for value in [":CA:CONNS", ":CA:REFUSED", ":UPTIME"] {
+        assert!(
+            prod.contains(concat!("target_status_", "pvs(STATUS_PREFIX")),
+            "the entry point stopped publishing the common descriptor/heap/uptime \
+             set; FD_CNT against FD_MAX is the value that predicts the ceiling"
+        );
+        for value in [":CA_CONN_CNT", ":CA_REFUSED_CNT"] {
             assert!(
                 prod.contains(value),
                 "status PV `{value}` is gone from the entry point"

@@ -1001,6 +1001,7 @@ dependencies = [
  "criterion",
  "epics-ca-rs",
  "epics-macros-rs",
+ "epics-rtems-boot",
  "hostname",
  "if-addrs",
  "libc",

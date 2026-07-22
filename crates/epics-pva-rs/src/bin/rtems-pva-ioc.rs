@@ -78,11 +78,14 @@ mod ioc {
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Instant;
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
+    use epics_base_rs::types::EpicsValue;
     use epics_pva_rs::server::PvDatabaseSource;
     use epics_pva_rs::server_native::blocking::{BlockingPvaServer, bind_udp_search};
     use epics_pva_rs::server_native::config::PvaServerConfig;
@@ -95,6 +98,15 @@ mod ioc {
         "record(longout, \"RTEMS:PVA:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
         "record(stringout, \"RTEMS:PVA:MSG\") { field(VAL, \"rtems-pva-ioc\") }\n",
     );
+
+    /// The namespace the status PVs are published under.
+    ///
+    /// This plays `$(IOCNAME)`'s role in devIocStats' templates — the whole
+    /// name is `<prefix>:<upstream leaf>`, one colon, upstream's spelling on
+    /// the right. Deliberately the same value `rtems-ca-ioc` uses: the two
+    /// binaries are two front-ends for the same board, never both running, so
+    /// an operator's screens should not have to know which one booted.
+    const STATUS_PREFIX: &str = "RTEMS";
 
     /// Load the database: every command-line argument is a `.db` file path
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
@@ -167,6 +179,7 @@ mod ioc {
             }
         };
         let db_for_names = db.clone();
+        let db_for_status = db.clone();
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.
@@ -219,6 +232,33 @@ mod ioc {
                 }
             };
 
+        // (3c) The status PVs. Same facility, same names and the same reason as
+        //      `rtems-ca-ioc`: on a target with no iocsh and no shell these are
+        //      the only way to ask the IOC how it is doing from anywhere but a
+        //      write-only serial console. The descriptor, heap and uptime set
+        //      is `target_status_pvs`, so both IOCs answer to one vocabulary.
+        //
+        //      Registered after `bind` so the connection count reads the server
+        //      that is already listening, and before the accept thread starts
+        //      so the first client cannot find them missing.
+        let conns_server = server.clone();
+        let mut status = target_status_pvs(STATUS_PREFIX, Instant::now());
+        status.push(
+            // No upstream counterpart: devIocStats predates PVA entirely, so
+            // there is no `@pva_connections` to match. Named in the shape of
+            // devIocStats' `CA_CONN_CNT` rather than a different one, so an
+            // operator who knows that name can guess this one.
+            StatusPv::new(format!("{STATUS_PREFIX}:PVA_CONN_CNT"), move || {
+                EpicsValue::Double(conns_server.active_connections() as f64)
+            }),
+        );
+        if let Err(e) = serve_status_pvs(db_for_status, status) {
+            eprintln!("rtems-pva-ioc: cannot register the status PVs: {e}");
+            return ExitCode::FAILURE;
+        }
+
+        // Listed after the status PVs are registered, so the console names
+        // everything a client can reach rather than only what the `.db` carried.
         let mut names = block_on_sync(db_for_names.all_record_names())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
         names.sort();
@@ -455,6 +495,38 @@ mod tests {
         assert!(
             arm.contains("EPICS_PVA_NAME_SERVERS"),
             "the failure message must name the configuration that still works"
+        );
+    }
+
+    /// The target has no shell, so an IOC that publishes no status PVs can only
+    /// be asked how it is doing by reading a write-only serial console.
+    ///
+    /// Only `PVA_CONN_CNT` is named here. The descriptor, heap and uptime
+    /// values come from `target_status_pvs`, which owns their names and has its
+    /// own test pinning them to devIocStats' spelling; restating them here
+    /// would be the second copy of the naming rule that function exists to
+    /// prevent.
+    #[test]
+    fn the_entry_point_publishes_its_status() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("serve_status_", "pvs(")),
+            "the entry point registers no status PVs; on a target with no iocsh \
+             that leaves `pvget` with nothing to ask"
+        );
+        assert!(
+            prod.contains(concat!("target_status_", "pvs(STATUS_PREFIX")),
+            "the entry point stopped publishing the common descriptor/heap/uptime \
+             set; FD_CNT against FD_MAX is the value that predicts the ceiling"
+        );
+        assert!(
+            prod.contains(":PVA_CONN_CNT"),
+            "the PVA connection count is gone — this is the one status value \
+             `rtems-ca-ioc` cannot publish, because it starts no PVA server"
         );
     }
 }

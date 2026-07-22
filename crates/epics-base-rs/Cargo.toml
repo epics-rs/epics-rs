@@ -17,6 +17,13 @@ chrono = "0.4"
 parking_lot = "0.12"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }
+# `server::status_pv::target_status_pvs` reads descriptor and heap usage out of
+# RTEMS through this crate's `stats` module. A leaf: `epics-rtems-boot` depends
+# on nothing of ours, its build script no-ops off RTEMS, and on a host target
+# both readers return `None`, so this costs a host build nothing. The
+# alternative was writing the status set out twice, once in each IOC binary,
+# which is how two copies of a naming rule come to disagree.
+epics-rtems-boot = { workspace = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 # Host-only dependencies — gated out for the RTEMS target (armv7-rtems-eabihf).

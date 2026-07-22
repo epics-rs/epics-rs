@@ -6,6 +6,30 @@
 //! it is doing is to `caget` it. This module registers a handful of plain PVs
 //! and keeps them current, so the answer exists.
 //!
+//! # The names are devIocStats', not ours
+//!
+//! Every value here that has an upstream counterpart uses the upstream name,
+//! from `iocStats/iocAdmin/Db/ioc.template` and `iocRTOS.template`
+//! (<https://github.com/epics-modules/iocStats>): `FD_CNT`, `FD_MAX`,
+//! `FD_FREE`, `MEM_FREE`, `MEM_USED`, `MEM_MAX`, `MEM_BLK`, `UPTIME`. Upstream
+//! writes them under a `$(IOCNAME)` macro with a colon separator, which is the
+//! role [`target_status_pvs`]'s `prefix` argument plays.
+//!
+//! This is a deliberate refusal to invent a parallel vocabulary. Operators
+//! already have OPI screens, archiver configurations and alarm handlers keyed
+//! to these names; a status surface that answered to `MEM:FREE` instead of
+//! `MEM_FREE` would be a gratuitous deviation on the one surface where matching
+//! upstream costs nothing and diverging costs every site its tooling.
+//!
+//! `UPTIME` is a **string**, because upstream's is a `stringin` carrying
+//! `[N day(s), ]HH:MM:SS` (`devIocStats/devIocStatsString.c:397-421`), not a
+//! seconds count. [`format_uptime`] reproduces that formatting exactly.
+//!
+//! Two values have no upstream counterpart and are named in the same shape
+//! rather than a different one — see the IOC binaries that publish them:
+//! `CA_REFUSED_CNT` (devIocStats counts CA clients and connections but never
+//! refusals) and `PVA_CONN_CNT` (devIocStats predates PVA).
+//!
 //! # A pusher, not a read hook
 //!
 //! The obvious shape — a [`ReadHook`](crate::server::pv::ReadHook) computing
@@ -36,37 +60,42 @@
 //! A caller cannot pass a good value here that this file does not already know,
 //! and can pass a fatal one.
 //!
+//! It is also the rate the heap walk is safe at. devIocStats' RTEMS memory OSD
+//! carries its author's warning that "gathering heap statistics could be
+//! expensive; I wouldn't want to run this too often w/o knowing how it is
+//! implemented" (`osdMemUsage.c:23-27`). That is an argument about polling
+//! rate, and one second is the answer to it.
+//!
 //! # No record layer
 //!
 //! [`PvDatabase::add_pv`] registers a `PvEntry::Simple` — no `.db` file, no
 //! record type, no device support, no scan task. A status PV is a number and a
 //! name; anything more would be machinery to maintain for no reader.
 //!
-//! # What is deliberately absent: free heap
+//! Two consequences of having no record graph, both improvements:
 //!
-//! Free heap is the one value that shows the ceiling *approaching* rather than
-//! after the fact, and it is still not here. C computes it with
-//! `malloc_get_statistics` (`os/RTEMS-score/osdPoolStatus.c`), for which there
-//! is no binding anywhere in `epics-rtems-boot` — it is the only status value
-//! that would need new FFI. Measured on the bring-up box at the real ceiling:
-//! 142 concurrent CA connections, connection 143 refused by the libbsd socket
-//! zone with `ENFILE`, and free heap at that moment had room for roughly 9.7
-//! more. Descriptors and memory bite within ten connections of each other, so a
-//! connection count is very nearly as predictive of the ceiling as free heap is
-//! — which buys the warning without the shim. Add `MEM:FREE` when something
-//! else needs `malloc_get_statistics`, not for this.
+//! * `FD_FREE` is upstream a `calc` record whose `CALC` is `B>0?B-A:C` with
+//!   `C = 1000` — a sentinel standing in for "no descriptor support", because a
+//!   `calc` has no way to say "unknown". Here it is
+//!   [`FdUsage::free`](epics_rtems_boot::stats::FdUsage::free) when there is a
+//!   reading and `NaN` when there is not, so "unknown" and "1000 free" are
+//!   different answers.
+//! * `MEM_MAX` is upstream a separate device-support value that is nonetheless
+//!   computed as free + used (`osdMemUsage.c:73`); here it is
+//!   [`MemUsage::total`](epics_rtems_boot::stats::MemUsage::total), arithmetic
+//!   on the two numbers the kernel actually reported.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::CaResult;
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
 use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread};
 use crate::server::database::PvDatabase;
 use crate::server::pv::ProcessVariable;
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString};
 
 /// How often every status PV is republished. See the module docs — one second
 /// is a floor set by the target's libc, not a tuning choice.
@@ -74,19 +103,25 @@ pub const PUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One status value: the PV name, and how to read it.
 ///
-/// The reader is a closure so this module needs to know nothing about what it
-/// is reporting — the CA server's connection count, an uptime clock and a PVA
-/// server's are all the same shape from here, and none of them makes
-/// `epics-base-rs` depend on the crate it came from.
+/// The reader is a closure returning an [`EpicsValue`], so this module needs to
+/// know nothing about what it is reporting — a CA server's connection count, a
+/// heap reading and an uptime *string* are all the same shape from here, and
+/// none of them makes `epics-base-rs` depend on the crate it came from.
+///
+/// Returning the value rather than an `f64` is what lets `UPTIME` keep
+/// upstream's `stringin` type. The PV's native type is taken from the first
+/// sample at registration (see [`serve_status_pvs`]), so a reader that returns
+/// a string produces a string PV by construction — there is no way to register
+/// a double PV whose pusher then publishes strings.
 pub struct StatusPv {
     name: String,
-    read: Box<dyn Fn() -> f64 + Send>,
+    read: Box<dyn Fn() -> EpicsValue + Send>,
 }
 
 impl StatusPv {
     /// `name` is the PV name as a client will `caget` it — fully qualified,
     /// including whatever prefix the IOC uses.
-    pub fn new(name: impl Into<String>, read: impl Fn() -> f64 + Send + 'static) -> Self {
+    pub fn new(name: impl Into<String>, read: impl Fn() -> EpicsValue + Send + 'static) -> Self {
         Self {
             name: name.into(),
             read: Box::new(read),
@@ -99,8 +134,92 @@ impl StatusPv {
     }
 }
 
-/// A running status-PV pusher. Dropping it retires the thread.
+/// A reading, or `NaN` when there is none.
 ///
+/// `NaN` rather than a sentinel: zero free descriptors and zero free heap are
+/// both real readings on this target, and they are the ones an operator most
+/// needs to believe. See the module docs on `FD_FREE`.
+fn reading(value: Option<f64>) -> EpicsValue {
+    EpicsValue::Double(value.unwrap_or(f64::NAN))
+}
+
+/// Elapsed time in devIocStats' `UPTIME` format: `[N day(s), ]HH:MM:SS`.
+///
+/// Reproduces `devIocStats/devIocStatsString.c:397-421` including its two
+/// singular/plural forms and the omission of the day part in the first 24
+/// hours. Sites parse this string, so the format is a compatibility surface
+/// rather than a presentation choice.
+pub fn format_uptime(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    let secs = total % 60;
+    let mins = (total / 60) % 60;
+    let hours = (total / 3600) % 24;
+    match total / 86_400 {
+        0 => format!("{hours:02}:{mins:02}:{secs:02}"),
+        1 => format!("1 day, {hours:02}:{mins:02}:{secs:02}"),
+        days => format!("{days} days, {hours:02}:{mins:02}:{secs:02}"),
+    }
+}
+
+/// The status values every RTEMS IOC publishes, whatever protocol it serves.
+///
+/// Descriptors, heap and uptime are properties of the *image*, not of the CA or
+/// PVA front-end, so both IOC binaries publish exactly this set and add only
+/// their own protocol counters. Written once here rather than twice in the two
+/// entry points: two copies of a naming rule is how they come to disagree, and
+/// a client cannot tell a renamed PV from a dead one.
+///
+/// `prefix` plays `$(IOCNAME)`'s role in the upstream templates; the separator
+/// is the colon upstream uses.
+///
+/// `started` is the instant the IOC came up, for `UPTIME`.
+///
+/// On a build with no RTEMS boot shim the descriptor and heap PVs are still
+/// registered and publish `NaN` — the honest answer, and the one that keeps the
+/// name set identical between a host smoke test and the target.
+pub fn target_status_pvs(prefix: &str, started: Instant) -> Vec<StatusPv> {
+    use epics_rtems_boot::stats::{fd_usage, mem_usage};
+
+    vec![
+        // The ceiling the box hits first. Measured: 142 concurrent CA
+        // connections served, the 143rd refused by the libbsd socket zone,
+        // which is sized from the descriptor cap this pair reports against.
+        StatusPv::new(format!("{prefix}:FD_CNT"), || {
+            reading(fd_usage().map(|fd| fd.used as f64))
+        }),
+        StatusPv::new(format!("{prefix}:FD_MAX"), || {
+            reading(fd_usage().map(|fd| fd.max as f64))
+        }),
+        StatusPv::new(format!("{prefix}:FD_FREE"), || {
+            reading(fd_usage().map(|fd| fd.free() as f64))
+        }),
+        StatusPv::new(format!("{prefix}:MEM_FREE"), || {
+            reading(mem_usage().map(|m| m.free as f64))
+        }),
+        StatusPv::new(format!("{prefix}:MEM_USED"), || {
+            reading(mem_usage().map(|m| m.used as f64))
+        }),
+        StatusPv::new(format!("{prefix}:MEM_MAX"), || {
+            reading(mem_usage().map(|m| m.total() as f64))
+        }),
+        // The fragmentation signal, and the reason it is worth a PV of its
+        // own: an allocation fails on the largest free block, not on the free
+        // total, so this is the number that falls before a connection stops
+        // being able to start its thread.
+        StatusPv::new(format!("{prefix}:MEM_BLK"), || {
+            reading(mem_usage().map(|m| m.largest_free as f64))
+        }),
+        // The one value none of the others gives: a reset. Without it a client
+        // cannot tell a board reboot from a network blip, because both look
+        // like a reconnect.
+        StatusPv::new(format!("{prefix}:UPTIME"), move || {
+            EpicsValue::String(PvString::from_bytes(
+                format_uptime(started.elapsed()).into_bytes(),
+            ))
+        }),
+    ]
+}
+
 /// A running status-PV pusher.
 ///
 /// # Dropping it does not stop it, deliberately
@@ -108,7 +227,7 @@ impl StatusPv {
 /// There is no `Drop`, and that is the point. The one caller that matters is an
 /// entry point whose process never exits, and tying the facility's life to a
 /// binding's scope there would mean a status PV freezes at its last value
-/// because someone wrote `let _ =` — leaving three PVs that answer `caget`
+/// because someone wrote `let _ =` — leaving a set of PVs that answer `caget`
 /// with a stale number. A frozen status PV is worse than an absent one: it
 /// reads exactly like a healthy IOC that happens to have no clients. So the
 /// pusher retires only when [`stop`](Self::stop) says so, and the handle is
@@ -136,9 +255,13 @@ impl StatusPvs {
 }
 
 /// One value paired with the PV it publishes to.
-type Published = (Box<dyn Fn() -> f64 + Send>, Arc<ProcessVariable>);
+type Published = (Box<dyn Fn() -> EpicsValue + Send>, Arc<ProcessVariable>);
 
 /// Register every PV in `pvs` on `db` and start publishing them.
+///
+/// Each PV is registered with its **first sample**, not with a placeholder, so
+/// the PV's native type is the type its reader produces — that is what makes
+/// `UPTIME` a string PV without this function knowing which value is which.
 ///
 /// Registration happens **on the calling thread**, before the pusher exists, so
 /// a name clash with an already-loaded record comes back as an error the caller
@@ -150,7 +273,8 @@ pub fn serve_status_pvs(db: Arc<PvDatabase>, pvs: Vec<StatusPv>) -> CaResult<Sta
     let mut published: Vec<Published> = Vec::with_capacity(pvs.len());
     let mut names = Vec::with_capacity(pvs.len());
     for pv in pvs {
-        let handle = block_on_sync(register(&db, &pv.name))
+        let initial = (pv.read)();
+        let handle = block_on_sync(register(&db, &pv.name, initial))
             .map_err(|e| crate::error::CaError::Protocol(format!("status PVs: {e}")))??;
         names.push(pv.name);
         published.push((pv.read, handle));
@@ -173,8 +297,12 @@ pub fn serve_status_pvs(db: Arc<PvDatabase>, pvs: Vec<StatusPv>) -> CaResult<Sta
 }
 
 /// Add one PV and hand back the live handle to push to.
-async fn register(db: &PvDatabase, name: &str) -> CaResult<Arc<ProcessVariable>> {
-    db.add_pv(name, EpicsValue::Double(0.0)).await?;
+async fn register(
+    db: &PvDatabase,
+    name: &str,
+    initial: EpicsValue,
+) -> CaResult<Arc<ProcessVariable>> {
+    db.add_pv(name, initial).await?;
     db.find_pv(name).await.ok_or_else(|| {
         crate::error::CaError::ChannelNotFound(format!(
             "status PV {name} vanished between add_pv and find_pv"
@@ -207,11 +335,11 @@ fn push_loop(published: &[Published], shutdown: &AtomicBool) {
 /// Every value is *read* before any is published, so one tick reports one
 /// instant rather than a spread over however long the publishes take.
 fn push_once(published: &[Published]) -> bool {
-    let samples: Vec<(f64, &Arc<ProcessVariable>)> =
+    let samples: Vec<(EpicsValue, &Arc<ProcessVariable>)> =
         published.iter().map(|(read, pv)| (read(), pv)).collect();
     block_on_sync(async {
         for (value, pv) in samples {
-            pv.set(EpicsValue::Double(value)).await;
+            pv.set(value).await;
         }
     })
     .is_ok()
@@ -228,6 +356,10 @@ mod tests {
         Arc::new(PvDatabase::new())
     }
 
+    fn double(v: f64) -> impl Fn() -> EpicsValue + Send + 'static {
+        move || EpicsValue::Double(v)
+    }
+
     /// The property the whole design turns on: a pushed value reaches a
     /// *monitor*, not only a GET. A read hook would satisfy the GET half and
     /// fail this one.
@@ -239,7 +371,7 @@ mod tests {
         let pvs = serve_status_pvs(
             db.clone(),
             vec![StatusPv::new("T:COUNT", move || {
-                reader.load(Ordering::Relaxed) as f64
+                EpicsValue::Double(reader.load(Ordering::Relaxed) as f64)
             })],
         )
         .expect("registration");
@@ -255,7 +387,7 @@ mod tests {
 
         source.store(42, Ordering::Relaxed);
         assert!(push_once(&[(
-            Box::new(move || source.load(Ordering::Relaxed) as f64),
+            Box::new(move || EpicsValue::Double(source.load(Ordering::Relaxed) as f64)),
             pv.clone(),
         )]));
 
@@ -267,7 +399,7 @@ mod tests {
         assert_eq!(
             format!("{}", pv.get()),
             "42",
-            "and the stored value must be the pushed sample, not the initial 0"
+            "and the stored value must be the pushed sample, not the registered one"
         );
     }
 
@@ -275,16 +407,49 @@ mod tests {
     #[test]
     fn a_name_clash_is_reported_to_the_caller() {
         let db = database();
-        let first = serve_status_pvs(db.clone(), vec![StatusPv::new("T:DUP", || 1.0)])
+        let first = serve_status_pvs(db.clone(), vec![StatusPv::new("T:DUP", double(1.0))])
             .expect("the first registration succeeds");
         first.stop();
 
-        let second = serve_status_pvs(db, vec![StatusPv::new("T:DUP", || 2.0)]);
+        let second = serve_status_pvs(db, vec![StatusPv::new("T:DUP", double(2.0))]);
         assert!(
             second.is_err(),
             "a status PV that collides with an existing name must fail the call, \
              not fail silently on the pusher thread"
         );
+    }
+
+    /// A PV takes its type from its reader's first sample, which is what lets
+    /// `UPTIME` be a string PV — upstream's `stringin` — while its neighbours
+    /// stay doubles, without this module knowing which is which.
+    #[test]
+    fn a_pv_takes_its_type_from_its_readers_first_sample() {
+        let db = database();
+        let handle = serve_status_pvs(
+            db.clone(),
+            vec![
+                StatusPv::new("T:NUM", double(5.0)),
+                StatusPv::new("T:STR", || {
+                    EpicsValue::String(PvString::from_bytes(b"00:00:07".to_vec()))
+                }),
+            ],
+        )
+        .expect("registration");
+        handle.stop();
+
+        let num = block_on_sync(db.find_pv("T:NUM"))
+            .expect("plain thread")
+            .expect("registered");
+        let text = block_on_sync(db.find_pv("T:STR"))
+            .expect("plain thread")
+            .expect("registered");
+        assert!(matches!(num.get(), EpicsValue::Double(_)));
+        assert!(
+            matches!(text.get(), EpicsValue::String(_)),
+            "a string reader must produce a string PV; a double PV here would \
+             make UPTIME a number and break every site's stringin client"
+        );
+        assert_eq!(format!("{}", text.get()), "00:00:07");
     }
 
     /// Every value in one tick is read before any of them is published, so
@@ -293,16 +458,16 @@ mod tests {
     ///
     /// Encoded by having the second value's reader look at what the *first*
     /// PV currently holds: read-all-then-publish-all means it still holds its
-    /// registered 0 at that moment, and an interleaved loop means it already
-    /// holds this tick's sample.
+    /// registered sample at that moment, and an interleaved loop means it
+    /// already holds this tick's.
     #[test]
     fn every_value_is_read_before_any_is_published() {
         let db = database();
         let handle = serve_status_pvs(
             db.clone(),
             vec![
-                StatusPv::new("T:FIRST", || 1.0),
-                StatusPv::new("T:SECOND", || 2.0),
+                StatusPv::new("T:FIRST", double(1.0)),
+                StatusPv::new("T:SECOND", double(2.0)),
             ],
         )
         .expect("registration");
@@ -322,25 +487,25 @@ mod tests {
             let first = first.clone();
             move || {
                 *seen.lock().expect("observation") = format!("{}", first.get());
-                2.0
+                EpicsValue::Double(2.0)
             }
         };
         let published: Vec<Published> = vec![
-            (Box::new(|| 1.0), first.clone()),
+            (Box::new(double(9.0)), first.clone()),
             (Box::new(observer), second),
         ];
         assert!(push_once(&published));
 
         assert_eq!(
             *seen.lock().expect("observation"),
-            "0",
+            "1",
             "the second value was read AFTER the first was published — the tick \
              spans two instants instead of one"
         );
         assert_eq!(
             format!("{}", first.get()),
-            "1",
-            "precondition: the first value really was published by this tick"
+            "9",
+            "precondition: this tick's sample really was published by it"
         );
     }
 
@@ -358,18 +523,18 @@ mod tests {
         let handle = serve_status_pvs(
             db,
             vec![StatusPv::new("T:TICKS", move || {
-                counter.fetch_add(1, Ordering::Relaxed) as f64
+                EpicsValue::Double(counter.fetch_add(1, Ordering::Relaxed) as f64)
             })],
         )
         .expect("registration");
         drop(handle);
 
         let deadline = std::time::Instant::now() + PUSH_INTERVAL * 4;
-        while ticks.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+        while ticks.load(Ordering::Relaxed) < 3 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            ticks.load(Ordering::Relaxed) >= 2,
+            ticks.load(Ordering::Relaxed) >= 3,
             "the pusher stopped when its handle was dropped; the status PVs are \
              now frozen at whatever they last held"
         );
@@ -398,7 +563,7 @@ mod tests {
             .expect("add");
         let pv = db.find_pv("T:NOPE").await.expect("registered");
         assert!(
-            !push_once(&[(Box::new(|| 1.0), pv)]),
+            !push_once(&[(Box::new(double(1.0)), pv)]),
             "on a current-thread runtime the publish cannot be driven"
         );
 
@@ -410,5 +575,93 @@ mod tests {
             !shutdown.load(Ordering::Acquire),
             "the loop retired on its own, without the flag"
         );
+    }
+
+    /// The uptime string is a compatibility surface: sites parse it. Every
+    /// boundary devIocStats' own formatter has is pinned here — the day part
+    /// appearing at all, its singular form, and the two-digit padding.
+    #[test]
+    fn the_uptime_string_matches_dev_ioc_stats_exactly() {
+        assert_eq!(format_uptime(Duration::from_secs(0)), "00:00:00");
+        assert_eq!(format_uptime(Duration::from_secs(7)), "00:00:07");
+        assert_eq!(format_uptime(Duration::from_secs(3_661)), "01:01:01");
+        assert_eq!(
+            format_uptime(Duration::from_secs(86_399)),
+            "23:59:59",
+            "the last second before the day part appears"
+        );
+        assert_eq!(
+            format_uptime(Duration::from_secs(86_400)),
+            "1 day, 00:00:00",
+            "singular, with a comma and a space — devIocStatsString.c:413-414"
+        );
+        assert_eq!(
+            format_uptime(Duration::from_secs(172_800)),
+            "2 days, 00:00:00"
+        );
+        assert_eq!(
+            format_uptime(Duration::from_secs(90_061)),
+            "1 day, 01:01:01"
+        );
+    }
+
+    /// The names are devIocStats', spelled exactly, under one colon. A rename
+    /// here silently breaks every OPI screen and archiver configuration keyed
+    /// to the upstream surface, and nothing in the IOC would report it.
+    #[test]
+    fn the_common_set_uses_the_upstream_names() {
+        let names: Vec<String> = target_status_pvs("IOC", Instant::now())
+            .iter()
+            .map(|pv| pv.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "IOC:FD_CNT",
+                "IOC:FD_MAX",
+                "IOC:FD_FREE",
+                "IOC:MEM_FREE",
+                "IOC:MEM_USED",
+                "IOC:MEM_MAX",
+                "IOC:MEM_BLK",
+                "IOC:UPTIME",
+            ]
+        );
+    }
+
+    /// On a host build there is no boot shim, so the descriptor and heap
+    /// readings do not exist. They must publish `NaN` rather than `0`: a
+    /// `FD_FREE` of zero is what an IOC out of descriptors reports, and it is
+    /// the alarm an operator acts on.
+    #[test]
+    fn an_absent_reading_publishes_nan_rather_than_zero() {
+        let pvs = target_status_pvs("IOC", Instant::now());
+        for pv in &pvs {
+            if pv.name().ends_with(":UPTIME") {
+                continue;
+            }
+            match (pv.read)() {
+                EpicsValue::Double(v) => assert!(
+                    v.is_nan(),
+                    "{} published {v} with no reading behind it; zero free \
+                     descriptors and zero free heap are real readings on the \
+                     target and must not be confused with an absent one",
+                    pv.name()
+                ),
+                other => panic!("{} is not a double: {other:?}", pv.name()),
+            }
+        }
+    }
+
+    /// Uptime is a string on every build, shim or no shim — it is measured in
+    /// Rust and has no reading to be missing.
+    #[test]
+    fn uptime_is_a_string_on_every_build() {
+        let pvs = target_status_pvs("IOC", Instant::now());
+        let uptime = pvs
+            .iter()
+            .find(|pv| pv.name() == "IOC:UPTIME")
+            .expect("UPTIME is in the common set");
+        assert!(matches!((uptime.read)(), EpicsValue::String(_)));
     }
 }

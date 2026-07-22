@@ -119,6 +119,51 @@
 
 use std::process::ExitCode;
 
+/// The built-in database, kept **outside** `mod ioc` deliberately.
+///
+/// It is data, not RTEMS code, and it is the one part of this binary a host
+/// can check for real: `mod ioc` does not compile on a host until stage 4, so
+/// a typo inside the `info(Q:group, …)` bodies below would otherwise reach a
+/// reader as a silent "no such PV" on a serial console with no shell to ask.
+/// The `test` arm of the predicate is what lets the guard at the bottom of
+/// this file parse it and build the group for real; the `rtems` arm is the
+/// production use. On a host non-test build it is compiled away, so it is
+/// never dead code.
+#[cfg(any(target_os = "rtems", test))]
+mod demo_db {
+    /// The database loaded when no `.db` file is given on the command line —
+    /// small enough to run on a bare target, wide enough to exercise the
+    /// scalar GET, PUT and MONITOR paths over pvAccess, and the QSRV2 group
+    /// GET/PUT paths on top of the same three records.
+    ///
+    /// The group is declared with `info(Q:group, …)` rather than a `.json`
+    /// file because a `-kernel` boot has no populated filesystem: there is no
+    /// path a `dbLoadGroup` argument could name, so the record-info route
+    /// (pvxs `loadConfigFromDb`, step 1 of `load_qsrv_groups`) is the only
+    /// group source a bare target has. Each record contributes its own
+    /// fragment naming the same group — the pvxs merge pattern, one field per
+    /// group field name — and every `+channel` is record-relative, because
+    /// info-group channels are prefixed with `"{record}."` unconditionally
+    /// (`parse_info_group`, groupconfigprocessor.cpp:810-818).
+    ///
+    /// `+putorder` on all three members is what makes the group putable; its
+    /// value is the order an atomic PUT drives the backing records in.
+    pub const DEMO_DB: &str = concat!(
+        "record(ao, \"RTEMS:PVA:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\")\n",
+        "  info(Q:group, {\"RTEMS:PVA:GRP\":{\"+id\":\"rtems:demo/Group:1.0\",\"+atomic\":true,",
+        "\"setpoint\":{\"+channel\":\"VAL\",\"+type\":\"scalar\",\"+putorder\":0}}})\n",
+        "}\n",
+        "record(longout, \"RTEMS:PVA:LO\") { field(VAL, \"7\") field(EGU, \"counts\")\n",
+        "  info(Q:group, {\"RTEMS:PVA:GRP\":",
+        "{\"count\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":1}}})\n",
+        "}\n",
+        "record(stringout, \"RTEMS:PVA:MSG\") { field(VAL, \"rtems-pva-ioc\")\n",
+        "  info(Q:group, {\"RTEMS:PVA:GRP\":",
+        "{\"message\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":2}}})\n",
+        "}\n",
+    );
+}
+
 #[cfg(target_os = "rtems")]
 mod ioc {
     use std::collections::HashMap;
@@ -141,14 +186,7 @@ mod ioc {
     use epics_pva_rs::server_native::composite::CompositeSource;
     use epics_pva_rs::server_native::config::PvaServerConfig;
 
-    /// The built-in database loaded when no `.db` file is given on the command
-    /// line — small enough to run on a bare target, wide enough to exercise
-    /// the scalar GET, PUT and MONITOR paths over pvAccess.
-    const DEMO_DB: &str = concat!(
-        "record(ao, \"RTEMS:PVA:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
-        "record(longout, \"RTEMS:PVA:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
-        "record(stringout, \"RTEMS:PVA:MSG\") { field(VAL, \"rtems-pva-ioc\") }\n",
-    );
+    use crate::demo_db::DEMO_DB;
 
     /// The namespace the status PVs are published under.
     ///
@@ -833,5 +871,73 @@ mod tests {
             "the PVA server config must come from `PvaServerConfig::default().with_env()`; \
              a hand-built config ships GUID 0"
         );
+    }
+
+    /// The built-in database really does define the group it advertises.
+    ///
+    /// Every other guard here reads source text; this one runs the same two
+    /// parsers the target runs — `parse_db`, then `parse_info_group` on each
+    /// record's `Q:group` tag, merged the way `load_qsrv_groups` merges them.
+    /// A misplaced brace or a `+channel` that names a field the record does
+    /// not have costs a full cross-build, image copy and qemu boot to notice,
+    /// and the symptom on the console is nothing at all: a group that was
+    /// never defined is simply a name no client can find.
+    #[test]
+    fn the_demo_database_defines_a_putable_group() {
+        use epics_bridge_rs::qsrv::group_config::{merge_group_defs, parse_info_group};
+        use std::collections::HashMap;
+
+        let recs =
+            epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
+                .expect("the built-in database must parse");
+        assert_eq!(recs.len(), 3, "the demo database is three records");
+
+        let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
+        for rec in &recs {
+            let json = rec
+                .info_tags
+                .iter()
+                .find(|(k, _)| k == "Q:group")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("record {} carries no Q:group tag", rec.name));
+            let defs = parse_info_group(&rec.name, &json)
+                .unwrap_or_else(|e| panic!("record {}: {e}", rec.name));
+            merge_group_defs(&mut groups, defs);
+        }
+
+        assert_eq!(groups.len(), 1, "all three fragments name one group");
+        let grp = groups.get("RTEMS:PVA:GRP").expect("the demo group");
+        assert_eq!(grp.struct_id.as_deref(), Some("rtems:demo/Group:1.0"));
+        assert!(grp.atomic, "the group is declared +atomic");
+        assert!(grp.atomic_is_set, "and declares it explicitly");
+
+        // Members in `put_order`, which is the order an atomic PUT drives the
+        // backing records in, with the record-relative channels resolved.
+        let members: Vec<(&str, &str, Option<i64>)> = grp
+            .members
+            .iter()
+            .map(|m| (m.field_name.as_str(), m.channel.as_str(), m.put_order))
+            .collect();
+        assert_eq!(
+            members,
+            vec![
+                ("setpoint", "RTEMS:PVA:AO.VAL", Some(0)),
+                ("count", "RTEMS:PVA:LO.VAL", Some(1)),
+                ("message", "RTEMS:PVA:MSG.VAL", Some(2)),
+            ],
+            "every member must be putable and point at a record the demo database defines"
+        );
+
+        // Each channel must name a record/field the same database declares —
+        // an unresolvable channel is accepted by the parser and only fails at
+        // group creation, on the target.
+        for m in &grp.members {
+            let (rec_name, _field) = m.channel.split_once('.').expect("record.FIELD");
+            assert!(
+                recs.iter().any(|r| r.name == rec_name),
+                "group member {} names record {rec_name}, which the demo database does not define",
+                m.field_name
+            );
+        }
     }
 }

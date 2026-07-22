@@ -230,7 +230,7 @@ impl SaveSet {
                 if self.config.backup.enable_savb {
                     let savb_path = self.config.save_path.with_extension("savB");
                     if !savb_path.exists() {
-                        let _ = tokio::fs::copy(&self.config.save_path, &savb_path).await;
+                        let _ = crate::runtime::fs::copy(&self.config.save_path, &savb_path).await;
                     }
                 }
 

@@ -64,20 +64,18 @@ pub async fn load_request_file_with_search_paths(
         })?
     };
 
-    let canonical =
-        tokio::fs::canonicalize(&resolved)
-            .await
-            .map_err(|e| AutosaveError::RequestFile {
-                path: resolved.display().to_string(),
-                message: format!("cannot resolve path: {e}"),
-            })?;
-    let content =
-        tokio::fs::read_to_string(&canonical)
-            .await
-            .map_err(|e| AutosaveError::RequestFile {
-                path: resolved.display().to_string(),
-                message: e.to_string(),
-            })?;
+    let canonical = crate::runtime::fs::canonicalize(&resolved)
+        .await
+        .map_err(|e| AutosaveError::RequestFile {
+            path: resolved.display().to_string(),
+            message: format!("cannot resolve path: {e}"),
+        })?;
+    let content = crate::runtime::fs::read_to_string(&canonical)
+        .await
+        .map_err(|e| AutosaveError::RequestFile {
+            path: resolved.display().to_string(),
+            message: e.to_string(),
+        })?;
     let base_dir = canonical.parent().unwrap_or(Path::new("."));
     let mut include_stack = vec![canonical.clone()];
     parse_request_inner(

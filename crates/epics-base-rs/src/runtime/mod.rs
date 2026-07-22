@@ -4,6 +4,7 @@ pub mod build_info;
 pub mod env;
 pub mod env_table;
 pub mod epics_string;
+pub mod fs;
 pub mod general_time;
 pub mod json_string;
 pub mod log;

@@ -71,7 +71,7 @@ pub async fn rotate_backups(
     // .sav → .savB
     if config.enable_savb {
         let savb_path = sav_path.with_extension("savB");
-        let _ = tokio::fs::copy(sav_path, &savb_path).await;
+        let _ = crate::runtime::fs::copy(sav_path, &savb_path).await;
     }
 
     // Sequence rotation
@@ -83,7 +83,7 @@ pub async fn rotate_backups(
         if should_rotate {
             let ext = format!("sav{}", state.seq_index);
             let seq_path = sav_path.with_extension(&ext);
-            let _ = tokio::fs::copy(sav_path, &seq_path).await;
+            let _ = crate::runtime::fs::copy(sav_path, &seq_path).await;
             state.seq_index = (state.seq_index + 1) % config.num_seq_files;
             state.last_seq_time = Some(std::time::Instant::now());
         }
@@ -99,7 +99,7 @@ pub async fn rotate_backups(
             let timestamp = Local::now().format("%y%m%d-%H%M%S");
             let ext = format!("sav_{timestamp}");
             let dated_path = sav_path.with_extension(&ext);
-            let _ = tokio::fs::copy(sav_path, &dated_path).await;
+            let _ = crate::runtime::fs::copy(sav_path, &dated_path).await;
             state.last_dated_time = Some(std::time::Instant::now());
         }
     }

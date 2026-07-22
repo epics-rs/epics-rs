@@ -156,7 +156,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.sav");
         // A file with content but NO `<END>` marker — truncated save.
-        tokio::fs::write(&path, "# autosave-rs V1.0\nPV1 1.0\nPV2 2.0\n")
+        crate::runtime::fs::write(&path, "# autosave-rs V1.0\nPV1 1.0\nPV2 2.0\n")
             .await
             .unwrap();
 
@@ -178,7 +178,7 @@ mod tests {
     async fn verify_on_valid_save_file_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ok.sav");
-        tokio::fs::write(&path, "# autosave-rs V1.0\nPV1 1.0\n<END>\n")
+        crate::runtime::fs::write(&path, "# autosave-rs V1.0\nPV1 1.0\n<END>\n")
             .await
             .unwrap();
 

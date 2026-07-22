@@ -238,8 +238,40 @@ mod pi_mutex {
         })
     }
 
+    /// The `pthread_mutex_t` lives behind a `Box`, and that is a correctness
+    /// requirement on RTEMS rather than a layout preference.
+    ///
+    /// RTEMS 6 binds a POSIX mutex to **its own address**: `pthread_mutex_init`
+    /// stores `flags = ((uintptr_t) mutex ^ POSIX_MUTEX_MAGIC) | protocol`, and
+    /// every later operation recomputes that from the address it is handed —
+    /// `POSIX_MUTEX_VALIDATE_OBJECT` (`rtems/posix/muteximpl.h:445-459`,
+    /// magic at `:64`) returns **`EINVAL`** when they disagree. So a
+    /// `pthread_mutex_t` that is *relocated* after being initialised is dead:
+    /// not slow, not unordered — every `lock` fails.
+    ///
+    /// Held inline, that is exactly what happened. `new` initialised the mutex
+    /// in a stack local and then moved the struct out by value (and callers
+    /// move it again — `record_lock`'s gates are `Box::leak(Box::new(…))`), so
+    /// on target the first `lock()` returned 22 and the assertion below took
+    /// the IOC down at boot. Measured, `doc/rtems-priority-locks-design.md`
+    /// §5 step 7; invisible on Linux because glibc's mutex carries no address
+    /// in its state and survives the move.
+    ///
+    /// Boxing makes the invariant hold **by construction**: the mutex is
+    /// allocated first and initialised at the address it will keep for its
+    /// whole life, and moving a `PiMutex` moves a pointer. There is no move to
+    /// forbid, so there is no runtime check, no `Pin` in the public API and
+    /// nothing for a future call site to get wrong. It is also what `std` does
+    /// for the same reason on every platform whose `pthread_mutex_t` cannot be
+    /// relocated.
+    ///
+    /// **Not** fixed by zeroing and letting RTEMS auto-initialise: the
+    /// auto-initialisation arm of that macro exists for
+    /// `PTHREAD_MUTEX_INITIALIZER`, and it produces a *default* mutex — no
+    /// protocol, i.e. no priority inheritance. That path would report success
+    /// while silently giving up the property this type exists for.
     pub struct PiMutex<T> {
-        inner: UnsafeCell<libc::pthread_mutex_t>,
+        inner: Box<UnsafeCell<libc::pthread_mutex_t>>,
         data: UnsafeCell<T>,
     }
 
@@ -248,7 +280,10 @@ mod pi_mutex {
 
     impl<T> PiMutex<T> {
         pub fn new(value: T) -> Self {
-            let mutex = UnsafeCell::new(unsafe { std::mem::zeroed() });
+            // Allocated before it is initialised, so `pthread_mutex_init` sees
+            // the address the mutex keeps for life — see the type's doc.
+            let mutex: Box<UnsafeCell<libc::pthread_mutex_t>> =
+                Box::new(UnsafeCell::new(unsafe { std::mem::zeroed() }));
             unsafe {
                 let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
                 let r = libc::pthread_mutexattr_init(&mut attr);
@@ -270,6 +305,13 @@ mod pi_mutex {
                 inner: mutex,
                 data: UnsafeCell::new(value),
             }
+        }
+
+        /// The address `pthread_mutex_init` was called with — the one RTEMS
+        /// validates every later operation against.
+        #[cfg(test)]
+        pub fn raw_addr(&self) -> usize {
+            self.inner.get() as usize
         }
 
         pub fn lock(&self) -> PiMutexGuard<'_, T> {
@@ -373,6 +415,31 @@ mod tests {
             !is_pi_mutex_active(),
             "the parking_lot fallback arm has no priority inheritance"
         );
+    }
+
+    /// The `pthread_mutex_t` must not travel with the `PiMutex` that owns it.
+    ///
+    /// RTEMS binds a POSIX mutex to its own address and returns `EINVAL` from
+    /// every operation on a relocated one (`PiMutex`'s doc). Measured on
+    /// target: with the mutex stored inline the IOC panicked on its first
+    /// `lock()` at boot. No host arm can reproduce *that* — glibc's mutex
+    /// survives the move and the default host build is `parking_lot` — so
+    /// what this pins is the property that makes it impossible: the address
+    /// handed to `pthread_mutex_init` is stable across a move of the owner.
+    /// Storing the mutex inline again fails here rather than on the next boot.
+    #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+    #[test]
+    fn the_pthread_object_does_not_move_with_the_mutex() {
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(7);
+        let before = m.raw_addr();
+        let moved = Box::new(m);
+        assert_eq!(
+            moved.raw_addr(),
+            before,
+            "the pthread_mutex_t moved with its owner; RTEMS answers EINVAL to \
+             every lock on a relocated mutex"
+        );
+        assert_eq!(*moved.lock(), 7);
     }
 
     /// Whichever arm is compiled must be a mutex. On host CI this is the

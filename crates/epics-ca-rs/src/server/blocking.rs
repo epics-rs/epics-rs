@@ -98,7 +98,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -146,6 +146,44 @@ pub struct BlockingCaServer {
     acf: SharedAcf,
     tcp_port: u16,
     shutdown: AtomicBool,
+    /// Clients currently being served — see [`active_connections`].
+    ///
+    /// [`active_connections`]: Self::active_connections
+    active: Arc<AtomicUsize>,
+}
+
+/// One served client's place in [`BlockingCaServer::active_connections`],
+/// returned however the client thread ends.
+///
+/// Taken *inside* the client thread rather than in the accept loop, and that
+/// placement is the whole design: a client that was refused because its thread
+/// could not be created was never served and must not be counted, and a client
+/// thread that panics must still give the slot back. Owning the decrement in a
+/// `Drop` is what covers the second — no cleanup on the normal exit path can.
+struct ClientSlot(Arc<AtomicUsize>);
+
+impl ClientSlot {
+    fn take(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self(active)
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How many clients this process has refused for want of resources, ever.
+///
+/// Monotonic and process-wide, not per-server: the resource that runs out — the
+/// target's thread and heap pool — is process-wide too, so a per-server count
+/// would divide a number whose whole meaning is that it is undivided. Published
+/// as a status PV by the RTEMS entry point, where a climbing value is the only
+/// way an operator learns that clients are being turned away.
+pub fn refused_clients() -> u64 {
+    REFUSED_CLIENTS.load(Ordering::Relaxed)
 }
 
 impl BlockingCaServer {
@@ -178,12 +216,26 @@ impl BlockingCaServer {
             acf,
             tcp_port,
             shutdown: AtomicBool::new(false),
+            active: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     /// The actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Clients currently being served.
+    ///
+    /// A count, not a limit. C rsrv has no connection limit at either of its
+    /// refusal sites (`caservertask.c:1234-1250` and `:110-118` both refuse on
+    /// a resource failure, never on a count), and neither do we — this exists
+    /// so the number can be *reported*. It is the number the bring-up box
+    /// measured the ceiling in: 142 concurrent, connection 143 refused by the
+    /// libbsd socket zone with `ENFILE`, with free heap good for about 9.7
+    /// more. Watching it climb is how an operator sees that coming.
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 
     /// Run the accept loop until [`shutdown`](Self::shutdown) is requested.
@@ -214,6 +266,7 @@ impl BlockingCaServer {
                     let db = self.db.clone();
                     let acf = self.acf.clone();
                     let tcp_port = self.tcp_port;
+                    let active = self.active.clone();
                     // The socket is handed to the thread *after* the thread
                     // exists, not captured by the closure. `Builder::spawn`
                     // consumes its closure, so a capture would drop the
@@ -237,6 +290,9 @@ impl BlockingCaServer {
                                 // spawn. Exiting is right either way.
                                 return;
                             };
+                            // Held for the whole client: its `Drop` returns the
+                            // slot however this thread ends, panic included.
+                            let _slot = ClientSlot::take(active);
                             // caservertask.c:109 — the TCP receiver is created
                             // as `epicsThreadCreate("CAS-client",
                             // epicsThreadPriorityCAServerLow, ...)`. Best
@@ -1698,6 +1754,87 @@ mod tests {
             }
         }
         reply.expect("reference produced a READ_NOTIFY reply")
+    }
+
+    /// The status-PV source: a served client is counted, and the count comes
+    /// back when it goes.
+    ///
+    /// This is the number the bring-up box measured the ceiling in (142
+    /// concurrent, 143 refused with `ENFILE`), so it is the one an operator
+    /// watches climb. It is a count and never a limit — nothing in this file
+    /// reads it to decide anything.
+    #[test]
+    fn a_served_client_is_counted_and_gives_the_slot_back() {
+        let db = seed_db(&[("BLK:CNT", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        assert_eq!(
+            server.active_connections(),
+            0,
+            "a bound-but-unconnected server serves nobody"
+        );
+
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // The greeting proves the client thread is running, so the slot has
+        // been taken — no sleep-and-hope.
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        assert_eq!(
+            server.active_connections(),
+            1,
+            "a client being served must be counted"
+        );
+
+        drop(c);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.active_connections() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            server.active_connections(),
+            0,
+            "the slot must come back when the client goes"
+        );
+
+        server.shutdown();
+        let _ = accept.join();
+    }
+
+    /// The placement that makes the count survivable: the slot is a guard, so
+    /// a client thread that unwinds still returns it. No cleanup on the normal
+    /// exit path covers this one.
+    #[test]
+    fn a_panicking_client_still_returns_its_slot() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = ClientSlot::take(active.clone());
+            assert_eq!(active.load(Ordering::Acquire), 1);
+            panic!("client thread blew up");
+        }));
+        assert!(panicked.is_err(), "precondition: the body must panic");
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "an unwinding client thread must not leak its slot — the count \
+             would drift up and never come down"
+        );
+    }
+
+    /// `REFUSED_CLIENTS` is what makes the refusal visible from off the box;
+    /// it was private, so nothing could publish it.
+    #[test]
+    fn the_refusal_count_is_readable_from_outside() {
+        let before = refused_clients();
+        assert_eq!(
+            before,
+            REFUSED_CLIENTS.load(Ordering::Relaxed),
+            "the accessor must read the counter the refusal owner increments, \
+             not a copy of it"
+        );
     }
 
     /// (i) End-to-end over a real TCP socket: handshake, CREATE_CHAN,

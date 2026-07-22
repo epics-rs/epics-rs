@@ -16,6 +16,7 @@ pub mod records;
 pub mod scan;
 pub(crate) mod scan_event;
 pub mod snapshot;
+pub mod status_pv;
 
 use crate::server::record::Record;
 

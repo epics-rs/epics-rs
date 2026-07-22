@@ -65,13 +65,15 @@ mod ioc {
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Instant;
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::net::cas_server_port;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_builder::IocBuilder;
-    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search};
+    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs};
+    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
 
     /// The built-in database loaded when no `.db` file is given on the command
     /// line — small enough to run on a bare target, wide enough to exercise
@@ -81,6 +83,16 @@ mod ioc {
         "record(longout, \"RTEMS:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
         "record(stringout, \"RTEMS:MSG\") { field(VAL, \"rtems-ca-ioc\") }\n",
     );
+
+    /// The namespace the status PVs are published under, matching [`DEMO_DB`]'s.
+    ///
+    /// A constant because this binary has no configuration surface — there is
+    /// no iocsh and no `.cmd` on the target. It follows that two of these IOCs
+    /// on one subnet publish the same three names and a client's SEARCH would
+    /// be answered by both; the fix when that day comes is to take the prefix
+    /// from the environment the way `cas_server_port` takes the port, and this
+    /// note is here so the next reader does not have to rediscover why.
+    const STATUS_PREFIX: &str = "RTEMS";
 
     /// Load the database: every command-line argument is a `.db` file path
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
@@ -137,15 +149,14 @@ mod ioc {
                 return ExitCode::FAILURE;
             }
         };
-        let mut names = block_on_sync(db.all_record_names())
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-        names.sort();
 
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:491-499). No ACF is
         //     configured, so access control is the permissive default.
         let port = cas_server_port();
         let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let db_for_status = db.clone();
+        let db_for_names = db.clone();
         let server = match BlockingCaServer::bind((Ipv4Addr::UNSPECIFIED, port), db, acf) {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -165,6 +176,59 @@ mod ioc {
                 return ExitCode::FAILURE;
             }
         };
+
+        // (3b) The status PVs. Nothing on this target has a shell, so these
+        //      numbers are the only way to ask the IOC how it is doing from
+        //      anywhere but the serial console — and the console is
+        //      write-only. See `status_pv`'s module docs for why this is a
+        //      pusher and not a read hook, and why free heap is absent.
+        //
+        //      `PVA:CONNS` is NOT here, and not because it is expensive:
+        //      `BlockingPvaServer::active_connections` is already public and
+        //      would be one more `StatusPv`. This binary starts no PVA server
+        //      (step (3) is the CA front-end and nothing else), so publishing
+        //      it would publish a constant zero — a number that reads like
+        //      "no PVA clients" when it means "no PVA server". It belongs to
+        //      whatever entry point owns a `BlockingPvaServer`, as one line.
+        //
+        //      Registered after `bind` so `CA:CONNS` reads the server that is
+        //      already listening, and before the accept thread starts so the
+        //      first client cannot find them missing.
+        let started = Instant::now();
+        let conns_server = server.clone();
+        if let Err(e) = serve_status_pvs(
+            db_for_status,
+            vec![
+                // The ceiling number. Measured on target: 142 concurrent, the
+                // 143rd refused by the libbsd socket zone with ENFILE.
+                StatusPv::new(format!("{STATUS_PREFIX}:CA:CONNS"), move || {
+                    conns_server.active_connections() as f64
+                }),
+                // Climbs only when a client was turned away. Process-wide and
+                // monotonic, so a client can tell "never happened" from
+                // "happened and stopped".
+                StatusPv::new(format!("{STATUS_PREFIX}:CA:REFUSED"), || {
+                    refused_clients() as f64
+                }),
+                // The one value none of the others gives: a reset. Without it
+                // a client cannot tell a board reboot from a network blip,
+                // because both look like a reconnect. Seconds, which is also
+                // this target's clock resolution.
+                StatusPv::new(format!("{STATUS_PREFIX}:UPTIME"), move || {
+                    started.elapsed().as_secs() as f64
+                }),
+            ],
+        ) {
+            eprintln!("rtems-ca-ioc: cannot register the status PVs: {e}");
+            return ExitCode::FAILURE;
+        }
+
+        // Listed after the status PVs are registered, so the console names
+        // everything a client can reach rather than only what the `.db`
+        // carried.
+        let mut names = block_on_sync(db_for_names.all_record_names())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        names.sort();
 
         let srv_tcp = server.clone();
         let tcp_thread = match thread::Builder::new()
@@ -272,5 +336,40 @@ mod tests {
                  tokio runtime and drives every future via park_on"
             );
         }
+    }
+
+    /// The target has no shell, so an IOC that publishes no status PVs can only
+    /// be asked how it is doing by reading a write-only serial console. Each of
+    /// these answers a question nothing else on the box answers: how close the
+    /// connection ceiling is, whether anyone has been turned away, and whether
+    /// the board rebooted.
+    #[test]
+    fn the_entry_point_publishes_its_status() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains(concat!("serve_status_", "pvs(")),
+            "the entry point registers no status PVs; on a target with no iocsh \
+             that leaves `caget` with nothing to ask"
+        );
+        for value in [":CA:CONNS", ":CA:REFUSED", ":UPTIME"] {
+            assert!(
+                prod.contains(value),
+                "status PV `{value}` is gone from the entry point"
+            );
+        }
+        // The handle is deliberately not held: `StatusPvs` has no `Drop`, so
+        // the pusher outlives it. If that ever changes, this entry point —
+        // which discards the handle — starts publishing three PVs frozen at 0,
+        // and `dropping_the_handle_does_not_stop_the_pusher` in `status_pv` is
+        // the test that fails first.
+        assert!(
+            !prod.contains(concat!("let _stat", "us = ")),
+            "this entry point does not hold the status-PV handle, and must not \
+             start pretending it needs to"
+        );
     }
 }

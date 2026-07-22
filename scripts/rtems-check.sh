@@ -45,9 +45,47 @@ COMMON=(+nightly check --no-default-features -Zbuild-std=std,panic_abort --targe
 # The crates that must compile for the target.
 CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot)
 
-# Binaries built for the target, as `crate:bin` pairs. The drift check below
-# fails if a `src/bin/*.rs` compiled for RTEMS is missing from this list.
-BINS=(epics-ca-rs:rtems-ca-ioc)
+# Binaries built for the target, as `crate:bin` pairs.
+BINS=(
+    epics-ca-rs:rtems-ca-ioc
+)
+
+# Binaries in the crates above that are deliberately NOT built for the target.
+#
+# This list exists so the check below can be a CENSUS rather than a search.
+# The previous version grepped `src/bin` for the literal `target_os = "rtems"`
+# and demanded a match be in BINS — which only ever sees a binary that says
+# "rtems" in its own source text. A binary gated in `Cargo.toml`
+# (`required-features`), gated by a feature predicate, or gated by nothing at
+# all was invisible to it and would land outside the gate exactly as
+# `rtems-ca-ioc` did. Requiring every binary to be classified one way or the
+# other removes the way to be absent: a new `src/bin/*.rs` fails this script
+# until someone states which side it is on.
+#
+# Every entry here is a host CLI tool. Measured, not assumed: they do not
+# compile for `armv7-rtems-eabihf` at all (E0432/E0433/E0308) and were never
+# meant to — see WHY NOT --all-targets above.
+HOST_ONLY=(
+    epics-ca-rs:ca-admin-rs
+    epics-ca-rs:ca-lint-rs
+    epics-ca-rs:ca-repeater-rs
+    epics-ca-rs:ca-replay-rs
+    epics-ca-rs:ca-soak
+    epics-ca-rs:ca-soak-observed
+    epics-ca-rs:caget-rs
+    epics-ca-rs:cainfo-rs
+    epics-ca-rs:camonitor-rs
+    epics-ca-rs:caput-rs
+    epics-ca-rs:softioc-rs
+    epics-pva-rs:mshim-rs
+    epics-pva-rs:pvcall-rs
+    epics-pva-rs:pvget-rs
+    epics-pva-rs:pvinfo-rs
+    epics-pva-rs:pvlist-rs
+    epics-pva-rs:pvmonitor-rs
+    epics-pva-rs:pvput-rs
+    epics-pva-rs:pvxvct-rs
+)
 
 QUIET=0
 [[ "${1:-}" == "--quiet" ]] && QUIET=1
@@ -59,19 +97,40 @@ if ! cargo +nightly --version >/dev/null 2>&1; then
     exit 1
 fi
 
-# Drift check: every binary whose source is compiled for RTEMS must be gated.
-missing=()
-while IFS= read -r src; do
-    crate="$(echo "$src" | cut -d/ -f2)"
-    bin="$(basename "$src" .rs)"
-    printf '%s\n' "${BINS[@]}" | grep -qx "$crate:$bin" || missing+=("$crate:$bin")
-done < <(grep -rl 'target_os = "rtems"' crates/*/src/bin/ 2>/dev/null || true)
+# Census: every binary in the RTEMS crates is in BINS or in HOST_ONLY.
+CLASSIFIED=("${BINS[@]}" "${HOST_ONLY[@]}")
+present=()
+unclassified=()
+for crate in "${CRATES[@]}"; do
+    for src in "crates/$crate/src/bin"/*.rs; do
+        [[ -e "$src" ]] || continue
+        pair="$crate:$(basename "$src" .rs)"
+        present+=("$pair")
+        printf '%s\n' "${CLASSIFIED[@]}" | grep -qx "$pair" || unclassified+=("$pair")
+    done
+done
 
-if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "error: these binaries are built for RTEMS but are not in this gate:" >&2
-    printf '  %s\n' "${missing[@]}" >&2
-    echo "Add them to BINS in $0 — an ungated target binary is how the last" >&2
-    echo "build break reached the bring-up box." >&2
+if [[ ${#unclassified[@]} -gt 0 ]]; then
+    echo "error: these binaries are in an RTEMS crate but are classified neither" >&2
+    echo "       as target binaries nor as host-only:" >&2
+    printf '  %s\n' "${unclassified[@]}" >&2
+    echo "Add each to BINS or to HOST_ONLY in $0. Being in neither is how a" >&2
+    echo "target binary lands outside this gate — which is how the last build" >&2
+    echo "break reached the bring-up box." >&2
+    exit 1
+fi
+
+# The other direction: a listed binary whose source is gone. Left unchecked, a
+# rename would silently stop being covered while both lists still looked full.
+stale=()
+for pair in "${CLASSIFIED[@]}"; do
+    printf '%s\n' "${present[@]}" | grep -qx "$pair" || stale+=("$pair")
+done
+
+if [[ ${#stale[@]} -gt 0 ]]; then
+    echo "error: these binaries are listed in $0 but have no source file:" >&2
+    printf '  %s\n' "${stale[@]}" >&2
+    echo "Remove or rename the entry — a stale one covers nothing." >&2
     exit 1
 fi
 

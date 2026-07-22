@@ -471,9 +471,10 @@ mod tests {
             ev.to_json().contains(r#""user":"a\nb""#),
             "the JSON encoder escapes the newline itself"
         );
+        let json = ev.to_json();
         assert_eq!(
-            &*epics_base_rs::runtime::log::single_line(&ev.to_json()),
-            ev.to_json(),
+            &*epics_base_rs::runtime::log::single_line(&json),
+            json,
             "the sink must not re-escape already-escaped JSON"
         );
     }

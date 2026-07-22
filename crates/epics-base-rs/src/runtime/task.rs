@@ -746,7 +746,7 @@ pub(crate) fn current_thread_band() -> u8 {
 /// band — the iocsh script runners — calls [`name_current_thread`] alone
 /// rather than inventing a priority just to be visible.
 ///
-/// The band is also *declared* here — [`current_thread_band`] reports it for
+/// The band is also *declared* here — `current_thread_band` reports it for
 /// the rest of the thread's life — which is what lets this crate's own
 /// priority-ordered waits rank a waiter even on a target, or with an RT
 /// policy, where the OS scheduler never saw the request.

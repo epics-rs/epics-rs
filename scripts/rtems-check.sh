@@ -20,6 +20,13 @@
 #   * A gate that lives in a paragraph drifts. This one is executable, so the
 #     scope is what runs rather than what someone remembered to type.
 #
+# The same defect then repeated on the other axis. `--lib`/`--bin` says WHAT is
+# compiled; it says nothing about WHICH CONFIGURATION, and the gate only ever
+# compiled one of the two. Everything an image gets from
+# `#[cfg(rtems_boot_linked)]` was outside it, so the gate stayed green while a
+# real image build hard-failed with `error[E0080]: evaluation panicked: RTEMS
+# libc layout bug`. Both axes are now a census: see CONFIGS below.
+#
 # WHY NOT --all-targets OR --bins
 #
 # Measured, not assumed: `cargo +nightly check -p epics-ca-rs --bins ... \
@@ -152,22 +159,73 @@ if [[ ${#stale[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# The two build configurations an RTEMS image can be in. The census above says
+# WHAT is compiled; this says IN WHICH CONFIGURATION, and the second one is new.
+#
+# `portability` is what every dev machine gets: `RTEMS_BSP_PREFIX` unset, so
+# `epics-rtems-boot`'s build script emits no `rtems_boot_linked` and the closure
+# type-checks with no toolchain present.
+#
+# `image` is what a bootable image actually is — and until this loop it was
+# compiled by NOTHING on any machine without a BSP. Everything behind
+# `#[cfg(rtems_boot_linked)]` was outside every gate: the `POSIX_Init` anchor,
+# `stats`' real extern bindings, and both `_RTEMS_LIBC_*_LAYOUT` refusals. That
+# is the same defect as the `--lib` miss at the top of this file, and it cost
+# the same way — this gate reported green while a real image build hard-failed
+# with `error[E0080]: evaluation panicked: RTEMS libc layout bug`.
+#
+# Selected through RUSTFLAGS rather than by editing the cfg. `epics-rtems-boot`
+# carries a test — `the_libc_layout_refusals_fire_for_every_image_that_can_boot`
+# — pinning those refusals to exactly `cfg(all(target_os = "rtems",
+# rtems_boot_linked))`, whose own comment says that widening the cfg deletes
+# this very gate. Naming the cfg from outside compiles that arm without
+# touching it, so one machine reaches both configurations and neither is
+# weakened.
+#
+# NOT `--no-default-features`. The session handoff diagnosed the missing
+# coverage as a feature-selection problem; measured, it is not.
+# `epics-rtems-boot` declares no `[features]` at all, so the flag cannot reach
+# its guards, and the flag is load-bearing for a different reason that must not
+# be undone: `epics-pva-rs`'s default `tls` drags `ring` -> `getrandom 0.2`,
+# which `compile_error!`s on this target.
+#
+# This pass is FATAL, not advisory. The failure it exists to catch is the one
+# that actually happened (session handoff §7): a `libc` branch missing the
+# `time_t` widening, which fires exactly one of the two refusals. Any scheme
+# that tolerates "the refusals we already know about" tolerates that too, and
+# is the vacuous pass in a new costume. Red here means this workspace cannot
+# build a bootable image — a true statement about the workspace, not a
+# complaint about the gate.
+CONFIGS=(portability image)
+
+# Whatever the operator set stays set; the configuration only ever adds.
+BASE_RUSTFLAGS="${RUSTFLAGS:-}"
+
 failed=()
 
-for crate in "${CRATES[@]}"; do
-    log "== $crate --lib"
-    if ! cargo "${COMMON[@]}" -p "$crate" --lib; then
-        failed+=("$crate --lib")
-    fi
-done
+for config in "${CONFIGS[@]}"; do
+    case "$config" in
+    image) export RUSTFLAGS="$BASE_RUSTFLAGS --cfg rtems_boot_linked" ;;
+    *) export RUSTFLAGS="$BASE_RUSTFLAGS" ;;
+    esac
 
-for pair in "${BINS[@]}"; do
-    crate="${pair%%:*}"
-    bin="${pair##*:}"
-    log "== $crate --bin $bin"
-    if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin"; then
-        failed+=("$crate --bin $bin")
-    fi
+    log "===== configuration: $config"
+
+    for crate in "${CRATES[@]}"; do
+        log "== [$config] $crate --lib"
+        if ! cargo "${COMMON[@]}" -p "$crate" --lib; then
+            failed+=("[$config] $crate --lib")
+        fi
+    done
+
+    for pair in "${BINS[@]}"; do
+        crate="${pair%%:*}"
+        bin="${pair##*:}"
+        log "== [$config] $crate --bin $bin"
+        if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin"; then
+            failed+=("[$config] $crate --bin $bin")
+        fi
+    done
 done
 
 if [[ ${#failed[@]} -gt 0 ]]; then
@@ -176,4 +234,5 @@ if [[ ${#failed[@]} -gt 0 ]]; then
     exit 1
 fi
 
-log "RTEMS gate: every crate and target binary compiles for $TARGET."
+log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
+log "the portability and the image configuration."

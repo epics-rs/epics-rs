@@ -107,6 +107,59 @@
 //! only ever enqueued while `held` is true, and `held` is only ever cleared
 //! with an empty queue, so `!held` implies "no waiters" and a first-poll
 //! acquisition cannot jump the queue.
+//!
+//! Acquisition order — MUST
+//! ------------------------
+//! `doc/rtems-priority-locks-design.md` §3's cross-check requires this to be
+//! written down, because as of step 4 the locks nested under L1 are *blocking*
+//! and a cycle would wedge a thread rather than a task. The order below is the
+//! one the code actually takes, not an aspiration — it was derived by reading
+//! every nesting site, and the bypass audit is in the commit that added it.
+//!
+//! > **A thread MUST acquire these in this order and MUST NOT acquire any of
+//! > them while holding one that appears later:**
+//! >
+//! > 1. **L1** — the per-record advisory gate ([`PvDatabase::lock_record`] /
+//! >    [`PvDatabase::lock_records`]), *this* module.
+//! > 2. **L46** — `PvDatabaseInner::registration_mutex`.
+//! > 3. the leaves, none of which is ever held while another lock is taken:
+//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket, the `records`
+//! >    map, `aliases`, and a record's own `RwLock<RecordInstance>`.
+//!
+//! **Owner/Gate:** [`PvDatabase::update_scan_index`] is the **only** production
+//! function that takes L46 from inside an L1-held window, and therefore the
+//! single owner of the whole L1 → L46 → L8b chain. Every other L46 holder
+//! (`add_pv`, `add_pv_with_hooks_full`, `remove_simple_pv`,
+//! `add_loaded_record`, `remove_record`, `add_alias`, `add_breaktables`) is a
+//! registration entry point reached from `.db` load, iocsh or the gateway,
+//! never from inside a put/process cycle — verified with `rg` over those
+//! symbols in `field_io.rs`, `processing.rs`, `links.rs`, `qsrv/group.rs` and
+//! `pvalink/integration.rs`, where every hit is inside a `#[cfg(test)]`
+//! module. A second function that nests L46 under L1 is a second owner of
+//! this chain: route it through `update_scan_index` instead, or the order
+//! above stops being checkable by reading one function.
+//!
+//! The rule's teeth are structural for the two rightmost steps: an L46 or
+//! L8a/L8b guard is `!Send`, so the compiler refuses any hold across an
+//! `.await` at the `tokio::spawn` sites, which is what stops a holder from
+//! suspending mid-chain. L1 is not covered by that yet — see below.
+//!
+//! ### What L1 is today, and the one await still inside its window
+//!
+//! L1 is still the async [`PriorityGate`] and `lock_record` / `lock_records`
+//! are still `async fn`. Step 4 deliberately stopped short of the type flip:
+//! seven of the nine holders (`doc/rtems-priority-locks-design.md` §1.1) hold
+//! the gate across an `.await`, so a `!Send` guard here would not compile
+//! before H6 (§5 step 5) lands.
+//!
+//! Concretely, after step 4 the H1 (`field_io.rs` `put_pv_inner`) and H2
+//! (`put_pv_and_post_with_origin`) windows each contain **exactly one**
+//! `.await`, and it is the same one in both: `run_special_actions`. The
+//! scan-index tail that used to sit beside it is synchronous now. That last
+//! await is not removable here — it re-enters H1/H6 and it reaches a real
+//! `ca://`/`pva://` network write; see `run_special_actions`' own doc comment
+//! for both branches. The remaining holders (H4, H6, H7, H8, H9) are untouched
+//! by step 4 and still await freely under the gate.
 
 // RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
 

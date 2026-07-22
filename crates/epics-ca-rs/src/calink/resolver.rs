@@ -450,10 +450,21 @@ impl CaLinkResolver {
     /// it is not yet in the registry — the first-access slow path.
     /// Steady-state reads hit the registry directly.
     async fn link_for(&self, name: &str) -> Option<Arc<CaLink>> {
-        if let Some(existing) = self.links.read().get(name).cloned() {
+        if let Some(existing) = self.cached_link(name) {
             return Some(existing);
         }
         self.open(name).await.ok()
+    }
+
+    /// The registry read with NO lazy open — the record-processing half of
+    /// [`Self::link_for`]. C `dbCaGetLink` and the `getAttributes` family
+    /// read `pca->...` under `pca->lock` and never create a channel
+    /// (`dbCa.c:448-535`, `:662-704`); the open is `dbCaAddLink`'s
+    /// `CA_CONNECT` on the `dbCaTask`, reached here through
+    /// [`LinkSet::connect_link`]. Every synchronous `LinkSet` accessor goes
+    /// through this, so none of them can suspend the record thread.
+    fn cached_link(&self, name: &str) -> Option<Arc<CaLink>> {
+        self.links.read().get(name).cloned()
     }
 }
 
@@ -711,7 +722,7 @@ fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
 
 #[async_trait::async_trait]
 impl LinkSet for CaLinkResolver {
-    async fn is_connected(&self, name: &str) -> bool {
+    fn is_connected(&self, name: &str) -> bool {
         let name = strip_ca_scheme(name);
         match self.links.read().get(name) {
             Some(link) => link.is_connected(),
@@ -735,7 +746,7 @@ impl LinkSet for CaLinkResolver {
     /// [`Self::link_for`] fallback (`resolver.rs:452-457`), which opens the
     /// channel and awaits the subscription round trip. That open now happens
     /// on the database's link work owner via [`Self::connect_link`].
-    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
         let link = self.links.read().get(name).cloned()?;
         link.value()
@@ -761,7 +772,7 @@ impl LinkSet for CaLinkResolver {
     /// inside `put_value` / `get_value`. Reporting `Disconnected` would
     /// refuse the very write whose staging performs the open, and the link
     /// would never connect.
-    async fn put_admission(&self, name: &str) -> PutAdmission {
+    fn put_admission(&self, name: &str) -> PutAdmission {
         let name = strip_ca_scheme(name);
         let links = self.links.read();
         match links.get(name) {
@@ -802,30 +813,30 @@ impl LinkSet for CaLinkResolver {
         .map_err(|e| e.to_string())
     }
 
-    async fn alarm_severity(&self, name: &str) -> Option<i32> {
+    fn alarm_severity(&self, name: &str) -> Option<i32> {
         let name = strip_ca_scheme(name);
-        let sev = self.link_for(name).await?.alarm_severity()?;
+        let sev = self.cached_link(name)?.alarm_severity()?;
         // Mirror the lset contract: only a non-zero severity is a
         // contribution worth propagating into the owning record's
         // LINK_ALARM. `0` (NO_ALARM) means "do not propagate".
         if sev > 0 { Some(sev) } else { None }
     }
 
-    async fn alarm_status(&self, name: &str) -> Option<i32> {
+    fn alarm_status(&self, name: &str) -> Option<i32> {
         // surface the remote STAT for `MSS` propagation.
         // Record processing only consults this when the alarm is
         // actually propagated (severity > 0 via `alarm_severity`), so
         // no severity gate is needed here.
         let name = strip_ca_scheme(name);
-        self.link_for(name).await?.alarm_status()
+        self.cached_link(name)?.alarm_status()
     }
 
-    async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+    fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
         let name = strip_ca_scheme(name);
-        self.link_for(name).await?.time_stamp()
+        self.cached_link(name)?.time_stamp()
     }
 
-    async fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, name: &str) -> Option<LinkMetadata> {
         // surface the remote display/control/alarm limits,
         // precision, units, DBF type and element count through the DB
         // link API so a record with a CA INP link inherits them, matching
@@ -833,10 +844,10 @@ impl LinkSet for CaLinkResolver {
         // no fresh GET — exactly as C `getControlLimits` &c. read
         // `pca->controlLimits`.
         let name = strip_ca_scheme(name);
-        self.link_for(name).await?.link_metadata()
+        self.cached_link(name)?.link_metadata()
     }
 
-    async fn link_names(&self) -> Vec<String> {
+    fn link_names(&self) -> Vec<String> {
         self.links.read().keys().cloned().collect()
     }
 }

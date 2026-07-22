@@ -366,16 +366,19 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     struct AlarmingLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for AlarmingLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(12.0))
         }
-        async fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        async fn alarm_message(&self, _: &str) -> Option<String> {
+        fn alarm_message(&self, _: &str) -> Option<String> {
             Some("remote major".into())
         }
     }
@@ -429,11 +432,14 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     struct QuietLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for QuietLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(5.0))
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
         // alarm_severity defaults to None.
     }
@@ -486,11 +492,14 @@ struct CapturingLset {
 }
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for CapturingLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         true
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(
         &self,
@@ -2020,13 +2029,16 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     struct ValueCaLset(f64);
     #[epics_base_rs::async_trait]
     impl LinkSet for ValueCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
             // The bare non-local SIOL record name reaches the CA lset
             // via the read-locality fallback `resolve_external_pv`.
             (name == "REMOTE:SIM").then_some(EpicsValue::Double(self.0))
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
     }
 
@@ -6682,13 +6694,16 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // Only the source record name (with `.TIME` stripped) should
             // reach the lset, mirroring C `TSEL_modified` truncating the
             // pvname at `.TIME`.
@@ -6748,13 +6763,16 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
             // fallback `external_link_time("ca://TSE_SRC")`.
@@ -8246,13 +8264,16 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for CalcCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
             (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             (name == "REMOTE:A").then_some((self.secs, self.nsec, 0))
         }
     }
@@ -9036,18 +9057,21 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for RawCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(7.0))
         }
-        async fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
             // Mirror the real CA resolver: only a non-zero severity is a
             // contribution worth returning.
             if self.sevr > 0 { Some(self.sevr) } else { None }
         }
-        async fn alarm_status(&self, _: &str) -> Option<i32> {
+        fn alarm_status(&self, _: &str) -> Option<i32> {
             Some(self.stat)
         }
     }

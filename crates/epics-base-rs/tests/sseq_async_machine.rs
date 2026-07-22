@@ -82,11 +82,14 @@ struct CaHoldLset(Arc<CaHoldState>);
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CaHoldLset {
-    async fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &str) -> bool {
         true
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let held = op == LinkPutOp::Async;
@@ -111,7 +114,7 @@ impl LinkSet for CaHoldLset {
         }
         Ok(())
     }
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         // Connected, DBF_DOUBLE scalar: the destination type sseq's
         // `processCallback` switch resolves (R16-1) so the step is put at all.
         Some(LinkMetadata {

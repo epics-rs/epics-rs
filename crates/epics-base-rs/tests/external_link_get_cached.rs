@@ -58,7 +58,7 @@ impl LazyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for LazyLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         self.cache.lock().is_some()
     }
 
@@ -70,7 +70,7 @@ impl LinkSet for LazyLset {
         self.cache.lock().clone()
     }
 
-    async fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         self.cache.lock().clone()
     }
 

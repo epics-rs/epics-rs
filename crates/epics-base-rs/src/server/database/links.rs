@@ -897,14 +897,14 @@ impl PvDatabase {
         } else {
             // Bare name — try every registered lset.
             for lset in self.registered_link_sets().await {
-                if let Some(ts) = lset.time_stamp(name).await {
+                if let Some(ts) = lset.time_stamp(name) {
                     return Some(ts);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.time_stamp(body).await
+        lset.time_stamp(body)
     }
 
     /// Build a [`LinkAlarm`] from the registered lset's alarm
@@ -924,33 +924,31 @@ impl PvDatabase {
             // Bare name — try every registered lset until one reports
             // a severity (mirrors `resolve_external_pv`'s bare path).
             for lset in self.registered_link_sets().await {
-                if let Some(sev) = lset.alarm_severity(name).await {
+                if let Some(sev) = lset.alarm_severity(name) {
                     return Some(LinkAlarm {
                         // prefer the remote STAT for MSS;
                         // fall back to LINK_ALARM when the lset has none.
                         stat: lset
                             .alarm_status(name)
-                            .await
                             .map(|s| s as u16)
                             .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
                         sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-                        amsg: lset.alarm_message(name).await.unwrap_or_default(),
+                        amsg: lset.alarm_message(name).unwrap_or_default(),
                     });
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.load().get(scheme)?;
-        let sev = lset.alarm_severity(body).await?;
+        let sev = lset.alarm_severity(body)?;
         Some(LinkAlarm {
             // remote STAT for MSS, else LINK_ALARM.
             stat: lset
                 .alarm_status(body)
-                .await
                 .map(|s| s as u16)
                 .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
             sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-            amsg: lset.alarm_message(body).await.unwrap_or_default(),
+            amsg: lset.alarm_message(body).unwrap_or_default(),
         })
     }
 
@@ -981,14 +979,14 @@ impl PvDatabase {
             ("ca", rest)
         } else {
             for lset in self.registered_link_sets().await {
-                if let Some(snap) = lset.remote_alarm(name).await {
+                if let Some(snap) = lset.remote_alarm(name) {
                     return Some(snap);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.remote_alarm(body).await
+        lset.remote_alarm(body)
     }
 
     /// Remote display / control / valueAlarm metadata for an external
@@ -1017,14 +1015,14 @@ impl PvDatabase {
             ("ca", rest)
         } else {
             for lset in self.registered_link_sets().await {
-                if let Some(meta) = lset.link_metadata(name).await {
+                if let Some(meta) = lset.link_metadata(name) {
                     return Some(meta);
                 }
             }
             return None;
         };
         let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.link_metadata(body).await
+        lset.link_metadata(body)
     }
 
     /// C `dbGetControlLimits` / `dbGetGraphicLimits` / `dbGetAlarmLimits` /
@@ -1655,7 +1653,7 @@ impl PvDatabase {
         // advisory write gate, and it does no I/O.
         let mut admission = PutAdmission::Disconnected;
         for lset in &lsets {
-            match lset.put_admission(body).await {
+            match lset.put_admission(body) {
                 PutAdmission::Connected => {
                     admission = PutAdmission::Connected;
                     break;
@@ -1739,7 +1737,7 @@ impl PvDatabase {
             }
             let mut last_err = String::new();
             for lset in lsets {
-                match lset.scan_forward(name).await {
+                match lset.scan_forward(name) {
                     Ok(()) => return Ok(()),
                     Err(e) => last_err = e,
                 }
@@ -1752,7 +1750,7 @@ impl PvDatabase {
             .load()
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        lset.scan_forward(body).await
+        lset.scan_forward(body)
     }
 
     /// Map a record's put-completion wait-set to the external-link put
@@ -3054,11 +3052,14 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for RecordingLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
         async fn put_value(
             &self,
@@ -3184,13 +3185,16 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for ForwardingLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             self.connected
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        async fn scan_forward(&self, name: &str) -> Result<(), String> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn scan_forward(&self, name: &str) -> Result<(), String> {
             self.forwards.lock().unwrap().push(name.to_string());
             if self.connected {
                 Ok(())

@@ -48,11 +48,14 @@ struct GateLset {
 
 #[async_trait::async_trait]
 impl LinkSet for GateLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         true
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, name: &str, value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         let v = value.to_f64().expect("tests only put doubles");
@@ -90,14 +93,17 @@ impl RecordingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for RecordingLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         self.admission == PutAdmission::Connected
     }
-    async fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: &str) -> PutAdmission {
         self.admission
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, _: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         self.writes

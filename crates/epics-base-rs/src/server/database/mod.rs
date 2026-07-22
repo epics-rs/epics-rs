@@ -1007,7 +1007,7 @@ impl PvDatabase {
         loop {
             let mut connected = 0usize;
             for (lset, name) in &targets {
-                if lset.is_connected(name).await {
+                if lset.is_connected(name) {
                     connected += 1;
                 }
             }
@@ -1048,7 +1048,7 @@ impl PvDatabase {
             return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for n in ca_lset.link_names().await {
+        for n in ca_lset.link_names() {
             if self.has_name_no_resolve(&n).await {
                 targets.push((ca_lset.clone(), n));
             }
@@ -1066,7 +1066,7 @@ impl PvDatabase {
     pub async fn unconnected_external_links(&self) -> Vec<String> {
         let mut names = Vec::new();
         for (lset, name) in self.external_link_targets().await {
-            if !lset.is_connected(&name).await {
+            if !lset.is_connected(&name) {
                 names.push(name);
             }
         }
@@ -1185,7 +1185,7 @@ impl PvDatabase {
             drop(registry);
             let any_lset = !lsets.is_empty();
             for lset in lsets {
-                if let Some(v) = lset.get_cached_value(name).await {
+                if let Some(v) = lset.get_cached_value(name) {
                     return Some(v);
                 }
             }
@@ -1205,7 +1205,7 @@ impl PvDatabase {
         };
         let lset = self.inner.link_sets.load().get(scheme);
         if let Some(lset) = lset {
-            if let Some(v) = lset.get_cached_value(body).await {
+            if let Some(v) = lset.get_cached_value(body) {
                 return Some(v);
             }
             self.stage_external_link_open(
@@ -2214,13 +2214,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             tokio::time::Instant::now() >= self.connect_at
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        async fn link_names(&self) -> Vec<String> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn link_names(&self) -> Vec<String> {
             self.names.clone()
         }
     }

@@ -107,7 +107,7 @@ async fn ca_link_resolves_remote_value() {
         "CA link must return the upstream PV's value"
     );
     assert!(
-        LinkSet::is_connected(&resolver, "CALINK:SRC").await,
+        LinkSet::is_connected(&resolver, "CALINK:SRC"),
         "CA link must report connected once a value is cached"
     );
     assert_eq!(resolver.link_count(), 1);
@@ -540,7 +540,7 @@ async fn ca_link_exposes_remote_metadata() {
     // so poll until the cached metadata lands.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let md = loop {
-        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC").await {
+        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
             // Wait for the CTRL get to fill the limits, not just the
             // channel-info type/count from a partial first store.
             if md.graphic_limits.is_some() {
@@ -575,7 +575,7 @@ async fn ca_link_exposes_remote_metadata() {
 
     // While connected the metadata is served; the read path gates on the
     // connection flag exactly like the value/alarm getters.
-    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC").await);
+    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC"));
 }
 
 /// `install_calink_resolver` registers under the `ca` scheme so the

@@ -104,7 +104,7 @@ struct CountingLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CountingLset {
-    async fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &str) -> bool {
         self.element_count.is_some()
     }
     /// The subject of these tests is which BUFFER the record hands the OUT
@@ -114,11 +114,14 @@ impl LinkSet for CountingLset {
     /// (`dbCaPutLinkCallback`, `dbCa.c:558-561`) is covered by
     /// `out_link_failure_alarm.rs`, and folding it in here would make the
     /// no-metadata case assert nothing at all.
-    async fn put_admission(&self, _name: &str) -> epics_base_rs::server::database::PutAdmission {
+    fn put_admission(&self, _name: &str) -> epics_base_rs::server::database::PutAdmission {
         epics_base_rs::server::database::PutAdmission::Connected
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(
         &self,
@@ -129,7 +132,7 @@ impl LinkSet for CountingLset {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         self.element_count.map(|n| LinkMetadata {
             element_count: Some(n),
             ..Default::default()

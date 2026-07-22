@@ -12,14 +12,25 @@
 //! Record-link reads dispatch through the matching lset before
 //! falling back to the legacy `ExternalPvResolver` closure.
 //!
-//! The trait is **async**. An lset's state is async state: pvalink and
-//! calink both open links, and cache them, on a tokio runtime. A sync
-//! trait forced them to reach that state through `block_in_place` +
-//! `Handle::block_on`, which panics on a current-thread runtime —
-//! including the one `#[epics::test]` builds and the one every asyn port
-//! actor runs. Since every caller of these methods is already an
-//! `async fn` (the database's link paths), awaiting the answer costs
-//! nothing and removes the bridge.
+//! The trait is **split by thread**, mirroring the C `dbCa` split
+//! between the record-processing thread and the `dbCaTask`
+//! (`dbCa.c:1191-1248`):
+//!
+//! * **Synchronous methods** are the ones record processing calls while
+//!   it holds the record's advisory write gate (C `dbScanLock`). They
+//!   answer from cached, monitor-fed state and MUST NOT perform I/O —
+//!   C `dbCaGetLink` copies out of `pca->pgetNative` and never touches
+//!   the wire (`dbCa.c:448-535`). Their signature is what enforces
+//!   that: a `fn` cannot await, so it cannot suspend the record thread.
+//! * **Async methods** ([`LinkSet::get_value`],
+//!   [`LinkSet::connect_link`], [`LinkSet::put_value`],
+//!   [`LinkSet::flush_puts`]) are the `dbCaTask` half. They run on the
+//!   database's link work owner, never on a record-processing thread,
+//!   and MAY block on the network.
+//!
+//! Before this split the "MUST NOT perform I/O" rule was a doc comment
+//! on an `async fn`, so nothing stopped a new lset from suspending
+//! record processing inside the gate. It is now a type-level property.
 //!
 //! # Adding a new lset
 //!
@@ -27,8 +38,9 @@
 //! struct MyLset { /* ... */ }
 //! #[epics_base_rs::async_trait]
 //! impl LinkSet for MyLset {
-//!     async fn is_connected(&self, name: &str) -> bool { /* ... */ }
-//!     async fn get_value(&self, name: &str) -> Option<EpicsValue> { /* ... */ }
+//!     fn is_connected(&self, name: &str) -> bool { /* cached */ }
+//!     fn get_cached_value(&self, name: &str) -> Option<EpicsValue> { /* cached */ }
+//!     async fn get_value(&self, name: &str) -> Option<EpicsValue> { /* may do I/O */ }
 //!     /* etc. */
 //! }
 //! db.register_link_set("pva", Arc::new(MyLset { ... })).await;
@@ -228,7 +240,10 @@ pub trait LinkSet: Send + Sync {
     /// True iff a fresh value is available for `name` without
     /// blocking. Used by the record processing loop to decide
     /// whether to mark the record's STAT as LINK_ALARM.
-    async fn is_connected(&self, name: &str) -> bool;
+    ///
+    /// Synchronous: asked on the record-processing thread inside the
+    /// record's advisory write gate. MUST NOT perform I/O.
+    fn is_connected(&self, name: &str) -> bool;
 
     /// Read the current value of `name`. Returns None when the
     /// upstream isn't yet connected or the lset has no cache for
@@ -248,14 +263,18 @@ pub trait LinkSet: Send + Sync {
     /// `!pca->isConnected` (`dbCa.c:459-464`) — the reading record takes
     /// LINK/INVALID for that cycle.
     ///
-    /// MUST NOT perform I/O.
+    /// MUST NOT perform I/O — which is why this is a `fn` and
+    /// [`Self::get_value`] is an `async fn`.
     ///
-    /// Default: delegate to [`Self::get_value`], which preserves the
-    /// pre-queue behaviour for an lset that has no separate cache. Every
-    /// lset whose `get_value` can open a channel or issue a network GET
-    /// MUST override, or the record thread suspends on the network again.
-    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.get_value(name).await
+    /// Default: `None`, i.e. "this lset keeps no cache". That is C's
+    /// `!pca->isConnected` arm verbatim: the reading record takes
+    /// LINK/INVALID for the cycle and the database stages the link's
+    /// open on the link work owner ([`Self::connect_link`]), which is
+    /// what warms the cache for the next cycle. An lset that CAN answer
+    /// from memory MUST override, or its links never read.
+    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        let _ = name;
+        None
     }
 
     /// Open (subscribe / connect) `name` so later
@@ -290,8 +309,8 @@ pub trait LinkSet: Send + Sync {
     /// live in a different cache than its INP links (pvalink keys its
     /// registry on direction) MUST override, or every OUT write to a
     /// perfectly healthy channel is refused.
-    async fn put_admission(&self, name: &str) -> PutAdmission {
-        if self.is_connected(name).await {
+    fn put_admission(&self, name: &str) -> PutAdmission {
+        if self.is_connected(name) {
             PutAdmission::Connected
         } else {
             PutAdmission::Disconnected
@@ -333,7 +352,7 @@ pub trait LinkSet: Send + Sync {
     /// forwards nothing through this hook — a DB FLNK target is processed
     /// directly by the database's `scanOnce` path (the DB lset's
     /// `scanForward`), not through an external link set.
-    async fn scan_forward(&self, name: &str) -> Result<(), String> {
+    fn scan_forward(&self, name: &str) -> Result<(), String> {
         let _ = name;
         Ok(())
     }
@@ -356,7 +375,7 @@ pub trait LinkSet: Send + Sync {
 
     /// Most recent alarm message string from the upstream PV, when
     /// available. None means no alarm or no cache.
-    async fn alarm_message(&self, _name: &str) -> Option<String> {
+    fn alarm_message(&self, _name: &str) -> Option<String> {
         None
     }
 
@@ -373,7 +392,7 @@ pub trait LinkSet: Send + Sync {
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
     /// `pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
-    async fn alarm_severity(&self, _name: &str) -> Option<i32> {
+    fn alarm_severity(&self, _name: &str) -> Option<i32> {
         None
     }
 
@@ -389,7 +408,7 @@ pub trait LinkSet: Send + Sync {
     /// behaviour for every non-`MSS` modifier and for lsets that leave
     /// this default. Mirrors pvxs `pvalink_lset.cpp` `pvaGetAlarm`
     /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
-    async fn alarm_status(&self, _name: &str) -> Option<i32> {
+    fn alarm_status(&self, _name: &str) -> Option<i32> {
         None
     }
 
@@ -412,7 +431,7 @@ pub trait LinkSet: Send + Sync {
     /// `None` means the lset cannot report a snapshot: no cache, the
     /// link is not connected (pvxs `CHECK_VALID` — `pvalink_lset.cpp:545`),
     /// or the link set does not track remote alarms. Default: none.
-    async fn remote_alarm(&self, _name: &str) -> Option<RemoteAlarm> {
+    fn remote_alarm(&self, _name: &str) -> Option<RemoteAlarm> {
         None
     }
 
@@ -421,7 +440,7 @@ pub trait LinkSet: Send + Sync {
     /// `timeStamp.userTag` widened to the 64-bit `epicsUTag` tag without
     /// sign extension, or `0` when the source carries none (CA links, or
     /// a PVA source whose timeStamp omits the field).
-    async fn time_stamp(&self, _name: &str) -> Option<(i64, i32, u64)> {
+    fn time_stamp(&self, _name: &str) -> Option<(i64, i32, u64)> {
         None
     }
 
@@ -442,7 +461,7 @@ pub trait LinkSet: Send + Sync {
     /// piece of metadata — the record then keeps its local default,
     /// matching the C getters that leave the caller's buffer
     /// untouched on a missing sub-field. Default impl: no metadata.
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         None
     }
 
@@ -450,7 +469,7 @@ pub trait LinkSet: Send + Sync {
     /// actively tracking). Used by `dbpvxr` to dump per-record
     /// link state without forcing the caller to know the full
     /// name list up-front.
-    async fn link_names(&self) -> Vec<String> {
+    fn link_names(&self) -> Vec<String> {
         Vec::new()
     }
 }
@@ -509,11 +528,14 @@ mod tests {
     struct StubLset;
     #[async_trait::async_trait]
     impl LinkSet for StubLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Long(42))
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
     }
 
@@ -524,7 +546,7 @@ mod tests {
         reg.register("pva", Arc::new(StubLset));
         assert_eq!(reg.len(), 1);
         let lset = reg.get("pva").expect("registered");
-        assert!(lset.is_connected("anything").await);
+        assert!(lset.is_connected("anything"));
         assert_eq!(lset.get_value("anything").await, Some(EpicsValue::Long(42)));
     }
 

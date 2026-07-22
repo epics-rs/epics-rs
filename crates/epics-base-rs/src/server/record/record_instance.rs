@@ -869,9 +869,57 @@ pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
     }
 }
 
+/// The `dbCommon` link fields, each with the C link-field type its text is
+/// parsed under (`dbStaticLib.c:2380-2391`): `INP`/`TSEL`/`SDIS` are
+/// `DBF_INLINK`, `OUT` is `DBF_OUTLINK`, `FLNK` is `DBF_FWDLINK`.
+///
+/// These five — and only these five — have a parse cache on
+/// [`RecordInstance`], which is what lets a one-shot init decision (C
+/// `dbInitLink` setting `DBLINK_FLAG_INITIALIZED`) be committed for them.
+/// The list has one owner because it is read from three places that must not
+/// drift: the per-field parse in `put_common_field`, the database's
+/// `record_link_fields` enumeration, and the `initialize_link_locality`
+/// commit. `FLNK` missing from just one of them is exactly how an external
+/// forward link went un-opened at init.
+pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
+    ("INP", super::link::LinkFieldType::In),
+    ("OUT", super::link::LinkFieldType::Out),
+    ("TSEL", super::link::LinkFieldType::In),
+    ("SDIS", super::link::LinkFieldType::In),
+    ("FLNK", super::link::LinkFieldType::Fwd),
+];
+
 impl RecordInstance {
     pub fn new(name: String, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
+    }
+
+    /// The raw text of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// other field name.
+    pub fn common_link_text(&self, field: &str) -> Option<&str> {
+        Some(match field {
+            "INP" => self.common.inp.as_str(),
+            "OUT" => self.common.out.as_str(),
+            "TSEL" => self.common.tsel.as_str(),
+            "SDIS" => self.common.sdis.as_str(),
+            "FLNK" => self.common.flnk.as_str(),
+            _ => return None,
+        })
+    }
+
+    /// The parse cache of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// other field name. The only mutable handle on the cache outside
+    /// `put_common_field`, so the iocInit locality commit cannot reach a slot
+    /// that has no matching raw text.
+    pub fn common_link_cache_mut(&mut self, field: &str) -> Option<&mut ParsedLink> {
+        Some(match field {
+            "INP" => &mut self.parsed_inp,
+            "OUT" => &mut self.parsed_out,
+            "TSEL" => &mut self.parsed_tsel,
+            "SDIS" => &mut self.parsed_sdis,
+            "FLNK" => &mut self.parsed_flnk,
+            _ => return None,
+        })
     }
 
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {

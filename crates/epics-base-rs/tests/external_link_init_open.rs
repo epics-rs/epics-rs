@@ -15,13 +15,14 @@
 //! `stage_external_link_open_by_name`, i.e. the same `LinkPutQueue` owner
 //! that consumes `connect_link`. Nothing here opens a channel inline.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(15): checked - these run and pass in the feature-ON suite.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::record::ParsedLink;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
@@ -239,6 +240,194 @@ async fn local_and_constant_links_stage_nothing() {
         lset.opened_names()
     );
     assert_eq!(db.external_link_opens_completed(), 0);
+}
+
+/// Boundary — a PLAIN (no `CP`/`CPP`/`CA` modifier) `Db` link whose target is
+/// not a record in this IOC. C `dbInitLink` hands it to `dbDbInitLink`
+/// (`dbLink.c:117-120`), whose `dbChannelCreate` cannot find the record and
+/// returns `S_db_notFound` (`dbDbLink.c:94-96`); execution falls through to
+/// `dbCaAddLinkCallbackOpt` (`dbLink.c:129`) and the link IS a CA link from
+/// then on. So both halves must hold: the holder's parse cache is rewritten to
+/// `Ca`, and the channel is opened at init like any other external link.
+#[tokio::test]
+async fn plain_non_local_db_link_converts_and_opens_at_init() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    // No modifier at all — `setup_cp_links` never looked at this link, and
+    // pre-fix nothing else converted or opened it either.
+    add_ai(&db, "AI_NONLOCAL", "OTHER:PV").await;
+
+    assert_eq!(
+        db.initialize_link_locality().await,
+        1,
+        "the non-local plain Db link must be converted"
+    );
+    let inp = db
+        .get_record("AI_NONLOCAL")
+        .unwrap()
+        .read()
+        .parsed_inp
+        .clone();
+    match inp {
+        ParsedLink::Ca(ca) => assert_eq!(ca.pv, "OTHER:PV"),
+        other => panic!("expected the link to become Ca, got {other:?}"),
+    }
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 1, "the converted link must be opened at init");
+    db.sync_external_link_puts().await;
+    assert_eq!(lset.opened_names(), vec!["OTHER:PV".to_string()]);
+
+    // The parity payoff, same as the explicit `ca://` case: no cold cycle.
+    process(&db, "AI_NONLOCAL").await;
+    assert_eq!(val_of(&db, "AI_NONLOCAL").await, Some(12.5));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the record thread must never reach the network-capable get_value"
+    );
+}
+
+/// Boundary — a `.FIELD` target. The CA channel name C falls through with is
+/// `plink->value.pv_link.pvname` verbatim (`dbLink.c:129`), i.e. the same
+/// `record.FIELD` string `dbChannelCreate` just failed on — not the bare
+/// record name.
+#[tokio::test]
+async fn plain_non_local_db_link_keeps_its_field_in_the_channel_name() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ai(&db, "AI_NONLOCAL_FLD", "OTHER:PV.SEVR").await;
+
+    assert_eq!(db.initialize_link_locality().await, 1);
+    db.setup_external_link_opens().await;
+    db.sync_external_link_puts().await;
+    assert_eq!(lset.opened_names(), vec!["OTHER:PV.SEVR".to_string()]);
+}
+
+/// Boundary — a `Db` link whose target IS local is untouched. C returns from
+/// `dbInitLink` the moment `dbDbInitLink` succeeds (`dbLink.c:118-120`), never
+/// reaching `dbCaAddLink`: the link keeps `dbDb_lset`, its lock-set merge, its
+/// `PP` target processing and its `MS` severity inheritance.
+#[tokio::test]
+async fn local_db_link_is_not_converted() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("LOCAL_SRC", Box::new(AiRecord::new(7.0)))
+        .await
+        .unwrap();
+    add_ai(&db, "AI_LOCAL_DB", "LOCAL_SRC").await;
+
+    assert_eq!(
+        db.initialize_link_locality().await,
+        0,
+        "a local Db link must not be converted"
+    );
+    let inp = db
+        .get_record("AI_LOCAL_DB")
+        .unwrap()
+        .read()
+        .parsed_inp
+        .clone();
+    assert!(
+        matches!(inp, ParsedLink::Db(_)),
+        "a local Db link must stay a Db link, got {inp:?}"
+    );
+    assert_eq!(db.setup_external_link_opens().await, 0);
+    db.sync_external_link_puts().await;
+    assert!(lset.opened_names().is_empty());
+}
+
+/// Boundary — a CP link to a non-local target is unchanged by the new pass.
+/// It was already converted (by `setup_cp_links`) and already registered as an
+/// external CP trigger; moving the rewrite to the `dbInitLink` pass must keep
+/// BOTH halves, because C reaches the identical `dbCaAddLink` call for a
+/// CP link — it just skips `dbDbInitLink` on the way (`dbLink.c:117`).
+#[tokio::test]
+async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ai(&db, "AI_CP_NONLOCAL", "OTHER:CP CP").await;
+
+    db.initialize_link_locality().await;
+    db.setup_cp_links().await;
+
+    let inp = db
+        .get_record("AI_CP_NONLOCAL")
+        .unwrap()
+        .read()
+        .parsed_inp
+        .clone();
+    match inp {
+        ParsedLink::Ca(ca) => assert_eq!(ca.pv, "OTHER:CP"),
+        other => panic!("a non-local CP link must be Ca, got {other:?}"),
+    }
+    assert!(
+        db.external_cp_pv_names()
+            .await
+            .contains(&"OTHER:CP".to_string()),
+        "the external CP trigger must still be registered"
+    );
+}
+
+/// Boundary — the decision is made ONCE. C sets `DBLINK_FLAG_INITIALIZED` and
+/// returns early on any later `dbInitLink` (`dbLink.c:95-101`), so a record
+/// that appears in the IOC *after* iocInit does NOT pull an already-converted
+/// link back to a local DB link. Our commit into the parse cache has the same
+/// shape: nothing re-derives it from locality afterwards.
+#[tokio::test]
+async fn a_record_added_after_init_does_not_un_convert_the_link() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ai(&db, "AI_EARLY", "LATE_SRC").await;
+    assert_eq!(db.initialize_link_locality().await, 1);
+
+    // The target shows up later — iocInit is over.
+    db.add_record("LATE_SRC", Box::new(AiRecord::new(3.0)))
+        .await
+        .unwrap();
+
+    let inp = db.get_record("AI_EARLY").unwrap().read().parsed_inp.clone();
+    match inp {
+        ParsedLink::Ca(ca) => assert_eq!(
+            ca.pv, "LATE_SRC",
+            "the link stays external; C never un-converts"
+        ),
+        other => panic!("a converted link must stay Ca, got {other:?}"),
+    }
+}
+
+/// Boundary — a `Constant` link is not a `PV_LINK` and never reaches the
+/// locality test: `dbInitLink` returns at `dbConstInitLink`
+/// (`dbLink.c:101-104`). A numeric `INP` must not be turned into a CA channel
+/// named `3.5`.
+#[tokio::test]
+async fn constant_link_is_not_converted() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    add_ai(&db, "AI_CONST2", "3.5").await;
+
+    assert_eq!(db.initialize_link_locality().await, 0);
+    assert_eq!(db.setup_external_link_opens().await, 0);
+    db.sync_external_link_puts().await;
+    assert!(lset.opened_names().is_empty());
 }
 
 /// Boundary — an external `FLNK`. `dbInitLink` reaches

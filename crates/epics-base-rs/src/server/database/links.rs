@@ -2857,10 +2857,132 @@ impl PvDatabase {
             .collect()
     }
 
-    /// Classify one parsed CP/CPP link, deciding the local-vs-external
-    /// routing — this method is the single owner of that decision, so the
-    /// CP trigger registry and the holder's value-read parse cache stay
-    /// consistent.
+    /// C `dbInitLink`'s locality decision for ONE parsed link — the single
+    /// owner of "a DB link whose target is not in this IOC is a CA link".
+    ///
+    /// C chain. `dbInitLink` hands a modifier-less `PV_LINK` to
+    /// `dbDbInitLink` and returns only if it succeeds
+    /// (`dbLink.c:117-120`: `if (!dbDbInitLink(plink, dbfType)) return;`).
+    /// `dbDbInitLink` calls `dbChannelCreate(pvname)` and bails with
+    /// `S_db_notFound` when no such record exists in this IOC
+    /// (`dbDbLink.c:94-96`). Execution therefore falls through to
+    /// `dbCaAddLinkCallbackOpt` (`dbLink.c:129`) and the link becomes a CA
+    /// link. A link that already carries `CA`/`CP`/`CPP` skips
+    /// `dbDbInitLink` entirely (`dbLink.c:117`) and reaches the very same
+    /// call — which is why this rule is policy-agnostic and
+    /// direction-agnostic: it is the one locality decision, not a CP-only
+    /// one. Restricting it to CP/CPP left every plain non-local `Db` link
+    /// unconverted and unopened.
+    ///
+    /// **Decided once.** C sets `DBLINK_FLAG_INITIALIZED` on entry and
+    /// returns early on every later call (`dbLink.c:95-101`), so a record
+    /// added to the IOC *after* iocInit does NOT un-convert a link that was
+    /// already made external. [`Self::initialize_link_locality`] reproduces
+    /// that by committing the decision into the holder's parsed-link cache,
+    /// which is never re-derived from locality afterwards.
+    ///
+    /// Every other variant is returned unchanged: `Constant`
+    /// (`dbConstInitLink`, `dbLink.c:101-104`), the JSON links
+    /// (`dbJLinkInit`, `:107-110`), a hardware link and an already-external
+    /// `Ca`/`Pva` link all take a different arm of `dbInitLink` and never
+    /// consult record locality.
+    pub(crate) fn db_init_link_locality(
+        &self,
+        parsed: crate::server::record::ParsedLink,
+    ) -> crate::server::record::ParsedLink {
+        let crate::server::record::ParsedLink::Db(db) = &parsed else {
+            return parsed;
+        };
+        if self.has_name_no_resolve(&db.record) {
+            return parsed;
+        }
+        crate::server::record::ParsedLink::Ca(crate::server::record::CaLink {
+            // `DbLink::channel_name` is the same string C keeps in
+            // `pv_link.pvname` across the `dbChannelCreate` → `dbCaAddLink`
+            // fallthrough, so the DB target and the CA channel cannot drift.
+            pv: db.channel_name(),
+            monitor_switch: db.monitor_switch,
+            policy: db.policy,
+        })
+    }
+
+    /// Commit C `dbInitLink`'s locality decision into every record's parsed
+    /// link cache — the iocInit pass that makes the rule STATE rather than a
+    /// test each read path repeats.
+    ///
+    /// Runs after all records have loaded and before `setup_cp_links`, which
+    /// is C's ordering: `initPVLinks` walks the loaded database once. Only the
+    /// [`COMMON_LINK_FIELDS`](crate::server::record::record_instance::COMMON_LINK_FIELDS)
+    /// have a parse cache to commit into; `INPA..`/`DOL..` and the `lnkCalc`
+    /// arguments are re-parsed from their raw text each process cycle and keep
+    /// the read path's runtime locality fallback
+    /// ([`Self::read_target_value`]) instead.
+    ///
+    /// The decision is taken from the field's RAW text, not from the cache:
+    /// the cache is only guaranteed fresh when the field was written through
+    /// `put_common_field`, and a link whose raw string was installed some
+    /// other way must still be initialised. Only a genuine `Db` → `Ca`
+    /// conversion is written back, so a cache that legitimately differs from
+    /// its raw text is left alone.
+    ///
+    /// Returns the number of links converted.
+    pub async fn initialize_link_locality(&self) -> usize {
+        use crate::server::record::record_instance::COMMON_LINK_FIELDS;
+        let names = self.all_record_names().await;
+        let mut converted = 0usize;
+        for name in &names {
+            let Some(rec) = self.get_record(name) else {
+                continue;
+            };
+            // Decide before taking the record's write lock: the locality query
+            // reads the database's record map, and nothing else in this crate
+            // holds a record-instance lock across that map.
+            let raw: Vec<(&str, String)> = {
+                let inst = rec.read();
+                COMMON_LINK_FIELDS
+                    .iter()
+                    .filter_map(|(field, _)| {
+                        inst.common_link_text(field)
+                            .filter(|t| !t.is_empty())
+                            .map(|t| (*field, t.to_string()))
+                    })
+                    .collect()
+            };
+            let mut rewrites: Vec<(&str, crate::server::record::ParsedLink)> = Vec::new();
+            for (field, text) in &raw {
+                let ftype = COMMON_LINK_FIELDS
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .map(|(_, t)| *t)
+                    .expect("field came from COMMON_LINK_FIELDS");
+                let parsed = crate::server::record::parse_link_field(text, ftype);
+                if !matches!(parsed, crate::server::record::ParsedLink::Db(_)) {
+                    continue;
+                }
+                let next = self.db_init_link_locality(parsed);
+                if matches!(next, crate::server::record::ParsedLink::Ca(_)) {
+                    rewrites.push((field, next));
+                }
+            }
+            if rewrites.is_empty() {
+                continue;
+            }
+            let mut inst = rec.write();
+            for (field, link) in rewrites {
+                if let Some(slot) = inst.common_link_cache_mut(field) {
+                    *slot = link;
+                    converted += 1;
+                }
+            }
+        }
+        if converted > 0 {
+            eprintln!("iocInit: {converted} non-local DB link(s) made external");
+        }
+        converted
+    }
+
+    /// Classify one parsed CP/CPP link into the local or the external CP
+    /// trigger registry.
     ///
     /// A link with no CP/CPP policy (`cp_passive_only() == None`), and
     /// every non-`Db`/`Ca` variant, is ignored.
@@ -2871,51 +2993,24 @@ impl PvDatabase {
     /// are mutually exclusive process classes and `CA` is matched first
     /// (`dbStaticLib.c:2369-2373`), so it is a plain CA link with no CP policy.
     ///
-    /// `Db`: C `dbInitLink` (`dbLink.c:118-130`) makes any link carrying a
-    /// `CP`/`CPP`/`CA` option a CA link, and `dbDbInitLink` keeps it local
-    /// only when the named record exists in this IOC. So a CP/CPP `Db`
-    /// link whose target is NOT a local record (e.g. `INP="other:pv CP"`,
-    /// no explicit `CA`) must be served externally — both the calink
-    /// trigger monitor (`ext_links`) AND the holder's value read. The read
-    /// half is the `convert_to_ca` entry: it carries the field name and an
-    /// equivalent [`CaLink`] so the caller rewrites the holder's cached
-    /// parse from `Db` to `Ca`, routing the read through the external
-    /// resolver. A local target keeps the local fast-path (`db_links`).
-    async fn classify_cp_link(
+    /// `Db`: a *local* target only. The locality decision is not made here —
+    /// [`super::PvDatabase::record_link_fields`] has already mapped every
+    /// enumerated link through [`Self::db_init_link_locality`], so a CP/CPP
+    /// link to a non-local target arrives at the `Ca` arm above and lands in
+    /// `ext_links` by the same route an explicit `ca://OTHER CP` does. That
+    /// rule used to live in this method, which is why it applied to CP/CPP
+    /// links only.
+    fn classify_cp_link(
         &self,
-        field: &str,
         parsed: crate::server::record::ParsedLink,
         target_name: &str,
         db_links: &mut Vec<(String, String, bool)>,
         ext_links: &mut Vec<(String, String, bool)>,
-        convert_to_ca: &mut Vec<(String, crate::server::record::CaLink)>,
     ) {
         match parsed {
             crate::server::record::ParsedLink::Db(db) => {
-                let Some(passive_only) = db.policy.cp_passive_only() else {
-                    return;
-                };
-                if self.has_name_no_resolve(&db.record) {
+                if let Some(passive_only) = db.policy.cp_passive_only() {
                     db_links.push((db.record, target_name.to_string(), passive_only));
-                } else {
-                    // Reconstruct the CA channel name verbatim: `record`
-                    // for a default-`VAL` link, `record.FIELD` otherwise —
-                    // the same string the `CA`-modifier path would store
-                    // in `CaLink::pv`.
-                    let pv = if db.field == "VAL" {
-                        db.record.clone()
-                    } else {
-                        format!("{}.{}", db.record, db.field)
-                    };
-                    ext_links.push((pv.clone(), target_name.to_string(), passive_only));
-                    convert_to_ca.push((
-                        field.to_string(),
-                        crate::server::record::CaLink {
-                            pv,
-                            monitor_switch: db.monitor_switch,
-                            policy: db.policy,
-                        },
-                    ));
                 }
             }
             crate::server::record::ParsedLink::Ca(ca) => {
@@ -2940,44 +3035,15 @@ impl PvDatabase {
             // Enumerate this record's link-bearing fields through the
             // single shared owner (`record_link_fields`) so the CA CP/CPP
             // setup here and the pvalink install scan can never diverge on
-            // which fields count as links. `classify_cp_link` keeps only
-            // the CP/CPP-policy links, routes local `Db` vs external `Ca`,
-            // and — for a CP/CPP `Db` link to a non-local target — emits a
-            // `convert_to_ca` entry so the holder's value read is rewired
-            // to the external resolver (C `dbLink.c:118-130`).
-            let mut convert_to_ca: Vec<(String, crate::server::record::CaLink)> = Vec::new();
-            for (field, _raw, parsed) in self.record_link_fields(target_name) {
-                self.classify_cp_link(
-                    &field,
-                    parsed,
-                    target_name,
-                    &mut db_links,
-                    &mut ext_links,
-                    &mut convert_to_ca,
-                )
-                .await;
-            }
-            // Apply the `Db`→`Ca` parse-cache rewrite for non-local CP/CPP
-            // links so the holder reads its value through the external
-            // resolver — consistent with the external CP trigger registered
-            // above (both halves use the same locality decision made in
-            // `classify_cp_link`). Only the common-field caches are
-            // rewritten; INPA.. / DOL.. links are re-parsed from their raw
-            // strings each process cycle and so are not covered here.
-            if !convert_to_ca.is_empty() {
-                if let Some(rec_arc) = self.get_record(target_name) {
-                    let mut inst = rec_arc.write();
-                    for (field, calink) in convert_to_ca {
-                        let link = crate::server::record::ParsedLink::Ca(calink);
-                        match field.as_str() {
-                            "INP" => inst.parsed_inp = link,
-                            "OUT" => inst.parsed_out = link,
-                            "TSEL" => inst.parsed_tsel = link,
-                            "SDIS" => inst.parsed_sdis = link,
-                            _ => {}
-                        }
-                    }
-                }
+            // which fields count as links. That owner already applies C
+            // `dbInitLink`'s locality fallthrough
+            // (`Self::db_init_link_locality`), so a CP/CPP link to a
+            // non-local target arrives here as `Ca` and needs no
+            // CP-specific conversion; the holder's own read path is rewired
+            // by `initialize_link_locality`, which commits the same decision
+            // into the parse cache for every link, CP or not.
+            for (_field, _raw, parsed) in self.record_link_fields(target_name) {
+                self.classify_cp_link(parsed, target_name, &mut db_links, &mut ext_links);
             }
         }
 
@@ -3488,10 +3554,16 @@ mod cp_link_locality_tests {
     /// local only when the named record exists in this IOC.
     ///
     /// Here `INP="OTHER:PV CP"` parses to `ParsedLink::Db` (bare name, no
-    /// `CA`), but `OTHER:PV` is not local. After `setup_cp_links` the
-    /// holder's `parsed_inp` must be rewritten to `ParsedLink::Ca` (so the
-    /// read routes through `resolve_external_pv`) and `OTHER:PV` must be
-    /// registered as an external CP trigger.
+    /// `CA`), but `OTHER:PV` is not local. The holder's `parsed_inp` must be
+    /// rewritten to `ParsedLink::Ca` (so the read routes through
+    /// `resolve_external_pv`) and `OTHER:PV` must be registered as an
+    /// external CP trigger.
+    ///
+    /// The two halves now have two owners, matching C's two calls:
+    /// `initialize_link_locality` is `dbInitLink`'s conversion and applies to
+    /// EVERY link, CP or not; `setup_cp_links` only registers the trigger.
+    /// The rewrite used to live inside `setup_cp_links`, which is why it
+    /// reached CP/CPP links alone.
     #[tokio::test]
     async fn cp_link_to_nonlocal_target_forced_external() {
         let db = PvDatabase::new();
@@ -3503,6 +3575,7 @@ mod cp_link_locality_tests {
             rec.write().common.inp = "OTHER:PV CP".to_string();
         }
 
+        db.initialize_link_locality().await;
         db.setup_cp_links().await;
 
         let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
@@ -3522,8 +3595,9 @@ mod cp_link_locality_tests {
     }
 
     /// A CP link whose target IS a local record keeps the local fast-path:
-    /// `setup_cp_links` must NOT rewrite its `parsed_inp` to `Ca` and must
-    /// NOT register it as an external CP link.
+    /// neither `initialize_link_locality` nor `setup_cp_links` may rewrite
+    /// its `parsed_inp` to `Ca`, and it must NOT be registered as an external
+    /// CP link.
     #[tokio::test]
     async fn cp_link_to_local_target_stays_db() {
         let db = PvDatabase::new();
@@ -3542,6 +3616,7 @@ mod cp_link_locality_tests {
             inst.parsed_inp = crate::server::record::parse_link_v2("SRC CP");
         }
 
+        db.initialize_link_locality().await;
         db.setup_cp_links().await;
 
         let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();

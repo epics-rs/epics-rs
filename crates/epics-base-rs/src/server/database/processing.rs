@@ -4446,11 +4446,34 @@ impl PvDatabase {
 
     /// Complete an asynchronous record's post-process steps.
     /// Call after device support signals completion (clears PACT, runs alarms, snapshot, OUT, FLNK).
+    ///
+    /// # The completion RE-TAKES the gate
+    ///
+    /// This is the other half of C's async-device shape. `dbProcess` released
+    /// `dbScanLock` when it set `pact` and returned; the completion runs on the
+    /// callback task, which takes the record's lock again for the epilogue —
+    /// C `callback.c:379-388` `ProcessCallback`:
+    ///
+    /// ```c
+    /// dbScanLock(pRec);
+    /// (*pRec->rset->process)(pRec);
+    /// dbScanUnlock(pRec);
+    /// ```
+    ///
+    /// So the epilogue below — alarm commit, snapshot, OUT writes, FLNK — runs
+    /// under the SAME exclusion as the cycle that started it, and a put that
+    /// arrived during the async window has either already been serialised
+    /// ahead of it or waits behind it. Every caller reaches this from a
+    /// completion task holding no gate (the device-write completion spawn
+    /// above, the seq DLYn chain, the tests); nothing calls it with the gate
+    /// held, which would dead-lock on the non-reentrant gate.
     pub fn complete_async_record<'a>(
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
+            let canonical: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
+            let _record_gate = self.lock_record(&canonical).await;
             let mut visited = HashSet::new();
             self.complete_async_record_inner(name, &mut visited, 0)
         })

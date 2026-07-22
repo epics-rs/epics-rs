@@ -1,6 +1,5 @@
 // RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
 
-
 pub mod db_access;
 mod field_io;
 pub mod filters;

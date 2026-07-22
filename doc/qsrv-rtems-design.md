@@ -1148,7 +1148,7 @@ Two consequences worth stating:
   feature set, which is why `clippy --workspace --all-targets` is green
   over both.
 
-### 9.5 Feature-ON census: unchanged, and the suite is green
+### 9.5 Feature-ON census: unchanged, and the suite is green — **superseded by §9.13**
 
 §6.3's 250-site bill is stage 4's and nothing in stage 1 touched it.
 `epics-bridge-rs` still declares no `rtems-exec-model` feature, carries
@@ -1156,6 +1156,10 @@ no `rtems-exec-gate` dev-dep and no `RTEMS-EXEC-MODEL-ALLOW` markers, so
 the census gates nothing for this crate yet. Recorded for stage 4's
 baseline: at `79cbcc81` `cargo nextest run -p epics-bridge-rs` is
 **674 tests, 674 passed, 0 skipped**.
+
+All three "still" clauses were made false by stage 4 (§9.13): the feature
+is declared, the dev-dep is in, and 33 files carry markers. The 250 is
+wrong as well — it was 392.
 
 ### 9.6 What stage 1 did *not* do — settled by stage 2
 

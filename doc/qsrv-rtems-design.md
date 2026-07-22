@@ -1,6 +1,7 @@
 # QSRV + pvalink on the RTEMS execution model
 
-**Status:** design; **stages 1 and 2 implemented** (see §7, and §9 for
+**Status:** design; **stages 1 and 2 implemented and stage 2 verified on
+the target** (see §7, §9.11 for the measured boot, and the rest of §9 for
 every place reality deviated from what the probes predicted — in
 particular §9.7, where stage 2 found §3.3's mount point unbuildable).
 Stages 3–5 unimplemented.
@@ -1260,7 +1261,7 @@ workspace where an RTEMS entry point is not host-selectable.
 | 1 | convert 5 spawns at `group.rs:2496`,`:2532`, `pva_adapter.rs:404`,`:838`,`:1134` | done; the two `group.rs` lines had drifted to `:2569`/`:2605` POST-ROUND. `MemberTaskGuard`'s field became the seam alias `TaskAbortHandle` |
 | 2 | give the provider an RTEMS-reachable construction path | done as `build_qsrv_mount` — and the **host runner was rewired through it**, so the two entry points share one owner instead of two copies. §2.5's three dead-code warnings: **3 → 0** |
 | 3 | mount in `epics-pva-rs:rtems-pva-ioc` | mounted, but in `epics-bridge-rs:rtems-pva-ioc` — see §9.7 |
-| 4 | extend the source-text guards | done; 4 guards → 7, each proved to fail on its own defect before being committed |
+| 4 | extend the source-text guards | done; 4 guards → 8, each proved to fail on its own defect before being committed. The 8th is not a source-text guard: it runs `parse_db` + `parse_info_group` over the built-in database and asserts the group it defines (see §9.11) |
 
 Two further notes:
 
@@ -1296,3 +1297,125 @@ Two things inside stage 2's own scope were deliberately left:
   re-examined against the callback pool. It is runtime-agnostic and needed
   no conversion, so it is outside this stage's diff — but it has never run
   on the exec backend either.
+
+### 9.11 Stage 2 on the target — measured
+
+Built for `armv7-rtems-eabihf` (`-Zbuild-std=std,panic_abort`,
+`--no-default-features --features qsrv-core`, 8,700,984-byte ELF) and
+booted under qemu `xilinx-zynq-a9` on the bring-up box, reached over
+`EPICS_PVA_NAME_SERVERS=127.0.0.1:5075` alone (SLIRP `hostfwd`; no UDP
+broadcast, `EPICS_PVA_AUTO_ADDR_LIST=NO`). Clients are the C++ pvxs
+tools. The forward is proven live by protocol traffic — type descriptors
+and values come back — not by a `connect()` that SLIRP would accept
+regardless.
+
+#### The group source a bare target can have
+
+A `-kernel` boot has no populated filesystem, so no argument can name a
+`.json` file and the `dbLoadGroup` route of §3.2 is unreachable on this
+target. The record-info route (pvxs `loadConfigFromDb`, step 1 of
+`load_qsrv_groups`) is the only group source it has, so the built-in
+database declares the group with three `info(Q:group, …)` fragments, one
+per record, naming one group. `+channel` values there are record-relative
+by construction: info-group channels are prefixed with `"{record}."`
+unconditionally (`groupconfigprocessor.cpp:810-818`), so an absolute PV
+name is not expressible on this path at all.
+
+That database moved **out** of the `target_os = "rtems"` module into a
+`cfg(any(target_os = "rtems", test))` one. It is data, not RTEMS code,
+and by §9.8 the IOC body has no host compile until stage 4 — so without
+the move, a misplaced brace in a group fragment would have been
+detectable only by a cross-build, an image copy and a qemu boot, and its
+symptom on the console is *nothing at all*: a group that was never
+defined is a name no client can find. The 8th guard now runs the same two
+parsers the target runs and asserts the group id, its atomicity, and the
+three members in put order with their resolved channels.
+
+#### Boot console
+
+```
+rtems-boot: main() reached
+epics-rs: lock protocol: PI is enabled, RT scheduling AllowRealtime
+INFO: PVXS QSRV2 is loaded, permitted, and ENABLED.
+INFO  epics_bridge_rs::qsrv::pva_adapter: qsrv: processGroups created 1 group(s)
+rtems-pva-ioc: serving 3 records on PVA TCP port 5075 (UDP search on 5076), GUID de505deeb1cf08b9b680a0ca, RTEMS execution model, no tokio runtime
+rtems-pva-ioc: QSRV2 ENABLED — sources: qsrvSingle(0), qsrvGroup(1)
+rtems-pva-ioc: NOTE pva:// record links do NOT resolve on this target — pvalink needs a blocking PVA client, which does not exist yet (design stage 5). An INP/OUT of the form @pva://... will never connect. ca:// links are unaffected.
+```
+
+`qsrv2_enabled()` and `load_qsrv_groups()` — the two functions stage 1
+left dead — are the second and third lines. Nothing panicked over the
+whole session (`grep -icE "panic|panicked|FAILURE"` → 0).
+
+#### Group introspection
+
+Asserted with `pvxinfo`, not a default-format `pvxget`: a GET reply never
+sets the top-level struct-id bit, so Delta output drops exactly the id
+being checked here.
+
+```
+$ pvxinfo -w 8 RTEMS:PVA:GRP
+RTEMS:PVA:GRP from 127.0.0.1:5075
+struct "rtems:demo/Group:1.0" {
+    struct "epics:nt/NTScalar:1.0" {
+        double value
+        ...
+    } setpoint
+    int32_t count
+    string message
+    struct { struct { int32_t queueSize; bool atomic } _options } record
+}
+```
+
+The declared `+id` survives to the wire; `+type:"scalar"` composes a full
+NTScalar substructure while the two `+type:"plain"` members are bare
+scalars; and the `record._options` block pvxs adds to every group is
+present, carrying `atomic` from the group's `+atomic`.
+
+#### Group GET, group PUT, single-PV regression
+
+```
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP        # values from the built-in database
+            double value = 1.5             #   RTEMS:PVA:AO.VAL, units "V", precision 3
+        int32_t count = 7                  #   RTEMS:PVA:LO.VAL
+        string message = "rtems-pva-ioc"   #   RTEMS:PVA:MSG.VAL
+              bool atomic = true
+
+$ pvxput -w 8 RTEMS:PVA:GRP setpoint.value=4.25 count=42 message=from-group-put
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP
+            double value = 4.25
+        int32_t count = 42
+        string message = "from-group-put"
+
+$ pvxget -w 8 RTEMS:PVA:AO RTEMS:PVA:LO RTEMS:PVA:MSG    # the backing records
+    value double = 4.25
+    value int32_t = 42
+    value string = "from-group-put"
+
+$ pvxput -w 8 RTEMS:PVA:AO 9.75; pvxput -w 8 RTEMS:PVA:LO 123
+$ pvxput -w 8 RTEMS:PVA:MSG single-put
+$ pvxget -w 8 RTEMS:PVA:AO RTEMS:PVA:LO RTEMS:PVA:MSG
+    value double = 9.75
+    value int32_t = 123
+    value string = "single-put"
+
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP        # the group sees the single PUTs
+            double value = 9.75
+        int32_t count = 123
+        string message = "single-put"
+
+$ pvxget -w 8 RTEMS:PVA_CONN_CNT RTEMS:FD_CNT RTEMS:FD_MAX
+    value double = 0 / 8 / 150
+```
+
+Both directions are live: a group PUT reaches the backing records, and a
+single PUT is visible through the group. `pvxinfo RTEMS:PVA:AO` still
+reports `epics:nt/NTScalar:1.0`, and the status PVs still resolve — so
+`qsrvSingle` at order 0 is not shadowed by the group source at order 1.
+
+#### What this run did not measure
+
+Only correctness. MONITOR on a group, the atomic-PUT interleave, and the
+spawn-count asymmetry of §8 item 2 were not exercised under load, and the
+`activation_handles` MONITOR START-STOP gate still has never run on the
+exec backend (§9.10).

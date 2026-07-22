@@ -57,7 +57,7 @@ fn poison_should_be_announced() -> bool {
 /// run on a facility thread; a panic under the lock on a *submitter's* thread
 /// — inside `schedule`/`request`, on whatever thread called it — has no such
 /// site, and this is what reports it.
-pub(super) fn recover<T>(facility: &str, result: std::sync::LockResult<T>) -> T {
+pub(crate) fn recover<T>(facility: &str, result: std::sync::LockResult<T>) -> T {
     match result {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -80,7 +80,7 @@ pub(super) fn recover<T>(facility: &str, result: std::sync::LockResult<T>) -> T 
 /// inside it costs that callback and nothing else.
 ///
 /// Returns `false` when the callback unwound.
-pub(super) fn run_isolated(facility: &str, cb: impl FnOnce()) -> bool {
+pub(crate) fn run_isolated(facility: &str, cb: impl FnOnce()) -> bool {
     match catch_unwind(AssertUnwindSafe(cb)) {
         Ok(()) => true,
         Err(payload) => {

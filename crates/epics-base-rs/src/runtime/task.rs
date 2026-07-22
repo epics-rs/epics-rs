@@ -1382,6 +1382,7 @@ mod tests {
                 include_str!("background/callback_executor.rs"),
             ),
             ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
 
         let mut unclassified = Vec::new();
@@ -2088,6 +2089,7 @@ mod tests {
                 include_str!("background/callback_executor.rs"),
             ),
             ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
         // The one exemption, named rather than pattern-matched: the
         // SCHED_FIFO range probe is `#[cfg(target_os = "linux")]`, exists for
@@ -2152,6 +2154,7 @@ mod tests {
                 include_str!("background/callback_executor.rs"),
             ),
             ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
+            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
         // Only the definition and the prologue's own delegation, both in
         // task.rs. Anywhere else is a thread banded without being named.

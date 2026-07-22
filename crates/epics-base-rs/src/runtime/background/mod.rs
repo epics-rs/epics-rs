@@ -30,7 +30,7 @@
 
 pub mod callback_executor;
 pub mod delayed_timer;
-mod facility;
+pub(crate) mod facility;
 pub mod future_exec;
 pub mod scan_once;
 pub mod timer_sleep;

@@ -37,6 +37,8 @@
 //! events arrive). On terminal failure the entry transitions to the
 //! `Disconnect` state, which the cleanup tick eventually evicts.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1888,6 +1890,9 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the eight gated tests below host a real async CA server, so the
+    // import carries their predicate — otherwise it is unused feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     use epics_ca_rs::server::CaServer;
     use serial_test::serial;
 
@@ -2366,6 +2371,13 @@ ASG(NewGroup) {
     /// Re-applying the same identity reports no change (idempotent), so a
     /// caller can gate a downstream access-rights re-notification on a real
     /// transition.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_2026_111_reload_updates_live_acl_on_admitted_pv() {
@@ -2423,6 +2435,13 @@ ASG(NewGroup) {
     /// non-empty downstream `units` proves the first-event recovery seeded
     /// it. Reverting `first_event_seen = !seed_succeeded` to `= false`
     /// leaves units empty and fails this test.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_gw23_seed_miss_first_prop_event_seeds_metadata() {
@@ -2524,6 +2543,13 @@ ASG(NewGroup) {
     /// Registration is now gated on a live upstream connection, so this
     /// test hosts a real `CaServer` serving the *real* name; the served
     /// (alias) name is what the shadow PV must be keyed by.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_fr2_alias_registers_shadow_pv_under_served_name() {
@@ -2576,6 +2602,13 @@ ASG(NewGroup) {
     /// a plain (non-alias) ALLOW match passes served == real,
     /// so the shadow PV is keyed by the same name — the pre-FR-2 behavior
     /// for non-alias names is preserved exactly.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_fr2_non_alias_keys_shadow_pv_by_same_name() {
@@ -2649,6 +2682,13 @@ ASG(NewGroup) {
     /// sentinel — proving the GET path forwards and the monitor path does
     /// not. Mirrors C `-no_cache` forwarding the read to the IOC
     /// (gateVc.cc:1361-1369).
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_no_cache_get_forwards_to_upstream() {
@@ -2703,6 +2743,13 @@ ASG(NewGroup) {
     /// Cached mode regression: NO read hook is installed, so a GET serves
     /// the stored shadow value even when the upstream differs — the
     /// no-cache forwarding is opt-in and does not leak into cached mode.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_cached_get_serves_shadow_value() {
@@ -2744,6 +2791,13 @@ ASG(NewGroup) {
     /// spawns one; `release_monitor` (last downstream monitor) aborts it.
     /// Mirrors C no-cache `getCB` creating the monitor only on
     /// `needPosting()` (gatePv.cc:1737-1753).
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_no_cache_monitor_is_lazy() {
@@ -2825,6 +2879,13 @@ ASG(NewGroup) {
     /// `ensure_subscribed`) and `ensure_monitor`/`release_monitor` are
     /// no-ops — the persistent monitor must outlive any single downstream
     /// subscriber.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_cached_monitor_eager_ensure_release_noop() {

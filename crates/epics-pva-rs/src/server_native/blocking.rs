@@ -1318,7 +1318,13 @@ const UDP_RECV_BUF: usize = 64 * 1024;
 /// with the flags on, the kernel may join this socket to an unrelated reuse
 /// group and load-balance SEARCHes away from it — and because reuse means a
 /// collision does *not* fail, there would be no error to detect afterwards.
-/// [[pva-udp-port-sharing-is-silent]]
+///
+/// Nor is there a message to read. CA announces the same situation — a
+/// `cas WARNING: ... two or more servers share the same UDP port` from
+/// `rsrv` — but PVA has no equivalent on either side of the wire, so a
+/// silently shared search port is invisible to the process that shared it.
+/// The only positive evidence of exclusive ownership is a client-side
+/// listing (`pvxlist`) that sees exactly the expected server.
 pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     bind_udp_search_socket(addr)
 }
@@ -3645,8 +3651,9 @@ mod tests {
     /// An ephemeral search port is bound *bare* — no `SO_REUSEADDR`/
     /// `SO_REUSEPORT` — so a second bind on that number fails loudly instead
     /// of silently joining a reuse group and load-balancing SEARCHes away.
-    /// [[pva-udp-port-sharing-is-silent]] is exactly the failure this rule
-    /// prevents: with the flags on there is no error to detect afterwards.
+    /// That silent sharing is exactly the failure this rule prevents: with
+    /// the flags on there is no error to detect afterwards, and unlike CA
+    /// there is no `cas WARNING` printed either — nothing would report it.
     #[test]
     fn an_ephemeral_search_port_is_not_silently_shared() {
         let first = bind_udp_search(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("first bind");

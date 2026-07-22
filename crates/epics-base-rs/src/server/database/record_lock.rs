@@ -64,67 +64,88 @@
 //! exactly as `dbScanLock` is a layer above the record's own field
 //! storage.
 //!
-//! Wait discipline — priority-ordered, not FIFO
-//! -------------------------------------------
-//! The gate used to be a `tokio::sync::Mutex<()>`, whose waiter queue is
-//! strictly FIFO. On the RTEMS backend both ends of the contention pair
-//! are banded IOC threads parked in `std::thread::park()`
-//! (`doc/rtems-priority-locks-design.md` §0 finding 4): a `scan-1` thread
-//! at EPICS 63 waits behind a `CAS-client` thread at EPICS 20 purely
-//! because the low-band thread asked first. Nothing in the kernel can fix
-//! that — the waiters are parked on a userspace queue it cannot see — so
-//! the queue itself has to be ordered. [`PriorityGate`] orders it by the
-//! waiter's declared EPICS band ([`crate::runtime::task::current_thread_band`],
-//! published by `enter_ioc_thread`), highest band first, FIFO among equal
-//! bands.
+//! What the gate *is* — a blocking priority-inheritance mutex
+//! ----------------------------------------------------------
+//! The gate is a [`crate::runtime::sync::PriorityInheritanceMutex`], the
+//! same primitive L46 (`registration_mutex`), L8a (`simple_pvs`) and L8b
+//! (one `scan_index` bucket) already use, and [`PvDatabase::lock_record`] /
+//! [`PvDatabase::lock_records`] are plain synchronous `fn`s returning RAII
+//! guards. This is `doc/rtems-priority-locks-design.md` §5 steps 5–6, and it
+//! is the parity shape rather than a Rust-side invention: C's `dbScanLock`
+//! takes `precord->mlok`, a plain `epicsMutex`, and on the RTEMS arm
+//! base compiles the POSIX implementation
+//! (`configure/toolchain.c:31-35` selects `OS_API = posix` for
+//! `__RTEMS_MAJOR__ >= 5`; `os/RTEMS-posix/osdMutex.c:8` is one `#include
+//! "../posix/osdMutex.c"`), whose `globalAttrInit`
+//! (`os/posix/osdMutex.c:71-88`) builds every `epicsMutex` with
+//! `PTHREAD_PRIO_INHERIT` — probing it once and silently degrading to
+//! `PTHREAD_PRIO_NONE` if the target refuses. `PriorityInheritanceMutex` is
+//! that same construction on that same API, including the probe.
 //!
-//! This closes handoff §8.0 **gap 3** only. It does **not** give the gate
-//! priority inheritance: there is still no kernel-visible owner, so a
-//! preempted low-band holder is still not boosted. That is gap 4, and it is
-//! `doc/rtems-priority-locks-design.md` §5 step 4 (L1 → `PriorityInheritanceMutex`),
-//! which discards the ordering logic below because a PI pthread mutex
-//! orders by priority in the kernel.
+//! ### The band-ordered wait queue is gone, and why that is not a loss
 //!
-//! ### The wake invariant — MUST
+//! Until §5 step 4 this gate was an async lock, and between steps 2 and 5 it
+//! was a hand-rolled `PriorityGate` whose waiters were parked in a
+//! `BTreeMap` keyed by the waiter's declared EPICS band, highest band first,
+//! FIFO among equals. That queue existed for exactly one reason: while the
+//! gate was async, both ends of a contention pair were *tasks* parked on a
+//! userspace queue the kernel could not see, so nothing but our own code
+//! could order them (`doc/rtems-priority-locks-design.md` §0 finding 4, §2
+//! option C). It was the async bridge, not the target design.
 //!
-//! > **Only the thread that owns the gate may pop a waiter off the queue.**
-//! > Ownership is handed *directly* from the releaser to the popped waiter —
-//! > `held` is never cleared while the queue is non-empty — so no third
-//! > party can barge in between the pop and the wake. A waiter that is
-//! > cancelled while merely queued MUST remove its own entry and nothing
-//! > else; a waiter that is cancelled *after* being handed ownership MUST
-//! > perform the release itself, because at that moment it **is** the owner.
+//! With a blocking PI mutex the waiters are real threads blocked in
+//! `pthread_mutex_lock`, so the *OS* orders the queue — by thread priority,
+//! which on the RTEMS backend is the EPICS band the thread declared through
+//! `enter_ioc_thread` — and additionally boosts a preempted low-band holder
+//! to the highest waiting band. The band-ordered wake order is therefore
+//! replaced by the kernel's PI wait order, which is strictly stronger: it is
+//! what closes handoff §8.0 **gap 4** (priority inheritance), which no
+//! userspace queue could close at all. `PriorityGate`, its `BTreeMap` wait
+//! queue, `GateAcquire` and the `DECLARED_BAND` thread-local that fed it are
+//! deleted with this flip.
 //!
-//! **Owner/gate:** [`PriorityGate::hand_off`] is the single pop site. It is
-//! reached from exactly two places, both of which own the gate when they
-//! call it: [`PriorityGate::release`] (run by `GateGuard::drop`) and
-//! `GateAcquire::drop` on the granted-then-cancelled path. Adding a third
-//! caller means adding a third owner and re-opening the barge/lost-wake
-//! family this rule exists to close — do not pop the queue anywhere else,
-//! including from an "opportunistic" fast path in `poll`.
+//! ### Where the ordering actually holds — [`crate::runtime::sync::is_pi_mutex_active`]
 //!
-//! The invariant that makes the fast path safe is the converse: a waiter is
-//! only ever enqueued while `held` is true, and `held` is only ever cleared
-//! with an empty queue, so `!held` implies "no waiters" and a first-poll
-//! acquisition cannot jump the queue.
+//! Priority inheritance is a property of the *build and the target*, and the
+//! function above is the single place that answers whether this process got
+//! it:
+//!
+//! * **RTEMS** — PI, and the answer is a *probe* result rather than a `cfg!`,
+//!   matching C's own degrade path (`os/posix/osdMutex.c:77-85`, reported by
+//!   `epicsMutexShowAll` at `:199-205`).
+//! * **Linux with the `linux-rt` Cargo feature** — PI unconditionally.
+//! * **every other build, including a default hosted Linux `cargo test`** —
+//!   `parking_lot::Mutex`, which has **no** priority inheritance and no
+//!   priority ordering. The host suite therefore verifies the *exclusion*
+//!   this module provides, never its ordering; ordering is on-target
+//!   territory (`doc/rtems-priority-locks-design.md` §5 step 7).
 //!
 //! Acquisition order — MUST
 //! ------------------------
 //! `doc/rtems-priority-locks-design.md` §3's cross-check requires this to be
-//! written down, because as of step 4 the locks nested under L1 are *blocking*
-//! and a cycle would wedge a thread rather than a task. The order below is the
+//! written down, because every lock in the chain is now *blocking* and a
+//! cycle would wedge a thread rather than a task. The order below is the
 //! one the code actually takes, not an aspiration — it was derived by reading
 //! every nesting site, and the bypass audit is in the commit that added it.
 //!
 //! > **A thread MUST acquire these in this order and MUST NOT acquire any of
 //! > them while holding one that appears later:**
 //! >
+//! > 0. **L33** — `epics-bridge-rs`' `GroupPvDef::atomic_write_lock`, the
+//! >    QSRV per-group atomic-PUT gate. Outside this crate, and only the
+//! >    atomic group PUT takes it — see the L33 section below.
 //! > 1. **L1** — the per-record advisory gate ([`PvDatabase::lock_record`] /
 //! >    [`PvDatabase::lock_records`]), *this* module.
 //! > 2. **L46** — `PvDatabaseInner::registration_mutex`.
 //! > 3. the leaves, none of which is ever held while another lock is taken:
-//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket, the `records`
-//! >    map, `aliases`, and a record's own `RwLock<RecordInstance>`.
+//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket, **L7**
+//! >    `ProcessVariable::subscribers`, the `records` map, `aliases`, and a
+//! >    record's own `RwLock<RecordInstance>`.
+//!
+//! [`RecordLockRegistry`]'s own map mutex (a `std::sync::Mutex`, unchanged by
+//! this flip) is *not* a rung of that order: it is taken and released inside
+//! [`RecordLockRegistry::gate_for`], strictly before the record gate it
+//! returns is locked, and no other lock is ever taken while it is held.
 //!
 //! **Owner/Gate:** [`PvDatabase::update_scan_index`] is the **only** production
 //! function that takes L46 from inside an L1-held window, and therefore the
@@ -139,290 +160,74 @@
 //! this chain: route it through `update_scan_index` instead, or the order
 //! above stops being checkable by reading one function.
 //!
-//! The rule's teeth are structural for the two rightmost steps: an L46 or
-//! L8a/L8b guard is `!Send`, so the compiler refuses any hold across an
-//! `.await` at the `tokio::spawn` sites, which is what stops a holder from
-//! suspending mid-chain. L1 is not covered by that yet — see below.
+//! ### The rule's teeth are structural, and now they cover L1 too
 //!
-//! ### What L1 is today, and the one await still inside its window
+//! Every guard in the list above is `!Send`. A `!Send` value held across an
+//! `.await` makes the enclosing future `!Send`, which the compiler rejects at
+//! every `tokio::spawn` / `runtime::task::spawn` site in this workspace — so
+//! "no suspension point inside a gate window" is a build error rather than a
+//! review convention. That is the structural guarantee `doc/rtems-priority-locks-design.md`
+//! §5 steps 5–6 (holders H1–H9) were staged to make reachable: each holder
+//! was first rewritten so its gate-held region contained zero `.await`s, and
+//! only then did the gate become a type that refuses to be held across one.
 //!
-//! L1 is still the async [`PriorityGate`] and `lock_record` / `lock_records`
-//! are still `async fn`. Step 4 deliberately stopped short of the type flip:
-//! seven of the nine holders (`doc/rtems-priority-locks-design.md` §1.1) hold
-//! the gate across an `.await`, so a `!Send` guard here would not compile
-//! before H6 (§5 step 5) lands.
-//!
-//! Concretely, after step 4 the H1 (`field_io.rs` `put_pv_inner`) and H2
-//! (`put_pv_and_post_with_origin`) windows each contain **exactly one**
-//! `.await`, and it is the same one in both: `run_special_actions`. The
-//! scan-index tail that used to sit beside it is synchronous now. That last
-//! await is not removable here — it re-enters H1/H6. It no longer reaches a
-//! `ca://`/`pva://` network write: `write_external_pv` stages the write on the
-//! database's link-put queue and returns, as C `dbCaPutLink` does
-//! (`dbCa.c:544-631`), so the only lset call left inside the window is the
-//! cached-state `put_admission` probe. See `run_special_actions`' own doc
-//! comment for the exact list.
-//!
-//! **H6, H7, H8 and H9 now hold their gate across zero `.await`s** (§5 steps
-//! 5/6, all landed): H6 (`processing.rs` `process_record_with_links_inner`)
-//! and H8 (`qsrv/group.rs` atomic GET, `lock_group_records_read` hoisted
-//! above the gate) first; H7 (`pvalink/integration.rs`'s atomic scan epoch)
-//! and H9 (`qsrv/group.rs` atomic group PUT) followed once their callee
-//! chains were sync post-H6. Only **H4** (`field_io.rs`
-//! `put_record_field_from_ca_inner`) remains untouched and still awaits
-//! freely under the gate.
+//! `!Send`ness is deliberate on both arms of [`crate::runtime::sync::PriorityInheritanceMutex`],
+//! and on the PI arm it is also a correctness requirement, not only a
+//! lint: POSIX requires a mutex to be unlocked by the thread that locked it,
+//! so a guard that could migrate between threads would call
+//! `pthread_mutex_unlock` from a non-owner.
 //!
 //! ### L33 — the QSRV atomic-PUT group lock, relative to L1
 //!
-//! `epics-bridge-rs`' `GroupPvDef::atomic_write_lock` (`qsrv/group_config.rs`,
-//! `Arc<tokio::sync::Mutex<()>>`) is a group-vs-group serialization aid, not
-//! one of the locks listed above (it lives in a different crate and has no
-//! nesting relationship with L46/L8a/L8b). It is acquired in
-//! `GroupChannel::put`'s atomic branch **before** `PvDatabase::lock_records`
-//! (L1) — first so a conversion failure in the up-front value-conversion
-//! phase aborts the whole atomic PUT before any member-record gate is even
+//! `epics-bridge-rs`' `GroupPvDef::atomic_write_lock` (`qsrv/group_config.rs`)
+//! is a group-vs-group serialization aid: it lives in a different crate and
+//! has no nesting relationship with L46/L8a/L8b, but it *is* held across L1
+//! and so occupies rung 0 of the order above. It is acquired in
+//! `GroupChannel::put`'s atomic branch **before** [`PvDatabase::lock_records`]
+//! — first so a conversion failure in the up-front value-conversion phase
+//! aborts the whole atomic PUT before any member-record gate is even
 //! requested, second so two atomic PUTs to the *same* group serialize before
-//! either reaches L1 at all. It stays a plain `tokio::sync::Mutex`, **not** a
-//! `PriorityInheritanceMutex`: it is held for the whole atomic block, which
-//! means it is held across `lock_records(…).await` itself — genuinely
-//! async today, since L1 has not made the step-4 type flip. Converting L33
-//! first would hold a `!Send` guard across that await and fail to compile at
-//! the connection-task spawn site, the same trap this module's own L1 type
-//! flip is staged around. L33 becomes convertible once L1 does (step 4).
+//! either reaches L1 at all.
+//!
+//! It is a `PriorityInheritanceMutex` as of this flip. It was a
+//! `tokio::sync::Mutex` for exactly as long as L1 was async: its window
+//! contains `lock_records`, which used to be a genuine suspension point, and
+//! a `!Send` guard across that await would not compile at the connection-task
+//! spawn site. That window is now the conversion phase, a synchronous
+//! `lock_records`, and a synchronous member loop — zero `.await`s — so the
+//! reason to keep it async is gone.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// No RTEMS-EXEC-MODEL-ALLOW marker: this file's tests are all plain `#[test]`s
+// now that the gate is a blocking lock (a contender has to be a real thread),
+// so none of them needs a reactor and there is nothing to account for.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::collections::HashMap;
 
-use crate::runtime::task::current_thread_band;
+use crate::runtime::sync::{PriorityInheritanceMutex, PriorityInheritanceMutexGuard};
 
 use super::PvDatabase;
 
-/// Position of one waiter in a gate's queue.
+/// One record's advisory write gate, and the lifetime it is handed out with.
 ///
-/// Ordered by band **descending** then arrival **ascending**, which is
-/// exactly the derived tuple order given the `Reverse` on the band: the
-/// `BTreeMap`'s first entry is always the highest band, and among equal
-/// bands always the one that arrived first. Equal-band FIFO is not a
-/// detail — without it, two threads in the same band would be reordered
-/// against each other by nothing but map iteration, which is the
-/// starvation surprise a priority queue is otherwise blamed for.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct WaiterKey {
-    band: Reverse<u8>,
-    seq: u64,
-}
-
-/// Everything a gate knows, under one non-async lock.
-///
-/// `std::sync::Mutex` deliberately: the critical sections here are a map
-/// insert/remove and a few field writes, never an `.await`, and a blocking
-/// lock is the only kind whose `unlock` can be reached from `Drop` — which
-/// is where cancellation is handled.
-#[derive(Default)]
-struct GateState {
-    /// `true` from the moment ownership is taken until the moment it is
-    /// released — *including* the window where ownership has been handed to
-    /// a waiter that has not been polled yet. Never cleared while
-    /// `waiters` is non-empty.
-    held: bool,
-    /// The waiter ownership was handed to, if any. It has already been
-    /// popped from `waiters`; it learns of the grant on its next poll, or
-    /// releases on its `Drop` if it is cancelled first.
-    granted_to: Option<WaiterKey>,
-    /// Arrival counter, giving equal-band waiters their FIFO order.
-    next_seq: u64,
-    /// Parked waiters, ordered by [`WaiterKey`]. A `None` waker means the
-    /// entry was enqueued by a poll that has not re-registered yet; it
-    /// cannot happen today (every insert carries a waker) but the shape
-    /// keeps `hand_off` total.
-    waiters: BTreeMap<WaiterKey, Option<Waker>>,
-}
-
-/// A single-owner advisory gate whose waiters are woken in EPICS-band
-/// order — the replacement for `tokio::sync::Mutex<()>` described in the
-/// module doc's wake-invariant section.
-#[derive(Default)]
-struct PriorityGate {
-    state: std::sync::Mutex<GateState>,
-}
-
-impl PriorityGate {
-    /// Acquire the gate, yielding an owned (`'static`, `Send`) guard.
-    ///
-    /// Cancel-safe: dropping the returned future before it completes leaves
-    /// the gate exactly as it found it, whether the future was still queued
-    /// or had already been handed ownership.
-    fn lock_owned(self: &Arc<Self>) -> GateAcquire {
-        GateAcquire {
-            gate: Arc::clone(self),
-            key: None,
-        }
-    }
-
-    /// Give up ownership. Run by `GateGuard::drop`; see the module doc's
-    /// MUST rule for who else may reach [`Self::hand_off`].
-    fn release(&self) {
-        let waker = {
-            let mut state = self.lock_state();
-            debug_assert!(state.held, "released a gate that was not held");
-            debug_assert!(
-                state.granted_to.is_none(),
-                "the gate was granted to a waiter while an owner still held it"
-            );
-            Self::hand_off(&mut state)
-        };
-        // Outside the state lock: a waker may run arbitrary scheduler code,
-        // and it must not be able to re-enter this gate's lock.
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    /// **The single pop site.** Hand ownership to the highest-ranked
-    /// waiter, or drop it if there is none.
-    ///
-    /// Returns the waker to fire once the caller has released the state
-    /// lock. Ownership is transferred *directly* — `held` stays `true`
-    /// whenever a waiter was popped — so nothing can acquire the gate in
-    /// the gap between the pop and the wake.
-    fn hand_off(state: &mut GateState) -> Option<Waker> {
-        match state.waiters.pop_first() {
-            Some((key, waker)) => {
-                state.granted_to = Some(key);
-                waker
-            }
-            None => {
-                state.held = false;
-                None
-            }
-        }
-    }
-
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, GateState> {
-        self.state.lock().expect("record gate state mutex poisoned")
-    }
-}
-
-/// The future returned by [`PriorityGate::lock_owned`].
-struct GateAcquire {
-    gate: Arc<PriorityGate>,
-    /// `Some` exactly while this future occupies a place in the gate's
-    /// queue *or* holds an unclaimed grant. Cleared when the guard is
-    /// handed out, which is what makes [`Drop`] a no-op on the success
-    /// path.
-    key: Option<WaiterKey>,
-}
-
-impl Future for GateAcquire {
-    type Output = GateGuard;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut state = this.gate.lock_state();
-        match this.key {
-            // First poll: take the gate outright if it is free. Free
-            // implies no waiters (see the module doc's converse
-            // invariant), so this cannot jump the queue.
-            None => {
-                if !state.held {
-                    state.held = true;
-                    drop(state);
-                    return Poll::Ready(GateGuard {
-                        gate: Arc::clone(&this.gate),
-                    });
-                }
-                let key = WaiterKey {
-                    band: Reverse(current_thread_band()),
-                    seq: state.next_seq,
-                };
-                state.next_seq += 1;
-                state.waiters.insert(key, Some(cx.waker().clone()));
-                this.key = Some(key);
-                Poll::Pending
-            }
-            Some(key) => {
-                if state.granted_to == Some(key) {
-                    // The releaser already transferred ownership to us;
-                    // `held` was never cleared, so there is nothing to take.
-                    state.granted_to = None;
-                    drop(state);
-                    this.key = None;
-                    return Poll::Ready(GateGuard {
-                        gate: Arc::clone(&this.gate),
-                    });
-                }
-                if let Some(slot) = state.waiters.get_mut(&key) {
-                    let stale = !matches!(slot, Some(waker) if waker.will_wake(cx.waker()));
-                    if stale {
-                        *slot = Some(cx.waker().clone());
-                    }
-                }
-                Poll::Pending
-            }
-        }
-    }
-}
-
-impl Drop for GateAcquire {
-    fn drop(&mut self) {
-        // `None` means never enqueued, or the guard was already handed out
-        // — in the latter case the guard owns the release.
-        let Some(key) = self.key.take() else {
-            return;
-        };
-        let waker = {
-            let mut state = self.gate.lock_state();
-            if state.granted_to == Some(key) {
-                // Cancelled after being handed ownership: this future *is*
-                // the owner, so it owes the same release the guard would
-                // have run. Skipping it wedges the gate forever.
-                state.granted_to = None;
-                PriorityGate::hand_off(&mut state)
-            } else {
-                // Cancelled while merely queued: remove this entry and
-                // nothing else. Popping the queue here would be a second
-                // owner for the wake transition.
-                state.waiters.remove(&key);
-                None
-            }
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-
-/// Ownership of one [`PriorityGate`], released on drop.
-///
-/// `'static` and `Send` (it is just an `Arc`), which is what lets
-/// [`RecordWriteGuard`] be held across `.await` points in a `tokio::spawn`ed
-/// future exactly as the `OwnedMutexGuard` it replaces was.
-struct GateGuard {
-    gate: Arc<PriorityGate>,
-}
-
-impl Drop for GateGuard {
-    fn drop(&mut self) {
-        self.gate.release();
-    }
-}
+/// `&'static` rather than `Arc`: [`RecordLockRegistry`] never removes an
+/// entry (see its doc), so a gate's lifetime already *is* the process's, and
+/// the PI mutex — a `pthread_mutex_t` on the target arms — has no owned-guard
+/// API to build an `Arc`-carrying guard from. Leaking one allocation per
+/// record at first use makes the guards genuinely `'static` with no `unsafe`
+/// and no reference counting on the write hot path, and frees exactly as much
+/// memory as the previous `Arc`-in-a-never-pruned-map did: none.
+type Gate = &'static PriorityInheritanceMutex<()>;
 
 /// Registry of per-record advisory write gates.
 ///
-/// Lazily allocates one `Arc<PriorityGate>` per canonical record name on
-/// first use. Entries are never removed: an EPICS database is loaded
-/// once at IOC init and the record set is effectively static, so the
-/// map size is bounded by the record count and removing entries would
-/// reintroduce a TOCTOU race with a concurrent locker.
+/// Lazily allocates one gate per canonical record name on first use.
+/// Entries are never removed: an EPICS database is loaded once at IOC init
+/// and the record set is effectively static, so the map size is bounded by
+/// the record count and removing entries would reintroduce a TOCTOU race
+/// with a concurrent locker.
 #[derive(Default)]
 pub(crate) struct RecordLockRegistry {
-    gates: std::sync::Mutex<HashMap<String, Arc<PriorityGate>>>,
+    gates: std::sync::Mutex<HashMap<String, Gate>>,
 }
 
 impl RecordLockRegistry {
@@ -432,14 +237,24 @@ impl RecordLockRegistry {
     /// [`PvDatabase::lock_record`] / [`PvDatabase::lock_records`]
     /// resolve aliases before calling this so an alias and its target
     /// always share one gate.
-    fn gate_for(&self, record: &str) -> Arc<PriorityGate> {
+    ///
+    /// The map lock is released before the caller locks the gate — it is not
+    /// a rung of the acquisition order, and holding it across a gate
+    /// acquisition would serialise every record in the database behind one
+    /// writer.
+    fn gate_for(&self, record: &str) -> Gate {
         let mut map = self
             .gates
             .lock()
             .expect("record-lock registry mutex poisoned");
-        map.entry(record.to_string())
-            .or_insert_with(|| Arc::new(PriorityGate::default()))
-            .clone()
+        match map.get(record) {
+            Some(gate) => gate,
+            None => {
+                let gate: Gate = Box::leak(Box::new(PriorityInheritanceMutex::new(())));
+                map.insert(record.to_string(), gate);
+                gate
+            }
+        }
     }
 }
 
@@ -447,9 +262,11 @@ impl RecordLockRegistry {
 ///
 /// Held for the duration of a plain CA/PVA write. Equivalent to the
 /// `dbScanLock`+`dbScanUnlock` pair around one `dbPutField` in C
-/// EPICS.
+/// EPICS. `!Send`, so the compiler refuses to let it live across an
+/// `.await` in any spawned future — see the module doc.
+#[must_use = "the write gate is released as soon as the guard is dropped"]
 pub struct RecordWriteGuard {
-    _guard: GateGuard,
+    _guard: PriorityInheritanceMutexGuard<'static, ()>,
 }
 
 /// RAII guard for an ordered set of record advisory write gates — the
@@ -460,12 +277,11 @@ pub struct RecordWriteGuard {
 /// atomic scan-on-update epoch); held across the whole member loop.
 /// While alive, every plain CA/PVA write to any of those records — and
 /// every other multi-record transaction sharing any of them — blocks.
-/// The guards are `'static` (they own an `Arc` of the gate) so the set can
-/// be held across `.await` points in the transaction loop.
+/// `!Send`, exactly as [`RecordWriteGuard`] is.
 #[must_use = "the locked epoch ends as soon as the guard is dropped"]
 pub struct ManyRecordWriteGuard {
     // Guards drop in vector order; order does not matter for release.
-    _guards: Vec<GateGuard>,
+    _guards: Vec<PriorityInheritanceMutexGuard<'static, ()>>,
 }
 
 impl PvDatabase {
@@ -480,16 +296,17 @@ impl PvDatabase {
     /// target always map to the same gate as [`Self::lock_records`]
     /// keys them.
     ///
-    /// If the gate is held, this waits in EPICS-band order rather than
-    /// FIFO — the calling thread's declared band decides its place in the
-    /// queue (module doc, "Wait discipline").
-    pub async fn lock_record(&self, record: &str) -> RecordWriteGuard {
+    /// **Blocks the calling thread** if the gate is held. The gate is not
+    /// reentrant — a caller that already owns it (a transaction owner inside
+    /// its own [`Self::lock_records`] epoch) MUST use the `_already_locked`
+    /// entry points instead, or it deadlocks against itself.
+    pub fn lock_record(&self, record: &str) -> RecordWriteGuard {
         let canonical = self
             .resolve_alias(record)
             .unwrap_or_else(|| record.to_string());
         let gate = self.inner.record_locks.gate_for(&canonical);
         RecordWriteGuard {
-            _guard: gate.lock_owned().await,
+            _guard: gate.lock(),
         }
     }
 
@@ -503,7 +320,9 @@ impl PvDatabase {
     /// records in the same global order and cannot deadlock (mirrors
     /// pvxs `DBManyLock` sorting the lock set in `dbLock.c`); the
     /// dedup means a record bound by more than one member link is
-    /// locked exactly once.
+    /// locked exactly once. That canonical order is load-bearing in a way
+    /// it was not while the gate was async: an out-of-order acquisition now
+    /// wedges two threads rather than two tasks.
     ///
     /// The returned [`ManyRecordWriteGuard`] must be held for the
     /// whole transaction. While it is alive, a concurrent plain write
@@ -514,7 +333,7 @@ impl PvDatabase {
     /// by the post-alias name) — matching `dbLockerAlloc`, which
     /// accepts the record pointers it is given without a liveness
     /// re-check.
-    pub async fn lock_records<I, S>(&self, records: I) -> ManyRecordWriteGuard
+    pub fn lock_records<I, S>(&self, records: I) -> ManyRecordWriteGuard
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -537,8 +356,7 @@ impl PvDatabase {
 
         let mut guards = Vec::with_capacity(names.len());
         for name in &names {
-            let gate = self.inner.record_locks.gate_for(name);
-            guards.push(gate.lock_owned().await);
+            guards.push(self.inner.record_locks.gate_for(name).lock());
         }
         ManyRecordWriteGuard { _guards: guards }
     }
@@ -547,52 +365,65 @@ impl PvDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    // These are plain `#[test]`s, not `#[tokio::test]`s, and that is forced
+    // rather than stylistic: the gate blocks the calling *thread*, so a
+    // contending waiter has to be a real thread. Parking one on a
+    // `current_thread` runtime's only worker would wedge the runtime instead
+    // of demonstrating exclusion. Being reactor-free they also run under
+    // `--features rtems-exec-model` and add no site to this file's
+    // RTEMS-EXEC-MODEL-ALLOW census.
+
+    /// Long enough that a non-blocking (broken) gate would have let the
+    /// contender through, short enough not to dominate the suite.
+    const SETTLE: Duration = Duration::from_millis(50);
+
     /// A single-record gate excludes a concurrent same-record locker.
-    #[tokio::test]
-    async fn lock_record_excludes_same_record() {
+    #[test]
+    fn lock_record_excludes_same_record() {
         let db = PvDatabase::new();
         let order = Arc::new(AtomicUsize::new(0));
 
-        let g = db.lock_record("ai:1").await;
+        let g = db.lock_record("ai:1");
 
         let db2 = db.clone();
         let order2 = order.clone();
-        let h = tokio::spawn(async move {
-            let _g2 = db2.lock_record("ai:1").await;
+        let h = std::thread::spawn(move || {
+            let _g2 = db2.lock_record("ai:1");
             // This must observe the first holder having released (1).
             order2.fetch_add(10, Ordering::SeqCst);
         });
 
-        // Give the spawned task time to block on the gate.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Give the spawned thread time to block on the gate.
+        std::thread::sleep(SETTLE);
         // First holder still owns the gate: counter untouched.
         assert_eq!(order.load(Ordering::SeqCst), 0);
         order.fetch_add(1, Ordering::SeqCst);
         drop(g);
 
-        h.await.unwrap();
+        h.join().unwrap();
         assert_eq!(order.load(Ordering::SeqCst), 11);
     }
 
     /// `lock_records` blocks a plain single-record write to a member.
-    #[tokio::test]
-    async fn lock_records_excludes_single_member_write() {
+    #[test]
+    fn lock_records_excludes_single_member_write() {
         let db = PvDatabase::new();
-        let many = db.lock_records(["g:a", "g:b", "g:c"]).await;
+        let many = db.lock_records(["g:a", "g:b", "g:c"]);
 
         let db2 = db.clone();
         let acquired = Arc::new(AtomicUsize::new(0));
         let acquired2 = acquired.clone();
-        let h = tokio::spawn(async move {
+        let h = std::thread::spawn(move || {
             // Plain write to a member must block until `many` drops.
-            let _g = db2.lock_record("g:b").await;
+            let _g = db2.lock_record("g:b");
             acquired2.store(1, Ordering::SeqCst);
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::thread::sleep(SETTLE);
         assert_eq!(
             acquired.load(Ordering::SeqCst),
             0,
@@ -600,317 +431,112 @@ mod tests {
         );
 
         drop(many);
-        h.await.unwrap();
+        h.join().unwrap();
         assert_eq!(acquired.load(Ordering::SeqCst), 1);
     }
 
     /// Two overlapping `lock_records` sets acquire in canonical order
     /// and therefore cannot deadlock even with reversed input order.
-    #[tokio::test]
-    async fn lock_records_overlapping_sets_no_deadlock() {
+    ///
+    /// With blocking gates a violated order wedges both threads outright,
+    /// which is why this runs the two sets on real threads and joins them
+    /// under a bounded wait rather than trusting a scheduler yield.
+    #[test]
+    fn lock_records_overlapping_sets_no_deadlock() {
         let db = PvDatabase::new();
+        let done = Arc::new(AtomicUsize::new(0));
 
-        let db_a = db.clone();
-        let ta = tokio::spawn(async move {
-            for _ in 0..50 {
-                let _g = db_a.lock_records(["x", "y", "z"]).await;
-                tokio::task::yield_now().await;
-            }
-        });
-        let db_b = db.clone();
-        let tb = tokio::spawn(async move {
-            for _ in 0..50 {
-                // Reversed input order — sort makes the real
-                // acquisition order identical, so no deadlock.
-                let _g = db_b.lock_records(["z", "y", "x"]).await;
-                tokio::task::yield_now().await;
-            }
-        });
+        let handles: Vec<_> = [["x", "y", "z"], ["z", "y", "x"]]
+            .into_iter()
+            .map(|set| {
+                let db = db.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        // Reversed input order on one side — sort makes the
+                        // real acquisition order identical, so no deadlock.
+                        let _g = db.lock_records(set);
+                        std::thread::yield_now();
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            ta.await.unwrap();
-            tb.await.unwrap();
-        })
-        .await
-        .expect("overlapping lock_records sets must not deadlock");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "overlapping lock_records sets must not deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// An epoch over a record set excludes a second epoch that shares
     /// any record until the first guard drops — and overlapping sets
     /// listed in opposite orders never deadlock (sorted acquisition).
-    #[tokio::test]
-    async fn overlapping_epochs_are_mutually_exclusive_and_deadlock_free() {
+    #[test]
+    fn overlapping_epochs_are_mutually_exclusive_and_deadlock_free() {
         let db = PvDatabase::new();
         let a = vec!["RECA".to_string(), "RECB".to_string()];
         // Opposite order on purpose — sorted acquisition must still
         // make this safe.
         let b = vec!["RECB".to_string(), "RECC".to_string()];
 
-        let guard_a = db.lock_records(&a).await;
+        let guard_a = db.lock_records(&a);
 
         // A second epoch sharing RECB must not be acquirable while
         // `guard_a` is alive.
         let db2 = db.clone();
-        let b2 = b.clone();
-        let handle = tokio::spawn(async move { db2.lock_records(&b2).await });
+        let entered = Arc::new(AtomicUsize::new(0));
+        let entered2 = entered.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard_b = db2.lock_records(&b);
+            entered2.store(1, Ordering::SeqCst);
+        });
 
-        // Give the spawned task a chance to run; it must still be
-        // blocked on RECB.
-        tokio::task::yield_now().await;
-        assert!(!handle.is_finished(), "epoch B must block on shared RECB");
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "epoch B must block on shared RECB"
+        );
 
         drop(guard_a);
-        // Now epoch B can complete.
-        let _guard_b = handle.await.expect("epoch B task");
+        handle.join().expect("epoch B thread");
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
 
     /// Two non-overlapping epochs run concurrently — no false
-    /// serialisation.
-    #[tokio::test]
-    async fn disjoint_epochs_do_not_block_each_other() {
+    /// serialisation. Taking the second on *this* thread while the first is
+    /// still held is the assertion: a gate keyed too coarsely would
+    /// self-deadlock here rather than merely being slow.
+    #[test]
+    fn disjoint_epochs_do_not_block_each_other() {
         let db = PvDatabase::new();
-        let _g1 = db.lock_records(&["X1".to_string()]).await;
+        let _g1 = db.lock_records(&["X1".to_string()]);
         // Disjoint set: must acquire immediately without blocking.
-        let _g2 = db.lock_records(&["X2".to_string()]).await;
+        let _g2 = db.lock_records(&["X2".to_string()]);
     }
 
-    // ------------------------------------------------------------------
-    // Wait discipline — the priority-ordered queue (see the module doc).
-    //
-    // Plain `#[test]`s driven by hand-rolled polling, not `#[tokio::test]`s,
-    // for three reasons. The band is a property of a *thread*, so the
-    // waiters have to be real banded OS threads rather than tasks
-    // multiplexed onto a runtime's worker pool. Hand polling makes the wake
-    // sequence directly observable and deterministic instead of
-    // sleep-timed. And neither needs a reactor, so these also run under
-    // `--features rtems-exec-model` and add no site to this file's
-    // RTEMS-EXEC-MODEL-ALLOW census.
-    // ------------------------------------------------------------------
-
-    use crate::runtime::task::{ThreadPriority, enter_ioc_thread};
-
-    type Waiter = Pin<Box<dyn Future<Output = RecordWriteGuard> + Send>>;
-
-    /// A waker that appends its id to a shared log when fired, so "who was
-    /// woken, in what order" is asserted directly rather than inferred from
-    /// which future happens to become ready.
-    struct RecordingWaker {
-        id: u8,
-        log: Arc<std::sync::Mutex<Vec<u8>>>,
-    }
-
-    impl std::task::Wake for RecordingWaker {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.log.lock().expect("wake log").push(self.id);
-        }
-    }
-
-    fn recording_waker(id: u8, log: &Arc<std::sync::Mutex<Vec<u8>>>) -> Waker {
-        Waker::from(Arc::new(RecordingWaker {
-            id,
-            log: Arc::clone(log),
-        }))
-    }
-
-    fn wakes(log: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
-        log.lock().expect("wake log").clone()
-    }
-
-    /// Take a free gate with no runtime at all: the uncontended path is
-    /// `Ready` on the first poll. Panics instead of hanging when the gate
-    /// is unexpectedly held, which is what makes it a wedge detector.
-    fn acquire_now(db: &PvDatabase, record: &str) -> RecordWriteGuard {
-        let mut fut = Box::pin(db.lock_record(record));
-        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(guard) => guard,
-            Poll::Pending => panic!("gate `{record}` was expected to be free"),
-        }
-    }
-
-    /// Park one waiter on `record` from a thread that declared `band`
-    /// through the real `enter_ioc_thread` prologue, then move the still
-    /// pending future back to the caller (it is `Send`).
-    fn park_waiter(db: &PvDatabase, record: &'static str, band: u8, waker: Waker) -> Waiter {
-        let db = db.clone();
-        std::thread::spawn(move || {
-            let _ = enter_ioc_thread(ThreadPriority::Custom(band));
-            let mut fut: Waiter = Box::pin(async move { db.lock_record(record).await });
-            let parked = fut
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending();
-            assert!(parked, "waiter must park: the gate is held");
-            fut
-        })
-        .join()
-        .expect("waiter thread")
-    }
-
-    /// Poll `waiter` with its own recording waker — re-registration must
-    /// not swap in a waker whose wake the log cannot see — and take the
-    /// guard if ownership has been handed over.
-    fn poll_waiter(waiter: &mut Waiter, waker: &Waker) -> Option<RecordWriteGuard> {
-        match waiter.as_mut().poll(&mut Context::from_waker(waker)) {
-            Poll::Ready(guard) => Some(guard),
-            Poll::Pending => None,
-        }
-    }
-
-    /// Release `held`, then drain the queue one grant at a time, returning
-    /// the waiter ids in the order the gate actually handed ownership out.
-    fn drain_in_grant_order(held: RecordWriteGuard, waiters: Vec<(u8, Waiter, Waker)>) -> Vec<u8> {
-        let mut pending = waiters;
-        let mut order = Vec::new();
-        drop(held);
-        while !pending.is_empty() {
-            let mut ready = None;
-            for (index, (_, waiter, waker)) in pending.iter_mut().enumerate() {
-                if let Some(guard) = poll_waiter(waiter, waker) {
-                    assert!(
-                        ready.is_none(),
-                        "the gate handed ownership to two waiters at once"
-                    );
-                    ready = Some((index, guard));
-                }
-            }
-            let (index, guard) =
-                ready.expect("a release must hand ownership to exactly one waiter");
-            order.push(pending.remove(index).0);
-            // Releasing this one is what wakes the next.
-            drop(guard);
-        }
-        order
-    }
-
-    /// Three waiters at EPICS bands 20 / 63 / 70 on a held gate are granted
-    /// it in band order 70, 63, 20 — the done-check of
-    /// `doc/rtems-priority-locks-design.md` §5 step 2.
-    ///
-    /// They are enqueued in the *opposite* order on purpose, lowest band
-    /// first, so arrival order and band order disagree on every pair. The
-    /// `tokio::sync::Mutex` this gate replaced is FIFO and fails this test
-    /// on its very first grant.
+    /// An alias and its target share one gate — the property every caller
+    /// relies on when it hands `lock_record` a client-supplied name and
+    /// `lock_records` a link-derived one.
     #[test]
-    fn priority_gate_grants_highest_band_first() {
+    fn alias_and_target_share_one_gate() {
         let db = PvDatabase::new();
-        let held = acquire_now(&db, "ai:band");
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        let mut waiters = Vec::new();
-        for band in [20u8, 63, 70] {
-            let waker = recording_waker(band, &log);
-            waiters.push((
-                band,
-                park_waiter(&db, "ai:band", band, waker.clone()),
-                waker,
-            ));
-        }
+        let registry = &db.inner.record_locks;
         assert!(
-            wakes(&log).is_empty(),
-            "no waiter may be woken while the gate is still held"
+            std::ptr::eq(registry.gate_for("REC:A"), registry.gate_for("REC:A")),
+            "the same canonical name must map to the same gate instance"
         );
-
-        let order = drain_in_grant_order(held, waiters);
-        assert_eq!(
-            order,
-            vec![70, 63, 20],
-            "waiters must be granted the gate in EPICS-band order, highest band first"
+        assert!(
+            !std::ptr::eq(registry.gate_for("REC:A"), registry.gate_for("REC:B")),
+            "distinct records must not share a gate"
         );
-        assert_eq!(
-            wakes(&log),
-            vec![70, 63, 20],
-            "each release must wake exactly the next waiter in band order"
-        );
-    }
-
-    /// Waiters in the *same* band keep arrival order among themselves.
-    ///
-    /// Without it a priority queue reorders equal-priority threads by
-    /// nothing but map iteration, which is the starvation surprise the
-    /// ordering is otherwise blamed for.
-    #[test]
-    fn priority_gate_equal_bands_stay_fifo() {
-        let db = PvDatabase::new();
-        let held = acquire_now(&db, "ai:fifo");
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        let band = ThreadPriority::ScanLow.value();
-        let mut waiters = Vec::new();
-        // `park_waiter` joins its thread, so arrival order is exactly this
-        // loop's order.
-        for id in [1u8, 2, 3] {
-            let waker = recording_waker(id, &log);
-            waiters.push((id, park_waiter(&db, "ai:fifo", band, waker.clone()), waker));
-        }
-
-        let order = drain_in_grant_order(held, waiters);
-        assert_eq!(
-            order,
-            vec![1, 2, 3],
-            "equal-band waiters must be granted in arrival order"
-        );
-        assert_eq!(wakes(&log), vec![1, 2, 3]);
-    }
-
-    /// A waiter future dropped while queued — and one dropped after it was
-    /// handed ownership but before it could be polled — must both leave the
-    /// gate usable.
-    ///
-    /// The second case is the one that wedges a hand-rolled async lock: the
-    /// dropped future *is* the owner at that moment, so its drop owes the
-    /// same hand-off `GateGuard::drop` would have run.
-    #[test]
-    fn cancelled_waiter_does_not_wedge_the_gate() {
-        let db = PvDatabase::new();
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let held = acquire_now(&db, "ai:cancel");
-
-        // (a) cancelled while merely queued. It is the highest band, so a
-        //     surviving queue entry would be granted before the low-band
-        //     waiter and the log would say so.
-        let queued = park_waiter(&db, "ai:cancel", 70, recording_waker(70, &log));
-        let low_waker = recording_waker(20, &log);
-        let mut low = park_waiter(&db, "ai:cancel", 20, low_waker.clone());
-        drop(queued);
-
-        drop(held);
-        assert_eq!(
-            wakes(&log),
-            vec![20],
-            "a cancelled queue entry must not be granted the gate"
-        );
-        let low_guard =
-            poll_waiter(&mut low, &low_waker).expect("low-band waiter must have been granted");
-
-        // (b) cancelled after being handed ownership, before its first
-        //     poll. Id 71 rather than 70 only to keep the log unambiguous.
-        let owner_waker = recording_waker(71, &log);
-        let granted = park_waiter(&db, "ai:cancel", 70, owner_waker);
-        let next_waker = recording_waker(63, &log);
-        let mut next = park_waiter(&db, "ai:cancel", 63, next_waker.clone());
-
-        drop(low_guard);
-        assert_eq!(
-            wakes(&log),
-            vec![20, 71],
-            "the highest-band waiter must be granted next"
-        );
-        drop(granted);
-        assert_eq!(
-            wakes(&log),
-            vec![20, 71, 63],
-            "a cancelled owner must hand the gate to the next waiter"
-        );
-        let next_guard = poll_waiter(&mut next, &next_waker)
-            .expect("the waiter behind the cancelled owner must be granted");
-        drop(next_guard);
-
-        // Nothing holds and nothing waits: the gate must be free again.
-        // `acquire_now` panics rather than hanging if it is not.
-        let _reacquired = acquire_now(&db, "ai:cancel");
     }
 }

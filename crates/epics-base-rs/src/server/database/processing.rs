@@ -584,7 +584,7 @@ impl PvDatabase {
 
     /// `process_record` variant for a caller that already
     /// owns the record's advisory write gate — the QSRV atomic group
-    /// PUT applying a `+proc` member. The gate `Mutex` is not
+    /// PUT applying a `+proc` member. The gate is not
     /// reentrant; the atomic group path MUST use this entry. See
     /// [`crate::server::database::PvDatabase::lock_records`].
     pub async fn process_record_already_locked(&self, name: &str) -> CaResult<()> {
@@ -714,7 +714,7 @@ impl PvDatabase {
     /// full-processing entry for a caller that already owns the
     /// record's advisory write gate via [`PvDatabase::lock_records`] —
     /// the QSRV atomic group GET/PUT and the pvalink atomic
-    /// scan-on-update epoch. The advisory gate `Mutex` is not
+    /// scan-on-update epoch. The advisory gate is not
     /// reentrant; a transaction owner holding `lock_records` over the
     /// member set MUST use this entry to scan a member record, or it
     /// would deadlock against its own epoch guard. Foreign (non-owner)
@@ -1323,7 +1323,7 @@ impl PvDatabase {
         // processes a link target under the lock set the caller already
         // owns, and re-acquiring would deadlock the non-reentrant gate.
         let _record_gate = if acquire_gate {
-            Some(self.lock_record(&name).await)
+            Some(self.lock_record(&name))
         } else {
             None
         };
@@ -4473,7 +4473,7 @@ impl PvDatabase {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
             let canonical: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
-            let _record_gate = self.lock_record(&canonical).await;
+            let _record_gate = self.lock_record(&canonical);
             let mut visited = HashSet::new();
             self.complete_async_record_inner(name, &mut visited, 0)
         })

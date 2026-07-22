@@ -8819,7 +8819,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
         .unwrap();
 
     // Transaction owner holds the member's gate via `lock_records`.
-    let epoch = db.lock_records(["MR_R5_MEMBER"]).await;
+    let epoch = db.lock_records(["MR_R5_MEMBER"]);
 
     let db2 = db.clone();
     let processed = Arc::new(AtomicU32::new(0));
@@ -8853,7 +8853,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
 
 /// Owner path. A transaction owner holding a member's advisory
 /// write gate via `lock_records` processes that member through the
-/// `_already_locked` full-processing entry. The gate `Mutex` is not
+/// `_already_locked` full-processing entry. The gate is not
 /// reentrant, so using the gate-acquiring `process_record_with_links`
 /// here would dead-lock the epoch against itself; the `_already_locked`
 /// entry must complete without blocking.
@@ -8865,7 +8865,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
         .unwrap();
 
     // Owner holds the member gate for the whole transaction.
-    let _epoch = db.lock_records(["MR_R5_OWNED"]).await;
+    let _epoch = db.lock_records(["MR_R5_OWNED"]);
 
     // Processing the member via the `_already_locked` entry while the
     // epoch is held must NOT dead-lock. Since H6 that entry is a `fn` —
@@ -8982,7 +8982,7 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
         .await
         .unwrap();
 
-    let epoch = db.lock_records(["SIW_EPOCH"]).await;
+    let epoch = db.lock_records(["SIW_EPOCH"]);
 
     let db2 = db.clone();
     let done = Arc::new(AtomicU32::new(0));

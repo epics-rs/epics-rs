@@ -879,7 +879,7 @@ impl GroupChannel {
             // yielding a torn snapshot (B updated, A stale) that defeats the
             // `atomic` flag — the GET-side twin of the PUT-side BR-R15 gap.
             let member_records = group_member_record_names(&self.db, &self.def.members);
-            let _many_guard = self.db.lock_records(&member_records).await;
+            let _many_guard = self.db.lock_records(&member_records);
 
             // Acquire every backing record's read guard synchronously, in the
             // sorted order `member_guards` already carries. The advisory
@@ -1384,7 +1384,7 @@ impl GroupChannel {
 
     /// [`Self::member_process_it`], applied — the atomic-PUT entry. This
     /// transaction already owns every member-record gate via `lock_records`
-    /// (the gate `Mutex` is not reentrant), so the transition below MUST use
+    /// (the gate is not reentrant), so the transition below MUST use
     /// the `_already_locked` entry. Synchronous: after
     /// `doc/rtems-priority-locks-design.md` H6, `put_driven_process_already_locked`
     /// is a plain `fn`, so this reaches the end of the atomic PUT's
@@ -1454,7 +1454,7 @@ impl GroupChannel {
     /// - `Inhibit` (process=false): raw-write the field, no processing.
     ///
     /// Split into an already-locked entry (atomic PUT, this transaction owns
-    /// every member gate via `lock_records`; the gate `Mutex` is not
+    /// every member gate via `lock_records`; the gate is not
     /// reentrant) and a gate-acquiring entry (non-atomic per-member path) —
     /// same tri-state mapping, different lock discipline.
     ///
@@ -1864,12 +1864,12 @@ impl GroupChannel {
             //
             // The member writes below MUST use the `_already_locked`
             // helper variants: this transaction already owns every
-            // member-record gate, and the per-record gate `Mutex` is
+            // member-record gate, and the per-record gate is
             // not reentrant. From here to the end of this block is
             // synchronous — zero `.await`s reached while `_many_guard`
             // is held (`doc/rtems-priority-locks-design.md` §1.1 H9).
             let member_records = group_member_record_names(&self.db, &self.def.members);
-            let _many_guard = self.db.lock_records(&member_records).await;
+            let _many_guard = self.db.lock_records(&member_records);
 
             for (member, action, val) in writes {
                 let (record_name, field_name) =
@@ -5150,7 +5150,7 @@ mod tests {
         let (db, def) = atomic_group_fixture().await;
         let channel = GroupChannel::new(db.clone(), def.clone());
 
-        let _held = db.lock_records(["A:rec", "B:rec"]).await;
+        let _held = db.lock_records(["A:rec", "B:rec"]);
 
         // "a" -> a non-numeric string. `A:rec.VAL` is DBF_DOUBLE
         // (`AiRecord`), so `convert_member_value` must reject it.
@@ -5412,7 +5412,7 @@ mod tests {
 
         // Hold the member-record write gates — the in-flight atomic
         // group PUT's `DBManyLocker` equivalent.
-        let many = db.lock_records(["A:rec", "B:rec"]).await;
+        let many = db.lock_records(["A:rec", "B:rec"]);
 
         // A direct CA write to a member record must block on the same
         // gate (`put_record_field_from_ca` takes `lock_record`).
@@ -5462,7 +5462,7 @@ mod tests {
 
         // Hold one member record's gate. The atomic group PUT must
         // block trying to acquire it via `lock_records`.
-        let held = db.lock_record("B:rec").await;
+        let held = db.lock_record("B:rec");
 
         let put = tokio::spawn(async move {
             channel.put(&atomic_put_value(5.0, 6.0)).await.unwrap();
@@ -5515,7 +5515,7 @@ mod tests {
 
         // Hold one member record's gate. The atomic group GET must block
         // trying to acquire the gate set via `lock_records`.
-        let held = db.lock_record("B:rec").await;
+        let held = db.lock_record("B:rec");
 
         let get = tokio::spawn(async move { channel.read_group().await.unwrap() });
 
@@ -5587,7 +5587,7 @@ mod tests {
 
         // Hold one member record's gate. A monitor-stamped read must block on
         // `lock_records` despite the group being non-atomic.
-        let held = db.lock_record("B:rec").await;
+        let held = db.lock_record("B:rec");
 
         let mon_channel = GroupChannel::new(db.clone(), def.clone())
             .with_monitor_stamp(epics_pva_rs::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT);

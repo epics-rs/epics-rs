@@ -2563,7 +2563,7 @@ impl PvDatabase {
                                 // C `processCallback`'s `dbScanLock` /
                                 // `dbScanUnlock` pair (`seqRecord.c:252`,
                                 // `:273`) — held for this group alone.
-                                let _gate = db.lock_record(&rec_name).await;
+                                let _gate = db.lock_record(&rec_name);
                                 let mut visited = HashSet::new();
                                 db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited, 0);
                             }

@@ -1057,67 +1057,76 @@ async fn scan_once(
     // The epoch guard is held only across the atomic group. pvxs
     // scopes `DBManyLocker L(atomic_lock)` to the atomic-target
     // loop and gives non-atomic targets their own per-record
-    // `DBLocker` afterwards — so the epoch must be dropped at the
+    // `DBLocker` afterwards — so the epoch must be released at the
     // atomic→non-atomic boundary, not at the end of the batch.
-    // Held in an `Option`; `None` once dropped (or when there are
-    // no atomic targets at all).
-    let mut atomic_epoch = if atomic_records.is_empty() {
-        None
-    } else {
-        Some(db_handle.lock_records(&atomic_records).await)
-    };
-
-    for (record, _order, atomic, passive_only) in &targets {
-        // `targets` is sorted atomic-first; the first non-atomic
-        // target marks the end of the atomic group, so release
-        // the epoch here — exactly where pvxs's `DBManyLocker`
-        // goes out of scope before the non-atomic loop.
-        if !*atomic {
-            atomic_epoch = None;
-        }
-        // CPP passive gate + PACT pre-check (pvxs `ScanTrack::scan`);
-        // see `scan_target_should_process`. The target write lock is
-        // released before the process call below, which takes its own
-        // per-record locks. Synchronous: `scan_target_should_process`
-        // does not await anything, so an atomic target's iteration here
-        // reaches the `process_record_with_links_already_locked` call
-        // below with zero `.await`s while `atomic_epoch` is held
-        // (`doc/rtems-priority-locks-design.md` §1.1 H7, §5 step 6).
-        if !scan_target_should_process(&db_handle, record, *passive_only) {
-            continue;
-        }
-        // B3: process WITH links so the CP/CPP-driven scan fans
-        // out via INP/OUT/FLNK — a pvalink feeding a calc record
-        // must propagate to the calc's FLNK chain. Bare
-        // `process_record` runs only `process_local` and would
-        // drop the chain. Fresh `visited` set + depth 0: this is
-        // the foreign-caller entry, like the scan loop and FLNK
-        // dispatch.
-        //
-        // an atomic target runs while `atomic_epoch`
-        // (`lock_records` over the atomic member set) is still
-        // held — its advisory write gate is already owned by this
-        // transaction. The gate `Mutex` is not reentrant, so an
-        // atomic target MUST process through the `_already_locked`
-        // entry; processing it via the gate-acquiring
-        // `process_record_with_links` would dead-lock the epoch
-        // against itself. A non-atomic target is reached only
-        // after the epoch was dropped at the atomic→non-atomic
-        // boundary above, so it is a genuine fresh foreign entry
-        // and takes the gate normally.
-        let mut visited = std::collections::HashSet::new();
-        if *atomic {
-            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited, 0);
+    //
+    // The two phases are two loops over the same `atomic`-first sorted
+    // `targets`, and the split is structural rather than tidiness: the
+    // epoch guard is a blocking `!Send` `ManyRecordWriteGuard`, so putting
+    // its scope in a block that contains no `.await` is what makes
+    // "the epoch is released before any suspension" a fact the compiler
+    // checks. The previous shape — one loop, the epoch in a `mut Option`
+    // cleared at the boundary — carried the same runtime invariant but
+    // could only assert it in a comment, and the borrow checker sees the
+    // `Option` as live across the non-atomic `.await` regardless.
+    {
+        // Atomic phase. Zero `.await`s below this line while the epoch is
+        // held (`doc/rtems-priority-locks-design.md` §1.1 H7, §5 step 6).
+        let _atomic_epoch = if atomic_records.is_empty() {
+            None
         } else {
-            let _ = db_handle
-                .process_record_with_links(record, &mut visited, 0)
-                .await;
+            Some(db_handle.lock_records(&atomic_records))
+        };
+
+        for (record, _order, atomic, passive_only) in &targets {
+            // `targets` is sorted atomic-first, so the first non-atomic
+            // target ends the atomic group.
+            if !*atomic {
+                break;
+            }
+            // CPP passive gate + PACT pre-check (pvxs `ScanTrack::scan`);
+            // see `scan_target_should_process`. The target write lock is
+            // released before the process call below, which takes its own
+            // per-record locks.
+            if !scan_target_should_process(&db_handle, record, *passive_only) {
+                continue;
+            }
+            // B3: process WITH links so the CP/CPP-driven scan fans
+            // out via INP/OUT/FLNK — a pvalink feeding a calc record
+            // must propagate to the calc's FLNK chain. Bare
+            // `process_record` runs only `process_local` and would
+            // drop the chain. Fresh `visited` set + depth 0: this is
+            // the foreign-caller entry, like the scan loop and FLNK
+            // dispatch.
+            //
+            // An atomic target runs while the epoch (`lock_records` over
+            // the atomic member set) is still held — its advisory write
+            // gate is already owned by this transaction. The gate is not
+            // reentrant, so an atomic target MUST process through the
+            // `_already_locked` entry; processing it via the
+            // gate-acquiring `process_record_with_links` would dead-lock
+            // the epoch against itself.
+            let mut visited = std::collections::HashSet::new();
+            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited, 0);
         }
     }
 
-    // Drop any still-held epoch (an all-atomic batch never hit
-    // the non-atomic boundary above).
-    drop(atomic_epoch);
+    // Non-atomic phase — reached only after the epoch above went out of
+    // scope, so each of these is a genuine fresh foreign entry that takes
+    // its own per-record gate, exactly as pvxs gives each non-atomic
+    // target its own `DBLocker`.
+    for (record, _order, atomic, passive_only) in &targets {
+        if *atomic {
+            continue;
+        }
+        if !scan_target_should_process(&db_handle, record, *passive_only) {
+            continue;
+        }
+        let mut visited = std::collections::HashSet::new();
+        let _ = db_handle
+            .process_record_with_links(record, &mut visited, 0)
+            .await;
+    }
 }
 
 #[epics_base_rs::async_trait]
@@ -4128,7 +4137,7 @@ mod tests {
         let competitor_db = db.clone();
         let competitor = tokio::spawn(async move {
             epoch_entered.notified().await;
-            let _epoch = competitor_db.lock_records(&["AT:B".to_string()]).await;
+            let _epoch = competitor_db.lock_records(&["AT:B".to_string()]);
             competitor_log.lock().push("EXTERNAL".to_string());
         });
 

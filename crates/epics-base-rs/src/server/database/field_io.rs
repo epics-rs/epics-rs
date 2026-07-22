@@ -506,7 +506,7 @@ impl PvDatabase {
     ///
     /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(name).await;
+        let _record_gate = self.acquire_put_gate(name);
         self.put_pv_already_locked(name, value)
     }
 
@@ -532,11 +532,11 @@ impl PvDatabase {
     /// `None` when `name` names no record: a simple PV has no `dbCommon` and
     /// therefore no `dbScanLock` in C either. The record lookup is repeated by
     /// the body — a map read, and records are never removed once loaded.
-    async fn acquire_put_gate(&self, name: &str) -> Option<super::record_lock::RecordWriteGuard> {
+    fn acquire_put_gate(&self, name: &str) -> Option<super::record_lock::RecordWriteGuard> {
         let (base, _) = super::parse_pv_name(name);
         self.get_record(base)?;
         let canonical: String = self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-        Some(self.lock_record(&canonical).await)
+        Some(self.lock_record(&canonical))
     }
 
     /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
@@ -921,7 +921,7 @@ impl PvDatabase {
             // (`doc/rtems-priority-locks-design.md` §2).
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            let _record_gate = self.lock_record(&canonical_base).await;
+            let _record_gate = self.lock_record(&canonical_base);
 
             // Guarded: the value write + monitor post. The record's DATA guard
             // is released at the block close before the tails below, which
@@ -1086,41 +1086,28 @@ impl PvDatabase {
     /// Must be called with no record lock held: a `WriteDbLink` can process its
     /// target, which re-enters the database.
     ///
-    /// # Still `async` — but no longer a network suspension
+    /// # Synchronous, and it has to stay that way
     ///
-    /// `doc/rtems-priority-locks-design.md` §5 step 4 turns the scan-index tail
-    /// synchronous; this tail cannot follow yet. There used to be two reasons;
-    /// one is closed:
+    /// This whole tail runs inside the caller's L1 gate window, and L1 is a
+    /// blocking priority-inheritance mutex whose guard is `!Send`
+    /// (`server::database::record_lock`). An `.await` anywhere reachable from
+    /// here is therefore a compile error at the spawn sites, not a review
+    /// finding — see `doc/rtems-priority-locks-design.md` §5 steps 5–6.
     ///
-    /// 1. **Open.** `execute_process_actions` → `write_out_link_value` →
-    ///    `write_db_link_value` (`links.rs`) re-enters
-    ///    `put_pv_already_locked` — i.e. **this function's own caller** — and
-    ///    `process_target`, which is H6. That resolves in step 5 by
-    ///    construction, not here.
-    /// 2. **Closed.** `write_out_link_value` → `write_external_pv` no longer
-    ///    calls `LinkSet::put_value` from this thread. It stages the write on
-    ///    the database's link-put queue and returns, exactly as C
-    ///    `dbCaPutLink` stages into `pca->pputNative`, calls `addAction` and
-    ///    returns (`dbCa.c:544-631`); the `ca://` / `pva://` round trip runs
-    ///    on the queue's owner task, C's `dbCaTask` (`dbCa.c:1226-1248`). See
-    ///    [`super::link_put_queue`].
-    ///
-    /// So the awaits left in this chain, with the gate held, are:
-    ///
-    /// * the H6 re-entry of reason 1 (a lock acquisition and a process
-    ///   cycle, not I/O);
-    /// * `LinkSet::put_admission` inside `write_external_pv` — a cached-state
-    ///   probe both production lsets answer from a map lookup plus an atomic,
-    ///   which is C's `if (!pca->isConnected …)` (`dbCa.c:558-561`);
-    /// * for a **put-notify / blocking-put** chain only
-    ///   ([`LinkPutOp::Async`](super::LinkPutOp::Async)), the await on the
-    ///   queue owner's completion — C's `CA_PUT_CALLBACK` route, where the
-    ///   originating record is likewise held until `putComplete` fires
-    ///   (`dbCa.c:1232-1236`, `:1056-1074`). A plain OUT write awaits nothing.
-    ///
-    /// The gate is still a `PriorityGate` handing out a `Send` guard, so that
-    /// compiles and is sound; reason 1 is what blocks the
-    /// L1 → `PriorityInheritanceMutex` flip, not this step.
+    /// The one call that used to make it a genuine suspension is gone:
+    /// `write_out_link_value` → `write_external_pv` does not call
+    /// `LinkSet::put_value` from this thread. It stages the write on the
+    /// database's link-put queue and returns, exactly as C `dbCaPutLink`
+    /// stages into `pca->pputNative`, calls `addAction` and returns
+    /// (`dbCa.c:544-631`); the `ca://` / `pva://` round trip runs on the
+    /// queue's owner task, C's `dbCaTask` (`dbCa.c:1226-1248`). See
+    /// [`super::link_put_queue`]. What is left inside the window is the
+    /// re-entrant database work C also does under `dbScanLock`:
+    /// `execute_process_actions` → `write_out_link_value` →
+    /// `write_db_link_value` re-entering `put_pv_already_locked` and
+    /// `process_target`, plus the cached-state `LinkSet::put_admission` probe
+    /// both production lsets answer from a map lookup and an atomic — C's
+    /// `if (!pca->isConnected …)` (`dbCa.c:558-561`).
     fn run_special_actions(
         &self,
         record_name: &str,
@@ -1145,17 +1132,16 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        let _record_gate = self.acquire_put_gate(record_name).await;
+        let _record_gate = self.acquire_put_gate(record_name);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
     }
 
     /// Variant for a caller that already owns the target
     /// record's advisory write gate — the QSRV atomic group PUT,
     /// which acquired every member-record gate up-front via
-    /// [`Self::lock_records`]. The per-record `tokio::sync::Mutex`
-    /// gate is NOT reentrant, so the atomic group path MUST use this
-    /// `_already_locked` entry to avoid dead-locking on its own
-    /// `ManyRecordWriteGuard`.
+    /// [`Self::lock_records`]. The per-record gate is NOT reentrant, so the
+    /// atomic group path MUST use this `_already_locked` entry to avoid
+    /// dead-locking on its own `ManyRecordWriteGuard`.
     pub fn put_record_field_from_ca_already_locked(
         &self,
         record_name: &str,
@@ -1180,7 +1166,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(record_name).await;
+        let _record_gate = self.acquire_put_gate(record_name);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
     }
@@ -1222,7 +1208,7 @@ impl PvDatabase {
         let canonical: String = self
             .resolve_alias(record_name)
             .unwrap_or_else(|| record_name.to_string());
-        let _record_gate = self.lock_record(&canonical).await;
+        let _record_gate = self.lock_record(&canonical);
 
         let mut instance = rec.write();
         check_put_disabled(&instance, &field_upper)?;
@@ -1329,7 +1315,7 @@ impl PvDatabase {
     /// advisory write gate (the `dbScanLock` analogue) itself;
     /// [`Self::put_driven_process_already_locked`] is for a caller that
     /// already owns it — `_record_gate` on the CA put path, or the QSRV
-    /// atomic group's `lock_records` epoch. The gate `Mutex` is not
+    /// atomic group's `lock_records` epoch. The gate is not
     /// reentrant, so a caller holding it MUST take the `_already_locked`
     /// entry.
     ///
@@ -1342,7 +1328,7 @@ impl PvDatabase {
     /// The PACT (RPRO) branch is success, as it is in C: `dbPutField` returns
     /// the `dbProcess` status only on the branch that ran it.
     pub async fn put_driven_process(&self, record_name: &str) -> CaResult<()> {
-        let _record_gate = self.acquire_put_gate(record_name).await;
+        let _record_gate = self.acquire_put_gate(record_name);
         self.put_driven_process_already_locked(record_name)
     }
 
@@ -1385,7 +1371,7 @@ impl PvDatabase {
         } = put;
         // The client already holds the receiver; a failure here (record gone,
         // field refused) must still release it, which dropping the sender does.
-        let _record_gate = self.acquire_put_gate(record_name).await;
+        let _record_gate = self.acquire_put_gate(record_name);
         let _ = self.put_record_field_from_ca_body(
             record_name,
             &field,
@@ -1651,7 +1637,7 @@ impl PvDatabase {
             // passed through. By the time control reaches here the record's
             // advisory gate is held on both paths: this function took it above
             // when `acquire_gate`, and the caller (an atomic group PUT) holds it
-            // when not. The gate `Mutex` is not reentrant, so acquiring it again
+            // when not. The gate is not reentrant, so acquiring it again
             // here deadlocks every PROC put.
             let _ = self.put_driven_process_already_locked(record_name);
             // The wait-set fires the oneshot only after the whole
@@ -2232,7 +2218,7 @@ impl PvDatabase {
             // share one gate. Held until return.
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            let _record_gate = self.lock_record(&canonical_base).await;
+            let _record_gate = self.lock_record(&canonical_base);
 
             let mut instance = rec.write();
             let prev_value = instance.record.get_field(&field);

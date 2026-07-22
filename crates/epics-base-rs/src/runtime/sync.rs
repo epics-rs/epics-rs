@@ -53,6 +53,25 @@ pub type PriorityInheritanceMutex<T> = pi_mutex::PiMutex<T>;
 #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
 pub type PriorityInheritanceMutex<T> = parking_lot::Mutex<T>;
 
+/// The guard [`PriorityInheritanceMutex::lock`] hands out, nameable so a
+/// caller can *store* one — the per-record write gate
+/// (`server::database::record_lock`) holds a `'static` guard in a struct
+/// field rather than a local.
+///
+/// `!Send` on every arm, and on the PI arms that is a correctness
+/// requirement rather than a lint: POSIX requires a mutex to be unlocked by
+/// the thread that locked it, so a guard that could migrate between threads
+/// would eventually call `pthread_mutex_unlock` from a non-owner. It is also
+/// what makes "no `.await` inside a lock window" a build error at every
+/// spawn site instead of a review convention.
+#[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+pub type PriorityInheritanceMutexGuard<'a, T> = pi_mutex::PiMutexGuard<'a, T>;
+
+/// See [`PriorityInheritanceMutexGuard`] — `parking_lot`'s guard is already
+/// `!Send` for the same reason.
+#[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+pub type PriorityInheritanceMutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
+
 /// Diagnostic — `true` when the PI variant is active in this build.
 ///
 /// On RTEMS this is **not** a `cfg!`: PI there is a probe, exactly as it is in
@@ -228,7 +247,10 @@ mod pi_mutex {
                 let r = libc::pthread_mutex_lock(self.inner.get());
                 assert_eq!(r, 0, "pthread_mutex_lock failed");
             }
-            PiMutexGuard { mutex: self }
+            PiMutexGuard {
+                mutex: self,
+                _not_send: std::marker::PhantomData,
+            }
         }
     }
 
@@ -242,6 +264,16 @@ mod pi_mutex {
 
     pub struct PiMutexGuard<'a, T> {
         mutex: &'a PiMutex<T>,
+        /// Makes the guard `!Send`, which `&PiMutex<T>` alone does not.
+        ///
+        /// Not a lint: POSIX requires `pthread_mutex_unlock` to be called by
+        /// the thread that locked the mutex (and an RTEMS PI mutex enforces
+        /// ownership), so a guard that could be moved to another thread and
+        /// dropped there would unlock from a non-owner. `parking_lot`'s
+        /// guard — the arm the host build compiles — is `!Send` for the same
+        /// reason, so this also keeps the two arms' auto traits identical
+        /// and the "no `.await` under a lock" build error target-independent.
+        _not_send: std::marker::PhantomData<*const ()>,
     }
 
     impl<T> Deref for PiMutexGuard<'_, T> {

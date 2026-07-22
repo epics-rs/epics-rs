@@ -98,15 +98,30 @@ async fn async_pending_record_does_not_hold_the_gate() {
         "the record must still be PACT: this is the async window under test"
     );
 
-    // ... and the gate is free RIGHT NOW. `lock_record` would block for the
-    // whole timeout if the async cycle still owned it.
-    let gate = tokio::time::timeout(
+    // ... and the gate is free RIGHT NOW.
+    probe_gate_is_free(&db, "H6:ASYNC")
+        .await
+        .expect("the gate must be free while the record is async-pending");
+}
+
+/// Take and immediately release `record`'s gate on a blocking-pool thread,
+/// bounded by a timeout.
+///
+/// The gate is a blocking priority-inheritance mutex, so "is it free?" cannot
+/// be asked by racing a future against a timer — a held gate parks the
+/// *thread*. Doing the acquisition on a `spawn_blocking` worker keeps the
+/// timeout meaningful: the probe returns `Err` exactly when the gate was still
+/// owned, which is the assertion these tests make.
+async fn probe_gate_is_free(db: &PvDatabase, record: &'static str) -> Result<(), &'static str> {
+    let db = db.clone();
+    tokio::time::timeout(
         Duration::from_secs(5),
-        db.lock_record("H6:ASYNC".to_string().as_str()),
+        tokio::task::spawn_blocking(move || drop(db.lock_record(record))),
     )
     .await
-    .expect("the gate must be free while the record is async-pending");
-    drop(gate);
+    .map_err(|_| "gate still held")?
+    .expect("gate probe task");
+    Ok(())
 }
 
 /// Boundary 1b — the same property through a real put. A CA-route put to an
@@ -207,10 +222,9 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         "seq must be PACT while its DLYn chain runs"
     );
     // The gate is free while the delay runs — the whole point of the port.
-    let gate = tokio::time::timeout(Duration::from_secs(5), db.lock_record("H6:SEQ"))
+    probe_gate_is_free(&db, "H6:SEQ")
         .await
         .expect("the gate must be free while the seq DLYn delay is pending");
-    drop(gate);
 
     // After the delay the group runs and the chain completes the cycle.
     for _ in 0..100 {
@@ -267,7 +281,20 @@ async fn the_async_completion_waits_for_the_gate() {
         .unwrap();
 
     // Someone else owns the record's gate — a QSRV atomic transaction, say.
-    let epoch = db.lock_records(["H6:CMPL"]).await;
+    // It is held on its own thread, not by this task: the gate blocks the
+    // *thread* that owns it, so a holder that also drives the rest of the test
+    // would be asserting about its own runtime rather than about the gate.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let db_holder = db.clone();
+    let holder = std::thread::spawn(move || {
+        let _epoch = db_holder.lock_records(["H6:CMPL"]);
+        held_tx.send(()).expect("holder announces the epoch");
+        let _ = release_rx.recv();
+    });
+    held_rx
+        .recv()
+        .expect("the epoch must be taken before the test proceeds");
 
     let db2 = db.clone();
     let completed = Arc::new(AtomicU32::new(0));
@@ -284,7 +311,8 @@ async fn the_async_completion_waits_for_the_gate() {
         "the completion epilogue must block on the gate a transaction holds"
     );
 
-    drop(epoch);
+    drop(release_tx);
+    holder.join().expect("epoch holder thread");
     tokio::time::timeout(Duration::from_secs(5), h)
         .await
         .expect("the completion must run once the gate is released")

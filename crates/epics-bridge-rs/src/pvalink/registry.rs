@@ -707,4 +707,99 @@ mod tests {
         );
         assert_eq!(reg.len(), 2, "two distinct channel owners cached");
     }
+
+    /// Stage 0 gate (`doc/pvalink-rtems-design.md` §5): the registry owns
+    /// ONE [`PvaClient`] for the whole IOC, so links that are deliberately
+    /// *distinct* still cost the upstream IOC exactly **one** TCP
+    /// connection.
+    ///
+    /// Two INP links to the same `pv_name` with different `queue_size` are
+    /// different `pvRequest`s — pvxs `channels_key_t = (channelName,
+    /// pvRequest)` (`pvxs/ioc/pvalink.h:115-120`) — hence distinct
+    /// `RegistryKey`s and distinct `PvaLink`s, each with its own monitor
+    /// subscription. What they must NOT have is distinct transports: both
+    /// resolve through the one client's `ConnectionPool`, which is keyed on
+    /// `SocketAddr`, so the server sees a single peer.
+    ///
+    /// Pre-fix, `PvaLink::open` built a `PvaClient` per link
+    /// (`link.rs:297`), giving each link its own pool — the server saw
+    /// TWO peers. On the RTEMS target that doubling is the resource
+    /// ceiling, not a cosmetic cost (design §2.4, §4.3).
+    ///
+    /// The client is pinned at the test server's address, so this
+    /// exercises the connection pool without any UDP search.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage0_distinct_link_variants_share_one_upstream_connection() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let initial = PvField::Structure(PvStructure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), PvField::Scalar(ScalarValue::Double(1.0)))],
+        });
+        let pv = SharedPV::build_mailbox();
+        pv.open(desc, initial).unwrap();
+        let source = SharedSource::new();
+        source.add("STAGE0:SHARED:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        // The single IOC-wide client — pvxs `linkGlobal->provider_remote`.
+        let reg = PvaLinkRegistry::with_client(
+            PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(3))
+                .build(),
+        );
+
+        let cfg_q1 = PvaLinkConfig {
+            monitor: true,
+            queue_size: 1,
+            ..PvaLinkConfig::defaults_for("STAGE0:SHARED:PV", LinkDirection::Inp)
+        };
+        let cfg_q8 = PvaLinkConfig {
+            monitor: true,
+            queue_size: 8,
+            ..PvaLinkConfig::defaults_for("STAGE0:SHARED:PV", LinkDirection::Inp)
+        };
+
+        let link_q1 = reg.get_or_open(cfg_q1).await.expect("open the Q=1 link");
+        let link_q8 = reg.get_or_open(cfg_q8).await.expect("open the Q=8 link");
+
+        assert!(
+            !Arc::ptr_eq(&link_q1, &link_q8),
+            "a different queueSize is a different pvRequest — the two links \
+             must stay distinct registry entries, or this gate would be \
+             asserting nothing"
+        );
+        assert_eq!(reg.len(), 2, "two distinct channel owners cached");
+
+        // The peer count only means something once both monitors have
+        // actually reached the server; each proves liveness by delivering
+        // its first event.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline
+            && !(link_q1.is_connected() && link_q8.is_connected())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            link_q1.is_connected() && link_q8.is_connected(),
+            "both monitor subscriptions must connect before the connection \
+             count is meaningful (Q=1 connected: {}, Q=8 connected: {})",
+            link_q1.is_connected(),
+            link_q8.is_connected()
+        );
+
+        assert_eq!(
+            server.report().peer_count,
+            1,
+            "two distinct pvalink channels sharing the IOC-wide client must \
+             cost the upstream IOC exactly ONE TCP connection"
+        );
+    }
 }

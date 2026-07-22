@@ -334,6 +334,45 @@ mod pi_mutex {
         }
     }
 
+    /// The `parking_lot::Mutex` arm has `Debug`, so this arm must too.
+    ///
+    /// [`PriorityInheritanceMutex`](super::PriorityInheritanceMutex) is one
+    /// type alias with three `cfg` arms, and any trait the fallback arm has
+    /// that a PI arm lacks is a build break that only ever appears on the
+    /// target: a `#[derive(Debug)]` on a struct holding one compiles on a
+    /// developer's box and fails for `armv7-rtems-eabihf`. That is how this
+    /// impl was found — `qsrv::group_config::GroupPvDef` (`#[derive(Debug,
+    /// Clone)]`, holding the L33 atomic-write lock) is the first such struct,
+    /// and it broke nothing until the crate entered the RTEMS gate. The
+    /// guard's `!Send` note above already states the rule for auto traits;
+    /// this is the same rule for the named ones.
+    ///
+    /// `try_lock` rather than `lock`, matching `parking_lot`: a `Debug` impl
+    /// that blocks deadlocks the moment anything formats a structure while the
+    /// lock is held — including a panic message on the locking thread.
+    impl<T: std::fmt::Debug> std::fmt::Debug for PiMutex<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // SAFETY: `trylock` never blocks. On success this thread owns the
+            // mutex for the read below and unlocks before returning, so the
+            // POSIX "unlock by the locking thread" rule holds.
+            let acquired = unsafe { libc::pthread_mutex_trylock(self.inner.get()) } == 0;
+            if !acquired {
+                return f
+                    .debug_struct("PiMutex")
+                    .field("data", &"<locked>")
+                    .finish();
+            }
+            let out = f
+                .debug_struct("PiMutex")
+                .field("data", unsafe { &*self.data.get() })
+                .finish();
+            unsafe {
+                libc::pthread_mutex_unlock(self.inner.get());
+            }
+            out
+        }
+    }
+
     pub struct PiMutexGuard<'a, T> {
         mutex: &'a PiMutex<T>,
         /// Makes the guard `!Send`, which `&PiMutex<T>` alone does not.

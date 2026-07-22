@@ -1,4 +1,8 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// The sixth tokio::test (stage_c1_name_servers_only_resolves_without_binding_udp)
+// is per-test #[cfg(not(feature = "rtems-exec-model"))] — its TCP name-server
+// resolution cannot run on the exec backend until Stage C2/C3 — so it is not one
+// of the five ungated sites this count covers.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -382,12 +386,6 @@ struct SearchEngineState {
     /// value is never consumed (libca's timer tuning is not modelled by
     /// the Rust retry-ring; see `handle_search_response`).
     dgram_seq: u32,
-    /// Per-destination last UDP send-error kind. Mirrors libca cae597d
-    /// (`udpiiu::SearchDestUDP::_lastError`): a persistent sendto()
-    /// failure (e.g. firewall, unreachable broadcast) repeats at search
-    /// rate (~30 ms) and would otherwise spam logs. We log on first
-    /// occurrence, on errno change, and on recovery; suppress repeats.
-    send_errors: HashMap<SocketAddr, std::io::ErrorKind>,
     /// `EPICS_RS_CLIENT_IGNORE` filter snapshot taken at startup.
     /// Rust-only client-side extension — NOT the C
     /// `EPICS_IOC_IGNORE_SERVERS` (server-side; see
@@ -432,7 +430,6 @@ impl SearchEngineState {
             penalty: HashMap::new(),
             breakers: CircuitBreakerRegistry::new(),
             dgram_seq: 0,
-            send_errors: HashMap::new(),
             ignored_servers: super::epics_rs_client_ignore().into_iter().collect(),
             resolved: HashMap::new(),
         }
@@ -490,45 +487,404 @@ impl SearchEngineState {
 }
 
 // ---------------------------------------------------------------------------
+// Search transport
+// ---------------------------------------------------------------------------
+
+/// The UDP half of the search transport: the per-NIC socket bundle, plus
+/// the destination policy and the per-destination diagnostics that only
+/// mean anything while those sockets exist.
+///
+/// Bundled into one value so a socket and the addresses it would transmit
+/// to cannot be configured independently. The membership test is whether a
+/// field can outlive the socket it describes: `addr_list` holds UDP SEARCH
+/// destinations (CA never opens a TCP circuit to an `EPICS_CA_ADDR_LIST`
+/// entry — only `EPICS_CA_NAME_SERVERS` entries get one), `send_errors`
+/// keys the libca `_lastError` suppression by those same destinations, and
+/// `prev_drops_per_iface` keys the `SO_RXQ_OVFL` transition log by the NIC
+/// of the socket that received the datagram. None of the three survives the
+/// socket's absence.
+struct UdpTransport {
+    /// libca-style multi-NIC bundle: one bound socket per IPv4 interface so
+    /// `255.255.255.255` and per-subnet broadcasts each leave via the
+    /// matching NIC.
+    socket: AsyncUdpV4,
+    /// Working UDP SEARCH destination list — `EPICS_CA_ADDR_LIST` as
+    /// parsed at startup, plus any discovery / programmatic mutation
+    /// applied since (libca `addAddrToChannelAccessAddressList`,
+    /// `configureChannelAccessAddressList`, `iocinf.cpp:45`, `:166`).
+    addr_list: Vec<super::AddrEntry>,
+    /// Per-destination last UDP send-error kind. Mirrors libca cae597d
+    /// (`udpiiu::SearchDestUDP::_lastError`): a persistent sendto()
+    /// failure (e.g. firewall, unreachable broadcast) repeats at search
+    /// rate (~30 ms) and would otherwise spam logs. We log on first
+    /// occurrence, on errno change, and on recovery; suppress repeats.
+    send_errors: HashMap<SocketAddr, std::io::ErrorKind>,
+    /// pvxs parity: per-NIC `SO_RXQ_OVFL` counters, logged on transitions
+    /// only. Keyed on the receiving NIC's `iface_ip`, which the
+    /// `AsyncUdpV4` `RecvMeta` carries on every datagram.
+    prev_drops_per_iface: HashMap<Ipv4Addr, u32>,
+}
+
+/// How the search engine reaches servers.
+///
+/// These are two transports, not "a socket, optionally". Every UDP-only
+/// piece of state lives inside the variant that owns the sockets, and every
+/// UDP operation is a method on this type — so "a UDP socket is bound" and
+/// "the arm that reads it is armed" are the same match rather than two facts
+/// that can disagree. An `Option<AsyncUdpV4>` plus an `if let` at each of
+/// the fanout sites is the patch; this is the fix
+/// (`doc/calink-rtems-design.md` §4.3, mirroring the PVA client's
+/// `SearchTransport` — `doc/pvalink-rtems-design.md` §8).
+///
+/// The configuration that needs the second variant is C's documented
+/// TCP-only name resolution mode (`modules/ca/src/client/CAref.html:515-520`):
+/// `EPICS_CA_NAME_SERVERS` set, `EPICS_CA_ADDR_LIST` empty and
+/// `EPICS_CA_AUTO_ADDR_LIST=NO`. On the RTEMS target it is the only mode
+/// available at all, because `AsyncUdpV4` is `#[cfg(not(target_os = "rtems"))]`.
+enum SearchTransport {
+    /// UDP SEARCH fanout and reply receive, alongside any TCP name servers.
+    Udp(Box<UdpTransport>),
+    /// No UDP socket is bound at all. Every SEARCH goes out over the
+    /// configured TCP name servers (`run_nameserver_connection`), replies
+    /// arrive on those same circuits, and the UDP `select!` arm parks
+    /// forever.
+    NameServersOnly,
+}
+
+impl SearchTransport {
+    /// Bind the per-NIC SEARCH socket bundle and take ownership of the UDP
+    /// destination list, so that binding a socket and deciding where it
+    /// transmits are one step.
+    ///
+    /// `None` when the bind fails — the caller's only sane response is to
+    /// abandon the engine, which is what `run_search_engine` did before this
+    /// type existed.
+    fn bind_udp(addr_list: Vec<super::AddrEntry>) -> Option<Self> {
+        // SO_REUSEADDR + (Linux) IP_MULTICAST_ALL=0 are applied to every
+        // per-NIC socket inside `AsyncUdpV4::bind`.
+        let socket = AsyncUdpV4::bind(0, true).ok()?;
+        // Larger receive buffer absorbs multi-PV SEARCH response bursts.
+        let _ = socket.set_recv_buffer_size(256 * 1024);
+        // Apply `EPICS_CA_MCAST_TTL` (epics-base 3.16, f2a1834d). Affects
+        // outgoing packets only when the destination falls in 224.0.0.0/4;
+        // setting it unconditionally is safe and lets sites that
+        // multicast SEARCH across routed segments raise the TTL via env.
+        let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
+        // pvxs `client.cpp` parity (commit a064677e3625): opt every per-NIC
+        // SEARCH socket into SO_RXQ_OVFL so a sustained reply backlog
+        // (slow main-loop, undersized SO_RCVBUF, mass-disconnect storm)
+        // surfaces as a debug log instead of silent reply loss. No-op on
+        // non-Linux. Failure is logged at trace and ignored — the
+        // counter is diagnostic-only.
+        if let Err(e) = socket.enable_so_rxq_ovfl() {
+            tracing::trace!(
+                target: "epics_ca_rs::client::search",
+                error = %e,
+                "SO_RXQ_OVFL enable on per-NIC SEARCH bundle failed (non-fatal)"
+            );
+        }
+        Some(Self::Udp(Box::new(UdpTransport {
+            socket,
+            addr_list,
+            send_errors: HashMap::new(),
+            prev_drops_per_iface: HashMap::new(),
+        })))
+    }
+
+    /// Select C's TCP-only name resolution mode: bind **no** UDP socket and
+    /// reach every server over `EPICS_CA_NAME_SERVERS` alone.
+    ///
+    /// Refused with an empty `nameserver_addrs`, because the result would be
+    /// an engine with no way to reach anything: every SEARCH would be built,
+    /// fanned to nobody, and retried forever. That is a configuration error
+    /// and it fails here — before any task is spawned — rather than
+    /// presenting as every channel timing out.
+    fn name_servers_only(nameserver_addrs: &[SocketAddr]) -> epics_base_rs::error::CaResult<Self> {
+        if nameserver_addrs.is_empty() {
+            return Err(epics_base_rs::error::CaError::InvalidValue(
+                "name-servers-only search engine requires a non-empty \
+                 EPICS_CA_NAME_SERVERS: with no UDP socket and no name server \
+                 the engine can reach no server at all"
+                    .to_string(),
+            ));
+        }
+        Ok(Self::NameServersOnly)
+    }
+
+    /// The UDP half, when there is one.
+    ///
+    /// `site` names the caller so the one-line debug records *which* UDP-only
+    /// operation was dropped on a [`Self::NameServersOnly`] engine. Callers
+    /// that legitimately do nothing without UDP (the SEARCH fanout, the DNS
+    /// refresh) match on the variant directly instead of logging per tick.
+    fn udp_mut(&mut self, site: &'static str) -> Option<&mut UdpTransport> {
+        match self {
+            Self::Udp(u) => Some(u),
+            Self::NameServersOnly => {
+                tracing::debug!(
+                    target: "epics_ca_rs::client::search",
+                    site,
+                    "ignoring UDP address-list change: this search engine binds \
+                     no UDP socket (EPICS_CA_NAME_SERVERS-only mode)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Append a unicast UDP SEARCH destination — libca
+    /// `addAddrToChannelAccessAddressList` (`iocinf.cpp:45`).
+    fn add_address(&mut self, addr: SocketAddr) {
+        let Some(u) = self.udp_mut("AddAddress") else {
+            return;
+        };
+        if !u.addr_list.iter().any(|e| e.sock == addr) {
+            let port = match addr {
+                SocketAddr::V4(a) => a.port(),
+                SocketAddr::V6(a) => a.port(),
+            };
+            u.addr_list.push(super::AddrEntry::new(addr, None, port));
+            tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
+        }
+    }
+
+    /// Drop a unicast UDP SEARCH destination (a discovery backend reporting
+    /// `DiscoveryEvent::Removed`).
+    fn remove_address(&mut self, addr: SocketAddr) {
+        let Some(u) = self.udp_mut("RemoveAddress") else {
+            return;
+        };
+        let before = u.addr_list.len();
+        u.addr_list.retain(|e| e.sock != addr);
+        if u.addr_list.len() != before {
+            tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
+        }
+    }
+
+    /// Replace the whole UDP SEARCH destination list — libca
+    /// `configureChannelAccessAddressList` (`iocinf.cpp:166`).
+    fn set_address_list(&mut self, list: Vec<SocketAddr>) {
+        let Some(u) = self.udp_mut("SetAddressList") else {
+            return;
+        };
+        tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
+        u.addr_list = list
+            .into_iter()
+            .map(|sock| {
+                let port = match sock {
+                    SocketAddr::V4(a) => a.port(),
+                    SocketAddr::V6(a) => a.port(),
+                };
+                super::AddrEntry::new(sock, None, port)
+            })
+            .collect();
+    }
+
+    /// `select!` arm: the next SEARCH reply datagram, with its receiving-NIC
+    /// metadata and that NIC's kernel drop counter.
+    ///
+    /// Parks forever without a UDP transport — the degradation shape the
+    /// PVA client's optional beacon socket already used, and the reason the
+    /// arm needs no `if` of its own.
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(epics_base_rs::net::RecvMeta, u32)> {
+        match self {
+            Self::Udp(u) => u.socket.recv_with_meta_with_drops(buf).await,
+            Self::NameServersOnly => std::future::pending().await,
+        }
+    }
+
+    /// Record this NIC's `SO_RXQ_OVFL` counter and log the transitions —
+    /// pvxs `udp_collector.cpp:55-67` logs at debug on
+    /// `prev != current && current != 0`.
+    fn note_drops(&mut self, iface_ip: Ipv4Addr, drops: u32) {
+        let Self::Udp(u) = self else { return };
+        let prev = u.prev_drops_per_iface.insert(iface_ip, drops).unwrap_or(0);
+        if drops != 0 && drops != prev {
+            tracing::debug!(
+                target: "epics_ca_rs::client::search",
+                %iface_ip,
+                prev,
+                drops,
+                "CA client SEARCH per-NIC socket buffer overflow"
+            );
+        }
+    }
+
+    /// Send one built SEARCH datagram to every UDP destination.
+    ///
+    /// Nothing is sent without a UDP transport: the destinations a datagram
+    /// would go to live inside [`UdpTransport`], so there is no list to walk
+    /// rather than a list that must be checked for emptiness.
+    async fn fanout(&mut self, frame: &[u8], site: &'static str) {
+        let Self::Udp(u) = self else { return };
+        // Split-borrow so the per-destination error-suppression map can be
+        // updated while the socket is borrowed for the send.
+        let UdpTransport {
+            socket,
+            addr_list,
+            send_errors,
+            ..
+        } = &mut **u;
+        for entry in addr_list.iter() {
+            send_with_fanout(socket, frame, entry.sock, site, send_errors).await;
+        }
+    }
+
+    /// Re-resolve every `EPICS_CA_ADDR_LIST` entry that was configured as a
+    /// hostname rather than an IP literal. No-op without a UDP transport —
+    /// the entries being refreshed are UDP destinations.
+    fn refresh_dns(&mut self) {
+        let Self::Udp(u) = self else { return };
+        // `refresh_dns()` is a no-op for IP-literal entries; for DNS
+        // entries it does a fresh `to_socket_addrs()` and replaces the
+        // cached IP when it differs. Changes are logged at info so
+        // operators can correlate an IOC migration with the client's
+        // discovery of the new address.
+        for entry in u.addr_list.iter_mut() {
+            let prev_sock = entry.sock;
+            match entry.refresh_dns() {
+                Ok(new_sock) if new_sock != prev_sock => {
+                    tracing::info!(
+                        hostname = ?entry.hostname,
+                        old = %prev_sock,
+                        new = %new_sock,
+                        "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        hostname = ?entry.hostname,
+                        error = %e,
+                        "ca-rs: DNS refresh failed; keeping cached IP"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every UDP address this transport bound. Empty for
+    /// [`Self::NameServersOnly`] because that variant holds no socket — the
+    /// "bound no UDP socket" property is a fact about the type, and this is
+    /// the runtime read of it.
+    ///
+    /// Test-only: nothing in the engine needs to know its own bound
+    /// addresses, so this exists for the stage-C1 gate
+    /// (`stage_c1_name_servers_only_resolves_without_binding_udp`) rather
+    /// than being production surface that happens to be tested. Scoped to the
+    /// configuration that actually runs that gate — it is per-test gated off
+    /// under `rtems-exec-model`, so the method would be dead there.
+    #[cfg(all(test, not(feature = "rtems-exec-model")))]
+    fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
+        match self {
+            Self::NameServersOnly => Vec::new(),
+            Self::Udp(u) => u.socket.local_addrs(),
+        }
+    }
+
+    /// The current UDP SEARCH destinations. Empty for
+    /// [`Self::NameServersOnly`], which has none by construction.
+    #[cfg(test)]
+    fn addr_list(&self) -> &[super::AddrEntry] {
+        match self {
+            Self::NameServersOnly => &[],
+            Self::Udp(u) => &u.addr_list,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// The ordinary client engine: bind the UDP SEARCH bundle and additionally
+/// use any `EPICS_CA_NAME_SERVERS` TCP circuits.
 pub(crate) async fn run_search_engine(
-    mut addr_list: Vec<super::AddrEntry>,
+    addr_list: Vec<super::AddrEntry>,
+    nameserver_addrs: Vec<SocketAddr>,
+    request_rx: mpsc::UnboundedReceiver<SearchRequest>,
+    response_tx: mpsc::UnboundedSender<SearchResponse>,
+    attempts: SearchAttempts,
+) {
+    let Some(transport) = SearchTransport::bind_udp(addr_list) else {
+        return;
+    };
+    run_engine(
+        transport,
+        nameserver_addrs,
+        request_rx,
+        response_tx,
+        attempts,
+    )
+    .await;
+}
+
+/// Build a search engine that binds **no UDP socket at all** and resolves
+/// every PV over the `EPICS_CA_NAME_SERVERS` TCP circuits alone.
+///
+/// This is C's documented UDP-free mode
+/// (`modules/ca/src/client/CAref.html:515-520`): "When used in combination
+/// with an empty EPICS_CA_ADDR_LIST and EPICS_CA_AUTO_ADDR_LIST set to
+/// \"NO\", Channel Access can be run without using UDP for name
+/// resolution." libca reaches it by registering a `SearchDestTCP` per
+/// `EPICS_CA_NAME_SERVERS` address (`cac.cpp:250-280`); it is what the RTEMS
+/// target needs, because `AsyncUdpV4` does not exist there at all
+/// (`doc/calink-rtems-design.md` §4.5).
+///
+/// Selection is an **explicit entry point**, not derived from the address
+/// list being empty — deriving it would silently drop UDP search for every
+/// host client that already runs with an empty `EPICS_CA_ADDR_LIST` and
+/// `AUTO_ADDR_LIST=NO` but still expects a later `AddAddress` / discovery
+/// event to work. Same reasoning as the PVA client's
+/// `SearchEngine::spawn_name_servers_only` (`doc/pvalink-rtems-design.md`
+/// §8.2).
+///
+/// The cost, stated plainly: no UDP SEARCH at all, so no reply can arrive
+/// from a server that is not behind one of the configured name servers, and
+/// runtime `AddAddress` / `SetAddressList` mutations have nowhere to go
+/// (they are logged and dropped).
+///
+/// Returns the engine future rather than running it, so the empty-name-server
+/// refusal is observed by the caller **before** anything is spawned.
+///
+/// No production caller selects this yet — stage C1 builds the capability, and
+/// the RTEMS mount (stage C5, `doc/calink-rtems-design.md` §6) is what will
+/// choose it. Its only current exerciser is the host gate test, which is per-test
+/// gated off under `rtems-exec-model`; so the function is dead in every
+/// configuration except a host (`not(feature)`) test build, and the `expect`
+/// covers exactly the others.
+#[cfg_attr(
+    any(not(test), feature = "rtems-exec-model"),
+    expect(
+        dead_code,
+        reason = "\
+    stage C1 builds the capability; the RTEMS mount (stage C5, \
+    doc/calink-rtems-design.md §6) is what selects it"
+    )
+)]
+pub(crate) fn name_servers_only_search_engine(
+    nameserver_addrs: Vec<SocketAddr>,
+    request_rx: mpsc::UnboundedReceiver<SearchRequest>,
+    response_tx: mpsc::UnboundedSender<SearchResponse>,
+    attempts: SearchAttempts,
+) -> epics_base_rs::error::CaResult<impl std::future::Future<Output = ()> + Send + 'static> {
+    let transport = SearchTransport::name_servers_only(&nameserver_addrs)?;
+    Ok(run_engine(
+        transport,
+        nameserver_addrs,
+        request_rx,
+        response_tx,
+        attempts,
+    ))
+}
+
+async fn run_engine(
+    mut transport: SearchTransport,
     nameserver_addrs: Vec<SocketAddr>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
     attempts: SearchAttempts,
 ) {
-    // libca-style multi-NIC: one bound socket per IPv4 interface so
-    // `255.255.255.255` and per-subnet broadcasts each leave via the
-    // matching NIC. SO_REUSEADDR + (Linux) IP_MULTICAST_ALL=0 are
-    // applied to every per-NIC socket inside `AsyncUdpV4::bind`.
-    let socket = match AsyncUdpV4::bind(0, true) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    // Larger receive buffer absorbs multi-PV SEARCH response bursts.
-    let _ = socket.set_recv_buffer_size(256 * 1024);
-    // Apply `EPICS_CA_MCAST_TTL` (epics-base 3.16, f2a1834d). Affects
-    // outgoing packets only when the destination falls in 224.0.0.0/4;
-    // setting it unconditionally is safe and lets sites that
-    // multicast SEARCH across routed segments raise the TTL via env.
-    let _ = socket.set_multicast_ttl_v4(epics_base_rs::runtime::net::ca_mcast_ttl());
-    // pvxs `client.cpp` parity (commit a064677e3625): opt every per-NIC
-    // SEARCH socket into SO_RXQ_OVFL so a sustained reply backlog
-    // (slow main-loop, undersized SO_RCVBUF, mass-disconnect storm)
-    // surfaces as a debug log instead of silent reply loss. No-op on
-    // non-Linux. Failure is logged at trace and ignored — the
-    // counter is diagnostic-only.
-    if let Err(e) = socket.enable_so_rxq_ovfl() {
-        tracing::trace!(
-            target: "epics_ca_rs::client::search",
-            error = %e,
-            "SO_RXQ_OVFL enable on per-NIC SEARCH bundle failed (non-fatal)"
-        );
-    }
-
     // Spawn a connection task per EPICS_CA_NAME_SERVERS entry.
     // Each task auto-reconnects on C's EPICS_CA_CONN_TMO cadence and
     // forwards outgoing search bytes to its TCP socket. Incoming responses are
@@ -560,10 +916,6 @@ pub(crate) async fn run_search_engine(
 
     let mut state = SearchEngineState::with_attempts(attempts);
     let mut recv_buf = [0u8; 65536];
-    // pvxs parity: track per-NIC SO_RXQ_OVFL counters, log on
-    // transitions only. Key on the receiving NIC's iface_ip
-    // (already exposed on the AsyncUdpV4 RecvMeta we read each tick).
-    let mut prev_drops_per_iface: HashMap<Ipv4Addr, u32> = HashMap::new();
 
     // pvxs `client.cpp::tickSearch`: a single steady tick advances the
     // bucket cursor. fast_tick is engaged after a beacon poke for one
@@ -593,22 +945,22 @@ pub(crate) async fn run_search_engine(
             req = request_rx.recv() => {
                 let Some(req) = req else { return };
                 let mut immediate: Vec<u32> = Vec::new();
-                if let Some(cid) = handle_request_or_addr(&mut state, &mut addr_list, req) {
+                if let Some(cid) = handle_request_or_addr(&mut state, &mut transport, req) {
                     immediate.push(cid);
                 }
                 // Drain any additional queued requests so a burst of
                 // Schedule messages all land before the next tick.
-                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                drain_pending_requests(&mut state, &mut transport, &mut request_rx, &mut immediate);
                 // pvxs `clientdiscover.cpp` parity: send the first SEARCH
                 // packet right now instead of waiting up to one tick for
                 // the bucket to come around. The bucket placement still
                 // governs all subsequent retries.
                 if !immediate.is_empty() {
-                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                    fire_searches(&mut state, &immediate, &mut transport, &nameserver_send_txs).await;
                 }
             }
 
-            result = socket.recv_with_meta_with_drops(&mut recv_buf) => {
+            result = transport.recv(&mut recv_buf) => {
                 let Ok((meta, drops)) = result else { continue };
                 // drain any queued `SearchRequest` before parsing
                 // this datagram. A `Schedule{Reconnect}` enqueued by the
@@ -624,23 +976,12 @@ pub(crate) async fn run_search_engine(
                 // is always observed first; this drain restores that
                 // ordering for the decoupled search-engine task.
                 let mut immediate: Vec<u32> = Vec::new();
-                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                drain_pending_requests(&mut state, &mut transport, &mut request_rx, &mut immediate);
                 if !immediate.is_empty() {
-                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                    fire_searches(&mut state, &immediate, &mut transport, &nameserver_send_txs).await;
                 }
-                // Surface per-NIC kernel drop transitions — pvxs
-                // `udp_collector.cpp:55-67` logs at debug on
-                // `prev != current && current != 0`.
-                let prev = prev_drops_per_iface.insert(meta.iface_ip, drops).unwrap_or(0);
-                if drops != 0 && drops != prev {
-                    tracing::debug!(
-                        target: "epics_ca_rs::client::search",
-                        iface_ip = %meta.iface_ip,
-                        prev,
-                        drops,
-                        "CA client SEARCH per-NIC socket buffer overflow"
-                    );
-                }
+                // Surface per-NIC kernel drop transitions.
+                transport.note_drops(meta.iface_ip, drops);
                 handle_udp_response(&mut state, &recv_buf[..meta.n], meta.src, &response_tx);
             }
 
@@ -651,9 +992,9 @@ pub(crate) async fn run_search_engine(
                 // so a stale `resolved` entry cannot survive into the
                 // multiply-defined check for this nameserver reply.
                 let mut immediate: Vec<u32> = Vec::new();
-                drain_pending_requests(&mut state, &mut addr_list, &mut request_rx, &mut immediate);
+                drain_pending_requests(&mut state, &mut transport, &mut request_rx, &mut immediate);
                 if !immediate.is_empty() {
-                    fire_searches(&mut state, &immediate, &addr_list, &socket, &nameserver_send_txs).await;
+                    fire_searches(&mut state, &immediate, &mut transport, &nameserver_send_txs).await;
                 }
                 // TCP nameserver path uses the libca-equivalent
                 // SEARCH-reply contract (no per-reply VERSION header).
@@ -661,41 +1002,14 @@ pub(crate) async fn run_search_engine(
             }
 
             _ = tick.tick() => {
-                process_bucket(&mut state, &addr_list, &socket, &nameserver_send_txs).await;
+                process_bucket(&mut state, &mut transport, &nameserver_send_txs).await;
                 if state.fast_ticks_remaining > 0 {
                     state.fast_ticks_remaining -= 1;
                 }
             }
 
             _ = dns_refresh.tick() => {
-                // re-resolve every hostname entry. The
-                // `refresh_dns()` call is a no-op for IP-literal
-                // entries; for DNS entries it does a fresh
-                // `to_socket_addrs()` and replaces the cached IP
-                // when it differs. We log changes at info-level so
-                // operators can correlate an IOC migration with
-                // the client's discovery of the new address.
-                for entry in addr_list.iter_mut() {
-                    let prev_sock = entry.sock;
-                    match entry.refresh_dns() {
-                        Ok(new_sock) if new_sock != prev_sock => {
-                            tracing::info!(
-                                hostname = ?entry.hostname,
-                                old = %prev_sock,
-                                new = %new_sock,
-                                "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::debug!(
-                                hostname = ?entry.hostname,
-                                error = %e,
-                                "ca-rs: DNS refresh failed; keeping cached IP"
-                            );
-                        }
-                    }
-                }
+                transport.refresh_dns();
             }
         }
 
@@ -952,41 +1266,20 @@ async fn run_nameserver_connection(
 /// literals on the wire.
 fn handle_request_or_addr(
     state: &mut SearchEngineState,
-    addr_list: &mut Vec<super::AddrEntry>,
+    transport: &mut SearchTransport,
     req: SearchRequest,
 ) -> Option<u32> {
     match req {
         SearchRequest::AddAddress(addr) => {
-            if !addr_list.iter().any(|e| e.sock == addr) {
-                let port = match addr {
-                    SocketAddr::V4(a) => a.port(),
-                    SocketAddr::V6(a) => a.port(),
-                };
-                addr_list.push(super::AddrEntry::new(addr, None, port));
-                tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
-            }
+            transport.add_address(addr);
             None
         }
         SearchRequest::RemoveAddress(addr) => {
-            let before = addr_list.len();
-            addr_list.retain(|e| e.sock != addr);
-            if addr_list.len() != before {
-                tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
-            }
+            transport.remove_address(addr);
             None
         }
         SearchRequest::SetAddressList(list) => {
-            tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
-            *addr_list = list
-                .into_iter()
-                .map(|sock| {
-                    let port = match sock {
-                        SocketAddr::V4(a) => a.port(),
-                        SocketAddr::V6(a) => a.port(),
-                    };
-                    super::AddrEntry::new(sock, None, port)
-                })
-                .collect();
+            transport.set_address_list(list);
             None
         }
         other => handle_request(state, other),
@@ -1008,12 +1301,12 @@ fn handle_request_or_addr(
 /// where circuit teardown and SEARCH-reply handling share one mutex.
 fn drain_pending_requests(
     state: &mut SearchEngineState,
-    addr_list: &mut Vec<super::AddrEntry>,
+    transport: &mut SearchTransport,
     request_rx: &mut mpsc::UnboundedReceiver<SearchRequest>,
     immediate: &mut Vec<u32>,
 ) {
     while let Ok(req) = request_rx.try_recv() {
-        if let Some(cid) = handle_request_or_addr(state, addr_list, req) {
+        if let Some(cid) = handle_request_or_addr(state, transport, req) {
             immediate.push(cid);
         }
     }
@@ -1435,8 +1728,7 @@ fn handle_search_response(
 /// the fact; the bucket scheduler prevents storms by construction.
 async fn process_bucket(
     state: &mut SearchEngineState,
-    addr_list: &[super::AddrEntry],
-    socket: &AsyncUdpV4,
+    transport: &mut SearchTransport,
     nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     let now = Instant::now();
@@ -1501,7 +1793,7 @@ async fn process_bucket(
         return;
     }
 
-    fire_searches(state, &to_send, addr_list, socket, nameserver_txs).await;
+    fire_searches(state, &to_send, transport, nameserver_txs).await;
 }
 
 /// Build batched UDP SEARCH datagrams for `cids` and send via every
@@ -1516,8 +1808,7 @@ async fn process_bucket(
 async fn fire_searches(
     state: &mut SearchEngineState,
     cids: &[u32],
-    addr_list: &[super::AddrEntry],
-    socket: &AsyncUdpV4,
+    transport: &mut SearchTransport,
     nameserver_txs: &[mpsc::Sender<Vec<u8>>],
 ) {
     state.dgram_seq = state.dgram_seq.wrapping_add(1);
@@ -1566,16 +1857,7 @@ async fn fire_searches(
         if current_frame.len() + payload.len() > MAX_UDP_SEND
             && current_frame.len() > CaHeader::SIZE
         {
-            for entry in addr_list {
-                send_with_fanout(
-                    socket,
-                    &current_frame,
-                    entry.sock,
-                    "bucket",
-                    &mut state.send_errors,
-                )
-                .await;
-            }
+            transport.fanout(&current_frame, "bucket").await;
             for ns_tx in nameserver_txs {
                 ns_try_send(ns_tx, current_frame.clone());
             }
@@ -1588,9 +1870,7 @@ async fn fire_searches(
             let mut solo = Vec::with_capacity(CaHeader::SIZE + payload.len());
             solo.extend_from_slice(&version_hdr);
             solo.extend_from_slice(&payload);
-            for entry in addr_list {
-                send_with_fanout(socket, &solo, entry.sock, "solo", &mut state.send_errors).await;
-            }
+            transport.fanout(&solo, "solo").await;
             for ns_tx in nameserver_txs {
                 ns_try_send(ns_tx, solo.clone());
             }
@@ -1601,16 +1881,7 @@ async fn fire_searches(
 
     // Flush the final frame.
     if current_frame.len() > CaHeader::SIZE {
-        for entry in addr_list {
-            send_with_fanout(
-                socket,
-                &current_frame,
-                entry.sock,
-                "flush",
-                &mut state.send_errors,
-            )
-            .await;
-        }
+        transport.fanout(&current_frame, "flush").await;
         for ns_tx in nameserver_txs {
             ns_try_send(ns_tx, current_frame.clone());
         }
@@ -1866,24 +2137,73 @@ mod tests {
     /// `AddAddress` previously appended — this is the path a discovery
     /// backend's `DiscoveryEvent::Removed` feeds. A removal for an
     /// address not in the list is a silent no-op.
-    #[test]
-    fn add_then_remove_address_round_trip() {
+    ///
+    /// Async because the destination list now lives inside `UdpTransport`,
+    /// whose construction binds the per-NIC socket bundle — the point of the
+    /// sum type is that there is no way to hold UDP destinations without the
+    /// socket that would transmit to them.
+    #[tokio::test]
+    async fn add_then_remove_address_round_trip() {
         let mut state = SearchEngineState::new();
-        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        let mut transport = SearchTransport::bind_udp(Vec::new()).expect("bind UDP transport");
         let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
         let b: SocketAddr = "10.0.0.8:5064".parse().unwrap();
 
-        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(a));
-        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::AddAddress(b));
-        assert_eq!(addr_list.len(), 2);
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::AddAddress(a));
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::AddAddress(b));
+        assert_eq!(transport.addr_list().len(), 2);
 
-        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
-        assert_eq!(addr_list.len(), 1);
-        assert!(addr_list.iter().all(|e| e.sock == b));
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::RemoveAddress(a));
+        assert_eq!(transport.addr_list().len(), 1);
+        assert!(transport.addr_list().iter().all(|e| e.sock == b));
 
         // Removing an address not present is a no-op, not a panic.
-        handle_request_or_addr(&mut state, &mut addr_list, SearchRequest::RemoveAddress(a));
-        assert_eq!(addr_list.len(), 1);
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::RemoveAddress(a));
+        assert_eq!(transport.addr_list().len(), 1);
+    }
+
+    /// The same three requests on a [`SearchTransport::NameServersOnly`]
+    /// engine have nowhere to go: an `EPICS_CA_ADDR_LIST` entry is a UDP
+    /// SEARCH destination, and that variant binds no UDP socket. They must
+    /// be dropped (with a debug line) rather than accumulating in a list
+    /// nothing will ever transmit to.
+    #[test]
+    fn name_servers_only_drops_address_list_mutations() {
+        let mut state = SearchEngineState::new();
+        let ns: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let mut transport = SearchTransport::name_servers_only(&[ns]).expect("non-empty NS list");
+        let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
+
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::AddAddress(a));
+        handle_request_or_addr(
+            &mut state,
+            &mut transport,
+            SearchRequest::SetAddressList(vec![a]),
+        );
+        handle_request_or_addr(&mut state, &mut transport, SearchRequest::RemoveAddress(a));
+        assert!(
+            transport.addr_list().is_empty(),
+            "NameServersOnly must hold no UDP SEARCH destinations"
+        );
+        assert!(
+            matches!(transport, SearchTransport::NameServersOnly),
+            "an address-list mutation must not promote the transport to Udp"
+        );
+    }
+
+    /// A name-servers-only engine with an empty `EPICS_CA_NAME_SERVERS` can
+    /// reach nothing at all — no UDP socket and no TCP circuit. Refuse it at
+    /// construction rather than spawning a task that resolves nothing
+    /// forever (`doc/calink-rtems-design.md` §6 stage C1).
+    #[test]
+    fn name_servers_only_refuses_empty_name_server_list() {
+        let err = SearchTransport::name_servers_only(&[])
+            .err()
+            .expect("empty name-server list must be refused");
+        assert!(
+            err.to_string().contains("EPICS_CA_NAME_SERVERS"),
+            "the refusal must name the parameter the operator has to set; got {err}"
+        );
     }
 
     #[test]
@@ -2517,6 +2837,172 @@ mod tests {
         );
     }
 
+    /// `doc/calink-rtems-design.md` §6 stage C1 gate: the client must resolve a
+    /// PV with `EPICS_CA_ADDR_LIST` empty and `EPICS_CA_AUTO_ADDR_LIST=NO`,
+    /// reaching the server **only** through `EPICS_CA_NAME_SERVERS`, having
+    /// bound **no UDP socket at all**. That is C's documented TCP-only name
+    /// resolution mode (`modules/ca/src/client/CAref.html:515-520`, §4.1) and
+    /// we had no test for it.
+    ///
+    /// The "no UDP socket" half is asserted twice, deliberately:
+    ///
+    /// * **structurally** — [`SearchTransport::NameServersOnly`] is a variant
+    ///   with no fields, so there is no socket for the engine to hold and no
+    ///   `select!` arm that could read one. That is the property the sum type
+    ///   exists to provide; an `Option<AsyncUdpV4>` would leave "bound" and
+    ///   "armed" free to disagree (§4.3).
+    /// * **at runtime** — [`SearchTransport::bound_udp_addrs`] reads back every
+    ///   address the transport actually bound, and it must be empty. A future
+    ///   change that gives `NameServersOnly` a socket fails here even if it
+    ///   still type-checks.
+    ///
+    /// The runtime half is guarded against being a tautology: the same
+    /// environment is first pushed through the real
+    /// `parse_addr_list_with_hostnames` and then through
+    /// `SearchTransport::bind_udp`, which **does** bind — so an empty list
+    /// below is a property of the variant, not of the test's configuration.
+    ///
+    /// The resolution half is what proves the degradation is not merely inert:
+    /// a SEARCH still goes out (over TCP) and the reply still resolves the cid.
+    ///
+    /// Gated off under `rtems-exec-model`: the resolution half dials the TCP
+    /// name server through `run_nameserver_connection`, which is spawned on
+    /// the exec backend's callback band (`runtime::task::spawn`) — a band
+    /// worker with no tokio I/O reactor, so `TcpStream::connect` panics there.
+    /// Making that path drive real sockets under the exec backend is Stage C2
+    /// (the blocking byte source) / C3 (the spawn seam), not this stage
+    /// (`doc/calink-rtems-design.md` §6). The structural half of the claim —
+    /// that `NameServersOnly` can hold no UDP socket — is a property of the
+    /// type and is additionally covered by
+    /// `name_servers_only_drops_address_list_mutations`, which runs in both
+    /// configurations.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn stage_c1_name_servers_only_resolves_without_binding_udp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // C's documented UDP-free configuration. SAFETY: serial_test::serial
+        // guarantees no concurrent env access; both vars are restored below.
+        let restore_list = std::env::var("EPICS_CA_ADDR_LIST").ok();
+        let restore_auto = std::env::var("EPICS_CA_AUTO_ADDR_LIST").ok();
+        unsafe {
+            std::env::set_var("EPICS_CA_ADDR_LIST", "");
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        }
+
+        let addr_list =
+            super::super::parse_addr_list_with_hostnames().expect("parse EPICS_CA_ADDR_LIST");
+        assert!(
+            addr_list.is_empty(),
+            "precondition: an empty EPICS_CA_ADDR_LIST with AUTO_ADDR_LIST=NO \
+             must yield no UDP SEARCH destination; got {addr_list:?}"
+        );
+
+        // Control, and the reason the assertion below is not a tautology: the
+        // UDP transport built from this very configuration DOES bind sockets.
+        let udp = SearchTransport::bind_udp(addr_list).expect("bind_udp must succeed on the host");
+        assert!(
+            !udp.bound_udp_addrs().is_empty(),
+            "control: the UDP transport must bind at least one per-NIC SEARCH \
+             socket, otherwise the NameServersOnly assertion proves nothing"
+        );
+        drop(udp);
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock name-server listener bind");
+        let ns_addr = ns_listener.local_addr().expect("mock name-server addr");
+
+        assert!(
+            SearchTransport::name_servers_only(&[ns_addr])
+                .expect("non-empty name-server list")
+                .bound_udp_addrs()
+                .is_empty(),
+            "NameServersOnly must bind no UDP socket"
+        );
+
+        // The server the mock name server will name in its SEARCH reply. A
+        // literal address (not the reply's source) so the assertion can tell
+        // "resolved through the name server" from "defaulted to the peer".
+        let server_addr: SocketAddr = "10.0.0.9:5064".parse().unwrap();
+        let cid = 4242u32;
+        let pv = "TEST:CA:NSONLY:PV";
+
+        let ns_handle = tokio::spawn(async move {
+            let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            let mut buf = vec![0u8; 8192];
+            let mut seen: Vec<u8> = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                seen.extend_from_slice(&buf[..n]);
+                // The client sends VERSION + CLIENT_NAME + HOST_NAME first,
+                // then the SEARCH frames; answer as soon as the PV name shows
+                // up anywhere in the stream.
+                if seen.windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                    let _ = stream.write_all(&search_reply(cid, server_addr)).await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+            }
+        });
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+        let engine = name_servers_only_search_engine(
+            vec![ns_addr],
+            req_rx,
+            resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
+        )
+        .expect("name-servers-only engine must build with a non-empty NS list");
+        let engine_handle = tokio::spawn(engine);
+
+        req_tx
+            .send(SearchRequest::Schedule {
+                cid,
+                pv_name: pv.into(),
+                reason: SearchReason::Initial,
+            })
+            .expect("schedule send");
+
+        let resolved = tokio::time::timeout(Duration::from_secs(10), resp_rx.recv()).await;
+
+        engine_handle.abort();
+        ns_handle.abort();
+
+        // Restore the environment for any later serial test.
+        match restore_list {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_ADDR_LIST", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_ADDR_LIST") },
+        }
+        match restore_auto {
+            Some(v) => unsafe { std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", v) },
+            None => unsafe { std::env::remove_var("EPICS_CA_AUTO_ADDR_LIST") },
+        }
+
+        match resolved.expect("resolution must complete within 10 s with no UDP socket bound") {
+            Some(SearchResponse::Found {
+                cid: found_cid,
+                server_addr: found_addr,
+            }) => {
+                assert_eq!(found_cid, cid, "the reply must resolve the scheduled cid");
+                assert_eq!(
+                    found_addr, server_addr,
+                    "the resolved server must be the one the TCP name server named"
+                );
+            }
+            Some(SearchResponse::MultiplyDefined { .. }) => {
+                panic!("a single name-server reply must resolve as Found")
+            }
+            None => panic!("search-response channel closed before a reply arrived"),
+        }
+    }
+
     /// Build a single-message CA_PROTO_SEARCH reply datagram naming
     /// `server` as the host of client-cid `cid`. Mirrors the wire
     /// shape parsed by `handle_search_response`: `data_type` carries
@@ -2568,7 +3054,12 @@ mod tests {
         let pv = "MR:R3:PV";
 
         let mut state = SearchEngineState::new();
-        let mut addr_list: Vec<super::super::AddrEntry> = Vec::new();
+        // The replies under test arrive on a name-server circuit
+        // (`handle_tcp_response`), so the drain runs against the transport
+        // that path actually uses — and binds no socket for a pure
+        // state-ordering test.
+        let mut transport =
+            SearchTransport::name_servers_only(&[server_a]).expect("non-empty NS list");
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SearchRequest>();
 
@@ -2610,7 +3101,7 @@ mod tests {
         // 3. A SEARCH reply from the NEW server B is ready at the same
         //    time. The fix drains queued requests before parsing it.
         let mut immediate: Vec<u32> = Vec::new();
-        drain_pending_requests(&mut state, &mut addr_list, &mut req_rx, &mut immediate);
+        drain_pending_requests(&mut state, &mut transport, &mut req_rx, &mut immediate);
         assert!(
             !state.resolved.contains_key(&cid),
             "Schedule{{Reconnect}} must invalidate the stale resolved \

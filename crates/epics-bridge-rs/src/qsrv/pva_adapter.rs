@@ -401,7 +401,7 @@ fn spawn_db_monitor_updates(
     mut monitor: super::group::AnyMonitor,
 ) -> mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate> {
     let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
-    tokio::spawn(async move {
+    epics_base_rs::runtime::task::spawn(async move {
         loop {
             // Park on poll() but stay responsive to downstream teardown.
             // An all-const / quiet monitor now *parks* in poll() (it no
@@ -835,7 +835,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 OpenedMonitor::Native(rx) => Some(rx.into()),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
-                    tokio::spawn(async move {
+                    epics_base_rs::runtime::task::spawn(async move {
                         loop {
                             // See `spawn_db_monitor_updates`: park on poll()
                             // but tear down on downstream drop so a quiet /
@@ -1131,7 +1131,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let mut monitor = channel.create_monitor().await.ok()?;
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
-            tokio::spawn(async move {
+            epics_base_rs::runtime::task::spawn(async move {
                 // Legacy ctx-less path: plain values, marked set dropped
                 // (the marked-aware cooked entry is `subscribe_checked_opts_marked`).
                 loop {
@@ -1263,6 +1263,105 @@ fn qsrv2_enabled() -> bool {
     decision.enabled
 }
 
+// ---------------------------------------------------------------------------
+// The QSRV mount — the one construction path for a served QSRV source
+// ---------------------------------------------------------------------------
+
+/// A built QSRV mount: the `ChannelSource` a PVA server answers QSRV
+/// channels from, plus the QSRV2 enable decision that produced it.
+///
+/// The decision is carried out of [`build_qsrv_mount`] rather than
+/// recomputed by the caller because the caller has more to gate on it than
+/// serving does — the host runner also gates the QSRV iocsh command set on
+/// it (pvxs registers those only inside `if(enableQ)`,
+/// iochooks.cpp:492-496).
+pub struct QsrvMount {
+    /// The source to hand to the PVA server (`Arc<QsrvPvStore>` **is** a
+    /// `DynSource`: the blanket `ChannelSourceObj` impl at
+    /// `server_native/source.rs:2361` supplies object safety, so there is no
+    /// adapter and no boxing here).
+    pub store: Arc<QsrvPvStore>,
+    /// The cached pvxs `enable2()` decision (iochooks.cpp:401-448).
+    pub enabled: bool,
+}
+
+/// Build the served QSRV mount: apply the QSRV2 enable decision, construct
+/// the provider, install the IOC-wide ACF on it, and finalize the group set
+/// — in the order C runs the equivalent hooks.
+///
+/// **This is the single owner of that sequence.** Both entry points that can
+/// serve QSRV go through it: the host dual-protocol runner
+/// ([`run_ca_pva_qsrv_ioc`]) and the RTEMS target IOC, which has no iocsh, no
+/// `IocApplication` and no CA server and so could not reach the runner. Two
+/// hand-rolled copies of "decide, build, load groups, wrap" is how the two
+/// would come to disagree about whether `PVXS_QSRV_ENABLE` is honoured or
+/// about whether groups are finalized before the first GET — the two
+/// properties that are invisible until a client asks.
+///
+/// The ordering constraint from C (`ioc/iochooks.cpp:343-366`:
+/// `processGroups()` at `initHookAfterInitDatabase`, `addGroupSrc()` at
+/// `initHookAfterIocBuilt`) is **structural here, not a rule to remember**:
+/// the group set is finalized before the [`QsrvPvStore`] that exposes it
+/// exists, so a caller cannot add the source to a server before the groups
+/// are built. What the caller still owns is the other half — bind and start
+/// accepting only after `add_source`.
+///
+/// `acf` is the IOC-wide access-security configuration, or `None`. Passing
+/// `None` leaves the provider on `AllowAllAccess`; passing the same config
+/// the CA server got is what keeps the two protocols on one policy, which
+/// is the documented configuration trap on the host side.
+///
+/// `group_files` carries `dbLoadGroup` requests the caller obtained by some
+/// route other than the iocsh command — which on the RTEMS target is the
+/// only route there is, because the target has no iocsh and therefore
+/// nothing ever pushes onto the base startup queue
+/// [`take_group_load_requests`](epics_base_rs::server::ioc_app::take_group_load_requests)
+/// drains. The target's command line *is* its st.cmd, so a `.json`
+/// argument becomes a `GroupLoadRequest` here and reaches exactly the same
+/// loader the host's `dbLoadGroup` feeds. The host runner passes an empty
+/// slice: its files are already on that queue. Keeping this a parameter of
+/// the one owner — rather than letting the target apply group files to the
+/// provider itself — is what preserves the ordering guarantee below; a
+/// caller that loaded groups on its own would necessarily do it after the
+/// store already existed.
+pub async fn build_qsrv_mount(
+    db: &Arc<epics_base_rs::server::database::PvDatabase>,
+    acf: Option<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    group_files: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
+) -> QsrvMount {
+    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
+    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before standing
+    // up the database/group sources. When disabled, the source is still
+    // mounted and the PVA server still serves native PVA PVs, but the
+    // BridgeProvider answers "absent" for every DB/group channel — matching a
+    // pvxs IOC where enable2() returned false.
+    let enabled = qsrv2_enabled();
+
+    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
+
+    // Install the IOC-wide ACF on the QSRV bridge so PVA single-record /
+    // group operations enforce the same policy the CA server does. Without
+    // this, an IOC launched with an ACF would protect CA but leave the PVA
+    // QSRV path on `AllowAllAccess`.
+    if let Some(acf_cfg) = acf {
+        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
+        provider.set_access_control(acf);
+        tracing::info!("qsrv: ACF installed on BridgeProvider");
+    }
+
+    // ── QSRV group loading (pvxs `processGroups()` parity) ──
+    // Gated on the QSRV2 enable decision, matching pvxs only adding the group
+    // source when `enable2()` is true.
+    if enabled {
+        load_qsrv_groups(&provider, db, group_files).await;
+    }
+
+    QsrvMount {
+        store: Arc::new(QsrvPvStore::new(provider)),
+        enabled,
+    }
+}
+
 /// Async link-set installer for
 /// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
 ///
@@ -1359,42 +1458,22 @@ pub async fn run_ca_pva_qsrv_ioc(
     // here honoured neither.
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
-    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
-    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before
-    // standing up the database/group sources and pvalink. When disabled,
-    // the PVA server still runs and serves native PVA PVs (NDPluginPva),
-    // but the BridgeProvider answers "absent" for every DB/group channel
-    // — matching a pvxs IOC where enable2() returned false.
-    let qsrv2_on = qsrv2_enabled();
-
     // ── QSRV bridge ──
-    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), qsrv2_on));
-
-    // install the IOC-wide ACF on the QSRV bridge so PVA
-    // single-record / group operations enforce the same policy as
-    // the CA server (which gets `config.acf` via
-    // `CaServer::from_parts` below). Without this, an IOC launched
-    // with `config.acf = Some(...)` would protect CA but leave the
-    // PVA QSRV path on `AllowAllAccess` — the documented
+    // The enable gate, the provider, the ACF install and the
+    // `processGroups()`-equivalent group load all live in `build_qsrv_mount`
+    // — the one owner shared with the RTEMS target IOC, so the two entry
+    // points cannot disagree about whether `PVXS_QSRV_ENABLE` was honoured
+    // or whether groups were finalized before the first client GET. The ACF
+    // is the same `config.acf` the CA server gets via `CaServer::from_parts`
+    // below; handing the PVA side a different one is the documented
     // configuration trap.
-    if let Some(acf_cfg) = config.acf.clone() {
-        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
-        provider.set_access_control(acf);
-        tracing::info!("qsrv: ACF installed on BridgeProvider");
-    }
-
-    // ── QSRV group loading (pvxs `processGroups()` parity) ──
-    // The runner is the single owner that builds the served provider's
-    // group set, from BOTH pvxs group sources, BEFORE the PVA server
-    // accepts any connection — the epics-rs iocRun-handoff equivalent of
-    // pvxs running `processGroups()` at `initHookAfterInitDatabase`
-    // (iochooks.cpp:343-345). Gated on the QSRV2 enable decision, matching
-    // pvxs only adding the group source when `enable2()` is true.
-    if qsrv2_on {
-        load_qsrv_groups(&provider, &db).await;
-    }
-
-    let store = Arc::new(QsrvPvStore::new(provider));
+    let QsrvMount {
+        store,
+        enabled: qsrv2_on,
+        // Empty `group_files`: this runner's `dbLoadGroup` requests already sit
+        // on the base startup queue, put there by the iocsh command during
+        // st.cmd. The parameter exists for the target IOC, which has no iocsh.
+    } = build_qsrv_mount(&db, config.acf.clone(), &[]).await;
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
     // Handles were stored in the global registry during st.cmd execution.
@@ -1489,7 +1568,13 @@ pub async fn run_ca_pva_qsrv_ioc(
 ///  1. DB `info(Q:group, ...)` records (`loadConfigFromDb`) — every record
 ///     carrying the tag contributes its group definition.
 ///  2. Queued `dbLoadGroup` files (`loadConfigFiles`) — drained from the
-///     base startup queue ([`take_group_load_requests`]) in st.cmd order.
+///     base startup queue ([`take_group_load_requests`]) in st.cmd order,
+///     followed by `extra` (the caller-supplied requests described on
+///     [`build_qsrv_mount`]). On the host exactly the first list is
+///     populated; on the RTEMS target, which has no iocsh to run the
+///     command, exactly the second is. They are the same request type
+///     applied by the same loader, so a group file behaves identically
+///     whichever route it arrived by.
 ///  3. `process_groups()` — validate/resolve trigger references
 ///     (`resolveTriggerReferences` / `createGroups`).
 ///
@@ -1500,6 +1585,7 @@ pub async fn run_ca_pva_qsrv_ioc(
 async fn load_qsrv_groups(
     provider: &Arc<BridgeProvider>,
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
+    extra: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) {
     use epics_base_rs::server::ioc_app::take_group_load_requests;
 
@@ -1516,8 +1602,12 @@ async fn load_qsrv_groups(
         }
     }
 
-    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order.
-    for req in take_group_load_requests() {
+    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order,
+    //    then the caller's own requests. Exactly one of the two lists is
+    //    non-empty in practice — the queue on a host with an iocsh, `extra`
+    //    on the target without one — so the concatenation order is not a
+    //    behaviour choice, it just keeps one loop over one request type.
+    for req in take_group_load_requests().iter().chain(extra) {
         match super::iocsh::apply_group_file(provider, &req.filename, &req.macros) {
             Ok(total) => {
                 tracing::info!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
@@ -3026,7 +3116,11 @@ mod tests {
 
         // Runner single-owner build into the SERVED provider, before serving.
         let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), true));
-        load_qsrv_groups(&provider, &db).await;
+        // `&[]`: this case drives the base startup queue (the real
+        // `dbLoadGroup` command ran above), which is the host route. The
+        // caller-supplied list is the target's route and is exercised by
+        // `rtems-pva-ioc`'s own tests.
+        load_qsrv_groups(&provider, &db, &[]).await;
         let store = Arc::new(QsrvPvStore::new(provider));
 
         // Both pvxs group sources are served by the same store/provider.

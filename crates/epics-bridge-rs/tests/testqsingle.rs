@@ -10,6 +10,12 @@
 //! pvxs equivalent: tests run against a live IOC; we run against
 //! `PvDatabase::add_record` since epics-base-rs gives us a
 //! Rust-native record system without a separate `iocInit`.
+//!
+//! `qsrv-core` and not `qsrv`: this file reaches only `epics_bridge_rs::qsrv`,
+//! which is what `qsrv-core` selects, and never the `PvaClient` that `qsrv`
+//! additionally restores. Naming the wider feature would gate the file out of
+//! the target's own selection for no reason.
+#![cfg(feature = "qsrv-core")]
 
 use std::sync::Arc;
 

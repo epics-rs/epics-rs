@@ -2168,7 +2168,13 @@ struct MemberEvent {
 ///
 /// Drop-guarded per-member task handle. Aborts the spawned forwarder
 /// when the GroupMonitor drops so a quiet PV doesn't leak the task.
-pub struct MemberTaskGuard(tokio::task::AbortHandle);
+///
+/// The handle type is the `runtime::task` seam alias, not tokio's: on the
+/// target this is `background::future_exec::AbortHandle` and the forwarders
+/// it cancels run on the callback pool, where the C group event pump
+/// (`ioc/groupsource.cpp:96`) runs one thread per source. `abort()` means the
+/// same thing on both backends, which is the only property this guard needs.
+pub struct MemberTaskGuard(epics_base_rs::runtime::task::TaskAbortHandle);
 
 impl Drop for MemberTaskGuard {
     fn drop(&mut self) {
@@ -2566,7 +2572,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 // can toggle this member's event flow without owning the sub.
                 self.activation_handles.push(sub.activation_handle());
                 let tx = tx.clone();
-                let handle = tokio::spawn(async move {
+                let handle = epics_base_rs::runtime::task::spawn(async move {
                     // `recv_event` (not `recv_snapshot`) so the per-event
                     // DBE mask reaches the mark resolution — pvxs reads
                     // `pDbFieldLog->mask` for the self-trigger narrowing.
@@ -2602,7 +2608,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 {
                     self.activation_handles.push(sub.activation_handle());
                     let tx = tx.clone();
-                    let handle = tokio::spawn(async move {
+                    let handle = epics_base_rs::runtime::task::spawn(async move {
                         while let Some(event) = sub.recv_event().await {
                             if tx
                                 .send(MemberEvent {

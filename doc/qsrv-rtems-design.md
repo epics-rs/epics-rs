@@ -1,8 +1,10 @@
 # QSRV + pvalink on the RTEMS execution model
 
-**Status:** design; **stage 1 implemented** (see §7 stage 1, and §9 for
-every place reality deviated from what the probes predicted). Stages 2–5
-unimplemented.
+**Status:** design; **stages 1 and 2 implemented and stage 2 verified on
+the target** (see §7, §9.11 for the measured boot, and the rest of §9 for
+every place reality deviated from what the probes predicted — in
+particular §9.7, where stage 2 found §3.3's mount point unbuildable).
+Stages 3–5 unimplemented.
 **Base:** `integration/rtems-scope-b` tip `9965bbd6`, plus the landed
 `pi-h7-h9-l33` round (`e8b6cd50` / `6db95afc` / `5d46ce3b`) — every count
 below that touches `qsrv/group.rs` or `pvalink/integration.rs` is stated
@@ -842,7 +844,12 @@ drops `tls` or `client` from a host build. The check that catches it is
 the full-workspace test run, because `tests/pva_gateway.rs` and
 `tests/pvalink_seam.rs` both exercise the client.
 
-### Stage 2 — the target mount: serve groups from `rtems-pva-ioc` (medium)
+### Stage 2 — the target mount: serve groups from `rtems-pva-ioc` (medium) — **DONE**
+
+Read §9.7–§9.10 before trusting the sub-steps below: step 3's stated mount
+point is unbuildable (cargo package cycle) and the binary moved crates
+instead.
+
 
 *Size:* ~150–250 lines in `rtems-pva-ioc.rs` + a small builder in
 `pva_adapter.rs`, plus the five spawn conversions in qsrv.
@@ -1133,10 +1140,282 @@ the census gates nothing for this crate yet. Recorded for stage 4's
 baseline: at `79cbcc81` `cargo nextest run -p epics-bridge-rs` is
 **674 tests, 674 passed, 0 skipped**.
 
-### 9.6 What stage 1 did *not* do
+### 9.6 What stage 1 did *not* do — settled by stage 2
 
 No behaviour changed and no serving path was mounted. `rtems-pva-ioc`
 still serves single-record PVs only; `CompositeSource` is untouched;
 `qsrv2_enabled` and `load_qsrv_groups` are still dead on the target,
 which is precisely §3.3's work list. The three dead-code warnings are
 left standing on purpose.
+
+**All four are closed by stage 2** (§9.7–§9.9): the mount exists, the
+composite carries both sources, both functions have a target-reachable
+caller, and the dead-code count is 3 → 0.
+
+### 9.7 Stage 2's topology deviation: §3.3 and §6.2 are unimplementable
+
+**Predicted:** §3.3 "grow `rtems-pva-ioc` an optional qsrv mount", and
+§6.2 "the target's qsrv mount lives in `epics-pva-rs:rtems-pva-ioc`, which
+is already in `BINS`". **Measured:** that arrangement cannot be built. It
+requires `epics-pva-rs` to depend on `epics-bridge-rs`, which already
+depends on `epics-pva-rs`, and cargo refuses at the package level — so
+`optional = true` and feature gating do not help:
+
+```
+error: cyclic package dependency: package `epics-bridge-rs v0.24.3` depends
+on itself. Cycle:
+package `epics-bridge-rs`
+    ... which satisfies path dependency `epics-bridge-rs` of package `epics-pva-rs`
+    ... which satisfies path dependency `epics-pva-rs` of package `epics-bridge-rs`
+```
+
+§3.3 was right about the *shape* — one IOC with a source registry, not a
+second binary — and wrong only about which crate can host it. The
+resolution keeps every one of its four reasons and moves the binary
+down-graph: `crates/epics-pva-rs/src/bin/rtems-pva-ioc.rs` →
+`crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs`, with
+`required-features = ["qsrv-core"]`. `epics-pva-rs` now produces no target
+binary at all.
+
+That is also the C layering, which is why it does not feel like a
+concession: QSRV sits above pvxs and base, and `epics-bridge-rs` is that
+layer. An entry point belongs at the top of the dependency stack, where
+every source it composes is visible.
+
+Rejected alternatives, both considered against §3.3's own criteria:
+
+* **A second binary in `epics-bridge-rs`, leaving `rtems-pva-ioc` in
+  place.** This is §3.3 reason 2 exactly — two near-identical entry points,
+  either duplicating the (now seven) source-text guards so they can drift,
+  or shipping without them — plus reason 1's two extra `-Zbuild-std`
+  builds per gate run, in both configurations.
+* **A new top crate holding the binary.** Same shape as the move, plus a
+  new `CRATES` entry and its build cost, for no property the move lacks.
+
+The published-surface objection (`epics-pva-rs` losing a binary) was
+checked and is not real: `rtems-pva-ioc` exists only on unpushed scope-B
+branches and has never shipped in a crates.io release.
+
+Three consequences that are easy to miss, all measured:
+
+1. **`build.rs` moves with the binary.** Link *arguments* — unlike
+   `-L`/`-l` — do not propagate from a dependency's build script to a
+   dependent's link, so `epics_rtems_boot::contract::emit_link_args()` must
+   be called by the package owning the binary. `epics-bridge-rs` gains a
+   `build.rs` and both the normal and build dependency on
+   `epics-rtems-boot`; `epics-pva-rs` sheds all three, because emitting
+   link args there would now decorate a link that never happens.
+2. **`scripts/rtems-check.sh`'s `BINS` loop had no feature selection.**
+   `COMMON` carries `--no-default-features`, and the `--lib` loop had
+   already grown `CRATE_FEATURES` in stage 1 (§9.3) for exactly this
+   reason; the `BINS` loop had not, because until now no target binary
+   needed a feature. It does now.
+3. **`required-features` on a target binary is safe here, and the comment
+   the binary arrived with said otherwise.** That comment warned a
+   `required-features` gate makes cargo silently *skip* the target,
+   "turning the RTEMS gate into a vacuous pass". Measured on this
+   toolchain, that is true only for the plural forms (`--bins`,
+   `--all-targets`); the explicit `--bin NAME` this gate issues is a hard
+   error:
+
+   ```
+   $ cargo check -p epics-bridge-rs --no-default-features --bin qsrv-rs
+   error: target `qsrv-rs` in package `epics-bridge-rs` requires the features: `qsrv-bin`
+   ```
+
+   Recorded at both the manifest and the gate so it is not re-derived.
+
+### 9.8 The accepted cost: the IOC body is not host-compiled until stage 4
+
+The moved binary's `ioc` module was gated
+`any(target_os = "rtems", feature = "rtems-exec-model")`. In its new home
+that names a feature `epics-bridge-rs` does not declare — a dangling
+predicate: three `unexpected_cfg` warnings and an arm no configuration can
+select. Declaring the feature to make the warnings go away is precisely
+§6.3's bill being dodged, since the feature is what pulls in the
+~250-site `rtems-exec-gate` census. So the predicate narrowed to
+`target_os = "rtems"` alone.
+
+**The cost, recorded here so stage 4 picks it up rather than
+rediscovering it:**
+
+* The IOC body's only compile coverage today is
+  `scripts/rtems-check.sh`, in both configurations. That is real coverage
+  — it is the gate this stage's binary is inside — but it is not a host
+  compile.
+* The `mod ioc` unit tests (`search_status` ×3, `split_load_args` ×2) do
+  not run on a host. Under `epics-pva-rs` they ran via
+  `-p epics-pva-rs --features rtems-exec-model`.
+* The source-text guards are **outside** `mod ioc` and are unaffected —
+  all seven run in every host test pass.
+
+Stage 4 restores both by declaring `rtems-exec-model` on
+`epics-bridge-rs` (with the census it owes) and widening this predicate
+back to the `any(...)` form. Until then this is the one place in the
+workspace where an RTEMS entry point is not host-selectable.
+
+### 9.9 What stage 2 changed, against §7's four steps
+
+| step | as designed | as built |
+|---|---|---|
+| 1 | convert 5 spawns at `group.rs:2496`,`:2532`, `pva_adapter.rs:404`,`:838`,`:1134` | done; the two `group.rs` lines had drifted to `:2569`/`:2605` POST-ROUND. `MemberTaskGuard`'s field became the seam alias `TaskAbortHandle` |
+| 2 | give the provider an RTEMS-reachable construction path | done as `build_qsrv_mount` — and the **host runner was rewired through it**, so the two entry points share one owner instead of two copies. §2.5's three dead-code warnings: **3 → 0** |
+| 3 | mount in `epics-pva-rs:rtems-pva-ioc` | mounted, but in `epics-bridge-rs:rtems-pva-ioc` — see §9.7 |
+| 4 | extend the source-text guards | done; 4 guards → 8, each proved to fail on its own defect before being committed. The 8th is not a source-text guard: it runs `parse_db` + `parse_info_group` over the built-in database and asserts the group it defines (see §9.11) |
+
+Two further notes:
+
+* §9.4's closing note that `--features qsrv-core --all-targets` is "not
+  clean under `-D warnings`, and deliberately so" is **retired**: the three
+  warnings it referred to were stage 2's work list and are now consumed.
+  That selection is clean.
+* §9.4's other pre-existing break — `tests/acf_access_control_contexts.rs`
+  and `tests/testqsingle.rs` carrying no feature header — was fixed, and
+  the census found a **third** file with the identical defect,
+  `tests/testqgroup.rs`, hidden behind the compiler's error cap. All three
+  took `#![cfg(feature = "qsrv-core")]`, not `qsrv`: none reaches
+  `PvaClient`, and the narrower predicate keeps them compiling under the
+  target's own selection. The `pva_gateway/{control,middleware}.rs`
+  `MonitorStream` break is a missing import rather than a missing gate and
+  is still open.
+
+### 9.10 What stage 2 did *not* do
+
+Stage 3 (the L-A/L-B lock cleanup) and stage 4 (the `rtems-exec-model`
+feature and its census) are untouched, and stage 5 remains blocked on a
+blocking PVA client — which is why the target IOC now states the `pva://`
+gap at boot instead of leaving it to be discovered.
+
+Two things inside stage 2's own scope were deliberately left:
+
+* **The spawn-count asymmetry is still unmeasured under load.** §7 stage
+  2's stated risk — C runs one `qsrvGroup` pump thread
+  (`ioc/groupsource.cpp:96`), this runs two tasks per member — is now
+  reachable on the target, but only correctness was verified, not
+  behaviour at saturation. §8 item 2 stands.
+* **The `activation_handles` / per-op MONITOR START-STOP gate** was not
+  re-examined against the callback pool. It is runtime-agnostic and needed
+  no conversion, so it is outside this stage's diff — but it has never run
+  on the exec backend either.
+
+### 9.11 Stage 2 on the target — measured
+
+Built for `armv7-rtems-eabihf` (`-Zbuild-std=std,panic_abort`,
+`--no-default-features --features qsrv-core`, 8,700,984-byte ELF) and
+booted under qemu `xilinx-zynq-a9` on the bring-up box, reached over
+`EPICS_PVA_NAME_SERVERS=127.0.0.1:5075` alone (SLIRP `hostfwd`; no UDP
+broadcast, `EPICS_PVA_AUTO_ADDR_LIST=NO`). Clients are the C++ pvxs
+tools. The forward is proven live by protocol traffic — type descriptors
+and values come back — not by a `connect()` that SLIRP would accept
+regardless.
+
+#### The group source a bare target can have
+
+A `-kernel` boot has no populated filesystem, so no argument can name a
+`.json` file and the `dbLoadGroup` route of §3.2 is unreachable on this
+target. The record-info route (pvxs `loadConfigFromDb`, step 1 of
+`load_qsrv_groups`) is the only group source it has, so the built-in
+database declares the group with three `info(Q:group, …)` fragments, one
+per record, naming one group. `+channel` values there are record-relative
+by construction: info-group channels are prefixed with `"{record}."`
+unconditionally (`groupconfigprocessor.cpp:810-818`), so an absolute PV
+name is not expressible on this path at all.
+
+That database moved **out** of the `target_os = "rtems"` module into a
+`cfg(any(target_os = "rtems", test))` one. It is data, not RTEMS code,
+and by §9.8 the IOC body has no host compile until stage 4 — so without
+the move, a misplaced brace in a group fragment would have been
+detectable only by a cross-build, an image copy and a qemu boot, and its
+symptom on the console is *nothing at all*: a group that was never
+defined is a name no client can find. The 8th guard now runs the same two
+parsers the target runs and asserts the group id, its atomicity, and the
+three members in put order with their resolved channels.
+
+#### Boot console
+
+```
+rtems-boot: main() reached
+epics-rs: lock protocol: PI is enabled, RT scheduling AllowRealtime
+INFO: PVXS QSRV2 is loaded, permitted, and ENABLED.
+INFO  epics_bridge_rs::qsrv::pva_adapter: qsrv: processGroups created 1 group(s)
+rtems-pva-ioc: serving 3 records on PVA TCP port 5075 (UDP search on 5076), GUID de505deeb1cf08b9b680a0ca, RTEMS execution model, no tokio runtime
+rtems-pva-ioc: QSRV2 ENABLED — sources: qsrvSingle(0), qsrvGroup(1)
+rtems-pva-ioc: NOTE pva:// record links do NOT resolve on this target — pvalink needs a blocking PVA client, which does not exist yet (design stage 5). An INP/OUT of the form @pva://... will never connect. ca:// links are unaffected.
+```
+
+`qsrv2_enabled()` and `load_qsrv_groups()` — the two functions stage 1
+left dead — are the second and third lines. Nothing panicked over the
+whole session (`grep -icE "panic|panicked|FAILURE"` → 0).
+
+#### Group introspection
+
+Asserted with `pvxinfo`, not a default-format `pvxget`: a GET reply never
+sets the top-level struct-id bit, so Delta output drops exactly the id
+being checked here.
+
+```
+$ pvxinfo -w 8 RTEMS:PVA:GRP
+RTEMS:PVA:GRP from 127.0.0.1:5075
+struct "rtems:demo/Group:1.0" {
+    struct "epics:nt/NTScalar:1.0" {
+        double value
+        ...
+    } setpoint
+    int32_t count
+    string message
+    struct { struct { int32_t queueSize; bool atomic } _options } record
+}
+```
+
+The declared `+id` survives to the wire; `+type:"scalar"` composes a full
+NTScalar substructure while the two `+type:"plain"` members are bare
+scalars; and the `record._options` block pvxs adds to every group is
+present, carrying `atomic` from the group's `+atomic`.
+
+#### Group GET, group PUT, single-PV regression
+
+```
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP        # values from the built-in database
+            double value = 1.5             #   RTEMS:PVA:AO.VAL, units "V", precision 3
+        int32_t count = 7                  #   RTEMS:PVA:LO.VAL
+        string message = "rtems-pva-ioc"   #   RTEMS:PVA:MSG.VAL
+              bool atomic = true
+
+$ pvxput -w 8 RTEMS:PVA:GRP setpoint.value=4.25 count=42 message=from-group-put
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP
+            double value = 4.25
+        int32_t count = 42
+        string message = "from-group-put"
+
+$ pvxget -w 8 RTEMS:PVA:AO RTEMS:PVA:LO RTEMS:PVA:MSG    # the backing records
+    value double = 4.25
+    value int32_t = 42
+    value string = "from-group-put"
+
+$ pvxput -w 8 RTEMS:PVA:AO 9.75; pvxput -w 8 RTEMS:PVA:LO 123
+$ pvxput -w 8 RTEMS:PVA:MSG single-put
+$ pvxget -w 8 RTEMS:PVA:AO RTEMS:PVA:LO RTEMS:PVA:MSG
+    value double = 9.75
+    value int32_t = 123
+    value string = "single-put"
+
+$ pvxget -w 8 -F tree RTEMS:PVA:GRP        # the group sees the single PUTs
+            double value = 9.75
+        int32_t count = 123
+        string message = "single-put"
+
+$ pvxget -w 8 RTEMS:PVA_CONN_CNT RTEMS:FD_CNT RTEMS:FD_MAX
+    value double = 0 / 8 / 150
+```
+
+Both directions are live: a group PUT reaches the backing records, and a
+single PUT is visible through the group. `pvxinfo RTEMS:PVA:AO` still
+reports `epics:nt/NTScalar:1.0`, and the status PVs still resolve — so
+`qsrvSingle` at order 0 is not shadowed by the group source at order 1.
+
+#### What this run did not measure
+
+Only correctness. MONITOR on a group, the atomic-PUT interleave, and the
+spawn-count asymmetry of §8 item 2 were not exercised under load, and the
+`activation_handles` MONITOR START-STOP gate still has never run on the
+exec backend (§9.10).

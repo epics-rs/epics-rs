@@ -739,7 +739,7 @@ transport-independent, this gate is where it shows, and the estimate
 moves. Budget for that rather than treating a red gate here as a
 surprise.
 
-### Stage 3 — the spawn seam and the band-blocking invariant (small)
+### Stage 3 — the spawn seam and the band-blocking invariant (small) — **DONE** (see §10)
 
 Convert the 12 production `tokio::spawn` in `client_native` (§4.1) and
 the 6 in `pvalink` to `runtime::task::spawn`; delete
@@ -1411,3 +1411,138 @@ name, not the client one this stage changed.
 | `cargo nextest run -p epics-base-rs --features rtems-exec-model` | 3520 passed, 0 failed |
 | `cargo clippy -p epics-pva-rs -p epics-base-rs --all-targets -- -D warnings` | clean, in both the default and the forced-on configuration |
 | `./scripts/rtems-check.sh` | exit 0; client probe 28, 2 pre-existing warnings unchanged |
+
+## 10. Stage 3 as built — where reality deviated from §5
+
+### 10.1 The invariant closure landed at the facility loop, not the band loop
+
+§5's candidate put the "on a callback band" marker at
+`callback_executor.rs:302-311`. It went one level down instead, into
+`runtime::background::facility::run_facility_loop` — the single function
+*every* facility worker's loop funnels through, not just the callback
+bands but the timer thread and the `scanOnce` worker too. That is the
+correct owner for the invariant as stated (§2.3: "no future spawned onto a
+callback band"), and strictly wider: parking is unsound on any of those
+single-worker loops, not only the priority bands. The loop was already
+pinned by `no_facility_propagates_a_poisoned_lock`, so the marker sits
+behind an existing guard rather than a new one.
+
+Mechanically: a private thread-local `ON_FACILITY_THREAD` set by an RAII
+`FacilityThreadMark` as the loop's first act; `on_facility_thread()` reads
+it; `block_on_sync` (`task.rs`) consults it *first* and returns
+`Err(NotBlockable::BackgroundWorker)`. `NotBlockable` went from a struct to
+a two-variant enum (`CurrentThreadRuntime`, `BackgroundWorker`) — the §5
+"third variant" framing, realised as an enum because the type carried no
+variants before. `server/scan.rs`'s `unreachable!` was widened to cover
+both. The invariant is now *reported* (a typed refusal), not *reviewed*.
+
+> **Invariant.** MUST NOT: a future running on any facility worker thread
+> call `block_on_sync` / `park_on` (it would deadlock the single-worker
+> loop).
+> **Owner/Gate.** `block_on_sync`, guarded by
+> `facility::on_facility_thread()`; the mark is owned solely by
+> `run_facility_loop`.
+> **Bypass audit.** `rg 'block_on_sync|park_on'` — every caller
+> (`scan.rs`, `blocking.rs` pumps, `audit.rs`, `status_pv.rs`, the
+> `rtems-*-ioc` bins, `blocking_io` pumps) is either on a non-facility
+> thread or already routes through `block_on_sync`; none construct a
+> facility-thread park directly.
+> **Structural closure.** The mark is private to the facility module and
+> set by exactly one function, so a future added to any worker loop
+> inherits the refusal by construction — no per-call-site discipline.
+> **Tests.** `a_future_on_a_callback_band_is_refused_a_blocking_bridge`,
+> `a_blocking_closure_on_a_callback_band_is_refused_too`, and
+> `a_thread_that_only_submits_to_a_band_still_blocks` — each written so a
+> broken gate *fails* rather than hangs (the awaited future is completable
+> from the test thread and released before the assertion). Mutation-checked.
+
+### 10.2 The unforeseen fork: exec backend cannot host the tokio-net transport
+
+§5 read the spawn conversion as mechanical and expected the feature-ON
+suite to stay green. It does not, and the reason is structural: converting
+the `client_native` connection spawns to the seam moves their
+`tokio::net` sockets and `tokio::time` timers onto the reactor-less
+callback pool. The host feature-ON tests drive the **hosted** transport
+(`tokio::net::TcpStream`), which panics "there is no reactor running" on a
+band worker — whereas the RTEMS target uses the **blocking** transport
+(`pva_blocking_client`, stage 2) that needs no reactor. So exec-backend +
+hosted-transport is a combination that exists only in the host test suite,
+never on target.
+
+The forcing experiment confirmed it is not a blanket-fixable timing issue:
+`--cfg pva_blocking_client` with `--features rtems-exec-model` still fails,
+because `search_engine`'s own `tokio::time` (the UDP-search half §4.2
+defers) runs on the pool regardless of transport. The reactor-dependent
+tests are therefore genuinely gated, per the rtems-exec-gate contract and
+the `server_native/tcp.rs` precedent — each `#[cfg(not(feature =
+"rtems-exec-model"))]`, each census marker reduced to match, helpers used
+only by gated tests carrying the same predicate:
+
+| file | gated | census |
+|---|---:|---|
+| `client_native/search_engine.rs` | 11 (live UDP search) | ALLOW 17 → 6 |
+| `client_native/context.rs` | 1 (search-timeout) | ALLOW 9 → 8 |
+| `client_native/channel.rs` | 1 (search-timeout) | ALLOW 4 → 3 |
+| `client_native/udp.rs` | 1 (live UDP `recv_loop`) | ALLOW 5 → 4 |
+| `tests/stability.rs` | 5 (live monitor) | ALLOW 31 → 26 |
+| `tests/monitor_finish_body.rs` | whole file (2/2) | marker → `#![cfg(not…)]` |
+| `tests/monitor_decode_fault_resets_circuit.rs` | whole file (2/2) | marker → `#![cfg(not…)]` |
+| `pvalink/registry.rs` | 1 (live upstream monitor) | ALLOW 6 → 5 |
+
+This is faithful to §4.2, which already defers the UDP-search half: the
+gated tests are exactly the ones that exercise a live socket or the search
+engine, and they run green again once §4.2's UDP stage lands and the
+target's blocking transport is what the suite drives.
+
+### 10.3 Driver-agnostic connection bodies had their timers ported too
+
+A spawn converted to the seam but still calling `tokio::time::interval`
+inside its body panics on the pool. So the timer calls in the converted,
+transport-independent connection bodies moved to the seam as well —
+`server_conn`'s heartbeat interval, `context`'s cache-clean interval, and
+`ops_v2`/`operation`'s sleeps and timeouts now use
+`runtime::task::{interval,sleep,timeout}`. The seam `Interval` exposes only
+`.tick()` (default Burst), so the dropped `set_missed_tick_behavior` call
+is a deliberate, behaviour-preserving simplification for these periodic
+loops. This mirrors the server precedent (`tcp.rs` connection bodies
+already use the seam timers).
+
+### 10.4 A structural fix surfaced: `PvaOperation::is_done`'s dual source of truth
+
+Under the exec seam, `cancel_aborts_op` flaked: `cancel()` synchronises on
+the operation's RAII termination guard (`terminated_rx`, documented as the
+single source of truth for "no longer running"), but `is_done()` read a
+*second* signal, `join.is_finished()`. The two flip at different instants
+on the seam's join handle, so `cancel()` could return — guard closed —
+while `is_done()` still read `false`. `is_done()` now reads the same guard
+(`terminated_rx.has_changed().is_err()`), removing the dual meaning by
+construction rather than by timing. 30/30 stress iterations green
+feature-ON. This is the "suppressed-error question" §5's stage-2 gate
+warned to budget for, surfacing one seam behaviour the conversion exposed.
+
+### 10.5 §5's stage-3 risk is stale: the bridge already carries the feature
+
+§5 warned that `rtems-exec-model` was not declared on `epics-bridge-rs`
+and that this stage would be gated behind `doc/qsrv-rtems-design.md` §7's
+census. That census has since landed: `epics-bridge-rs/Cargo.toml`
+declares `rtems-exec-model = ["epics-base-rs/rtems-exec-model"]`, the crate
+has its own `tests/rtems_exec_model_gate.rs`, and the pvalink files carry
+census markers (`integration.rs` 38, `link.rs` 24, `registry.rs` 6→5,
+`iocsh.rs` 2). No blocking dependency remained. The `:826` "third handle
+field" §5 named was in fact the `install_pvalink_resolver` parameter, not a
+struct field; `new(handle)` became `new()` with a `Default` impl.
+
+### 10.6 The gate as measured
+
+| gate | result |
+|---|---|
+| `cargo nextest run -p epics-pva-rs` (default) | 1382 passed, 2 skipped |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1352 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-bridge-rs --features pvalink,qsrv-core` (default) | pvalink 142 passed |
+| `cargo nextest run -p epics-bridge-rs --features pvalink,qsrv-core,rtems-exec-model` | 681 passed, 0 failed |
+| `cargo nextest run -p epics-base-rs --features rtems-exec-model` | 3523 passed, 0 failed |
+| `cancel_aborts_op`, feature-ON, ×30 | 30/30 pass (the is_done fix, stressed) |
+| both crates' `rtems_exec_model_gate` census tests | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo nextest run --workspace` | 10116 passed, 0 failed, 2 skipped |
+| `./scripts/rtems-check.sh` | exit 0; client probe **28** (ratchet held), 2 pre-existing `server_native/` warnings unchanged (§9.9) |

@@ -17,7 +17,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,7 +31,12 @@ use epics_base_rs::types::EpicsValue;
 /// it was asked to connect. Models a monitor-fed resolver: the value appears
 /// because the open created a subscription, not because anyone read.
 struct CountingLset {
-    cache: parking_lot::Mutex<Option<EpicsValue>>,
+    /// Keyed by link name for the same reason [`LazyLset`] in
+    /// `external_link_get_cached.rs` is: `pca->pgetNative` belongs to a
+    /// `caLink`. A shared cell would let one link's open warm another
+    /// link's read, so a per-link assertion would be reporting the
+    /// scheduler.
+    cache: parking_lot::Mutex<HashMap<String, EpicsValue>>,
     opened: parking_lot::Mutex<Vec<String>>,
     network_reads: Arc<AtomicUsize>,
 }
@@ -39,7 +44,7 @@ struct CountingLset {
 impl CountingLset {
     fn new(reads: &Arc<AtomicUsize>) -> Arc<Self> {
         Arc::new(Self {
-            cache: parking_lot::Mutex::new(None),
+            cache: parking_lot::Mutex::new(HashMap::new()),
             opened: parking_lot::Mutex::new(Vec::new()),
             network_reads: Arc::clone(reads),
         })
@@ -54,23 +59,25 @@ impl CountingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for CountingLset {
-    async fn is_connected(&self, _: &str) -> bool {
-        self.cache.lock().is_some()
+    async fn is_connected(&self, name: &str) -> bool {
+        self.cache.lock().contains_key(name)
     }
 
     async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         self.network_reads.fetch_add(1, Ordering::SeqCst);
         self.connect_link(name).await;
-        self.cache.lock().clone()
+        self.cache.lock().get(name).cloned()
     }
 
-    async fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
-        self.cache.lock().clone()
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        self.cache.lock().get(name).cloned()
     }
 
     async fn connect_link(&self, name: &str) {
         self.opened.lock().push(name.to_string());
-        *self.cache.lock() = Some(EpicsValue::Double(12.5));
+        self.cache
+            .lock()
+            .insert(name.to_string(), EpicsValue::Double(12.5));
     }
 }
 

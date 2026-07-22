@@ -22,6 +22,8 @@
 //! `caput`, `acf_deny`, `subscribe`, `unsubscribe`. Keep additions
 //! strictly additive — downstream log shippers parse the JSON.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;

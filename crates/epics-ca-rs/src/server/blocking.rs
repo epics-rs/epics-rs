@@ -95,6 +95,8 @@
 //! ARE handled (the loop waits for the rest). A future increment factors the
 //! shared sans-io frame parser both loops call.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};

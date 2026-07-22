@@ -1,8 +1,9 @@
 # QSRV + pvalink on the RTEMS execution model
 
-**Status:** design; **stage 1 implemented** (see §7 stage 1, and §9 for
-every place reality deviated from what the probes predicted). Stages 2–5
-unimplemented.
+**Status:** design; **stages 1 and 2 implemented** (see §7, and §9 for
+every place reality deviated from what the probes predicted — in
+particular §9.7, where stage 2 found §3.3's mount point unbuildable).
+Stages 3–5 unimplemented.
 **Base:** `integration/rtems-scope-b` tip `9965bbd6`, plus the landed
 `pi-h7-h9-l33` round (`e8b6cd50` / `6db95afc` / `5d46ce3b`) — every count
 below that touches `qsrv/group.rs` or `pvalink/integration.rs` is stated
@@ -842,7 +843,12 @@ drops `tls` or `client` from a host build. The check that catches it is
 the full-workspace test run, because `tests/pva_gateway.rs` and
 `tests/pvalink_seam.rs` both exercise the client.
 
-### Stage 2 — the target mount: serve groups from `rtems-pva-ioc` (medium)
+### Stage 2 — the target mount: serve groups from `rtems-pva-ioc` (medium) — **DONE**
+
+Read §9.7–§9.10 before trusting the sub-steps below: step 3's stated mount
+point is unbuildable (cargo package cycle) and the binary moved crates
+instead.
+
 
 *Size:* ~150–250 lines in `rtems-pva-ioc.rs` + a small builder in
 `pva_adapter.rs`, plus the five spawn conversions in qsrv.
@@ -1133,10 +1139,160 @@ the census gates nothing for this crate yet. Recorded for stage 4's
 baseline: at `79cbcc81` `cargo nextest run -p epics-bridge-rs` is
 **674 tests, 674 passed, 0 skipped**.
 
-### 9.6 What stage 1 did *not* do
+### 9.6 What stage 1 did *not* do — settled by stage 2
 
 No behaviour changed and no serving path was mounted. `rtems-pva-ioc`
 still serves single-record PVs only; `CompositeSource` is untouched;
 `qsrv2_enabled` and `load_qsrv_groups` are still dead on the target,
 which is precisely §3.3's work list. The three dead-code warnings are
 left standing on purpose.
+
+**All four are closed by stage 2** (§9.7–§9.9): the mount exists, the
+composite carries both sources, both functions have a target-reachable
+caller, and the dead-code count is 3 → 0.
+
+### 9.7 Stage 2's topology deviation: §3.3 and §6.2 are unimplementable
+
+**Predicted:** §3.3 "grow `rtems-pva-ioc` an optional qsrv mount", and
+§6.2 "the target's qsrv mount lives in `epics-pva-rs:rtems-pva-ioc`, which
+is already in `BINS`". **Measured:** that arrangement cannot be built. It
+requires `epics-pva-rs` to depend on `epics-bridge-rs`, which already
+depends on `epics-pva-rs`, and cargo refuses at the package level — so
+`optional = true` and feature gating do not help:
+
+```
+error: cyclic package dependency: package `epics-bridge-rs v0.24.3` depends
+on itself. Cycle:
+package `epics-bridge-rs`
+    ... which satisfies path dependency `epics-bridge-rs` of package `epics-pva-rs`
+    ... which satisfies path dependency `epics-pva-rs` of package `epics-bridge-rs`
+```
+
+§3.3 was right about the *shape* — one IOC with a source registry, not a
+second binary — and wrong only about which crate can host it. The
+resolution keeps every one of its four reasons and moves the binary
+down-graph: `crates/epics-pva-rs/src/bin/rtems-pva-ioc.rs` →
+`crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs`, with
+`required-features = ["qsrv-core"]`. `epics-pva-rs` now produces no target
+binary at all.
+
+That is also the C layering, which is why it does not feel like a
+concession: QSRV sits above pvxs and base, and `epics-bridge-rs` is that
+layer. An entry point belongs at the top of the dependency stack, where
+every source it composes is visible.
+
+Rejected alternatives, both considered against §3.3's own criteria:
+
+* **A second binary in `epics-bridge-rs`, leaving `rtems-pva-ioc` in
+  place.** This is §3.3 reason 2 exactly — two near-identical entry points,
+  either duplicating the (now seven) source-text guards so they can drift,
+  or shipping without them — plus reason 1's two extra `-Zbuild-std`
+  builds per gate run, in both configurations.
+* **A new top crate holding the binary.** Same shape as the move, plus a
+  new `CRATES` entry and its build cost, for no property the move lacks.
+
+The published-surface objection (`epics-pva-rs` losing a binary) was
+checked and is not real: `rtems-pva-ioc` exists only on unpushed scope-B
+branches and has never shipped in a crates.io release.
+
+Three consequences that are easy to miss, all measured:
+
+1. **`build.rs` moves with the binary.** Link *arguments* — unlike
+   `-L`/`-l` — do not propagate from a dependency's build script to a
+   dependent's link, so `epics_rtems_boot::contract::emit_link_args()` must
+   be called by the package owning the binary. `epics-bridge-rs` gains a
+   `build.rs` and both the normal and build dependency on
+   `epics-rtems-boot`; `epics-pva-rs` sheds all three, because emitting
+   link args there would now decorate a link that never happens.
+2. **`scripts/rtems-check.sh`'s `BINS` loop had no feature selection.**
+   `COMMON` carries `--no-default-features`, and the `--lib` loop had
+   already grown `CRATE_FEATURES` in stage 1 (§9.3) for exactly this
+   reason; the `BINS` loop had not, because until now no target binary
+   needed a feature. It does now.
+3. **`required-features` on a target binary is safe here, and the comment
+   the binary arrived with said otherwise.** That comment warned a
+   `required-features` gate makes cargo silently *skip* the target,
+   "turning the RTEMS gate into a vacuous pass". Measured on this
+   toolchain, that is true only for the plural forms (`--bins`,
+   `--all-targets`); the explicit `--bin NAME` this gate issues is a hard
+   error:
+
+   ```
+   $ cargo check -p epics-bridge-rs --no-default-features --bin qsrv-rs
+   error: target `qsrv-rs` in package `epics-bridge-rs` requires the features: `qsrv-bin`
+   ```
+
+   Recorded at both the manifest and the gate so it is not re-derived.
+
+### 9.8 The accepted cost: the IOC body is not host-compiled until stage 4
+
+The moved binary's `ioc` module was gated
+`any(target_os = "rtems", feature = "rtems-exec-model")`. In its new home
+that names a feature `epics-bridge-rs` does not declare — a dangling
+predicate: three `unexpected_cfg` warnings and an arm no configuration can
+select. Declaring the feature to make the warnings go away is precisely
+§6.3's bill being dodged, since the feature is what pulls in the
+~250-site `rtems-exec-gate` census. So the predicate narrowed to
+`target_os = "rtems"` alone.
+
+**The cost, recorded here so stage 4 picks it up rather than
+rediscovering it:**
+
+* The IOC body's only compile coverage today is
+  `scripts/rtems-check.sh`, in both configurations. That is real coverage
+  — it is the gate this stage's binary is inside — but it is not a host
+  compile.
+* The `mod ioc` unit tests (`search_status` ×3, `split_load_args` ×2) do
+  not run on a host. Under `epics-pva-rs` they ran via
+  `-p epics-pva-rs --features rtems-exec-model`.
+* The source-text guards are **outside** `mod ioc` and are unaffected —
+  all seven run in every host test pass.
+
+Stage 4 restores both by declaring `rtems-exec-model` on
+`epics-bridge-rs` (with the census it owes) and widening this predicate
+back to the `any(...)` form. Until then this is the one place in the
+workspace where an RTEMS entry point is not host-selectable.
+
+### 9.9 What stage 2 changed, against §7's four steps
+
+| step | as designed | as built |
+|---|---|---|
+| 1 | convert 5 spawns at `group.rs:2496`,`:2532`, `pva_adapter.rs:404`,`:838`,`:1134` | done; the two `group.rs` lines had drifted to `:2569`/`:2605` POST-ROUND. `MemberTaskGuard`'s field became the seam alias `TaskAbortHandle` |
+| 2 | give the provider an RTEMS-reachable construction path | done as `build_qsrv_mount` — and the **host runner was rewired through it**, so the two entry points share one owner instead of two copies. §2.5's three dead-code warnings: **3 → 0** |
+| 3 | mount in `epics-pva-rs:rtems-pva-ioc` | mounted, but in `epics-bridge-rs:rtems-pva-ioc` — see §9.7 |
+| 4 | extend the source-text guards | done; 4 guards → 7, each proved to fail on its own defect before being committed |
+
+Two further notes:
+
+* §9.4's closing note that `--features qsrv-core --all-targets` is "not
+  clean under `-D warnings`, and deliberately so" is **retired**: the three
+  warnings it referred to were stage 2's work list and are now consumed.
+  That selection is clean.
+* §9.4's other pre-existing break — `tests/acf_access_control_contexts.rs`
+  and `tests/testqsingle.rs` carrying no feature header — was fixed, and
+  the census found a **third** file with the identical defect,
+  `tests/testqgroup.rs`, hidden behind the compiler's error cap. All three
+  took `#![cfg(feature = "qsrv-core")]`, not `qsrv`: none reaches
+  `PvaClient`, and the narrower predicate keeps them compiling under the
+  target's own selection. The `pva_gateway/{control,middleware}.rs`
+  `MonitorStream` break is a missing import rather than a missing gate and
+  is still open.
+
+### 9.10 What stage 2 did *not* do
+
+Stage 3 (the L-A/L-B lock cleanup) and stage 4 (the `rtems-exec-model`
+feature and its census) are untouched, and stage 5 remains blocked on a
+blocking PVA client — which is why the target IOC now states the `pva://`
+gap at boot instead of leaving it to be discovered.
+
+Two things inside stage 2's own scope were deliberately left:
+
+* **The spawn-count asymmetry is still unmeasured under load.** §7 stage
+  2's stated risk — C runs one `qsrvGroup` pump thread
+  (`ioc/groupsource.cpp:96`), this runs two tasks per member — is now
+  reachable on the target, but only correctness was verified, not
+  behaviour at saturation. §8 item 2 stands.
+* **The `activation_handles` / per-op MONITOR START-STOP gate** was not
+  re-examined against the callback pool. It is runtime-agnostic and needed
+  no conversion, so it is outside this stage's diff — but it has never run
+  on the exec backend either.

@@ -994,6 +994,7 @@ version = "0.0.0"
 name = "epics-base-rs"
 version = "0.24.3"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bytes",
  "chrono",

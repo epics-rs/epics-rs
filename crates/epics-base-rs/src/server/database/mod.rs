@@ -19,6 +19,7 @@ pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -302,13 +303,23 @@ struct PvDatabaseInner {
     /// commands run with the database in its post-init state.
     after_ioc_running: std::sync::Mutex<Vec<String>>,
     /// Optional resolver for external PVs (ca://, pva:// links).
-    external_resolver: RwLock<Option<ExternalPvResolver>>,
+    ///
+    /// Whole-value replace: the only writer stores a complete new value
+    /// ([`PvDatabase::set_external_resolver`]), so an
+    /// [`ArcSwapOption`] store IS the mutation and no writer gate is
+    /// needed. Readers take the `Arc` with no lock at all — see
+    /// `doc/rtems-priority-locks-design.md` §3 row L8f.
+    external_resolver: ArcSwapOption<ExternalPvResolver>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
-    search_resolver: RwLock<Option<SearchResolver>>,
+    ///
+    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8g).
+    search_resolver: ArcSwapOption<SearchResolver>,
     /// Optional per-request gate consulted before a *cached* simple PV is
     /// advertised as existing (e.g. CA gateway host/state admission). See
     /// [`ExistenceGate`]. `None` for a plain IOC (short-circuit unchanged).
-    existence_gate: RwLock<Option<ExistenceGate>>,
+    ///
+    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8h).
+    existence_gate: ArcSwapOption<ExistenceGate>,
     /// Per-scheme link sets — pluggable backends for `pva://` /
     /// `ca://` link resolution. Consulted before the legacy
     /// [`ExternalPvResolver`] in [`Self::resolve_external_pv`].
@@ -338,7 +349,13 @@ struct PvDatabaseInner {
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
     /// SUBL). Populated once at iocInit from the IocApp/IocBuilder registry;
     /// read-only thereafter.
-    subroutine_registry: RwLock<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    ///
+    /// Whole-registry replace ([`PvDatabase::install_subroutine_registry`]),
+    /// so an [`ArcSwap`] store IS the mutation and no writer gate is needed
+    /// (§3 row L8j). `OnceLock` was rejected: install is a `pub async fn` that
+    /// tests and a second `iocInit` may call again, and `OnceLock` would
+    /// silently drop the second registry instead of replacing it.
+    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
     /// Breakpoint tables by name (C `bptList`), shared by every db-load path so
     /// `ai`/`ao` records with `LINR >= 3` resolve their linearisation table. An
     /// `Arc` snapshot is installed on each record at creation; the master grows
@@ -592,9 +609,9 @@ impl PvDatabase {
         Self {
             inner: Arc::new(PvDatabaseInner {
                 simple_pvs: RwLock::new(HashMap::new()),
-                external_resolver: RwLock::new(None),
-                search_resolver: RwLock::new(None),
-                existence_gate: RwLock::new(None),
+                external_resolver: ArcSwapOption::empty(),
+                search_resolver: ArcSwapOption::empty(),
+                existence_gate: ArcSwapOption::empty(),
                 link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
                 records: parking_lot::RwLock::new(HashMap::new()),
                 scan_index: RwLock::new(HashMap::new()),
@@ -611,7 +628,7 @@ impl PvDatabase {
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
-                subroutine_registry: RwLock::new(HashMap::new()),
+                subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
                 breaktable_registry: RwLock::new(Arc::new(
                     crate::server::cvt_bpt::BreakTableRegistry::new(),
                 )),
@@ -685,7 +702,7 @@ impl PvDatabase {
         &self,
         registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
     ) {
-        *self.inner.subroutine_registry.write().await = registry;
+        self.inner.subroutine_registry.store(Arc::new(registry));
     }
 
     /// Look up a registered subroutine by name. The processing path uses this
@@ -696,12 +713,7 @@ impl PvDatabase {
         &self,
         name: &str,
     ) -> Option<Arc<crate::server::record::SubroutineFn>> {
-        self.inner
-            .subroutine_registry
-            .read()
-            .await
-            .get(name)
-            .cloned()
+        self.inner.subroutine_registry.load().get(name).cloned()
     }
 
     /// Atomically claim the right to start the scan scheduler for this DB.
@@ -757,24 +769,24 @@ impl PvDatabase {
     /// fails to find a name. Used by proxy/gateway implementations to
     /// lazily populate PVs on first search.
     pub async fn set_search_resolver(&self, resolver: SearchResolver) {
-        *self.inner.search_resolver.write().await = Some(resolver);
+        self.inner.search_resolver.store(Some(Arc::new(resolver)));
     }
 
     /// Remove the previously installed search resolver, if any.
     pub async fn clear_search_resolver(&self) {
-        *self.inner.search_resolver.write().await = None;
+        self.inner.search_resolver.store(None);
     }
 
     /// Install the per-request existence gate (see [`ExistenceGate`]).
     /// Replaces any previously installed gate. Used by the CA gateway so
     /// a cached shadow PV re-runs host/state admission per request.
     pub async fn set_existence_gate(&self, gate: ExistenceGate) {
-        *self.inner.existence_gate.write().await = Some(gate);
+        self.inner.existence_gate.store(Some(Arc::new(gate)));
     }
 
     /// Remove the previously installed existence gate, if any.
     pub async fn clear_existence_gate(&self) {
-        *self.inner.existence_gate.write().await = None;
+        self.inner.existence_gate.store(None);
     }
 
     /// True when a cached simple PV named `name` must be treated as
@@ -788,10 +800,10 @@ impl PvDatabase {
     /// "cached simple PV ⇒ exists" short-circuit is closed uniformly on
     /// both the create and search paths.
     async fn simple_pv_gate_denies(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
-        let gate = match self.inner.existence_gate.read().await.clone() {
-            Some(g) => g,
-            None => return false,
+        let Some(gate) = self.inner.existence_gate.load_full() else {
+            return false;
         };
+        let gate = (*gate).clone();
         // Strip the channel-filter suffix exactly as the lookups do
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
@@ -811,7 +823,7 @@ impl PvDatabase {
     /// Set an external PV resolver for CA/PVA link resolution.
     /// The resolver is called synchronously from link reads.
     pub async fn set_external_resolver(&self, resolver: ExternalPvResolver) {
-        *self.inner.external_resolver.write().await = Some(resolver);
+        self.inner.external_resolver.store(Some(Arc::new(resolver)));
     }
 
     /// Register a [`LinkSet`] under `scheme` (e.g. `"pva"` /
@@ -1047,7 +1059,11 @@ impl PvDatabase {
                 }
             }
             // Fall through to legacy resolver.
-            let resolver = self.inner.external_resolver.read().await.clone();
+            let resolver = self
+                .inner
+                .external_resolver
+                .load_full()
+                .map(|r| (*r).clone());
             return match resolver {
                 Some(r) => r(name).await,
                 None => None,
@@ -1059,7 +1075,11 @@ impl PvDatabase {
                 return Some(v);
             }
         }
-        let resolver = self.inner.external_resolver.read().await.clone();
+        let resolver = self
+            .inner
+            .external_resolver
+            .load_full()
+            .map(|r| (*r).clone());
         match resolver {
             Some(r) => r(name).await,
             None => None,
@@ -1692,7 +1712,7 @@ impl PvDatabase {
             return Some(entry);
         }
         // Try the search resolver
-        let resolver = self.inner.search_resolver.read().await.clone();
+        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
         if let Some(r) = resolver {
             if r(name.to_string(), peer).await {
                 return self.find_entry_no_resolve(name).await;
@@ -1725,7 +1745,7 @@ impl PvDatabase {
             }
             return true;
         }
-        let resolver = self.inner.search_resolver.read().await.clone();
+        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
         if let Some(r) = resolver {
             if r(name.to_string(), peer).await {
                 return self.has_name_no_resolve(name).await;

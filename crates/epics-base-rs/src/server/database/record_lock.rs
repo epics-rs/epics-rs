@@ -120,6 +120,15 @@
 //!   this module provides, never its ordering; ordering is on-target
 //!   territory (`doc/rtems-priority-locks-design.md` §5 step 7).
 //!
+//! Read as a claim about *this* gate: on the host, `lock_record` excludes and
+//! nothing more, and no host test can be written that would catch a lost
+//! inversion. Two further conditions have to hold on target before the
+//! ordering is real, and neither is this module's to enforce — the probe must
+//! have returned `PTHREAD_PRIO_INHERIT`, and the contending threads must
+//! actually carry distinct scheduling priorities, which requires
+//! `RtPolicy::AllowRealtime` in [`crate::runtime::task`]. With the RT switch
+//! off, every thread is one priority and PI has nothing to inherit.
+//!
 //! Acquisition order — MUST
 //! ------------------------
 //! `doc/rtems-priority-locks-design.md` §3's cross-check requires this to be
@@ -132,15 +141,24 @@
 //! > them while holding one that appears later:**
 //! >
 //! > 0. **L33** — `epics-bridge-rs`' `GroupPvDef::atomic_write_lock`, the
-//! >    QSRV per-group atomic-PUT gate. Outside this crate, and only the
-//! >    atomic group PUT takes it — see the L33 section below.
+//! >    QSRV per-group atomic-PUT gate (`PriorityInheritanceMutex`). Outside
+//! >    this crate, and only the atomic group PUT takes it — see the L33
+//! >    section below.
 //! > 1. **L1** — the per-record advisory gate ([`PvDatabase::lock_record`] /
-//! >    [`PvDatabase::lock_records`]), *this* module.
-//! > 2. **L46** — `PvDatabaseInner::registration_mutex`.
+//! >    [`PvDatabase::lock_records`]), *this* module
+//! >    (`PriorityInheritanceMutex`).
+//! > 2. **L46** — `PvDatabaseInner::registration_mutex`
+//! >    (`PriorityInheritanceMutex`).
 //! > 3. the leaves, none of which is ever held while another lock is taken:
-//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket, **L7**
-//! >    `ProcessVariable::subscribers`, the `records` map, `aliases`, and a
-//! >    record's own `RwLock<RecordInstance>`.
+//! >    **L8a** `simple_pvs`, **L8b** one `scan_index` bucket and **L7**
+//! >    `ProcessVariable::subscribers` (all `PriorityInheritanceMutex`), plus
+//! >    the `records` map, `aliases`, and a record's own
+//! >    `RwLock<RecordInstance>` (`parking_lot::RwLock` — C has no
+//! >    reader-writer lock to be PI-faithful to, §5.3 addendum).
+//! >
+//! > Every rung is a blocking lock. There is no async lock left anywhere on
+//! > the put/process path, which is what makes the order a MUST rather than a
+//! > preference: a cycle wedges a thread.
 //!
 //! [`RecordLockRegistry`]'s own map mutex (a `std::sync::Mutex`, unchanged by
 //! this flip) is *not* a rung of that order: it is taken and released inside
@@ -177,6 +195,14 @@
 //! so a guard that could migrate between threads would call
 //! `pthread_mutex_unlock` from a non-owner.
 //!
+//! The compiler only *reports* it at a spawn site, though, so the standing
+//! check is a direct one — for every binding of a gate guard, read forward to
+//! the end of its drop scope and find no `.await`:
+//!
+//! ```text
+//! rg -n 'let (mut )?\w+ = .*\.(lock_record|lock_records|acquire_put_gate)\(' crates/
+//! ```
+//!
 //! ### L33 — the QSRV atomic-PUT group lock, relative to L1
 //!
 //! `epics-bridge-rs`' `GroupPvDef::atomic_write_lock` (`qsrv/group_config.rs`)
@@ -189,13 +215,12 @@
 //! requested, second so two atomic PUTs to the *same* group serialize before
 //! either reaches L1 at all.
 //!
-//! It is a `PriorityInheritanceMutex` as of this flip. It was a
-//! `tokio::sync::Mutex` for exactly as long as L1 was async: its window
-//! contains `lock_records`, which used to be a genuine suspension point, and
-//! a `!Send` guard across that await would not compile at the connection-task
-//! spawn site. That window is now the conversion phase, a synchronous
-//! `lock_records`, and a synchronous member loop — zero `.await`s — so the
-//! reason to keep it async is gone.
+//! It is a `PriorityInheritanceMutex`. It was a `tokio::sync::Mutex` for
+//! exactly as long as L1 was async: its window contains `lock_records`, which
+//! used to be a genuine suspension point, and a `!Send` guard across that
+//! await would not compile at the connection-task spawn site. That window is
+//! now the conversion phase, a synchronous `lock_records`, and a synchronous
+//! member loop — zero `.await`s — so the reason to keep it async is gone.
 
 // No RTEMS-EXEC-MODEL-ALLOW marker: this file's tests are all plain `#[test]`s
 // now that the gate is a blocking lock (a contender has to be a real thread),

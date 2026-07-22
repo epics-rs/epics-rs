@@ -1079,9 +1079,18 @@ impl BlockingPvaServer {
         // moment the problem is visible at all.
         let mut config = config;
         config.guid = random_guid()?;
+        // The reserved `__server` composition, identical to the one
+        // `PvaServer::start` performs — this driver used to bind the user
+        // source directly, which left it with no server meta-channel and made
+        // `pvxlist`/`pvlist-rs` fail against an otherwise healthy server.
+        let source = crate::server_native::server_info::compose_with_server_info(source)
+            .map_err(io::Error::other)?;
         // Same wiring the hosted single-listener path does at
         // `accept.rs:69-70`: the source needs the handle to force-disconnect
-        // downstream channels out of band.
+        // downstream channels out of band. Applied to the COMPOSITE, as
+        // `start` does — `CompositeSource::set_channel_invalidator` fans the
+        // handle out to every child, so a leaf that publishes invalidations
+        // still receives it.
         let channel_invalidator = ChannelInvalidator::new();
         source.set_channel_invalidator(channel_invalidator.clone());
         Ok(Self {
@@ -3099,6 +3108,43 @@ mod tests {
             cur.get_u8().expect("status"),
             0xFF,
             "a connection accepted by the blocking accept loop must serve channels"
+        );
+
+        stop_and_join(&server, accept);
+    }
+
+    /// The reserved server meta-channel must exist on a blocking server too.
+    ///
+    /// This is what `pvxlist -i`, `pvxlist <address>` and our own `pvlist-rs`
+    /// create a channel for. Without it the server boots, serves its user PVs
+    /// and looks healthy, while every attempt to ask it what it is fails with
+    /// "Refused to create Channel" — an IOC that cannot be diagnosed from a
+    /// client is the exact failure mode the RTEMS path can least afford,
+    /// because there is no shell on the target to ask instead.
+    ///
+    /// Asserted through the accept loop rather than on the source, so it
+    /// covers what `bind` actually composed rather than what a test composed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_reserved_server_channel_is_servable() {
+        let order = ByteOrder::Little;
+        let (server, accept) = start_server(isolated_config());
+        let mut client = TestClient::connect(server.local_addr().expect("addr"));
+
+        client.send(&app_frame(
+            Command::CreateChannel,
+            order,
+            create_channel_payload(42, crate::server_native::SERVER_PV_NAME, order),
+        ));
+        let body = client.read_until(Command::CreateChannel);
+        let mut cur = Cursor::new(&body[..]);
+        assert_eq!(cur.get_u32(order).expect("cid"), 42, "cid echoed");
+        let _sid = cur.get_u32(order).expect("sid");
+        assert_eq!(
+            cur.get_u8().expect("status"),
+            0xFF,
+            "a blocking PVA server must serve the reserved `{}` channel, or \
+             pvxlist/pvlist cannot introspect it at all",
+            crate::server_native::SERVER_PV_NAME,
         );
 
         stop_and_join(&server, accept);

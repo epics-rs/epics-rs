@@ -251,47 +251,14 @@ impl PvaServer {
         // built-in server-info source can report connection counts.
         let peers = crate::server_native::peers::PeerRegistry::new();
 
-        // User source kept as a dyn handle: the built-in source's
-        // channel-list closure enumerates it directly (rather than
-        // the composite, which would also include the built-in source
-        // — harmless since its `list_pvs` is empty, but enumerating
-        // the user half keeps the intent explicit).
+        // The reserved `__server` composition — the same one
+        // `BlockingPvaServer::bind` performs. Written once in
+        // `server_info::compose_with_server_info`, because two copies of a
+        // composition rule is how the blocking driver came to have no
+        // server meta-channel at all.
         let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
-        let server_info = Arc::new(super::server_info::ServerInfoSource::new({
-            let user_source = user_source.clone();
-            move || {
-                let user_source = user_source.clone();
-                async move { user_source.list_pvs().await }
-            }
-        }));
-
-        // Composite registry: built-in `__server` at order -1, BEFORE
-        // default-order (0) user sources, matching pvxs registering its
-        // `ServerSource` at `(order = -1, "__server")` (server.cpp:542-547)
-        // where the lowest order is consulted first (server.h:108-118).
-        // The built-in source only claims the reserved `server` name, so
-        // running it first shadows a user PV named `server` (the pvxs
-        // diagnostic-source contract) while every other name still falls
-        // through to the user source. A user that genuinely wants to own
-        // `server` must register at an explicit order < -1.
-        let composite = super::CompositeSource::new();
-        composite
-            .add_source("__user", user_source, 0)
-            .map_err(|e| {
-                PvaError::Protocol(format!("PvaServer::start: register user source: {e}"))
-            })?;
-        composite
-            .add_source(
-                super::server_info::SERVER_SOURCE_NAME,
-                server_info as DynSource,
-                -1,
-            )
-            .map_err(|e| {
-                PvaError::Protocol(format!(
-                    "PvaServer::start: register built-in server source: {e}"
-                ))
-            })?;
-        let dyn_source: DynSource = composite as Arc<dyn ChannelSourceObj>;
+        let dyn_source: DynSource = super::server_info::compose_with_server_info(user_source)
+            .map_err(|e| PvaError::Protocol(format!("PvaServer::start: {e}")))?;
 
         // One server-wide channel-invalidation fan-out. A source that can
         // invalidate a channel out of band (the PVA gateway, on an operator

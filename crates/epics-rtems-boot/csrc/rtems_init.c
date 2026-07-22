@@ -219,19 +219,31 @@ void *POSIX_Init(void *argument)
      * the init task just above idle, and let libbsd's background work outrank
      * it.
      *
-     * CORRECTION, from the RTEMS source: this does NOT leave the IOC's own
-     * server threads outranking the init task, as this comment previously
-     * claimed. `_POSIX_Threads_Default_attributes` sets
+     * This value is INHERITED, and that is the whole reason it matters.
+     * `_POSIX_Threads_Default_attributes` sets
      * `inheritsched = PTHREAD_INHERIT_SCHED`
      * (`cpukit/posix/src/pthreadattrdefault.c:49-58`), and Rust's `std` never
-     * calls `pthread_attr_setinheritsched`, so every thread created from here
-     * inherits *this* priority rather than getting one of its own. Every IOC
-     * thread therefore runs just above idle, all at the same level, until
-     * `apply_priority_impl` gains an RTEMS arm — see the note there for what
-     * that arm is still waiting on (libbsd's own band, which is unmeasured).
+     * calls `pthread_attr_setinheritsched`, so a thread created from here gets
+     * *this* priority rather than one of its own. Base does not have that
+     * problem because `epicsThreadCreate` sets `PTHREAD_EXPLICIT_SCHED` on the
+     * attribute set (`libcom/src/osi/os/posix/osdThread.c:158-166`); base's
+     * init task stays at this same `RTEMS_MAXIMUM_PRIORITY - 1` for the rest
+     * of its life (`libcom/RTEMS/posix/rtems_init.c:1038`, never raised again)
+     * and calls `main()` from it, exactly as we do.
      *
-     * That is survivable on a dedicated board, where nothing else competes,
-     * but it does mean none of the port's priority design is in effect here.
+     * So do NOT raise this value to rescue a thread that forgot its band:
+     * lowering here is base parity and is what lets libbsd's background work
+     * outrank the init task. The rule is the other half instead —
+     * *every* IOC thread takes its own band on itself, as its first statement,
+     * through `epics_base_rs::runtime::task::enter_ioc_thread`, which since
+     * `52784cb4` really does call `pthread_setschedparam` on this target. A
+     * thread that skips that prologue does not run "at the default"; it runs
+     * here, one level above idle. Each server crate's `blocking.rs` carries
+     * the source guard that keeps the set of such threads empty.
+     *
+     * The one thread that legitimately stays here is this one: after `main()`
+     * has started the IOC it only waits, and C's init task — which goes on to
+     * run iocsh — is at the same level for the same reason.
      */
     sc = rtems_task_set_priority(RTEMS_SELF, RTEMS_MAXIMUM_PRIORITY - 1U,
                                  &old_prio);

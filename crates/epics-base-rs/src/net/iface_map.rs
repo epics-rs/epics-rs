@@ -260,7 +260,8 @@ fn enumerate_v4() -> Vec<IfaceInfo> {
     // C parity: on Linux consult the live kernel `IFF_UP`/`IFF_LOOPBACK`
     // flags via `getifaddrs` so an administratively-down interface that
     // still has an IPv4 address configured is not reported as a fanout
-    // target. (The crate links `libc` only on Linux.)
+    // target. (Linux-only because `getifaddrs`/`SIOCGIFFLAGS` is the Linux
+    // path — the crate itself links `libc` on every unix.)
     #[cfg(target_os = "linux")]
     let up_flags = interface_up_flags();
 

@@ -556,10 +556,17 @@ allocator. Verified at fd=400 with 320 held connections and
 and kept accepting. Its only reachable trigger today is the panic arm, which
 *was* driven on a real console.
 
-### 5.9 Priority — the axis where blocking should win, and currently does not
+### 5.9 Priority — the axis where blocking should win
 
-This is the one property the blocking model buys that a reactor cannot, and we
-are not collecting it. Three independent reasons, each measured.
+> **Superseded, 2026-07-22.** This section used to say priority was "dead three
+> ways" on RTEMS. Two of those three are closed in the tree and the third was
+> never what it was described as. What each reason said, and what is true now,
+> is under *Status of the three reasons* below — **read that before acting on
+> anything else in this section**, because the paragraphs after it were written
+> against the old state. What remains open is the *lock* half (the wait
+> discipline and PI), not the *thread* half.
+
+This is the one property the blocking model buys that a reactor cannot.
 
 **Why a reactor structurally cannot do priority inheritance.** In a reactor the
 entity waiting on a contended resource is a *callback in a queue*. The kernel
@@ -570,23 +577,108 @@ all connections share one priority and none can preempt another;
 callback. A blocking thread parked in `recv()` has none of these limits — which
 is the whole argument, and it is why the rest of this section matters.
 
-**Reason 1 — RT priority cannot be switched on, on this target.**
-`RtPolicy::current()` reads `EPICS_RS_ALLOW_RT_PRIORITY` (`task.rs:511`,`:550`)
-and defaults to `Disabled`. `POSIX_Init` calls `setenv` **zero** times and there
-is no shell, so there is no way to set it. `sched_calls_made() == 0` is the
-*documented correct* reading for the switch being off, so this is silent.
+#### Status of the three reasons
 
-**Reason 2 — even switched on, it would do nothing.** `apply_priority_impl`'s
-non-Linux arm (`task.rs:769-773`) returns `Unsupported`, because `epics-base-rs`
-links `libc` only on linux (`Cargo.toml:66-67`). The whole pvxs-parity priority
-design (18 / 16 / CaServerLow / −1) therefore has **zero effect on the one
-target that has no other way to set priorities**.
+**Reason 1 — "RT priority cannot be switched on, on this target." CLOSED by
+`d3dbb785`.** `DEFAULT_POLICY` is now a function of the target
+(`task.rs:584-596`): `AllowRealtime` on RTEMS, `Disabled` on hosted.
+`EPICS_RS_ALLOW_RT_PRIORITY` still overrides in *both* directions, so
+`=NO` turns it off on target. The old reasoning — that `POSIX_Init` calls
+`setenv` zero times and there is no shell, so an env-var opt-in is unreachable
+— was correct; the fix was to stop making the target's default depend on an
+env var it cannot set. Note the consequence for diagnosis:
+`sched_calls_made() == 0` is no longer the correct reading on RTEMS, it is now
+a symptom.
 
-**Reason 3 — the baseline is at the bottom.** The shim lowers the init task to
-`RTEMS_MAXIMUM_PRIORITY - 1` (`rtems_init.c:222`), and RTEMS pthreads inherit
-their creator's priority, so every IOC thread runs just above idle.
+**Reason 2 — "even switched on, it would do nothing." CLOSED by `52784cb4`.**
+`apply_priority_impl` has a live `#[cfg(target_os = "rtems")]` arm
+(`task.rs:1113-1147`) that maps through `map_epics_priority_rtems` and calls
+`pthread_setschedparam` via its own `rtems_sched` extern block — declared
+locally because `libc`'s `newlib/rtems` module declares neither the function
+nor `sched_param`. `Cargo.toml:79-80` links `libc` under `cfg(unix)`, not
+linux-only. There is deliberately no range probe on this arm: RTEMS performs no
+privilege check on `pthread_setschedparam`, and the map's image is a fixed
+`[56, 155]` inside the measured settable `[1, 254]`. The map is the RTEMS-score
+one (`posix = 56 + epics`), which is a *deliberate deviation* from
+base-on-RTEMS-6's linear posix map — see `doc/pi-lock-evaluation.md` and the
+comment on `map_epics_priority_rtems`.
 
-**And half the locks would escape priority anyway.** Full table:
+**Reason 3 — "the baseline is at the bottom." TRUE, and it is not a defect to
+fix at the shim.** `POSIX_Init` lowers itself to `RTEMS_MAXIMUM_PRIORITY - 1`
+(`epics-rtems-boot/csrc/rtems_init.c:236`) and RTEMS pthreads inherit their
+creator's parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58`; `std`
+never calls `pthread_attr_setinheritsched`). Base is identical here — it lowers
+to the same value at `libcom/RTEMS/posix/rtems_init.c:1038`, never raises it,
+and calls `main()` from it — and escapes the consequence not by raising the
+baseline but by setting `PTHREAD_EXPLICIT_SCHED` at every thread creation
+(`libcom/src/osi/os/posix/osdThread.c:158-166`). `std::thread::Builder` cannot
+do that, so **the equivalent is that every thread takes its own band as its
+first statement**, which is what `runtime::task::enter_ioc_thread` is.
+
+So Reason 3 is not "priority is dead"; it is "a thread that skips the prologue
+does not run at a default, it runs one level above idle." The question it turns
+into is a census: which threads skip it.
+
+#### The census — every thread that exists on the target
+
+From the two binaries the gate builds (`rtems-ca-ioc`, `rtems-pva-ioc`), every
+spawn reachable from them:
+
+| thread | site | band |
+|---|---|---|
+| `main` (`POSIX_Init` → `main`) | — | inherits `MAXIMUM_PRIORITY-1` — **correct**, see below |
+| `cbLow` / `cbMedium` / `cbHigh` | `background/callback_executor.rs:293`→`:301` | `enter_ioc_thread(prio.os_priority())` |
+| `cbTimer` | `background/delayed_timer.rs:232`→`:249` | `ScanHigh` |
+| `scanOnce` | `background/scan_once.rs:176`→`:185` | `ScanLow` |
+| `status-pv` | `server/status_pv.rs:291` | `Low`, via `spawn_dedicated_thread` |
+| `CAS-TCP` | `ca .../blocking.rs`, `serve` | `CAS_TCP_PRIORITY` = 18 |
+| `CAS-UDP` | `ca .../blocking.rs`, `serve_udp_search` | `CAS_UDP_PRIORITY` = 16 |
+| `CAS-client-blocking <peer>` | `ca .../blocking.rs`, accept loop | `CaServerLow` = 20 |
+| `CAS-event-blocking <peer>` | `ca .../blocking.rs`, per client | 19 |
+| `PVAS-TCP` | `pva .../blocking.rs`, `serve` | `PVA_SERVER_PRIORITY` = 18 |
+| `PVAS-UDP` | `pva .../blocking.rs`, `serve_udp_search` | `PVA_UDP_PRIORITY` = 16 |
+| `PVAS-conn <peer>` | `pva .../blocking.rs`, accept loop | 18 |
+| `PVAS-reader` / `PVAS-writer <peer>` | `pva .../blocking.rs`, `spawn_child` | 18 |
+
+Not in the closure, and why: `iocsh-startup` / `iocsh-after-ioc-running`
+(`server/ioc_app.rs:696`,`:1040`) — neither RTEMS binary constructs an
+`IocApp`, they build through `IocBuilder`; and they are one-shot script
+runners, which in C run on the init task at exactly this baseline anyway.
+`cbRtProbe` (`task.rs:818`) — `#[cfg(target_os = "linux")]`.
+
+**`CAS-TCP` and `CAS-UDP` were the whole of the inherits-near-idle set**, and
+they were closed on this branch. They called `name_current_thread()` alone,
+documented as "deliberately unbanded". C bands both: `rsrv` builds one
+descending ladder from `epicsThreadPriorityCAServerLow`
+(`caservertask.c:562-575`), which on RTEMS is exactly `p-1`
+(`RTEMS-score/osdThread.c:120-131`) giving `20, 19, 18, 17, 16`, and takes
+`threadPrios[2]` for `CAS-TCP` (`:716`) and `threadPrios[4]` for `CAS-UDP`
+(`:722`) — the same 18 and 16 the PVA side already used for the same roles. The
+rule is now uniform with no unbanded exception, and the source guard in
+`ca .../blocking.rs` pins that (four `enter_ioc_thread`, zero
+`name_current_thread`, zero `apply_to_current_thread` in production scope).
+
+**The `main` thread stays at `MAXIMUM_PRIORITY-1` on purpose.** It is the one
+thread nobody creates, so no spawn-site owner can cover it — and it does not
+need one: after it has started the IOC it only `join`s, and C's init task,
+which goes on to run iocsh, sits at the same level for the same reason. Do not
+"fix" it by raising the shim's lowering: that lowering is base parity and it is
+what lets libbsd's background work outrank the init task.
+
+**Invariant, and its single owner.** MUST: every OS thread that runs IOC work
+on the RTEMS target takes its scheduling band *and* its OS name through
+`runtime::task::enter_ioc_thread`, on the thread itself, before it runs any
+work. MUST NOT: any such thread run at the priority inherited from
+`POSIX_Init`. Owner: `enter_ioc_thread`. It is reached two ways, and both make
+the band unforgettable by signature — `spawn_dedicated_thread`, which takes the
+`ThreadPriority` as a parameter, and a hand-rolled `thread::Builder` whose body
+calls it first. The hand-rolled sites exist for reasons that are load-bearing
+(the `CAS-client` socket-handover channel needs to know spawn failed before the
+socket moves), so they are classified *through owner*, not eliminated.
+
+#### Still open: the locks
+
+**Half the locks escape priority regardless.** Full table:
 `doc/pi-lock-evaluation.md` (main `3406721d`). `runtime/sync.rs:3` re-exports
 tokio's `Mutex`/`RwLock`, so **14 of 25 shared locks are async locks**. A
 blocking thread reaching one via `block_on_sync` → `park_on` sits in
@@ -600,9 +692,13 @@ the `dbScanLock` analogue (`database/record_lock.rs:70`), which C protects with
 
 **The mechanism itself is alive — priorities work when actually set.** §5.3's
 control: giving the libevent loop thread `SCHED_FIFO` 3 against the other's 1
-made the starvation disappear. Not a contradiction of reasons 1-3 — RTEMS
-pthreads inherit, so unset priorities are all equal and therefore inert, while
-explicitly set ones take effect.
+made the starvation disappear. That experiment is now the *supporting* evidence
+rather than a caveat: it shows the kernel honours an explicitly set band, which
+is exactly the path `enter_ioc_thread` takes.
+
+**What is still unmeasured is whether it takes effect for us on target.** No
+boot has been taken since `52784cb4`. Everything above is source truth, not a
+task listing — see §8.0 gap 2 for the exact reading to take.
 
 **One caution from that same experiment.** With priorities separated, guest idle
 was **0.000074 s of 4.017 s**. Priority divides CPU; it does not create any.
@@ -702,16 +798,18 @@ decides.
 Stated as a checklist, not as prose, so it can be closed rather than discussed.
 **The blocking driver on RTEMS should be indistinguishable from RSRV's thread
 model in every property that matters, and different only where the difference
-is declared and better.** Current state is measured, not assumed:
+is declared and better.** Current state, with every row labelled by how it is
+known — measured on a boot, or read out of the source:
 
-| property | C — RSRV, measured | us, measured | |
+| property | C — RSRV | us | |
 |---|---|---|---|
 | threads per connection | 2 — `CAS-client` Big, `CAS-event` Medium | CA 2 — Big + Medium | **parity** |
 | stack classes requested | Big + Medium | Big + Medium (§5.2) | **parity** |
 | descriptors per connection | 1 | 1 (§5.7) | **parity** |
 | multiplexing syscalls | 0 | 0 | **parity** |
 | per-thread leak | 0 (raw pthreads) | **128 B** | **gap 1** |
-| thread priority actually applied | *unmeasured on RTEMS* | **0 — dead 3 ways** (§5.9) | **gap 2** |
+| thread priority requested | `PTHREAD_EXPLICIT_SCHED` at creation, every thread | every thread, via `enter_ioc_thread` (§5.9 census) | **parity in source** |
+| thread priority *observed on target* | *unmeasured* | *unmeasured* | **gap 2 — one boot** |
 | lock wait discipline | `RTEMS_PRIORITY` ordered | tokio FIFO fair | **gap 3** |
 | PI on the scan lock | on — `epicsMutexMustCreate`, `dbLock.c:86` | none — L1 is `park_on`-invisible | **gap 4** |
 | refusal at the ceiling | accept, then **zero bytes**, then FIN | `CA_PROTO_ERROR`/`ECA_ALLOCMEM`, announced on powers of two | **deliberate, better** |
@@ -719,22 +817,43 @@ is declared and better.** Current state is measured, not assumed:
 Four gaps, in dependency order — each is only worth doing if the one above it
 is done, because otherwise it is unobservable:
 
-1. **Measure whether C's own thread priorities take effect on RTEMS 6.** This is
-   the missing cell in the table and it is one boot: `rt task` (or equivalent)
-   on the C IOC at a few held connections, reading the actual priorities of
-   `CAS-client` / `CAS-event` / `CAS-TCP`. Until this is known, "reach C's
-   level" has no number. It may turn out C is inert on this target too, in which
-   case gap 2 is parity already and the goal shrinks.
-2. **Make priority applicable at all on RTEMS** — the `Unsupported` arm at
-   `task.rs:769-773` and the `libc`-on-linux-only manifest line
-   (`Cargo.toml:66-67`), then a way to select the policy without `setenv` and
-   without a shell.
+1. **Measure whether C's own thread priorities take effect on RTEMS 6.** Still
+   the missing cell for the C column, and still one boot: `rt task` (or
+   equivalent) on the C IOC at a few held connections, reading the actual
+   priorities of `CAS-client` / `CAS-event` / `CAS-TCP`. Until this is known,
+   "reach C's level" has no number. It may turn out C is inert on this target
+   too, in which case gap 2 shrinks to a self-consistency check.
+2. **Measure ours, on the same boot.** No longer a code task — the code landed
+   (`52784cb4`, `ad9440e4`, `d3dbb785`, and the `CAS-TCP`/`CAS-UDP` banding on
+   this branch); what is missing is a reading. Boot `rtems-ca-ioc`, hold a
+   couple of clients, and take an RTEMS task listing. Expected, if the chain
+   works end to end: every thread appears **by name** (`ad9440e4` publishes
+   names through `pthread_setname_np`, so a nameless listing means the naming
+   half failed), and the POSIX priorities are `56 + epics` —
+   `CAS-client` 76, `CAS-event` 75, `CAS-TCP` 74, `CAS-UDP` 72, `scanOnce` 116,
+   `cbTimer` 126, `status-pv` 66 — against `main`, which the shim sets with the
+   *classic* API to core 254, i.e. POSIX 1.
+   Two specific failure modes to distinguish, because they look alike from
+   outside: *all* IOC threads equal at the baseline means the policy or the
+   `pthread_setschedparam` arm is not firing at all; the right *spread* but at
+   unexpected absolute values means the map is off, not the mechanism. Also
+   record where libbsd's own threads land relative to 74 — a `CAS-TCP` that
+   outranks the network stack is a new problem, and that band was never
+   measured.
 3. **Priority-ordered wait, not FIFO** — a lock whose wait queue respects
-   priority, which tokio's does not offer.
-4. **PI on L1**, the `dbScanLock` analogue. Blocked by design, not by effort:
-   `record_lock.rs:110`,`:121` hand out an `OwnedMutexGuard` so callers can hold
-   it across awaits. Closing this is a structural change to that API, not a
-   swap of lock type, and it needs sign-off.
+   priority, which tokio's does not offer. **Not started; needs the user's
+   sign-off before anyone begins.** Scope, so the decision has something to be
+   made against: 14 of 25 shared locks are tokio async locks reached through
+   `block_on_sync` → `park_on`, where the waiter sits in `std::thread::park()`
+   with no kernel-visible wait queue at all — so this is not a lock-type swap
+   but a question of what those 14 become. `doc/pi-lock-evaluation.md` has the
+   table. Depends on gap 2: until a boot shows thread priority is real on
+   target, a priority-ordered wait has nothing to order by.
+4. **PI on L1**, the `dbScanLock` analogue. **Blocked by design, not by effort,
+   and needs the user's sign-off.** `record_lock.rs:110`,`:121` hand out an
+   `OwnedMutexGuard` so callers can hold it across awaits; closing this is a
+   structural change to that API, not a swap of lock type. Scope only — do not
+   start it as part of a priority task.
 
 Separately and independently: **gap 1**, the 128 B/thread leak, is what the
 thread-pool design of §8.4 closes.

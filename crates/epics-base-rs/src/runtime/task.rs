@@ -418,7 +418,13 @@ pub enum ThreadPriority {
 impl ThreadPriority {
     /// The raw EPICS priority value `0..=99`, matching the
     /// `epicsThreadPriority*` constants in `epicsThread.h`.
-    pub fn value(self) -> u8 {
+    ///
+    /// `const` so a server can *derive* its band from the named one C derives
+    /// it from — `CaServerLow - 2` rather than a bare `18` with a comment
+    /// asserting the two are the same number. C builds exactly that ladder at
+    /// `caservertask.c:562-575`; restating its output as a literal is how the
+    /// ladder and its constants come to disagree.
+    pub const fn value(self) -> u8 {
         let v = match self {
             ThreadPriority::Low => 10,
             ThreadPriority::CaServerLow => 20,
@@ -430,7 +436,8 @@ impl ThreadPriority {
             ThreadPriority::Iocsh => 91,
             ThreadPriority::Custom(v) => v,
         };
-        v.min(PRIORITY_MAX)
+        // `Ord::min` is not `const`; the clamp is the same one.
+        if v > PRIORITY_MAX { PRIORITY_MAX } else { v }
     }
 }
 

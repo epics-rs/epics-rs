@@ -33,6 +33,7 @@ running the real gate invocation against the real target triple:
 | C | probe B, plus `#[cfg(not(target_os = "rtems"))]` on `run_ca_pva_qsrv_ioc` and its re-export | **0 errors**, 3 warnings |
 | C-image | probe C with `RUSTFLAGS=--cfg rtems_boot_linked` | **0 errors** |
 | D | `-p epics-pva-rs --no-default-features --features client` | **47 errors** |
+| E | probe C **without** the tokio per-target split (`features = ["full"]` left unconditional) | **58 errors** in `mio` / `socket2` / `signal-hook-registry` |
 
 Command for A–C:
 
@@ -280,8 +281,14 @@ crates/epics-bridge-rs/Cargo.toml:93
     tokio = { version = "1", features = ["full"] }
 ```
 
-`full` includes `net`, which pulls `mio`, which has no selector for
-RTEMS. `epics-base-rs` (`Cargo.toml:55-70`) and `epics-pva-rs`
+Measured (probe E): with everything else at probe C's zero-error state
+and only this left unsplit, the build produces **58 errors** — 31 in
+`mio` (`error[E0583]: file not found for module `selector``,
+`... module `waker``, `unresolved import `crate::sys::IoSourceState``),
+the rest in `socket2` (`unresolved import `libc::SOCK_RAW``) and
+`signal-hook-registry`. `full` includes `net` and `signal`; `net` pulls
+`mio`, which has no selector for RTEMS.
+`epics-base-rs` (`Cargo.toml:55-70`) and `epics-pva-rs`
 (`Cargo.toml:150-173`) both solve this by splitting the dependency into
 two `[target.'cfg(...)'.dependencies]` tables, and both carry the comment
 explaining why a shared table cannot be used (**cargo unions a
@@ -802,7 +809,7 @@ Each stage names its own gate. No stage depends on a later one.
 *Size:* ~40 lines of `Cargo.toml`, 2 lines of `cfg` in `src/`, 6 lines of
 `scripts/rtems-check.sh`.
 
-1. Split `tokio` per-target (§2.2b).
+1. Split `tokio` per-target (§2.2b) — measured as worth 58 errors.
 2. Spell out `epics-pva-rs` / `epics-ca-rs` with `default-features =
    false`, and restore the dropped features through the host-facing
    bridge features (§2.2a).

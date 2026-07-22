@@ -203,14 +203,32 @@ fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
 ///    one. Routing it there puts it in the same stream, at
 ///    [`ErrlogSevEnum::Fatal`], for whatever is reading that stream.
 ///
-/// # It chains rather than replaces
+/// # It replaces rather than chains
 ///
-/// The previously installed hook — `std`'s default, unless an application put
-/// its own in — still runs, after this one. That keeps the payload, the
-/// location and the `RUST_BACKTRACE` note, none of which this reproduces, and
-/// it means installing this can only *add* output. The errlog line goes first
-/// on purpose: on a slow serial console the summary should not be behind a
-/// backtrace that may not finish printing.
+/// This used to run `std`'s default hook after its own line, on the reasoning
+/// that installing it could then only *add* output. On the target that
+/// reasoning does not hold, for three measured reasons:
+///
+/// 1. **The output would be doubled.** The line below already carries the
+///    thread, the panic site and the payload — everything the default hook
+///    prints — so chaining puts the same panic on the console twice. It reaches
+///    the console either way: with [`install_console_subscriber`] in place the
+///    subscriber writes it, and with nothing listening the `errlog` console
+///    fallback does.
+/// 2. **The `RUST_BACKTRACE` note is advice that cannot be taken.** There is no
+///    environment on the target to set that variable in, so a backtrace is off
+///    by construction; printing "run with `RUST_BACKTRACE=1`" on a serial
+///    console tells an operator to do something impossible.
+/// 3. **The panic path must stay shallow.** The default hook's formatting and
+///    backtrace machinery is stack the panic path does not otherwise need, and
+///    the per-connection stack ceiling is the thing currently being measured on
+///    the target. A hook must not be what makes the panic path deeper than the
+///    peak that measurement is establishing.
+///
+/// The consequence for a hosted build is deliberate and worth stating: a
+/// process that calls this gives up `std`'s backtrace-on-panic for the one line
+/// below. A host application that wants the backtrace should not install this
+/// hook — it is written for an image with no environment and no debugger.
 ///
 /// Returns `false` when it was already installed, having changed nothing.
 pub fn install_panic_hook() -> bool {
@@ -218,8 +236,7 @@ pub fn install_panic_hook() -> bool {
     if PANIC_HOOK_INSTALLED.swap(true, AtomicOrdering::AcqRel) {
         return false;
     }
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    std::panic::set_hook(Box::new(|info| {
         let location = match info.location() {
             Some(l) => format!("{}:{}", l.file(), l.line()),
             None => "an unknown location".to_string(),
@@ -229,7 +246,6 @@ pub fn install_panic_hook() -> bool {
             ErrlogSevEnum::Fatal,
             &panic_announcement(thread.name(), &location, &panic_payload(info)),
         );
-        previous(info);
     }));
     true
 }
@@ -629,6 +645,37 @@ mod tests {
         assert!(
             !install_panic_hook(),
             "a second install must be refused, not chained onto the first"
+        );
+        let _ = std::panic::take_hook();
+    }
+
+    /// The hook replaces the previous one; it does not run it afterwards.
+    ///
+    /// Chaining would print the panic twice — this hook's line already carries
+    /// the thread, site and payload — and would append `std`'s
+    /// "run with `RUST_BACKTRACE=1`" note, which on the target is advice for an
+    /// environment that does not exist. A sentinel hook proves the absence
+    /// directly: if the previous hook still ran, it would flip the flag.
+    #[test]
+    #[serial]
+    fn the_panic_hook_does_not_run_the_hook_it_replaced() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let previous_ran = Arc::new(AtomicBool::new(false));
+        let flag = previous_ran.clone();
+        std::panic::set_hook(Box::new(move |_| {
+            flag.store(true, AtomicOrdering::SeqCst);
+        }));
+
+        assert!(install_panic_hook(), "the install takes effect");
+        let caught = std::panic::catch_unwind(|| panic!("a panic the hook must report once"));
+        assert!(caught.is_err(), "the panic was raised");
+
+        assert!(
+            !previous_ran.load(AtomicOrdering::SeqCst),
+            "the replaced hook must not run: chaining it doubles the console \
+             output and appends a RUST_BACKTRACE note that cannot be acted on"
         );
         let _ = std::panic::take_hook();
     }

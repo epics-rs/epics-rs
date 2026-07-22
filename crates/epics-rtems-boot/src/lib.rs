@@ -18,7 +18,9 @@
 //! * `csrc/rtems_config.c` — the `CONFIGURE_*` directives, derived from EPICS
 //!   base's POSIX arm.
 //! * `csrc/rtems_init.c` — `POSIX_Init`: console, clock, libbsd, DHCP, `main`.
-//! * `build.rs` — compiles the two C files with `cc` and emits the propagating
+//! * [`stats`] — descriptor and heap usage, the two IOC-statistics values Rust
+//!   cannot reach on this target, over `csrc/rtems_stats.c`.
+//! * `build.rs` — compiles the C files with `cc` and emits the propagating
 //!   half of the contract.
 //!
 //! # Two build configurations, and why an unset prefix is not an error
@@ -72,8 +74,15 @@
 //!
 //! Open, in the order the bring-up box will hit them:
 //!
-//! 1. **The C does not compile here.** Neither `csrc/` file has been through a
-//!    compiler; the host tests guard their structure, not their syntax.
+//! 1. **The C does not compile here.** `csrc/rtems_config.c` and
+//!    `csrc/rtems_init.c` have never been through a compiler on this machine;
+//!    the host tests guard their structure, not their syntax.
+//!    `csrc/rtems_stats.c` is the exception and the pattern to copy:
+//!    `arm-rtems6-gcc -c -march=armv7-a -mthumb -mfpu=neon -mfloat-abi=hard
+//!    -mtune=cortex-a9 -Wall -Wextra` against the bring-up box's installed
+//!    `xilinx_zynq_a9_qemu` headers exits 0 with no diagnostics and defines
+//!    both of its symbols. That is why its two deviations from devIocStats are
+//!    stated as measured rather than as reasoning.
 //! 2. **The include path is a guess.** [`contract::bsp_include_dir`] assumes the
 //!    standard RTEMS 6 layout. Take the real `-I` set from a BSP sample's
 //!    *compile* line.
@@ -91,6 +100,7 @@
 //!    veneers resolve.
 
 pub mod contract;
+pub mod stats;
 
 /// Undefined symbol deliberately left in this crate's object graph when it is
 /// built for RTEMS without [`contract::BSP_PREFIX_ENV`].

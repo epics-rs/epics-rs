@@ -21,6 +21,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(rtems_boot_linked)");
     println!("cargo::rerun-if-changed=csrc/rtems_config.c");
     println!("cargo::rerun-if-changed=csrc/rtems_init.c");
+    println!("cargo::rerun-if-changed=csrc/rtems_stats.c");
     println!("cargo::rerun-if-changed=src/contract.rs");
     println!("cargo::rerun-if-env-changed={BSP_PREFIX_ENV}");
     println!("cargo::rerun-if-env-changed={BSP_ENV}");
@@ -53,6 +54,7 @@ fn main() {
     build
         .file("csrc/rtems_config.c")
         .file("csrc/rtems_init.c")
+        .file("csrc/rtems_stats.c")
         .include(&include_dir)
         // Base passes -DBSP_$(RTEMS_BSP) (modules/libcom/RTEMS/Makefile:41) so
         // configuration can be BSP-conditional; kept for parity even though our

@@ -631,8 +631,8 @@ complete rather than selective.)
 | id | site | type | held across `.await`? | verdict |
 |---|---|---|---|---|
 | **L33** | **STALE — see §9.1.** At `32cc7847` this is already `Arc<PriorityInheritanceMutex<()>>` (`qsrv/group_config.rs:76`); the flip landed between this document's base `9965bbd6` and stage 1, and it is what produced stage 1's one unpredicted blocker. The row below describes the pre-flip shape. ~~`qsrv/group_config.rs:64` `GroupPvDef::atomic_write_lock: Arc<tokio::sync::Mutex<()>>` (constructed `:800`)~~ | `tokio::sync::Mutex` | **yes** — post-H9 it is acquired *before* `PvDatabase::lock_records` and therefore held across `lock_records(…).await` | **TBD → resolved by the landed round: stays `tokio::sync::Mutex` for now.** `5d46ce3b` states it directly: "It stays a plain `tokio::sync::Mutex`, **not** a `PriorityInheritanceMutex`: it is held for the whole atomic block, which means it is held across `lock_records(…).await` itself — genuinely async today, since L1 has not made the step-4 type flip. Converting L33 first would hold a `!Send` guard across that await and fail to compile at the connection-task spawn site… L33 becomes convertible once L1 does (step 4)." So: **blocked on L1's step-4 type flip, not on this work.** No action in any stage of §7. |
-| **L-A** | `qsrv/provider.rs:641` `BridgeProvider::record_cache: tokio::sync::RwLock<HashMap<String, (NtType, DbFieldType)>>` (constructed `:746`) | `tokio::sync::RwLock` | **needs checking** — it is a pure memo of `(NtType, DbFieldType)` per record name | **→ `parking_lot::RwLock`.** It guards a `HashMap` insert/lookup with no I/O inside the critical section, which is the exact profile the rest of `BridgeProvider` already uses (`groups`, `access_cell`, `base_group_defs`, `group_files` are all `parking_lot::RwLock` — `provider.rs:628, 647, 656, 668`). Being the one tokio lock in a struct whose four siblings are `parking_lot` is itself the tell. Converting removes a PI-invisible wait from the GET/PUT hot path and removes four `.await`s. **Precondition:** confirm no `.await` occurs while a guard is live (a `!Send` guard across an await fails to compile at the connection-task spawn site — the same trap L33 documents), which the compiler will state for us. |
-| **L-B** | `qsrv/pva_adapter.rs:194` `QsrvPvStore::pva_pvs: Arc<tokio::sync::RwLock<HashMap<String, PvaPvHandle>>>` (imported `:13`, threaded through `:287`, `:328`) | `tokio::sync::RwLock` | read-only on the serve path (`:337` `pva_pvs.read().await.get(..).cloned()`) | **→ `parking_lot::RwLock`, or `arc-swap`.** Same profile: a name→handle map, cloned out immediately, no I/O under the guard. Note `PvaPvHandle`'s own interior state is *already* `parking_lot::Mutex` (`:49`, `:50`), so the outer tokio lock is the odd one out. `arc-swap` (already a dependency, `Cargo.toml:107`) is the better fit if registration is rare and lookup is hot — but that is an optimisation, and `parking_lot` is the structural fix. |
+| **L-A** | **DONE — §9.12.** Now `parking_lot::RwLock` (`provider.rs:650`, ctor `:755`). The row below describes the pre-conversion shape. `qsrv/provider.rs:641` `BridgeProvider::record_cache: tokio::sync::RwLock<HashMap<String, (NtType, DbFieldType)>>` (constructed `:746`) | `tokio::sync::RwLock` | **needs checking** — it is a pure memo of `(NtType, DbFieldType)` per record name | **→ `parking_lot::RwLock`.** It guards a `HashMap` insert/lookup with no I/O inside the critical section, which is the exact profile the rest of `BridgeProvider` already uses (`groups`, `access_cell`, `base_group_defs`, `group_files` are all `parking_lot::RwLock` — `provider.rs:628, 647, 656, 668`). Being the one tokio lock in a struct whose four siblings are `parking_lot` is itself the tell. Converting removes a PI-invisible wait from the GET/PUT hot path and removes four `.await`s. **Precondition:** confirm no `.await` occurs while a guard is live (a `!Send` guard across an await fails to compile at the connection-task spawn site — the same trap L33 documents), which the compiler will state for us. |
+| **L-B** | **DONE — §9.12.** Now `parking_lot::RwLock` (`pva_adapter.rs:203`, ctor `:210`); `arc-swap` was *not* taken. The row below describes the pre-conversion shape. `qsrv/pva_adapter.rs:194` `QsrvPvStore::pva_pvs: Arc<tokio::sync::RwLock<HashMap<String, PvaPvHandle>>>` (imported `:13`, threaded through `:287`, `:328`) | `tokio::sync::RwLock` | read-only on the serve path (`:337` `pva_pvs.read().await.get(..).cloned()`) | **→ `parking_lot::RwLock`, or `arc-swap`.** Same profile: a name→handle map, cloned out immediately, no I/O under the guard. Note `PvaPvHandle`'s own interior state is *already* `parking_lot::Mutex` (`:49`, `:50`), so the outer tokio lock is the odd one out. `arc-swap` (already a dependency, `Cargo.toml:107`) is the better fit if registration is rare and lookup is hot — but that is an optimisation, and `parking_lot` is the structural fix. |
 | **L-C** | `pvalink/registry.rs:10` `use tokio::sync::Notify`; used at `:89-91` (`pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>`), `:234`, `:257` (`tokio::pin!(notified)`), `:284` | `tokio::sync::Notify` | **yes, by construction** — the whole point is "park until another task finishes opening this link" | **keep.** `Notify` is runtime-agnostic (it is a waker list, not a reactor primitive) and `park_on` names it as allowed. The single-flight pattern it implements — one opener, N waiters — is the correct shape and has no cheaper synchronous equivalent. It is PI-invisible, which matters only if a high-priority thread can wait behind a low-priority opener; on RTEMS today it cannot, because **pvalink is not in the RTEMS closure at all** (§3.4). Revisit when it is. |
 
 **Locks that are already synchronous (no action, listed for completeness):**
@@ -880,7 +880,7 @@ sufficient**: this stage's real gate is a boot on the QEMU box with
 this runs 2 tasks per member. On the callback pool that is a concurrency
 question, not a correctness one, until it is measured.
 
-### Stage 3 — lock cleanup (small)
+### Stage 3 — lock cleanup (small) — **DONE** (see §9.12)
 
 Convert L-A (`provider.rs:641`) and L-B (`pva_adapter.rs:194`) to
 `parking_lot::RwLock` (§5). Independent of stages 1–2 and of the RTEMS
@@ -1419,3 +1419,102 @@ Only correctness. MONITOR on a group, the atomic-PUT interleave, and the
 spawn-count asymmetry of §8 item 2 were not exercised under load, and the
 `activation_handles` MONITOR START-STOP gate still has never run on the
 exec backend (§9.10).
+
+### 9.12 Stage 3 as built — the lock family, and how the property is proved
+
+Stage 3 landed as `46c60b48` (L-A) / `b3ddb6e6` (L-B) on top of
+`7f9a089d`. §7's stage-3 entry was accurate and needed no correction: both
+locks converted to `parking_lot::RwLock`, L33 untouched, `arc-swap` not
+taken (§5 offered it for L-B as an optimisation; `parking_lot` is the
+structural fix and the registration/lookup ratio was never measured, so
+taking it would have been speculative).
+
+**The cited line numbers survived stage 2.** §5 cites `provider.rs:641`
+and `pva_adapter.rs:194`; stage 2 grew `pva_adapter.rs` by ~176 lines but
+entirely *below* `QsrvPvStore` (`load_qsrv_groups` moved to `:1490`,
+§9.1), so both declarations were still exactly where §5 put them. Both
+were nevertheless re-located structurally rather than by line, because
+that could not be known in advance.
+
+**The family, enumerated before editing.** Anchors: declarations
+`rg -n 'tokio::sync::(Mutex|RwLock)|use tokio::sync'` and acquisitions
+`rg -n '\.(read|write|lock)\(\)\s*\.await'`, both over
+`crates/epics-bridge-rs/src/qsrv/` plus `src/bin/rtems-pva-ioc.rs` —
+i.e. the whole `qsrv-core` module graph (`pvalink` is
+`#[cfg(feature = "pvalink")]`, outside it, so L-C is not in this family).
+That is 2 declarations and 14 acquisition sites:
+
+| site | classification |
+|---|---|
+| `provider.rs:641` decl + `:746` ctor | L-A — converted |
+| `provider.rs:1277, 1432, 1461` | L-A acquisitions — converted |
+| `pva_adapter.rs:13` `use tokio::sync::{RwLock, mpsc}` | L-B import — reduced to `mpsc` |
+| `pva_adapter.rs:194` decl + `:201` ctor + `:287`, `:328` param types | L-B — converted |
+| `pva_adapter.rs:217, 291, 337, 489, 526, 787, 1001, 1016, 1034, 1054, 1109, 1127` | L-B acquisitions — converted |
+| `group_config.rs:66` | **distinct** — comment naming L33, which is already `PriorityInheritanceMutex` (§9.1); the row is blocked on L1 step 4, not on this stage |
+| `group.rs:1787`, `group.rs:5257` | **distinct** — comments, no lock |
+| `group.rs:2195, 2209, 2519` | **distinct** — `tokio::sync::mpsc`, a channel not a lock; `park_on` allows it and it carries no guard |
+| `bin/rtems-pva-ioc.rs:640` | **distinct** — comment stating the `tokio::sync` allowance |
+
+After the two commits, `rg '\.(read\|write\|lock)\(\)\s*\.await'` over
+`src/qsrv/` returns **only** the `group.rs:5257` comment, and the
+`tokio::sync` lock-type anchor returns only the two comments. The family
+is closed, not sampled.
+
+**One site needed restructuring, not a bare `.await` deletion.**
+`check_monitor_request` read
+
+```rust
+if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
+```
+
+An `if` condition keeps its temporaries alive to the end of the whole
+condition, so simply dropping `.await` would have left a sync guard live
+across the `is_servable_group` await on the right-hand side. Split into
+two sequential `if`s. Every other site's critical section ends before the
+next await without restructuring.
+
+**Two functions lost their `async`,** because the lock was the only thing
+they awaited: `BridgeProvider::clear_cache` (no callers) and
+`QsrvPvStore::register_pva_pv` (one production call site at
+`pva_adapter.rs:1498`, six in tests). Leaving a `pub async fn` with a
+wholly synchronous body would have been residue.
+
+**How "no await under either guard" is proved.** Not by inspection — by
+construction, and then confirmed by negative control. `parking_lot`'s
+guards are `!Send`; every `QsrvPvStore` `ChannelSource` method returns
+`impl Future<..> + Send`, and those methods are the only route to both
+locks (L-B directly, L-A through `provider.create_channel_with_creds`).
+So a guard held across an await is a compile error. Confirmed by
+deliberately introducing one in each file and observing the failure
+before reverting:
+
+* L-A — `self.db.has_name(..).await` inserted under the live
+  `record_cache` read guard in `create_channel_with_creds`:
+  `error: future cannot be sent between threads safely`, reported at
+  `create_channel` (`provider.rs:1350`) *and* propagated out to
+  `get_value_checked` (`pva_adapter.rs:517`) and `put_value_checked`
+  (`:588`) — which is the transitive `+ Send` reach being demonstrated,
+  since `ChannelProvider`'s own `async fn`s carry no `Send` bound of
+  their own.
+* L-B — `provider.channel_find(key).await` inserted inside `list_pvs`'s
+  `for key in pva_pvs.read().keys()` loop: the same error, reported
+  directly at the `impl Future<Output = Vec<String>> + Send` bound.
+
+The `for`-loop shape was chosen for the L-B control on purpose: it is the
+one site whose guard outlives a whole block rather than a single
+expression, so it is where the property is weakest by inspection and the
+compiler's answer matters most.
+
+**Gates.** `cargo fmt --all`; `cargo clippy -p epics-bridge-rs
+--all-targets -- -D warnings` and the same with `--no-default-features
+--features qsrv-core` (the target's selection, §2.2c) both exit 0;
+`cargo nextest run -p epics-bridge-rs` 683/683; `scripts/rtems-check.sh`
+exit 0 in both configurations after each commit; full-workspace
+`cargo clippy --workspace --all-targets -- -D warnings` exit 0 and
+`cargo nextest run --workspace` 10103 passed / 2 skipped.
+
+**Not done here.** No behaviour changed and nothing was re-measured on
+the target: stage 3 is a `!Send`-guard reduction, so the RTEMS evidence in
+§9.11 stands as-is and was not re-run on hardware. §8's open items are
+untouched.

@@ -638,7 +638,16 @@ pub struct BridgeProvider {
     /// Metadata cache for single-record channels: (NtType, DbFieldType).
     /// Avoids repeated record introspection on every create_channel() call.
     /// Corresponds to C++ PDBProvider's transient_pv_map.
-    record_cache: tokio::sync::RwLock<HashMap<String, (NtType, DbFieldType)>>,
+    ///
+    /// [`parking_lot::RwLock`], like every other lock in this struct: the
+    /// critical section is a `HashMap` get/insert with no I/O in it, so an
+    /// async lock bought nothing and cost a PI-invisible wait on the
+    /// GET/PUT hot path (doc/qsrv-rtems-design.md §5, L-A). The guard is
+    /// `!Send`, so a future that held one across an `.await` would fail the
+    /// `+ Send` bound the `QsrvPvStore` source methods impose on every
+    /// caller of this provider — the rule is enforced by construction, not
+    /// by review.
+    record_cache: parking_lot::RwLock<HashMap<String, (NtType, DbFieldType)>>,
     /// Live access-control cell. Channels and AccessContexts hold an
     /// `Arc<LiveAccessProxy>` that points at this cell, so
     /// `set_access_control` is observed by all existing channels on
@@ -743,7 +752,7 @@ impl BridgeProvider {
         Self {
             db,
             groups: parking_lot::RwLock::new(HashMap::new()),
-            record_cache: tokio::sync::RwLock::new(HashMap::new()),
+            record_cache: parking_lot::RwLock::new(HashMap::new()),
             access_cell: Arc::new(parking_lot::RwLock::new(Arc::new(AllowAllAccess))),
             channels_created: std::sync::atomic::AtomicU64::new(0),
             ops_get: std::sync::atomic::AtomicU64::new(0),
@@ -1273,8 +1282,11 @@ impl BridgeProvider {
     }
 
     /// Clear the record metadata cache.
-    pub async fn clear_cache(&self) {
-        self.record_cache.write().await.clear();
+    ///
+    /// Synchronous: the whole body is one `parking_lot` write guard over a
+    /// `HashMap::clear`, with nothing to await.
+    pub fn clear_cache(&self) {
+        self.record_cache.write().clear();
     }
 }
 
@@ -1429,7 +1441,9 @@ impl BridgeProvider {
         // construction path through `BridgeChannel::new` so the
         // per-channel filter chain is parsed.
         if parsed.json_suffix.is_none() {
-            let cache = self.record_cache.read().await;
+            // Sync guard, scoped to this block: nothing inside it awaits, and
+            // it is dropped before the `has_name` await below.
+            let cache = self.record_cache.read();
             if let Some(&(nt_type, value_dbf)) = cache.get(name) {
                 return Ok(AnyChannel::Single(
                     BridgeChannel::from_cached(
@@ -1458,7 +1472,7 @@ impl BridgeProvider {
             // are NOT cached — each filtered subscription parses
             // its own chain.
             if parsed.json_suffix.is_none() {
-                let mut cache = self.record_cache.write().await;
+                let mut cache = self.record_cache.write();
                 cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
             }
 

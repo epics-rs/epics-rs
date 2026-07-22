@@ -48,6 +48,7 @@ CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot)
 # Binaries built for the target, as `crate:bin` pairs.
 BINS=(
     epics-ca-rs:rtems-ca-ioc
+    epics-pva-rs:rtems-pva-ioc
 )
 
 # Binaries in the crates above that are deliberately NOT built for the target.

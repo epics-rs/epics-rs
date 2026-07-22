@@ -10,6 +10,11 @@ repository.workspace = true
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
+# The RTEMS boot shim for `rtems-pva-ioc`. Empty on every non-RTEMS target, so
+# this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
+# one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
+# the IOC's `main`. Same reasoning as `epics-ca-rs`.
+epics-rtems-boot = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -95,6 +100,12 @@ default = ["tls", "pkcs12", "client"]
 # gate-out territory). The wire decoder the server needs is NOT part of this
 # feature — it is the always-compiled `crate::decode`.
 client = []
+# Host-selectable RTEMS execution model — passthrough to
+# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` declares it.
+# Routes the `runtime::task` seam to the std-thread background executor on a
+# hosted target, which is what compiles `rtems-pva-ioc`'s real entry point
+# off RTEMS so it can be linted and tested here. OFF by default.
+rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
 # drops rustls/tokio-rustls/rustls-pemfile/x509-parser — and with them `ring`
 # and `getrandom 0.2`, the crate that does not build for RTEMS. With the
@@ -185,6 +196,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
 ] }
 
+# `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
+# `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
+# table is evaluated against the HOST, so a `cfg(target_os = "rtems")` one
+# would never match.
+[build-dependencies]
+epics-rtems-boot = { workspace = true }
+
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
@@ -234,3 +252,13 @@ required-features = ["client"]
 [[bin]]
 name = "mshim-rs"
 path = "src/bin/mshim-rs.rs"
+
+# The RTEMS PVA IOC entry point. Deliberately NOT given `required-features`,
+# for the same reason `epics-ca-rs`'s `rtems-ca-ioc` is not: it must be built
+# by a bare `cargo check --bin rtems-pva-ioc --target armv7-rtems-eabihf`, and
+# a `required-features` gate would make cargo silently *skip* the target
+# instead, turning the RTEMS gate into a vacuous pass. It needs no `client`:
+# it is a server.
+[[bin]]
+name = "rtems-pva-ioc"
+path = "src/bin/rtems-pva-ioc.rs"

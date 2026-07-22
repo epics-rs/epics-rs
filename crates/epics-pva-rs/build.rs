@@ -1,4 +1,5 @@
-//! Names the one capability `auth::plain` needs and `cfg(unix)` cannot express.
+//! Names the one capability `auth::plain` needs and `cfg(unix)` cannot express,
+//! and emits the RTEMS link arguments for `rtems-pva-ioc`.
 //!
 //! # The dual meaning this exists to split
 //!
@@ -53,6 +54,12 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 ];
 
 fn main() {
+    // Emit the RTEMS link arguments for `rtems-pva-ioc`. Link *arguments* —
+    // unlike `-L`/`-l` — do not propagate from a dependency's build script to a
+    // dependent's link (measured; see `epics_rtems_boot::contract`), so the
+    // package that owns the binary has to emit them. No-ops off RTEMS.
+    epics_rtems_boot::contract::emit_link_args();
+
     println!("cargo::rustc-check-cfg=cfg(local_account_db)");
 
     // `unix` is a precondition rather than a synonym: it is what puts `libc`

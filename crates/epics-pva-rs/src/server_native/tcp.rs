@@ -14030,6 +14030,15 @@ mod tests {
         );
     }
 
+    // Reactor-dependent, and specifically tokio-shaped: it stands a task up
+    // with a bare `tokio::spawn` so it can hand `AbortOnDrop` a raw
+    // `tokio::task::AbortHandle`, and it reads the outcome through tokio's
+    // `JoinError::is_cancelled`. Under `rtems-exec-model` the `runtime::task`
+    // seam's `TaskAbortHandle` is a *different* type with a different join
+    // error, so the fixture does not even typecheck there — and the production
+    // sites it stands in for (`finish_exec_data_task`, `monitor_abort`) take
+    // their handle from the seam and do compile on both backends.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn cancel_request_pauses_monitor_without_aborting() {
         // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
@@ -14155,6 +14164,11 @@ mod tests {
     /// accepted (`serverget.cpp:511-514`). Regression for the pre-fix
     /// handler that only paused monitors and left GET/PUT/RPC/PROCESS
     /// `Executing`, still able to emit a stale reply and blocking re-EXEC.
+    // Same reason as `cancel_request_pauses_monitor_without_aborting` above:
+    // a bare `tokio::spawn` handle into `AbortOnDrop` plus a tokio
+    // `JoinError::is_cancelled` readout, neither of which exists on the
+    // executor backend.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task() {
         let order = ByteOrder::Little;
@@ -21039,6 +21053,9 @@ mod bfr15_tests {
         synth_frame(Command::Get, order, payload)
     }
 
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn put_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let intro = nt_scalar_desc();
         let mut payload = Vec::new();
@@ -21051,6 +21068,9 @@ mod bfr15_tests {
         synth_frame(Command::Put, order, payload)
     }
 
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn destroy_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -21060,6 +21080,9 @@ mod bfr15_tests {
 
     /// Poll `counter` until it reaches `want`, panicking after ~1 s. Used to
     /// wait for a spawned task to enter its (blocking) source call.
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn wait_for(counter: &AtomicUsize, want: usize) {
         for _ in 0..200 {
             if counter.load(Ordering::SeqCst) >= want {
@@ -21097,6 +21120,14 @@ mod bfr15_tests {
     /// (a) `Executing` boundary on GET: a second GET EXEC arriving while the
     /// first source read is in flight is ignored — it neither starts a second
     /// source read nor aborts the first.
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -21179,6 +21210,14 @@ mod bfr15_tests {
     /// (b) `Executing` boundary on PUT: a second PUT EXEC arriving while the
     /// first write is in flight is ignored — neither a second write starts nor
     /// the first is aborted.
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -21262,6 +21301,14 @@ mod bfr15_tests {
     /// removing the op drops its `AbortOnDrop` guard, cancelling the spawned
     /// read. (The `Executing` gate suppresses only an implicit re-EXEC, never
     /// an explicit teardown.)
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
         let order = ByteOrder::Little;

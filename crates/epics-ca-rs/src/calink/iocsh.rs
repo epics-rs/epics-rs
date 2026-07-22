@@ -57,6 +57,14 @@ pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
 /// `ca://...` (or bare ` CA`-modified) link via the registered
 /// [`epics_base_rs::server::database::LinkSet`]. The CA-link
 /// counterpart of `dbpvxr`.
+///
+/// `FLNK` is included, and must be: C `dbcar` walks
+/// `pdbRecordType->link_ind[j]` — every link field of the record type, with
+/// no `dbfType` filter — and prints each one whose `plink->type` is
+/// `CA_LINK` (`dbCaTest.c:88-136`). An `FLNK="ca://OTHER.PROC"` is such a
+/// link (`dbLink.c:118-136` reaches `dbCaAddLink` for `DBF_FWDLINK` too), so
+/// hiding it here would under-report exactly the links `dbcar` exists to
+/// show.
 pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
     CommandDef::new(
         "dbcaxr",

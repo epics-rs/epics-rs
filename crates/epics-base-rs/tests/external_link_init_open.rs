@@ -15,7 +15,7 @@
 //! `stage_external_link_open_by_name`, i.e. the same `LinkPutQueue` owner
 //! that consumes `connect_link`. Nothing here opens a channel inline.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -239,6 +239,108 @@ async fn local_and_constant_links_stage_nothing() {
         lset.opened_names()
     );
     assert_eq!(db.external_link_opens_completed(), 0);
+}
+
+/// Boundary — an external `FLNK`. `dbInitLink` reaches
+/// `dbCaAddLinkCallbackOpt` for `DBF_FWDLINK` exactly as for the other two
+/// directions (`dbLink.c:118-136`; the `dbfType == DBF_FWDLINK` block *below*
+/// the call only sets `pvlOptFWD` / warns about a non-`.PROC` target). The
+/// port already forwards a live external `FLNK`
+/// (`processing.rs::dispatch_external_forward_link`), so the channel must be
+/// connecting before the first forward trigger rather than being staged by
+/// that trigger's own refusal.
+#[tokio::test]
+async fn external_forward_link_is_opened_at_init() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("AI_FWD", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("AI_FWD").expect("just added");
+        let mut inst = rec.write();
+        inst.put_common_field("FLNK", EpicsValue::String("ca://REMOTE:FWD.PROC".into()))
+            .unwrap();
+    }
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 1, "an external FLNK must be staged at init");
+    db.sync_external_link_puts().await;
+    assert_eq!(
+        lset.opened_names(),
+        vec!["REMOTE:FWD.PROC".to_string()],
+        "C's open-at-init covers DBF_FWDLINK"
+    );
+}
+
+/// Boundary — a local `FLNK` stages nothing. C resolves it through
+/// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:117-120`); the
+/// forward trigger is the local `dbScanPassive` path, not a link set. Widening
+/// `record_link_fields` to carry `FLNK` must not turn every fanout chain in a
+/// database into an external open attempt.
+#[tokio::test]
+async fn local_forward_link_stages_nothing() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("FWD_TGT", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("AI_FWD_LOCAL", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("AI_FWD_LOCAL").expect("just added");
+        let mut inst = rec.write();
+        inst.put_common_field("FLNK", EpicsValue::String("FWD_TGT".into()))
+            .unwrap();
+    }
+
+    let staged = db.setup_external_link_opens().await;
+    assert_eq!(staged, 0, "a local FLNK resolves as a DB link");
+    db.sync_external_link_puts().await;
+    assert!(
+        lset.opened_names().is_empty(),
+        "a local FLNK must not open an external channel, got {:?}",
+        lset.opened_names()
+    );
+}
+
+/// Boundary — an `FLNK` carries no CP/CPP policy, so widening the enumeration
+/// must leave `setup_cp_links` untouched. C masks a `DBF_FWDLINK`'s modifier
+/// set to `pvlOptCA` alone (`dbStaticLib.c:2390`), which is what
+/// `LinkFieldType::Fwd` reproduces: `FLNK="OTHER CP"` parses as a plain NPP
+/// forward link, never a CP holder edge.
+#[tokio::test]
+async fn forward_link_never_registers_a_cp_holder() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lset = CountingLset::new(&reads);
+    let db = PvDatabase::new();
+    db.register_link_set("ca", lset.clone()).await;
+
+    db.add_record("CP_SRC", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("AI_FWD_CP", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("AI_FWD_CP").expect("just added");
+        let mut inst = rec.write();
+        inst.put_common_field("FLNK", EpicsValue::String("CP_SRC CP".into()))
+            .unwrap();
+    }
+
+    db.setup_cp_links().await;
+    assert!(
+        db.get_cp_targets("CP_SRC").is_empty(),
+        "a forward link's CP modifier is masked off, so no holder edge exists"
+    );
 }
 
 /// Boundary — the CP path is not double-staged. `setup_cp_links` already

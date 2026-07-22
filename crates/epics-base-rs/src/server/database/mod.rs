@@ -1119,6 +1119,20 @@ impl PvDatabase {
         push("OUT", &inst.common.out, LinkFieldType::Out, &mut out);
         push("TSEL", &inst.common.tsel, LinkFieldType::In, &mut out);
         push("SDIS", &inst.common.sdis, LinkFieldType::In, &mut out);
+        // FLNK is `DBF_FWDLINK` (`dbCommon.dbd.pod:575`), so it parses under
+        // `LinkFieldType::Fwd` — C masks its modifier set to `pvlOptCA` alone
+        // (`dbStaticLib.c:2390`), which is why a `Fwd` link can never carry a
+        // CP/CPP policy and so is inert in `setup_cp_links`.
+        //
+        // It belongs in this enumeration because C `dbInitLink` reaches
+        // `dbCaAddLinkCallbackOpt` for `DBF_FWDLINK` exactly as it does for
+        // `DBF_INLINK`/`DBF_OUTLINK` (`dbLink.c:118-136` — the `dbfType` tests
+        // below the call only set `pvlOptInpNative` / `pvlOptFWD`), and our
+        // own forward-link dispatch already forwards live `Ca`/`Pva`/`PvaJson`
+        // FLNKs (`processing.rs::dispatch_external_forward_link`). Omitting it
+        // meant `setup_external_link_opens` never staged an external FLNK, so
+        // the first forward trigger after iocInit hit a cold channel.
+        push("FLNK", &inst.common.flnk, LinkFieldType::Fwd, &mut out);
         // Record-specific multi-input links (INPA..INPL for
         // calc/calcout/sel/sub) and the CP-capable input link fields
         // (DOL family, NVL, SELL, SGNL).

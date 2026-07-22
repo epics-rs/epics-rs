@@ -841,6 +841,20 @@ pub async fn install_pvalink_resolver(
     // event and field/sevr/Q settings are effective from the first
     // read/write without iocsh pre-warming.
     use epics_base_rs::server::record::ParsedLink;
+    // `record_link_fields` also yields `FLNK`, and this scan must see it:
+    // pvxs installs a pvaLink on a forward link exactly as on an input or
+    // output one. `dbInitLink` hands a `JSON_LINK` to `dbJLinkInit`
+    // (`dbLink.c:107-111`) *before* any `dbfType` discrimination, `pva_lset`
+    // supplies the `DBF_FWDLINK` entry point `pvaScanForward`
+    // (`pvxs/ioc/pvalink_lset.cpp:680-694`), and pvxs' own test helper accepts
+    // `DBF_FWDLINK` as a pvalink field (`pvxs/ioc/pvalink.cpp:117-127`).
+    //
+    // An `FLNK` takes the non-`OUT` arm below on purpose even though a pvxs
+    // forward link ends in a Put: [`PvaLinkResolver::scan_forward`] resolves
+    // the target through `inp_cfg_for` / `try_get_inp`, i.e. the INP config and
+    // registry entry this arm creates (pvxs' `pvaLinkChannel` always monitors).
+    // Routing `FLNK` to `open_out_link` would register its options under the
+    // OUT map, where the forward dispatch would never find them.
     for record_name in db.all_record_names().await {
         for (field_name, _raw, parsed) in db.record_link_fields(&record_name) {
             match &parsed {

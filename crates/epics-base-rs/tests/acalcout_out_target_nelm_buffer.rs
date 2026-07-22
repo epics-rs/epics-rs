@@ -107,6 +107,16 @@ impl LinkSet for CountingLset {
     async fn is_connected(&self, _name: &str) -> bool {
         self.element_count.is_some()
     }
+    /// The subject of these tests is which BUFFER the record hands the OUT
+    /// put (`&oval` vs `oav`), driven by the cached element count. Admit
+    /// every write so the buffer choice is observable: the separate
+    /// connection gate C applies before staging
+    /// (`dbCaPutLinkCallback`, `dbCa.c:558-561`) is covered by
+    /// `out_link_failure_alarm.rs`, and folding it in here would make the
+    /// no-metadata case assert nothing at all.
+    async fn put_admission(&self, _name: &str) -> epics_base_rs::server::database::PutAdmission {
+        epics_base_rs::server::database::PutAdmission::Connected
+    }
     async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
         None
     }
@@ -151,6 +161,10 @@ fn invalid_ivov_record(dopt: i16, nelm: u32, out: &str) -> AcalcoutRecord {
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
     db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    // An external OUT put is staged on the link-put queue and the record
+    // returns (C `dbCaPutLink`, `dbCa.c:622-624`); `dbCaSync`
+    // (`dbCa.c:1191-1194`) is the barrier that makes it observable.
+    db.sync_external_link_puts().await;
 }
 
 /// Scalar local target, DOPT=Use OCAL: effective nelm 1 → `&pcalc->oval`

@@ -1564,7 +1564,10 @@ impl PvDatabase {
     }
 
     /// Write a value to an external (`ca://` / `pva://`) OUT link
-    /// through the registered [`LinkSet`].
+    /// through the registered [`LinkSet`] — **by staging it on the
+    /// database's link-put queue and returning**, exactly as C
+    /// `dbCaPutLink` stages into `pca->pputNative` and returns
+    /// (`dbCa.c:544-631`).
     ///
     /// This is the OUTPUT-side twin of [`Self::resolve_external_pv`]:
     /// the input side dispatches a `ParsedLink::Ca`/`Pva` read through
@@ -1580,10 +1583,30 @@ impl PvDatabase {
     /// scheme). For a bare name every registered lset is tried in
     /// turn — the first whose `put_value` succeeds wins.
     ///
-    /// Returns `Ok(())` on a successful remote write, `Err(reason)`
-    /// when no lset is registered for the scheme or the lset rejects
-    /// the write (the caller folds that into a LINK alarm — it must
-    /// never panic).
+    /// # What the returned status means
+    ///
+    /// The **staging** status, which is what C returns: `dbCaPutLink`'s
+    /// value is the conversion status or the `-1` refusal of
+    /// `dbCa.c:558-561`, never the outcome of the wire write (that reaches
+    /// the operator through `errlogPrintf` on the `dbCaTask`,
+    /// `dbCa.c:1240-1244`). So:
+    ///
+    /// * `Err` — no lset is registered for the scheme, or the lset reports
+    ///   the link as [`PutAdmission::Disconnected`]. The caller folds this
+    ///   into the owning record's LINK/INVALID (`setLinkAlarm`), same cycle,
+    ///   same as before this change.
+    /// * `Ok(())` for [`LinkPutOp::Plain`] — the write is staged. It is
+    ///   **not** yet on the wire. This is the fire-and-forget flavour, C's
+    ///   `CA_PUT` / `ca_array_put` (`dbCa.c:1228-1231`), and it is the whole
+    ///   point of the queue: record processing no longer suspends on a
+    ///   `ca://`/`pva://` round trip inside the record's advisory write gate.
+    /// * For [`LinkPutOp::Async`] the call still awaits — that is the
+    ///   completion flavour, C's `CA_PUT_CALLBACK` / `ca_array_put_callback`
+    ///   whose `putComplete` drives the originating record's completion
+    ///   (`dbCa.c:1232-1236`, `:1056-1074`). It awaits the queue owner's
+    ///   result rather than performing the network write itself, so the
+    ///   network op has moved off the record thread in both flavours; only
+    ///   the *waiting* remains, and only where a put-notify chain requires it.
     ///
     /// `op` carries the delivery semantics the lset must honour:
     /// [`LinkPutOp::Async`] when the write is part of a put-notify /
@@ -1595,47 +1618,99 @@ impl PvDatabase {
         value: EpicsValue,
         op: LinkPutOp,
     ) -> Result<(), String> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
+        use super::link_put_queue::{LinkKey, LinkTarget};
+        use super::link_set::PutAdmission;
+
+        let (target, body, lsets) = if let Some(rest) = name.strip_prefix("pva://") {
+            let lset = self
+                .inner
+                .link_sets
+                .load()
+                .get("pva")
+                .ok_or_else(|| format!("no 'pva' link set registered for '{name}'"))?;
+            (LinkTarget::Scheme("pva".to_string()), rest, vec![lset])
         } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
+            let lset = self
+                .inner
+                .link_sets
+                .load()
+                .get("ca")
+                .ok_or_else(|| format!("no 'ca' link set registered for '{name}'"))?;
+            (LinkTarget::Scheme("ca".to_string()), rest, vec![lset])
         } else {
-            // Bare name — try every registered lset in turn, first
+            // Bare name — every registered lset is a candidate, first
             // accepting write wins (mirrors `resolve_external_pv`'s
             // bare-name path).
             let lsets = self.registered_link_sets().await;
             if lsets.is_empty() {
                 return Err(format!("no link set registered for external link '{name}'"));
             }
-            let mut last_err = String::new();
-            for lset in lsets {
-                match lset.put_value(name, value.clone(), op).await {
-                    Ok(()) => {
-                        // Production drain of any retry-queued OUT
-                        // writes on this lset now that a write has
-                        // reached it (the channel may have just
-                        // reconnected). pvxs replays the queued
-                        // put from record processing, not test code
-                        // (`pvalink_channel.cpp:220-263`).
-                        lset.flush_puts().await;
-                        return Ok(());
-                    }
-                    Err(e) => last_err = e,
-                }
-            }
-            return Err(last_err);
+            (LinkTarget::Any, name, lsets)
         };
-        let lset = self
-            .inner
-            .link_sets
-            .load()
-            .get(scheme)
-            .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        let result = lset.put_value(body, value, op).await;
-        if result.is_ok() {
-            lset.flush_puts().await;
+
+        // C `dbCaPutLinkCallback`'s first gate (`dbCa.c:558-561`): a link
+        // that is known-down refuses the put and stages nothing, so the
+        // record alarms in this cycle. `put_admission` is answered from
+        // cached state — this is the only lset call left inside the record's
+        // advisory write gate, and it does no I/O.
+        let mut admission = PutAdmission::Disconnected;
+        for lset in &lsets {
+            match lset.put_admission(body).await {
+                PutAdmission::Connected => {
+                    admission = PutAdmission::Connected;
+                    break;
+                }
+                // Unopened outranks Disconnected: the write must still be
+                // staged so the lset's lazy open runs (see `PutAdmission`).
+                PutAdmission::Unopened => admission = PutAdmission::Unopened,
+                PutAdmission::Disconnected => {}
+            }
         }
-        result
+        if admission == PutAdmission::Disconnected {
+            return Err(format!(
+                "external link '{name}' is not connected (dbCa.c:558-561)"
+            ));
+        }
+
+        self.inner
+            .link_puts
+            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
+        let key = LinkKey {
+            target,
+            name: body.to_string(),
+        };
+        match self.inner.link_puts.stage_put(key, value, op) {
+            // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:622-624`).
+            None => Ok(()),
+            // `dbCaPutLinkCallback`: the completion route. The owner resolves
+            // this when its `put_value` returns, as `putComplete` does.
+            Some(rx) => rx
+                .await
+                .unwrap_or_else(|_| Err("external link put completion channel closed".to_string())),
+        }
+    }
+
+    /// Drain the external-link put queue — C `dbCaSync`
+    /// (`dbCa.c:1191-1194`, the `CA_SYNC` action the `dbCaTask` answers only
+    /// once everything queued ahead of it has been serviced).
+    ///
+    /// Returns when every staged write has been handed to its lset and that
+    /// lset's `put_value` has returned. The barrier a caller needs when it
+    /// must observe the effect of a [`LinkPutOp::Plain`] write, which by
+    /// construction is no longer complete when `write_external_pv` returns.
+    pub async fn sync_external_link_puts(&self) {
+        self.inner.link_puts.sync().await;
+    }
+
+    /// Number of staged external-link writes a later write on the same link
+    /// overwrote — C's `pca->nNoWrite` (`dbCa.c:611-612`).
+    pub fn external_link_puts_coalesced(&self) -> u64 {
+        self.inner.link_puts.coalesced_count()
+    }
+
+    /// Number of external-link writes the queue owner has completed.
+    pub fn external_link_puts_completed(&self) -> u64 {
+        self.inner.link_puts.completed_count()
     }
 
     /// Fire a forward link (FLNK) whose target is an external
@@ -3043,6 +3118,10 @@ mod nonlocal_db_link_write_tests {
             0,
         )
         .await;
+        // Staged on the link-put queue and returned, as C `dbCaPutLink`
+        // does (`dbCa.c:622-624`); `dbCaSync` (`dbCa.c:1191-1194`) is the
+        // barrier that makes the wire write observable.
+        db.sync_external_link_puts().await;
 
         let captured = puts.lock().unwrap();
         assert_eq!(

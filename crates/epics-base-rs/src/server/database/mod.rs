@@ -5,6 +5,7 @@ use std::future::Future;
 pub mod db_access;
 mod field_io;
 pub mod filters;
+mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
@@ -13,7 +14,8 @@ mod scan_index;
 mod snapshot;
 
 pub use link_set::{
-    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
+    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
+    RemoteAlarm,
 };
 pub use processing::{AsyncDbHandle, AsyncToken};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
@@ -433,6 +435,12 @@ struct PvDatabaseInner {
     /// snapshot is what the read paths already assumed.
     /// `doc/rtems-priority-locks-design.md` §3 row L8i.
     link_sets: SnapshotCell<link_set::LinkSetRegistry>,
+    /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
+    /// Record processing stages a write here and returns; the queue's single
+    /// owner task performs the `ca://`/`pva://` network write off the
+    /// record's advisory write gate, exactly as `dbCaTask` does
+    /// (`dbCa.c:1158-1333`). See [`link_put_queue`].
+    link_puts: Arc<link_put_queue::LinkPutQueue>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -727,6 +735,7 @@ impl PvDatabase {
                 search_resolver: ArcSwapOption::empty(),
                 existence_gate: ArcSwapOption::empty(),
                 link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
+                link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
                 records: parking_lot::RwLock::new(HashMap::new()),
                 scan_index: ScanIndex::new(),
                 load_order: SnapshotCell::new(HashMap::new()),

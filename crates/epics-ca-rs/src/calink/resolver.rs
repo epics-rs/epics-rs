@@ -16,7 +16,9 @@ use crate::DbFieldType;
 use crate::client::{CaChannel, CaClient};
 use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{
+    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
 use parking_lot::RwLock;
@@ -722,6 +724,28 @@ impl LinkSet for CaLinkResolver {
     async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
         self.link_for(name).await?.value()
+    }
+
+    /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
+    /// return -1;` (`dbCa.c:558-561`), answered from cached state: the links
+    /// map plus the `CaLink::connected` flag the connection watcher owns
+    /// ([`note_conn_event`]). No I/O — the database asks this on the
+    /// record-processing thread, inside the record's advisory write gate.
+    ///
+    /// A link this resolver has never opened reports `Unopened` rather than
+    /// `Disconnected`: C opens at `dbCaAddLink` (record init) so the `caLink`
+    /// always exists by the first put, while this resolver opens lazily
+    /// inside `put_value` / `get_value`. Reporting `Disconnected` would
+    /// refuse the very write whose staging performs the open, and the link
+    /// would never connect.
+    async fn put_admission(&self, name: &str) -> PutAdmission {
+        let name = strip_ca_scheme(name);
+        let links = self.links.read();
+        match links.get(name) {
+            None => PutAdmission::Unopened,
+            Some(link) if link.is_connected() => PutAdmission::Connected,
+            Some(_) => PutAdmission::Disconnected,
+        }
     }
 
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {

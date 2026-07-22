@@ -438,7 +438,7 @@ impl PvaLinkResolver {
         let Some(db_handle) = self.db.read().clone() else {
             return;
         };
-        if scan_target_should_process(&db_handle, record, passive_only).await {
+        if scan_target_should_process(&db_handle, record, passive_only) {
             let mut visited = std::collections::HashSet::new();
             let _ = db_handle
                 .process_record_with_links(record, &mut visited, 0)
@@ -978,11 +978,7 @@ async fn run_notify_forwarder(
 /// ([`PvaLinkResolver::scan_attached_record`]). The write guard is
 /// released before returning so the caller's process call can take its
 /// own locks. A missing record returns `false`.
-async fn scan_target_should_process(
-    db_handle: &PvDatabase,
-    record: &str,
-    passive_only: bool,
-) -> bool {
+fn scan_target_should_process(db_handle: &PvDatabase, record: &str, passive_only: bool) -> bool {
     let Some(rec) = db_handle.get_record(record) else {
         return false;
     };
@@ -1068,8 +1064,12 @@ async fn scan_once(
         // CPP passive gate + PACT pre-check (pvxs `ScanTrack::scan`);
         // see `scan_target_should_process`. The target write lock is
         // released before the process call below, which takes its own
-        // per-record locks.
-        if !scan_target_should_process(&db_handle, record, *passive_only).await {
+        // per-record locks. Synchronous: `scan_target_should_process`
+        // does not await anything, so an atomic target's iteration here
+        // reaches the `process_record_with_links_already_locked` call
+        // below with zero `.await`s while `atomic_epoch` is held
+        // (`doc/rtems-priority-locks-design.md` §1.1 H7, §5 step 6).
+        if !scan_target_should_process(&db_handle, record, *passive_only) {
             continue;
         }
         // B3: process WITH links so the CP/CPP-driven scan fans

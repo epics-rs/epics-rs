@@ -65,7 +65,6 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
     db.get_pv(pv)
-        .await
         .unwrap_or_else(|e| panic!("{pv} must be served: {e:?}"))
 }
 

@@ -60,12 +60,12 @@ async fn db_of(db_text: &str) -> Arc<PvDatabase> {
 }
 
 async fn nord_udf(db: &PvDatabase, rec: &str) -> (i64, i64) {
-    let n = match db.get_pv(&format!("{rec}.NORD")).await.unwrap() {
+    let n = match db.get_pv(&format!("{rec}.NORD")).unwrap() {
         EpicsValue::ULong(v) => v as i64,
         EpicsValue::Long(v) => v as i64,
         other => panic!("{rec}.NORD: unexpected type {other:?}"),
     };
-    let u = match db.get_pv(&format!("{rec}.UDF")).await.unwrap() {
+    let u = match db.get_pv(&format!("{rec}.UDF")).unwrap() {
         EpicsValue::UChar(v) => v as i64,
         EpicsValue::Char(v) => v as i64,
         other => panic!("{rec}.UDF: unexpected type {other:?}"),

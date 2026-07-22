@@ -1236,7 +1236,7 @@ impl BridgeProvider {
         ) {
             return None;
         }
-        self.db.get_pv(&channel).await.ok()
+        self.db.get_pv(&channel).ok()
     }
 
     /// Write a single field of a group. Mirrors pvxs `putGroupField`.

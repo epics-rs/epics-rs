@@ -196,7 +196,7 @@ fn cmd_dbgf() -> CommandDef {
                 _ => return Err("invalid argument".to_string()),
             };
 
-            match ctx.block_on(ctx.db().get_pv(name)) {
+            match ctx.db().get_pv(name) {
                 Ok(val) => {
                     let type_name = dbf_type_name(&val);
                     // epics-base dc70dfd6: dbgf must C-style-escape
@@ -320,7 +320,7 @@ fn cmd_dbpf() -> CommandDef {
             })?;
 
             // Read back to confirm
-            match ctx.block_on(ctx.db().get_pv(name)) {
+            match ctx.db().get_pv(name) {
                 Ok(val) => {
                     let type_name = dbf_type_name(&val);
                     ctx.println(&format!("{type_name}: {val}"));
@@ -1315,7 +1315,7 @@ async fn install_record_defs(
             // &sval)`, run from every SIML-bearing `init_record`
             // (pass 1) — the only site that loads a constant
             // SIML/SIOL into SIMM/SVAL.
-            ctx.db().rec_gbl_init_simm(&rec_arc).await;
+            ctx.db().rec_gbl_init_simm(&rec_arc);
             // C `wdogInit(prec)` from `init_record` pass 1
             // (histogramRecord.c:168) — arms the SDEL monitor
             // watchdog; a re-arm supersedes the previous one, which is
@@ -2053,7 +2053,7 @@ record(bo, "$(P)_calc_ctrl") {{
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
 
         // Read back
-        let val = ctx.block_on(db.get_pv("TEMP")).unwrap();
+        let val = db.get_pv("TEMP").unwrap();
         match val {
             EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
             other => panic!("expected Double(42.0), got {:?}", other),

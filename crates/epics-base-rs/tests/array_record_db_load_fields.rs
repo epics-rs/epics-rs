@@ -74,7 +74,6 @@ record(waveform, "ARR:WF") {
 
 async fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
     db.get_pv(pv)
-        .await
         .unwrap_or_else(|e| panic!("{pv} not readable: {e}"))
 }
 

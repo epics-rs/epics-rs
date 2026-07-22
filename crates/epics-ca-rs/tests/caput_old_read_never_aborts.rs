@@ -211,7 +211,6 @@ async fn caput_writes_a_read_denied_pv_and_exits_zero() {
     // `exit(1)` skipped.
     let stored = db
         .get_pv("R921:WRITEONLY")
-        .await
         .expect("read the record back through the database");
     assert_eq!(
         stored,

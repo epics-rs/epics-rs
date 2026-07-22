@@ -235,7 +235,7 @@ async fn r14_62_successful_local_out_put_raises_no_alarm() {
         "a successful OUT put must leave the writing record un-alarmed"
     );
     assert_eq!(
-        db.get_pv("AO_GOOD_DEST").await.unwrap().to_f64(),
+        db.get_pv("AO_GOOD_DEST").unwrap().to_f64(),
         Some(3.0),
         "…and the value must have landed on the target"
     );

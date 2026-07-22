@@ -1421,7 +1421,7 @@ impl GroupChannel {
         // member-record gate via `lock_records`, and the gate `Mutex` is not
         // reentrant.
         if already_locked {
-            self.db.put_driven_process_already_locked(record_name).await
+            self.db.put_driven_process_already_locked(record_name)
         } else {
             self.db.put_driven_process(record_name).await
         }
@@ -1460,7 +1460,7 @@ impl GroupChannel {
                 ProcessMode::Inhibit => {
                     let pv = format!("{record_name}.{field_name}");
                     if already_locked {
-                        self.db.put_pv_already_locked(&pv, value).await
+                        self.db.put_pv_already_locked(&pv, value)
                     } else {
                         self.db.put_pv(&pv, value).await
                     }
@@ -1473,13 +1473,11 @@ impl GroupChannel {
                     // would occupy its notify slot until async
                     // processing settles).
                     if already_locked {
-                        self.db
-                            .put_record_field_from_ca_no_notify_already_locked(
-                                record_name,
-                                field_name,
-                                value,
-                            )
-                            .await
+                        self.db.put_record_field_from_ca_no_notify_already_locked(
+                            record_name,
+                            field_name,
+                            value,
+                        )
                     } else {
                         self.db
                             .put_record_field_from_ca_no_notify(record_name, field_name, value)
@@ -1490,16 +1488,18 @@ impl GroupChannel {
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
                     if already_locked {
-                        self.db.put_pv_already_locked(&pv, value).await
+                        self.db.put_pv_already_locked(&pv, value)
                     } else {
                         self.db.put_pv(&pv, value).await
                     }
                     .map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
                     if already_locked {
-                        self.db
-                            .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                            .await
+                        self.db.process_record_with_links_already_locked(
+                            record_name,
+                            &mut visited,
+                            0,
+                        )
                     } else {
                         self.db
                             .process_record_with_links(record_name, &mut visited, 0)
@@ -2931,7 +2931,7 @@ mod tests {
     /// through this helper keeps the C polarity in ONE place.
     async fn has_processed(db: &Arc<PvDatabase>, rec: &str) -> bool {
         use epics_base_rs::types::EpicsValue;
-        match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+        match db.get_pv(&format!("{rec}.INIT")).unwrap() {
             EpicsValue::Short(v) => v == 0,
             other => panic!("unexpected INIT type: {other:?}"),
         }
@@ -4264,7 +4264,7 @@ mod tests {
                 "a changing meta member must post-process its record \
                  (groupsource.cpp:568, atomic={atomic})"
             );
-            let val = match db.get_pv("META:rec.VAL").await.unwrap() {
+            let val = match db.get_pv("META:rec.VAL").unwrap() {
                 EpicsValue::Double(d) => d,
                 other => panic!("unexpected VAL type: {other:?}"),
             };
@@ -5044,8 +5044,8 @@ mod tests {
             .expect("put task did not panic");
 
         // Both member records received the written values.
-        let a = db.get_pv("A:rec.VAL").await.unwrap();
-        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        let a = db.get_pv("A:rec.VAL").unwrap();
+        let b = db.get_pv("B:rec.VAL").unwrap();
         match (a, b) {
             (
                 epics_base_rs::types::EpicsValue::Double(va),
@@ -5231,8 +5231,8 @@ mod tests {
         // Final state is one of the two PUTs fully applied — never a
         // mix (1.0,2.0) / (2.0,1.0). The lock guarantees the loops did
         // not interleave member writes.
-        let a = db.get_pv("A:rec.VAL").await.unwrap();
-        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        let a = db.get_pv("A:rec.VAL").unwrap();
+        let b = db.get_pv("B:rec.VAL").unwrap();
         match (a, b) {
             (
                 epics_base_rs::types::EpicsValue::Double(va),
@@ -5303,7 +5303,7 @@ mod tests {
             .expect("direct write must complete once gates are released")
             .expect("direct write task panicked");
 
-        match db.get_pv("A:rec.VAL").await.unwrap() {
+        match db.get_pv("A:rec.VAL").unwrap() {
             epics_base_rs::types::EpicsValue::Double(v) => assert_eq!(v, 99.0),
             other => panic!("unexpected A:rec.VAL: {other:?}"),
         }
@@ -5342,8 +5342,8 @@ mod tests {
             .expect("atomic PUT must complete once the member gate is free")
             .expect("atomic PUT task panicked");
 
-        let a = db.get_pv("A:rec.VAL").await.unwrap();
-        let b = db.get_pv("B:rec.VAL").await.unwrap();
+        let a = db.get_pv("A:rec.VAL").unwrap();
+        let b = db.get_pv("B:rec.VAL").unwrap();
         match (a, b) {
             (
                 epics_base_rs::types::EpicsValue::Double(va),

@@ -144,19 +144,19 @@ async fn an_undefined_waveform_carries_the_initial_udf_severity() {
     assert!(handle.read().common.udf != 0, "never processed, so UDF");
 
     assert_eq!(
-        db.get_pv("UDF:WF.SEVR").await.unwrap().to_f64(),
+        db.get_pv("UDF:WF.SEVR").unwrap().to_f64(),
         Some(AlarmSeverity::Invalid as i32 as f64),
         "iocInit gives every never-processed record SEVR = UDFS (INVALID)"
     );
     assert_eq!(
-        db.get_pv("UDF:WF.STAT").await.unwrap().to_f64(),
+        db.get_pv("UDF:WF.STAT").unwrap().to_f64(),
         Some(f64::from(
             epics_base_rs::server::recgbl::alarm_status::UDF_ALARM
         )),
         "STAT is born UDF (dbCommon.dbd initial(\"UDF\"))"
     );
     assert_eq!(
-        db.get_pv("UDF:WF").await.unwrap(),
+        db.get_pv("UDF:WF").unwrap(),
         EpicsValue::DoubleArray(vec![])
     );
 }

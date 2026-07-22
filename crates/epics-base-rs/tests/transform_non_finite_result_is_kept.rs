@@ -131,7 +131,7 @@ async fn the_non_finite_value_is_fanned_out_through_outa() {
     put(&db, "OUTA", EpicsValue::String("T_TGT.VAL PP".into())).await;
     process(&db, "T").await;
 
-    match db.get_pv("T_TGT").await.unwrap() {
+    match db.get_pv("T_TGT").unwrap() {
         EpicsValue::Double(d) => assert_eq!(
             d,
             f64::INFINITY,

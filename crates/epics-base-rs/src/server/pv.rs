@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::runtime::sync::Mutex;
+use parking_lot::Mutex as BlockingMutex;
 
 use crate::error::CaError;
 use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome, TryRecvError};
@@ -322,7 +322,15 @@ pub struct ProcessVariable {
     /// (`set` / `set_snapshot`) still `.await`s the monitor fan-out, but
     /// drops this guard first.
     pub value: parking_lot::RwLock<EpicsValue>,
-    pub subscribers: Mutex<Vec<Subscriber>>,
+    /// Monitor fan-out list. A BLOCKING `parking_lot`-class mutex, not the
+    /// async one: every emission path runs from a record-processing thread
+    /// with the record's advisory gate held, and C's `db_post_events` likewise
+    /// takes `evUser->lock` — a plain `epicsMutex` — from inside `dbScanLock`
+    /// (`dbEvent.c::db_post_events`). Holding an async mutex here would put a
+    /// suspension point inside that window. Every critical section below is
+    /// bounded list work (`retain` / `push` / `sub.post`), with no I/O and no
+    /// `.await` inside it.
+    pub subscribers: BlockingMutex<Vec<Subscriber>>,
     /// Sticky metadata of the last full-snapshot write. `None` until a
     /// [`Self::set_snapshot`] lands; a value-only [`Self::set`] clears it
     /// back to `None` (a plain value write carries no explicit
@@ -370,7 +378,7 @@ impl ProcessVariable {
         Self {
             name,
             value: parking_lot::RwLock::new(initial),
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: BlockingMutex::new(Vec::new()),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
             posted_meta: parking_lot::RwLock::new(None),
             write_hook: parking_lot::RwLock::new(None),
@@ -580,7 +588,7 @@ impl ProcessVariable {
     }
 
     /// Set a new value and notify all subscribers.
-    pub async fn set(&self, new_value: EpicsValue) {
+    pub fn set(&self, new_value: EpicsValue) {
         {
             let mut val = self.value.write();
             *val = new_value.clone();
@@ -589,7 +597,7 @@ impl ProcessVariable {
         // the bare-PV default so a stale full-snapshot's metadata does
         // not linger on a value the client never stamped.
         *self.posted_meta.write() = None;
-        self.notify_subscribers(new_value).await;
+        self.notify_subscribers(new_value);
     }
 
     /// Set value from a full snapshot (value + alarm + timestamp) and notify
@@ -597,7 +605,7 @@ impl ProcessVariable {
     /// the upstream alarm status/severity and IOC timestamp to downstream
     /// monitors. Mirrors `gateVcData::setEventData` + `vcPostEvent` in the
     /// C ca-gateway: the incoming `dbr_time_xxx` GDD carries all three fields.
-    pub async fn set_snapshot(&self, snapshot: Snapshot) {
+    pub fn set_snapshot(&self, snapshot: Snapshot) {
         {
             let mut val = self.value.write();
             *val = snapshot.value.clone();
@@ -609,7 +617,7 @@ impl ProcessVariable {
             timestamp: snapshot.timestamp,
             user_tag: snapshot.user_tag,
         });
-        self.notify_subscribers_from_snapshot(snapshot).await;
+        self.notify_subscribers_from_snapshot(snapshot);
     }
 
     /// Single delivery owner: emit `snapshot` to every live subscriber
@@ -624,9 +632,9 @@ impl ProcessVariable {
     /// class differs per caller, nothing else. The snapshot is built once
     /// by the caller (one timestamp per logical event) and cloned per
     /// subscriber.
-    async fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
+    fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         // Remove subscribers whose consumer has been dropped.
         subs.retain(|sub| !sub.is_closed());
         for sub in subs.iter() {
@@ -674,14 +682,13 @@ impl ProcessVariable {
     /// reconnect storms when the upstream is just briefly
     /// unreachable). Mirrors gatePvData::death's "alarm-post"
     /// alternative discussed in the C++ ca-gateway audit.
-    pub async fn post_alarm(&self, severity: u16, status: u16) {
+    pub fn post_alarm(&self, severity: u16, status: u16) {
         use crate::server::recgbl::EventMask;
         let value = self.value.read().clone();
         let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
-        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot)
-            .await;
+        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot);
     }
 
     /// Post a `DBE_PROPERTY` monitor event carrying the decoded upstream
@@ -706,17 +713,16 @@ impl ProcessVariable {
     pub async fn post_property(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
         self.apply_metadata(&mut snapshot);
-        self.deliver(EventMask::PROPERTY, snapshot).await;
+        self.deliver(EventMask::PROPERTY, snapshot);
     }
 
     /// Notify all subscribers of a new value.
-    async fn notify_subscribers(&self, value: EpicsValue) {
+    fn notify_subscribers(&self, value: EpicsValue) {
         use crate::server::recgbl::EventMask;
         let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
-        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot)
-            .await;
+        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot);
     }
 
     /// Notify all subscribers using a pre-built Snapshot (value + alarm +
@@ -724,7 +730,7 @@ impl ProcessVariable {
     /// and IOC timestamp without synthesising a new zero-alarm local-time
     /// snapshot. Installed shadow metadata fills any metadata field the
     /// gateway snapshot left absent (see [`Self::apply_metadata`]).
-    async fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
+    fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
         self.apply_metadata(&mut snapshot);
         // C gateway fires postEvent(VALUE|ALARM|LOG) for every
@@ -733,8 +739,7 @@ impl ProcessVariable {
         self.deliver(
             EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
             snapshot,
-        )
-        .await;
+        );
     }
 
     /// Add an in-process subscriber, attached to an event queue of its own.
@@ -745,14 +750,13 @@ impl ProcessVariable {
     /// queue, and flow control (a CA circuit concept) never engages on it.
     /// The CA server, whose subscriptions DO share one circuit-wide queue, uses
     /// [`Self::add_subscriber_on`].
-    pub async fn add_subscriber(
+    pub fn add_subscriber(
         &self,
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
     ) -> Option<EventReader> {
         self.add_subscriber_on(&EventUser::new(), sid, data_type, mask)
-            .await
     }
 
     /// Add a subscriber whose events are queued on `user`'s event queue —
@@ -765,7 +769,7 @@ impl ProcessVariable {
     /// against a misbehaving client opening many MONITOR ops against one shared
     /// PV; the per-channel cap limits channels but not subscriber rows on a
     /// single PV). Operators override it via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
-    pub async fn add_subscriber_on(
+    pub fn add_subscriber_on(
         &self,
         user: &EventUser,
         sid: u32,
@@ -773,7 +777,7 @@ impl ProcessVariable {
         mask: u16,
     ) -> Option<EventReader> {
         let cap = max_subscribers_per_pv();
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         // Reap rows whose consumer is gone BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
         // already retain-filter on every emission, but a PV with
@@ -823,7 +827,7 @@ impl ProcessVariable {
     /// isolated across subscribers. An empty chain is a no-op (keeps the
     /// default). No-op when no subscriber matches `sid` (e.g. it was
     /// reaped between add and attach).
-    pub async fn attach_filters_to_subscriber(
+    pub fn attach_filters_to_subscriber(
         &self,
         sid: u32,
         filters: crate::server::database::filters::FilterChain,
@@ -831,15 +835,15 @@ impl ProcessVariable {
         if filters.is_empty() {
             return;
         }
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         if let Some(sub) = subs.iter_mut().find(|s| s.sid == sid) {
             sub.filters = filters;
         }
     }
 
     /// Remove a subscriber by subscription ID.
-    pub async fn remove_subscriber(&self, sid: u32) {
-        let mut subs = self.subscribers.lock().await;
+    pub fn remove_subscriber(&self, sid: u32) {
+        let mut subs = self.subscribers.lock();
         subs.retain(|s| s.sid != sid);
     }
 }
@@ -895,7 +899,7 @@ impl PvSubscription {
         // `data_type` is nominal for snapshot consumers: `deliver` ships
         // the full `Snapshot` and gates only on mask/filters, never on the
         // stored type — `DbSubscription` likewise registers as `Double`.
-        let reader = pv.add_subscriber(sid, DbFieldType::Double, mask).await?;
+        let reader = pv.add_subscriber(sid, DbFieldType::Double, mask)?;
         Some(Self { reader, pv, sid })
     }
 
@@ -943,7 +947,7 @@ impl Drop for PvSubscription {
         // live subscription to clean up.
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::runtime::task::spawn(async move {
-                pv.remove_subscriber(sid).await;
+                pv.remove_subscriber(sid);
             });
         }
     }
@@ -976,7 +980,7 @@ mod mask_gate_tests {
         let posted_time = WallTime::from_unix(1_600_000_000, 42);
         let mut snap = Snapshot::new(EpicsValue::Double(7.0), 3, 2, posted_time);
         snap.user_tag = 9;
-        pv.set_snapshot(snap).await;
+        pv.set_snapshot(snap);
 
         let got = pv.snapshot();
         assert_eq!(got.value, EpicsValue::Double(7.0), "value persisted");
@@ -986,7 +990,7 @@ mod mask_gate_tests {
         assert_eq!(got.timestamp, posted_time, "timestamp persisted to GET");
 
         // A plain value write reverts to the bare-PV default.
-        pv.set(EpicsValue::Double(8.0)).await;
+        pv.set(EpicsValue::Double(8.0));
         let after = pv.snapshot();
         assert_eq!(after.value, EpicsValue::Double(8.0));
         assert_eq!(after.alarm.status, 0, "value set clears posted alarm");
@@ -1005,14 +1009,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_err(),
             "DBE_ALARM-only subscriber must not receive a value post"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_ok(),
             "DBE_ALARM subscriber must receive an alarm post"
@@ -1026,14 +1029,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive an alarm post"
         );
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a value post"
@@ -1057,9 +1059,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_LOG)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive a set_snapshot post"
@@ -1072,9 +1073,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_ALARM-only subscriber must receive a set_snapshot post"
@@ -1087,9 +1087,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a set_snapshot post"
@@ -1102,11 +1101,10 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(rx.try_recv().is_ok(), "value post delivered to VALUE|ALARM");
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(rx.try_recv().is_ok(), "alarm post delivered to VALUE|ALARM");
     }
 
@@ -1119,14 +1117,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_LOG)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive a value post"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive an alarm post"
@@ -1142,15 +1139,14 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert_eq!(
             rx.try_recv().expect("value event").mask,
             EventMask::VALUE | EventMask::LOG,
             "value post carries VALUE|LOG"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert_eq!(
             rx.try_recv().expect("alarm event").mask,
             EventMask::ALARM | EventMask::LOG,
@@ -1173,19 +1169,18 @@ mod mask_gate_tests {
         ));
         let mut reader = pv
             .add_subscriber(7, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
-            .await
             .expect("subscriber added");
         // Append VALUE|LOG posts until the ring space reaches the replace
         // threshold; from here every post overwrites the tail entry.
         let appended = event_que_size() - events_per_que();
         for i in 1..=appended {
-            pv.set(EpicsValue::Double(i as f64)).await;
+            pv.set(EpicsValue::Double(i as f64));
         }
         // Replaces the tail: its class (ALARM|LOG) must not be lost.
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         // Replaces it again with a value post — both classes fold into the
         // survivor.
-        pv.set(EpicsValue::Double(99.0)).await;
+        pv.set(EpicsValue::Double(99.0));
 
         let mut last = None;
         while let Ok(event) = reader.try_recv() {
@@ -1231,7 +1226,7 @@ mod mask_gate_tests {
         let appended = event_que_size() - events_per_que();
         let burst = appended + 92;
         for i in 1..=burst {
-            pv.set(EpicsValue::Double(i as f64)).await;
+            pv.set(EpicsValue::Double(i as f64));
         }
         let mut seq = Vec::new();
         while let Ok(Some(snap)) =
@@ -1308,9 +1303,8 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(2.0)).await;
+        pv.set(EpicsValue::Double(2.0));
         let ev = rx.try_recv().expect("value event delivered");
         assert_eq!(
             ev.snapshot.display.expect("metadata on value post").units,
@@ -1327,7 +1321,6 @@ mod metadata_tests {
         pv.set_metadata(meta()); // installed units = degC
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
         let mut snap = Snapshot::new(
             EpicsValue::Double(3.0),
@@ -1339,7 +1332,7 @@ mod metadata_tests {
             units: "volts".into(),
             ..Default::default()
         });
-        pv.set_snapshot(snap).await;
+        pv.set_snapshot(snap);
         let ev = rx.try_recv().expect("snapshot delivered");
         assert_eq!(
             ev.snapshot.display.expect("caller display kept").units,
@@ -1357,11 +1350,9 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("subscriber added");
         let mut val_rx = pv
             .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
         pv.post_property(Snapshot::new(
             EpicsValue::Double(1.0),
@@ -1402,7 +1393,6 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("subscriber added");
         // The upstream CTRL event timestamp: a fixed point in the past, so
         // it is unmistakably NOT a fresh wall clock minted by the post.
@@ -1462,7 +1452,7 @@ mod read_hook_tests {
     async fn read_snapshot_fires_hook_for_fresh_value() {
         let pv = pv();
         // Stored shadow value is a sentinel the hook must override.
-        pv.set(EpicsValue::Double(999.0)).await;
+        pv.set(EpicsValue::Double(999.0));
         pv.set_read_hook(Arc::new(|| {
             Box::pin(async {
                 Ok(Snapshot::new(
@@ -1533,7 +1523,7 @@ mod read_hook_tests {
     #[tokio::test]
     async fn snapshot_ignores_read_hook() {
         let pv = pv();
-        pv.set(EpicsValue::Double(7.0)).await;
+        pv.set(EpicsValue::Double(7.0));
         pv.set_read_hook(Arc::new(|| {
             Box::pin(async {
                 Ok(Snapshot::new(
@@ -1605,8 +1595,7 @@ mod read_hook_tests {
         // monitor post). Make it concrete and DIFFERENT from the upstream
         // GET so a graft-onto-shadow regression is observable.
         let shadow_time = UNIX_EPOCH + Duration::from_secs(1_000);
-        pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time))
-            .await;
+        pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time));
         // The fresh upstream GET reports a different value, alarm, and time.
         let upstream_time = WallTime::from_unix(2_000, 0);
         pv.set_read_hook(Arc::new(move || {

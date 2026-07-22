@@ -1213,7 +1213,7 @@ fn handle_client_blocking(
                                 let _ = ev_tx.send(EventTaskControl::Cancel(sub.sub_id));
                                 match &sub.target {
                                     ChannelTarget::SimplePv(pv) => {
-                                        let _ = block_on_sync(pv.remove_subscriber(sub.sub_id));
+                                        pv.remove_subscriber(sub.sub_id);
                                     }
                                     ChannelTarget::RecordField { record, .. } => {
                                         record.write().remove_subscriber(sub.sub_id);
@@ -1331,7 +1331,7 @@ fn handle_client_blocking(
     for (_, sub) in blk_subs.drain() {
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
-                let _ = block_on_sync(pv.remove_subscriber(sub.sub_id));
+                pv.remove_subscriber(sub.sub_id);
             }
             ChannelTarget::RecordField { record, .. } => {
                 record.write().remove_subscriber(sub.sub_id);
@@ -2976,7 +2976,7 @@ mod tests {
         // thread uses.
         match &r.target {
             ChannelTarget::SimplePv(pv) => {
-                block_on_sync(pv.set(EpicsValue::Double(update))).expect("blockable");
+                pv.set(EpicsValue::Double(update));
             }
             _ => panic!("REF:MON must be a simple PV"),
         }
@@ -3030,7 +3030,7 @@ mod tests {
 
         // db_post_events: the event thread delivers the update over the socket.
         let pv = simple_pv(&db, "BLK:MON");
-        block_on_sync(pv.set(EpicsValue::Double(99.0))).expect("blockable");
+        pv.set(EpicsValue::Double(99.0));
         let update = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
         assert_eq!(monitor_reply_value(&update), 99.0, "posted monitor update");
 
@@ -3083,7 +3083,7 @@ mod tests {
 
         // Post an update while flow control is on: it must be held, not sent.
         let pv = simple_pv(&db, "BLK:GATE");
-        block_on_sync(pv.set(EpicsValue::Double(2.0))).expect("blockable");
+        pv.set(EpicsValue::Double(2.0));
 
         // A second READ_NOTIFY barrier: the dispatch thread has now cycled past
         // the post. Under EVENTS_OFF the ONLY frame that may follow is this
@@ -3144,7 +3144,7 @@ mod tests {
             c.write_all(&event_add_double_frame(sid, 0x01)).unwrap();
             let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD); // initial
             let pv = simple_pv(&db, "BLK:LEAK");
-            block_on_sync(pv.set(EpicsValue::Double(8.0))).expect("blockable");
+            pv.set(EpicsValue::Double(8.0));
             let upd = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
             assert_eq!(monitor_reply_value(&upd), 8.0);
             // Drop `c`: the client thread's read loop exits; its teardown
@@ -3156,10 +3156,7 @@ mod tests {
         let pv = simple_pv(&db, "BLK:LEAK");
         let mut cleared = false;
         for _ in 0..200 {
-            if block_on_sync(pv.subscribers.lock())
-                .expect("blockable")
-                .is_empty()
-            {
+            if pv.subscribers.lock().is_empty() {
                 cleared = true;
                 break;
             }
@@ -3187,7 +3184,7 @@ mod tests {
             "second subscriber sees the current value"
         );
         let pv2 = simple_pv(&db, "BLK:LEAK");
-        block_on_sync(pv2.set(EpicsValue::Double(9.0))).expect("blockable");
+        pv2.set(EpicsValue::Double(9.0));
         let upd2 = read_until_cmmd(&mut c2, CA_PROTO_EVENT_ADD);
         assert_eq!(monitor_reply_value(&upd2), 9.0);
         drop(c2);

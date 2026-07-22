@@ -147,7 +147,7 @@ impl AutosaveManager {
                             loop {
                                 tokio::select! {
                                     _ = ticker.tick() => {
-                                        let current = db.get_pv(&trigger_pv).await.ok();
+                                        let current = db.get_pv(&trigger_pv).ok();
                                         let current_str = current.as_ref().map(|v| v.to_string());
 
                                         let should_save = match mode {
@@ -216,7 +216,7 @@ impl AutosaveManager {
                                     let mut changed = false;
 
                                     for pv in &pv_names {
-                                        if let Ok(val) = db.get_pv(pv).await {
+                                        if let Ok(val) = db.get_pv(pv) {
                                             let val_str = save_file::value_to_save_str(&val);
                                             if let Some(old_str) = last_snapshot.get(pv) {
                                                 if !values_equal_str(old_str, &val_str, float_epsilon) {
@@ -365,7 +365,7 @@ async fn update_status_pvs(
         .await;
 
     // Heartbeat
-    if let Ok(current) = db.get_pv(&format!("{prefix}SR_heartbeat")).await {
+    if let Ok(current) = db.get_pv(&format!("{prefix}SR_heartbeat")) {
         if let Some(v) = current.to_f64() {
             let _ = db
                 .put_pv_no_process(

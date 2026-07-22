@@ -86,7 +86,7 @@ async fn r15_64_numeric_target_still_receives_oval() {
     process(&db, "SC").await;
 
     assert_eq!(
-        db.get_pv("TGT").await.unwrap(),
+        db.get_pv("TGT").unwrap(),
         EpicsValue::Double(7.0),
         "a DBF_DOUBLE target still takes OVAL"
     );

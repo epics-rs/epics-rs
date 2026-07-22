@@ -332,7 +332,7 @@ async fn unresolved_destination_is_not_written_at_all() {
     );
     // The sequence still completes — the step is not stranded.
     assert_eq!(
-        db.get_pv("SSEQ_UN.BUSY").await.unwrap(),
+        db.get_pv("SSEQ_UN.BUSY").unwrap(),
         EpicsValue::Short(0),
         "the sequence finishes even though the step wrote nothing"
     );

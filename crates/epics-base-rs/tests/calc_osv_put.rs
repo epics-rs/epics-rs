@@ -32,19 +32,13 @@ async fn scalcout_osv_accepts_string_and_numeric_puts() {
     db.put_record_field_from_ca("S", "OSV", EpicsValue::String("hi".into()))
         .await
         .expect("caput OSV 'hi' must be accepted (DBF_STRING, not a menu)");
-    assert_eq!(
-        db.get_pv("S.OSV").await.unwrap(),
-        EpicsValue::String("hi".into())
-    );
+    assert_eq!(db.get_pv("S.OSV").unwrap(), EpicsValue::String("hi".into()));
 
     // The empty string — the exact oracle repro — must also stand.
     db.put_record_field_from_ca("S", "OSV", EpicsValue::String("".into()))
         .await
         .expect("caput OSV '' must be accepted");
-    assert_eq!(
-        db.get_pv("S.OSV").await.unwrap(),
-        EpicsValue::String("".into())
-    );
+    assert_eq!(db.get_pv("S.OSV").unwrap(), EpicsValue::String("".into()));
 
     // A numeric put converts to its string form (C `dbFastPutConvert`
     // DBR_DOUBLE→DBF_STRING), also accepted.
@@ -52,7 +46,7 @@ async fn scalcout_osv_accepts_string_and_numeric_puts() {
         .await
         .expect("caput OSV 1.5 must be accepted");
     assert_eq!(
-        db.get_pv("S.OSV").await.unwrap(),
+        db.get_pv("S.OSV").unwrap(),
         EpicsValue::String("1.5".into())
     );
 }

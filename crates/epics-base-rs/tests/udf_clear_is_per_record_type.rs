@@ -110,7 +110,7 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
         "DOL closed_loop defines the dfanout (softIoc: DF2)"
     );
     assert_eq!(
-        db.get_pv("DF2.VAL").await.unwrap().to_f64().unwrap(),
+        db.get_pv("DF2.VAL").unwrap().to_f64().unwrap(),
         7.0,
         "the DOL value lands in VAL"
     );

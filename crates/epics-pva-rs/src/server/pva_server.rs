@@ -181,7 +181,7 @@ impl PvaServer {
     }
 
     pub async fn get(&self, name: &str) -> CaResult<EpicsValue> {
-        self.db.get_pv(name).await
+        self.db.get_pv(name)
     }
 
     /// Run with the default [`PvDatabaseSource`].

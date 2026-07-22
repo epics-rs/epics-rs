@@ -78,7 +78,7 @@ async fn put_notify(db: &PvDatabase, pv: &str, field: &str, value: &str) -> bool
 }
 
 async fn readback(db: &PvDatabase, pv: &str, field: &str) -> String {
-    match db.get_pv(&format!("{pv}.{field}")).await.unwrap() {
+    match db.get_pv(&format!("{pv}.{field}")).unwrap() {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("{pv}.{field} is not a string: {other:?}"),
     }

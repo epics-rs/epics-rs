@@ -49,7 +49,7 @@ pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<Ve
             continue;
         }
 
-        let live = match db.get_pv(&entry.pv_name).await {
+        let live = match db.get_pv(&entry.pv_name) {
             Ok(val) => val,
             Err(_) => {
                 results.push(VerifyEntry {

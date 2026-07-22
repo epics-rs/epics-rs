@@ -59,7 +59,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         "ODLY>0 cycle sets DLYA and defers"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUT deferred on the ODLY delaying cycle"
     );
@@ -72,7 +72,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "PACT held: a foreign dbProcess during the ODLY delay must NOT fire the \
          deferred OUT early (C calcoutRecord.c:282 holds pact across the delay)"
@@ -84,7 +84,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the ODLY delay"
     );

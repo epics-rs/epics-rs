@@ -735,81 +735,76 @@ impl PvaLinkResolver {
     }
 
     /// Build the [`ExternalPvResolver`] closure that the database
-    /// expects. Pre-warm INP links via [`Self::open`] to keep the
-    /// steady-state path lock-free: the closure has a cache-hit fast path
-    /// (a pre-warmed monitor, no I/O) and only opens the link on the first
-    /// call for a given PV.
+    /// expects.
+    ///
+    /// Cache-only, like [`LinkSet::get_cached_value`] and for the same
+    /// reason: this closure runs on the record-processing thread with the
+    /// record's advisory gate held. C `dbCaGetLink` reads `pca->pgetNative`
+    /// under `pca->lock` and returns -1 while the link is down
+    /// (`dbCa.c:448-535`, `:459-464`); it never waits for the wire. A miss
+    /// therefore stages the open on the pvalink runtime — C `dbCaAddLink`'s
+    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`) — and reports `None`
+    /// for this cycle, so the reading record takes LINK/INVALID until the
+    /// monitor cache is warm.
     pub fn build_resolver(self) -> ExternalPvResolver {
         let resolver = self;
         Arc::new(move |name: &str| {
-            let resolver = resolver.clone();
-            let name = name.to_string();
-            Box::pin(async move {
-                let name = name.as_str();
-                if !resolver.is_enabled() {
-                    return None;
-                }
-                // Strip optional pva:// prefix — the resolver receives the
-                // bare PV name in some link forms but the prefixed form in
-                // others. `ca://` is handled by libca, not pvalink — reject.
-                let full = match name.strip_prefix("pva://") {
-                    Some(stripped) => stripped,
-                    None => {
-                        if name.starts_with("ca://") {
-                            return None;
-                        }
-                        name
+            if !resolver.is_enabled() {
+                return None;
+            }
+            // Strip optional pva:// prefix — the resolver receives the
+            // bare PV name in some link forms but the prefixed form in
+            // others. `ca://` is handled by libca, not pvalink — reject.
+            let full = match name.strip_prefix("pva://") {
+                Some(stripped) => stripped,
+                None => {
+                    if name.starts_with("ca://") {
+                        return None;
                     }
-                };
-                // strip query string; lazily register per-link
-                // options; get per-link config before the fast path so the
-                // field selector is available for `try_read_cached_with_field`.
-                let bare = link_pv_name(full);
-                if full != bare {
-                    lazy_register_inp_opts(&resolver.link_options, full);
+                    name
                 }
-                // cfg carries the per-link field (among other opts).
-                let cfg = resolver.inp_cfg_for(full);
+            };
+            // strip query string; lazily register per-link
+            // options; get per-link config before the fast path so the
+            // field selector is available for `try_read_cached_with_field`.
+            let bare = link_pv_name(full);
+            if full != bare {
+                lazy_register_inp_opts(&resolver.link_options, full);
+            }
+            // cfg carries the per-link field (among other opts).
+            let cfg = resolver.inp_cfg_for(full);
 
-                // Fast path: a previously-opened link with a cached
-                // monitor value. No `block_on`, no async runtime touch.
-                // `try_get_inp` resolves THIS caller's monitor variant
-                // (`pipeline` / `Q`), so a `Q=1` record reads from its own
-                // monitor, not a `Q=64` sibling sharing the PV name.
-                // `try_read_cached_with_field`
-                // then applies the per-link field selector.
-                if let Some(link) =
-                    resolver
-                        .registry
-                        .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
-                    && let Some(value) = link.try_read_cached_with_field(&cfg.field)
-                {
+            // Cache hit: a previously-opened link with a cached monitor
+            // value. `try_get_inp` resolves THIS caller's monitor variant
+            // (`pipeline` / `Q`), so a `Q=1` record reads from its own
+            // monitor, not a `Q=64` sibling sharing the PV name.
+            // `try_read_cached_with_field` then applies the per-link field
+            // selector.
+            if let Some(link) = resolver
+                .registry
+                .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
+            {
+                if let Some(value) = link.try_read_cached_with_field(&cfg.field) {
                     resolver
                         .reads
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return pvfield_to_epics_value(&value);
                 }
+                // Open but the first monitor event has not landed. C's
+                // `!pca->gotInNative` arm returns without a value
+                // (`dbCa.c:465-470`).
+                return None;
+            }
 
-                // Slow path: link not yet open or first-event not arrived.
-                // Open the link (idempotent) then read it.
-                // B4: use `inp_cfg_for` so a link registered via
-                // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
-                // `monorder`); `default_inp_cfg` would discard them.
-                let field = cfg.field.clone();
-                let (link, value) = async {
-                    let link = resolver.registry.get_or_open(cfg).await.ok()?;
-                    // use per-link field selector.
-                    let value = link.read_with_field(&field).await.ok()?;
-                    Some((link, value))
-                }
-                .await?;
-                let _ = link;
-                resolver
-                    .reads
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                pvfield_to_epics_value(&value)
-            })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<EpicsValue>> + Send>>
+            // Never opened. Stage the open off the record thread and refuse
+            // this cycle. B4: `inp_cfg_for` so a link registered via
+            // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
+            // `monorder`); `default_inp_cfg` would discard them.
+            let registry = resolver.registry.clone();
+            resolver.handle.spawn(async move {
+                let _ = registry.get_or_open(cfg).await;
+            });
+            None
         })
     }
 }
@@ -1098,9 +1093,7 @@ async fn scan_once(
         // and takes the gate normally.
         let mut visited = std::collections::HashSet::new();
         if *atomic {
-            let _ = db_handle
-                .process_record_with_links_already_locked(record, &mut visited, 0)
-                .await;
+            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited, 0);
         } else {
             let _ = db_handle
                 .process_record_with_links(record, &mut visited, 0)

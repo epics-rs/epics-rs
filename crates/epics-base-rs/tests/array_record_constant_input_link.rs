@@ -84,28 +84,22 @@ async fn constant_array_inp_is_loaded_at_init() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("CONST:AAI").await.unwrap(),
+        db.get_pv("CONST:AAI").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
         "aai: field(INP,\"[1,2,3]\") must be loaded at init"
     );
-    assert_eq!(
-        db.get_pv("CONST:AAI.NORD").await.unwrap().to_f64(),
-        Some(3.0)
-    );
+    assert_eq!(db.get_pv("CONST:AAI.NORD").unwrap().to_f64(), Some(3.0));
     assert!(
         db.get_record("CONST:AAI").unwrap().read().common.udf == 0,
         "a record loaded from a constant link is DEFINED"
     );
 
     assert_eq!(
-        db.get_pv("CONST:WF").await.unwrap(),
+        db.get_pv("CONST:WF").unwrap(),
         EpicsValue::DoubleArray(vec![4.0, 5.0]),
         "waveform: field(INP,\"[4,5]\") must be loaded at init"
     );
-    assert_eq!(
-        db.get_pv("CONST:WF.NORD").await.unwrap().to_f64(),
-        Some(2.0)
-    );
+    assert_eq!(db.get_pv("CONST:WF.NORD").unwrap().to_f64(), Some(2.0));
 }
 
 /// Process must not re-apply the constant over data a client put into VAL.
@@ -119,13 +113,13 @@ async fn constant_inp_is_not_re_applied_at_process() {
             .unwrap();
         process(&db, rec).await;
         assert_eq!(
-            db.get_pv(rec).await.unwrap(),
+            db.get_pv(rec).unwrap(),
             EpicsValue::DoubleArray(vec![9.0, 8.0, 7.0, 6.0]),
             "{rec}: a constant INP must deliver NOTHING at process (C read_aai/read_wf: \
              `if (dbLinkIsConstant(pinp)) return 0;`)"
         );
         assert_eq!(
-            db.get_pv(&format!("{rec}.NORD")).await.unwrap().to_f64(),
+            db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64(),
             Some(4.0)
         );
     }
@@ -144,7 +138,7 @@ async fn unset_inp_does_not_wipe_client_data() {
             .unwrap();
         process(&db, rec).await;
         assert_eq!(
-            db.get_pv(rec).await.unwrap(),
+            db.get_pv(rec).unwrap(),
             EpicsValue::DoubleArray(vec![1.5, 2.5]),
             "{rec}: an unset INP is a constant link — process must not touch VAL"
         );
@@ -161,7 +155,7 @@ async fn real_db_inp_still_reads_every_cycle() {
         .unwrap();
     process(&db, "LINKED:WF").await;
     assert_eq!(
-        db.get_pv("LINKED:WF").await.unwrap(),
+        db.get_pv("LINKED:WF").unwrap(),
         EpicsValue::DoubleArray(vec![10.0, 20.0])
     );
 
@@ -174,7 +168,7 @@ async fn real_db_inp_still_reads_every_cycle() {
         .unwrap();
     process(&db, "LINKED:WF").await;
     assert_eq!(
-        db.get_pv("LINKED:WF").await.unwrap(),
+        db.get_pv("LINKED:WF").unwrap(),
         EpicsValue::DoubleArray(vec![30.0, 40.0, 50.0])
     );
 }

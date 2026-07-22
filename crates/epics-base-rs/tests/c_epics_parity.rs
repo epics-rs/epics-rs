@@ -629,7 +629,7 @@ async fn soft_input_reads_from_db_link() {
     db.put_pv("source", EpicsValue::Long(42)).await.unwrap();
 
     // Verify source
-    let val = db.get_pv("source").await.unwrap();
+    let val = db.get_pv("source").unwrap();
     assert_eq!(val, EpicsValue::Long(42));
 }
 
@@ -660,12 +660,12 @@ async fn soft_output_writes_to_db() {
 
     // Direct put simulates output record writing
     db.put_pv("dest", EpicsValue::Double(42.5)).await.unwrap();
-    let val = db.get_pv("dest").await.unwrap();
+    let val = db.get_pv("dest").unwrap();
     assert_eq!(val, EpicsValue::Double(42.5));
 
     // Write again
     db.put_pv("dest", EpicsValue::Double(0.0)).await.unwrap();
-    let val = db.get_pv("dest").await.unwrap();
+    let val = db.get_pv("dest").unwrap();
     assert_eq!(val, EpicsValue::Double(0.0));
 }
 
@@ -1308,15 +1308,15 @@ async fn database_multiple_records() {
         .await
         .unwrap();
 
-    assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(1.0));
-    assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
-    assert_eq!(db.get_pv("bo1").await.unwrap(), EpicsValue::Enum(0));
-    assert_eq!(db.get_pv("lo1").await.unwrap(), EpicsValue::Long(100));
+    assert_eq!(db.get_pv("ai1").unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(db.get_pv("ai2").unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("bo1").unwrap(), EpicsValue::Enum(0));
+    assert_eq!(db.get_pv("lo1").unwrap(), EpicsValue::Long(100));
 
     // Modify one, others unchanged
     db.put_pv("ai1", EpicsValue::Double(99.0)).await.unwrap();
-    assert_eq!(db.get_pv("ai1").await.unwrap(), EpicsValue::Double(99.0));
-    assert_eq!(db.get_pv("ai2").await.unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("ai1").unwrap(), EpicsValue::Double(99.0));
+    assert_eq!(db.get_pv("ai2").unwrap(), EpicsValue::Double(2.0));
 }
 
 /// C EPICS: record not found returns error
@@ -1326,7 +1326,7 @@ async fn database_record_not_found() {
     use std::sync::Arc;
 
     let db = Arc::new(PvDatabase::new());
-    let result = db.get_pv("nonexistent").await;
+    let result = db.get_pv("nonexistent");
     assert!(result.is_err(), "Getting nonexistent PV should fail");
 }
 
@@ -1770,20 +1770,17 @@ async fn database_init_cleanup_cycle() {
         db.add_record("cycle1", Box::new(AoRecord::new(1.0)))
             .await
             .unwrap();
-        assert_eq!(db.get_pv("cycle1").await.unwrap(), EpicsValue::Double(1.0));
+        assert_eq!(db.get_pv("cycle1").unwrap(), EpicsValue::Double(1.0));
     }
 
     // Cycle 2: fresh database, old records gone
     {
         let db = Arc::new(PvDatabase::new());
-        assert!(
-            db.get_pv("cycle1").await.is_err(),
-            "Old record should not exist"
-        );
+        assert!(db.get_pv("cycle1").is_err(), "Old record should not exist");
         db.add_record("cycle2", Box::new(AoRecord::new(2.0)))
             .await
             .unwrap();
-        assert_eq!(db.get_pv("cycle2").await.unwrap(), EpicsValue::Double(2.0));
+        assert_eq!(db.get_pv("cycle2").unwrap(), EpicsValue::Double(2.0));
     }
 }
 
@@ -1835,7 +1832,7 @@ async fn flnk_chain_processes_target() {
     db.put_pv("src", EpicsValue::Double(42.0)).await.unwrap();
 
     // src should have value 42
-    assert_eq!(db.get_pv("src").await.unwrap(), EpicsValue::Double(42.0));
+    assert_eq!(db.get_pv("src").unwrap(), EpicsValue::Double(42.0));
 }
 
 /// C EPICS: Chain 3 — Loop breaking via visited set
@@ -1929,7 +1926,7 @@ async fn rapid_puts_to_same_record() {
             .unwrap();
     }
 
-    let val = db.get_pv("rapid").await.unwrap();
+    let val = db.get_pv("rapid").unwrap();
     assert_eq!(
         val,
         EpicsValue::Double(9.0),
@@ -2019,11 +2016,11 @@ async fn independent_records_no_interference() {
 
     // Process A shouldn't affect B
     db.process_record("iso_a").await.unwrap();
-    assert_eq!(db.get_pv("iso_b").await.unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("iso_b").unwrap(), EpicsValue::Double(2.0));
 
     // Modify A shouldn't affect B
     db.put_pv("iso_a", EpicsValue::Double(99.0)).await.unwrap();
-    assert_eq!(db.get_pv("iso_b").await.unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("iso_b").unwrap(), EpicsValue::Double(2.0));
 }
 
 /// Run a deep FLNK-processing chain test on a thread with a large stack.

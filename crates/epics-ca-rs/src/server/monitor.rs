@@ -357,7 +357,6 @@ mod tests {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
@@ -377,7 +376,7 @@ mod tests {
             );
 
             for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
-                pv.set(EpicsValue::Double(v)).await;
+                pv.set(EpicsValue::Double(v));
                 wait_for(&stats.subscription_events_processed, i as u64 + 1).await;
             }
 
@@ -404,7 +403,6 @@ mod tests {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
@@ -423,7 +421,7 @@ mod tests {
                 },
             );
 
-            pv.set(EpicsValue::Double(1.0)).await;
+            pv.set(EpicsValue::Double(1.0));
             wait_for(&stats.subscription_events_posted, 1).await;
             // Give the task ample opportunity to (wrongly) process it.
             for _ in 0..16 {

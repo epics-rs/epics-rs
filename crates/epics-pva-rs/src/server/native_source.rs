@@ -732,7 +732,7 @@ impl ChannelSource for PvDatabaseSource {
                     let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
                         OpError::failed("PUT value not representable as EpicsValue")
                     })?;
-                    pv.set_snapshot(snap).await;
+                    pv.set_snapshot(snap);
                     Ok(())
                 }
                 // A record-backed channel is an EXTERNAL client put, so it
@@ -3157,7 +3157,7 @@ ASG(DEFAULT) {
         let ctx = make_ctx("localhost", "op", "ca");
 
         assert_eq!(
-            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            db.get_pv("CALC:PUT.UDF").expect("UDF get"),
             EpicsValue::UChar(1),
             "a record that has never processed is UDF"
         );
@@ -3175,13 +3175,13 @@ ASG(DEFAULT) {
             .expect("PUT must succeed");
 
         assert_eq!(
-            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            db.get_pv("CALC:PUT.UDF").expect("UDF get"),
             EpicsValue::UChar(0),
             "an external PUT owes dbPutField, which processes a PASSIVE record \
              and clears UDF — `put_pv` (dbPut) would leave it set"
         );
         assert_eq!(
-            db.get_pv("CALC:PUT.VAL").await.expect("VAL get"),
+            db.get_pv("CALC:PUT.VAL").expect("VAL get"),
             EpicsValue::Double(3.0),
             "processing must evaluate CALC=\"A\" into VAL"
         );

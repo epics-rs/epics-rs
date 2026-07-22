@@ -166,7 +166,7 @@ async fn siml_and_siol_inherit_ms() {
         "SIOL=\"SRC MS\" in simulation: softIoc gives MAJOR/LINK"
     );
     // The simulated read still landed.
-    let v = db.get_pv("R2.VAL").await.unwrap().to_f64().unwrap();
+    let v = db.get_pv("R2.VAL").unwrap().to_f64().unwrap();
     assert_eq!(v, 5.0, "the SIOL value reaches VAL through SVAL");
 }
 

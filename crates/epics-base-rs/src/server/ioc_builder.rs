@@ -229,7 +229,7 @@ impl IocBuilder {
                 }
                 // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
                 // &sval)`, run from every SIML-bearing `init_record` (pass 1).
-                db.rec_gbl_init_simm(&rec_arc).await;
+                db.rec_gbl_init_simm(&rec_arc);
                 // C `wdogInit(prec)` from `init_record` pass 1
                 // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
                 // No-op for every record type without one.
@@ -317,7 +317,7 @@ impl IocBuilder {
                 // &sval)`, run from every SIML-bearing `init_record` (pass 1).
                 // The lock is released and retaken by the owner, which is the
                 // only site allowed to load a constant SIML/SIOL.
-                db.rec_gbl_init_simm(&rec_arc).await;
+                db.rec_gbl_init_simm(&rec_arc);
                 // C `wdogInit(prec)` from `init_record` pass 1
                 // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
                 db.arm_watchdog(&def.name);

@@ -1009,7 +1009,7 @@ impl SseqRecord {
 /// invoke it only where that is intended (phase `Wait`, where nothing is
 /// pending, or right after `cancel_async_reentry`).
 async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
-    if let Some(token) = handle.mint_async_token(name).await {
+    if let Some(token) = handle.mint_async_token(name) {
         let (waitset, completion) = AsyncDbHandle::new_put_notify();
         waitset.leave();
         handle.reprocess_on_notify(token, completion);

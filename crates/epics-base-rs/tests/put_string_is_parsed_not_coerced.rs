@@ -77,7 +77,7 @@ async fn caput(db: &PvDatabase, rec: &str, field: &str, text: &str) -> Result<()
 }
 
 async fn read(db: &PvDatabase, pv: &str) -> EpicsValue {
-    db.get_pv(pv).await.unwrap()
+    db.get_pv(pv).unwrap()
 }
 
 /// A refused put must leave the field EXACTLY as it was. Accepting the put and

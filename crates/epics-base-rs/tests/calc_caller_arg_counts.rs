@@ -362,16 +362,16 @@ record(swait, "W:L") {
 
     process("W:M").await;
     assert_eq!(
-        db.get_pv("W:M").await.unwrap().to_f64().unwrap(),
+        db.get_pv("W:M").unwrap().to_f64().unwrap(),
         0.0,
         "M is not one of swait's twelve args: the store is dropped and the fetch is 0"
     );
 
     process("W:L").await;
     assert_eq!(
-        db.get_pv("W:L").await.unwrap().to_f64().unwrap(),
+        db.get_pv("W:L").unwrap().to_f64().unwrap(),
         5.0,
         "L is the last one that exists"
     );
-    assert_eq!(db.get_pv("W:L.L").await.unwrap().to_f64().unwrap(), 5.0);
+    assert_eq!(db.get_pv("W:L.L").unwrap().to_f64().unwrap(), 5.0);
 }

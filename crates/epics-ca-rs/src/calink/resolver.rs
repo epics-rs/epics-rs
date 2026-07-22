@@ -518,7 +518,7 @@ async fn run_monitor(
                 // held across the process call.
                 let db_handle = db.read().clone();
                 if let Some(db_handle) = db_handle {
-                    db_handle.dispatch_external_cp_targets(&pv_name).await;
+                    db_handle.dispatch_external_cp_targets(&pv_name);
                 }
             }
             // A monitor error event (e.g. a transient server-side

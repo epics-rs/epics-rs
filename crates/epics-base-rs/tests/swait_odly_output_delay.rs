@@ -111,7 +111,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     // Give any erroneous spawned OEVT post time to land before asserting none.
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert_eq!(
-        db.get_pv("W_TGT").await.unwrap().to_f64(),
+        db.get_pv("W_TGT").unwrap().to_f64(),
         Some(0.0),
         "ODLY>0 delaying cycle must NOT write OUT (deferred to the watchdog)"
     );
@@ -135,7 +135,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W_TGT").await.unwrap().to_f64(),
+        db.get_pv("W_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation must drive OUT to OVAL=42 after the ODLY delay"
     );
@@ -183,7 +183,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(0.0),
         "output deferred on the delaying cycle"
     );
@@ -196,7 +196,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(0.0),
         "PACT held: a foreign dbProcess during the ODLY delay must NOT fire the \
          deferred OUT early (it bails at the entry guard, as C does)"
@@ -220,7 +220,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the delay"
     );
@@ -291,7 +291,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     );
     // The OUTPUT is still deferred: target keeps its seed on the delaying cycle.
     assert_eq!(
-        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        db.get_pv("W4_TGT").unwrap().to_f64(),
         Some(0.0),
         "the OUT write stays deferred even though VAL posted at delay-start"
     );
@@ -304,7 +304,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        db.get_pv("W4_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the delay"
     );
@@ -418,7 +418,7 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W2_TGT").await.unwrap().to_f64(),
+        db.get_pv("W2_TGT").unwrap().to_f64(),
         Some(7.0),
         "ODLY=0: OUT written to OVAL=7 on the same cycle"
     );

@@ -373,7 +373,7 @@ async fn group_put_unputable_marked_member_warns_over_the_wire() {
 
     // The diagnostic reports the drop; it does not undo it. The
     // no-putorder member is still never written.
-    let b = db.get_pv("RLOG:b.VAL").await.expect("read b");
+    let b = db.get_pv("RLOG:b.VAL").expect("read b");
     assert!(
         matches!(b, EpicsValue::Double(v) if v == 2.0),
         "the no-putorder member must keep its pre-PUT value, got {b:?}"

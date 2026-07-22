@@ -93,7 +93,6 @@ async fn async_token_fire_drives_process_reentry() {
 
     let token = db
         .mint_async_token("T1")
-        .await
         .expect("record exists, mint must succeed");
     assert!(token.is_current(), "freshly-minted token is current");
 
@@ -113,7 +112,7 @@ async fn async_token_fire_drives_process_reentry() {
 async fn async_token_stale_after_cancel_is_noop() {
     let (db, count) = db_with_record("T2").await;
 
-    let token = db.mint_async_token("T2").await.unwrap();
+    let token = db.mint_async_token("T2").unwrap();
     let baseline = count.load(Ordering::Relaxed);
 
     // Cancel (C `callbackCancelDelayed`): advance the generation so the
@@ -132,7 +131,7 @@ async fn async_token_stale_after_cancel_is_noop() {
     );
 
     // A fresh mint after cancel is current again and does re-enter.
-    let token2 = db.mint_async_token("T2").await.unwrap();
+    let token2 = db.mint_async_token("T2").unwrap();
     assert!(token2.is_current());
     token2.fire(&db).await.unwrap();
     assert_eq!(
@@ -149,8 +148,8 @@ async fn async_token_stale_after_cancel_is_noop() {
 async fn newer_mint_supersedes_prior_token() {
     let (db, count) = db_with_record("T2B").await;
 
-    let older = db.mint_async_token("T2B").await.unwrap();
-    let newer = db.mint_async_token("T2B").await.unwrap();
+    let older = db.mint_async_token("T2B").unwrap();
+    let newer = db.mint_async_token("T2B").unwrap();
     assert!(!older.is_current(), "older token superseded by newer mint");
     assert!(newer.is_current(), "newer token is current");
 
@@ -245,7 +244,7 @@ async fn reprocess_on_notify_reenters_waiter_on_completion() {
     let (db, count) = db_with_record("T4").await;
     let baseline = count.load(Ordering::Relaxed);
 
-    let token = db.mint_async_token("T4").await.unwrap();
+    let token = db.mint_async_token("T4").unwrap();
     let (notify, rx) = PvDatabase::new_put_notify();
 
     // The waiting record arms the bridge: complete downstream -> re-enter.
@@ -270,7 +269,7 @@ async fn reprocess_on_notify_with_cancelled_token_is_noop() {
     let (db, count) = db_with_record("T5").await;
     let baseline = count.load(Ordering::Relaxed);
 
-    let token = db.mint_async_token("T5").await.unwrap();
+    let token = db.mint_async_token("T5").unwrap();
     let (notify, rx) = PvDatabase::new_put_notify();
     let handle = db.reprocess_on_notify(token, rx);
 
@@ -648,7 +647,7 @@ async fn cancel_reprocess_action_supersedes_outstanding_token() {
 
     // An outstanding re-entry token, as a pending DLYn delay / WAITn wait
     // would hold.
-    let token = db.mint_async_token("CR").await.unwrap();
+    let token = db.mint_async_token("CR").unwrap();
     assert!(token.is_current(), "freshly-minted token is current");
 
     // Drive a process() that emits CancelReprocess.

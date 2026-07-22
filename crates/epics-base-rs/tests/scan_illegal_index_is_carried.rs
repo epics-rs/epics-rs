@@ -57,7 +57,7 @@ async fn db_with_scanned_ai() -> PvDatabase {
 }
 
 async fn scan_index(db: &PvDatabase) -> u16 {
-    match db.get_pv("REC.SCAN").await.unwrap() {
+    match db.get_pv("REC.SCAN").unwrap() {
         EpicsValue::Enum(v) => v,
         other => panic!("SCAN is a DBF_MENU: {other:?}"),
     }
@@ -154,7 +154,7 @@ async fn sscn_carries_an_illegal_index_and_only_65535_is_the_sentinel() {
     db.put_record_field_from_ca("REC", "SSCN", EpicsValue::Enum(10))
         .await
         .unwrap();
-    let EpicsValue::Enum(v) = db.get_pv("REC.SSCN").await.unwrap() else {
+    let EpicsValue::Enum(v) = db.get_pv("REC.SSCN").unwrap() else {
         panic!("SSCN is a DBF_MENU")
     };
     assert_eq!(v, 10);

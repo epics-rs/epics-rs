@@ -99,7 +99,7 @@ async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
          (transformRecord.c:554-560)"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUTB must NOT be written: C returns before the output loop \
          (transformRecord.c:608-619)"
@@ -134,7 +134,7 @@ async fn r9_61_ivla_ignore_error_still_calcs_and_drives_outputs() {
         "IVLA=Ignore error: CLCB = A+100 = 300 runs despite the INVALID input"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(300.0),
         "IVLA=Ignore error: OUTB drives the target"
     );

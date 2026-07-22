@@ -77,7 +77,7 @@ async fn r15_63_siol_pp_processes_the_passive_target() {
     process(&db, "AO_SIM").await;
 
     assert_eq!(
-        db.get_pv("SIOL_TGT").await.unwrap(),
+        db.get_pv("SIOL_TGT").unwrap(),
         EpicsValue::Double(42.0),
         "the simulated output still reaches the SIOL target"
     );

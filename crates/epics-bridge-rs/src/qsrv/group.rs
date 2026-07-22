@@ -831,14 +831,23 @@ impl GroupChannel {
         // groupsource.cpp:444-459 DBManyLocker pattern).
         //
         // CRITICAL: an atomic group MUST NOT re-lock a member record
-        // inside `read_member` — `lock_group_records_read` already
-        // holds an `OwnedRwLockReadGuard` on every member record, and
-        // `tokio::sync::RwLock` is write-preferring. A plain CA/PVA
-        // writer queued between the first guard and a second `.read()`
-        // would make that `.read().await` block behind the writer,
-        // which itself blocks behind the still-held first guard — a
-        // recursive-read deadlock. So the atomic path resolves every
-        // member against the pre-acquired guards and never re-locks.
+        // inside `read_member` — `lock_group_records_read` (`:608-633`)
+        // only resolves each member to a bare
+        // `Arc<parking_lot::RwLock<RecordInstance>>`; no guard is held
+        // yet at that point. The real `parking_lot::RwLockReadGuard`s
+        // are taken synchronously, all at once, in the loop below
+        // (`:886`) into `guard_map`, with the advisory `_many_guard`
+        // gate already held to keep writers out for that window.
+        // parking_lot's `RwLock` is task-fair: a reader blocks if a
+        // writer is already waiting, even though the lock is logically
+        // free for reads, so recursively acquiring a read lock on a
+        // record already in `guard_map` can deadlock — a writer
+        // queued after that guard was taken would make a second
+        // `.read()` on the same record block behind the writer, which
+        // itself blocks behind the still-held first guard. So the
+        // atomic path resolves every member through
+        // `read_member_locked` against `guard_map` and never calls
+        // `.read()`/`.write()` on a member record a second time.
         if atomic {
             // Resolve every member's backing record handle BEFORE the gate is
             // taken. `lock_group_records_read` takes no per-record lock and

@@ -90,7 +90,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         "ODLY>0 cycle sets DLYA and defers"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUT must not be written on the ODLY delaying cycle"
     );
@@ -110,7 +110,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
          pact cycle"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "IVOA=Don't_drive must suppress the OUT write on the ODLY delayed \
          cycle for a non-persistent (MS-link) INVALID source too \

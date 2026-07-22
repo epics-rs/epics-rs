@@ -50,7 +50,7 @@ async fn link_status_reads_derived_constant_after_load() {
     ];
     for (rec, fields) in cases {
         for f in *fields {
-            let got = db.get_pv(&format!("{rec}.{f}")).await.unwrap();
+            let got = db.get_pv(&format!("{rec}.{f}")).unwrap();
             assert_eq!(
                 got.to_f64(),
                 Some(3.0),
@@ -73,7 +73,7 @@ async fn link_status_put_is_refused_and_value_stands() {
             err.is_err(),
             "{rec}.{f} is SPC_NOMOD — a client put must be refused, got {err:?}"
         );
-        let got = db.get_pv(&format!("{rec}.{f}")).await.unwrap();
+        let got = db.get_pv(&format!("{rec}.{f}")).unwrap();
         assert_eq!(
             got.to_f64(),
             Some(3.0),

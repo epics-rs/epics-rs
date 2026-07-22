@@ -1,7 +1,5 @@
 // RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
 
-use std::future::Future;
-
 pub mod db_access;
 mod field_io;
 pub mod filters;
@@ -114,20 +112,15 @@ pub enum PvEntry {
 }
 
 /// Callback for resolving external PV names (CA/PVA links).
-/// Returns the current value of the external PV, or None if unavailable.
+/// Returns the *cached* value of the external PV, or `None` if unavailable.
 ///
-/// **Async**, for the same reason [`LinkSet`] is: an external link's value
-/// lives on a tokio runtime, and a sync closure could only reach it through a
-/// blocking bridge that panics on a current-thread runtime. The one caller
-/// (`PvDatabase::resolve_external_pv`) is already async.
-pub type ExternalPvResolver = Arc<
-    dyn for<'a> Fn(
-            &'a str,
-        )
-            -> std::pin::Pin<Box<dyn Future<Output = Option<EpicsValue>> + Send + 'a>>
-        + Send
-        + Sync,
->;
+/// **Sync**, for the same reason [`LinkSet::get_cached_value`] is: this runs
+/// on the record-processing thread with the record's L1 gate held, and C's
+/// `dbCaGetLink` likewise only reads `pca->pgetNative` under `pca->lock` —
+/// it never waits for the wire (`dbCa.c:448-535`). A resolver that cannot
+/// answer from cache must stage the open on its own executor and return
+/// `None` (C's `!pca->isConnected` arm, `dbCa.c:459-464`).
+pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sync>;
 
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
@@ -827,7 +820,7 @@ impl PvDatabase {
     /// to re-resolve an aSub's subroutine when SNAM changes (C `fetch_values`
     /// `registryFunctionFind`). `None` when the name is not registered, which
     /// the caller treats as C's `S_db_BadSub` (skip running the subroutine).
-    pub(crate) async fn find_subroutine_named(
+    pub(crate) fn find_subroutine_named(
         &self,
         name: &str,
     ) -> Option<Arc<crate::server::record::SubroutineFn>> {
@@ -1007,7 +1000,7 @@ impl PvDatabase {
         loop {
             let mut connected = 0usize;
             for (lset, name) in &targets {
-                if lset.is_connected(name).await {
+                if lset.is_connected(name) {
                     connected += 1;
                 }
             }
@@ -1048,8 +1041,8 @@ impl PvDatabase {
             return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for n in ca_lset.link_names().await {
-            if self.has_name_no_resolve(&n).await {
+        for n in ca_lset.link_names() {
+            if self.has_name_no_resolve(&n) {
                 targets.push((ca_lset.clone(), n));
             }
         }
@@ -1066,7 +1059,7 @@ impl PvDatabase {
     pub async fn unconnected_external_links(&self) -> Vec<String> {
         let mut names = Vec::new();
         for (lset, name) in self.external_link_targets().await {
-            if !lset.is_connected(&name).await {
+            if !lset.is_connected(&name) {
                 names.push(name);
             }
         }
@@ -1164,14 +1157,14 @@ impl PvDatabase {
     /// `None` for this cycle. C's open happens at record init rather than at
     /// first read, but in both designs the connect runs on the link task and
     /// the reading record takes LINK/INVALID until the cache is warm.
-    pub(crate) async fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
+    pub(crate) fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
         // dispatch in record/link.rs). `Any` tries every registered
         // lset in turn; the first one with a cached value wins.
         let (target, body) = Self::split_external_link_name(name);
         for lset in link_put_queue::resolve_lsets(&self.inner, &target) {
-            if let Some(v) = lset.get_cached_value(body).await {
+            if let Some(v) = lset.get_cached_value(body) {
                 return Some(v);
             }
         }
@@ -1184,7 +1177,7 @@ impl PvDatabase {
             .load_full()
             .map(|r| (*r).clone());
         match resolver {
-            Some(r) => r(name).await,
+            Some(r) => r(name),
             None => None,
         }
     }
@@ -1817,7 +1810,7 @@ impl PvDatabase {
     }
 
     /// Internal: synchronous existence check without resolver.
-    async fn has_name_no_resolve(&self, name: &str) -> bool {
+    fn has_name_no_resolve(&self, name: &str) -> bool {
         // strip the channel-filter suffix before lookup so a
         // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
         // resolves to its underlying PV at UDP-search time. This is the
@@ -1901,7 +1894,7 @@ impl PvDatabase {
     /// responder passes the datagram source address so the gateway can
     /// apply host-scoped `.pvlist` admission.
     pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
-        if self.has_name_no_resolve(name).await {
+        if self.has_name_no_resolve(name) {
             // Same per-request gate as `find_entry_from`: a cached simple
             // PV the gateway's host/state admission denies must answer
             // does-not-exist at search time. Records/aliases bypass.
@@ -1913,7 +1906,7 @@ impl PvDatabase {
         let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
         if let Some(r) = resolver {
             if r(name.to_string(), peer).await {
-                return self.has_name_no_resolve(name).await;
+                return self.has_name_no_resolve(name);
             }
         }
         false
@@ -2216,13 +2209,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             tokio::time::Instant::now() >= self.connect_at
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        async fn link_names(&self) -> Vec<String> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn link_names(&self) -> Vec<String> {
             self.names.clone()
         }
     }
@@ -2496,12 +2492,12 @@ mod tests {
         db.register_cp_link("SRC_ALIAS", "DST_ALIAS", false).await;
 
         // Lookup must succeed via the canonical source name.
-        let targets = db.get_cp_targets("SRC_REAL").await;
+        let targets = db.get_cp_targets("SRC_REAL");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].record, "DST_REAL");
         assert!(!targets[0].passive_only);
         // Alias-keyed lookup must NOT have been registered.
-        let alias_lookup = db.get_cp_targets("SRC_ALIAS").await;
+        let alias_lookup = db.get_cp_targets("SRC_ALIAS");
         assert!(alias_lookup.is_empty());
     }
 

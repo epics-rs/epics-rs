@@ -341,7 +341,7 @@ fn push_once(published: &[Published]) -> bool {
         published.iter().map(|(read, pv)| (read(), pv)).collect();
     block_on_sync(async {
         for (value, pv) in samples {
-            pv.set(value).await;
+            pv.set(value);
         }
     })
     .is_ok()
@@ -383,8 +383,8 @@ mod tests {
             .expect("plain thread")
             .expect("the PV was registered");
         const DBE_VALUE: u16 = 1;
-        let mut rx = block_on_sync(pv.add_subscriber(1, DbFieldType::Double, DBE_VALUE))
-            .expect("plain thread")
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
             .expect("subscriber added");
 
         source.store(42, Ordering::Relaxed);

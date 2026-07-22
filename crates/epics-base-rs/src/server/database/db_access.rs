@@ -86,7 +86,6 @@ impl DbChannel {
     pub async fn get_f64(&self) -> f64 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0)
@@ -95,7 +94,6 @@ impl DbChannel {
     pub async fn get_i16(&self) -> i16 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| v.to_f64())
             .map(|f| f as i16)
@@ -103,7 +101,7 @@ impl DbChannel {
     }
 
     pub async fn get_string(&self) -> String {
-        match self.db.get_pv(&self.name).await {
+        match self.db.get_pv(&self.name) {
             Ok(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             Ok(v) => v.to_string(),
             Err(_) => String::new(),
@@ -199,7 +197,6 @@ impl DbChannel {
     pub async fn get_i32(&self) -> i32 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),

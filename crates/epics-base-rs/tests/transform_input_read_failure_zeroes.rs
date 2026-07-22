@@ -65,7 +65,7 @@ async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     }
 
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUTA drives the zeroed channel: C outputs 0 for a dead INPx source"
     );

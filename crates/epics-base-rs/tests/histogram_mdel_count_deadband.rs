@@ -68,11 +68,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn mcnt(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.MCNT"))
-        .await
-        .unwrap()
-        .to_f64()
-        .unwrap()
+    db.get_pv(&format!("{rec}.MCNT")).unwrap().to_f64().unwrap()
 }
 
 /// The softIoc transcript, value for value: MCNT counts up to MDEL+1, the post

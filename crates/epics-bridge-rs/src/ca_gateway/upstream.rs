@@ -1056,13 +1056,11 @@ impl UpstreamManager {
                 // correct EPICS status for a link-disconnect alarm;
                 // upstream disconnect is visible to downstream monitors
                 // both via severity and via the correct status code.
-                let _ = db_clone
-                    .post_alarm(
-                        &name,
-                        3,
-                        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                    )
-                    .await;
+                let _ = db_clone.post_alarm(
+                    &name,
+                    3,
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                );
 
                 // Back off, then loop: the top of the loop re-subscribes
                 // (the single subscribe site). Bail out if the cache
@@ -2683,7 +2681,7 @@ ASG(NewGroup) {
         let pv = db.find_pv(name).await.expect("shadow PV registered");
         // Make the stored shadow value a sentinel the fresh fetch must
         // override — proving the GET goes upstream, not to the cache.
-        pv.set(EpicsValue::Double(SENTINEL)).await;
+        pv.set(EpicsValue::Double(SENTINEL));
 
         let read = pv.read_snapshot().await.expect("no-cache GET forwards");
         assert_eq!(
@@ -2729,7 +2727,7 @@ ASG(NewGroup) {
             .expect("ensure_subscribed connects to the hosted upstream");
 
         let pv = db.find_pv(name).await.expect("shadow PV registered");
-        pv.set(EpicsValue::Double(SENTINEL)).await;
+        pv.set(EpicsValue::Double(SENTINEL));
 
         let read = pv.read_snapshot().await.expect("cached GET never errors");
         assert_eq!(

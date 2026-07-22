@@ -3321,7 +3321,7 @@ impl AsynRecord {
             // force_finish_reentry / WAITn completion. A token whose record
             // was meanwhile removed (mint `None`) or superseded by an AQR
             // cancel re-enters nothing, by the generation gate.
-            if let Some(token) = db.mint_async_token(&name).await {
+            if let Some(token) = db.mint_async_token(&name) {
                 let (waitset, completion) = AsyncDbHandle::new_put_notify();
                 waitset.leave();
                 let _ = db.reprocess_on_notify(token, completion);

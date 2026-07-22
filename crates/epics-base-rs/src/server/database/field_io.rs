@@ -470,22 +470,17 @@ impl PvDatabase {
     /// [`crate::runtime::task::block_on_sync`] for which mechanism is used
     /// where.
     ///
-    /// Returns an error on a **current-thread** runtime, where blocking cannot
-    /// be made sound: parking that runtime's only thread halts the task holding
-    /// the database lock this call awaits. Such callers must `await`
-    /// [`Self::get_pv`] instead.
+    /// Kept as a distinct entry point for source compatibility with the
+    /// callers that predate [`Self::get_pv`] becoming a `fn`; there is no
+    /// blocking left to do, so there is no current-thread-runtime failure mode
+    /// either. C `dbGetField` is likewise a plain call from any thread.
     pub fn get_pv_blocking(&self, name: &str) -> CaResult<EpicsValue> {
-        crate::runtime::task::block_on_sync(self.get_pv(name)).unwrap_or_else(|_| {
-            Err(CaError::InvalidValue(
-                "get_pv_blocking cannot block a current-thread runtime; await get_pv() instead"
-                    .into(),
-            ))
-        })
+        self.get_pv(name)
     }
 
     /// Get the current value of a PV or record field.
     /// Uses resolve_field for records (3-level priority).
-    pub async fn get_pv(&self, name: &str) -> CaResult<EpicsValue> {
+    pub fn get_pv(&self, name: &str) -> CaResult<EpicsValue> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -511,14 +506,37 @@ impl PvDatabase {
     ///
     /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_pv_inner(name, value, true).await
+        let _record_gate = self.acquire_put_gate(name).await;
+        self.put_pv_already_locked(name, value)
     }
 
     /// `put_pv` variant for a caller already holding the
     /// record's advisory write gate (QSRV atomic group PUT). See
     /// [`Self::put_record_field_from_ca_already_locked`].
-    pub async fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_pv_inner(name, value, false).await
+    ///
+    /// This is the whole `dbPut` body — the gate-held region, and it is a
+    /// `fn`. See [`Self::acquire_put_gate`].
+    pub fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+        self.put_pv_body(name, value)
+    }
+
+    /// Take the L1 advisory write gate a put to `name` needs, if any.
+    ///
+    /// The gate boundary of the whole put family: EVERY `_already_locked`
+    /// entry is the body below this line and contains no `.await`, so an
+    /// caller that already owns the gate calls the body directly and a caller
+    /// that does not calls this first. C's shape exactly — `dbPutField` does
+    /// `dbScanLock(precord)` … `dbScanUnlock(precord)` around a `dbPut` that
+    /// itself never blocks (`dbAccess.c:1246-1300`).
+    ///
+    /// `None` when `name` names no record: a simple PV has no `dbCommon` and
+    /// therefore no `dbScanLock` in C either. The record lookup is repeated by
+    /// the body — a map read, and records are never removed once loaded.
+    async fn acquire_put_gate(&self, name: &str) -> Option<super::record_lock::RecordWriteGuard> {
+        let (base, _) = super::parse_pv_name(name);
+        self.get_record(base)?;
+        let canonical: String = self.resolve_alias(base).unwrap_or_else(|| base.to_string());
+        Some(self.lock_record(&canonical).await)
     }
 
     /// C `IOCSource::doPreProcessing` gate (pvxs `iocsource.cpp:363-375`).
@@ -583,12 +601,7 @@ impl PvDatabase {
         put_drives_processing_of(&instance, &field_upper)
     }
 
-    async fn put_pv_inner(
-        &self,
-        name: &str,
-        value: EpicsValue,
-        acquire_gate: bool,
-    ) -> CaResult<()> {
+    fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -597,7 +610,7 @@ impl PvDatabase {
         // `simple_pvs` field doc in `database/mod.rs`.
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            pv.set(value).await;
+            pv.set(value);
             return Ok(());
         }
 
@@ -607,24 +620,16 @@ impl PvDatabase {
             // name so scan-index updates target the right entry.
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
-            // advisory write gate (`dbScanLock` analogue) so a
-            // plain `put_pv` to a backing record cannot interleave
-            // with an atomic group transaction holding the same gate.
-            // Skipped when the caller already owns the gate.
-            //
-            // Held to the `return Ok(())` below, and that is the point: C's
-            // `dbScanLock` covers `dbPut` *including* `dbPutSpecial(paddr, 1)`
-            // and the scan-list move, so the tails below are inside the
-            // exclusion window in C and must be inside it here. Shrinking the
-            // window to end at the value write would re-open exactly the
-            // interleaving `lock_records` exists to close
+            // The caller holds the advisory write gate (`dbScanLock`
+            // analogue) for `canonical_base` — see [`Self::acquire_put_gate`].
+            // It is held to the `return Ok(())` below, and that is the point:
+            // C's `dbScanLock` covers `dbPut` *including*
+            // `dbPutSpecial(paddr, 1)` and the scan-list move, so the tails
+            // below are inside the exclusion window in C and must be inside it
+            // here. Shrinking the window to end at the value write would
+            // re-open exactly the interleaving `lock_records` exists to close
             // (`record_lock.rs`, "Rust port"). See
             // `doc/rtems-priority-locks-design.md` §2, "the semantic question".
-            let _record_gate = if acquire_gate {
-                Some(self.lock_record(&canonical_base).await)
-            } else {
-                None
-            };
             // Scoped guard: everything the put commits happens under this
             // write guard, which ends (releasing the `!Send` parking_lot
             // guard) before the tails below, which re-enter the database.
@@ -762,8 +767,7 @@ impl PvDatabase {
             // `dbPutLink` calls a `special()` makes included — before it returns
             // to `dbPutField`. This is the last statement of the `dbPut`
             // analogue, so it is that point.
-            self.run_special_actions(&canonical_base, &rec, special_actions)
-                .await;
+            self.run_special_actions(&canonical_base, &rec, special_actions);
 
             // mirror the CA-write path's ASG-field notifier so
             // restore scripts / autosave / admin tools that go via
@@ -802,10 +806,10 @@ impl PvDatabase {
     /// transient hiccup). Returns `ChannelNotFound` for record-backed
     /// PVs — those carry their own `common.sevr/stat` in record
     /// processing.
-    pub async fn post_alarm(&self, name: &str, severity: u16, status: u16) -> CaResult<()> {
+    pub fn post_alarm(&self, name: &str, severity: u16, status: u16) -> CaResult<()> {
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            pv.post_alarm(severity, status).await;
+            pv.post_alarm(severity, status);
             return Ok(());
         }
         Err(crate::error::CaError::ChannelNotFound(name.to_string()))
@@ -820,7 +824,7 @@ impl PvDatabase {
     pub async fn put_pv_and_post_snapshot(&self, name: &str, snapshot: Snapshot) -> CaResult<()> {
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            pv.set_snapshot(snapshot).await;
+            pv.set_snapshot(snapshot);
             return Ok(());
         }
         Err(CaError::ChannelNotFound(name.to_string()))
@@ -897,7 +901,7 @@ impl PvDatabase {
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
             let _ = origin; // simple PVs don't currently honor origin tagging
-            pv.set(value).await;
+            pv.set(value);
             return Ok(());
         }
 
@@ -1053,8 +1057,7 @@ impl PvDatabase {
                 CommonFieldPutResult::NoChange => {}
             }
 
-            self.run_special_actions(&canonical_base, &rec, special_actions)
-                .await;
+            self.run_special_actions(&canonical_base, &rec, special_actions);
 
             // same SPC_AS parity as `put_pv` / `put_pv_no_process`
             // / the CA-write path — a gateway mirroring `.ASG` via
@@ -1118,7 +1121,7 @@ impl PvDatabase {
     /// The gate is still a `PriorityGate` handing out a `Send` guard, so that
     /// compiles and is sound; reason 1 is what blocks the
     /// L1 → `PriorityInheritanceMutex` flip, not this step.
-    async fn run_special_actions(
+    fn run_special_actions(
         &self,
         record_name: &str,
         rec: &std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
@@ -1128,9 +1131,7 @@ impl PvDatabase {
             return;
         }
         let mut visited = HashSet::new();
-        // A `WriteDbLink` here can land back in a `dbPut` (its target's), which
-        // is the function that called us: the async cycle needs one boxed edge.
-        Box::pin(self.execute_process_actions(record_name, rec, actions, &mut visited, 0)).await;
+        self.execute_process_actions(record_name, rec, actions, &mut visited, 0);
     }
 
     /// CA client's unified entry point for record field put.
@@ -1144,8 +1145,8 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        self.put_record_field_from_ca_inner(record_name, field, value, true, NotifyRequest::New)
-            .await
+        let _record_gate = self.acquire_put_gate(record_name).await;
+        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
     }
 
     /// Variant for a caller that already owns the target
@@ -1155,14 +1156,13 @@ impl PvDatabase {
     /// gate is NOT reentrant, so the atomic group path MUST use this
     /// `_already_locked` entry to avoid dead-locking on its own
     /// `ManyRecordWriteGuard`.
-    pub async fn put_record_field_from_ca_already_locked(
+    pub fn put_record_field_from_ca_already_locked(
         &self,
         record_name: &str,
         field: &str,
         value: EpicsValue,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
-        self.put_record_field_from_ca_inner(record_name, field, value, false, NotifyRequest::New)
-            .await
+        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::New)
     }
 
     /// Fire-and-forget variant — C `dbPutField` semantics: the put
@@ -1180,8 +1180,8 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        self.put_record_field_from_ca_inner(record_name, field, value, true, NotifyRequest::None)
-            .await
+        let _record_gate = self.acquire_put_gate(record_name).await;
+        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
     }
 
@@ -1236,14 +1236,13 @@ impl PvDatabase {
     /// Fire-and-forget + caller-held gate: see
     /// [`Self::put_record_field_from_ca_no_notify`] and
     /// [`Self::put_record_field_from_ca_already_locked`].
-    pub async fn put_record_field_from_ca_no_notify_already_locked(
+    pub fn put_record_field_from_ca_no_notify_already_locked(
         &self,
         record_name: &str,
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
-        self.put_record_field_from_ca_inner(record_name, field, value, false, NotifyRequest::None)
-            .await
+        self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
     }
 
@@ -1343,20 +1342,13 @@ impl PvDatabase {
     /// The PACT (RPRO) branch is success, as it is in C: `dbPutField` returns
     /// the `dbProcess` status only on the branch that ran it.
     pub async fn put_driven_process(&self, record_name: &str) -> CaResult<()> {
-        self.put_driven_process_inner(record_name, true).await
+        let _record_gate = self.acquire_put_gate(record_name).await;
+        self.put_driven_process_already_locked(record_name)
     }
 
     /// [`Self::put_driven_process`] for a caller that already owns the
-    /// record's advisory write gate.
-    pub async fn put_driven_process_already_locked(&self, record_name: &str) -> CaResult<()> {
-        self.put_driven_process_inner(record_name, false).await
-    }
-
-    async fn put_driven_process_inner(
-        &self,
-        record_name: &str,
-        acquire_gate: bool,
-    ) -> CaResult<()> {
+    /// record's advisory write gate. The gate-held body — no `.await`.
+    pub fn put_driven_process_already_locked(&self, record_name: &str) -> CaResult<()> {
         {
             let Some(rec) = self.get_record(record_name) else {
                 return Ok(());
@@ -1369,13 +1361,7 @@ impl PvDatabase {
             instance.common.putf = true;
         }
         let mut visited = HashSet::new();
-        if acquire_gate {
-            self.process_record_with_links(record_name, &mut visited, 0)
-                .await
-        } else {
-            self.process_record_with_links_already_locked(record_name, &mut visited, 0)
-                .await
-        }
+        self.process_record_with_links_already_locked(record_name, &mut visited, 0)
     }
 
     /// C `dbNotifyCompletion` → restart (dbNotify.c:207-231, state
@@ -1399,23 +1385,23 @@ impl PvDatabase {
         } = put;
         // The client already holds the receiver; a failure here (record gone,
         // field refused) must still release it, which dropping the sender does.
-        let _ = self
-            .put_record_field_from_ca_inner(
-                record_name,
-                &field,
-                value,
-                true,
-                NotifyRequest::Deferred(completion),
-            )
-            .await;
+        let _record_gate = self.acquire_put_gate(record_name).await;
+        let _ = self.put_record_field_from_ca_body(
+            record_name,
+            &field,
+            value,
+            NotifyRequest::Deferred(completion),
+        );
     }
 
-    async fn put_record_field_from_ca_inner(
+    /// The gate-held body of the whole CA field-put family — a `fn`, so
+    /// nothing in it can suspend while the L1 gate is held. The gate is the
+    /// caller's; see [`Self::acquire_put_gate`].
+    fn put_record_field_from_ca_body(
         &self,
         record_name: &str,
         field: &str,
         value: EpicsValue,
-        acquire_gate: bool,
         notify_request: NotifyRequest,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
         let field = field.to_ascii_uppercase();
@@ -1440,19 +1426,12 @@ impl PvDatabase {
             record_name
         };
 
-        // take the record's advisory write gate — the
-        // `dbScanLock(precord)` analogue. While a QSRV atomic group
-        // PUT/GET holds this record's gate via `lock_records`, this
-        // plain write blocks here, so a direct backing-record write
-        // can no longer land between member writes of an atomic group
-        // transaction. Held until the function returns. Skipped when
-        // the caller (atomic group PUT) already owns the gate — the
-        // gate `Mutex` is not reentrant.
-        let _record_gate = if acquire_gate {
-            Some(self.lock_record(record_name).await)
-        } else {
-            None
-        };
+        // The caller holds the record's advisory write gate — the
+        // `dbScanLock(precord)` analogue, taken by [`Self::acquire_put_gate`]
+        // or (QSRV atomic group PUT) by `lock_records` over the whole member
+        // set. While it is held a plain write to the same record blocks, so a
+        // direct backing-record write cannot land between member writes of an
+        // atomic group transaction. It is held until the function returns.
 
         // Special field intercepts (read lock, then drop)
         {
@@ -1495,7 +1474,7 @@ impl PvDatabase {
                 }
             };
             match name_to_resolve {
-                Some(name) => self.find_subroutine_named(&name).await.is_none(),
+                Some(name) => self.find_subroutine_named(&name).is_none(),
                 None => false,
             }
         };
@@ -1634,7 +1613,7 @@ impl PvDatabase {
                 // non-zero `dbPut` status (`dbAccess.c:1263-1264`), so it must NOT
                 // process. Either way the client is answered `ECA_PUTFAIL`.
                 if want_notify {
-                    let _ = self.put_driven_process_already_locked(record_name).await;
+                    let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
@@ -1674,7 +1653,7 @@ impl PvDatabase {
             // when `acquire_gate`, and the caller (an atomic group PUT) holds it
             // when not. The gate `Mutex` is not reentrant, so acquiring it again
             // here deadlocks every PROC put.
-            let _ = self.put_driven_process_already_locked(record_name).await;
+            let _ = self.put_driven_process_already_locked(record_name);
             // The wait-set fires the oneshot only after the whole
             // FLNK/OUT chain (sync + async) settles. If it has
             // already completed the chain was fully synchronous —
@@ -2018,7 +1997,7 @@ impl PvDatabase {
             Ok(cr) => cr,
             Err((e, should_process)) => {
                 if should_process {
-                    let _ = self.put_driven_process_already_locked(record_name).await;
+                    let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
@@ -2040,8 +2019,7 @@ impl PvDatabase {
         // C `dbPutField` reaches `dbProcess` only after `dbPut` — and therefore
         // after `dbPutSpecial(paddr, 1)` and every `dbPutLink` it made — has run
         // to completion. Execute them here, ahead of the `pp(TRUE)` process.
-        self.run_special_actions(record_name, &rec, std::mem::take(&mut special_actions))
-            .await;
+        self.run_special_actions(record_name, &rec, std::mem::take(&mut special_actions));
 
         // Update scan index if SCAN or PHAS changed
         match common_result {
@@ -2162,7 +2140,7 @@ impl PvDatabase {
         // Process the record after field put — through the single owner of C's
         // `dbPutField:1269-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
-        let _ = self.put_driven_process_already_locked(record_name).await;
+        let _ = self.put_driven_process_already_locked(record_name);
 
         // Is the ORIGINATING record itself still async-pending? Its
         // wait-set membership is taken + `leave`d at its own completion
@@ -2239,7 +2217,7 @@ impl PvDatabase {
 
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            pv.set(value).await;
+            pv.set(value);
             return Ok(());
         }
 
@@ -2343,26 +2321,26 @@ mod tests {
         db.put_pv("CANON.VAL", EpicsValue::Double(1.5))
             .await
             .unwrap();
-        let v = db.get_pv("ALT.VAL").await.unwrap();
+        let v = db.get_pv("ALT.VAL").unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 1.5));
 
         // put_pv via alias
         db.put_pv("ALT.VAL", EpicsValue::Double(7.0)).await.unwrap();
-        let v = db.get_pv("CANON.VAL").await.unwrap();
+        let v = db.get_pv("CANON.VAL").unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 7.0));
 
         // put_pv_and_post via alias
         db.put_pv_and_post("ALT.VAL", EpicsValue::Double(11.0))
             .await
             .unwrap();
-        let v = db.get_pv("CANON.VAL").await.unwrap();
+        let v = db.get_pv("CANON.VAL").unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 11.0));
 
         // put_pv_no_process via alias
         db.put_pv_no_process("ALT.VAL", EpicsValue::Double(13.0))
             .await
             .unwrap();
-        let v = db.get_pv("ALT.VAL").await.unwrap();
+        let v = db.get_pv("ALT.VAL").unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
     }
 
@@ -2386,19 +2364,19 @@ mod tests {
         db.put_pv("SEL.SELM", EpicsValue::String("Specified".into()))
             .await
             .unwrap();
-        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(0));
+        assert_eq!(db.get_pv("SEL.SELM").unwrap(), EpicsValue::Enum(0));
 
         // put_pv_and_post: a later choice, proving the whole menu.
         db.put_pv_and_post("SEL.SELM", EpicsValue::String("High Signal".into()))
             .await
             .unwrap();
-        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(1));
+        assert_eq!(db.get_pv("SEL.SELM").unwrap(), EpicsValue::Enum(1));
 
         // A bare numeric string still resolves (C epicsParseUInt16 fallback).
         db.put_pv("SEL.SELM", EpicsValue::String("2".into()))
             .await
             .unwrap();
-        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(2));
+        assert_eq!(db.get_pv("SEL.SELM").unwrap(), EpicsValue::Enum(2));
     }
 
     /// `set_pv_metadata` installs the upstream `DBR_CTRL_*` metadata on a
@@ -2423,7 +2401,6 @@ mod tests {
         let pv = db.find_pv("gw:meta").await.expect("PV exists");
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("subscriber added");
 
         // Build a CTRL-class snapshot carrying display metadata.
@@ -2483,11 +2460,9 @@ mod tests {
 
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("property subscriber added");
         let mut val_rx = pv
             .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("value subscriber added");
 
         // Upstream CTRL event: metadata + MAJOR/HIGH alarm + a fixed past
@@ -2566,7 +2541,7 @@ mod tests {
 
         // Read back via canonical to confirm the value landed on the
         // right record.
-        let v = db.get_pv("CANON.VAL").await.unwrap();
+        let v = db.get_pv("CANON.VAL").unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 2.5));
     }
 
@@ -2679,7 +2654,7 @@ mod tests {
 
         // The field landed on the record.
         assert_eq!(
-            db.get_pv("M:ENUM.ZRST").await.unwrap(),
+            db.get_pv("M:ENUM.ZRST").unwrap(),
             EpicsValue::String("LABEL".into())
         );
 

@@ -74,7 +74,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
             .await
             .unwrap();
 
-        let cnt = db.get_pv("cnt").await.unwrap().to_f64().unwrap();
+        let cnt = db.get_pv("cnt").unwrap().to_f64().unwrap();
         if i < 4 {
             assert_eq!(
                 cnt, 0.0,
@@ -85,7 +85,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
     }
 
     // Exactly one emit over four cycles → FLNK fired once → counter == 1.
-    let cnt = db.get_pv("cnt").await.unwrap().to_f64().unwrap();
+    let cnt = db.get_pv("cnt").unwrap().to_f64().unwrap();
     assert_eq!(
         cnt, 1.0,
         "FLNK must fire once (on the 4th/emit cycle), not on every input cycle"
@@ -93,7 +93,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
 
     // The emitted value is the average of 1..=4 = 2.5, confirming the emit
     // cycle is the one that drove the forward link.
-    let val = db.get_pv("cmp").await.unwrap();
+    let val = db.get_pv("cmp").unwrap();
     let avg = match val {
         EpicsValue::DoubleArray(a) => a.first().copied().unwrap_or(f64::NAN),
         EpicsValue::Double(v) => v,

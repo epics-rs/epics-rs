@@ -419,7 +419,7 @@ async fn sdly_input_record() -> PvDatabase {
 /// Wait for the queued replay (C's restart callback) to land its value.
 async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
     for _ in 0..500 {
-        if let Ok(EpicsValue::Double(v)) = db.get_pv(name).await
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(name)
             && (v - want).abs() < 1e-10
         {
             return;

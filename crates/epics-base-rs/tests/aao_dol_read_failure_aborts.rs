@@ -116,12 +116,12 @@ async fn dead_dol_writes_nothing_out_and_does_not_fire_flnk() {
     process(&db, "AAO:DEAD").await;
 
     assert_eq!(
-        db.get_pv("DEAD:OUT").await.unwrap(),
+        db.get_pv("DEAD:OUT").unwrap(),
         EpicsValue::DoubleArray(vec![]),
         "C returns BEFORE writeValue: a stale VAL must not reach the OUT target"
     );
     assert_eq!(
-        db.get_pv("DEAD:FLNK").await.unwrap(),
+        db.get_pv("DEAD:FLNK").unwrap(),
         EpicsValue::DoubleArray(vec![]),
         "C returns BEFORE recGblFwdLink: the forward link must not fire"
     );
@@ -173,17 +173,17 @@ async fn live_dol_completes_the_cycle() {
     process(&db, "AAO:LIVE").await;
 
     assert_eq!(
-        db.get_pv("AAO:LIVE").await.unwrap(),
+        db.get_pv("AAO:LIVE").unwrap(),
         EpicsValue::DoubleArray(vec![2.5]),
         "the DOL value lands in VAL (one element, NORD=1)"
     );
     assert_eq!(
-        db.get_pv("LIVE:OUT").await.unwrap(),
+        db.get_pv("LIVE:OUT").unwrap(),
         EpicsValue::DoubleArray(vec![2.5]),
         "writeValue runs"
     );
     assert_eq!(
-        db.get_pv("LIVE:FLNK").await.unwrap(),
+        db.get_pv("LIVE:FLNK").unwrap(),
         EpicsValue::DoubleArray(vec![42.0]),
         "recGblFwdLink runs — the FLNK target processed and pulled its own INP"
     );
@@ -196,7 +196,7 @@ async fn cycle_resumes_when_the_dol_source_returns() {
     let db = build().await;
     process(&db, "AAO:DEAD").await;
     assert_eq!(
-        db.get_pv("DEAD:OUT").await.unwrap(),
+        db.get_pv("DEAD:OUT").unwrap(),
         EpicsValue::DoubleArray(vec![])
     );
 
@@ -207,11 +207,11 @@ async fn cycle_resumes_when_the_dol_source_returns() {
     process(&db, "AAO:DEAD").await;
 
     assert_eq!(
-        db.get_pv("AAO:DEAD").await.unwrap(),
+        db.get_pv("AAO:DEAD").unwrap(),
         EpicsValue::DoubleArray(vec![3.0])
     );
     assert_eq!(
-        db.get_pv("DEAD:OUT").await.unwrap(),
+        db.get_pv("DEAD:OUT").unwrap(),
         EpicsValue::DoubleArray(vec![3.0]),
         "the recovered fetch runs the full cycle again"
     );

@@ -1939,17 +1939,17 @@ async fn r17_35_group_scalar_member_put_derefs_the_nt_wrapper() {
             .unwrap_or_else(|e| panic!("atomic={atomic}: scalar-member PUT rejected: {e}"));
 
         assert_eq!(
-            db.get_pv("TEST:sc_ao.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_ao.VAL").unwrap(),
             EpicsValue::Double(2.5),
             "atomic={atomic}: numeric scalar member must write the value leaf"
         );
         assert_eq!(
-            db.get_pv("TEST:sc_so.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_so.VAL").unwrap(),
             EpicsValue::String("hello".into()),
             "atomic={atomic}: string scalar member must write the value leaf"
         );
         assert_eq!(
-            db.get_pv("TEST:sc_mb.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_mb.VAL").unwrap(),
             EpicsValue::Enum(1),
             "atomic={atomic}: enum scalar member must write value.index"
         );
@@ -1974,7 +1974,7 @@ async fn r17_35_plain_member_put_is_not_unwrapped() {
     ch.put(&put).await.expect("plain member PUT");
 
     assert_eq!(
-        db.get_pv("TEST:level.VAL").await.unwrap(),
+        db.get_pv("TEST:level.VAL").unwrap(),
         EpicsValue::Double(7.5)
     );
 }
@@ -2022,7 +2022,7 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
     ch.put(&put).await.expect("long-string member PUT");
 
     assert_eq!(
-        db.get_pv("TEST:lstrwf.VAL").await.unwrap(),
+        db.get_pv("TEST:lstrwf.VAL").unwrap(),
         EpicsValue::CharArray(b"hello\0".to_vec()),
         "long-string member PUT must write the NUL-terminated char image"
     );

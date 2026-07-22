@@ -113,7 +113,7 @@ async fn caput_ff(db: &PvDatabase, field: &str, text: &str) -> Result<(), String
 }
 
 async fn read_proc(db: &PvDatabase) -> EpicsValue {
-    db.get_pv("REC.PROC").await.unwrap()
+    db.get_pv("REC.PROC").unwrap()
 }
 
 // --- PROC rejected: the put fails, byte not stored, process depends on path ---

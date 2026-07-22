@@ -71,7 +71,7 @@ async fn test_inp_link_processing() {
         .await
         .unwrap();
 
-    let val = db.get_pv("DEST").await.unwrap();
+    let val = db.get_pv("DEST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
@@ -366,16 +366,19 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     struct AlarmingLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for AlarmingLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(12.0))
         }
-        async fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
             Some(2) // MAJOR — as if the link's MS mode let it through
         }
-        async fn alarm_message(&self, _: &str) -> Option<String> {
+        fn alarm_message(&self, _: &str) -> Option<String> {
             Some("remote major".into())
         }
     }
@@ -429,11 +432,14 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     struct QuietLset;
     #[epics_base_rs::async_trait]
     impl LinkSet for QuietLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(5.0))
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
         // alarm_severity defaults to None.
     }
@@ -486,11 +492,14 @@ struct CapturingLset {
 }
 #[epics_base_rs::async_trait]
 impl epics_base_rs::server::database::LinkSet for CapturingLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         true
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(
         &self,
@@ -664,6 +673,12 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited, 0)
         .await
         .unwrap();
+    // The completion flavour stages and returns like the plain one (C
+    // `dbCaPutLinkCallback`, `dbCa.c:614-624`), so the wire write is observed
+    // through the `dbCaSync` barrier. This test asserts the OP FLAVOUR, not
+    // the timing — the timing boundary is
+    // `external_link_put_enqueue::async_put_completion_is_reported_through_the_notify_chain`.
+    db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
     assert_eq!(
@@ -1408,7 +1423,7 @@ async fn test_ao_omsl_dol() {
         .await
         .unwrap();
 
-    let val = db.get_pv("OUTPUT").await.unwrap();
+    let val = db.get_pv("OUTPUT").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
@@ -1439,7 +1454,7 @@ async fn test_ao_oif_incremental() {
         .unwrap();
 
     // Initial VAL=100 (=> PVAL=100 at init) + DOL delta 10 = 110.
-    let val = db.get_pv("OUTPUT").await.unwrap();
+    let val = db.get_pv("OUTPUT").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 110.0).abs() < 1e-10),
         other => panic!("expected Double(110.0), got {:?}", other),
@@ -1472,7 +1487,7 @@ async fn test_ao_ivoa_dont_drive() {
         .await
         .unwrap();
 
-    let val = db.get_pv("TARGET").await.unwrap();
+    let val = db.get_pv("TARGET").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 0.0).abs() < 1e-10),
         other => panic!("expected Double(0.0), got {:?}", other),
@@ -1561,13 +1576,13 @@ async fn test_ao_ivoa_set_to_ivov_writes_oval() {
         .unwrap();
 
     // TARGET should now hold IVOV (42), not the original VAL (7).
-    let v = db.get_pv("TARGET").await.unwrap();
+    let v = db.get_pv("TARGET").unwrap();
     assert!(
         matches!(v, EpicsValue::Double(d) if (d - 42.0).abs() < 1e-9),
         "TARGET must receive IVOV via OVAL: got {v:?}"
     );
     // Source record's OVAL must also reflect IVOV (the C convention).
-    let oval = db.get_pv("SRC.OVAL").await.unwrap();
+    let oval = db.get_pv("SRC.OVAL").unwrap();
     assert!(
         matches!(oval, EpicsValue::Double(d) if (d - 42.0).abs() < 1e-9),
         "SRC.OVAL must equal IVOV: got {oval:?}"
@@ -1596,7 +1611,7 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
 
     // After IVOA=2, RVAL must equal IVOV (=1) — pre-fix it stayed at 0.
     // RVAL is DBF_ULONG (boRecord.dbd.pod:252).
-    let rval = db.get_pv("BO_SRC.RVAL").await.unwrap();
+    let rval = db.get_pv("BO_SRC.RVAL").unwrap();
     assert!(
         matches!(rval, EpicsValue::ULong(1)),
         "BO_SRC.RVAL must equal IVOV(1): got {rval:?}"
@@ -1644,7 +1659,7 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
         .unwrap();
 
     // OUT_TGT must receive OVAL=IVOV (17.5), not the calc result.
-    let v = db.get_pv("OUT_TGT").await.unwrap();
+    let v = db.get_pv("OUT_TGT").unwrap();
     assert!(
         matches!(v, EpicsValue::Double(d) if (d - 17.5).abs() < 1e-9),
         "OUT_TGT must receive IVOV via OVAL: got {v:?}"
@@ -1672,13 +1687,13 @@ async fn test_sim_mode_input() {
         .await
         .unwrap();
 
-    let val = db.get_pv("SIM_AI").await.unwrap();
+    let val = db.get_pv("SIM_AI").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 99.0).abs() < 1e-10),
         other => panic!("expected Double(99.0), got {:?}", other),
     }
 
-    let sevr = db.get_pv("SIM_AI.SEVR").await.unwrap();
+    let sevr = db.get_pv("SIM_AI.SEVR").unwrap();
     assert!(matches!(sevr, EpicsValue::Short(1)));
 }
 
@@ -1720,12 +1735,12 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
         .unwrap();
 
     // VAL=99 > HIHI=50 → HIHI MAJOR maximizes over the SIMM MINOR.
-    let sevr = db.get_pv("SIM_AI2.SEVR").await.unwrap();
+    let sevr = db.get_pv("SIM_AI2.SEVR").unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(2)),
         "sim limit MAJOR must win over SIMM MINOR: got {sevr:?}"
     );
-    let stat = db.get_pv("SIM_AI2.STAT").await.unwrap();
+    let stat = db.get_pv("SIM_AI2.STAT").unwrap();
     assert!(
         matches!(stat, EpicsValue::Short(s) if s as u16 == alarm_status::HIHI_ALARM),
         "STAT must be HIHI_ALARM, not SIMM_ALARM: got {stat:?}"
@@ -1961,7 +1976,7 @@ async fn test_sim_mode_toggle() {
     db.process_record_with_links("TEST_AI", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("TEST_AI").await.unwrap();
+    let val = db.get_pv("TEST_AI").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 10.0).abs() < 1e-10),
         other => panic!("expected Double(10.0), got {:?}", other),
@@ -1972,7 +1987,7 @@ async fn test_sim_mode_toggle() {
     db.process_record_with_links("TEST_AI", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("TEST_AI").await.unwrap();
+    let val = db.get_pv("TEST_AI").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
@@ -1999,7 +2014,7 @@ async fn test_sim_mode_output() {
         .await
         .unwrap();
 
-    let val = db.get_pv("SIM_OUT").await.unwrap();
+    let val = db.get_pv("SIM_OUT").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 77.0).abs() < 1e-10),
         other => panic!("expected Double(77.0), got {:?}", other),
@@ -2020,13 +2035,16 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     struct ValueCaLset(f64);
     #[epics_base_rs::async_trait]
     impl LinkSet for ValueCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
             // The bare non-local SIOL record name reaches the CA lset
             // via the read-locality fallback `resolve_external_pv`.
             (name == "REMOTE:SIM").then_some(EpicsValue::Double(self.0))
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
         }
     }
 
@@ -2049,7 +2067,7 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
         .await
         .unwrap();
 
-    let val = db.get_pv("SIM_AI_NL").await.unwrap();
+    let val = db.get_pv("SIM_AI_NL").unwrap();
     assert!(
         matches!(val, EpicsValue::Double(v) if (v - 73.0).abs() < 1e-10),
         "non-local Db SIOL must read the remote sim value into VAL: got {val:?}"
@@ -4381,7 +4399,7 @@ async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
     );
 
     // The field is untouched…
-    match db.get_pv("EMPTYPUT.VAL").await.unwrap() {
+    match db.get_pv("EMPTYPUT.VAL").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 5.0).abs() < 1e-10,
             "the empty request must not overwrite VAL (silent zero was the bug 12cfd418d fixed)"
@@ -4458,7 +4476,7 @@ async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
         result.is_ok(),
         "C dbPut clamps nRequest to the scalar destination and succeeds: {result:?}"
     );
-    match db.get_pv("ARRPUT.VAL").await.unwrap() {
+    match db.get_pv("ARRPUT.VAL").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 1.0).abs() < 1e-10,
             "element 0 must be written (got {v}), the surplus elements dropped"
@@ -4484,7 +4502,7 @@ async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
         .await
         .expect("an array into an array field must succeed");
     assert_eq!(
-        db.get_pv("ARRWF.VAL").await.unwrap(),
+        db.get_pv("ARRWF.VAL").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
         "an array destination must NOT be clamped to element 0"
     );
@@ -4504,7 +4522,7 @@ async fn r6_10_single_element_array_into_scalar_writes_that_element() {
     db.put_record_field_from_ca("ONEPUT", "VAL", EpicsValue::DoubleArray(vec![7.0]))
         .await
         .expect("a one-element array into a scalar must succeed");
-    match db.get_pv("ONEPUT.VAL").await.unwrap() {
+    match db.get_pv("ONEPUT.VAL").unwrap() {
         EpicsValue::Double(v) => assert!((v - 7.0).abs() < 1e-10, "expected 7.0, got {v}"),
         other => panic!("expected Double, got {other:?}"),
     }
@@ -4544,7 +4562,7 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
         .await
         .unwrap();
 
-    match db.get_pv("LNKAI.VAL").await.unwrap() {
+    match db.get_pv("LNKAI.VAL").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 7.0).abs() < 1e-10,
             "an array source into a scalar VAL must deliver element 0 (got {v}; \
@@ -4600,7 +4618,7 @@ async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
     );
     // …and the record is otherwise untouched by the rejected puts.
     assert_eq!(
-        db.get_pv("BADFLD.DESC").await.unwrap(),
+        db.get_pv("BADFLD.DESC").unwrap(),
         EpicsValue::String("ok".into())
     );
 }
@@ -4703,7 +4721,7 @@ async fn test_pini_records_process_in_ascending_phas_order() {
 
     db.pini_process(PiniMode::Yes).await;
 
-    match db.get_pv("PHAS_SINK").await.unwrap() {
+    match db.get_pv("PHAS_SINK").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 30.0).abs() < 1e-10,
             "PINI must process in ascending PHAS order (PHAS_C last); SINK={v}"
@@ -4913,7 +4931,7 @@ async fn test_constant_inp_link() {
         .await
         .unwrap();
 
-    let init_val = db.get_pv("AI_CONST").await.unwrap();
+    let init_val = db.get_pv("AI_CONST").unwrap();
     match init_val {
         EpicsValue::Double(v) => assert!(
             (v - 3.15).abs() < 1e-10,
@@ -4935,7 +4953,7 @@ async fn test_constant_inp_link() {
     db.process_record_with_links("AI_CONST", &mut visited, 0)
         .await
         .unwrap();
-    match db.get_pv("AI_CONST").await.unwrap() {
+    match db.get_pv("AI_CONST").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 7.0).abs() < 1e-10,
             "a constant INP must not be re-applied at process, got {v}"
@@ -4962,7 +4980,7 @@ async fn test_calc_multi_input_db_links() {
     db.process_record_with_links("CALC_REC", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("CALC_REC").await.unwrap();
+    let val = db.get_pv("CALC_REC").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 30.0).abs() < 1e-10),
         other => panic!("expected Double(30.0), got {:?}", other),
@@ -4999,7 +5017,7 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
 
     // DST must see 42: the PP link processed PP_SRC first, computing
     // its VAL=42 before the value was read. A stale read would yield 0.
-    let val = db.get_pv("PP_DST").await.unwrap();
+    let val = db.get_pv("PP_DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -5008,7 +5026,7 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
         other => panic!("expected Double(42.0), got {other:?}"),
     }
     // The source itself must have been processed (VAL latched to 42).
-    let src_val = db.get_pv("PP_SRC").await.unwrap();
+    let src_val = db.get_pv("PP_SRC").unwrap();
     match src_val {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -5043,7 +5061,7 @@ async fn process_record_fetches_input_links() {
     // giving VAL=11; the old reduced path left A=0 -> VAL=1.
     db.process_record("DST_F").await.unwrap();
 
-    match db.get_pv("DST_F").await.unwrap() {
+    match db.get_pv("DST_F").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 11.0).abs() < 1e-10,
             "process_record must fetch INPA (SRC_F=10): expected 11, got {v}"
@@ -5075,7 +5093,7 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
 
     // NPP_SRC was never processed, so its VAL stays at the default 0.0
     // and DST reads 0, not 42.
-    let val = db.get_pv("NPP_DST").await.unwrap();
+    let val = db.get_pv("NPP_DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             v.abs() < 1e-10,
@@ -5160,7 +5178,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
         .await
         .unwrap();
 
-    match db.get_pv("SINK").await.unwrap() {
+    match db.get_pv("SINK").unwrap() {
         EpicsValue::Double(v) => assert!(
             (v - 1.0).abs() < 1e-10,
             "SINK.INP=DIRECT.B0 must read the B0 bit (1), got {v}"
@@ -5204,7 +5222,7 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
         .await
         .unwrap();
 
-    let val = db.get_pv("BARE_DST").await.unwrap();
+    let val = db.get_pv("BARE_DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             v.abs() < 1e-10,
@@ -5213,7 +5231,7 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
         other => panic!("expected Double(0.0), got {other:?}"),
     }
     // BARE_SRC must still hold its unprocessed default.
-    let src_val = db.get_pv("BARE_SRC").await.unwrap();
+    let src_val = db.get_pv("BARE_SRC").unwrap();
     match src_val {
         EpicsValue::Double(v) => assert!(
             v.abs() < 1e-10,
@@ -5270,8 +5288,8 @@ async fn test_calc_pp_link_cycle_terminates() {
 
     // Both records read a finite value (default 0.0 — neither has a
     // real source). The point is that processing completed at all.
-    let va = db.get_pv("CALC_A").await.unwrap();
-    let vb = db.get_pv("CALC_B").await.unwrap();
+    let va = db.get_pv("CALC_A").unwrap();
+    let vb = db.get_pv("CALC_B").unwrap();
     match (va, vb) {
         (EpicsValue::Double(x), EpicsValue::Double(y)) => {
             assert!(
@@ -5295,7 +5313,7 @@ async fn test_calc_constant_inputs() {
     db.process_record_with_links("CALC_CONST", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("CALC_CONST").await.unwrap();
+    let val = db.get_pv("CALC_CONST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 8.5).abs() < 1e-10),
         other => panic!("expected Double(8.5), got {:?}", other),
@@ -5481,12 +5499,12 @@ async fn test_dfanout_value_write() {
     db.process_record_with_links("DFAN", &mut visited, 0)
         .await
         .unwrap();
-    let val_a = db.get_pv("DEST_A").await.unwrap();
+    let val_a = db.get_pv("DEST_A").unwrap();
     match val_a {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
     }
-    let val_b = db.get_pv("DEST_B").await.unwrap();
+    let val_b = db.get_pv("DEST_B").unwrap();
     match val_b {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {:?}", other),
@@ -5533,12 +5551,12 @@ async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
         .unwrap();
 
     // DOL_SRC's VAL (7.5) must have flowed through DOL → dfanout.VAL → OUTA/OUTB.
-    let val_a = db.get_pv("DFAN_DEST_A").await.unwrap();
+    let val_a = db.get_pv("DFAN_DEST_A").unwrap();
     assert!(
         matches!(val_a, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
         "DFAN_DEST_A must reflect DOL_SRC (=7.5), got {val_a:?}"
     );
-    let val_b = db.get_pv("DFAN_DEST_B").await.unwrap();
+    let val_b = db.get_pv("DFAN_DEST_B").unwrap();
     assert!(
         matches!(val_b, EpicsValue::Double(v) if (v - 7.5).abs() < 1e-10),
         "DFAN_DEST_B must reflect DOL_SRC (=7.5), got {val_b:?}"
@@ -5573,7 +5591,7 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
         .await
         .unwrap();
 
-    let val_a = db.get_pv("DFAN_DEST_A2").await.unwrap();
+    let val_a = db.get_pv("DFAN_DEST_A2").unwrap();
     assert!(
         matches!(val_a, EpicsValue::Double(v) if (v - 3.0).abs() < 1e-10),
         "OMSL=supervisory must keep the operator-staged VAL (=3.0), got {val_a:?}"
@@ -5678,7 +5696,7 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
         .await
         .unwrap();
 
-    let val = db.get_pv("DFAN_OK_DEST").await.unwrap();
+    let val = db.get_pv("DFAN_OK_DEST").unwrap();
     assert!(
         matches!(val, EpicsValue::Double(v) if (v - 5.0).abs() < 1e-10),
         "successful OUT write must land VAL=5.0 on the target, got {val:?}"
@@ -5720,12 +5738,12 @@ async fn test_seq_dol_lnk_dispatch() {
     db.process_record_with_links("SEQ_REC", &mut visited, 0)
         .await
         .unwrap();
-    let val1 = db.get_pv("SEQ_DEST1").await.unwrap();
+    let val1 = db.get_pv("SEQ_DEST1").unwrap();
     match val1 {
         EpicsValue::Double(v) => assert!((v - 100.0).abs() < 1e-10),
         other => panic!("expected Double(100.0), got {:?}", other),
     }
-    let val2 = db.get_pv("SEQ_DEST2").await.unwrap();
+    let val2 = db.get_pv("SEQ_DEST2").unwrap();
     match val2 {
         EpicsValue::Double(v) => assert!((v - 200.0).abs() < 1e-10),
         other => panic!("expected Double(200.0), got {:?}", other),
@@ -5759,13 +5777,13 @@ async fn test_seq_writes_dol_readback_into_don() {
         .unwrap();
 
     // LNK0 driven (existing behaviour).
-    let dest = db.get_pv("SEQ9_DEST").await.unwrap();
+    let dest = db.get_pv("SEQ9_DEST").unwrap();
     match dest {
         EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
         other => panic!("expected Double(42.0), got {other:?}"),
     }
     // DO0 read back from DOL0 — was stale (0.0) pre-fix.
-    let do0 = db.get_pv("SEQ9_REC.DO0").await.unwrap();
+    let do0 = db.get_pv("SEQ9_REC.DO0").unwrap();
     match do0 {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -5797,7 +5815,7 @@ async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
         .await
         .unwrap();
 
-    let do0 = db.get_pv("SEQ9B_REC.DO0").await.unwrap();
+    let do0 = db.get_pv("SEQ9B_REC.DO0").unwrap();
     match do0 {
         EpicsValue::Double(v) => assert!(
             (v - 7.0).abs() < 1e-10,
@@ -5967,7 +5985,7 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
         .unwrap();
 
     // The OUT write ran before FLNK, so the observer read the fresh 42.0.
-    let observed = db.get_pv("WF_OBSERVER").await.unwrap();
+    let observed = db.get_pv("WF_OBSERVER").unwrap();
     match observed {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -5999,7 +6017,7 @@ async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
 /// sseq machine's per-step `DLYn` delays + async re-entries.
 async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
     for _ in 0..400 {
-        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv).await {
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
                 return;
             }
@@ -6008,7 +6026,7 @@ async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
     }
     panic!(
         "{pv}: did not reach {want} before timeout (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
@@ -6117,12 +6135,12 @@ async fn test_sseq_per_step_dly_delays_step_write() {
     // and step 2 must not fire before step 1.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
-        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
+        db.get_pv("SSEQ_DLY_TGT1").unwrap(),
         EpicsValue::Double(0.0),
         "step 1 LNKn must not fire before its DLY1 delay elapses"
     );
     assert_eq!(
-        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
+        db.get_pv("SSEQ_DLY_TGT2").unwrap(),
         EpicsValue::Double(0.0),
         "step 2 must not fire before step 1's delay completes"
     );
@@ -6150,12 +6168,12 @@ async fn test_sel_nvl_link() {
     db.process_record_with_links("SEL_REC", &mut visited, 0)
         .await
         .unwrap();
-    let seln = db.get_pv("SEL_REC.SELN").await.unwrap();
+    let seln = db.get_pv("SEL_REC.SELN").unwrap();
     match seln {
         EpicsValue::UShort(v) => assert_eq!(v, 2),
         other => panic!("expected UShort(2), got {:?}", other),
     }
-    let val = db.get_pv("SEL_REC").await.unwrap();
+    let val = db.get_pv("SEL_REC").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 30.0).abs() < 1e-10),
         other => panic!("expected Double(30.0), got {:?}", other),
@@ -6180,7 +6198,7 @@ async fn test_sel_nvl_link_high_index_unsigned() {
     db.process_record_with_links("SEL_REC_HI", &mut visited, 0)
         .await
         .unwrap();
-    let seln = db.get_pv("SEL_REC_HI.SELN").await.unwrap();
+    let seln = db.get_pv("SEL_REC_HI.SELN").unwrap();
     match seln {
         EpicsValue::UShort(v) => assert_eq!(v, 40000, "high SELN must survive the NVL link"),
         other => panic!("expected UShort(40000), got {:?}", other),
@@ -6198,7 +6216,7 @@ async fn test_dol_cp_link_registration() {
     ao.dol = "MTR CP".to_string();
     db.add_record("MOTOR_POS", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("MTR").await;
+    let targets = db.get_cp_targets("MTR");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MOTOR_POS");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6219,7 +6237,7 @@ async fn test_dol_cp_link_triggers_processing() {
     db.process_record_with_links("SRC", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DST").await.unwrap();
+    let val = db.get_pv("DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 10.0).abs() < 1e-10),
         other => panic!("expected Double(10.0), got {:?}", other),
@@ -6258,7 +6276,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     }
     db.setup_cp_links().await;
 
-    let targets = db.get_cp_targets("CPOUT_TGT").await;
+    let targets = db.get_cp_targets("CPOUT_TGT");
     assert_eq!(
         targets.len(),
         1,
@@ -6277,7 +6295,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
         .await
         .unwrap();
     assert!(
-        db.get_pv("CPOUT_TGT").await.is_ok(),
+        db.get_pv("CPOUT_TGT").is_ok(),
         "the PP OUT link must still reach its target"
     );
 }
@@ -6295,7 +6313,7 @@ async fn test_cpp_link_registration_is_passive_only() {
     ao.dol = "SRC CPP".to_string();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("SRC").await;
+    let targets = db.get_cp_targets("SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "DST");
     assert!(
@@ -6326,7 +6344,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
     db.process_record_with_links("SRC", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DST").await.unwrap();
+    let val = db.get_pv("DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             v.abs() < 1e-10,
@@ -6354,7 +6372,7 @@ async fn test_cpp_link_processes_passive_target() {
     db.process_record_with_links("SRC", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DST").await.unwrap();
+    let val = db.get_pv("DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             (v - 10.0).abs() < 1e-10,
@@ -6385,7 +6403,7 @@ async fn test_cp_link_processes_nonpassive_target() {
     db.process_record_with_links("SRC", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DST").await.unwrap();
+    let val = db.get_pv("DST").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             (v - 10.0).abs() < 1e-10,
@@ -6413,7 +6431,7 @@ async fn test_cp_overrides_cpp_for_same_edge() {
         rec_arc.write().common.inp = "SRC CPP".to_string();
     }
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("SRC").await;
+    let targets = db.get_cp_targets("SRC");
     assert_eq!(
         targets.len(),
         1,
@@ -6437,7 +6455,7 @@ async fn test_seq_dol_cp_link_registration() {
     seq.dol1 = "SENSOR CP".to_string();
     db.add_record("MY_SEQ", Box::new(seq)).await.unwrap();
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("SENSOR").await;
+    let targets = db.get_cp_targets("SENSOR");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MY_SEQ");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6454,7 +6472,7 @@ async fn test_sel_nvl_cp_link_registration() {
     sel.nvl = "INDEX_SRC CP".to_string();
     db.add_record("MY_SEL", Box::new(sel)).await.unwrap();
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("INDEX_SRC").await;
+    let targets = db.get_cp_targets("INDEX_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "MY_SEL");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6473,7 +6491,7 @@ async fn test_sdis_cp_link_registration() {
         rec_arc.write().common.sdis = "DISABLE_SRC CP".to_string();
     }
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("DISABLE_SRC").await;
+    let targets = db.get_cp_targets("DISABLE_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "GUARDED");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6568,7 +6586,7 @@ async fn test_rpro_causes_reprocessing() {
     db.process_record_with_links("DEST", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DEST").await.unwrap();
+    let val = db.get_pv("DEST").unwrap();
     assert_eq!(val.to_f64().unwrap() as i64, 10);
 
     db.put_pv_no_process("SRC", EpicsValue::Double(20.0))
@@ -6582,7 +6600,7 @@ async fn test_rpro_causes_reprocessing() {
     db.process_record_with_links("DEST", &mut visited, 0)
         .await
         .unwrap();
-    let val = db.get_pv("DEST").await.unwrap();
+    let val = db.get_pv("DEST").unwrap();
     assert_eq!(val.to_f64().unwrap() as i64, 20);
     let rec = db.get_record("DEST").unwrap();
     let inst = rec.read();
@@ -6604,7 +6622,7 @@ async fn test_tsel_cp_link_registration() {
         inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
     }
     db.setup_cp_links().await;
-    let targets = db.get_cp_targets("TSE_SRC").await;
+    let targets = db.get_cp_targets("TSE_SRC");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].record, "TARGET");
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
@@ -6682,13 +6700,16 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // Only the source record name (with `.TIME` stripped) should
             // reach the lset, mirroring C `TSEL_modified` truncating the
             // pvname at `.TIME`.
@@ -6748,13 +6769,16 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for TimeCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(1.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
             // fallback `external_link_time("ca://TSE_SRC")`.
@@ -7866,7 +7890,7 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("CVT_LO.VAL").await.unwrap(),
+        db.get_pv("CVT_LO.VAL").unwrap(),
         EpicsValue::Long(2147483647),
         "CBUG-E2: saturate. x86-64 C: -2147483648"
     );
@@ -7875,14 +7899,11 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(70000.9))
         .await
         .unwrap();
-    assert_eq!(
-        db.get_pv("CVT_LO.VAL").await.unwrap(),
-        EpicsValue::Long(70000)
-    );
+    assert_eq!(db.get_pv("CVT_LO.VAL").unwrap(), EpicsValue::Long(70000));
     db.put_record_field_from_ca("CVT_LO", "VAL", EpicsValue::Double(-3.9))
         .await
         .unwrap();
-    assert_eq!(db.get_pv("CVT_LO.VAL").await.unwrap(), EpicsValue::Long(-3));
+    assert_eq!(db.get_pv("CVT_LO.VAL").unwrap(), EpicsValue::Long(-3));
 
     // FTVL=SHORT destination: each element clamps at the ELEMENT's width, so
     // 70000 -> 32767. A C IOC converts through a 32-bit instruction and then
@@ -7894,7 +7915,7 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     )
     .await
     .unwrap();
-    match db.get_pv("CVT_WFS.VAL").await.unwrap() {
+    match db.get_pv("CVT_WFS.VAL").unwrap() {
         EpicsValue::ShortArray(v) => assert_eq!(
             v,
             vec![1, 2, -3, 32767],
@@ -8013,14 +8034,8 @@ async fn test_compress_ouse_and_inpn_fields() {
         .unwrap();
     let rec = db.get_record("CMP_OUSE").unwrap();
 
-    assert_eq!(
-        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
-        EpicsValue::ULong(0)
-    );
-    assert_eq!(
-        db.get_pv("CMP_OUSE.INPN").await.unwrap(),
-        EpicsValue::Long(0)
-    );
+    assert_eq!(db.get_pv("CMP_OUSE.OUSE").unwrap(), EpicsValue::ULong(0));
+    assert_eq!(db.get_pv("CMP_OUSE.INPN").unwrap(), EpicsValue::Long(0));
 
     // Both are special(SPC_NOMOD): refused on every runtime route.
     for field in ["OUSE", "INPN"] {
@@ -8042,12 +8057,9 @@ async fn test_compress_ouse_and_inpn_fields() {
             .unwrap();
     }
     db.process_record("CMP_OUSE").await.unwrap();
+    assert_eq!(db.get_pv("CMP_OUSE.NUSE").unwrap(), EpicsValue::ULong(1));
     assert_eq!(
-        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
-        EpicsValue::ULong(1)
-    );
-    assert_eq!(
-        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
+        db.get_pv("CMP_OUSE.OUSE").unwrap(),
         EpicsValue::ULong(1),
         "monitor() latches OUSE = NUSE on a publishing cycle"
     );
@@ -8056,14 +8068,8 @@ async fn test_compress_ouse_and_inpn_fields() {
     db.put_record_field_from_ca("CMP_OUSE", "RES", EpicsValue::Short(1))
         .await
         .unwrap();
-    assert_eq!(
-        db.get_pv("CMP_OUSE.NUSE").await.unwrap(),
-        EpicsValue::ULong(0)
-    );
-    assert_eq!(
-        db.get_pv("CMP_OUSE.OUSE").await.unwrap(),
-        EpicsValue::ULong(0)
-    );
+    assert_eq!(db.get_pv("CMP_OUSE.NUSE").unwrap(), EpicsValue::ULong(0));
+    assert_eq!(db.get_pv("CMP_OUSE.OUSE").unwrap(), EpicsValue::ULong(0));
 
     // The latch is what gates the NUSE post: that first RES moved NUSE 1 -> 0,
     // so it posted NUSE alongside VAL...
@@ -8201,7 +8207,6 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
     let mut visited = HashSet::new();
     let value = db
         .read_link_value_soft(&parsed, true, &mut visited, 0)
-        .await
         .expect("calc link evaluates");
     match value {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
@@ -8246,13 +8251,16 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for CalcCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
             (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
         }
-        async fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
             (name == "REMOTE:A").then_some((self.secs, self.nsec, 0))
         }
     }
@@ -8753,7 +8761,7 @@ async fn test_bare_out_link_does_not_process_target() {
         .unwrap();
 
     // The value must have landed on the target.
-    let tgt_val = db.get_pv("TGT_OUT").await.unwrap();
+    let tgt_val = db.get_pv("TGT_OUT").unwrap();
     assert_eq!(
         tgt_val.to_f64().unwrap(),
         33.0,
@@ -8860,15 +8868,12 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     let _epoch = db.lock_records(["MR_R5_OWNED"]).await;
 
     // Processing the member via the `_already_locked` entry while the
-    // epoch is held must NOT dead-lock — bounded by a timeout so a
-    // regression (reverting to the gate-acquiring entry) fails loudly.
+    // epoch is held must NOT dead-lock. Since H6 that entry is a `fn` —
+    // it holds no `.await` at all, so a regression that put the
+    // gate-acquiring entry back would not even compile here; before H6 this
+    // was a `tokio::time::timeout` around the same call.
     let mut visited = HashSet::new();
-    let res = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited, 0),
-    )
-    .await
-    .expect("process_record_with_links_already_locked must not dead-lock under a held epoch");
+    let res = db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited, 0);
     res.expect("owner-path processing of an owned member must succeed");
     assert!(visited.contains("MR_R5_OWNED"));
 }
@@ -9036,18 +9041,21 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     }
     #[epics_base_rs::async_trait]
     impl LinkSet for RawCaLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             true
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             Some(EpicsValue::Double(7.0))
         }
-        async fn alarm_severity(&self, _: &str) -> Option<i32> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn alarm_severity(&self, _: &str) -> Option<i32> {
             // Mirror the real CA resolver: only a non-zero severity is a
             // contribution worth returning.
             if self.sevr > 0 { Some(self.sevr) } else { None }
         }
-        async fn alarm_status(&self, _: &str) -> Option<i32> {
+        fn alarm_status(&self, _: &str) -> Option<i32> {
             Some(self.stat)
         }
     }
@@ -9927,7 +9935,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     db.process_record_with_links("AO_INCR_DST", &mut visited, 0)
         .await
         .unwrap();
-    let v1 = db.get_pv("AO_INCR_DST").await.unwrap();
+    let v1 = db.get_pv("AO_INCR_DST").unwrap();
     assert!(
         matches!(v1, EpicsValue::Double(v) if (v - 10.0).abs() < 1e-10),
         "cycle 1 VAL must be 10, got {v1:?}"
@@ -9956,7 +9964,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     db.process_record_with_links("AO_INCR_DST", &mut visited2, 0)
         .await
         .unwrap();
-    let v2 = db.get_pv("AO_INCR_DST").await.unwrap();
+    let v2 = db.get_pv("AO_INCR_DST").unwrap();
     assert!(
         matches!(v2, EpicsValue::Double(v) if (v - 15.0).abs() < 1e-10),
         "cycle 2 must increment from PVAL=10 (=>15), not caput VAL=100 (=>105); got {v2:?}"
@@ -9980,7 +9988,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     ao.init_record(0).unwrap(); // recGblInitConstantLink: VAL = 7
     db.add_record("AO_CONST", Box::new(ao)).await.unwrap();
 
-    let v0 = db.get_pv("AO_CONST").await.unwrap();
+    let v0 = db.get_pv("AO_CONST").unwrap();
     assert!(
         matches!(v0, EpicsValue::Double(v) if (v - 7.0).abs() < 1e-10),
         "constant DOL must seed VAL=7 at init, got {v0:?}"
@@ -9991,7 +9999,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     db.process_record_with_links("AO_CONST", &mut visited, 0)
         .await
         .unwrap();
-    let v1 = db.get_pv("AO_CONST").await.unwrap();
+    let v1 = db.get_pv("AO_CONST").unwrap();
     assert!(
         matches!(v1, EpicsValue::Double(v) if (v - 7.0).abs() < 1e-10),
         "process must not change a constant-DOL VAL, got {v1:?}"
@@ -10010,7 +10018,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     db.process_record_with_links("AO_CONST", &mut visited2, 0)
         .await
         .unwrap();
-    let v2 = db.get_pv("AO_CONST").await.unwrap();
+    let v2 = db.get_pv("AO_CONST").unwrap();
     assert!(
         matches!(v2, EpicsValue::Double(v) if (v - 42.0).abs() < 1e-10),
         "constant DOL must not clobber a client caput on reprocess; expected 42, got {v2:?}"
@@ -10040,7 +10048,7 @@ async fn ao_constant_dol_incremental_does_not_increment() {
             .await
             .unwrap();
     }
-    let v = db.get_pv("AO_CONST_INCR").await.unwrap();
+    let v = db.get_pv("AO_CONST_INCR").unwrap();
     assert!(
         matches!(v, EpicsValue::Double(x) if (x - 5.0).abs() < 1e-10),
         "constant DOL + Incremental must stay at the constant (5), not accumulate; got {v:?}"
@@ -10063,7 +10071,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     lo.init_record(0).unwrap();
     db.add_record("LO_CONST", Box::new(lo)).await.unwrap();
 
-    let v0 = db.get_pv("LO_CONST").await.unwrap();
+    let v0 = db.get_pv("LO_CONST").unwrap();
     assert_eq!(
         v0.to_f64(),
         Some(9.0),
@@ -10079,7 +10087,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     db.process_record_with_links("LO_CONST", &mut visited, 0)
         .await
         .unwrap();
-    let v1 = db.get_pv("LO_CONST").await.unwrap();
+    let v1 = db.get_pv("LO_CONST").unwrap();
     assert_eq!(
         v1.to_f64(),
         Some(99.0),
@@ -10106,7 +10114,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     so.init_record(0).unwrap();
     db.add_record("SO_CONST", Box::new(so)).await.unwrap();
 
-    let v0 = db.get_pv("SO_CONST").await.unwrap();
+    let v0 = db.get_pv("SO_CONST").unwrap();
     assert!(
         matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "1.50"),
         "constant DOL must seed VAL=\"1.50\" at init (cvt_st_st copies the text), got {v0:?}"
@@ -10123,7 +10131,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     db.process_record_with_links("SO_CONST", &mut visited, 0)
         .await
         .unwrap();
-    let v1 = db.get_pv("SO_CONST").await.unwrap();
+    let v1 = db.get_pv("SO_CONST").unwrap();
     assert!(
         matches!(&v1, EpicsValue::String(s) if s.as_str_lossy() == "world"),
         "constant DOL must not clobber a string caput on reprocess; got {v1:?}"
@@ -10297,7 +10305,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
         "FLNK must not fire on the ODLY delaying cycle"
     );
     assert_eq!(
-        db.get_pv("CO6_TGT").await.unwrap().to_f64(),
+        db.get_pv("CO6_TGT").unwrap().to_f64(),
         Some(0.0),
         "FLNK target must not be processed on the delaying cycle"
     );
@@ -10312,7 +10320,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
         "FLNK must fire on the delayed cycle"
     );
     assert_eq!(
-        db.get_pv("CO6_TGT").await.unwrap().to_f64(),
+        db.get_pv("CO6_TGT").unwrap().to_f64(),
         Some(1.0),
         "FLNK target processed exactly once (delayed cycle only), not on both cycles"
     );
@@ -10352,7 +10360,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
         .unwrap();
 
     // Selected input (INPB) source WAS processed by its PP link → 42.
-    let sel_val = db.get_pv("R7_SEL").await.unwrap();
+    let sel_val = db.get_pv("R7_SEL").unwrap();
     match sel_val {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -10360,7 +10368,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
         ),
         other => panic!("expected Double(42.0), got {other:?}"),
     }
-    let srcb = db.get_pv("R7_SRCB").await.unwrap();
+    let srcb = db.get_pv("R7_SRCB").unwrap();
     match srcb {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -10371,7 +10379,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
     // KEY: the NON-selected input (INPA) source must NOT be fetched, so
     // its PP link never fires and its VAL stays at the default 0. Pre-fix
     // the framework fetched ALL inputs and this would be 42.
-    let srca = db.get_pv("R7_SRCA").await.unwrap();
+    let srca = db.get_pv("R7_SRCA").unwrap();
     match srca {
         EpicsValue::Double(v) => assert!(
             v.abs() < 1e-10,
@@ -10411,7 +10419,7 @@ async fn sel_high_mode_fetches_all_inputs() {
         .unwrap();
 
     // High picks the maximum of the fetched inputs → 42.
-    let sel_val = db.get_pv("R7H_SEL").await.unwrap();
+    let sel_val = db.get_pv("R7H_SEL").unwrap();
     match sel_val {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -10420,7 +10428,7 @@ async fn sel_high_mode_fetches_all_inputs() {
         other => panic!("expected Double(42.0), got {other:?}"),
     }
     // BOTH sources processed: the non-max source still got fetched.
-    let srca = db.get_pv("R7H_SRCA").await.unwrap();
+    let srca = db.get_pv("R7H_SRCA").unwrap();
     match srca {
         EpicsValue::Double(v) => assert!(
             (v - 10.0).abs() < 1e-10,
@@ -10428,7 +10436,7 @@ async fn sel_high_mode_fetches_all_inputs() {
         ),
         other => panic!("expected Double(10.0), got {other:?}"),
     }
-    let srcb = db.get_pv("R7H_SRCB").await.unwrap();
+    let srcb = db.get_pv("R7H_SRCB").unwrap();
     match srcb {
         EpicsValue::Double(v) => assert!(
             (v - 42.0).abs() < 1e-10,
@@ -10461,7 +10469,7 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
         .await
         .unwrap();
 
-    let val = db.get_pv("R8_SEL").await.unwrap();
+    let val = db.get_pv("R8_SEL").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             (v - 5.0).abs() < 1e-10,
@@ -10498,7 +10506,7 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
         .await
         .unwrap();
 
-    let val = db.get_pv("R8N_SEL").await.unwrap();
+    let val = db.get_pv("R8N_SEL").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             (v - 7.0).abs() < 1e-10,
@@ -10530,7 +10538,7 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
         .await
         .unwrap();
 
-    let val = db.get_pv("R8_SEL_EMPTY").await.unwrap();
+    let val = db.get_pv("R8_SEL_EMPTY").unwrap();
     match val {
         EpicsValue::Double(v) => assert!(
             v.is_nan(),

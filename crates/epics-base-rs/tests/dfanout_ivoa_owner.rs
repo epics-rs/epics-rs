@@ -98,13 +98,13 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(9.0),
         "IVOA=Set_output_to_IVOV assigns prec->val = prec->ivov \
          (dfanoutRecord.c:137) — VAL itself, not just the pushed copy"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(9.0),
         "push_values sends prec->val, which is now IVOV"
     );
@@ -133,7 +133,7 @@ async fn r15_65_a_failed_push_does_not_retro_trigger_the_ivov_arm() {
         "precondition: the failed OUTA put alarms the record (dbLink.c:444-446)"
     );
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "the IVOA switch is decided on the checkAlarms severity BEFORE the push \
          (dfanoutRecord.c:128); an INVALID raised BY the push must not reach \
@@ -154,12 +154,12 @@ async fn r15_65_ivoa_continue_pushes_val_unchanged() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "Continue_normally leaves VAL alone"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(200.0),
         "…and pushes it"
     );
@@ -178,12 +178,12 @@ async fn r15_65_ivoa_dont_drive_suppresses_the_push() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "Don't_drive leaves VAL alone"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(0.0),
         "…and drives nothing"
     );

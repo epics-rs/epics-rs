@@ -59,7 +59,7 @@ impl CountingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for CountingLset {
-    async fn is_connected(&self, name: &str) -> bool {
+    fn is_connected(&self, name: &str) -> bool {
         self.cache.lock().contains_key(name)
     }
 
@@ -69,7 +69,7 @@ impl LinkSet for CountingLset {
         self.cache.lock().get(name).cloned()
     }
 
-    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
         self.cache.lock().get(name).cloned()
     }
 

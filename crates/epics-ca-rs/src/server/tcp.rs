@@ -2207,7 +2207,7 @@ where
         sub.task.abort();
         match &sub.target {
             ChannelTarget::SimplePv(pv) => {
-                pv.remove_subscriber(sub.sub_id).await;
+                pv.remove_subscriber(sub.sub_id);
             }
             ChannelTarget::RecordField { record, .. } => {
                 record.write().remove_subscriber(sub.sub_id);
@@ -3454,7 +3454,7 @@ pub(crate) async fn dispatch_message(
                         .unwrap_or_default();
                     match &sub.target {
                         ChannelTarget::SimplePv(pv) => {
-                            pv.remove_subscriber(sub.sub_id).await;
+                            pv.remove_subscriber(sub.sub_id);
                         }
                         ChannelTarget::RecordField { record, .. } => {
                             record.write().remove_subscriber(sub.sub_id);
@@ -3710,7 +3710,7 @@ pub(crate) async fn dispatch_message(
                         sub.task.abort();
                         match &sub.target {
                             ChannelTarget::SimplePv(pv) => {
-                                pv.remove_subscriber(sub.sub_id).await;
+                                pv.remove_subscriber(sub.sub_id);
                             }
                             ChannelTarget::RecordField { record, .. } => {
                                 record.write().remove_subscriber(sub.sub_id);
@@ -4295,7 +4295,7 @@ pub(crate) async fn serve_write_head(
                 };
                 hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
             } else {
-                pv.set(new_value).await;
+                pv.set(new_value);
                 Ok(ProcessCompletion::Sync)
             }
         }
@@ -4797,9 +4797,7 @@ pub(crate) async fn register_subscription(
     {
         match &entry.target {
             ChannelTarget::SimplePv(pv) => {
-                let rx_opt = pv
-                    .add_subscriber_on(&state.event_user, sub_id, native_type, mask)
-                    .await;
+                let rx_opt = pv.add_subscriber_on(&state.event_user, sub_id, native_type, mask);
                 let Some(rx) = rx_opt else {
                     // per-PV subscriber cap reached.
                     // Previously dropped silently
@@ -4840,8 +4838,7 @@ pub(crate) async fn register_subscription(
                 // record-field `attach_filter_to_last_subscriber`
                 // path below; both source the chain from the single
                 // `ChannelEntry::filter_chain` owner.
-                pv.attach_filters_to_subscriber(sub_id, entry.filter_chain())
-                    .await;
+                pv.attach_filters_to_subscriber(sub_id, entry.filter_chain());
 
                 let denied = Arc::new(AtomicBool::new(access_denied));
                 // initial event is the snapshot when read

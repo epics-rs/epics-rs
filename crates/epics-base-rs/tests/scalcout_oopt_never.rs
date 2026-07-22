@@ -69,12 +69,12 @@ async fn scalcout_never_writes_nothing_to_out() {
     }
 
     assert_eq!(
-        db.get_pv("S:NEVER").await.unwrap().to_f64(),
+        db.get_pv("S:NEVER").unwrap().to_f64(),
         Some(7.0),
         "the calc still runs — only the OUT write is suppressed"
     );
     assert_eq!(
-        db.get_pv("T:NEVER").await.unwrap(),
+        db.get_pv("T:NEVER").unwrap(),
         EpicsValue::Double(0.0),
         "C `case scalcoutOOPT_Never: doOutput = 0` — the OUT target never moves"
     );
@@ -89,7 +89,7 @@ async fn scalcout_every_time_still_drives_out() {
     process(&db, "S:EVERY").await;
 
     assert_eq!(
-        db.get_pv("T:EVERY").await.unwrap(),
+        db.get_pv("T:EVERY").unwrap(),
         EpicsValue::Double(7.0),
         "OOPT=Every Time drives the OUT link"
     );
@@ -105,7 +105,7 @@ async fn acalcout_never_writes_nothing_to_out() {
     }
 
     assert_eq!(
-        db.get_pv("T:ANEVER").await.unwrap(),
+        db.get_pv("T:ANEVER").unwrap(),
         EpicsValue::Double(0.0),
         "C `aCalcoutRecord.c` Never: doOutput = 0"
     );
@@ -129,7 +129,7 @@ async fn an_unnamed_oopt_index_drives_no_output() {
     process(&db, "S:EVERY").await;
 
     assert_eq!(
-        db.get_pv("T:EVERY").await.unwrap(),
+        db.get_pv("T:EVERY").unwrap(),
         EpicsValue::Double(0.0),
         "C initialises doOutput = 0 and only a matching case raises it"
     );

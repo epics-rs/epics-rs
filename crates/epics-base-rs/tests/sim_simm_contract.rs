@@ -58,7 +58,7 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
         .await
         .unwrap();
 
-    let val = db.get_pv("SIMCONST").await.unwrap();
+    let val = db.get_pv("SIMCONST").unwrap();
     assert_eq!(
         val,
         EpicsValue::Long(42),
@@ -101,7 +101,7 @@ async fn simm_no_with_unset_links_does_not_simulate() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("SIMOFF").await.unwrap(),
+        db.get_pv("SIMOFF").unwrap(),
         EpicsValue::Long(7),
         "SIMM=NO must not copy SVAL into VAL"
     );
@@ -480,7 +480,7 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("RAWIN").await.unwrap(),
+        db.get_pv("RAWIN").unwrap(),
         EpicsValue::Long(7),
         "C's default arm performs NO device substitution — SVAL must not reach VAL"
     );
@@ -517,7 +517,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("SINK").await.unwrap(),
+        db.get_pv("SINK").unwrap(),
         EpicsValue::Long(0),
         "the default arm returns before the SIOL redirect — SIOL must not be written"
     );
@@ -546,7 +546,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
         .await
         .unwrap();
 
-    assert_eq!(db.get_pv("BSINK").await.unwrap(), EpicsValue::Long(0));
+    assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
     let rec = db.get_record("BRAW").unwrap();
     let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
@@ -638,7 +638,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     }
 
     assert_eq!(
-        db.get_pv("E5TGT").await.unwrap(),
+        db.get_pv("E5TGT").unwrap(),
         EpicsValue::Long(0),
         "busyRecord.c:399-401 returns before write_busy — the OUT target keeps its value"
     );
@@ -667,7 +667,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("E5STGT").await.unwrap(),
+        db.get_pv("E5STGT").unwrap(),
         EpicsValue::Long(0),
         "the `if (status) return status` precedes the `dbPutLink(&prec->siol, ...)`"
     );

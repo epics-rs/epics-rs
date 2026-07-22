@@ -66,7 +66,7 @@ async fn r14_61_string_target_receives_osv_not_oval() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("SO_TGT").await.unwrap(),
+        db.get_pv("SO_TGT").unwrap(),
         EpicsValue::String("ocal-str".into()),
         "a DBF_STRING target takes DBR_STRING from OSV (devsCalcoutSoft.c:131-134)"
     );
@@ -95,7 +95,7 @@ async fn r14_61_char_array_target_receives_sval_bytes() {
     let mut want = b"calc-str".to_vec();
     want.resize(12, 0);
     assert_eq!(
-        db.get_pv("WF_TGT").await.unwrap(),
+        db.get_pv("WF_TGT").unwrap(),
         EpicsValue::CharArray(want),
         "a DBF_CHAR array target takes DBF_CHAR from SVAL (devsCalcoutSoft.c:136-138)"
     );
@@ -120,7 +120,7 @@ async fn r14_61_numeric_target_still_receives_oval() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("AI_TGT").await.unwrap(),
+        db.get_pv("AI_TGT").unwrap(),
         EpicsValue::Double(7.0),
         "a numeric target keeps the DBR_DOUBLE OVAL put (devsCalcoutSoft.c:140)"
     );

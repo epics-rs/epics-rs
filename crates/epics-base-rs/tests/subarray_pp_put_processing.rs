@@ -47,7 +47,7 @@ async fn field(
     rec: &str,
     f: &str,
 ) -> Option<EpicsValue> {
-    db.get_pv(&format!("{rec}.{f}")).await.ok()
+    db.get_pv(&format!("{rec}.{f}")).ok()
 }
 
 /// C, `caput SA:CONST.NELM 2` on `INP="[1,2,3,4]" MALM=8 INDX=0`:
@@ -61,7 +61,7 @@ async fn nelm_put_narrows_the_slice_it_does_not_empty_val() {
         .expect("subArray NELM is pp(TRUE), not SPC_NOMOD — the caput must land");
 
     assert_eq!(
-        db.get_pv("SA:CONST").await.unwrap(),
+        db.get_pv("SA:CONST").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0]),
         "NELM=2 keeps the first two elements of the constant, it does not wipe VAL"
     );
@@ -95,7 +95,7 @@ async fn nelm_put_above_malm_clamps_at_process() {
         Some(EpicsValue::Long(4))
     );
     assert_eq!(
-        db.get_pv("SA:CONST").await.unwrap(),
+        db.get_pv("SA:CONST").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
     );
 }
@@ -111,7 +111,7 @@ async fn indx_put_moves_the_window() {
         .expect("subArray INDX is pp(TRUE) — the caput must land");
 
     assert_eq!(
-        db.get_pv("SA:CONST").await.unwrap(),
+        db.get_pv("SA:CONST").unwrap(),
         EpicsValue::DoubleArray(vec![2.0, 3.0, 4.0])
     );
     assert_eq!(
@@ -158,7 +158,7 @@ async fn empty_inp_val_put_processes_and_nelm_put_re_subsets() {
     .await
     .unwrap();
     assert_eq!(
-        db.get_pv("SA:EMPTY").await.unwrap(),
+        db.get_pv("SA:EMPTY").unwrap(),
         EpicsValue::DoubleArray(vec![20.0, 30.0, 40.0]),
         "VAL is pp(TRUE): the put itself processes and slices"
     );
@@ -167,7 +167,7 @@ async fn empty_inp_val_put_processes_and_nelm_put_re_subsets() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("SA:EMPTY").await.unwrap(),
+        db.get_pv("SA:EMPTY").unwrap(),
         EpicsValue::DoubleArray(vec![30.0, 40.0])
     );
     assert_eq!(

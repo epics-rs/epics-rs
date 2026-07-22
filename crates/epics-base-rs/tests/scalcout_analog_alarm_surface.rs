@@ -80,17 +80,17 @@ async fn severity_at(db: &PvDatabase, a: f64) -> (AlarmSeverity, u16) {
 async fn the_alarm_fields_exist_and_are_writable() {
     let db = build().await;
 
-    assert_eq!(db.get_pv("S:LIM.HIHI").await.unwrap().to_f64(), Some(10.0));
-    assert_eq!(db.get_pv("S:LIM.LOLO").await.unwrap().to_f64(), Some(-10.0));
-    assert_eq!(db.get_pv("S:LIM.HIGH").await.unwrap().to_f64(), Some(5.0));
-    assert_eq!(db.get_pv("S:LIM.LOW").await.unwrap().to_f64(), Some(-5.0));
-    assert_eq!(db.get_pv("S:LIM.HYST").await.unwrap().to_f64(), Some(2.0));
-    assert_eq!(db.get_pv("S:LIM.LALM").await.unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("S:LIM.HIHI").unwrap().to_f64(), Some(10.0));
+    assert_eq!(db.get_pv("S:LIM.LOLO").unwrap().to_f64(), Some(-10.0));
+    assert_eq!(db.get_pv("S:LIM.HIGH").unwrap().to_f64(), Some(5.0));
+    assert_eq!(db.get_pv("S:LIM.LOW").unwrap().to_f64(), Some(-5.0));
+    assert_eq!(db.get_pv("S:LIM.HYST").unwrap().to_f64(), Some(2.0));
+    assert_eq!(db.get_pv("S:LIM.LALM").unwrap().to_f64(), Some(0.0));
 
     db.put_pv("S:LIM.HIHI", EpicsValue::Double(42.0))
         .await
         .expect("HIHI is a writable DBF_DOUBLE (sCalcoutRecord.dbd:479)");
-    assert_eq!(db.get_pv("S:LIM.HIHI").await.unwrap().to_f64(), Some(42.0));
+    assert_eq!(db.get_pv("S:LIM.HIHI").unwrap().to_f64(), Some(42.0));
 }
 
 /// The C ladder, level by level (`sCalcoutRecord.c:727-748`): HIHI/LOLO are
@@ -141,7 +141,7 @@ async fn hysteresis_holds_the_level_through_lalm() {
         (AlarmSeverity::Major, alarm_status::HIHI_ALARM)
     );
     assert_eq!(
-        db.get_pv("S:LIM.LALM").await.unwrap().to_f64(),
+        db.get_pv("S:LIM.LALM").unwrap().to_f64(),
         Some(10.0),
         "C latches LALM at the LEVEL it alarmed at (hihi), not at VAL"
     );
@@ -178,7 +178,7 @@ async fn an_invalid_limit_excursion_reaches_the_ivoa_gate() {
         "CALC=20 is over HIHI=10 with HHSV=INVALID"
     );
     assert_eq!(
-        db.get_pv("T:IVOA").await.unwrap(),
+        db.get_pv("T:IVOA").unwrap(),
         EpicsValue::Double(0.0),
         "IVOA=Don't drive outputs vetoes the OUT write on the INVALID cycle"
     );

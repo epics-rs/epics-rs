@@ -544,14 +544,16 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
             Err(e) => result = Err(e),
         }
     }
+    // C reports a failed wire write on the task, via `errlogPrintf`
+    // (`dbCa.c:1240-1244`) — for BOTH flavours: the `status != ECA_NORMAL`
+    // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
+    // (`dbCa.c:1226-1244`). The record has already returned; its alarm came
+    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does.
+    if let Err(e) = &result {
+        eprintln!("dbCa: external link put to '{}' failed: {e}", key.name);
+    }
     if let Some(c) = completion {
         c.resolve(result);
-    } else if let Err(e) = result {
-        // Plain flavour: C reports a failed wire write only on the task, via
-        // `errlogPrintf` (`dbCa.c:1240-1244`). The record has already
-        // returned; its alarm came from the staging gate, exactly as
-        // `dbCaPutLink`'s `-1` does.
-        eprintln!("dbCa: external link put to '{}' failed: {e}", key.name);
     }
 }
 

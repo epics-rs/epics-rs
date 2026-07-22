@@ -19,7 +19,7 @@
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -203,11 +203,135 @@ struct ChanStat {
 // the new connection's TCP-level connect can race with the OS-level
 // release of the old port, surfacing as ConnectionRefused.
 
-/// Type-erased read half. We accept either a plain TCP read half or a
-/// TLS read half through the same code path.
-type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+/// Type-erased read half. We accept a plain TCP read half, a TLS read half, or
+/// a blocking pump's adapter through the same code path.
+pub(crate) type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 /// Type-erased write half.
-type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+pub(crate) type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+/// The EPICS priority a client connection's two pump threads run at.
+///
+/// pvxs gives its client reactor thread `epicsThreadPriorityCAServerLow-2`
+/// (`pvxs/src/client.cpp`, the same `PVXTCP` band the server's acceptor takes),
+/// and the server driver in this crate takes 18 for exactly that reason. A
+/// client pump does the same job — move bytes between a socket and a frame
+/// pipeline — so it takes the same number rather than a new one: splitting how
+/// work is scheduled *internally* must not change how it is scheduled relative
+/// to everything else.
+const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    epics_base_rs::runtime::task::ThreadPriority::Custom(18);
+
+/// Dial `target` and drive it with two blocking pump threads.
+///
+/// Compiled on every target, not only the ones that select it: the RTEMS build
+/// is not the only caller — [`ServerConn::connect_blocking`] is public, and a
+/// host test that wants both transports in one binary needs this to exist
+/// unconditionally. Nothing here names `tokio::net`, so it costs the target
+/// nothing to keep it always-on.
+///
+/// The two bounds are deliberately different values and must not be collapsed
+/// into one; see [`dial_pva`] for what each one is.
+fn dial_blocking(
+    target: SocketAddr,
+    connect_timeout: Duration,
+    write_deadline: Duration,
+) -> PvaResult<(DynRead, DynWrite)> {
+    use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
+
+    // `connect_timeout` rather than `connect`: this is a blocking syscall, and
+    // it is the one place in the blocking path that is NOT on a pump thread. On
+    // RTEMS the caller is a bare thread, so blocking it is correct and is what
+    // the server driver does. On a host taking this path it occupies a runtime
+    // worker for at most `connect_timeout`, which is why the bound is passed
+    // rather than left to the OS.
+    let stream =
+        std::net::TcpStream::connect_timeout(&target, connect_timeout).map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::TimedOut => PvaError::Timeout,
+                _ => PvaError::Io(e),
+            }
+        })?;
+    // `read_timeout` keeps `PumpConfig`'s effectively-infinite default, and
+    // that is load-bearing rather than a default taken for lack of a better
+    // value. `reader_pump` ends the connection when its `SO_RCVTIMEO` expires,
+    // so any finite value here is an idle-disconnect bound — and an idle PVA
+    // circuit is *supposed* to be silent between echoes (15 s by default,
+    // `heartbeat_interval`), with `tcp_timeout` (40 s) the only thing entitled
+    // to call it dead. Handing the pump a per-operation deadline instead makes
+    // every connection quieter than one operation self-destruct. What ends a
+    // parked reader here is `ReaderPumpGuard`'s `shutdown`, driven by the
+    // cancellation token the heartbeat already fires — the same mechanism the
+    // server driver relies on for the same reason.
+    let (reader, writer) = drive_socket_blocking(
+        stream,
+        "PVAC",
+        &target.to_string(),
+        PVA_CLIENT_PRIORITY,
+        &PumpConfig {
+            send_timeout: write_deadline,
+            ..PumpConfig::default()
+        },
+    )
+    .map_err(PvaError::Io)?;
+    Ok((Box::new(reader), Box::new(writer)))
+}
+
+/// Dial `target` and return the connection's two byte halves.
+///
+/// **This is the client's one TCP dial.** [`ServerConn::connect`] and the
+/// name-server connection in `search_engine` both come through it, so there is
+/// one place where "how does this client get bytes onto a socket" is decided
+/// and one place a new transport would have to be added.
+///
+/// Two implementations, selected at compile time and never at runtime:
+///
+/// * hosted — `tokio::net::TcpStream`, split into its two owned halves. What
+///   shipped before this seam existed, unchanged.
+/// * `target_os = "rtems"` or `--cfg pva_blocking_client` —
+///   `runtime::blocking_io`'s two blocking pump threads over one
+///   `Arc<TcpStream>`. RTEMS has no tokio reactor (`tokio::net` does not even
+///   compile for the target), so on that target this is not a preference.
+///
+/// The returned halves are the same `DynRead`/`DynWrite` the TLS path produces,
+/// which is the whole reason the client needed no protocol change to gain a
+/// second transport: `ServerConn::run_handshake_and_spawn` cannot tell them
+/// apart.
+///
+/// # The two bounds
+///
+/// * `connect_timeout` — how long the TCP connect itself may take. Both
+///   transports honour it; it is the client's per-operation deadline
+///   (`ConnConfig::op_timeout`, pvxs `operationTimeout`).
+/// * `write_deadline` — how long **one whole frame** may take to reach the
+///   wire. It exists only on the blocking side, because only there is a write
+///   a parked thread that something has to be entitled to reclaim
+///   (`blocking_io::write_frame_deadline`); the hosted writer task has no such
+///   bound and needs none. Callers pass the connection's own liveness bound —
+///   `ConnConfig::tcp_timeout` — so the pump can never end a circuit the
+///   protocol would still consider alive. Recorded as a deviation in
+///   `doc/pvalink-rtems-design.md` §9.
+pub(crate) async fn dial_pva(
+    target: SocketAddr,
+    connect_timeout: Duration,
+    write_deadline: Duration,
+) -> PvaResult<(DynRead, DynWrite)> {
+    #[cfg(not(any(target_os = "rtems", pva_blocking_client)))]
+    {
+        // The hosted transport has no per-frame write bound to apply.
+        let _ = write_deadline;
+        let stream = timeout(connect_timeout, TcpStream::connect(target))
+            .await
+            .map_err(|_| PvaError::Timeout)?
+            .map_err(PvaError::Io)?;
+        stream.set_nodelay(true).ok();
+        let (reader, writer) = stream.into_split();
+        Ok((Box::new(reader), Box::new(writer)))
+    }
+    #[cfg(any(target_os = "rtems", pva_blocking_client))]
+    {
+        dial_blocking(target, connect_timeout, write_deadline)
+    }
+}
 
 impl ServerConn {
     /// Open a plain TCP connection, run the handshake, and start
@@ -222,15 +346,39 @@ impl ServerConn {
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
-            .await
-            .map_err(|_| PvaError::Timeout)?
-            .map_err(PvaError::Io)?;
-        stream.set_nodelay(true).ok();
-        let (reader, writer) = stream.into_split();
-        let reader: DynRead = Box::new(reader);
-        let writer: DynWrite = Box::new(writer);
+        let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
+    }
+
+    /// Open a plain TCP connection driven by **two blocking threads** instead of
+    /// the tokio reactor, run the handshake, and start background tasks.
+    ///
+    /// The third constructor, beside [`connect`](Self::connect) and
+    /// [`connect_tls`](Self::connect_tls), and the one an RTEMS target uses:
+    /// there is no tokio reactor there, and `tokio::net` does not compile for
+    /// the triple at all.
+    ///
+    /// It is *not* a second protocol. It hands
+    /// [`run_handshake_and_spawn`](Self::run_handshake_and_spawn) the same
+    /// `DynRead`/`DynWrite` the other two do, built from
+    /// `runtime::blocking_io`'s adapters, so the handshake, the reader task's
+    /// frame loop, the writer task, the heartbeat and every operation state
+    /// machine are the same code reached by the same path. The two pump threads
+    /// are owned by the adapters, so they retire when the reader and writer
+    /// tasks let go of them — the same lifecycle the hosted socket halves have.
+    ///
+    /// [`connect`](Self::connect) already selects this transport on RTEMS and
+    /// under `--cfg pva_blocking_client`. This entry point exists for a caller
+    /// that wants it explicitly, and for tests that want both transports in one
+    /// binary.
+    pub async fn connect_blocking(
+        target: SocketAddr,
+        user: &str,
+        host: &str,
+        conn: ConnConfig,
+    ) -> PvaResult<Arc<Self>> {
+        let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout)?;
         Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
     }
 
@@ -2757,6 +2905,104 @@ mod tests {
         assert!(
             conn.is_alive(),
             "application-echo heartbeat must keep the pvxs-shaped link alive"
+        );
+    }
+
+    /// [`ServerConn::connect_blocking`] completes the same handshake as
+    /// [`ServerConn::connect`], on an ordinary host build.
+    ///
+    /// This is deliberately **not** covered by the `--cfg pva_blocking_client`
+    /// suite run, which proves a different thing: that run rebuilds the crate
+    /// with `dial_pva` selecting the blocking transport, so what it exercises is
+    /// `connect`. Nothing in it ever calls this constructor, and a `--cfg` no
+    /// manifest can set is not something a default build can be argued from. So
+    /// the third constructor is asserted here, where the crate is compiled
+    /// exactly as it ships, and the assertion is that the two transports are
+    /// interchangeable at runtime rather than one replacing the other at build
+    /// time.
+    ///
+    /// `#[tokio::test]` — the default `CurrentThread` flavor, on purpose. The
+    /// two pump threads must be able to park while the runtime's only thread
+    /// drives the handshake future, which is the property
+    /// `runtime::task::spawn_dedicated_thread` establishes by declining to
+    /// inherit a current-thread ambient handle. Run this on a `multi_thread`
+    /// flavor and it passes either way, testing nothing.
+    #[tokio::test]
+    async fn connect_blocking_completes_the_same_handshake_as_connect() {
+        use crate::proto::encode_size_into;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let order = ByteOrder::Little;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // SET_BYTE_ORDER + CONNECTION_VALIDATION.
+            let mut hs = Vec::new();
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut hs);
+            let mut payload = Vec::new();
+            payload.put_u32(0x10000, order);
+            payload.put_u16(32_767, order);
+            encode_size_into(1, order, &mut payload);
+            encode_string_into("anonymous", order, &mut payload);
+            PvaHeader::application(
+                true,
+                order,
+                Command::ConnectionValidation.code(),
+                payload.len() as u32,
+            )
+            .write_into(&mut hs);
+            hs.extend_from_slice(&payload);
+            let _ = sock.write_all(&hs).await;
+
+            // Drain the client's CONNECTION_VALIDATION reply, then validate.
+            let mut drain = [0u8; 512];
+            let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut drain)).await;
+            let mut ok = Vec::new();
+            PvaHeader::application(true, order, Command::ConnectionValidated.code(), 1)
+                .write_into(&mut ok);
+            ok.push(0xFF);
+            let _ = sock.write_all(&ok).await;
+
+            // Hold the circuit open past the assertions below, silent. With a
+            // finite pump read timeout this is what tore the connection down.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let conn = ServerConn::connect_blocking(
+            addr,
+            "testuser",
+            "testhost",
+            ConnConfig {
+                op_timeout: Duration::from_secs(2),
+                tcp_timeout: Duration::from_secs(30),
+                max_message_size: None,
+            },
+        )
+        .await
+        .expect("blocking handshake must succeed");
+
+        assert!(
+            conn.is_alive(),
+            "connection must be alive after the blocking handshake"
+        );
+
+        // An idle circuit stays up. The reader pump's `SO_RCVTIMEO` ends the
+        // connection when it expires, so this is what fails if it is ever given
+        // a per-operation deadline (`op_timeout` above is 2 s) instead of
+        // `PumpConfig`'s effectively-infinite default. `tcp_timeout` is 30 s, so
+        // the heartbeat has no opinion yet either.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            conn.is_alive(),
+            "an idle blocking circuit must outlive op_timeout: the reader pump's \
+             receive timeout is not an idle-disconnect bound"
         );
     }
 }

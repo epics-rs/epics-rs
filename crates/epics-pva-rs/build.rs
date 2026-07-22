@@ -39,6 +39,28 @@
 //! Adding a target is a one-line change here, and it is a decision someone has
 //! to make deliberately rather than one that happens by inheritance.
 
+// # `pva_blocking_client` — forcing the blocking client transport on a host
+//
+// The PVA client dials through one seam with two implementations: the tokio
+// `TcpStream` on a hosted target, and `runtime::blocking_io`'s two-thread pump
+// on RTEMS, which has no reactor. Showing that the second one leaves the frame
+// pipeline untouched means running the *whole* host client suite against it,
+// including the integration tests in `tests/`, which are separate crates and so
+// cannot see anything `#[cfg(test)]`.
+//
+// It is a bare `--cfg`, checked below and emitted by nobody:
+//
+//     RUSTFLAGS="--cfg pva_blocking_client" cargo nextest run -p epics-pva-rs
+//
+// A cargo feature was the obvious alternative and is the wrong tool: features
+// unify across the graph, so any crate in a workspace build enabling it would
+// silently move every other crate's PVA client onto the blocking transport. A
+// runtime env var would ship the switch in release binaries, where an operator
+// setting it would change the transport of a production IOC. A `--cfg` that no
+// manifest can turn on cannot reach either place — it exists only for a build
+// someone typed the flag for, which is the same mechanism
+// `scripts/rtems-check.sh` uses for `rtems_boot_linked`.
+
 /// Targets whose libc is backed by a real passwd/group database.
 ///
 /// Every entry is a hosted unix with `getpwnam(3)`, `getgrgid(3)` and
@@ -61,6 +83,8 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(local_account_db)");
+    // Declared, never emitted here. See the note above `PVA_BLOCKING_CLIENT`.
+    println!("cargo::rustc-check-cfg=cfg(pva_blocking_client)");
 
     // `unix` is a precondition rather than a synonym: it is what puts `libc`
     // in the dependency graph at all (`Cargo.toml`, meaning 1 above). Stating

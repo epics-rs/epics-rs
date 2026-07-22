@@ -300,5 +300,74 @@ if [[ ${#failed[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The PVA client probe: a RATCHET, not a pass/fail build.
+#
+# `doc/pvalink-rtems-design.md` §5 stage 2 asks for this crate's target
+# selection to be "extended to include `client`". Taken literally — adding
+# `client` to CRATE_FEATURES — the whole gate goes red, because the client's
+# remaining errors are all UDP (newlib has no `recvmsg`/`cmsghdr`/`CMSG_*`, no
+# `IP_PKTINFO` original-destination recovery) and §4.2 stages that work AFTER
+# this one, deliberately. A gate that is red for work nobody has started yet
+# reports nothing, and stages 3-5 all extend the green one above.
+#
+# So the selection is measured rather than built: the count is the artefact.
+# §1.2 could only report "47, and that is a lower bound" because an unresolved
+# import poisons its module and rustc then suppresses downstream errors in code
+# naming its items — so a file reporting zero was ambiguous between "compiles"
+# and "hidden". Pinning the number here is what stops that count drifting
+# unobserved in either direction:
+#
+#   * MORE than expected — a change put the client further from the target.
+#     That is the regression this exists to catch, and it is fatal.
+#   * FEWER than expected — someone did the work and did not lower the number.
+#     Also fatal, and for the reason the binary census above is bidirectional:
+#     a bound nobody updates stops being a measurement and becomes decoration.
+#
+# History, `--no-default-features --features client -p epics-pva-rs --lib`:
+#
+#     47  before stage 1        29 primary + an 18-error [u8] cascade
+#     29  after stages 1 and 2  cascade gone with search_engine's TcpStream
+#     28  after server_conn's unconditional tokio::net import was removed
+#
+# All 28 are UDP: udp.rs 20, search_engine.rs 7, search.rs 1. `server_conn.rs`
+# and `ops_v2.rs` are at zero, and — since `ops_v2.rs` names nothing from
+# `search_engine`/`udp` — that zero is now a real result rather than a
+# suppressed one, which settles §6 item 1 for that file. `channel.rs` and
+# `context.rs` are also at zero but still name `search_engine::SearchEngine`,
+# so theirs stays suppressed until the UDP stage lands.
+#
+# Portability configuration only: every error is name resolution, which
+# `rtems_boot_linked` does not reach, so the second configuration would cost a
+# full build to re-measure an identical number.
+PVA_CLIENT_TARGET_ERRORS=28
+
+log "== [probe] epics-pva-rs --lib --features client (ratchet)"
+export RUSTFLAGS="$BASE_RUSTFLAGS"
+# rustc's own summary line ("due to 28 previous errors"), which is the number
+# §1.2 and §9 quote. Counting diagnostics out of `--message-format=json`
+# instead means re-deriving it from a field order cargo does not promise, and
+# getting the "could not compile" summary — itself `"level":"error"` — in or
+# out of the total by accident. No line at all means zero errors, and the
+# comparison below is what turns that into a failure rather than a `0`
+# silently passing through some other arm.
+client_errors=$(cargo "${COMMON[@]}" -p epics-pva-rs --lib --features client 2>&1 |
+    grep -oP 'due to \K\d+(?= previous error)' || true)
+client_errors=${client_errors:-0}
+
+if [[ "$client_errors" -ne "$PVA_CLIENT_TARGET_ERRORS" ]]; then
+    echo "RTEMS gate FAILED: the PVA client's target error count moved." >&2
+    echo "  expected: $PVA_CLIENT_TARGET_ERRORS (PVA_CLIENT_TARGET_ERRORS in $0)" >&2
+    echo "  measured: $client_errors" >&2
+    if [[ "$client_errors" -gt "$PVA_CLIENT_TARGET_ERRORS" ]]; then
+        echo "A change moved epics-pva-rs's client further from $TARGET. Reproduce with:" >&2
+    else
+        echo "Fewer errors than recorded — update the number so it keeps measuring:" >&2
+    fi
+    echo "  cargo ${COMMON[*]} -p epics-pva-rs --lib --features client" >&2
+    exit 1
+fi
+
 log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
 log "the portability and the image configuration."
+log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors, all UDP."

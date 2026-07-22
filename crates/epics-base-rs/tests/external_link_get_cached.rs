@@ -18,7 +18,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,7 +33,12 @@ use epics_base_rs::types::EpicsValue;
 /// `get_value` (the network-capable read) counts its calls: the record path
 /// must never reach it.
 struct LazyLset {
-    cache: parking_lot::Mutex<Option<EpicsValue>>,
+    /// Keyed BY LINK NAME, because `pca->pgetNative` belongs to a `caLink`
+    /// and not to the lset. One shared cell would mean "the value of
+    /// whichever link was opened last", so opening link A would warm link
+    /// B's read and B would never miss — making a per-link assertion depend
+    /// on when the work owner's task happened to run.
+    cache: parking_lot::Mutex<HashMap<String, EpicsValue>>,
     /// What `connect_link` publishes into the cache. `None` models a remote that
     /// stays down.
     on_open: Option<EpicsValue>,
@@ -48,7 +53,7 @@ impl LazyLset {
         reads: &Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            cache: parking_lot::Mutex::new(None),
+            cache: parking_lot::Mutex::new(HashMap::new()),
             on_open,
             opens: Arc::clone(opens),
             network_reads: Arc::clone(reads),
@@ -58,8 +63,8 @@ impl LazyLset {
 
 #[async_trait::async_trait]
 impl LinkSet for LazyLset {
-    async fn is_connected(&self, _: &str) -> bool {
-        self.cache.lock().is_some()
+    async fn is_connected(&self, name: &str) -> bool {
+        self.cache.lock().contains_key(name)
     }
 
     /// The network read. Opens on demand — exactly what the record path must
@@ -67,17 +72,17 @@ impl LinkSet for LazyLset {
     async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         self.network_reads.fetch_add(1, Ordering::SeqCst);
         self.connect_link(name).await;
-        self.cache.lock().clone()
+        self.cache.lock().get(name).cloned()
     }
 
-    async fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
-        self.cache.lock().clone()
+    async fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
+        self.cache.lock().get(name).cloned()
     }
 
-    async fn connect_link(&self, _: &str) {
+    async fn connect_link(&self, name: &str) {
         self.opens.fetch_add(1, Ordering::SeqCst);
         if let Some(v) = self.on_open.clone() {
-            *self.cache.lock() = Some(v);
+            self.cache.lock().insert(name.to_string(), v);
         }
     }
 }

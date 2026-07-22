@@ -27,9 +27,59 @@
 //! silent one, which is the property being defended.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
+
+thread_local! {
+    /// Set for the whole life of a facility worker loop — see
+    /// [`on_facility_thread`].
+    ///
+    /// Private to this module on purpose: [`run_facility_loop`] is the only
+    /// thing that can set it, and every facility worker thread runs its loop
+    /// through that function (`no_facility_propagates_a_poisoned_lock` pins
+    /// that for all three), so "this thread is a facility worker" cannot be
+    /// asserted by anything that is not one, and cannot be *missed* by
+    /// anything that is.
+    static ON_FACILITY_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Is the calling thread a background-facility worker — a callback band
+/// ([`super::callback_executor`]), the delayed-callback timer
+/// ([`super::delayed_timer`]) or the scanOnce worker ([`super::scan_once`])?
+///
+/// **The invariant this exists for.** Each facility has a bounded worker set
+/// (one thread per band by default, C `callbackThreadsDefault`, and exactly one
+/// for the timer and for scanOnce), and every unit of work it carries is
+/// enqueued *for that worker*. A worker that parks waiting for async progress
+/// is therefore waiting for something only it could have run: the deferred
+/// callbacks, the FLNK tails, the monitor tails and — on RTEMS, where
+/// [`crate::runtime::task::spawn`] routes here — every other spawned future on
+/// that band. Parking the delayed timer is worse still: it stops every `sleep`,
+/// `interval` and scan period in the process, so a future waiting on a timeout
+/// waits forever.
+///
+/// [`crate::runtime::task::block_on_sync`] is the single gate that consults
+/// this, and refuses rather than deadlocking.
+pub(crate) fn on_facility_thread() -> bool {
+    ON_FACILITY_THREAD.with(Cell::get)
+}
+
+/// Marks the calling thread a facility worker until it is dropped.
+struct FacilityThreadMark(bool);
+
+impl FacilityThreadMark {
+    fn set() -> Self {
+        FacilityThreadMark(ON_FACILITY_THREAD.with(|f| f.replace(true)))
+    }
+}
+
+impl Drop for FacilityThreadMark {
+    fn drop(&mut self) {
+        ON_FACILITY_THREAD.with(|f| f.set(self.0));
+    }
+}
 
 /// Latch for the poison announcement below: set on the first recovery.
 ///
@@ -105,7 +155,15 @@ pub(crate) fn run_isolated(facility: &str, cb: impl FnOnce()) -> bool {
 /// a ring no thread will ever drain. Then the loss is stated — at `Fatal`,
 /// because from this point the facility is gone for the life of the process
 /// while everything around it still looks well.
+///
+/// This is also where the thread marks itself a facility worker
+/// ([`on_facility_thread`]): every worker loop already comes through here, so
+/// no facility — present or future — can acquire a worker thread that has not
+/// been marked. The mark covers the loop's dynamic extent and is restored on
+/// the way out (including on an unwind), so a caller that runs a loop inline on
+/// a borrowed thread does not leave that thread marked afterwards.
 pub(super) fn run_facility_loop(facility: &str, body: impl FnOnce(), on_lost: impl FnOnce()) {
+    let _marked = FacilityThreadMark::set();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
         on_lost();
         errlog_sev_printf(
@@ -231,7 +289,10 @@ mod tests {
             }
             assert!(
                 prod.contains("run_facility_loop("),
-                "{label} does not guard its worker loop: its loss would be silent"
+                "{label} does not guard its worker loop: its loss would be silent, \
+                 and its thread would not be marked a facility worker — so \
+                 `block_on_sync` would hand it a blocking bridge that parks the \
+                 facility"
             );
             assert!(
                 prod.contains("run_isolated("),

@@ -1,8 +1,8 @@
-# RTEMS deviation — `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150, not base's 64
+# RTEMS deviation — we run base's score-arm ceiling of 150 on a target where base runs the POSIX arm's 64
 
 **Status:** recorded deviation, measured on the bring-up box
 **Date:** 2026-07-22
-**Configuration site:** `crates/epics-rtems-boot/csrc/rtems_config.c:131` (§F)
+**Configuration site:** `crates/epics-rtems-boot/csrc/rtems_config.c` §F
 **Upstream reference:** `epics-base` `modules/libcom/RTEMS/posix/rtems_config.c:83`
 
 This file exists so that nobody re-runs a 300-connection ramp on the target to
@@ -12,20 +12,66 @@ during the scope-B session. Nothing is estimated.
 
 ---
 
-## 1. The deviation
+## 1. The deviation — and what shape it actually is
+
+**150 is not a number we invented.** Upstream base carries *two* values, one per
+OS-API arm:
 
 | | value | source |
 |---|---|---|
-| stock EPICS base (POSIX arm) | **64** | `modules/libcom/RTEMS/posix/rtems_config.c:83` |
-| stock EPICS base (score arm) | **150**, spelled `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` | `modules/libcom/RTEMS/score/rtems_config.c:36` |
-| **our guest** | **150** | `crates/epics-rtems-boot/csrc/rtems_config.c:131` |
+| EPICS base, **POSIX** arm | **64**, spelled `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` | `modules/libcom/RTEMS/posix/rtems_config.c:83` |
+| EPICS base, **score** arm | **150**, spelled `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` | `modules/libcom/RTEMS/score/rtems_config.c:36` |
+| **our guest** | **150** | `crates/epics-rtems-boot/csrc/rtems_config.c` §F |
 
-Our shim is derived from base's *POSIX* arm, and the POSIX arm ships 64. Taking
-150 is therefore our deviation from the file we ported, even though the number
-itself is base's own value on its other arm. It is a `#ifndef`/`#define` pair,
-so the build can override it without a source edit.
+Our shim's §F already records that we took base's score-arm value deliberately.
+The deviation is therefore *not* "we picked an arbitrary number" — it is which
+**arm** we take the number from, and that matters because base does not compile
+both:
 
-### Why base caps at 64, and why that reason does not bind here
+- `configure/toolchain.c:32-35` — `#if __RTEMS_MAJOR__>=5` ⟹ `OS_API = posix`,
+  `#else` ⟹ `OS_API = score`.
+- `modules/libcom/RTEMS/Makefile:15` — `SRC_DIRS += ../$(OS_API)`, and `:27`
+  pulls `rtems_config.c` out of whichever arm directory that selected.
+
+So **an RTEMS 6 build of base compiles the POSIX arm, and the value base
+actually runs with on this target is 64.** The score arm's 150 is a value base
+still ships but no longer compiles here. Stated exactly: *we run the score arm's
+150 on a target where base runs the POSIX arm's 64.* That is the deviation.
+
+(The same `OS_API = posix` selection is why our shim is derived from the POSIX
+arm in the first place, and it is cited for the same reason in the stack-class
+argument — handoff §5.2.)
+
+### The cap is not hard-coded — this is the bisect route
+
+`§F` wraps the value in an `#ifndef` / `#define` / `#endif`, deliberately, so a
+build can carry a different ceiling **without a source edit**:
+
+```c
+#ifndef CONFIGURE_MAXIMUM_FILE_DESCRIPTORS
+#define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 150
+#endif
+```
+
+Any `-D CONFIGURE_MAXIMUM_FILE_DESCRIPTORS=N` reaching the shim's compile line
+wins. That compile line is built by `crates/epics-rtems-boot/build.rs`, which
+hands the three `csrc/*.c` files to `cc::Build` (`cc 1.2.60`). The fd=400 image
+in §3 — the one that produced the memory-wall measurement — is an image built
+with a different ceiling, and this `#ifndef` is what makes such an image
+possible without touching this file.
+
+*Inferred, not exercised in this tree:* `build.rs` adds no dedicated knob for
+this — its only `.define()` is `BSP_<bsp>` — so the env-var route would be
+`cc`'s own target `CFLAGS` handling
+(`CFLAGS_armv7_rtems_eabihf=-DCONFIGURE_MAXIMUM_FILE_DESCRIPTORS=400`). That
+follows from `cc`'s documented behaviour; it has not been run from this
+worktree, and nothing here records how the fd=400 image was actually built.
+
+### Why base caps at 64 — SETTLED, and it does not bind on us
+
+Do not re-open this: both halves below are recorded next to the configuration
+itself (`csrc/rtems_config.c` §F) and one of them is a measurement, not an
+argument.
 
 Base's comment sits directly above its `#define`
 (`modules/libcom/RTEMS/posix/rtems_config.c:70-81`) and says, verbatim, that
@@ -36,15 +82,20 @@ that a cap at or above `FD_SETSIZE` "will likely cause applications making
 
 > IOC core components (libca and RSRV) do not make `select()` calls.
 
-Two facts already recorded next to our configuration close this for us:
+Two facts close it:
 
-- **We make no `select()`/`poll()` call either.** `rg 'libc::select|libc::poll|FD_SET'`
-  across `epics-base-rs`, `epics-ca-rs` and `epics-pva-rs` returns zero hits —
-  this port is blocking thread-per-connection with no reactor anywhere.
-- **`FD_SETSIZE` on this BSP is 256, not 64.** newlib's `sys/select.h:33-34`
-  takes the `__rtems__` arm; confirmed by preprocessing with the real BSP
-  include path. 150 is under the ceiling even for a library that *does* call
-  `select()`.
+- **`FD_SETSIZE` on this BSP is 256, not the newlib default of 64.** newlib's
+  `sys/select.h:33-34` takes the `__rtems__` arm — **confirmed by preprocessing
+  with the real BSP include path**, so this is measured rather than reasoned.
+  150 is under that ceiling *even for a library that does call `select()`*, so
+  base's caveat cannot fire at our cap regardless of what any code does.
+- **Nothing of ours calls `select()`/`poll()` anyway.**
+  `rg 'libc::select|libc::poll|FD_SET'` across `epics-base-rs`, `epics-ca-rs`
+  and `epics-pva-rs` returns zero hits — this port is blocking
+  thread-per-connection with no reactor anywhere.
+
+The first fact is the load-bearing one: it holds even if the second stops
+holding. The second would only become relevant again above 256.
 
 The macro spelling is settled too: `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is the
 RTEMS 6 name (`confdefs/libio.h:89` reads it; `confdefs/obsolete.h:109-111`
@@ -153,14 +204,19 @@ RTEMS epoch base and not wall clock.
 
 ## 5. If you are about to change the cap
 
-- Raising it above 256 crosses this BSP's `FD_SETSIZE` and re-opens base's
-  `select()` caveat for any *future* code that multiplexes — ours does not
-  today, but that is a property of the port, not of the platform.
+- **You do not need to edit the source.** §1's `#ifndef` means a `-D` on the
+  shim's compile line carries a different ceiling; that is the bisect route,
+  and it is how an image with a cap other than 150 exists at all.
+- Raising it above 256 crosses this BSP's `FD_SETSIZE`, which re-opens base's
+  `select()` caveat for any code that multiplexes. That is the one place the
+  unaudited question still matters: **libbsd's internals were never audited for
+  `select()` use** (`src/lib.rs` open item 3). Below 256 it cannot bite.
 - Raising it within the guest's current memory buys at most 9 connections
   (§3). Do not spend a target session re-deriving that.
-- Lowering it back to base's 64 costs most of the ceiling for no measured
-  benefit on this BSP. *(Inferred, not measured: our stack has never been run
-  at cap 64. The same `cap − 8` arithmetic would put the fd wall at 56 — 53 is
+- Lowering it back to base's 64 — the value base itself compiles on RTEMS 6 —
+  costs most of the ceiling for no measured benefit on this BSP. *(Inferred,
+  not measured: our stack has never been run at cap 64. The same `cap − 8`
+  arithmetic would put the fd wall at 56 — 53 is
   **C's** number at that cap, not ours, because C holds 11 descriptors at idle
   where we hold 8.)*
 - The number that would actually move the ceiling is per-connection memory,

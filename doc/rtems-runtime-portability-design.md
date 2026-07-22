@@ -664,8 +664,10 @@ These were reasoned from source/library presence, **not** compiled:
   served, #143 refused with `ENFILE`) and heap (151 served on an image whose
   cap was raised to 400, refused with `EAGAIN` on thread creation) — so the
   effective ceiling is 142 and raising the cap alone buys nine. Full record,
-  including why our cap of 150 deviates from stock base's 64 and what an
-  operator can watch: **`doc/rtems-fd-ceiling-deviation.md`**. *Inferred, not
+  including how our cap deviates (we run base's *score*-arm 150 on a target
+  where base compiles the *POSIX* arm and runs 64), how to override it without
+  a source edit, and what an operator can watch:
+  **`doc/rtems-fd-ceiling-deviation.md`**. *Inferred, not
   separately measured:* neither observed refusal was an RTEMS object-table
   exhaustion, and `CONFIGURE_UNLIMITED_OBJECTS` is set
   (`csrc/rtems_config.c`), so the configured task limit was not the binding

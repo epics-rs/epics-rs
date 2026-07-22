@@ -110,7 +110,15 @@ extern void *POSIX_Init(void *argument);
  * across epics-base-rs, epics-ca-rs and epics-pva-rs returns zero hits, because
  * this port is blocking thread-per-connection with no reactor anywhere. Base's
  * own score arm sets 150 (`score/rtems_config.c:36`), so that is the value
- * taken here.
+ * taken here — 150 is base's own number, not one invented for this shim.
+ *
+ * But base does not compile both arms. configure/toolchain.c:32-35 selects
+ * OS_API = posix when __RTEMS_MAJOR__ >= 5, and RTEMS/Makefile:15 (`SRC_DIRS +=
+ * ../$(OS_API)`) with :27 pulls rtems_config.c out of the arm that selected.
+ * So an RTEMS 6 build of base compiles the POSIX arm, and the ceiling base
+ * ACTUALLY RUNS WITH on this target is 64. The deviation is which arm's number
+ * we run, not the number: we run the score arm's 150 where base runs the POSIX
+ * arm's 64.
  *
  * This is the binding constraint on concurrent clients: one connection is one
  * descriptor however many threads serve it.
@@ -124,11 +132,19 @@ extern void *POSIX_Init(void *argument);
  * The FD_SETSIZE worry is settled too, and does not bind: newlib's
  * sys/select.h:33-34 takes the __rtems__ arm and defines FD_SETSIZE 256
  * (confirmed by preprocessing with the real BSP include path), so 150 is under
- * the ceiling even for a library that does call select().
- * Overridable from the build so the box can bisect it without a source edit.
+ * the ceiling even for a library that does call select(). That measurement is
+ * the load-bearing half — it holds whatever our own code does, and only a cap
+ * above 256 would re-open the question. Do not re-litigate it.
+ *
+ * THE VALUE BELOW IS NOT HARD-CODED. The #ifndef wrapper is deliberate: any
+ * -D CONFIGURE_MAXIMUM_FILE_DESCRIPTORS=N reaching this file's compile line
+ * wins, so the box can bisect the ceiling without a source edit. The fd=400
+ * image whose memory-wall number appears below is an image with a different
+ * cap; this wrapper is the route by which one exists.
  *
  * ---------------------------------------------------------------------------
- * THIS 150 IS A DEVIATION FROM THE FILE THIS SHIM IS DERIVED FROM.
+ * THIS IS A DEVIATION: we run base's score-arm 150 on a target where base
+ * itself compiles the POSIX arm and runs 64 (see the arm selection above).
  * Full record, with every measurement: `doc/rtems-fd-ceiling-deviation.md`.
  * ---------------------------------------------------------------------------
  *

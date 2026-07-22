@@ -16,9 +16,10 @@
 //! * [`contract`] — the link flags, pure and host-tested. Also the module a
 //!   dependent's `build.rs` calls into.
 //! * `csrc/rtems_config.c` — the `CONFIGURE_*` directives, derived from EPICS
-//!   base's POSIX arm. Its file-descriptor ceiling deviates from that arm (150
-//!   against base's 64) and is what caps concurrent clients;
-//!   `doc/rtems-fd-ceiling-deviation.md` is the measured record.
+//!   base's POSIX arm. Its file-descriptor ceiling deviates from that arm — we
+//!   take 150 from base's *score* arm where the POSIX arm base actually
+//!   compiles on RTEMS 6 says 64 — and that ceiling is what caps concurrent
+//!   clients; `doc/rtems-fd-ceiling-deviation.md` is the measured record.
 //! * `csrc/rtems_init.c` — `POSIX_Init`: console, clock, libbsd, DHCP, `main`.
 //! * [`stats`] — descriptor and heap usage, the two IOC-statistics values Rust
 //!   cannot reach on this target, over `csrc/rtems_stats.c`.
@@ -88,17 +89,26 @@
 //! 2. **The include path is a guess.** [`contract::bsp_include_dir`] assumes the
 //!    standard RTEMS 6 layout. Take the real `-I` set from a BSP sample's
 //!    *compile* line.
-//! 3. ~~**The fd ceiling is a recommendation.** 150 is base's own score-arm
-//!    value and our three crates make no `select`/`poll` call, but libbsd's
-//!    internals were not audited and the confdefs macro may be spelled
-//!    `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` in RTEMS 6.~~ **CLOSED — the
-//!    ceiling is measured, and it is the wall the IOC hits first.** 142
-//!    concurrent CA connections served, the 143rd refused with `ENFILE`;
-//!    `MAXIMUM_FILE_DESCRIPTORS` is the correct RTEMS 6 spelling; `FD_SETSIZE`
-//!    is 256 on this BSP, not 64. Stock base ships 64 here, so our 150 is a
-//!    deviation — recorded with all of its measurements, including why raising
-//!    the cap buys only nine more connections, in
+//! 3. **The fd ceiling — mostly closed; one audit still owed.**
+//!    ~~150 is base's own score-arm value and our three crates make no
+//!    `select`/`poll` call, but … the confdefs macro may be spelled
+//!    `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` in RTEMS 6.~~ **Closed on the
+//!    box**, and `csrc/rtems_config.c` §F is where the evidence lives:
+//!    `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is the RTEMS 6 spelling
+//!    (`confdefs/libio.h:89` reads it; `confdefs/obsolete.h:109-111` makes the
+//!    older name a rename `#warning`), the ceiling is measured at 142
+//!    concurrent CA connections with the 143rd refused `ENFILE`, and
+//!    `FD_SETSIZE` on this BSP is 256 rather than newlib's default 64, so
+//!    base's `select()` caveat cannot fire at a cap of 150 whatever any library
+//!    does. The deviation this leaves — we run base's *score*-arm 150 on a
+//!    target where base compiles the *POSIX* arm and runs 64, and the cap is
+//!    overridable through the `#ifndef` — is recorded with every measurement in
 //!    `doc/rtems-fd-ceiling-deviation.md`.
+//!    **Still genuinely open:** *libbsd's internals were never audited for
+//!    `select()` use.* That does not bind at 150 (`FD_SETSIZE` is 256), so it
+//!    is a precondition for raising the cap **above 256**, not a live risk
+//!    today — and the memory wall makes such a cap useless on this guest
+//!    anyway.
 //! 4. **`CONFIGURE_MAXIMUM_USER_EXTENSIONS 1` may be one too few** once
 //!    `CONFIGURE_STACK_CHECKER_ENABLED` also claims capacity; base reserves 5.
 //! 5. **Library resolution is untested.** `-lbsd -lm -lz` before the `-qrtems`

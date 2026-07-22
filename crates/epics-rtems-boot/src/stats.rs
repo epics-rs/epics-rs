@@ -36,10 +36,11 @@
 /// by the libbsd socket zone, which is sized from this cap — ahead of the heap
 /// ceiling, which had room for roughly ten more connections at that moment.
 ///
-/// The cap of 150 is a deviation from stock EPICS base, which ships 64;
-/// `doc/rtems-fd-ceiling-deviation.md` carries the measurements, including why
-/// `free()` at idle is numerically the connection ceiling and why
-/// `CA_REFUSED_CNT` never sees this wall.
+/// The cap of 150 is base's own score-arm value, run on a target where base
+/// itself compiles the POSIX arm and runs 64 — a deviation in which arm's
+/// number we take, not an invented number. `doc/rtems-fd-ceiling-deviation.md`
+/// carries the measurements, including why `free()` at idle is numerically the
+/// connection ceiling and why `CA_REFUSED_CNT` never sees this wall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdUsage {
     /// Descriptors currently open, across the whole image — sockets, the

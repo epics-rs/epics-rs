@@ -1,0 +1,1297 @@
+# `ca://` record links and the CA client on the RTEMS target
+
+**Status:** design only. No production code changed by this document. The
+probes below were `cargo check` invocations over a temporary un-gate of
+`epics-ca-rs/src/lib.rs`, reverted from a byte-identical backup before this
+file was written; `git status --porcelain` is empty at the commit that
+carries it, and `./scripts/rtems-check.sh` is green after the revert (§1.5).
+**Scope:** the CA half of the gap `doc/pvalink-rtems-design.md` §3.3 named —
+*"the functional gap on the target IOC is **both** link schemes, not just
+`pva://`"*. That document designed the `pva://` half; this one designs the
+`ca://` half, and the two tracks share seams that must be built once (§6).
+**Base:** `8c305c37` (*Merge pvalink-rtems-design: measured design for
+`pva://` links on RTEMS (stage 5)*).
+**C reference:** EPICS base at `/home/stevek/work/epics-base` (paths below
+are relative to that root).
+**Sibling document:** `doc/pvalink-rtems-design.md`. Where the two designs
+share infrastructure — the byte-source seam, the spawn seam, the callback-band
+invariant, the on-target topology, the stack-class table — this document
+**cites** it rather than re-deriving, and says explicitly where CA differs.
+
+Every number here was produced by running the command quoted next to it on
+this tree at `8c305c37`. Where a claim could not be measured it says so and
+lands in §7, not in the body.
+
+---
+
+## 0. The reframing, and the numbers that produce it
+
+`doc/pvalink-rtems-design.md` §3.3 recorded the CA client as an unmeasured
+peer of the PVA client, and its §6 item 8 listed *"whether the CA client is
+otherwise as transport-erased as the PVA client … was **not** measured"* as
+UNVERIFIED. This document measures it. The answer is **more** transport-erased,
+by every metric the sibling document used:
+
+| metric | PVA client (`client_native`) | **CA client (`client`)** | source |
+|---|---:|---:|---|
+| target compile errors | 47 | **18** (probe A) / **29** (probe B) | §1.1 |
+| of those, **primary** (non-cascade) | 29 | **7** | §1.3 |
+| production bare `tokio::spawn` | 12 | **1** | §5.1 |
+| production spawns already on `runtime::task::spawn` | 0 | **17** | §5.1 |
+| task-handle fields typed as the seam alias | 0 | **all of them** | §5.1 |
+| connection state machine transport-erased | yes — boxed `DynRead`/`DynWrite` | **yes — generic `R: AsyncRead` / `W: AsyncWrite`** | §1.6 |
+| TCP-only name resolution implemented | yes (`EPICS_PVA_NAME_SERVERS`) | **yes (`EPICS_CA_NAME_SERVERS`)** | §4 |
+| search frame needs a `local_addr` readback | **yes** (blocks UDP on target) | **no** | §4.4 |
+| one shared client per IOC (C parity) | **no** — one per link, a defect | **yes** — `OnceCell`, already correct | §2.4 |
+
+Two of those rows carry the whole design.
+
+**The CA client is already on the spawn seam.** The sibling document's stage 3
+— *"convert the 12 production `tokio::spawn` in `client_native` … to
+`runtime::task::spawn`"* — has, on the CA side, already happened. Measured
+(§5.1): 17 production spawns go through `epics_base_rs::runtime::task::spawn`,
+every task-handle field is `runtime::task::TaskHandle<T>` rather than a bare
+`tokio::task::JoinHandle`, and exactly **one** bare `tokio::spawn` survives
+(`client/mod.rs:1374`), inside a `Handle::try_current().is_ok()` guard in
+`Drop`.
+
+**calink does not have pvalink's stage-0 defect.** `CaLinkResolver` holds
+**one** shared `CaClient` in a `tokio::sync::OnceCell` (`resolver.rs:268`,
+`:288-296`), with an eager-seed injection seam `with_client`
+(`resolver.rs:302-309`). That is C `dbCa` parity as written: C creates exactly
+one client context, `ca_context_create` at `dbCa.c:1162`, stored in
+`dbCaClientContext` (`dbCa.c:78`, `:1164`). So the sibling document's stage 0
+— its "do this first", ~40 lines, the single largest RTEMS resource lever —
+**has no CA equivalent to build.** Verified in §2.4.
+
+What the CA side has instead, and pvalink does not, is a **band-occupancy
+problem in the monitor callback** (§5.4): `run_monitor` calls
+`dispatch_external_cp_targets`, which runs full synchronous record processing —
+FLNK chains included — inline on the monitor task. pvalink's `on_event` does a
+store and a non-blocking `try_send`. On RTEMS both land on the same
+single-worker `cbMedium` band. That is the CA-specific risk this design must
+answer, and it is the one place where CA is *harder* than PVA.
+
+So the honest shape of the CA work is:
+
+1. give the client a **blocking byte source** for its already-generic
+   `read_loop`/`write_loop` — the same primitive stage 2 of the sibling
+   document builds, which means it must be built **once, in `epics-base-rs`**
+   (§3.3 — this is a correction to that document's stage 2);
+2. make the search engine buildable with **no UDP socket** so it runs off
+   `EPICS_CA_NAME_SERVERS` alone — measured viable, and cheaper than the PVA
+   equivalent because no `local_addr` readback is involved (§4);
+3. replace three `libc`/`socket2` call sites the CA **server** already solved
+   in this same crate (§3.2) — including one, `libc::FIONREAD`, that is
+   literally a second instance of a defect family the server closed with a
+   named constant;
+4. put `calink` on the spawn seam — the one place CA is *behind* the client
+   it drives (§2.5).
+
+---
+
+## 1. The CA client's RTEMS failure surface, measured
+
+### 1.1 The probes
+
+`epics-ca-rs/src/lib.rs` gates the whole client front end out of the target
+build. Measured, at the exact lines the brief cited:
+
+```
+rg -n 'mod calink|mod client|mod channel|mod discovery|mod repeater|mod hostname' \
+   crates/epics-ca-rs/src/lib.rs
+31:pub mod audit;
+38:pub mod calink;          # preceded at :37 by #[cfg(not(target_os = "rtems"))]
+43:pub(crate) mod channel;  # :42
+46:pub mod cli;             # :45
+48:pub mod client;          # :47
+52:pub mod copt;            # :51
+54:pub mod discovery;       # :53
+59:pub mod hostname;        # :58
+64:pub mod repeater;        # :63
+```
+
+with the block comment at `lib.rs:26-30`: *"The async CA client, discovery,
+repeater, and CA-link resolver are the `tokio::net` host-only front-end …
+The RTEMS build serves CA only through the `std::net` blocking server driver
+(`server::blocking`); client-side connectivity and the discovery stack are a
+later increment."*
+
+**Probe A** — un-gate `client` and the two private modules it needs
+(`channel`, `hostname`), nothing else:
+
+```
+cargo +nightly check --locked --no-default-features \
+  -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf -p epics-ca-rs --lib
+```
+
+```
+error: could not compile `epics-ca-rs` (lib) due to 18 previous errors
+```
+
+**Probe B** — additionally un-gate `discovery` and `repeater`, which
+`client/mod.rs` names at `:29` (`use crate::repeater`) and `:456`/`:598`/`:606`/
+`:682-684`/`:790`/`:799` (`crate::discovery`):
+
+```
+error: could not compile `epics-ca-rs` (lib) due to 29 previous errors
+```
+
+**Control** — the same feature selection on the host, unmodified tree:
+
+```
+cargo check --locked --no-default-features -p epics-ca-rs --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.81s     (exit 0)
+```
+
+Every one of the 18 / 29 is target-specific. Nothing here is a pre-existing
+host defect.
+
+### 1.2 Why there are two numbers, and why B > A is the interesting direction
+
+`doc/pvalink-rtems-design.md` §1.2 argued that *"47 is a lower bound, and must
+be reported as one"* — an unresolved import poisons its module and rustc
+suppresses downstream type errors in code that names the poisoned items. That
+argument was made from theory there, because no second probe existed to test
+it.
+
+Probe A → probe B **demonstrates it directly.** Un-gating two more modules
+*removed* 8 errors (the `crate::discovery` path resolutions) and *added* 13
+that had not previously been reported at all — the `E0277` `[u8]`-unsized
+cascade at `client/search.rs:592` (×12) and `:648` (×1), inside the
+`tokio::select!` body whose channel types were poisoned by `search.rs:7`
+and `:10`.
+
+So: **a smaller error count from a narrower un-gate is not better news.** The
+18 of probe A is a lower bound on the 20 that belong to `client/` proper, and
+both are lower bounds until a stage builds green. Stage 2's gate (§6) is what
+converts this into a settled number.
+
+### 1.3 The 29, classified by layer
+
+Taken from `--message-format=json`, with each diagnostic's primary span walked
+out through its macro-expansion chain so a `tokio::select!` arm is attributed
+to *our* file rather than to tokio's `select.rs` — the same method as
+`doc/pvalink-rtems-design.md` §1.2.
+
+| layer | count | sites |
+|---|---:|---|
+| **newlib/`libc` gaps** (`FIONREAD` absent in the `libc` RTEMS bindings) | **1** | `client/transport.rs:113` |
+| **`tokio::net`** (`TcpStream`, `UdpSocket`) | **3** | `client/search.rs:10`, `client/transport.rs:12`, `repeater.rs:5` |
+| **`socket2`** | **6** | `client/transport.rs:991,992`, `hostname.rs:61,67`, `repeater.rs:102,400` |
+| **`epics_base_rs::net::AsyncUdpV4`** (host-only in base) | **2** | `client/beacon_monitor.rs:7`, `client/search.rs:7` |
+| **`if-addrs`-backed helpers in `epics_base_rs::net`** (host-gated `fn`s) | **4** | `repeater.rs:149,172,551,576` |
+| **cascade** — `[u8]` unsized, all inside the `select!` body poisoned by the imports above | **13** | `client/search.rs:592` (×12), `:648` |
+
+By rustc error code: 13 × `E0277`, 6 × `E0432`, 5 × `E0433`, 5 × `E0425`.
+
+By file:
+
+| file | errors | of which cascade |
+|---|---:|---:|
+| `client/search.rs` | 15 | 13 |
+| `repeater.rs` | 7 | 0 |
+| `client/transport.rs` | 4 | 0 |
+| `hostname.rs` | 2 | 0 |
+| `client/beacon_monitor.rs` | 1 | 0 |
+| `client/mod.rs` | **0** | — |
+| `client/subscription.rs`, `types.rs`, `state.rs`, `sync_group.rs`, `circuit_breaker.rs` | **0** | — |
+
+**Seven primary errors in the client proper** — `search.rs:7`, `:10`;
+`transport.rs:12`, `:113`, `:991`, `:992`; `beacon_monitor.rs:7`. That is the
+number this design is about. `repeater.rs` (7) and `hostname.rs` (2) are
+support modules whose disposition is a scoping decision, not a port (§1.4).
+
+`client/mod.rs` — 6,456 lines, the client context, channel cache, coordinator
+and the whole public API — reports **zero**, and unlike `ops_v2.rs` in the
+sibling document that is *corroborated* rather than merely un-contradicted: a
+source-text census over the same file finds zero `tokio::net`, zero `socket2`,
+zero `libc::`, and every task handle already typed as the seam alias (§5.1).
+It is still not proof (§1.2), and it is still §7 item 1.
+
+### 1.4 What this means per subsystem
+
+| subsystem | lines | verdict | evidence |
+|---|---:|---|---|
+| **Wire protocol** (`crate::protocol`) | 1,409 | **already on the target** | ungated in `lib.rs`; zero `tokio::`; `rtems-check.sh` green (§1.5) |
+| **Channel state** (`channel.rs` — `AccessRights`, id allocators) | 102 | already portable | zero `tokio::`; gated only because *the client* is |
+| **`estdlib`, `iocinf`, `observability`, `audit`, `cap_token`, `server/recv`** | 3,082 | already on the target | ungated, in the green gate |
+| **Client context + channel cache + public API** (`client/mod.rs`) | 6,456 | **zero errors**; corroborated by source-text census | §1.3, §5.1 |
+| **Subscription / types / state / sync_group / circuit_breaker** | 3,821 | **zero errors** | §1.3 |
+| **Circuit framing** (`client/transport.rs`) | 4,343 | **transport-erased already** — 4 errors, all on 4 lines | `read_loop`/`write_loop` generic (§1.6); `TcpStream` at `:12` only |
+| **Search engine** (`client/search.rs`) | 2,739 | **split** — the UDP arms are blocked, the TCP name-server path is not | `run_nameserver_connection` (`:731`) uses `TcpStream` only; §4 |
+| **Beacon monitor** (`client/beacon_monitor.rs`) | 2,438 | **not portable as written**, and **not needed** for a record link | one error (`AsyncUdpV4`); §6 stage C1 defers it |
+| **`repeater.rs`** | 39,111 B | out of scope for a link; a CA client can run without a local repeater | 7 errors; C's repeater is a separate process (`caRepeater`) |
+| **`hostname.rs`** | 11,677 B | reverse-DNS for the peer-name cache; diagnostic only | 2 errors, both `socket2::SockAddr` |
+
+The decisive line: the CA client's **protocol layer is shared with the CA
+server**, not duplicated. All four client files import `use
+crate::protocol::*` (`mod.rs:28`, `search.rs:13`, `transport.rs:15`,
+`beacon_monitor.rs:10`), and `crate::protocol` is ungated, 1,409 lines, zero
+`tokio::` — it compiles for `armv7-rtems-eabihf` today because the blocking
+CA server needs it. The brief asked whether the client shares the sans-io
+protocol types the server's refactor produced or duplicates them: **it shares
+them.** The CA sans-io work (`391e94d9`, `5c5d7f1a`) extracted the server's
+*reply-byte production* and *outbox ownership*; the wire types under both
+sides were already one copy.
+
+### 1.5 Baseline gate
+
+```
+./scripts/rtems-check.sh
+RTEMS gate: every crate and target binary compiles for armv7-rtems-eabihf, in both
+the portability and the image configuration.                              (exit 0)
+```
+
+Run **after** the probe revert, on the committed tree. Five crates × 2
+configurations + 2 target binaries × 2 configurations. This is the gate every
+stage in §6 extends.
+
+### 1.6 The seam, three ways
+
+`doc/pvalink-rtems-design.md` §1.5 put the PVA server driver and the proposed
+PVA client side by side. The CA client belongs in that picture, one column
+further along:
+
+```
+PVA server (shipped)          PVA client (proposed)         CA client (measured)
+────────────────────────      ─────────────────────────     ─────────────────────────────
+tcp.rs:2862                   server_conn.rs:208            transport.rs:1275
+ type SrvRead = Box<dyn        type DynRead = Box<dyn         async fn write_loop<
+ AsyncRead + Unpin + Send>     AsyncRead + Unpin + Send>        W: AsyncWrite + Unpin + Send>
+                                                            transport.rs:1388
+                                                             async fn read_loop<
+                                                               R: AsyncRead + Unpin + Send>
+        ▲                              ▲                              ▲
+   ┌────┴────┐                    ┌────┴────┐                    ┌─────┴─────┐
+accept.rs  blocking.rs        connect()  connect_blocking()  connect_server()   ??? 
+(reactor)  (2 threads)        (TcpStream)  (to build)        transport.rs:958   (to build)
+```
+
+The CA client is in the **best** starting position of the three: its loops are
+*generic* over `AsyncRead`/`AsyncWrite`, not boxed. The PVA server had to
+introduce the erasure; the PVA client had it as a boxed trait object; the CA
+client has it as a type parameter, which costs no vtable and forces no
+allocation.
+
+`TcpStream` is named in the CA client on exactly **two** production lines,
+`transport.rs:12` and `search.rs:10` — the sibling document's §3.3 measured
+`transport.rs:12` and concluded *"the client-side seam this document proposes
+is generic … whatever blocking byte-source primitive stage 2 lands should be
+shared, not duplicated into a second copy for CA later."* That reading is
+confirmed, and §3.3 below sharpens it into a crate-boundary requirement that
+document did not state.
+
+The three constructor sites that need a blocking sibling:
+
+| site | what it names | who consumes it |
+|---|---|---|
+| `transport.rs:978` — `TcpStream::connect(server_addr).await` | the upstream circuit | `read_loop`/`write_loop` via `stream.into_split()` (`:1110`, `:1138`) |
+| `transport.rs:991-992` — `socket2::SockRef` / `TcpKeepalive` | keepalive on that circuit | — |
+| `search.rs:737` — `TcpStream::connect(addr).await` in `run_nameserver_connection` | the `EPICS_CA_NAME_SERVERS` circuit | an **inline** read loop (`:783`), *not* the generic `read_loop` |
+
+That last row is the one asymmetry: the name-server connection's read loop is
+written inline inside `run_nameserver_connection` rather than reusing the
+generic `read_loop`. It is ~60 lines of re-implemented CA framing
+(`search.rs:783-885`). Stage C2 should route it through the same primitive
+rather than growing a third framing loop — one seam, two callers.
+
+---
+
+## 2. calink's actual client surface
+
+### 2.1 It is nine operations, and one file
+
+`crates/epics-ca-rs/src/calink/` is 1,396 lines over three files — an order of
+magnitude smaller than pvalink's 10,855. Exactly **one** of them imports the
+CA client:
+
+```
+rg -n 'use crate::client' crates/epics-ca-rs/src/calink/*.rs
+resolver.rs:16:use crate::client::{CaChannel, CaClient};
+```
+
+(`resolver.rs:593` and `:895` also name `crate::client::ConnectionEvent`,
+both inside `#[cfg(test)]`.)
+
+The complete production call surface:
+
+| # | operation | call site | used for | context it runs in |
+|---:|---|---|---|---|
+| 1 | `CaClient::new()` | `resolver.rs:318` | **one** client for the IOC, inside `OnceCell::get_or_try_init` — see §2.4 | first `open`, on the link work owner |
+| 2 | `client.create_channel(pv_name)` | `resolver.rs:349` | one CA channel per distinct PV name | `CaLinkResolver::open` |
+| 3 | `channel.connection_events()` | `resolver.rs:358` | connection-event stream; subscribed **before** `subscribe()` so `Connected` cannot be missed | same |
+| 4 | `channel.subscribe_with_mask(0.0, DBE_VALUE\|DBE_ALARM)` | `resolver.rs:368-369` | the monitor that backs the cache | same |
+| 5 | `channel.info()` | `resolver.rs:621` | native DBF type + element count after connect | `fetch_link_metadata`, spawned |
+| 6 | `channel.get_with_metadata_count(DbrClass::Ctrl, 1)` | `resolver.rs:629` | one-shot CTRL attribute fetch per connect | same |
+| 7 | `channel.native_field_type()` / `channel.element_count()` | `resolver.rs:172-173`, `:501` | cache-servability gate (C `dbCa.c`, per `resolver.rs:44` — see §7 item 10) | synchronous read path + monitor task |
+| 8 | `channel.put_nowait(&value)` | `resolver.rs:810` | `LinkPutOp::Plain` — fire-and-forget `CA_PROTO_WRITE` | `put_value`, link-put-queue owner |
+| 9 | `channel.put(&value)` | `resolver.rs:811` | `LinkPutOp::Async` — put-with-callback | same |
+
+There is no RPC, no discovery, no beacon subscription, no repeater
+registration, no `sync_group`, no TLS. **A blocking CA client that serves this
+list needs neither `beacon_monitor.rs` nor `repeater.rs`** — which removes 8 of
+the 29 measured errors from the critical path by scoping alone, not by porting
+(§1.4).
+
+C `dbCa`'s own libca surface is the same shape: `ca_create_channel`
+(`dbCa.c:1206`), `ca_add_array_event` (`:1290`, `:1305`), `ca_array_put` /
+`ca_array_put_callback` (`:1229`/`:1233`, `:1252`/`:1256`), `ca_get_callback`
+(`:1278`), `ca_clear_channel` (`:181`), `replace_access_rights_event`
+(`:1219`). Our list maps one-to-one except that C's access-rights event is not
+yet wired on the calink side.
+
+### 2.2 The threading contract — identical to pvalink's, and calink already obeys it
+
+The `LinkSet` sync/async split is `epics-base-rs` property, not a per-scheme
+one. It is documented in full in `doc/pvalink-rtems-design.md` §2.2 (the table
+of `is_connected` / `get_cached_value` / `put_admission` as `fn` with **MUST
+NOT perform I/O**, against `get_value` / `connect_link` / `put_value` /
+`flush_puts` as `async fn` on the database's link work owner, plus the
+measurement that the owner is already on the RTEMS seam via
+`link_put_queue.rs:446`, `:479`, `:491`). **That section applies verbatim to
+calink; it is not re-derived here.**
+
+What is CA-specific is that `CaLinkResolver`'s implementation of it is, if
+anything, tighter than pvalink's. Measured at `resolver.rs:724-800`:
+
+* `get_cached_value` (`:749`) goes through `cached_link` (`:466`), a plain
+  `parking_lot` read of the registry with **no lazy open** — and the doc
+  comment names why: *"Every synchronous `LinkSet` accessor goes through this,
+  so none of them can suspend the record thread."*
+* `put_admission` (`:775`) reads the same registry plus the
+  `CaLink::connected` `AtomicBool`, and distinguishes `Unopened` from
+  `Disconnected` so that the very write whose staging performs the open is not
+  refused.
+* `connect_link` (`:758`) is the deferred-open path, and its doc cites the C
+  original: *"C `dbCaAddLink`'s `CA_CONNECT` work … Runs on the link work
+  owner, so the `subscribe` round trip inside `open` is off the record
+  thread."* (Measured in this checkout: `dbCaAddLink` at `dbCa.c:425`,
+  `addAction(pca, CA_CONNECT)` at `:415`; the comment's own `:735-800` does
+  not match — §7 item 10.)
+
+That is C `dbCa`'s deferred channel setup exactly: `dbCaAddLink`
+(`dbCa.c:425`) posts `CA_CONNECT` to a work list (`:415`), and the `dbCaLink`
+worker thread later calls `ca_create_channel` (`:1206`). **No production path blocks the record thread on the wire.**
+
+### 2.3 The one shared assumption that is not CA's to keep
+
+C gives `dbCa` a **dedicated thread**:
+
+```
+dbCa.c:339   opts.stackSize = epicsThreadGetStackSize(epicsThreadStackBig);
+dbCa.c:340   opts.priority  = epicsThreadPriorityMedium;
+dbCa.c:355   dbCaWorker = epicsThreadCreateOpt("dbCaLink", dbCaTask, NULL, &opts);
+```
+
+One `Big`-stack, Medium-priority, joinable thread — and that thread is where
+both the libca work list *and* `db_process(prec)` for CP holders run
+(`dbCa.c:1320`). Our design puts the equivalent work on a shared callback band
+instead. §5.4 is about whether that is survivable; it is the CA delta that
+pvalink does not have.
+
+### 2.4 The defect pvalink has, that calink does **not** — verified
+
+`doc/pvalink-rtems-design.md` §2.4 is its longest section and its stage 0: an
+IOC with N distinct `pva://` links builds N independent `PvaClient`s, each
+with its own connection pool and search engine, against pvxs's single
+`linkGlobal->provider_remote`. The brief asked this document to verify and
+state that calink has no equivalent. **Verified. It does not.**
+
+```rust
+// crates/epics-ca-rs/src/calink/resolver.rs:255-268 (struct at :262)
+pub struct CaLinkResolver {
+    /// Shared CA client, created lazily on the first link [`Self::open`].
+    client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
+    handle: tokio::runtime::Handle,
+    /// Open links keyed by bare PV name (`ca://` scheme stripped).
+    links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
+    db: Arc<RwLock<Option<PvDatabase>>>,
+}
+```
+
+Three properties, each measured:
+
+1. **One client, structurally.** `client()` (`resolver.rs:315-324`) is
+   `get_or_try_init`, so *"the `OnceCell` guarantees exactly one client even
+   under concurrent first opens"*, and a client-init failure is returned
+   rather than cached so a later open retries — *"matching C `dbCa`'s deferred
+   channel setup"*.
+2. **An injection seam that is production, not test-only.** `with_client`
+   (`resolver.rs:302-309`) seeds the cell eagerly via `OnceCell::new_with`,
+   documented for *"a caller [to] share one client across the CA gateway and
+   the CA links, or pin the client to a specific server in tests."* pvalink's
+   equivalent (`PvaLink::for_test_with_client`, `link.rs:1531`) is named for
+   tests and is not the only constructor; calink's is neither.
+3. **One channel per PV, one circuit per server.** `links` is keyed by bare PV
+   name, so *"multiple records pointing at the same remote PV share one CA
+   channel + subscription"* (`resolver.rs:255-259`). Below that,
+   `CircuitKey = (SocketAddr, u8)` (`client/types.rs:30`) — address plus
+   priority — so **all** channels to one upstream IOC at one priority share
+   **one** TCP circuit. N links to M upstream IOCs cost M circuits, not N.
+
+C parity holds at both levels: one `ca_context_create` for the whole IOC
+(`dbCa.c:1162`, stored at `:78`/`:1164`), and libca's own virtual-circuit
+sharing below it.
+
+**Consequence for the plan.** The sibling document's stage 0 — the change it
+argued should go first, before any RTEMS work, because it was simultaneously a
+C-parity defect and the largest resource lever — has **no CA counterpart**.
+The CA track starts at the equivalent of pvalink's stage 1. That is the single
+biggest reason the CA track is shorter.
+
+### 2.5 What calink *does* have: the `tokio::runtime::Handle` trap, one level worse
+
+`doc/pvalink-rtems-design.md` §4.1 identified the trap that no compile probe
+catches: `tokio::runtime::Handle` and `Handle::current()` **compile for
+`armv7-rtems-eabihf`**, because the RTEMS tokio table retains
+`rt`/`time`/`sync`/`macros`, so a resolver holding a `Handle` will *type-check
+for the target and panic at boot*.
+
+`epics-ca-rs` has the identical manifest shape (`Cargo.toml:81-92`): on
+`cfg(target_os = "rtems")` tokio keeps `rt`, `rt-multi-thread`, `sync`,
+`time`, `macros`, `io-util`, `io-std`, `fs`, `parking_lot` — no `net` — while
+`socket2` and `if-addrs` are absent from the RTEMS dependency set entirely
+(`Cargo.toml:76-79`). So the trap applies unchanged.
+
+calink is caught by it in **three** places, and one of them is worse than
+anything in pvalink:
+
+| site | what it is | why it fails on target |
+|---|---|---|
+| `calink/mod.rs:75` | `install_calink_resolver(&db, tokio::runtime::Handle::current())` | `Handle::current()` panics with no tokio runtime |
+| `calink/resolver.rs:269`, `:288`, `:302` | `handle: tokio::runtime::Handle` field + both constructors | same |
+| `calink/resolver.rs:383`, `:391`, `:568` | `self.handle.spawn(...)` ×3 | schedules onto a tokio runtime that does not exist |
+| **`calink/resolver.rs:129`** | **`struct AbortOnDrop(tokio::task::JoinHandle<()>);`** | **hard-typed to the tokio handle** |
+
+That last row is the structural one. `runtime::task::TaskHandle<T>` is
+`tokio::task::JoinHandle<T>` under the hosted default but
+`background::future_exec::JoinFuture<T>` under `exec_backend`
+(`runtime/task.rs:136`, `:145`). A struct field spelled
+`tokio::task::JoinHandle<()>` cannot hold what `runtime::task::spawn` returns
+on the target — so this is not a "route the call through the seam" edit, it is
+a type change.
+
+The contrast with the client it drives is exact, and it is the inverse of the
+PVA situation:
+
+| | production bare `tokio::spawn` | `handle.spawn` | seam `spawn` | seam-typed handles | `Handle::current()` |
+|---|---:|---:|---:|---:|---:|
+| **CA client** (`client/*.rs`) | 1 | 0 | 17 | all | 0 |
+| **calink** (`calink/*.rs`) | 0 | **3** | 0 | none | **1** |
+| *PVA client* (`client_native`, from sibling §4.1) | *12* | *0* | *0* | *none* | *—* |
+| *pvalink* (from sibling §4.1) | *2* | *4* | *0* | *none* | *yes* |
+
+The CA client did this work; calink did not. §6 stage C3 is that edit, and it
+is small.
+
+---
+
+## 3. The in-crate precedent — the blocking CA **server** driver
+
+This is where the CA track has an advantage no PVA document could claim: the
+blocking driver and the client that needs one **live in the same crate**.
+
+### 3.1 What exists
+
+| artefact | lines | shape |
+|---|---:|---|
+| `epics-ca-rs/src/server/blocking.rs` | 3,541 | thread-per-client CA server; C `rsrv`/`camsgtask` parity |
+| `epics-ca-rs/src/server/recv.rs` | 378 | `RecvAccumulator` — sans-io byte accumulation with a server-chosen ceiling |
+| `epics-ca-rs/src/server/outbox.rs` | 132 | single-owner write side |
+| `epics-ca-rs/src/protocol.rs` | 1,409 | the wire types **both** sides already share (§1.4) |
+
+Its module doc states the reuse rule this design inherits (`blocking.rs:38-49`):
+*"The wire logic is NOT reimplemented. This driver constructs the shared
+`ClientState` and drives the shared `dispatch_message` … to completion on the
+client thread via `block_on_sync`."*
+
+### 3.2 What transfers to a blocking CA client — four primitives, precisely
+
+**1. `pending_bytes` / `FIONREAD_REQUEST` — this one is not "transferable", it
+is the *same defect already fixed once*.**
+
+The client's `transport.rs:106-116` is:
+
+```rust
+#[cfg(unix)]
+fn fd_recv_queue_probe(fd: std::os::fd::RawFd) -> OsRecvQueueProbe {
+    ... libc::ioctl(fd, libc::FIONREAD, &mut pending) ...
+}
+```
+
+`libc::FIONREAD` is absent from the `armv7-rtems-eabihf` bindings — that is
+measured error `E0425` at `transport.rs:113` (§1.3). The **server already
+solved exactly this**, with a named constant and a derivation
+(`blocking.rs:616-637`):
+
+```rust
+#[cfg(all(unix, not(target_os = "rtems")))]
+const FIONREAD_REQUEST: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
+#[cfg(target_os = "rtems")]
+const FIONREAD_REQUEST: libc::c_ulong = 0x4004_667F;
+```
+
+with the doc comment deriving `0x4004_667F` from RTEMS newlib's
+`sys/rtems/include/sys/filio.h` (`_IOR('f', 127, int)`) through `sys/ioccom.h`'s
+`_IOR(g,n,t) = IOC_OUT | (sizeof(t) << 16) | (g << 8) | n`, and noting that a
+wrong value only makes the `ioctl` error, after which every caller flushes —
+*"never a hang or a crash."*
+
+Per the project's rule that a defect citation names a *sample* and not the
+population: the anchor is `libc::FIONREAD`, and `rg -n 'FIONREAD' --glob '*.rs'
+crates/` returns exactly two definition sites — the server's guarded constant
+and the client's bare use. The client's site is the same defect. It should be
+fixed by **hoisting `FIONREAD_REQUEST` + `pending_bytes` to a shared home**,
+not by copying the `#[cfg]` pair into `transport.rs`.
+
+This is also a live instance of the recorded hazard *"RTEMS satisfies
+`cfg(unix)`"*: `#[cfg(unix)]` did hand RTEMS the Linux-shaped path here. It
+failed loudly only because the *constant* is missing — `libc::ioctl` itself
+exists on RTEMS. Had the client spelled the request number inline, this would
+have compiled and misbehaved on target only.
+
+**2. The one-descriptor read/write split — `Arc<TcpStream>`, never `try_clone`.**
+
+`blocking.rs:903-921` states the rule and the measurement:
+
+> *"The split is made by SHARING one `TcpStream` through an `Arc`, not by
+> duplicating the descriptor. `try_clone` is `fcntl(F_DUPFD_CLOEXEC)`, and on
+> RTEMS 6 that cannot work for a socket: RTEMS's `fcntl` has no
+> `F_DUPFD_CLOEXEC` case at all (`cpukit/libcsupport/src/fcntl.c:146-220`
+> falls to `default: errno = EINVAL`), and even plain `F_DUPFD` fails because
+> `duplicate_iop` (`fcntl.c:47-77`) calls the file's `open_h` while
+> rtems-libbsd installs `rtems_bsd_sysgen_nodeops` on every socket … Measured
+> on the target: `dup`, `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on an
+> accepted socket while `F_DUPFD` on `/dev/console` succeeds."*
+
+`impl Read for &TcpStream` gives the two roles from one descriptor. A blocking
+client's reader and writer threads must do the same. Identical to the sibling
+document's §3.2 finding for PVA; recorded twice, in both drivers, because it
+is the kind of thing that compiles and then fails only on target.
+
+**3. Raw-`libc` socket setup instead of `socket2`.** `socket2` is not in the
+RTEMS dependency set at all (`Cargo.toml:76-79`), which is why
+`transport.rs:991-992`'s keepalive block is 2 of the 7 primary errors. The
+server already sets socket options with raw `libc` — `set_reuse_opt`
+(`blocking.rs:551`), `bind_udp_search_socket` (`:571`, with a `#[cfg(not(unix))]`
+fallback at `:610`). The same shape covers `SO_KEEPALIVE` / `TCP_KEEPIDLE` /
+`TCP_KEEPINTVL` for the client circuit, and `hostname.rs`'s two `socket2::SockAddr`
+uses are reverse-DNS diagnostics that a target build should simply not carry.
+
+**4. `bind_udp_search` — a working UDP bind for the target, already written.**
+`blocking.rs:546` is a `std::net::UdpSocket` bound through raw `libc` with the
+`SO_REUSEADDR`/`SO_REUSEPORT` pre-bind setup, needing no `socket2`. If a later
+stage wants UDP search on the CA client (§6 stage C6), this is the primitive —
+not new work.
+
+Beyond primitives, one *fact* transfers unchanged and binds the client:
+**no `local_addr` readback.** RTEMS's libc omits the BSD `sockaddr` length
+byte, so `bind()` succeeds and `local_addr()` returns `InvalidInput`
+(sibling §3.2). §4.4 is where CA gets to shrug this off and PVA cannot.
+
+### 3.3 What does **not** transfer — and the crate-boundary correction
+
+**The CA server driver has no `AsyncRead`/`AsyncWrite` adapter to lend.**
+
+This is the substantive correction this document owes its sibling. The two
+blocking drivers took *different* shapes:
+
+| | PVA server (`server_native/blocking.rs`) | CA server (`server/blocking.rs`) |
+|---|---|---|
+| how blocking bytes meet async code | `ChannelReader` / `ChannelWriter` — `AsyncRead`/`AsyncWrite` adapters over bounded mpsc, fed by two threads (`:607`, `:734`) | **none** — the handler future is driven to completion *on the client thread* by `block_on_sync` / `park_on` |
+| what the thread runs | a pump | the protocol dispatch itself |
+
+`doc/pvalink-rtems-design.md` stage 2 says: *"Promote those two adapters out of
+`server_native` into a module both drivers use."* Measured, "both drivers"
+cannot include CA, because of the dependency graph:
+
+```
+rg -n 'epics-base-rs|epics-ca-rs|epics-pva-rs' crates/epics-ca-rs/Cargo.toml crates/epics-pva-rs/Cargo.toml
+crates/epics-ca-rs/Cargo.toml:11:epics-base-rs = { workspace = true }
+crates/epics-pva-rs/Cargo.toml:11:epics-base-rs = { workspace = true }
+```
+
+`epics-ca-rs` does not depend on `epics-pva-rs`, and must not — the only crate
+that depends on both is `epics-bridge-rs`, which sits *above* them. And
+`epics-base-rs` has no such adapter today:
+
+```
+rg -n 'impl AsyncRead|impl AsyncWrite' --glob '*.rs' crates/epics-base-rs/src
+(no output)
+```
+
+So the sibling document's *"one seam, two callers, not two seams"* argument is
+right and its *destination* is wrong. Promoting `ChannelReader`/`ChannelWriter`
+within `epics-pva-rs` yields a primitive the CA client structurally cannot
+call, and the next CA increment then writes the third copy — which is exactly
+the outcome that argument exists to prevent.
+
+**The structural fix: the blocking byte-source primitive lands in
+`epics-base-rs`, once, and both protocol crates call it.** `epics-base-rs`
+already owns every other member of this family — `runtime::task::spawn`,
+`block_on_sync`/`park_on`, `StackSizeClass`, `spawn_dedicated_thread`,
+`enter_ioc_thread`. A blocking-socket→`AsyncRead`/`AsyncWrite` adapter pair is
+the same kind of object and belongs beside them (`runtime::net` or a new
+`runtime::io`). Doing it there also gives `FIONREAD_REQUEST`/`pending_bytes`
+(§3.2 item 1) and the `Arc<TcpStream>` no-dup rule (item 2) a home that is not
+inside one protocol's server module.
+
+This has an ordering consequence, and it is the one hard dependency between
+the two tracks: **whichever track reaches this primitive first must build it
+in `epics-base-rs`.** If the PVA track lands stage 2 into `epics-pva-rs`
+first, the CA track's stage C2 has to move it afterwards — a strictly larger
+change than putting it in the right crate once. §6 states this as an explicit
+cross-track gate.
+
+One further shape does **not** carry over. The CA server's per-client
+`Big`-stack thread runs the whole dispatch under `park_on`
+(`blocking.rs:339`). A CA *client* has no analogue: `read_loop`/`write_loop`
+are already async tasks spawned through the seam (`transport.rs:1086`, `:1095`,
+`:1111`, `:1120`, `:1139`, `:1148`), so on target they land on the callback
+pool. A client circuit therefore costs **two threads (a reader pump and a
+writer pump), not three** — the same arithmetic as the sibling's §4.3, for the
+same reason.
+
+---
+
+## 4. CA search on the target: `EPICS_CA_NAME_SERVERS`
+
+### 4.1 C supports it, and documents it as the UDP-free mode
+
+The brief's premise is correct, and the C reference is explicit
+(`modules/ca/src/client/CAref.html:515-520`):
+
+> *"For any IP addresses specified in the EPICS environment variable
+> EPICS_CA_NAME_SERVERS, TCP connections are opened and used for CA client
+> name resolution requests. (Thus, broadcast addresses are not allowed in
+> EPICS_CA_NAME_SERVERS.) When used in combination with an empty
+> EPICS_CA_ADDR_LIST and EPICS_CA_AUTO_ADDR_LIST set to "NO", **Channel Access
+> can be run without using UDP for name resolution.** Such an TCP-only mode
+> allows for Channel Access to work e.g. through SSH tunnels."*
+
+The implementation is in `cac`'s constructor (`cac.cpp:250-280`): it loads the
+list, and for each address registers a `SearchDestTCP` and creates a virtual
+circuit via `findOrCreateVirtCircuit` at minor version 11. The parameter is
+declared at `envDefs.h:55` and defaults empty at `configure/CONFIG_ENV:32`.
+
+This is the exact CA analogue of `EPICS_PVA_NAME_SERVERS`, which
+`doc/pvalink-rtems-design.md` §4.2 used to defer UDP search out of the PVA
+critical path.
+
+### 4.2 We implement it — measured
+
+The brief asked whether our client implements it, *because if it does the UDP
+search can be deferred exactly like the pvalink doc's stage 1*. It does.
+
+A first grep for the literal `EPICS_CA_NAME_SERVERS` under
+`crates/epics-ca-rs/src` returns only `bin/ca-lint-rs.rs:70`, which is
+misleading: the implementation is spelled `nameserver` throughout.
+
+```
+rg -n 'nameserver|NAME_SERVERS' --glob '*.rs' crates/epics-ca-rs/src crates/epics-base-rs/src
+```
+
+| piece | site |
+|---|---|
+| env parameter declaration | `epics-base-rs/src/runtime/env_table.rs:34` — `EnvParam::new("EPICS_CA_NAME_SERVERS", "")`, listed in the table at `:102` |
+| parse | `client/mod.rs:5339` — `pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)>`, reading `env_table::EPICS_CA_NAME_SERVERS` at `:5340` |
+| wire-up | `client/mod.rs:718`, `:742-743`, `:756` — passed into `run_search_engine` |
+| one TCP task per name server | `search.rs:551-559` — `for addr in nameserver_addrs { … runtime::task::spawn(run_nameserver_connection(addr, rx, resp_tx)) }` |
+| the connection itself | `search.rs:731-737` — `TcpStream::connect`, libca handshake order VERSION → CLIENT_NAME → HOST_NAME (`tcpiiu.cpp:755-762`), reconnect on `EPICS_CA_CONN_TMO` |
+| bounded send queue | `search.rs:547` — `EPICS_CA_NAMESERVER_QUEUE_DEPTH`, default 256; drop-on-full with a metric (`ns_try_send`, `:1623`), a fix for Launchpad #739789 |
+
+So the TCP name-server path is real, C-faithful, already on the spawn seam,
+and — critically — it consumes the **same** search frames as the UDP path.
+`fire_searches` (`search.rs:1516-1618`) builds `current_frame` **once** and
+fans it to both:
+
+```rust
+for entry in addr_list { send_with_fanout(socket, &current_frame, entry.sock, …).await; }
+for ns_tx in nameserver_txs { ns_try_send(ns_tx, current_frame.clone()); }
+```
+
+and replies from both are parsed by the one shared `handle_udp_response`. The
+frame producer is sans-io already.
+
+### 4.3 But the UDP socket is by value, not `Option` — that is the stage
+
+```rust
+// crates/epics-ca-rs/src/client/search.rs:507-510
+let socket = match AsyncUdpV4::bind(0, true) {
+    Ok(s) => s,
+    Err(_) => return,
+};
+```
+
+`run_search_engine` binds a per-NIC `AsyncUdpV4` bundle unconditionally and
+**returns** — killing the whole engine, name-server tasks included — if the
+bind fails. `AsyncUdpV4` is `#[cfg(not(target_os = "rtems"))]` in base
+(`epics-base-rs/src/net/mod.rs:28-54`), which is 2 of the 7 primary errors and
+the root of all 13 cascade errors (§1.3).
+
+This is the same shape as the PVA `run_engine`'s `search_socket: AsyncUdpV4`
+by-value signature, and it takes the same fix — and it should take the sibling
+document's *structural* form, not the patch form:
+
+> a `SearchTransport::{Udp(AsyncUdpV4, …), NameServersOnly}` sum type, so
+> "UDP socket present" and "UDP arms armed" cannot disagree. A bare `Option`
+> plus `if let` in the fanout sites is the patch; the sum type is the fix.
+> — `doc/pvalink-rtems-design.md` §5 stage 1
+
+The CA version is smaller than PVA's: the UDP surface inside
+`run_search_engine` is one bind, one `set_recv_buffer_size`, one
+`set_multicast_ttl_v4`, one `enable_so_rxq_ovfl`, the `recv` arm of the
+`select!`, the per-NIC `SO_RXQ_OVFL` bookkeeping, and three `send_with_fanout`
+call sites in `fire_searches`.
+
+### 4.4 The CA advantage: no `local_addr` readback
+
+This is where the two protocols genuinely diverge, and it is in CA's favour.
+
+`doc/pvalink-rtems-design.md` §4.2 item 3 established that PVA's UDP search is
+blocked on the target by more than missing primitives: `run_engine` computes
+`response_port` from `search_socket.local_addrs()` and stamps it into **every
+SEARCH frame**, and on target `local_addr()` returns `InvalidInput`, so a UDP
+SEARCH would advertise port 0.
+
+CA has no such field. A `CA_PROTO_SEARCH` reply is returned to the datagram's
+source address, so the frame carries no response port to stamp. Measured
+against our own frame builder — `build_search_payload` (`search.rs:1647`) and
+the per-datagram VERSION header (`fire_searches:1523-1540`) construct the
+bytes from the cid, the padded PV name, `CA_MINOR_VERSION` and
+`state.dgram_seq`, and nothing else:
+
+```
+rg -n 'local_addr' crates/epics-ca-rs/src/client/{search,transport,mod}.rs
+client/search.rs:2345,2348,2446      # all inside #[cfg(test)] — a test "sniffer" socket
+client/transport.rs:3856,4108,4175   # all inside #[cfg(test)]
+```
+
+**No production line of the CA client reads `local_addr` at all.** So the
+RTEMS libc `sockaddr` bug does not block CA UDP search the way it blocks PVA's
+— and the 16 `IP_PKTINFO`/`recvmsg`/`CMSG_*` errors that dominate PVA's `udp.rs`
+have **no CA counterpart either** (CA's UDP surface is `AsyncUdpV4`, 2 errors,
+not raw cmsg recovery).
+
+Which means: for CA, UDP search is deferred in §6 because it is *not needed for
+a record link*, not because it is *blocked*. That is a weaker reason, and the
+plan should say so rather than borrowing PVA's stronger one.
+
+### 4.5 What the target actually needs
+
+For stage C5's on-target gate, the guest IOC needs exactly:
+
+```
+EPICS_CA_NAME_SERVERS=10.0.2.2:5064
+EPICS_CA_ADDR_LIST=
+EPICS_CA_AUTO_ADDR_LIST=NO
+```
+
+— the C-documented TCP-only mode (§4.1), with `EPICS_CA_AUTO_ADDR_LIST=NO`
+load-bearing because auto-address-list would otherwise reintroduce a broadcast
+destination.
+
+---
+
+## 5. RTEMS constraints — CA deltas only
+
+`doc/pvalink-rtems-design.md` §4 is the platform chapter for both tracks. Its
+§4.1 (the single spawn seam, and the `Handle::current()` compile-but-panic
+trap), §4.3's `StackSizeClass` table (`Small` 262,144 / `Medium` 524,288 /
+`Big` 1,048,576 bytes on `armv7-rtems-eabihf`, and the correction that the
+commonly-quoted 2 MiB is the 64-bit host figure), its baseline thread census,
+and §4.4's 1-second `Instant` quantum **apply unchanged and are not repeated
+here.** What follows is only what differs for CA.
+
+### 5.1 The spawn seam: the CA client is already on it
+
+Measured with a brace-aware scanner that skips `#[cfg(test)]` and
+`#[cfg(all(test, …))]` modules by matching their closing brace (a first-
+`#[cfg(test)]`-line heuristic like the sibling document's mis-classifies
+`transport.rs`, whose first `#[cfg(test)]` is a single-item gate at `:127`):
+
+| file | production bare `tokio::spawn` | production `runtime::task::spawn` |
+|---|---:|---:|
+| `client/mod.rs` | **1** (`:1374`) | 9 |
+| `client/transport.rs` | 0 | 6 |
+| `client/search.rs` | 0 | 2 |
+| `client/beacon_monitor.rs`, `subscription.rs`, `types.rs`, `state.rs`, `sync_group.rs`, `circuit_breaker.rs` | 0 | 0 |
+| **total** | **1** | **17** |
+
+and every handle field is the seam alias, with the reasoning already written
+into the source:
+
+```rust
+// client/transport.rs:265-268
+// Spawned via `runtime::task::spawn`, so typed as the seam handle.
+// Byte-identical to `tokio::task::JoinHandle` under the hosted default;
+// the executor's `JoinFuture` under `rtems-exec-model`.
+_read_task:  epics_base_rs::runtime::task::TaskHandle<()>,
+_write_task: epics_base_rs::runtime::task::TaskHandle<()>,
+```
+
+Same at `client/mod.rs:443-449` (`_coordinator`, `_search_task`),
+`client/mod.rs:3221` (`EventWatcher`), and `client/sync_group.rs:33-37`, which
+even imports the alias under the old name (`use …::TaskHandle as JoinHandle`)
+so the seam is what the file means by "JoinHandle".
+
+**The one survivor**, `client/mod.rs:1373-1374`:
+
+```rust
+if tokio::runtime::Handle::try_current().is_ok() {
+    tokio::spawn(async move { /* bounded coordinator shutdown */ });
+}
+```
+
+It does not panic on target — `try_current()` returns `Err` and the block is
+skipped. But it is a silent functional gap: on RTEMS, `CaClient::drop` would
+never run the bounded coordinator shutdown. It should be routed through the
+seam like its 17 siblings, which also removes the guard.
+
+**Consequence:** the sibling document's stage 3 splits for CA. Its
+client-side half is already done; only its calink-side half (§2.5) and its
+band invariant (§5.4) remain.
+
+### 5.2 Threads and stacks per CA connection, blocking shape
+
+Using the sibling §4.3 stack classes and the §3.3 finding that a client
+circuit costs two pump threads rather than three:
+
+| item | threads | armv7 stack | notes |
+|---|---:|---:|---|
+| per **upstream server** circuit (reader + writer pumps, `Small`) | 2 | 524,288 | one circuit per `(SocketAddr, priority)` — §2.4 |
+| per **name-server** circuit (reader + writer pumps, `Small`) | 2 | 524,288 | needed only if a name server is configured |
+| `read_loop` / `write_loop` / coordinator / search-engine *tasks* | 0 | 0 | cbMedium band |
+| calink monitor + connection-watcher tasks, per link | 0 | 0 | cbMedium band — and see §5.4 |
+
+So the cost is **per distinct TCP peer, not per link** — and unlike pvalink,
+calink has that property *today* (§2.4), not after a stage-0 fix. An IOC with
+any number of `ca://` links to one upstream IOC, reached through one name
+server, costs **4 threads / 1 MiB** of stack.
+
+Every one of those threads must call `enter_ioc_thread` as its first statement
+— RTEMS pthreads inherit `POSIX_Init`'s near-idle priority.
+`spawn_dedicated_thread` (`runtime/task.rs:1298`, `:1324`) does it;
+a raw `thread::Builder` does not, which is why the CA server driver carries a
+source-text guard for it. A new blocking client must be inside that guard's
+scope, not beside it.
+
+### 5.3 The fd budget — a client spends from the *server's* 142
+
+`doc/rtems-fd-ceiling-deviation.md` §2-3 measured, on the bring-up box:
+
+| | value | source |
+|---|---:|---|
+| `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` | 150 | `epics-rtems-boot/csrc/rtems_config.c` §F |
+| descriptors the IOC holds at idle | 8 | arithmetic, confirmed by `FD_CNT + FD_FREE = FD_MAX = 150` |
+| **last inbound client served** | **142** | measured ramp; `#143` refused with `ENFILE` |
+| memory wall (free heap ÷ 1,589,000 B) | 151 | measured |
+
+The interaction that matters here, and that neither prior document states:
+**a CA client's descriptors come out of the IOC's idle hold, so every one of
+them lowers the 142 by one.** The fd wall is `MAXIMUM_FILE_DESCRIPTORS − (idle
+hold)`, and adding link connectivity increases the idle hold:
+
+| configuration | added fds | new idle hold | inbound clients served |
+|---|---:|---:|---:|
+| today (`rtems-ca-ioc`, no client) | 0 | 8 | 142 |
+| + 1 name-server circuit + 1 upstream circuit | 2 | 10 | **140** |
+| + 4 upstream IOCs, 1 name server | 5 | 13 | **137** |
+| + UDP search (per-NIC bundle, ≥1 socket) | ≥1 more | ≥14 | ≤136 |
+
+This is small in absolute terms and it is *not* a reason to defer anything —
+but it is a real coupling, it is arithmetic rather than estimate, and it is
+the reason §6's on-target gate reads the status PVs' `FD_CNT` rather than
+assuming the link cost is free. It is also a second, independent argument for
+TCP-only search on the target: the per-NIC UDP bundle costs one descriptor per
+IPv4 interface, for a capability a record link does not need.
+
+Note the memory wall (151) and fd wall (140-ish with links) stay in the same
+order, so links do not change *which* wall binds.
+
+### 5.4 The band-occupancy delta — the one place CA is harder than PVA
+
+`doc/pvalink-rtems-design.md` §2.3 argued that one `cbMedium` worker suffices
+for pvalink, and the argument was specific: *"the callback body does no
+blocking work. `on_event` (`link.rs:355-365`) does a `store`, a `parking_lot`
+lock write, and `enqueue_scan_trigger`, whose send is a **non-blocking
+`try_send`** with a coalesce-on-full fallback."*
+
+**calink's callback body is not that.** `run_monitor`
+(`calink/resolver.rs:477-530`) does the store — and then:
+
+```rust
+let db_handle = db.read().clone();
+if let Some(db_handle) = db_handle {
+    db_handle.dispatch_external_cp_targets(&pv_name);
+}
+```
+
+`dispatch_external_cp_targets` (`epics-base-rs/src/server/database/processing.rs:5037`)
+is a **synchronous** call that walks every registered CP/CPP holder of that PV
+and, for each, calls `process_one_cp_target` (`:4982`) →
+`process_record_with_links_recursive` — full record processing, FLNK chains
+and all, inline on the calling task.
+
+On the host that task is a tokio worker among many. On RTEMS,
+`runtime::task::spawn` puts it on the `cbMedium` band, which has **one**
+worker. So on target, one monitor event on one `ca://` link runs an entire
+record-processing chain on the band that also carries every deferred callback
+and every other link's monitor.
+
+Three things to say about that precisely, because it is easy to overstate:
+
+1. **It is C-faithful in shape.** C `dbCa`'s event callback
+   (`eventCallbackComm`, `dbCa.c:940`) updates the cache and adds
+   `CA_DBPROCESS` (`dbCa.c:871`, `:1011`), and the worker thread runs
+   `db_process(prec)` (`dbCa.c:1314-1320`) — also on the link worker, not on a
+   scan thread. The Rust code cites this ordering deliberately
+   (`resolver.rs:507-517`), though with line numbers from a different base
+   revision (§7 item 10). So the design is not wrong; it is the *thread
+   supply* that differs.
+2. **What differs is dedicated vs shared.** C gives that work its own `Big`-
+   stack thread (`dbCa.c:339`, `:355`; §2.3). Our exec backend gives it a
+   shared band with `DEFAULT_THREADS_PER_PRIORITY = 1`.
+3. **The executor is cooperative**, so an *idle* monitor releases its worker
+   (sibling §2.3). The occupancy is for the duration of the processing chain,
+   not permanent. But a chain is unbounded in a way a `try_send` is not.
+
+The invariant the sibling document stated for pvalink therefore needs a
+**stronger** CA form. Its version:
+
+> **MUST NOT** any pvalink task spawned onto a callback band call
+> `block_on_sync` / `park_on`.
+
+is necessary but not sufficient here, because `dispatch_external_cp_targets`
+parks nothing — it simply *runs for a long time*. The CA-specific addition:
+
+> **Invariant.** A `ca://` link's monitor task MUST NOT run record processing
+> inline on the band worker that received the event.
+> **Owner.** `CaLinkResolver::run_monitor` is the single site that turns a CA
+> monitor event into local processing (`resolver.rs:519-521`); it is the only
+> place the transition can be made.
+
+Two candidate closures, and the structural one is preferred:
+
+* **Patch:** give calink its own dedicated thread, C-style, and spawn
+  `run_monitor` onto it. Closest to C, but it re-introduces a per-subsystem
+  thread the exec model exists to avoid, and it does not generalise —
+  pvalink's forwarders, QSRV's group forwarders and FLNK tails have the same
+  shape on the same band.
+* **Structural:** make the CP fan-out an *enqueue* rather than a call —
+  route `dispatch_external_cp_targets` through the same scan-trigger path
+  pvalink's `enqueue_scan_trigger` already uses, so the monitor task's body is
+  bounded by construction on both schemes and the band never runs a
+  record chain. This makes the illegal shape unrepresentable rather than
+  reviewed, and it removes the dual meaning of "the monitor task" (a cache
+  updater on one path, a record processor on the other).
+
+The structural option is a **semantic change** — it moves CP-holder processing
+off the monitor callback's own stack — and it needs sign-off rather than a
+silent pick. It is stage C4 in §6, and it is measured-unknown whether it is
+required at all: §7 item 3.
+
+### 5.5 The clock
+
+Sibling §4.4 applies: `Instant` is 1-second-quantized on target. Two CA sites:
+
+* `CaLinkResolver::wait_for_link_connected` (`resolver.rs:422`, sleeping at `:440`) polls at 25 ms
+  — finer than pvalink's 50 ms, and equally unexpressible. It is a test
+  helper; the consequence is that an on-target link-up test must be written
+  with second-scale deadlines.
+* `run_nameserver_connection` (`search.rs:742-746`) backs off by
+  `EPICS_CA_CONN_TMO` (default 30 s), which is comfortably above the quantum.
+  Unlike pvalink's 250 ms reconnect ladder, this is *already* C's cadence and
+  needs no adjustment — the port comment at `search.rs:718-726` records that
+  an earlier 1→30 s exponential backoff was removed precisely to match C.
+
+---
+
+## 6. Staged plan, sequenced against the pvalink track
+
+Same discipline as `doc/pvalink-rtems-design.md` §5: each stage names its own
+gate, and no stage depends on a later one. Stage numbering is `C*` to keep the
+two tracks distinguishable in cross-references.
+
+**Cross-track ordering — three dependencies, and only three.**
+
+| # | dependency | direction | why |
+|---:|---|---|---|
+| 1 | the blocking byte-source primitive must land in **`epics-base-rs`** | whichever track builds it first | `epics-ca-rs` cannot reach `epics-pva-rs` (§3.3). Building it inside `epics-pva-rs` forces a later move. |
+| 2 | `pvalink` stage 0 (one shared client) | **PVA only** | calink has no equivalent (§2.4). No CA stage waits on it. |
+| 3 | `epics-bridge-rs` gaining `rtems-exec-model` (sibling §5 stage 3 risk, the 250-site census) | **PVA only** | calink lives in `epics-ca-rs`, which already declares the feature (`Cargo.toml:113`) and already carries the census gate (`tests/rtems_exec_model_gate.rs`). Stage C3 is not blocked by it. |
+
+Everything else is independent, and the two tracks' stage 1s (search-without-UDP)
+touch different crates and can run concurrently.
+
+### Stage C1 — a CA search engine that runs with no UDP socket (medium, host-testable)
+
+Replace `run_search_engine`'s unconditional `AsyncUdpV4::bind` (`search.rs:507`)
+with a `SearchTransport::{Udp(AsyncUdpV4, …), NameServersOnly}` sum type, so
+"UDP socket present" and "UDP arms armed" cannot disagree (§4.3). The
+name-server path (`:551-559`, `:731`) and `handle_udp_response` are untouched.
+Refuse construction of `NameServersOnly` with an empty name-server list — a
+search engine that can reach nothing should fail loudly at build, not resolve
+nothing forever.
+
+*Size:* ~100 lines in `search.rs`; no other file.
+
+*Gate:*
+* a host test that resolves a PV with `EPICS_CA_ADDR_LIST` empty and
+  `EPICS_CA_AUTO_ADDR_LIST=NO`, reaching the server **only** via
+  `EPICS_CA_NAME_SERVERS`, asserting the client bound **no** UDP socket —
+  this is C's documented TCP-only mode (§4.1) and we have no test for it today;
+* `cargo nextest run -p epics-ca-rs`;
+* `cargo clippy -p epics-ca-rs --all-targets -- -D warnings`.
+
+*Risk:* the 13-error `[u8]` cascade at `search.rs:592` (§1.3) says inference in
+that `select!` is already fragile. Expect the arm-shape change to surface real
+type errors the cascade was hiding. That is the point.
+
+### Stage C2 — the blocking byte source, in `epics-base-rs` (medium; **shared with the PVA track**)
+
+Add to `epics-base-rs` a blocking-socket → `AsyncRead`/`AsyncWrite` adapter
+pair plus the two facts that must not be re-derived: `Arc<TcpStream>` with
+`impl Read/Write for &TcpStream` (never `try_clone`, §3.2 item 2), and
+`FIONREAD_REQUEST`/`pending_bytes` hoisted out of
+`epics-ca-rs/src/server/blocking.rs:616-670` (§3.2 item 1).
+
+Then in `epics-ca-rs`, add a blocking sibling to `connect_server`
+(`transport.rs:958`) that dials with `std::net::TcpStream::connect`, drives the
+socket with two threads through the new adapters, and hands the **existing
+generic** `read_loop`/`write_loop` (`:1388`, `:1275`) their `R`/`W`. Replace
+the `socket2` keepalive block (`:991-992`) with raw-`libc` setsockopt in the
+shape of `server/blocking.rs:551`. Route `run_nameserver_connection`'s dial
+(`search.rs:737`) through the same primitive, and fold its inline framing loop
+(`:783-890`) into `read_loop` — one seam, two callers, not two seams and three
+framing loops (§1.6).
+
+*Size:* ~200 lines new in `epics-base-rs`, ~150 in `epics-ca-rs`, ~80 lines of
+moves. The PVA track's stage 2 then *consumes* the base primitive instead of
+promoting `ChannelReader`/`ChannelWriter` within `epics-pva-rs`.
+
+*Gate:*
+* the whole `epics-ca-rs` client test suite passing **with the blocking
+  constructor forced on**, on the host — the only way to show the frame
+  pipeline is untouched;
+* `./scripts/rtems-check.sh` with `epics-ca-rs`'s `lib.rs` gate lifted from
+  `client` (and `channel`) — **this is the stage that turns §1.2's "18/29 is a
+  lower bound" into a number**, and in particular settles whether
+  `client/mod.rs`'s zero is real (§7 item 1);
+* `cargo nextest run -p epics-ca-rs`;
+* a source-text guard that `client/` names no `socket2` and no bare
+  `libc::FIONREAD`.
+
+*Risk:* the suppressed-error question, same as the sibling's. If
+`client/mod.rs` or `subscription.rs` is not in fact transport-independent, this
+gate is where it shows.
+
+*Not in this stage:* `beacon_monitor.rs`, `repeater.rs`, `hostname.rs`,
+`discovery`. A record link needs none of them (§2.1); they stay gated and the
+target build selects the client without them. That scoping removes 9 of the 29
+errors without a line of porting, and it must be a **stated** feature split
+(`client-core` vs `client`) rather than an absence — the same argument
+`scripts/rtems-check.sh:70-84` makes for `qsrv-core`.
+
+### Stage C3 — put calink on the spawn seam (small, host-only)
+
+Delete `CaLinkResolver::handle` (`resolver.rs:269`, `:288`, `:302`) and its
+three `handle.spawn` calls (`:383`, `:391`, `:568`); spawn through
+`runtime::task::spawn`. Change `AbortOnDrop` (`resolver.rs:129`) from
+`tokio::task::JoinHandle<()>` to `runtime::task::TaskHandle<()>` — a type
+change, not a call change (§2.5). Drop `Handle::current()` from
+`calink_link_set_install` (`mod.rs:75`) and from `iocsh.rs:150`. Route
+`client/mod.rs:1374`'s surviving bare `tokio::spawn` through the seam and
+delete its `try_current` guard (§5.1).
+
+*Size:* ~50 lines across `calink/{mod,resolver,iocsh}.rs` and `client/mod.rs`.
+
+*Why it can go first:* it has no RTEMS dependency and no dependency on C1 or
+C2. It is provable on the host.
+
+*Gate:*
+* a source-text guard in `epics-ca-rs` mirroring
+  `epics-pva-rs/src/server_native/tcp.rs:8180-8191` — "production scope must
+  spawn through `runtime::task::spawn`; found N bare `tokio::spawn(`" —
+  extended to also reject `handle.spawn(` and a `tokio::runtime::Handle`
+  field in production types. **The client would pass this guard today; calink
+  would not.** That asymmetry is exactly what the guard is for;
+* `cargo nextest run -p epics-ca-rs --features rtems-exec-model` — the
+  feature-ON suite is the only place the exec backend actually runs, and
+  `epics-ca-rs` already declares the feature and carries the census gate;
+* `cargo nextest run -p epics-ca-rs -p epics-bridge-rs` (the bridge's
+  `calink_lset_contexts.rs` drives this surface).
+
+### Stage C4 — the band invariant, and calink's CP fan-out (small, needs sign-off)
+
+Close the sibling's band invariant by construction, per its stage 3 — a
+thread-local "on a callback band" marker consulted by `block_on_sync`
+(`runtime/task.rs:114`) so parking a band worker is *reported*, not reviewed.
+That half is shared with the PVA track and should be built once.
+
+Then close the CA-specific half (§5.4): the monitor task must not run a record
+chain inline. **Preferred: the structural form** — make
+`dispatch_external_cp_targets` an enqueue onto the existing scan-trigger path
+rather than a synchronous call, so both schemes' monitor bodies are bounded by
+construction. This is a semantic change (CP-holder processing moves off the
+monitor callback's stack) and it is stated here for sign-off rather than
+picked silently. The patch alternative — a dedicated calink thread, C-style —
+is recorded as a fallback and is *not* the proposal.
+
+*Gate:*
+* a test that a future calling `block_on_sync` from a band worker is refused
+  rather than deadlocking;
+* a test that a CA monitor event on a link with a deep CP→FLNK chain returns
+  the monitor task to the executor within a bounded number of polls;
+* `cargo nextest run -p epics-ca-rs -p epics-base-rs --features rtems-exec-model`.
+
+*Risk:* whether this stage is needed at all is unmeasured (§7 item 3). If
+stage C5's on-target measurement shows band latency is not affected, the
+structural change may still be worth having for the invariant, but the urgency
+changes. Measure before committing to the semantic change.
+
+### Stage C5 — mount calink in `rtems-ca-ioc` (small)
+
+Select the target client feature (stage C2's `client-core`) for
+`epics-ca-rs` in `scripts/rtems-check.sh`'s `CRATE_FEATURES`, un-gate `calink`
+in `lib.rs:37-38`, install the resolver in `rtems-ca-ioc.rs` beside the
+existing database assembly, and replace the startup banner — which today says
+nothing about links — with the resolver state and link count.
+
+Note for the banner: the target installs no tracing subscriber, so only
+`eprintln!`/`println!` reach the console (`rtems-ca-ioc.rs:279`, `:285`,
+`:314` are already the only diagnostics that survive). Any link diagnostic
+written with `tracing::` is discarded.
+
+*Gate:*
+* `./scripts/rtems-check.sh` green in both configurations;
+* `rtems-ca-ioc`'s existing source-text guards, extended over the new code;
+* `cargo nextest run -p epics-ca-rs`.
+
+**Not sufficient.** This stage's real gate is C6.
+
+### Stage C6 — two IOCs on the wire, one `ca://`-linking to the other (the actual gate)
+
+Everything above is `cargo check` and host tests. "Type-checks for RTEMS" and
+"runs on RTEMS" are different claims and this workspace has been bitten by the
+gap twice (`scripts/rtems-check.sh:14-28`).
+
+Box and topology: **identical to `doc/pvalink-rtems-design.md` §5 stage 5
+topology A** — QEMU `-M xilinx-zynq-a9 -m 256M -nic user,model=cadence_gem`,
+SLIRP, guest at `10.0.2.15`, host reachable at `10.0.2.2`, `hostfwd` host port
+equal to guest port. That section's setup is not repeated; only the CA
+substitutions are:
+
+| pvalink stage 5 | this stage |
+|---|---|
+| upstream `softIocPVX` on the host | upstream `softIoc` (C base) on the host, serving one `ai` and one `ao` |
+| `EPICS_PVA_NAME_SERVERS=10.0.2.2:5075` | `EPICS_CA_NAME_SERVERS=10.0.2.2:5064` **plus** `EPICS_CA_ADDR_LIST=` and `EPICS_CA_AUTO_ADDR_LIST=NO` (§4.5) |
+| `INP=@pva://UPSTREAM:AI CP` | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=@ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
+| `pvxget` / `pvxput` from the host | `caget` / `caput` from the host |
+| forwarded `tcp::5075-:5075` | forwarded `tcp::5064-:5064` |
+
+*Pass criteria, each an observation on the console or on the wire, because the
+target has no iocsh:*
+
+1. Console banner reports the calink resolver installed and the link count,
+   not silence.
+2. `caget` from the host against the **guest's** downstream record returns the
+   upstream's value.
+3. `caput` to the upstream changes the guest record within one scan period —
+   proving the **monitor** path, not just a GET.
+4. Kill the upstream: guest record goes `LINK`/`INVALID`. Restart it: the
+   record recovers **without** rebooting the guest — proving reconnect
+   survives the 1 s clock quantum (§5.5).
+5. An OUT link (`OUT=@ca://UPSTREAM:AO`) writes and is observed upstream —
+   and both `LinkPutOp::Plain` (`put_nowait`) and `LinkPutOp::Async` (`put`)
+   are exercised, because `resolver.rs:810-811` routes them to different wire
+   operations and only the C-parity split makes that distinction meaningful.
+6. Thread count and per-thread stack peaks match §5.2's arithmetic to within
+   one thread, **and** the circuit count to the upstream is **1** regardless
+   of link count (§2.4's property, on target).
+7. `FD_CNT` on the status PVs equals the pre-link value plus exactly the
+   circuits opened (§5.3) — this is the measurement that says the fd coupling
+   is arithmetic and not a surprise.
+
+*Gate:* all seven criteria, each with the command and its output pasted into a
+measurement document, in the shape of
+`doc/rtems-priority-on-target-measurement.md`. Anything short of that is stage
+C5 with extra confidence.
+
+**Sequencing against pvalink stage 5:** both need the same box, the same SLIRP
+route and the same `hostfwd` discipline. Whichever runs first should record the
+outbound-SLIRP verification (sibling §6 item 4, currently UNVERIFIED) once, for
+both.
+
+---
+
+## 7. Unverified — needs measurement
+
+Everything here is a claim this document could **not** settle.
+
+1. **`client/mod.rs`, `subscription.rs`, `types.rs`, `state.rs`,
+   `sync_group.rs`, `circuit_breaker.rs` are transport-independent.** They
+   report zero errors under both probes and the source-text census
+   corroborates (zero `tokio::net`, zero `socket2`, zero `libc::`, all handles
+   on the seam). But rustc suppresses downstream errors after a poisoned
+   import, and probe A → probe B *demonstrated* that suppression is real in
+   this crate (§1.2). Stage C2's gate settles it.
+2. **calink's own RTEMS error surface is unmeasured, and unmeasurable today.**
+   Un-gating `calink` for the target stops at its dependency — the client's
+   errors — so the bridge of `calink` is never reached. A stub-client probe
+   was considered and rejected for the same reason the sibling document
+   rejected it, and here the reason is concrete rather than general:
+   `tokio::runtime::Handle` and `tokio::task::JoinHandle` both **compile** for
+   the target (`Cargo.toml:81-92` keeps tokio's `rt`), so such a probe would
+   report calink green while `Handle::current()` (`calink/mod.rs:75`) panics at
+   boot. Source-text census is what we have: `calink/*.rs` names zero socket
+   types, zero `socket2`, zero `libc::` — and four seam violations (§2.5).
+3. **Whether §5.4's band occupancy is a real problem.** The mechanism is
+   measured (`run_monitor` → `dispatch_external_cp_targets` →
+   `process_record_with_links_recursive`, all synchronous, all on one band
+   worker). What is *not* measured is whether it causes observable latency on
+   target for realistic link and CP-holder counts. This is the one place where
+   the CA design might need a semantic change (stage C4), so it is the
+   highest-value unknown in this document. It composes with the sibling's §6
+   item 3 and with QSRV group forwarders on the same band.
+4. **Whether `FIONREAD_REQUEST = 0x4004_667F` is right on target.** Derived
+   from RTEMS newlib headers, not measured on the box — the CA server's own
+   doc comment says so (`blocking.rs:628-631`) and notes the failure mode is
+   benign (every caller flushes). Hoisting it in stage C2 does not make it
+   more verified; the QEMU/BSP phase should check it once, for both users.
+5. **Whether the CA client's circuit sharing holds under `calink`'s access
+   pattern on target.** `CircuitKey = (SocketAddr, u8)` is source-measured
+   (§2.4); that N links to one IOC yield one circuit is a host property that
+   stage C6 criterion 6 checks on target for the first time.
+6. **`repeater.rs` scoping.** §2.1 asserts a record link needs no repeater
+   registration, from calink's call surface. C's client registers with a
+   repeater for beacon fan-out (`repeaterSubscribeTimer.cpp:84-90`), and
+   beacons drive libca's search re-poke on server restart. Whether a
+   target IOC's `ca://` links reconnect acceptably *without* beacon-driven
+   re-poke — relying only on the `EPICS_CA_CONN_TMO` retry cadence — is
+   untested. Stage C6 criterion 4 is the first evidence either way.
+7. **`hostname.rs`'s two errors.** Assumed to be droppable (reverse-DNS for a
+   diagnostic peer-name cache). Whether any production client path *requires*
+   a resolved peer name — as opposed to logging one — was not audited.
+8. **Whether stage C2's base-crate primitive fits the PVA track unchanged.**
+   §3.3 argues `ChannelReader`/`ChannelWriter` should be built once in
+   `epics-base-rs`. Whether they carry `server_native`-specific assumptions in
+   their back-pressure accounting is the sibling document's §6 item 7, still
+   unread, and it is now a *cross-track* risk rather than a PVA-only one.
+9. **Outbound SLIRP from guest to `10.0.2.2`.** Inherited unchanged from the
+   sibling's §6 item 4. Stage C6 depends on it exactly as pvalink stage 5
+   does; verify once, for both.
+10. **calink's C-parity line citations drift from the checked-out
+    reference.** Spot-checked against
+    `/home/stevek/work/epics-base/modules/database/src/ioc/db/dbCa.c`: some of
+    `calink/resolver.rs`'s citations are exact (`dbCaGetLink` at `:448`,
+    `pcaGetCheck` at `:650`), while others are off by 15-300 lines
+    (`eventCallback` cited `:925`, measured `:940`; `db_process` cited
+    `:1295`, measured `:1320`; `CA_DBPROCESS` cited `:993-994`, measured
+    `:871`/`:1011`; `dbCaAddLink` cited `:735-800`, measured `:425`/`:415`).
+    The *claims* those comments make were verified correct here; only the
+    coordinates are stale, presumably written against a different base
+    revision. Not a defect in this design, but it means a reader cannot
+    navigate from calink to C by line number, and no citation in this
+    document is inherited from those comments without re-measurement.

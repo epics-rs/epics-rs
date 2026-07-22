@@ -108,7 +108,7 @@ use std::time::Duration;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::task::{
-    StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread, name_current_thread,
+    StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::PvDatabase;
@@ -136,6 +136,35 @@ use crate::server::udp::{self, SearchReplyBatch};
 /// wakes a waiter), so it is sound to acquire under `park_on` and builds for
 /// RTEMS. It is NOT `tokio`'s socket/timer/spawn machinery.
 type SharedAcf = Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>;
+
+/// The EPICS priority the TCP accept loop runs at.
+///
+/// C parity: `rsrv` builds a descending ladder from
+/// `epicsThreadPriorityCAServerLow` (`caservertask.c:562-575`) and creates
+/// `CAS-TCP` with `threadPrios[2]` (`:716`). On RTEMS
+/// `epicsThreadHighestPriorityLevelBelow` is exactly `p - 1`
+/// (`libcom/src/osi/os/RTEMS-score/osdThread.c:120-131`), so the ladder is
+/// `20, 19, 18, 17, 16` and the listener is **18** — `CAServerLow - 2`, the
+/// same number `PVAS-TCP` takes (`pvxs/src/server.cpp:388`).
+///
+/// Below the per-client receiver (`CaServerLow` = 20) and its sender (19) on
+/// purpose: accepting is cheap and hands off immediately, so a burst of new
+/// connections must not preempt the clients already being served.
+const CAS_TCP_PRIORITY: ThreadPriority =
+    ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 2);
+
+/// The EPICS priority the UDP name-search responder runs at.
+///
+/// C parity: `threadPrios[4]` (`caservertask.c:722`), which on RTEMS is
+/// `CAServerLow - 4` = **16** — again the number the PVA side already uses
+/// for the same role (`PVA_UDP_PRIORITY`, `pvxs/src/udp_collector.cpp:93`).
+///
+/// The gap below [`CAS_TCP_PRIORITY`] is the point: SEARCH is broadcast
+/// traffic from every client on the subnet, and a search storm the server did
+/// not ask for must not be able to starve an accept, a command dispatch or a
+/// monitor send.
+const CAS_UDP_PRIORITY: ThreadPriority =
+    ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 4);
 
 /// A blocking, thread-per-client CA TCP server.
 ///
@@ -246,11 +275,20 @@ impl BlockingCaServer {
     /// spawn, `caservertask.c:109`); client threads are detached and exit on
     /// disconnect.
     pub fn serve(&self) {
-        // `CAS-TCP` takes no EPICS band — it accepts and hands off, and the
-        // per-client thread is where the depth is — but it must still be
-        // identifiable in an RTEMS task listing, where `Builder::name` alone
-        // never reaches the kernel.
-        name_current_thread();
+        // The band belongs to the loop, not to whoever spawned the thread:
+        // `serve` is what actually blocks here, on every path that reaches it.
+        //
+        // On RTEMS this is not optional decoration. `POSIX_Init` lowers itself
+        // to `RTEMS_MAXIMUM_PRIORITY - 1` (`epics-rtems-boot`'s
+        // `rtems_init.c`, matching base's `libcom/RTEMS/posix/rtems_init.c`)
+        // and RTEMS pthreads inherit their creator's parameters
+        // (`cpukit/posix/src/pthreadattrdefault.c:49-58`), so a thread that
+        // does not take a band of its own runs one level above idle. Base
+        // escapes that by setting `PTHREAD_EXPLICIT_SCHED` at creation
+        // (`osdThread.c:158-166`); `std::thread::Builder` cannot, so taking
+        // the band at the top of the thread body is our equivalent — and a
+        // loop that skipped it would be preempted by every client it accepts.
+        let _ = enter_ioc_thread(CAS_TCP_PRIORITY);
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
@@ -383,8 +421,10 @@ impl BlockingCaServer {
     /// drive the shared `udp::parse_search_datagram` and shape via
     /// `SearchReplyBatch`.
     pub fn serve_udp_search(&self, socket: UdpSocket) -> CaResult<()> {
-        // Same as `serve`: `CAS-UDP` is unbanded but must not be anonymous.
-        name_current_thread();
+        // Same rule as `serve`, and the same reason: the loop that blocks owns
+        // its band, because inheritance from `POSIX_Init` would otherwise put
+        // it one level above idle on the target.
+        let _ = enter_ioc_thread(CAS_UDP_PRIORITY);
         handle_udp_search_blocking(socket, self.db.clone(), self.tcp_port, &self.shutdown)
     }
 }
@@ -1527,45 +1567,70 @@ mod tests {
         );
     }
 
-    /// Every CA server thread is identifiable in an RTEMS task listing.
+    /// # Invariant
     ///
-    /// `std` calls the platform `pthread_setname_np` from `Builder::spawn`
-    /// only on the hosted targets it supports, and RTEMS is not one — so a
-    /// name set with `Builder::name` never reaches the kernel there and the
-    /// thread shows up nameless. Each of the four CA server threads must
-    /// therefore publish its own name: the two that have an EPICS band do it
-    /// through `enter_ioc_thread`, and `CAS-TCP`/`CAS-UDP`, which are
-    /// deliberately unbanded, call `name_current_thread` at the top of
-    /// `serve`/`serve_udp_search` rather than inventing a priority just to be
-    /// visible.
+    /// MUST: every CA server thread takes its scheduling band **and** its OS
+    /// name through `enter_ioc_thread`, on the thread itself, before it runs
+    /// any server work. MUST NOT: any CA server thread run at the priority it
+    /// inherited from `POSIX_Init`.
+    ///
+    /// `enter_ioc_thread` is the single owner of that transition, and both
+    /// halves are load-bearing on the target and unobservable off it:
+    ///
+    /// * **Band.** RTEMS pthreads inherit their creator's scheduling
+    ///   parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58`, and `std`
+    ///   never calls `pthread_attr_setinheritsched`), and the boot shim runs
+    ///   `POSIX_Init` at `RTEMS_MAXIMUM_PRIORITY - 1`. A thread that skips the
+    ///   prologue therefore does not run "at the default" — it runs one level
+    ///   above idle.
+    /// * **Name.** `std` calls the platform `pthread_setname_np` from
+    ///   `Builder::spawn` only on hosted targets, and RTEMS is not one, so a
+    ///   name set with `Builder::name` never reaches the kernel and the thread
+    ///   is anonymous in a task listing. `apply_to_current_thread` sets the
+    ///   band without the name, so it is asserted *absent* rather than merely
+    ///   uncounted.
+    ///
+    /// Four threads, four calls: the accept loop, the UDP responder, the
+    /// per-client receiver and the per-client event sender. There is no
+    /// unbanded case — a fifth call would mean a thread nobody assigned a
+    /// number to, and a fourth-minus-one an inherited one.
     ///
     /// Source inspection, because the defect is a call that is *absent*.
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
-    fn every_ca_server_thread_publishes_its_name() {
+    fn every_ca_server_thread_takes_its_band_and_its_name() {
         let prod = production_scope(include_str!("blocking.rs"));
 
-        // The two banded threads, through the prologue.
         assert_eq!(
             prod.matches("enter_ioc_thread(").count(),
-            2,
-            "the per-client receiver and the per-client event sender"
+            4,
+            "the accept loop, the UDP responder, the per-client receiver and \
+             the per-client event sender"
         );
         assert_eq!(
             prod.matches("apply_to_current_thread(").count(),
             0,
             "banding without naming leaves an RTEMS-anonymous thread"
         );
-        // The two unbanded ones, by name, at the entry of the loop each runs.
-        for entry in ["pub fn serve(&self) {", "pub fn serve_udp_search("] {
+        assert_eq!(
+            prod.matches("name_current_thread(").count(),
+            0,
+            "naming without banding leaves a thread one level above idle on \
+             the target; `enter_ioc_thread` is the whole prologue"
+        );
+        // Each of the two loops that a caller hands a bare `thread::Builder`
+        // takes its band at its own top, so the spawn site cannot forget it.
+        for (entry, band) in [
+            ("pub fn serve(&self) {", "CAS_TCP_PRIORITY"),
+            ("pub fn serve_udp_search(", "CAS_UDP_PRIORITY"),
+        ] {
             let at = prod
                 .find(entry)
                 .unwrap_or_else(|| panic!("{entry} moved; update this guard"));
-            let head = &prod[at..(at + 600).min(prod.len())];
+            let head = &prod[at..(at + 1200).min(prod.len())];
             assert!(
-                head.contains("name_current_thread()"),
-                "{entry} must name its thread; CAS-TCP/CAS-UDP are otherwise \
-                 anonymous on target"
+                head.contains(&format!("enter_ioc_thread({band})")),
+                "{entry} must enter its IOC thread role at `{band}`"
             );
         }
     }
@@ -1574,25 +1639,44 @@ mod tests {
     use epics_base_rs::types::{DbFieldType, EpicsValue};
     use std::net::Ipv4Addr;
 
-    /// The two CA-server thread priorities, against `caservertask.c`.
+    /// The four CA-server thread priorities, against `caservertask.c`.
     ///
-    /// Wiring them is a one-line call per thread that does nothing at all
-    /// with the RT switch off, so nothing else in the suite would notice the
-    /// pair being swapped. The ordering is the part that matters: C runs the
-    /// TCP receiver at `epicsThreadPriorityCAServerLow` (`:109`) and the
-    /// sender one level below it (`:560`, `:1508`), so a client that stops
-    /// reading its socket cannot starve command dispatch for the others.
+    /// C builds one descending ladder from `epicsThreadPriorityCAServerLow` by
+    /// repeated `epicsThreadHighestPriorityLevelBelow` (`:562-575`), which on
+    /// RTEMS is exactly `p - 1` (`libcom/src/osi/os/RTEMS-score/osdThread.c:
+    /// 120-131`) — so `20, 19, 18, 17, 16` — and takes `[0]` for the per-client
+    /// TCP receiver (`:109`), `[1]` for its event sender (`:560`, `:1508`),
+    /// `[2]` for `CAS-TCP` (`:716`) and `[4]` for `CAS-UDP` (`:722`). `[3]` is
+    /// the beacon sender, which we do not run as a separate thread.
+    ///
+    /// Wiring each is a one-line call that does nothing at all with the RT
+    /// switch off, so nothing else in the suite would notice two of them being
+    /// swapped. The **ordering** is the part that matters, and it is exactly
+    /// what an inherited priority destroys: with every thread at one level, a
+    /// broadcast search storm and a client that stopped reading its socket
+    /// both compete on equal terms with command dispatch for every other
+    /// client.
     #[test]
     fn cas_thread_priorities_match_caservertask_c() {
         let receiver = ThreadPriority::CaServerLow;
         let sender = ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 1);
         assert_eq!(receiver.value(), 20, "epicsThreadPriorityCAServerLow");
-        assert_eq!(sender.value(), 19, "one level below the receiver");
+        assert_eq!(sender.value(), 19, "threadPrios[1]");
+        assert_eq!(CAS_TCP_PRIORITY.value(), 18, "threadPrios[2]");
+        assert_eq!(CAS_UDP_PRIORITY.value(), 16, "threadPrios[4]");
         assert!(
             sender.value() < receiver.value(),
             "the CAS event sender must not outrank the receiver"
         );
-        // Both stay inside the CA-server band, below the scan bands
+        assert!(
+            CAS_TCP_PRIORITY.value() < sender.value(),
+            "accepting a new client must not preempt an established one"
+        );
+        assert!(
+            CAS_UDP_PRIORITY.value() < CAS_TCP_PRIORITY.value(),
+            "broadcast SEARCH traffic must never be able to starve an accept"
+        );
+        // All four stay inside the CA-server band, below the scan bands
         // (epicsThread.h:73-83).
         assert!(receiver.value() <= ThreadPriority::CaServerHigh.value());
         assert!(receiver.value() < ThreadPriority::ScanLow.value());

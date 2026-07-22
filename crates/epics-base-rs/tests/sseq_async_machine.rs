@@ -96,8 +96,15 @@ impl LinkSet for CaHoldLset {
         if held {
             // The completion-aware put stays outstanding until the test
             // completes it — this is what keeps the sseq's `WAITn` parked.
+            //
+            // `runtime::task::sleep`, not `tokio::time::sleep`: this body is
+            // an lset callback, so the framework runs it wherever it runs
+            // callbacks. Under `rtems-exec-model` that is the background
+            // executor's `cbMedium` thread, which has no tokio reactor, and
+            // a `tokio::time` timer there panics rather than sleeping —
+            // taking the whole test's sequence down with it.
             while !self.0.released.lock().unwrap().contains(name) {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
             }
         }
         Ok(())

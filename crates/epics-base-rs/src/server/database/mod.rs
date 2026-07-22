@@ -857,7 +857,13 @@ impl PvDatabase {
         if total == 0 {
             return (0, 0);
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        // `std::time::Instant`, not `tokio::time::Instant`: the sleep below
+        // is the runtime seam, whose clock is std's on both backends. Reading
+        // the deadline off tokio's clock made the two disagree — under
+        // `start_paused` tokio's clock advances only when the runtime decides
+        // to, while the RTEMS backend's timer thread follows the real one, so
+        // the loop could sleep against one clock and expire against another.
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let mut connected = 0usize;
             for (lset, name) in &targets {
@@ -868,7 +874,7 @@ impl PvDatabase {
             if connected == total {
                 return (connected, total);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return (connected, total);
             }
             crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;

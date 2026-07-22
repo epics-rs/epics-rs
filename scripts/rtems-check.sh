@@ -67,7 +67,26 @@ TARGET="armv7-rtems-eabihf"
 COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort --target "$TARGET")
 
 # The crates that must compile for the target.
-CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot)
+CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
+
+# Per-crate feature selection, on top of COMMON's `--no-default-features`.
+#
+# For the first four crates the empty selection IS the target's configuration,
+# so they are absent here. `epics-bridge-rs` is the first crate for which that
+# is false, and silently, in the direction that reports green: with no features
+# at all it compiles `error`, `convert` and `lib.rs` and nothing else — the
+# `qsrv` module is behind `#[cfg(feature = "qsrv-core")]`, so a featureless
+# build type-checks 0 of the 11,281 production lines this gate exists to cover.
+#
+# So the selection is stated rather than defaulted, and stated per crate rather
+# than globally: it says out loud that this crate's target configuration is a
+# CHOICE. `qsrv-core` and not `qsrv` because `qsrv` implies `pvalink`, which
+# needs `epics_pva_rs::client_native` — 47 errors on this target
+# (doc/qsrv-rtems-design.md §0 probe D). See that document §2.2 for why the
+# split is a named feature rather than an absence.
+declare -A CRATE_FEATURES=(
+    [epics-bridge-rs]="qsrv-core"
+)
 
 # Binaries built for the target, as `crate:bin` pairs.
 BINS=(
@@ -110,6 +129,24 @@ HOST_ONLY=(
     epics-pva-rs:pvmonitor-rs
     epics-pva-rs:pvput-rs
     epics-pva-rs:pvxvct-rs
+    # The bridge's five binaries. All host-only, and for a reason the CLI
+    # tools above do not share: each is `required-features`-gated on a feature
+    # the target selection does not carry, so none is even reachable under
+    # `--features qsrv-core`. `qsrv-rs` additionally needs `clap`,
+    # `tracing-subscriber` and `run_ca_pva_qsrv_ioc` — the last of which is
+    # `#[cfg(not(target_os = "rtems"))]`. The target's QSRV mount is
+    # `epics-pva-rs:rtems-pva-ioc`, already in BINS, not a sixth binary here.
+    #
+    # Spelled with underscores because the census computes its pairs from
+    # `basename src/bin/*.rs .rs`, and the bridge's `[[bin]]` entries give
+    # explicit `path`s whose file names use underscores while the bin NAMES use
+    # hyphens (`src/bin/ca_gateway_rs.rs` -> bin `ca-gateway-rs`). Hyphens here
+    # would fail the census twice over — "unclassified" and "stale" at once.
+    epics-bridge-rs:ca_gateway_rs
+    epics-bridge-rs:dual_gateway_rs
+    epics-bridge-rs:dual_ioc_rs
+    epics-bridge-rs:pva_gateway_rs
+    epics-bridge-rs:qsrv_rs
 )
 
 QUIET=0
@@ -212,8 +249,10 @@ for config in "${CONFIGS[@]}"; do
     log "===== configuration: $config"
 
     for crate in "${CRATES[@]}"; do
-        log "== [$config] $crate --lib"
-        if ! cargo "${COMMON[@]}" -p "$crate" --lib; then
+        feats=()
+        [[ -n "${CRATE_FEATURES[$crate]:-}" ]] && feats=(--features "${CRATE_FEATURES[$crate]}")
+        log "== [$config] $crate --lib ${feats[*]-}"
+        if ! cargo "${COMMON[@]}" -p "$crate" --lib ${feats[@]+"${feats[@]}"}; then
             failed+=("[$config] $crate --lib")
         fi
     done

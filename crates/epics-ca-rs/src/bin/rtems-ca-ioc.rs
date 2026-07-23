@@ -610,8 +610,23 @@ mod ioc {
                     ))
                     .await;
                     n += 1;
+                    // The `dbPutField` shape (fire-and-forget), not `put_pv`:
+                    // an ai's VAL is `pp(TRUE)`, so a bare `dbPut` suppresses
+                    // its immediate monitor post (dbAccess.c:1414-1418) and
+                    // leaves the record's UDF *alarm* standing — a host
+                    // `camonitor` on the tick saw one line, forever
+                    // (doc/calink-rtems-design.md §11.7 item 2). C driver
+                    // code writing its own record does `dbPutField`, whose pp
+                    // gate processes the passive record: the cycle posts the
+                    // monitor with a fresh timestamp and clears the UDF
+                    // alarm, which is what makes the tick measurable off the
+                    // wire.
                     let _ = tick_db
-                        .put_pv(C6_TICK_RECORD, EpicsValue::Double(n as f64))
+                        .put_record_field_from_ca_no_notify(
+                            C6_TICK_RECORD,
+                            "VAL",
+                            EpicsValue::Double(n as f64),
+                        )
                         .await;
                 }
             });

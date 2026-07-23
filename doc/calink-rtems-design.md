@@ -2411,11 +2411,22 @@ to-mid-teens millisecond latency tax on other links sharing the band.
    (epics-base-rs, the half the resolver cannot see: `is_connected` stays
    TRUE while the dispatch lands LINK_ALARM/INVALID with VAL untouched, and
    the alarm clears on the next event after read access returns).
-2. **`RTEMS:CA:TICK` is UDF/INVALID and posts no CA monitor.** The C6 probe
+2. ~~**`RTEMS:CA:TICK` is UDF/INVALID and posts no CA monitor.** The C6 probe
    writes it through `PvDatabase::put_pv`, which neither clears UDF nor posts
    a monitor. Harmless for the probe (the measurement polls instead) but it
    means `put_pv` is not a record-processing write; anything that needs a
-   monitor must not use it.
+   monitor must not use it.~~ CLOSED (commit c415cc1d). The complaint was two
+   defects wearing one symptom. `put_pv` was missing C `dbPut`'s tail
+   (`dbAccess.c:1408-1418`): it now clears UDF on value-field puts and posts
+   `DBE_VALUE|DBE_LOG` unless the field is the value field *and* `pp(TRUE)` —
+   the same rule, through the same shared helper, as the CA put route, so a
+   `dbPutLink`-routed CP write posts exactly as C's does. But that alone
+   would not have lit `RTEMS:CA:TICK`: an ai `VAL` is `pp(TRUE)`, so a bare
+   `dbPut` there is silent *in C too* — the tick's real defect was using the
+   `dbPut` analogue where it needed the `dbPutField` shape. The probe now
+   writes through `put_record_field_from_ca_no_notify`, whose process cycle
+   clears the UDF alarm and posts the monitor. `put_pv` remains a
+   non-processing write; what changed is that it is no longer a *silent* one.
 3. **The C6 probe records and threads are in `rtems-ca-ioc`.** `DEMO_DB`
    carries 14 probe records and `main` starts two probe threads (`c6-probe`,
    the tick task). They are the measurement rig, not IOC content, and should

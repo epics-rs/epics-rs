@@ -462,6 +462,47 @@ fn post_array_info(
     }
 }
 
+/// C `dbPut`'s field-monitor tail (`dbAccess.c:1408-1418`) — **the one post
+/// rule every `dbPut` body shares**, reached by every put route (CA,
+/// `dbPutLink`, internal `put_pv`):
+///
+/// ```c
+/// if (precord->mlis.count &&
+///     !(isValueField && pfldDes->process_passive))
+///     db_post_events(precord, pfieldsave, DBE_VALUE | DBE_LOG);
+/// ```
+///
+/// The immediate post is suppressed for the value field ONLY when that field
+/// is `pp(TRUE)`: for the routes that then process (`dbPutField`'s pp gate,
+/// a ` PP` OUT link's `processTarget`), the cycle re-posts it via the
+/// deadband snapshot with a fresh timestamp; for the routes that do not (an
+/// NPP OUT link, a bare `dbPut` from driver code), C is silent until the
+/// next scan — measured against softIoc in `array_put_posts_nord.rs`'s
+/// header. For a value field that is NOT `pp` (calc/calcout/aSub VAL), this
+/// post is the only one there is.
+///
+/// The suppression is a static property of the field, never of the caller's
+/// intent — C's `pfldDes->process_passive` is DBD data — which is what makes
+/// it shareable: `put_pv` (which never processes) and the CA route (which
+/// may) apply the identical rule, exactly as C's one `dbPut` serves both
+/// `dbPutLink` and `dbPutField`. `process_passive_fields()` is total and
+/// fail-safe: any field of an unmodeled type (`&[]`) posts.
+fn dbput_post_put_field(instance: &mut crate::server::record::RecordInstance, field: &str) {
+    let suppress = field == instance.record.primary_field()
+        && instance
+            .record
+            .process_passive_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field));
+    if !suppress {
+        instance.cleanup_subscribers();
+        instance.notify_field(
+            field,
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+        );
+    }
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously, from a thread that cannot `await`.
     ///
@@ -501,8 +542,18 @@ impl PvDatabase {
         Err(CaError::ChannelNotFound(name.to_string()))
     }
 
-    /// Set a PV value or record field, notifying subscribers.
-    /// Tries record put_field first, then put_common_field as fallback.
+    /// Set a PV value or record field — the C `dbPut` analogue
+    /// (`dbAccess.c:1316-1419`), whole: value write + `special`/`on_put`, the
+    /// value-field UDF clear, and the field's `DBE_VALUE|DBE_LOG` monitor
+    /// post ([`dbput_post_put_field`], suppressed only for a `pp(TRUE)` value
+    /// field exactly as C's tail suppresses it). Tries record `put_field`
+    /// first, then `put_common_field` as fallback.
+    ///
+    /// Does NOT process the record — `dbPutField`'s pp gate is
+    /// [`Self::put_record_field_from_ca`] — so, as with a bare C `dbPut`, a
+    /// `pp(TRUE)` value field (ai/ao/waveform VAL …) posts nothing here and a
+    /// caller that needs a monitor on such a field must either drive a
+    /// process or use [`Self::put_pv_and_post`].
     ///
     /// Acquires the record's advisory write gate.
     pub async fn put_pv(&self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -668,9 +719,14 @@ impl PvDatabase {
                 // inside `dbPut`); executed below, once the record lock is released.
                 let mut special_actions = Vec::new();
 
-                // put_pv is C EPICS dbPut: write value + special/on_put.
-                // Does NOT post monitor events (use put_pv_and_post for that).
-                // Does NOT clear UDF or trigger processing.
+                // put_pv is C EPICS dbPut: write value + special/on_put, clear
+                // UDF on a value-field put, and post the field's DBE_VALUE|
+                // DBE_LOG monitor per `dbPut`'s tail (dbAccess.c:1408-1418).
+                // Does NOT trigger processing (that is `dbPutField`'s pp gate,
+                // this port's `put_record_field_from_ca`), so — exactly like a
+                // bare C `dbPut` — a pp(TRUE) value field's post stays
+                // suppressed and its stale UDF *alarm* stands until a process
+                // cycle recomputes stat/sevr.
                 let common_result = match request {
                     // C `dbAccess.c:1370-1372` — accept, write nothing, alarm.
                     PutRequest::EmptyIntoScalar => {
@@ -689,7 +745,18 @@ impl PvDatabase {
                                 // `pp(TRUE)` process. `calcRecord::special` uses
                                 // that to refuse an uncompilable CALC with
                                 // S_db_badField, so the status must not be dropped.
-                                special_after_put(&mut instance, &field, &mut special_actions)?
+                                let result =
+                                    special_after_put(&mut instance, &field, &mut special_actions)?;
+                                // C `dbAccess.c::dbPut:1410-1411` clears ONLY
+                                // `precord->udf = FALSE` on a value-field put —
+                                // the same clear (and the same
+                                // `is_udf_defining_put` predicate) as the CA
+                                // route and `put_pv_and_post`. stat/sevr are NOT
+                                // touched: see the comment block above.
+                                if instance.record.is_udf_defining_put(&field) {
+                                    instance.common.udf = 0;
+                                }
+                                result
                             }
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?
@@ -701,9 +768,10 @@ impl PvDatabase {
 
                 // C `dbPut` runs `dbPutSpecial(paddr, 1)` regardless of caller entry
                 // path, so a put via this internal route commits/writes the same
-                // `special()`-driven alarm the CA route does. State only — `put_pv`
-                // posts no monitors (its contract), so unlike the CA path these
-                // commit the alarm without the STAT/SEVR posts.
+                // `special()`-driven alarm the CA route does. State only — unlike
+                // the CA path these commit the alarm without the STAT/SEVR posts
+                // (C's bare `dbPut` runs no `monitor()`, so it posts no alarm
+                // transition either).
                 //
                 // compress SPC_RESET: `monitor()`'s `recGblResetAlarms` commits the
                 // born-UDF alarm (compressRecord.c:103).
@@ -725,13 +793,21 @@ impl PvDatabase {
                 // field's value actually changed (faac1df1).
                 instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
-                // The one post this body makes. `put_pv` is the `dbPutLink` route's
-                // `dbPut`, and C's `put_array_info` is reached from every `dbPut` —
-                // an OUT link that shortens a waveform posts NORD in C even when the
-                // link is NPP and the target never processes. The value-field post
-                // stays absent here (C suppresses it for a `pp(TRUE)` value field,
-                // and the port's other callers of `put_pv` rely on the process cycle
-                // for it); NORD has no such second path.
+                // C `dbPut:1408-1414`'s field-monitor post, through the one owner
+                // ([`dbput_post_put_field`], shared with the CA route). `put_pv`
+                // is the `dbPutLink` route's `dbPut` and the internal driver-put
+                // entry, and C posts DBE_VALUE|DBE_LOG from *every* `dbPut` —
+                // an NPP OUT link writing a calc's A, an autosave restore, a
+                // status pusher, all post immediately. Pre-fix this body posted
+                // nothing at all, so camonitor on anything written via `put_pv`
+                // went silent forever (doc/calink-rtems-design.md §11.7 item 2).
+                dbput_post_put_field(&mut instance, &field);
+
+                // C's `put_array_info` is likewise reached from every `dbPut` —
+                // an OUT link that shortens a waveform posts NORD in C even when
+                // the link is NPP and the target never processes, and the
+                // value-field post above is suppressed for a waveform (VAL is
+                // `pp(TRUE)`); NORD has no such second path.
                 post_array_info(&mut instance, &old_nord, 0);
 
                 (common_result, special_actions)
@@ -1803,39 +1879,15 @@ impl PvDatabase {
                 // cycle's tail (`processing.rs:2997` / `complete_async_record_inner`)
                 // or by the disable-alarm bail (`dbAccess.c:576`).
 
-                instance.cleanup_subscribers();
-                // C `dbPut:1408-1414` posts DBE_VALUE|DBE_LOG for the put field
-                // unless `(isValueField && pfldDes->process_passive)` — the
-                // immediate post is suppressed for the value field ONLY when that
-                // field is `pp(TRUE)`, because then the reprocess cycle
-                // (`dbPutField:1265-1268`) re-posts it via the deadband snapshot.
-                // For a value field that is NOT `pp` (calc/calcout/aSub VAL), C
-                // posts here and does not reprocess; the port must do the same,
-                // because the `should_process` gate below skips the cycle for a
-                // non-`pp` value field — without this post a direct VAL put would
-                // fire no monitor at all.
-                // (ACKT/ACKS have no arm here: they are SPC_NOMOD, refused by the
-                // gate above. Alarm acknowledgement arrives as a DBR request type,
-                // through [`Self::put_alarm_ack_from_ca`].)
-                //
-                // Suppress the immediate value-field post only when this put
-                // will itself drive a reprocess (the cycle re-posts the field).
-                // `process_passive_fields()` is total/fail-safe: a put to a
-                // non-pp field — including any field of an unmodeled type
-                // (`&[]`) — does not reprocess, so it is not suppressed here.
-                let suppress_value_field_post = field == instance.record.primary_field()
-                    && instance
-                        .record
-                        .process_passive_fields()
-                        .iter()
-                        .any(|f| f.eq_ignore_ascii_case(&field));
-                if !suppress_value_field_post {
-                    instance.notify_field(
-                        &field,
-                        crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::LOG,
-                    );
-                }
+                // C `dbPut:1408-1414`'s field-monitor post, through the one
+                // owner ([`dbput_post_put_field`], shared with `put_pv`). On
+                // this route the pp-value-field suppression pairs with the
+                // `should_process` gate below: a suppressed field is exactly
+                // one the reprocess cycle re-posts via the deadband snapshot.
+                // (ACKT/ACKS have no arm here: they are SPC_NOMOD, refused by
+                // the gate above. Alarm acknowledgement arrives as a DBR
+                // request type, through [`Self::put_alarm_ack_from_ca`].)
+                dbput_post_put_field(&mut instance, &field);
 
                 // The NORD post, through the one owner — C reaches `put_array_info`
                 // from `dbPut`, so the CA route posts it exactly like the internal

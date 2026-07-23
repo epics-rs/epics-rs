@@ -330,19 +330,30 @@ record(epid, "TEST:PID2") {
 }
 
 // ============================================================
-// Epid Bug 1 — supervisory epid with empty STPL: do_pid NEVER runs.
+// Epid Bug 1 — supervisory epid with empty STPL: do_pid never runs
+// UNTIL something writes VAL.
 //
-// C `epidRecord.c`: `special = NULL` (line 105) — no operator UDF
-// clear. `udf` starts TRUE (`epidRecord.c` init) and is cleared only
-// by a CONSTANT STPL (`epidRecord.c:160-164`) or a closed-loop
-// `dbGetLink(stpl)` success (`epidRecord.c:191-193`). A supervisory
-// (`SMSL=0`) epid with an empty/non-constant STPL keeps `udf` TRUE
-// forever, so `epidRecord.c:195` `return(0)` skips `do_pid` on EVERY
-// cycle. An operator `caput` to VAL does NOT clear `udf`.
+// C `epidRecord.c`: `udf` starts TRUE (`epidRecord.c` init) and the
+// record's own code clears it only via a CONSTANT STPL
+// (`epidRecord.c:160-164`) or a closed-loop `dbGetLink(stpl)` success
+// (`epidRecord.c:191-193`). While `udf` is TRUE, `epidRecord.c:195`
+// `return(0)` skips `do_pid` on EVERY cycle.
 //
-// This exercises the framework auto-clear path (`clears_udf()` /
-// `value_is_undefined()` recomputed after `process()`), not a manual
-// `set_process_context` push.
+// But the record is not the only udf owner: C `dbPut`'s tail clears
+// `udf` on ANY value-field put (`dbAccess.c:1414-1415`,
+// `if (isValueField) precord->udf = FALSE;`) — `special = NULL` is
+// irrelevant, the clear lives in dbAccess, not in `special()`. So an
+// operator setting the supervisory setpoint (any dbPut route to VAL)
+// DOES define the record, and the next cycle runs `do_pid` — that is
+// how a supervisory epid is used. (An earlier revision asserted the
+// put leaves `udf` set; that encoded the port's missing `dbPut` udf
+// clear, `doc/calink-rtems-design.md` §11.7 item 2, not C.)
+//
+// Phase 1 (no VAL write) exercises the framework auto-clear path
+// (`clears_udf()` / `value_is_undefined()` recomputed after
+// `process()`): udf must stay TRUE across cycles with nothing
+// writing VAL. Phase 2 puts VAL through the dbPut analogue and
+// proves the dbAccess clear + the do_pid run.
 // ============================================================
 
 #[tokio::test]
@@ -368,14 +379,10 @@ record(epid, "TEST:PIDSUP") {
         .unwrap();
     let db = server.database().clone();
 
-    // Operator sets the setpoint directly — C `special = NULL`, so
-    // this does NOT clear udf.
-    server
-        .put("TEST:PIDSUP.VAL", EpicsValue::Double(100.0))
-        .await
-        .unwrap();
-
-    // Process 5 cycles via the full link path.
+    // Phase 1 — nothing writes VAL. Process 5 cycles via the full
+    // link path: the framework's post-process recompute must not
+    // invent a udf clear (the original bug auto-cleared udf after
+    // cycle 1 because VAL == 0.0 is not NaN), and do_pid must not run.
     for _ in 0..5 {
         db.put_record_field_from_ca("TEST:PIDSUP", "PROC", EpicsValue::Short(1))
             .await
@@ -383,26 +390,44 @@ record(epid, "TEST:PIDSUP") {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
-    // do_pid must NEVER have run — P stays 0 across all 5 cycles.
-    let p = server.get("TEST:PIDSUP.P").await.unwrap();
-    match p {
-        EpicsValue::Double(v) => {
-            assert_eq!(
-                v, 0.0,
-                "supervisory epid with empty STPL must NEVER run do_pid; \
-                 P must stay 0 after 5 cycles, got {}",
-                v
-            );
-        }
-        other => panic!("expected Double, got {:?}", other),
-    }
-
-    // The framework must keep UDF set every cycle.
     let udf = server.get("TEST:PIDSUP.UDF").await.unwrap();
     assert_eq!(
         udf,
         EpicsValue::UChar(1),
-        "UDF must stay set for a supervisory empty-STPL epid"
+        "UDF must stay set across 5 cycles when nothing writes VAL — \
+         only a value-field put (dbAccess.c:1414-1415) or the record's \
+         own STPL conditions may clear it"
+    );
+    let p = server.get("TEST:PIDSUP.P").await.unwrap();
+    assert_eq!(
+        p,
+        EpicsValue::Double(0.0),
+        "do_pid must not have run while udf is TRUE (epidRecord.c:195)"
+    );
+
+    // Phase 2 — the operator sets the supervisory setpoint. The dbPut
+    // analogue clears udf (VAL is the value field, dbAccess.c:1415;
+    // `special = NULL` plays no part), so the next cycle runs do_pid:
+    // P = KP * (VAL - CVAL) = 2.0 * (100 - 0) = 200.
+    server
+        .put("TEST:PIDSUP.VAL", EpicsValue::Double(100.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:PIDSUP", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+
+    let udf = server.get("TEST:PIDSUP.UDF").await.unwrap();
+    assert_eq!(
+        udf,
+        EpicsValue::UChar(0),
+        "a value-field put defines the record (C dbPut clears udf)"
+    );
+    let p = server.get("TEST:PIDSUP.P").await.unwrap();
+    assert_eq!(
+        p,
+        EpicsValue::Double(200.0),
+        "with udf cleared by the VAL put, do_pid runs: P = KP * (VAL - CVAL)"
     );
 }
 

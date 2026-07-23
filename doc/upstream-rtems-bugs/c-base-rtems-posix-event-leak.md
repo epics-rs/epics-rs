@@ -108,6 +108,30 @@ plus its OS-thread `suspendEvent` — 3 wrapper blocks per thread lifecycle,
 Unbounded in connect/disconnect count: a cycling client (or a flapping
 network link driving libca reconnects) grows the heap monotonically.
 
+**Measured on target (2026-07-23, stock C IOC):** exactly **160.0 B and
+5.000 blocks per client connect/disconnect cycle — 32 B per leaked block**
+— on `~/rtems-cside/cioc-fd64.exe` (base R7.0.10 `bf11a0c`, zero source
+patches, RTEMS 6 `2faafecb`, BSP `xilinx_zynq_a9_qemu`). RTEMS shell
+`malloc info` read at three markers in the boot console (`cioc.log`):
+
+| marker | Total bytes used | used blocks |
+|---|---|---|
+| `B0-baseline-after-60-warmup` | 32,304,056 | 18,756 |
+| `B1-after-batchA-250` | 32,344,056 | 20,006 |
+| `B2-after-batchB-600` | 32,440,056 | 23,006 |
+
+Batch A: +40,000 B / +1,250 blocks over 250 cycles; batch B: +96,000 B /
++3,000 blocks over 600 — both exactly 160.0 B and 5.000 blocks per cycle,
+byte-exact linear. The integer 5 matches the block count enumerated above
+(rows 1–5; this driver cancels no monitors). `epicsThreadShowAll` was
+taken at every marker; the thread census returns to the idle set between
+batches, so the growth is unreachable heap, not lingering threads.
+
+Two corollaries of the *exact* 5.000: `pthread_setname_np` leaves no
+per-thread residue on this target (a sixth block per cycle would have
+shown), and rsrv's freelists are confirmed bounded (the 60-cycle warm-up
+absorbed their high-water growth; none appears in the batches).
+
 ## What a correct fix looks like
 
 Add the missing release to `epicsEventDestroy`:
@@ -126,15 +150,22 @@ One line; mirrors `os/posix/osdEvent.c:79` and the same directory's
 
 ## Not measured / open
 
-- **Bytes per leaked block**: `sizeof(epicsEventOSD)` =
-  `sizeof(rtems_binary_semaphore)` + RTEMS heap-block overhead. No RTEMS
-  headers on the audit machine; needs a target measurement (our bring-up box
-  has the toolchain).
-- `os/RTEMS-posix/osdThreadExtra.c:46-47` runs `pthread_setname_np` on every
-  thread create (default hook); whether RTEMS's implementation allocates is
-  unchecked.
-- No on-target repro was run for the C IOC (would need a C IOC image cycling
-  clients while logging heap; our rigs currently boot the Rust IOC).
+- ~~Bytes per leaked block~~ **MEASURED 2026-07-23: 32 B per block, 160.0 B
+  per rsrv client cycle** (see the target measurement above). 32 B is the
+  RTEMS heap accounting cost of the `malloc(sizeof(epicsEventOSD))` block,
+  not `sizeof` itself.
+- ~~pthread_setname_np allocation~~ **CLOSED by the same measurement**: the
+  per-cycle block count is exactly 5.000 with two thread creations per
+  cycle, so `pthread_setname_np` (run on every create via
+  `osdThreadExtra.c:46-47`) leaves no permanent per-thread allocation.
+- ~~No on-target repro~~ **RUN 2026-07-23** on the `~/rtems-cside/` rig; the
+  full measurement document (cycle characterization, driver scripts, raw-log
+  checksums) is being written by the measurement panel and lands with its
+  branch.
+- The direct `epicsEventCreate`/`epicsEventDestroy` loop sizing (isolating
+  the 32 B without the rsrv machinery) is in progress on the same rig.
+- libca-side per-circuit figure (predicted 6 blocks = 192 B) is derived from
+  the same 32 B block cost, not separately measured.
 
 ## Relation to our own finding
 
@@ -159,6 +190,8 @@ missing `free`. The two defects are independent and both upstream.
 | still on upstream master | WebFetch of raw.githubusercontent.com master file (2026-07-23) |
 | introduced by PR #206, merged 2022-01-24, `1655d68e` | `gh pr view 206` |
 | no existing issue/PR | `gh search issues` / `gh search prs` (queries listed above) |
+| 160.0 B / 5.000 blocks per cycle, 32 B/block | read directly from the target boot console `~/rtems-cside/cioc.log` markers `B0-baseline-after-60-warmup` (:365) / `B1-after-batchA-250` (:408) / `B2-after-batchB-600` (:451) on 2026-07-23 and recomputed by hand from the `Total bytes used` / `Number of used blocks` lines — not quoted from the measurement panel's summary |
+| census returns to idle between batches | `epicsThreadShowAll` present at every marker in the same log (rows counted by the measurement panel; invocation sites verified directly) |
 | `toolchain.c` OS_API split | rg of `configure/toolchain.c:33/:35` |
 | `osdThread.c:175/:179/:235` create/destroy pairing | sed slice of the file |
 | rsrv/dbEvent table rows 3–5, `:572/:591` | sed slices of `caservertask.c`, `dbEvent.c` |

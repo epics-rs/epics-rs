@@ -80,12 +80,17 @@ CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
 #
 # So the selection is stated rather than defaulted, and stated per crate rather
 # than globally: it says out loud that this crate's target configuration is a
-# CHOICE. `qsrv-core` and not `qsrv` because `qsrv` implies `pvalink`, which
-# needs `epics_pva_rs::client_native` — 47 errors on this target
-# (doc/qsrv-rtems-design.md §0 probe D). See that document §2.2 for why the
-# split is a named feature rather than an absence.
+# CHOICE. `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
+# implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
+# pva:// record-link resolver — is now on the target (design stage 4). It pulls
+# `epics-pva-rs/client`, whose UDP transport is cfg-gated out so the client
+# compiles for the triple (the ratchet probe below measures zero), and does NOT
+# pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
+# `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
+# was `qsrv-core` alone, because `client_native` was 47 errors on this target
+# (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
 declare -A CRATE_FEATURES=(
-    [epics-bridge-rs]="qsrv-core"
+    [epics-bridge-rs]="qsrv-core,pvalink"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.
@@ -98,8 +103,8 @@ BINS=(
     # doc/qsrv-rtems-design.md §9.7). It is still the only target PVA binary, so
     # this stays one entry, not two.
     #
-    # It carries `required-features = ["qsrv-core"]`, which the loop below
-    # supplies from CRATE_FEATURES. That combination is safe here and was
+    # It carries `required-features = ["qsrv-core", "pvalink"]`, which the loop
+    # below supplies from CRATE_FEATURES. That combination is safe here and was
     # measured, because the manifest comment the binary arrived with warned the
     # opposite: an unmet `required-features` makes cargo silently SKIP the
     # target for the plural forms (`--bins`, `--all-targets`), but an explicit

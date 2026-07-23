@@ -262,13 +262,18 @@ required-features = ["dual-gateway-bin"]
 # invocation fails loudly rather than passing vacuously. The gate additionally
 # passes `qsrv-core` per-bin, so the covered configuration is the real one.
 #
-# The gate is `qsrv-core` and not `qsrv`: this is a server, so it needs neither
-# `epics-pva-rs/client` nor `epics-ca-rs`, and `qsrv` would drag in `pvalink`,
-# which does not build for the target at all (§3.4).
+# The gate is `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
+# pulls `qsrv-bin` host machinery this target never runs, but `pvalink` — the
+# pva:// record-link resolver — is mounted on the target as of design stage 4.
+# `pvalink` pulls `epics-pva-rs/client` (its UDP transport cfg-gated out so it
+# compiles for the triple) without `tls`/`pkcs12`, because the `epics-pva-rs`
+# dependency is `default-features = false`. Both features are `required-features`
+# so `scripts/rtems-check.sh`'s explicit `--bin rtems-pva-ioc` hard-fails if the
+# per-bin selection ever drops one, rather than silently skipping the target.
 [[bin]]
 name = "rtems-pva-ioc"
 path = "src/bin/rtems-pva-ioc.rs"
-required-features = ["qsrv-core"]
+required-features = ["qsrv-core", "pvalink"]
 
 # `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
 # `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`

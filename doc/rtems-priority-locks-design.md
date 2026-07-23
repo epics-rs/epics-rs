@@ -549,13 +549,29 @@ threads: `field_io.rs:493`, `:595`, `:790`, `:804`, `:826`, `:851`, `:877`,
 * *Who reads concurrently:* one `CAS-client <n>` pooled worker per live CA TCP
   connection, one `PVAS-conn` per PVA connection, the UDP search responders via
   `has_name_from` (`mod.rs:1645`), and the scan/callback bands through the put
-  paths. On the RTEMS target that population is bounded in the **single digits**
-  by the 2 MiB-per-thread stack ceiling (~5 CA / ~3 PVA connections), not by the
-  lock.
+  paths. On the RTEMS target that population is bounded at **142** — the
+  measured fd wall, not a stack estimate, and not the lock.
+
+  *(This bullet used to say "single digits … ~5 CA / ~3 PVA connections",
+  derived from a 2 MiB-per-thread stack ceiling. Both halves were wrong.
+  **2 MiB is the 64-bit host's `Big` class**: `StackSizeClass::bytes` is
+  `f × 0x10000 × size_of::<usize>()` (`task.rs:695-703`), so on
+  `armv7-rtems-eabihf`, where `usize` is 4 bytes, the classes are
+  **256 KiB / 512 KiB / 1 MiB** — a CA connection's `Big` + `Medium` and a PVA
+  connection's `Big` + `Small` + `Small` are each 1,572,864 B, not ~4–6 MiB.
+  And the binding ceiling is not stacks at all: 150 configured descriptors
+  minus the 8 the IOC holds at idle gives **142** concurrent connections, with
+  client #143 refused by `accept` with `ENFILE`, while the memory wall sits at
+  151 and was only reachable on an image with the fd cap raised to 400 —
+  measured, `doc/rtems-fd-ceiling-deviation.md` §2–§3, and the derivation the
+  CA worker pool's capacity was set from,
+  `doc/rtems-connection-worker-pool-design.md` §9.)*
 * *Critical section:* one `HashMap::get` plus an `Arc::clone` at 13 of the 14
   sites. The exception is `all_simple_pv_names` (`mod.rs:1853`), which clones
   every key and is reached only from iocsh dumps.
-* *Cost of demotion:* ≤ ~10 threads serialise on an O(1) section. C serialises
+* *Cost of demotion:* ≤ 142 threads serialise on an O(1) section — the
+  corrected bound above, not the ~10 this line carried while it inherited the
+  stack estimate. C serialises
   the same lookup at a **finer** grain (per hash bucket) than our single
   map-wide lock, so the port is already coarser than C here and the demotion
   does not make it coarser still. **Accepted.**

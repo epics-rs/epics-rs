@@ -75,11 +75,14 @@ exits 0 while staging a binary dated the day before; with the spec wiring and
 `set -e -o pipefail` (as `build-ca.sh` has always had) it exits 101 and stages
 nothing.
 
-The script is not repaired here, because it has no role left to repair *to*:
-its distinguishing feature was a PVA server image without `qsrv-core`, and
-that target no longer exists. `build-qsrv.sh` (`qsrv-core,pvalink,
-bringup-probes`) and `build-stage5.sh` (`qsrv-core,pvalink`) cover what
-remains. It should be deleted rather than re-pointed.
+The script is not repaired, because it has no role left to repair *to*: its
+distinguishing feature was a PVA server image without `qsrv-core`, and that
+target no longer exists. `build-qsrv.sh` (`qsrv-core,pvalink,bringup-probes`)
+and `build-stage5.sh` (`qsrv-core,pvalink`) cover what remains.
+
+**Retired 2026-07-24**: renamed to `build-pva.sh.dead` on the box, so no rig
+can invoke it by its old name and get a stale image. Its `build-pva.sh.prespec`
+backup is kept beside it as the record of what it was before the wiring.
 
 `cargo check` does not link, so the gate needs no BSP/linker; a real image
 build does, hence the `CARGO_TARGET_..._LINKER` env on the box (the checkout's

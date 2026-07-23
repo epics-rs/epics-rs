@@ -261,6 +261,7 @@ struct ServerConnection {
     /// causing the watchdog to expire on schedule and probe the
     /// circuit then). Mirrors libca's `tcpRecvWatchdog` model — see
     /// `TransportCommand::BeaconArrivalNotify` for full rationale.
+    #[cfg(feature = "client")]
     beacon_arrival_tx: mpsc::UnboundedSender<bool>,
     // Spawned via `runtime::task::spawn`, so typed as the seam handle.
     // Byte-identical to `tokio::task::JoinHandle` under the hosted default;
@@ -483,6 +484,7 @@ pub(crate) async fn run_transport_manager(
                         // Emit BEFORE replaying queued commands so the
                         // reset is observed before any subsequent
                         // anomaly classification on this circuit.
+                        #[cfg(feature = "client")]
                         let _ = event_tx.send(TransportEvent::ServerConnected { server_addr });
                         for queued_cmd in queued {
                             process_command(
@@ -561,6 +563,7 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             priority,
             ..
         } => Some((*server_addr, *priority)),
+        #[cfg(feature = "client")]
         TransportCommand::BeaconArrivalNotify { .. } => None,
     }
 }
@@ -810,6 +813,7 @@ fn process_command(
                 event_tx,
             );
         }
+        #[cfg(feature = "client")]
         TransportCommand::BeaconArrivalNotify {
             server_addr,
             anomaly,
@@ -1033,6 +1037,14 @@ async fn connect_server(
     // of a `CircuitUnresponsive` still in flight from the write loop.
     let unresponsive = std::sync::Arc::new(UnresponsiveGate::new());
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
+    // `client-core` has no beacon facility, so nothing will ever send on
+    // this. Dropping the sender here puts `read_loop`'s arrival arm in the
+    // state a shutdown leaves it in — closed on first poll, then disarmed —
+    // rather than leaving a channel alive that no code can feed. (The arm
+    // itself cannot be `cfg`'d: `tokio::select!` does not accept attributes
+    // on a branch.)
+    #[cfg(not(feature = "client"))]
+    drop(beacon_arrival_tx);
 
     // Build initial CA handshake.
     let handshake = build_client_handshake(priority, &identity);
@@ -1165,6 +1177,7 @@ async fn connect_server(
         write_tx,
         pending_frames,
         server_minor,
+        #[cfg(feature = "client")]
         beacon_arrival_tx,
         _read_task: read_task,
         _write_task: write_task,
@@ -2592,12 +2605,14 @@ mod server_connection_drop_tests {
         let write_abort = write_task.abort_handle();
 
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        #[cfg(feature = "client")]
         let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
 
         let conn = ServerConnection {
             server_minor: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             write_tx,
             pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(feature = "client")]
             beacon_arrival_tx,
             _read_task: read_task,
             _write_task: write_task,

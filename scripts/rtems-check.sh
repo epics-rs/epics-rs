@@ -383,6 +383,56 @@ if [[ "$client_errors" -ne "$PVA_CLIENT_TARGET_ERRORS" ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The CA client probe: the same RATCHET, for the other protocol.
+#
+# `doc/calink-rtems-design.md` §6 stage C5 mounts the `ca://` record-link
+# resolver in `rtems-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
+# the target — `calink` drives a live `CaClient` (§2.1). Same staging problem
+# as the PVA probe above: the remaining errors are work this design stages
+# after the split, and a gate red for unstarted work reports nothing. So the
+# selection is measured rather than built, and the count is the artefact.
+#
+# The measured configuration is `--features client-core`, NOT `client`: the
+# split is stated in `crates/epics-ca-rs/Cargo.toml`, and `client-core` is what
+# an image selects — the circuit, the search engine, subscriptions and the link
+# resolver, without the beacon monitor / repeater / service discovery /
+# reverse-DNS stack that a record link never reaches. Probing `client` instead
+# would measure the errors of code this target is never going to build.
+#
+# History, `--no-default-features --features client-core -p epics-ca-rs --lib`:
+#
+#     22  before the split      measured with `client`/`channel`/`calink` merely
+#                               un-gated: 7 of them are the discovery stack's
+#     15  after the split       11 primary + a 4-error [u8] cascade in
+#                               `search.rs`'s select! (design §1.3)
+#
+# Bidirectional for the same reason the binary census is: MORE is a regression
+# that moved the client further from the target; FEWER means someone did the
+# work and left the bound behind, at which point it stops measuring and becomes
+# decoration.
+CA_CLIENT_TARGET_ERRORS=15
+
+log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
+export RUSTFLAGS="$BASE_RUSTFLAGS"
+ca_client_errors=$(cargo "${COMMON[@]}" -p epics-ca-rs --lib --features client-core 2>&1 |
+    grep -oP 'due to \K\d+(?= previous error)' || true)
+ca_client_errors=${ca_client_errors:-0}
+
+if [[ "$ca_client_errors" -ne "$CA_CLIENT_TARGET_ERRORS" ]]; then
+    echo "RTEMS gate FAILED: the CA client's target error count moved." >&2
+    echo "  expected: $CA_CLIENT_TARGET_ERRORS (CA_CLIENT_TARGET_ERRORS in $0)" >&2
+    echo "  measured: $ca_client_errors" >&2
+    if [[ "$ca_client_errors" -gt "$CA_CLIENT_TARGET_ERRORS" ]]; then
+        echo "A change moved epics-ca-rs's client further from $TARGET. Reproduce with:" >&2
+    else
+        echo "Fewer errors than recorded — update the number so it keeps measuring:" >&2
+    fi
+    echo "  cargo ${COMMON[*]} -p epics-ca-rs --lib --features client-core" >&2
+    exit 1
+fi
+
 log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
 log "the portability and the image configuration."
 log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
+log "CA client (--features client-core): $CA_CLIENT_TARGET_ERRORS target errors."

@@ -102,7 +102,32 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [features]
-default = []
+# The full client — what every hosted build has always had, so an existing
+# consumer sees no change. `--no-default-features` is what an RTEMS target
+# build passes, and it is the configuration that gets to state its own
+# selection (`scripts/rtems-check.sh`'s `CRATE_FEATURES`).
+default = ["client"]
+# The CA client a *record link* needs, and nothing else
+# (`doc/calink-rtems-design.md` §2.1, §6 stage C2): `client`, `channel` and
+# `calink` — search (UDP where it exists, `EPICS_CA_NAME_SERVERS` where it
+# does not), the virtual circuit, subscriptions, and the `ca://` link
+# resolver over them.
+#
+# A STATED split, not an absence. The alternative — leaving the discovery
+# stack out of the target build by having no name for what is left — makes
+# "the target's client" a thing nobody can select, build or test on a host,
+# and the boundary then only exists inside `scripts/rtems-check.sh`. Named
+# here, `--no-default-features --features client-core` is a configuration a
+# host can compile and lint, which is what makes the split provable off the
+# target. Same argument `epics-bridge-rs` makes for `qsrv-core` vs `qsrv`.
+client-core = []
+# `client-core` plus the host-only UDP discovery stack it does not need: the
+# beacon monitor (`client::beacon_monitor`), CA repeater registration
+# (`repeater`), service discovery (`discovery`) and the reverse-DNS peer-name
+# cache (`hostname`). Every one of those is a UDP socket, a `getnameinfo`, or
+# a dependency that does not build for `armv7-rtems-eabihf`; none of them is
+# reachable from a record link.
+client = ["client-core"]
 # Host-selectable RTEMS execution model — passthrough to
 # `epics-base-rs/rtems-exec-model`. Routes the `runtime::task` seam to the
 # std-thread background executor on a hosted target, so the blocking CA
@@ -206,21 +231,32 @@ harness = false
 name = "end_to_end_bench"
 harness = false
 
+# The only example, and it plugs a custom `discovery::Backend` into
+# `CaClientConfig` — both of which the full `client` feature owns.
+[[example]]
+name = "custom_discovery_backend"
+path = "examples/custom_discovery_backend.rs"
+required-features = ["client"]
+
 [[bin]]
 name = "caget-rs"
 path = "src/bin/caget-rs.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "caput-rs"
 path = "src/bin/caput-rs.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "camonitor-rs"
 path = "src/bin/camonitor-rs.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "cainfo-rs"
 path = "src/bin/cainfo-rs.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "ca-repeater-rs"
@@ -255,8 +291,9 @@ path = "src/bin/rtems-ca-ioc.rs"
 [[bin]]
 name = "ca-soak"
 path = "src/bin/ca-soak.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "ca-soak-observed"
 path = "src/bin/ca-soak-observed.rs"
-required-features = ["observability"]
+required-features = ["observability", "client-core"]

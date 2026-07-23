@@ -22,40 +22,56 @@
 //! This crate provides the CA wire protocol implementation,
 //! separated from the core IOC infrastructure in `epics-base-rs`.
 
-// The async CA client, discovery, repeater, and CA-link resolver are the
-// `tokio::net` host-only front-end: their deps (`tokio` net feature → `mio`,
-// `socket2`, `if-addrs`) do not build for RTEMS. The RTEMS build serves CA
-// only through the `std::net` blocking server driver (`server::blocking`);
-// client-side connectivity and the discovery stack are a later increment.
-// Gated out for the RTEMS target (armv7-rtems-eabihf).
+// The CA client, the discovery stack, and the CA-link resolver.
+//
+// The client and everything over it (`channel`, `calink`, the `cli`/`copt`
+// tool support) are selected by the `client-core` FEATURE rather than by the
+// target, because which of them a build gets is a choice a build makes — a
+// record link needs the circuit, the search engine and the resolver, and
+// needs none of the UDP discovery stack (`doc/calink-rtems-design.md` §2.1).
+// `default = ["client"]` keeps every hosted consumer on the full set; an
+// RTEMS image selects `client-core` (`scripts/rtems-check.sh`).
+//
+// `discovery`, `repeater` and `hostname` stay gated on the TARGET, not on a
+// feature: each is host-only for a reason that is a fact about the platform
+// (`mdns-sd`/`hickory` do not build for RTEMS; `getnameinfo` has no newlib
+// backing), and each has a consumer outside the client — `discovery` backs
+// the CA server's mDNS/DNS announce, `repeater` backs `ca-repeater-rs`. What
+// the `client` feature owns is the client's *references* to them.
 pub mod audit;
 /// CA links for record INP/OUT fields — resolves ` CA`-modified /
 /// `ca://` record link fields to a live CA client (monitor-backed
-/// cache). Mirrors C `dbCa.c` / `dbCaLink`. Always compiled on hosted:
-/// having `epics-ca-rs` is enough to resolve CA links, no feature
-/// opt-in. Host-only (it drives a live CA client, `tokio::net`).
-#[cfg(not(target_os = "rtems"))]
+/// cache). Mirrors C `dbCa.c` / `dbCaLink`. Compiled whenever the client
+/// is: having `epics-ca-rs` with its default features is enough to
+/// resolve CA links, no separate opt-in.
+#[cfg(feature = "client-core")]
 pub mod calink;
 pub mod cap_token;
-// CA client channel state (`AccessRights`, id allocators); used only by the
-// host-only `client`. Host-only.
-#[cfg(not(target_os = "rtems"))]
+// CA client channel state (`AccessRights`, id allocators); used only by
+// `client`.
+#[cfg(feature = "client-core")]
 pub(crate) mod channel;
 pub mod chaos;
-#[cfg(not(target_os = "rtems"))]
+// CA client-tool option/format helpers. They name `client` items, so they
+// follow it; still host-only on top of that, because their consumers are the
+// host CLI binaries.
+#[cfg(all(feature = "client-core", not(target_os = "rtems")))]
 pub mod cli;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(feature = "client-core")]
 pub mod client;
 // CA client-tool (`caget`/`caput`/`cainfo`) argument parsing; it references
-// `cli::IntStyle` and backs only the host client binaries. Host-only.
-#[cfg(not(target_os = "rtems"))]
+// `cli::IntStyle` and backs only the host client binaries.
+#[cfg(all(feature = "client-core", not(target_os = "rtems")))]
 pub mod copt;
 #[cfg(not(target_os = "rtems"))]
 pub mod discovery;
 pub mod estdlib;
 // Reverse-DNS (`getnameinfo` via `socket2::SockAddr`) for the CA client's
-// peer-name cache; only the client uses it. Host-only.
-#[cfg(not(target_os = "rtems"))]
+// peer-name cache. Its only consumer is the client's `peer_display_name` /
+// `peer_resolved_name`, so it follows the `client` feature as well as the
+// target: `client-core` names a peer by its dotted address, which is C's own
+// answer for an address with no PTR record.
+#[cfg(all(feature = "client", not(target_os = "rtems")))]
 pub mod hostname;
 pub(crate) mod iocinf;
 pub mod observability;

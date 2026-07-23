@@ -650,6 +650,7 @@ impl SearchTransport {
 
     /// Drop a unicast UDP SEARCH destination (a discovery backend reporting
     /// `DiscoveryEvent::Removed`).
+    #[cfg(feature = "client")]
     fn remove_address(&mut self, addr: SocketAddr) {
         let Some(u) = self.udp_mut("RemoveAddress") else {
             return;
@@ -1274,6 +1275,7 @@ fn handle_request_or_addr(
             transport.add_address(addr);
             None
         }
+        #[cfg(feature = "client")]
         SearchRequest::RemoveAddress(addr) => {
             transport.remove_address(addr);
             None
@@ -1441,9 +1443,9 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
         // `handle_request_or_addr` before they reach this match.
         // Defensive no-op so adding new variants doesn't crash if
         // future code paths plumb them straight to handle_request.
-        SearchRequest::AddAddress(_)
-        | SearchRequest::RemoveAddress(_)
-        | SearchRequest::SetAddressList(_) => None,
+        SearchRequest::AddAddress(_) | SearchRequest::SetAddressList(_) => None,
+        #[cfg(feature = "client")]
+        SearchRequest::RemoveAddress(_) => None,
     }
 }
 
@@ -2142,6 +2144,7 @@ mod tests {
     /// whose construction binds the per-NIC socket bundle — the point of the
     /// sum type is that there is no way to hold UDP destinations without the
     /// socket that would transmit to them.
+    #[cfg(feature = "client")]
     #[tokio::test]
     async fn add_then_remove_address_round_trip() {
         let mut state = SearchEngineState::new();
@@ -2180,6 +2183,7 @@ mod tests {
             &mut transport,
             SearchRequest::SetAddressList(vec![a]),
         );
+        #[cfg(feature = "client")]
         handle_request_or_addr(&mut state, &mut transport, SearchRequest::RemoveAddress(a));
         assert!(
             transport.addr_list().is_empty(),

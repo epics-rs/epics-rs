@@ -264,7 +264,7 @@ fn set_circuit_keepalive(stream: &std::net::TcpStream) {
 /// both transports, and so the TLS path — which needs a duplex, not two halves
 /// — can wrap it exactly as it wraps a `TcpStream`.
 #[cfg(any(target_os = "rtems", ca_blocking_client))]
-struct PumpedCircuit {
+pub(super) struct PumpedCircuit {
     reader: epics_base_rs::runtime::blocking_io::GuardedReader,
     writer: epics_base_rs::runtime::blocking_io::GuardedWriter,
 }
@@ -308,10 +308,10 @@ impl AsyncWrite for PumpedCircuit {
 /// What [`dial_ca`] returns: a `tokio::net::TcpStream` on a hosted build, a
 /// [`PumpedCircuit`] where there is no reactor to register one with.
 #[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
-type CaCircuit = TcpStream;
+pub(super) type CaCircuit = TcpStream;
 /// See the hosted definition.
 #[cfg(any(target_os = "rtems", ca_blocking_client))]
-type CaCircuit = PumpedCircuit;
+pub(super) type CaCircuit = PumpedCircuit;
 
 /// Split a dialled circuit into the two halves `read_loop` / `write_loop` take.
 ///
@@ -321,7 +321,7 @@ type CaCircuit = PumpedCircuit;
 /// either side. The hosted arm keeps `into_split`'s owned halves (no `BiLock`,
 /// unchanged from before this seam existed).
 #[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
-fn split_circuit(
+pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
     tokio::net::tcp::OwnedReadHalf,
@@ -332,7 +332,7 @@ fn split_circuit(
 
 /// See the hosted definition.
 #[cfg(any(target_os = "rtems", ca_blocking_client))]
-fn split_circuit(
+pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
     epics_base_rs::runtime::blocking_io::GuardedReader,
@@ -362,7 +362,7 @@ fn split_circuit(
 /// `None` on failure, with the reason logged: the search engine retries the
 /// address on its own cadence, which is what C's `disconnectNotify` + `break`
 /// leaves to the same layer.
-async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
+pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
     #[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
     {
         // No application-level connect deadline. C `tcpRecvThread::connect`

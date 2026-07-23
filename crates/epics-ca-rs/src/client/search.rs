@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use epics_base_rs::net::AsyncUdpV4;
 use epics_base_rs::runtime::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::interval;
 
 use crate::protocol::*;
@@ -1049,22 +1048,25 @@ async fn run_nameserver_connection(
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
     loop {
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    target: "epics_ca_rs::client::search",
-                    nameserver = %addr,
-                    error = %e,
-                    "EPICS_CA_NAME_SERVERS connect failed; retrying after EPICS_CA_CONN_TMO"
-                );
-                tokio::time::sleep(super::transport::connection_timeout()).await;
-                continue;
-            }
+        // The client's one dial (`transport::dial_ca`), which is also what
+        // decides the transport: on a target with no reactor this circuit
+        // comes up on the same two pump threads an upstream circuit does. The
+        // receive-queue probe it returns belongs to libca's flow control,
+        // which is a property of a *data* circuit — a name-service circuit
+        // carries only SEARCH and its reply, so it is dropped here rather than
+        // threaded through the inline reader below.
+        let Some((stream, _bytes_pending_in_os)) = super::transport::dial_ca(addr).await else {
+            // `dial_ca` already logged the OS error.
+            tracing::debug!(
+                target: "epics_ca_rs::client::search",
+                nameserver = %addr,
+                "EPICS_CA_NAME_SERVERS connect failed; retrying after EPICS_CA_CONN_TMO"
+            );
+            tokio::time::sleep(super::transport::connection_timeout()).await;
+            continue;
         };
-        let _ = stream.set_nodelay(true);
 
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = super::transport::split_circuit(stream);
 
         // Send initial VERSION + HOST_NAME + CLIENT_NAME so the nameserver
         // accepts our search frames (mirrors transport.rs handshake).

@@ -413,12 +413,15 @@ fi
 #                               receive-queue probe became one compile-time
 #                               transport choice; `tokio::net` and `socket2`
 #                               are named only on the hosted arm
+#     10  name-server dial       `run_nameserver_connection` came through the
+#                               same seam, so `tokio::net` is gone from the
+#                               client entirely
 #
 # Bidirectional for the same reason the binary census is: MORE is a regression
 # that moved the client further from the target; FEWER means someone did the
 # work and left the bound behind, at which point it stops measuring and becomes
 # decoration.
-CA_CLIENT_TARGET_ERRORS=11
+CA_CLIENT_TARGET_ERRORS=10
 
 log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
 export RUSTFLAGS="$BASE_RUSTFLAGS"

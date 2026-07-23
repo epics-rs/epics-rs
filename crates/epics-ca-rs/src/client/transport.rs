@@ -222,17 +222,25 @@ static CA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
 #[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
 static CA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the CA
-/// client's dial pool.
+/// BRING-UP PROBE: `(workers created, dial attempts submitted, dials queued,
+/// workers dialing)` for the CA client's dial pool.
 ///
 /// Behind `bringup-probes` with the rest of the measurement rig
 /// (`doc/calink-rtems-design.md` §11.7 item 3): a default image compiles
 /// neither the counter nor this accessor.
+///
+/// The last two are what make the `MAX_DIAL_WORKERS` bound readable rather
+/// than inferable: at the bound the worker count stops climbing, and the only
+/// way to tell that from "no more dials were offered" is that `queued` is
+/// non-zero while `dialing` sits at the bound.
 #[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
-pub fn dial_pool_probe() -> (usize, usize) {
+pub fn dial_pool_probe() -> (usize, usize, usize, usize) {
+    let (queued, dialing) = CA_DIAL_POOL.queue_depth();
     (
         CA_DIAL_POOL.worker_count(),
         CA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        queued,
+        dialing,
     )
 }
 

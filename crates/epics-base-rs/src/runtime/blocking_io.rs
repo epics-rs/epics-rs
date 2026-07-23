@@ -396,6 +396,18 @@ impl DialPool {
         self.lock().workers
     }
 
+    /// Requests waiting for a worker, and workers currently inside a dial.
+    ///
+    /// The other half of the bound: `worker_count()` alone cannot distinguish
+    /// "four workers, nothing queued" from "four workers, every one pinned and
+    /// a fifth dial waiting" — which is the state
+    /// [`MAX_DIAL_WORKERS`](self::MAX_DIAL_WORKERS) exists to produce and the
+    /// only state in which the queueing it documents is observable.
+    pub fn queue_depth(&self) -> (usize, usize) {
+        let q = self.lock();
+        (q.pending.len(), q.busy)
+    }
+
     /// Submit a dial. The returned receiver resolves with whatever the worker's
     /// `connect` returned.
     ///

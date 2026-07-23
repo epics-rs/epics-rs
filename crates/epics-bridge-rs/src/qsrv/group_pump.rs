@@ -14,10 +14,30 @@
 //! delivery to ~0.35 Hz and stalling an unrelated scalar monitor for up to
 //! 16.9 s on the RTEMS target (doc/qsrv-rtems-design.md §9.14). This module
 //! is the structural fix: member events stay queued in their own
-//! [`EvQue`](epics_base_rs::server::event_queue::EvQue)s and ONE task —
+//! [`EvQue`](epics_base_rs::server::event_queue::EvQue)s and ONE drain —
 //! shared by every group subscription on the server — consumes them,
 //! assembles the atomic snapshot and posts the group update. Tasks woken
 //! per member tick: O(members) → O(1).
+//!
+//! # Why the drain is a dedicated thread, not a pool task
+//!
+//! Upstream's pump IS a thread — `db_start_events` creates it — and the
+//! first landing of this module learned why the hard way. It spawned
+//! [`pump_main`] with `runtime::task::spawn`, which on the exec backend is
+//! a task on the Medium callback band: one cooperative worker, released
+//! only when a task's poll RETURNS, and `pump_main`'s poll returns only
+//! when the command channel and every member queue are simultaneously
+//! empty. On the target the `.1 second` scans (EPICS 66, above cbMedium's
+//! 64) refilled the member queues faster than the drain emptied them, so
+//! that poll never returned: the band's only worker never ran another
+//! Medium task (all per-PV monitor forwarding dead) and never slept
+//! (SCHED_FIFO 64 busy on a single core — every thread below it starved,
+//! protocol echo included). One group subscription wedged the whole server,
+//! permanently (doc/qsrv-rtems-design.md §9.15). A dedicated thread removes
+//! the failure class instead of relocating it: the drain parks on its own
+//! stack, occupies no shared worker, and runs BELOW the connection threads
+//! so even a saturated drain cannot preempt protocol traffic — see
+//! [`QSRV_GROUP_PUMP_PRIORITY`].
 //!
 //! # Invariant
 //!
@@ -37,24 +57,32 @@
 //!   pump will read.
 //! * MUST NOT: the drain run while no group subscription exists — C parity
 //!   (forwarding work only under subscription); on last-deregistration the
-//!   task terminates through the finalizer above.
+//!   thread terminates through the finalizer above.
+//! * MUST: the drain run on its own dedicated OS thread ([`pump_main`]
+//!   under `block_on_sync`), never on a shared callback-band worker — and
+//!   every one of its awaits stay runtime-agnostic (waker-based, no
+//!   reactor, no internal thread-blocking bridge), so the only thread its
+//!   park points ever park is its own.
 //!
-//! # Exec-backend liveness (why the drain may park)
+//! # Drain liveness (who wakes the parked drain thread)
 //!
-//! On the RTEMS exec backend a task that returns `Pending` with its waker
-//! registered nowhere live is dropped. Every park point of [`pump_main`]
-//! keeps the waker in a structure owned by the sender side:
+//! The drain thread parks between polls (`park_on`'s `ThreadWaker`);
+//! every park point of [`pump_main`] keeps its waker in a structure owned
+//! by the sender side, so the unpark cannot be lost:
 //!
 //! 1. the command channel — waker held by the `UnboundedReceiver`'s shared
 //!    channel state, whose `UnboundedSender` lives in `PumpShared` for the
 //!    pump's whole life (cleared only by the exit finalizer, after which
-//!    the task returns without awaiting again);
+//!    the thread returns without awaiting again);
 //! 2. member queues — waker held in each polled `EvQue::poll_wakers`,
 //!    inside the `Arc<EvQue>` the record's subscriber slot (the
 //!    `EventSink`) keeps alive; a record post flushes it via
-//!    `wake_readers`;
+//!    `wake_readers` — the same contract the CA blocking driver's
+//!    per-connection drain loops already park on;
 //! 3. `read_group().await` — the same DB await surface the per-monitor
-//!    poll path already used, unchanged;
+//!    poll path already used, unchanged; its awaits are `tokio::sync` /
+//!    `poll_fn` futures (no reactor, no timers), which is what lets the
+//!    same body run under a hosted runtime and under `park_on`;
 //! 4. the update queue never parks the pump: [`UpdatePusher::push`] is
 //!    synchronous and coalesces instead of blocking (below).
 //!
@@ -67,13 +95,16 @@
 //! sets unioned (pvxs's monitor FIFO squash). Push therefore never blocks,
 //! so one slow subscriber cannot stall the drain for other groups.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::task::{Poll, Waker};
 
+use epics_base_rs::runtime::task::{
+    StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread,
+};
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::snapshot::PropertySupport;
@@ -81,6 +112,28 @@ use epics_base_rs::server::snapshot::PropertySupport;
 use super::group::{EventMark, GroupChannel, GroupMonitor, MemberEventKind};
 use super::group_config::GroupPvDef;
 use super::provider::MonitorPoll;
+
+/// The EPICS priority of the `qsrvGroup` drain thread — deliberately ONE
+/// BELOW the PVA connection threads, where pvxs puts its pump one ABOVE.
+///
+/// pvxs starts the pump with `db_start_events(.., "qsrvGroup", ..,
+/// epicsThreadPriorityCAServerLow - 1)` (`ioc/groupsource.cpp:96`) = 19 on
+/// the ladder this workspace already copied its PVA numbers from: the
+/// blocking driver's connection threads sit at `CAServerLow - 2` = 18
+/// (`PVA_SERVER_PRIORITY`, `server_native/blocking.rs`) and its UDP search
+/// responder at `CAServerLow - 4` = 16. Taking upstream's 19 literally
+/// would put the drain ABOVE the connection threads, and the §9.15
+/// regression measured exactly what a drain above the protocol threads
+/// does to a single-core SCHED_FIFO target when it saturates: echo
+/// unanswered, fresh clients timing out, delivery dead server-wide. Per
+/// event this drain also does strictly more work than upstream's pump
+/// callback budgeted for that slot (a full atomic `read_group` of every
+/// member). So the deviation: 17 keeps the pump above the SEARCH responder
+/// (preserving pvxs's drain > search ordering — a discovery storm must not
+/// starve group delivery) but below established connections, so a
+/// saturated drain degrades group update latency (member queues coalesce,
+/// newest-wins) instead of protocol liveness.
+const QSRV_GROUP_PUMP_PRIORITY: ThreadPriority = ThreadPriority::Custom(17);
 
 // ---------------------------------------------------------------------------
 // Update queue — pump → monitor, bounded, replace-in-place on overflow
@@ -334,7 +387,42 @@ impl GroupPump {
         tx.send(cmd).expect("fresh channel with a live receiver");
         shared.cmd_tx = Some(tx);
         let pump = self.clone();
-        epics_base_rs::runtime::task::spawn(pump_main(pump, rx));
+        // A dedicated thread, NEVER `runtime::task::spawn`: on the exec
+        // backend that is a Medium-band pool task, and a drain whose poll
+        // returns only when every member queue is dry held the band's one
+        // worker forever on the target — the §9.15 server-wide wedge (see
+        // the module docs). Upstream's pump is a thread for the same
+        // reason (`db_start_events`, `groupsource.cpp:96`); its name is
+        // upstream's, and fits RTEMS's 16-byte thread-name cap.
+        //
+        // `Big` stack, not upstream's event-task `Medium` (`dbEvent.c:1117`):
+        // `block_on_sync` pins `pump_main` — including each `read_group` +
+        // NT-assembly state machine — on this stack, the same audited
+        // future the `Big`-stacked connection threads run for a group GET;
+        // C's `Medium` sizes a shallower C callback frame.
+        let spawned = spawn_dedicated_thread(
+            "qsrvGroup".into(),
+            QSRV_GROUP_PUMP_PRIORITY,
+            StackSizeClass::Big,
+            move || {
+                if let Err(e) = block_on_sync(pump_main(pump, rx)) {
+                    // Unreachable by construction: a fresh dedicated thread
+                    // is neither a facility worker nor a current-thread
+                    // runtime. If it ever fires, the exit finalizer never
+                    // ran — the next `register` recovers through its
+                    // send-failure arm.
+                    tracing::error!(error = ?e, "qsrv group drain thread could not block on its pump");
+                }
+            },
+        );
+        if let Err(e) = spawned {
+            // pvxs treats a pump that cannot start as fatal to source setup
+            // (`groupsource.cpp:97` throws). Restore the invariant
+            // (`cmd_tx` `Some` ⟺ live pump) before propagating, so the
+            // failed spawn cannot masquerade as a live drain.
+            shared.cmd_tx = None;
+            panic!("qsrv group drain thread could not be created: {e}");
+        }
         RegistrationHandle {
             pump: self.clone(),
             id,
@@ -426,9 +514,9 @@ async fn pump_main(
 /// the event-arriving-during-teardown boundary resolves to teardown.
 ///
 /// When this returns `Pending` it has polled EVERY member reader, so the
-/// task's waker is registered with the command channel and with every
-/// member queue — any of them becoming ready re-wakes the drain (and, on
-/// the exec backend, keeps the task retained).
+/// drain's waker is registered with the command channel and with every
+/// member queue — any of them becoming ready re-wakes (unparks) the drain
+/// thread.
 fn next_wake<'a>(
     cmd_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<PumpCmd>,
     regs: &'a mut BTreeMap<u64, LiveReg>,
@@ -811,6 +899,70 @@ mod tests {
         // The handle's late Deregister must be a harmless no-op.
         drop(handle);
         assert!(!pump.has_live_drain());
+    }
+
+    /// The §9.15 fatal-regression test — group delivery MUST NOT depend on
+    /// the shared callback pool's Medium band.
+    ///
+    /// The first pump landing spawned [`pump_main`] with
+    /// `runtime::task::spawn`, which on the exec backend is a task on the
+    /// Medium callback band: ONE cooperative worker, released only when a
+    /// task's poll RETURNS — and `pump_main`'s poll returns only when the
+    /// command channel and every member queue are simultaneously empty. On
+    /// the target the `.1 second` scans (EPICS 66, above cbMedium's 64)
+    /// refilled the member queues faster than the drain emptied them, so the
+    /// poll never returned, the band's only worker never ran another Medium
+    /// task or slept again, and every thread below 64 starved: one group
+    /// subscription wedged ALL monitor delivery server-wide, killed protocol
+    /// echo and timed out fresh clients, permanently (measured, §9.15). The
+    /// same class was caught independently on the host: a name-server dial
+    /// occupying cbMedium for its 40 s connect timeout froze delivery
+    /// server-wide.
+    ///
+    /// So: occupy the Medium band's only worker for the WHOLE test, and
+    /// require the drain to deliver anyway. On the band-task shape this
+    /// fails deterministically (the pump task is queued behind the pin and
+    /// can never run); on the dedicated-thread shape (pvxs's `qsrvGroup`
+    /// thread, `db_start_events` at `groupsource.cpp:96`) it passes without
+    /// the band ever becoming free. Exec backend only: on the tokio backend
+    /// `spawn_blocking` goes to a large pool and pins nothing.
+    #[cfg(feature = "rtems-exec-model")]
+    #[tokio::test]
+    async fn drain_delivers_while_the_medium_band_worker_is_occupied() {
+        // Pin the Medium band's ONLY worker (DEFAULT_THREADS_PER_PRIORITY
+        // = 1): the closure holds it until released, so nothing spawned onto
+        // the band can run for the duration of the test.
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pin = epics_base_rs::runtime::task::spawn_blocking(move || {
+            let _ = pinned_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+        });
+        pinned_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the pin closure reached the band worker");
+
+        let (db, def) = one_member_group("TP:GRP", "TP:a").await;
+        let pump = GroupPump::new();
+        let mut mon = GroupMonitor::new(db.clone(), def).with_pump(pump.clone());
+        mon.start().await.expect("start");
+        post_value(&db, "TP:a");
+
+        let polled = tokio::time::timeout(Duration::from_secs(3), mon.poll()).await;
+        // Release the band before asserting, so a failure does not leave the
+        // worker wedged for the rest of the process.
+        let _ = release_tx.send(());
+        let polled = polled
+            .expect(
+                "group delivery must not depend on the shared Medium callback band \
+                 (§9.15: the band-task pump wedged the whole target)",
+            )
+            .expect("assembled update");
+        assert!(!polled.value.fields.is_empty());
+
+        mon.stop().await;
+        wait_drain_stopped(&pump).await;
+        drop(pin);
     }
 
     /// Delivery-keeps-up regression (host-scale stand-in for the on-target

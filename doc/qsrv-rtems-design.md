@@ -1788,7 +1788,10 @@ still owed (§9.15 "What is NOT claimed").
 
 Closes §9.14's verdict on §8 item 2. Landed on `unfixed3/group-drain`
 as `74ea6eb1` (poll-based `EvQue` reader) + `a0078c5f` (the drain) +
-`6b472636` (flood regression test).
+`6b472636` (flood regression test). **Amended by §9.15.1:** this first
+landing ran the drain as a callback-pool task, and that execution
+context was a fatal regression on the target — the drain is now a
+dedicated thread. Everything else in this section stands.
 
 **Shape.** `crates/epics-bridge-rs/src/qsrv/group_pump.rs` is the port
 of pvxs's one `"qsrvGroup"` event pump (`ioc/groupsource.cpp:96`):
@@ -1881,6 +1884,109 @@ QEMU/BSP box against this branch. §8 item 5's attribution question is
 mooted in its "which band for the forwarders" form (there are no
 forwarders), but the on-target rerun is still the gate that retires
 §9.14's LOAD table.
+
+### 9.15.1 The first drain landing killed the target — the drain must be a thread, not a pool task
+
+Plainly: §9.15 as first merged (`08da8342`) was a fatal regression on
+the QEMU target. The §9.14 tree it replaced starved delivery but
+stayed alive; the pump tree wedged the whole server, permanently, from
+ONE group subscription. Measured on the target: the victim scalar
+`RTEMS:PVA:V0` was perfect at baseline (900 updates, clean 100 ms
+cadence); the moment a monitor opened on the 20-member
+`RTEMS:PVA:BIG`, V0 delivered exactly 3 more updates (0.23 s) and then
+nothing; BIG delivered its connect-time snapshot only; ~40 s later
+both pvxs clients reported "connection to Server timeout" and
+disconnected; a fresh `pvxget` of V0 timed out permanently; the IOC
+process stayed alive throughout.
+
+**Mechanism** (pinned from code + the measurements above). The drain
+was spawned with `runtime::task::spawn`, which under `rtems-exec-model`
+is a task on the callback pool's Medium band: ONE worker thread
+(`cbMedium`, `DEFAULT_THREADS_PER_PRIORITY = 1`) at SCHED_FIFO EPICS 64,
+and the cooperative executor (`future_exec.rs`) returns that worker to
+its drain-and-sleep loop only when a task's poll RETURNS. `pump_main`'s
+poll is `loop { next_wake().await; handle }` — it returns `Pending`
+only when the command channel AND every member `EvQue` are
+simultaneously empty. The 20 members are `.1 second` self-driven
+records, and the periodic scan thread that refills their queues runs
+at `periodic_priority(6)` = EPICS 66, ABOVE cbMedium's 64 — it preempts
+the drain and reposts every 100 ms, and with target-scale `read_group`
+latency (an atomic 20-record read + NT assembly per event, on
+QEMU-TCG) the queues were never simultaneously dry. So that one poll
+never returned, and everything followed: (a) the band's only worker
+never ran another Medium task — every per-PV monitor forwarder
+(`spawn_db_monitor_updates`) starved, which is V0's
+3-in-flight-then-nothing and BIG's snapshot-only; (b) the worker never
+slept — a SCHED_FIFO-64 thread continuously busy on the single core
+starves every thread below it: the PVA connection threads (EPICS 18),
+accept (18) and UDP search (16), which is the echo death at ~40 s and
+the fresh client that can never connect; (c) scan at 66 kept preempting
+and reposting, closing the loop permanently. Nothing crashed, so the
+IOC stayed "alive". The same failure class was then caught
+independently on the host: a gdb all-thread dump showed `cbMedium`
+occupied for a ~40 s synchronous name-server dial
+(`dial_blocking` from the pvalink stage-5 `ns_task`), freezing
+delivery for the duration — one occupant that does not return its
+poll, or blocks outright, on the Medium band = broad delivery
+starvation. (That NS-dial-on-the-band defect is pre-existing and
+distinct; recorded, not fixed here.)
+
+**Why every host gate was green.** Hosted production spawns onto a
+multi-worker tokio runtime, and the feature-ON host tests drove
+`GroupMonitor` directly with short bursts that let the queues go dry —
+nothing drove the blocking driver (`BlockingPvaServer`) with a group
+source under sustained posting. That coverage gap is closed below.
+
+**The fix** (structural, and exactly upstream's shape): the drain is a
+dedicated OS thread. pvxs never ran its pump on a shared pool —
+`db_start_events(.., "qsrvGroup", ..)` creates a thread
+(`ioc/groupsource.cpp:96`). `GroupPump::register` now spawns
+`"qsrvGroup"` through `runtime::task::spawn_dedicated_thread` driving
+`pump_main` under `block_on_sync` (`park_on` on a bare thread: parks
+its OWN stack between polls, occupies no shared worker; every
+`pump_main` await is runtime-agnostic — `tokio::sync` channel state,
+`EvQue::poll_wakers`, the DB read futures — so the thread is wakeable
+from any poster). `Big` stack (the pinned future contains the same
+`read_group` + NT-assembly state machine the Big-stacked connection
+threads run). Lifecycle is unchanged: spawned on first registration,
+exits through `finalize_if_idle` on last deregistration, so the thread
+(and its RTEMS stack carve-out) exists only while a group subscription
+does. NOT taken: re-banding the drain or resizing the pool — a drain
+whose poll can outlive any budget starves whatever band hosts it; the
+thread removes the failure class instead of relocating it.
+
+**Priority: a deliberate deviation from upstream.**
+`QSRV_GROUP_PUMP_PRIORITY = Custom(17)`. pvxs runs its pump at
+`epicsThreadPriorityCAServerLow - 1` = 19, one ABOVE its TCP workers'
+`CAServerLow - 2` = 18 — the same ladder our blocking driver's 18/16
+came from. Taking 19 literally would put a saturated drain above the
+protocol threads on a single-core SCHED_FIFO target, and this section
+is the measurement of what that does. 17 keeps the drain above the UDP
+search responder (16; pvxs's drain > search ordering — a discovery
+storm must not starve group delivery) but below established
+connections: a saturated drain now degrades group-update latency (the
+member queues coalesce, newest-wins) instead of protocol liveness.
+
+**Proof, host-observable both ways.**
+`drain_delivers_while_the_medium_band_worker_is_occupied`
+(`group_pump.rs`, feature-ON): pins the Medium band's only worker for
+the whole test and requires group delivery anyway — fails on the
+band-task drain with a 3 s delivery timeout (recorded), passes in
+0.03 s on the thread drain. And the coverage gap itself:
+`tests/qsrv_group_blocking_driver.rs` (feature-ON) drives the real
+blocking driver end-to-end — `build_qsrv_mount` →
+`qsrvSingle`/`qsrvGroup` composite → `BlockingPvaServer` → three real
+client circuits: a 20-member group monitor, an unrelated scalar
+monitor (V0's role), a poster thread flooding every member, a fresh
+GET mid-flood. On the band-task drain it fails with the target's exact
+symptom — "timed out waiting for: scalar monitor updates during a
+group flood" after the connect-time snapshots landed (recorded, 12.0 s
+run) — and passes on the thread drain in 0.04 s.
+
+**What is NOT claimed.** Same honesty as §9.15: these are host proofs
+of the mechanism, not target numbers. The on-target rerun — this
+regression's re-verification AND §9.14's q8 table — has not been run
+against this branch and remains the gate.
 
 ### 9.16 Scan ownership as built — SCAN was dead on the PVA-only target, now core-owned
 

@@ -11,8 +11,11 @@
 //! # `ca_blocking_client` — forcing the blocking client transport on a host
 //!
 //! The CA client dials through one seam ([`client::transport::dial_ca`]) with
-//! two implementations: `tokio::net::TcpStream` on a hosted target, and
-//! `runtime::blocking_io`'s two-thread pump on RTEMS, which has no reactor.
+//! two implementations: `tokio::net::TcpStream` on `tokio_backend`, and
+//! `runtime::blocking_io`'s two-thread pump on `exec_backend`, which gives a
+//! spawned future no reactor. This `--cfg` forces the second one on a build
+//! that would otherwise take the first; it is the only way to reach that arm
+//! without also moving the whole crate onto the exec backend.
 //! Showing that the second one leaves the frame pipeline untouched means
 //! running the *whole* host client suite against it, including the integration
 //! tests under `tests/`, which are separate crates and so cannot see anything

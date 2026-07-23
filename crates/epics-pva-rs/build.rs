@@ -42,8 +42,11 @@
 // # `pva_blocking_client` — forcing the blocking client transport on a host
 //
 // The PVA client dials through one seam with two implementations: the tokio
-// `TcpStream` on a hosted target, and `runtime::blocking_io`'s two-thread pump
-// on RTEMS, which has no reactor. Showing that the second one leaves the frame
+// `TcpStream` on `tokio_backend`, and `runtime::blocking_io`'s two-thread pump
+// on `exec_backend`, which gives a spawned future no reactor. This `--cfg`
+// forces the second one on a build that would otherwise take the first; it is
+// the only way to reach that arm without also moving the whole crate onto the
+// exec backend. Showing that the second one leaves the frame
 // pipeline untouched means running the *whole* host client suite against it,
 // including the integration tests in `tests/`, which are separate crates and so
 // cannot see anything `#[cfg(test)]`.

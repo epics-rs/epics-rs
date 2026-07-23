@@ -316,8 +316,11 @@ mod ioc {
     /// the inbound `hostfwd`, so the upstream cannot also use it).
     const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
 
-    /// STAGE-5 PROBE: the C task census and stack-usage report — see
-    /// `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
+    // STAGE-5 PROBE: the C task census and stack-usage report — see
+    // `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
+    // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
+    // document extern blocks, and the target build is the only one that
+    // compiles this.)
     #[cfg(target_os = "rtems")]
     unsafe extern "C" {
         fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);

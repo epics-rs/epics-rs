@@ -457,6 +457,37 @@ impl CaLinkResolver {
         self.links.read().len()
     }
 
+    /// C6 PROBE: every open link's PV name and connection state, sorted.
+    ///
+    /// The guest-side half of the on-target gate's criteria 1 and 4: with
+    /// no iocsh on the target the console is the only place the link
+    /// registry can be read from *inside* the IOC, next to what `caget`
+    /// reads from outside. `dbcaxr` prints the same facts but needs a
+    /// shell to invoke it.
+    pub fn link_report(&self) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = self
+            .links
+            .read()
+            .iter()
+            .map(|(name, link)| (name.clone(), link.is_connected()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// C6 PROBE: the shared client's virtual-circuit count, or `None`
+    /// when no link has been opened yet and the lazy client does not
+    /// exist.
+    ///
+    /// This is §2.4's "one upstream circuit regardless of link count",
+    /// observed from the guest. The host-side counterpart is `ss -tn`
+    /// against the upstream's port; both are recorded because either one
+    /// alone can be read as an artefact of where it was measured.
+    pub async fn client_connection_count(&self) -> Option<usize> {
+        let client = self.client.get()?;
+        Some(client.ioc_connection_count().await)
+    }
+
     /// Lazily resolve `name` to its cached [`CaLink`]. Opens the link when
     /// it is not yet in the registry — the first-access slow path.
     /// Steady-state reads hit the registry directly.

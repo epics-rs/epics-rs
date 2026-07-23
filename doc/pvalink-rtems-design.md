@@ -808,9 +808,11 @@ replace the banner that currently says nothing about links.
 *Status: run on the box on 2026-07-23; all six topology-A criteria pass.
 The measurements, the four defects it found, and where reality deviated
 from this section are §12. Two corrections to the text below, both
-recorded there: the `@pva://…` spelling in the topology-A paragraph does
-not load (§12.1), and the §4.3 thread table it points at was missing two
-baseline threads (§12.6).*
+recorded there: the topology-A paragraph spelled the record links
+`@pva://…`, which does not load (§12.2 — `@` is the INST_IO sigil), and
+the §4.3 thread table it points at was missing two baseline threads
+(§12.6). The link spellings are corrected in place below; §12.2 keeps the
+rejected form, because naming it is that section's job.*
 
 Everything above is `cargo check` and host tests. "Type-checks for RTEMS"
 and "runs on RTEMS" are different claims and this workspace has been bitten
@@ -825,7 +827,7 @@ the guest a route *out* to the host at `10.0.2.2` with no `hostfwd` and no
 (`doc/rtems-priority-on-target-measurement.md:176`). Run an upstream
 PVA IOC on the host (`softIocPVX` from pvxs, or our own `qsrv-rs`) serving
 one `ai`; boot `rtems-pva-ioc` with `EPICS_PVA_NAME_SERVERS=10.0.2.2:5075`
-and a `.db` whose record carries `INP=@pva://UPSTREAM:AI CP`.
+and a `.db` whose record carries `INP=pva://UPSTREAM:AI CP`.
 
 *Pass criteria, each stated as an observation on the console or on the
 wire, because the target has no iocsh:*
@@ -841,7 +843,7 @@ wire, because the target has no iocsh:*
 4. Kill the upstream: guest record goes `LINK`/`INVALID`. Restart it: the
    record recovers **without** rebooting the guest — proving the
    re-subscribe loop (`link.rs:335-430`) survives the 1 s clock quantum.
-5. An OUT link (`OUT=@pva://UPSTREAM:AO`) writes and is observed
+5. An OUT link (`OUT=pva://UPSTREAM:AO`) writes and is observed
    upstream — proving `flush_puts` on the link-put-queue owner.
 6. `rt stackuse` / `rt top` on the guest: thread count and per-thread
    peaks match §4.3's arithmetic to within one thread, and the connection
@@ -1748,7 +1750,7 @@ TCP.
 
 ### 12.2 §5's `.db` spelling does not load — `@pva://` is INST_IO
 
-§5 stage 5 says the guest record carries `INP=@pva://UPSTREAM:AI CP`. It
+§5 stage 5 said the guest record carries `INP=@pva://UPSTREAM:AI CP`. It
 does not load, in this tree or in C. A leading `@` is INST_IO, and
 `dbCanSetLink` (`record/link.rs:487`, C `dbStaticLib.c:2400`) refuses
 INST_IO on a record whose bound device support declares CONSTANT — which
@@ -1768,6 +1770,12 @@ record(ai, "RTEMS:PVA:DOWN")  { field(INP, "{pva: { pv: 'UPSTREAM:AI', proc: 'CP
 record(ai, "RTEMS:PVA:DOWN2") { field(INP, "pva://UPSTREAM:AI CP") }
 record(ao, "RTEMS:PVA:UPLNK") { field(OUT, "{pva: { pv: 'UPSTREAM:AO' }}") }
 ```
+
+§5 stage 5 carried the rejected spelling in prose and is now corrected in
+place; this section keeps it, because the rejected form is what it exists
+to name. The same `@` defect on the CA side, and the twelve source sites
+that carried it across both IOC binaries, are
+`doc/calink-rtems-design.md` §10.7.
 
 ### 12.3 The topology is compiled in, because the target has neither a filesystem nor argv
 
@@ -1800,6 +1808,14 @@ STAGE5 seq=1 link pv=UPSTREAM:AO dir=Out connected=true records=["RTEMS:PVA:UPLN
 
 "2 links" for three records is correct and is the §2.4 property on
 target: `UPSTREAM:AI` is shared by both INP records.
+
+That banner is quoted as it was printed by the `f75f1e56` image and is
+left byte for byte, so the `@pva://...` in its second half stays. It was
+itself one of the twelve source sites `doc/calink-rtems-design.md` §10.7
+corrected: the banner *text* named a spelling the loader rejects, while
+the links the same image actually loaded were the two in §12.2 that do.
+`rtems-pva-ioc.rs:671-673` now prints `pva://... INP/OUT resolve over
+EPICS_PVA_NAME_SERVERS`.
 
 **(2) `pvxget` from the host against the guest's record returns the
 upstream value. PASS.** Command and output (host, through the `hostfwd`):

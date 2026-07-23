@@ -1200,7 +1200,7 @@ substitutions are:
 |---|---|
 | upstream `softIocPVX` on the host | upstream `softIoc` (C base) on the host, serving one `ai` and one `ao` |
 | `EPICS_PVA_NAME_SERVERS=10.0.2.2:5075` | `EPICS_CA_NAME_SERVERS=10.0.2.2:5064` **plus** `EPICS_CA_ADDR_LIST=` and `EPICS_CA_AUTO_ADDR_LIST=NO` (§4.5) |
-| `INP=pva://UPSTREAM:AI CP` (spelled `@pva://` in that doc — see §10.7) | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
+| `INP=pva://UPSTREAM:AI CP` (that doc spelled it `@pva://` when this row was written; corrected there — see §10.7 and `doc/pvalink-rtems-design.md` §12.2) | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
 | `pvxget` / `pvxput` from the host | `caget` / `caput` from the host |
 | forwarded `tcp::5075-:5075` | forwarded `tcp::5064-:5064` |
 

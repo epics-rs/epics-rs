@@ -1,4 +1,4 @@
-//! Parser for `@pva://...` link strings.
+//! Parser for `pva://...` link strings.
 //!
 //! Accepted forms (matches pvxs `pvalink_jlif.cpp`):
 //!
@@ -845,8 +845,16 @@ mod tests {
         );
     }
 
+    /// The parser tolerates a leading `@`, but nothing in an IOC can hand
+    /// it one: `try_parse_hw_link` (`epics-base-rs` `link.rs:1074-1086`)
+    /// claims any field starting with `@` as INST_IO before the scheme arm
+    /// runs, and `iocInit` then refuses it on a soft record
+    /// (`doc/pvalink-rtems-design.md` §12.2, measured on target). This is
+    /// therefore leniency on a path with no producer, kept because
+    /// removing it would be a behaviour change, not a spelling fix. Pinned
+    /// so the tolerance is a decision rather than an accident.
     #[test]
-    fn at_prefix_accepted() {
+    fn at_prefix_accepted_though_no_record_can_deliver_one() {
         let c = PvaLinkConfig::parse("@pva://X", LinkDirection::Out).unwrap();
         assert_eq!(c.pv_name, "X");
     }

@@ -931,7 +931,7 @@ the target IOC serves `Q:group` PVs and resolves **no** `pva://` record
 links. That is a real functional gap against a C IOC (which gets pvalink
 through `pvalink_enable()`, `ioc/iochooks.cpp:495`) and it should be
 stated in `rtems-pva-ioc`'s startup banner rather than discovered by an
-operator whose `INP=@pva://…` silently never connects.
+operator whose `INP=pva://…` silently never connects.
 
 ---
 

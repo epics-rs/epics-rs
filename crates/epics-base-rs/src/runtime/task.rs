@@ -504,6 +504,37 @@ pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output,
     .await
 }
 
+/// [`timeout`] against an absolute [`Instant`] instead of a duration — the
+/// seam's `tokio::time::timeout_at`.
+///
+/// It exists because one deadline shared across several sequential awaits is a
+/// different bound from a fresh duration per await: `caget_many` gives its
+/// whole batch one deadline, so a slow first PV eats the budget the rest would
+/// otherwise each get in full. Expressing that with `timeout` would need the
+/// caller to do the subtraction, which is the arithmetic that drifts.
+#[cfg(tokio_backend)]
+pub async fn timeout_at<F: Future>(deadline: Instant, fut: F) -> Result<F::Output, Elapsed> {
+    tokio::time::timeout_at(deadline, fut).await
+}
+
+/// RTEMS/exec: raced against [`sleep_until`], the absolute-deadline twin of
+/// what [`timeout`] races against.
+#[cfg(exec_backend)]
+pub async fn timeout_at<F: Future>(deadline: Instant, fut: F) -> Result<F::Output, Elapsed> {
+    let mut sleep = std::pin::pin!(sleep_until(deadline));
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Ok(v));
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(Elapsed(())));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 pub fn runtime_handle() -> tokio::runtime::Handle {
     tokio::runtime::Handle::current()
 }

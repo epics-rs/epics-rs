@@ -4786,25 +4786,67 @@ mod runtime_seam_guard {
     //! Both panic at runtime, on the target, with a green `cargo check` and a
     //! green host suite — the exact failure mode a source guard is for.
 
-    /// Production slice: everything before the first column-0 `mod` — every
-    /// one of which, in this file, is a test module.
+    /// Production slice: everything before the first column-0 *inline* `mod`
+    /// (`mod name {`) — every one of which, in both files below, is a test
+    /// module. A column-0 `mod name;` declaration is not a boundary:
+    /// `client/mod.rs` opens with eight of them.
     ///
-    /// NOT "the first `#[cfg(test)]`": this file has a `#[cfg(test)]` *fn* at
-    /// column 0 near the top (`drained_socket_probe`), and cutting there would
-    /// shrink the slice past every line this guard exists to cover. Nor "the
-    /// first `#[cfg(test)] mod`", which silently skips a module gated
-    /// `#[cfg(all(test, …))]` and swallows it into the production slice — a
-    /// slice rule that grows the covered region when a test module is gated is
-    /// the wrong shape. Cutting at the `mod` line itself is invariant to which
-    /// attribute precedes it. The positive assertions below fail closed if
-    /// this ever slips again.
-    fn production() -> &'static str {
-        let src = include_str!("transport.rs");
-        match src.find("\nmod ") {
-            Some(i) => &src[..i],
-            None => src,
+    /// NOT "the first `#[cfg(test)]`": `transport.rs` has a `#[cfg(test)]`
+    /// *fn* at column 0 near the top (`drained_socket_probe`), and cutting
+    /// there would shrink the slice past every line this guard exists to
+    /// cover. Nor "the first `#[cfg(test)] mod`", which silently skips a
+    /// module gated `#[cfg(all(test, …))]` and swallows it into the
+    /// production slice — a slice rule that *grows* the covered region when a
+    /// test module is gated is the wrong shape. Cutting at the `mod` line
+    /// itself is invariant to which attribute precedes it. The MUST_CONTAIN
+    /// anchors below fail closed if this ever slips again.
+    fn production(src: &'static str) -> &'static str {
+        let mut off = 0usize;
+        for line in src.split_inclusive('\n') {
+            if line.starts_with("mod ") && line.trim_end().ends_with('{') {
+                return &src[..off];
+            }
+            off += line.len();
         }
+        src
     }
+
+    /// Every file the target actually runs on a callback band, each with the
+    /// anchors its production slice must still contain. The anchors are two
+    /// kinds at once and deliberately so: structural ones (`async fn
+    /// read_loop`) make a slice rule that silently shrinks fail here instead
+    /// of passing vacuously, and seam ones (`runtime::task::TaskSet`) assert
+    /// the positive — that this path reaches the runtime *through* the seam,
+    /// not merely that it avoids the banned spellings by having no timers at
+    /// all.
+    const TARGET_LIVE: [(&str, &str, &[&str]); 2] = [
+        (
+            // The transport manager plus both circuit pumps: one instance of
+            // each per virtual circuit, all on `cbMedium` on the target.
+            "client/transport.rs",
+            include_str!("transport.rs"),
+            &[
+                "async fn run_transport_manager",
+                "async fn read_loop",
+                "async fn write_loop",
+                concat!("runtime::task", "::TaskSet"),
+                concat!("runtime::task", "::sleep_until("),
+            ],
+        ),
+        (
+            // Every channel operation's round-trip bound. Target finding 2
+            // (`doc/calink-rtems-design.md` §11.1): four `cbMedium` panics
+            // from `tokio::time::timeout` in the channel read path, which the
+            // transport-only guard could not see.
+            "client/mod.rs",
+            include_str!("mod.rs"),
+            &[
+                "impl CaChannel {",
+                concat!("runtime::task", "::timeout("),
+                concat!("runtime::task", "::timeout_at("),
+            ],
+        ),
+    ];
 
     /// Drop whole-line comments, so the prose *explaining* why a shape is
     /// banned cannot itself trip the check. Trailing comments are kept —
@@ -4823,50 +4865,36 @@ mod runtime_seam_guard {
 
     #[test]
     fn circuit_path_reaches_the_runtime_only_through_the_seam() {
-        let prod = production();
+        for (label, src, must_contain) in TARGET_LIVE {
+            let code = code_only(production(src));
 
-        // Fail closed: the slice must still cover the three functions the
-        // target actually runs on every circuit.
-        for anchor in [
-            "async fn run_transport_manager",
-            "async fn read_loop",
-            "async fn write_loop",
-        ] {
-            assert!(
-                prod.contains(anchor),
-                "production slice no longer covers `{anchor}`; the slice rule broke \
-                 before this guard could check anything"
-            );
-        }
+            for anchor in must_contain {
+                assert!(
+                    code.contains(anchor),
+                    "{label}: production slice no longer contains `{anchor}`; either \
+                     the slice rule broke before this guard could check anything, or \
+                     this path stopped reaching the runtime through the seam"
+                );
+            }
 
-        let code = code_only(prod);
-
-        // Positive: the circuit path does use the seam.
-        assert!(
-            code.contains(concat!("runtime::task", "::TaskSet")),
-            "the transport manager must hold its pending connects in the seam's \
-             task set"
-        );
-        assert!(
-            code.contains(concat!("runtime::task", "::sleep_until(")),
-            "the receive watchdog must sleep through the seam"
-        );
-
-        // Negative: no shape that needs a tokio runtime survives on the
-        // circuit path. Each of these compiles fine for `armv7-rtems-eabihf`
-        // and panics the callback-band worker at runtime.
-        for needle in [
-            concat!("tokio::task", "::JoinSet"),
-            concat!("tokio::time", "::"),
-            concat!("tokio", "::spawn("),
-        ] {
-            assert_eq!(
-                code.matches(needle).count(),
-                0,
-                "the CA circuit path must not name `{needle}`: on the RTEMS target \
-                 these run on a callback band with no tokio runtime in the process, \
-                 and the failure is a runtime panic on the target, not a build error"
-            );
+            // Negative: no shape that needs a tokio runtime survives on the
+            // target-live path. Each of these compiles fine for
+            // `armv7-rtems-eabihf` and panics the callback-band worker at
+            // runtime.
+            for needle in [
+                concat!("tokio::task", "::JoinSet"),
+                concat!("tokio::time", "::"),
+                concat!("tokio", "::spawn("),
+            ] {
+                assert_eq!(
+                    code.matches(needle).count(),
+                    0,
+                    "{label} must not name `{needle}`: on the RTEMS target this file \
+                     runs on a callback band with no tokio runtime in the process, \
+                     and the failure is a runtime panic on the target, not a build \
+                     error"
+                );
+            }
         }
     }
 }

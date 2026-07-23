@@ -1076,8 +1076,11 @@ which carries `dep:epics-ca-rs`. `qsrv-core` does not: the crate's *only*
 `epics_ca_rs` reference in `qsrv` is at `pva_adapter.rs:1427`, inside
 `run_ca_pva_qsrv_ioc`, so the dependency belongs to the host runner and
 moves to `qsrv` with it. Under the target selection `epics-ca-rs` is not
-in the graph at all. Its `default` list is also empty, so
-`default-features = false` would drop nothing even if it were.
+in the graph at all, and that — not its feature list — is the whole
+reason. (This paragraph also claimed its `default` list was empty. That
+was true when written and stopped being true at `274a734b`, which split
+`client-core` out and made `default = ["client"]`; the argument never
+rested on it, so only the sentence changed.)
 
 Spelling it out anyway would have bought no coverage and cost a second
 place where a hand-written `version = "0.24.0"` can drift from the

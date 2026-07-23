@@ -169,9 +169,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
 # `qsrv-core`, the RTEMS selection, gets the reduced set.
 epics-pva-rs = { path = "../epics-pva-rs", version = "0.24.0", optional = true, default-features = false }
-# `epics-ca-rs` stays inherited: its `default` feature list is empty, so there
-# is nothing for `default-features = false` to drop, and it is not in the
-# `qsrv-core` graph at all.
+# `epics-ca-rs` stays inherited, but NOT because its defaults are empty — they
+# stopped being empty at `274a734b`, which introduced the `client-core`/`client`
+# split and made `default = ["client"]`. The reason is narrower and is a fact
+# about the graph rather than about the feature list: no feature this crate can
+# select on the target pulls `epics-ca-rs` at all. `dep:epics-ca-rs` is reached
+# only through `qsrv`, `ca-gateway`, `dual-ioc` and `experimental-rust-tls`, and
+# the RTEMS selection (`scripts/rtems-check.sh`: `qsrv-core,pvalink`) carries
+# none of them — measured with `cargo tree -p epics-bridge-rs
+# --no-default-features --features qsrv-core,pvalink`, which does not name it.
+# So `default-features = false` here would change nothing the target compiles,
+# while costing the second hand-written `version = "0.24.0"` that the
+# `epics-pva-rs` entry above had to accept for a real reason.
+#
+# If a target feature ever does pull it, this entry needs the same treatment
+# `epics-pva-rs` got — `client` is a real default to drop now, and the target's
+# selection is `client-core`.
 epics-ca-rs = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

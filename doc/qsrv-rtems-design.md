@@ -982,11 +982,11 @@ Everything here is a claim this document could not settle from source.
    prediction held. The specific open question is also answered:
    `tests/pva_gateway.rs`'s sites **do** count — §9.13 books `pva_gateway`
    at 92 (68 in-module plus the 24 in `tests/pva_gateway.rs`), carried
-   under a file-level `RTEMS-EXEC-MODEL-ALLOW` marker ("not built
-   feature-ON by default — behind the `pva-gateway` feature") rather than
-   excluded. The file's marker reads 25 today — one site added since the
-   §9.13 count; the census gate tracks the marker, so the drift is
-   accounted, not silent.
+   under a file-level `RTEMS-EXEC-MODEL-ALLOW` marker rather than
+   excluded (reason since promoted from "not built feature-ON by
+   default" to "checked" — §9.17). The file's marker reads 25 today —
+   one site added since the §9.13 count; the census gate tracks the
+   marker, so the drift is accounted, not silent.
 7. ~~**`scripts/rtems-check.sh` census spelling.**~~ **VERIFIED (stage 1,
    `a6ae5e9b`): underscores.** The census pairs are
    `epics-bridge-rs:ca_gateway_rs`, `:dual_gateway_rs`, `:dual_ioc_rs`,

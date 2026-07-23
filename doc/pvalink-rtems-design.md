@@ -1504,7 +1504,7 @@ defers) runs on the pool regardless of transport.
 > the host exactly as on target. The eleven tests this section gated stay
 > gated; they now carry `cfg(tokio_backend)`, the predicate their subject
 > carries, which the census tool recognises as a gate. Full account:
-> `doc/calink-rtems-design.md` §11. The reactor-dependent
+> `doc/calink-rtems-design.md` §12. The reactor-dependent
 tests are therefore genuinely gated, per the rtems-exec-gate contract and
 the `server_native/tcp.rs` precedent — each `#[cfg(not(feature =
 "rtems-exec-model"))]`, each census marker reduced to match, helpers used
@@ -1561,7 +1561,7 @@ warned to budget for, surfacing one seam behaviour the conversion exposed.
 > onto the reactor-free backend while `epics-pva-rs` still compiled its
 > reactor-backed UDP transport in and selected it: `rtems-pva-ioc`, the binary
 > the feature exists for, was built in the one state that panics at boot. The
-> `const` assertion described in `doc/calink-rtems-design.md` §11.2 is what
+> `const` assertion described in `doc/calink-rtems-design.md` §12.2 is what
 > found it; the manifest now forwards to both clients.
 
 §5 warned that `rtems-exec-model` was not declared on `epics-bridge-rs`

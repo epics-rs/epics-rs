@@ -31,7 +31,7 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // The UDP SEARCH/beacon transport is compiled out wherever a spawned future
 // has no tokio reactor — `cfg(exec_backend)`, which is the RTEMS target *and*
@@ -69,7 +69,12 @@ use tokio::sync::{mpsc, oneshot};
 // exists. Measured on target: a direct `tokio::time::interval` panics the
 // `cbMedium` worker with *"there is no reactor running"* the moment the engine
 // starts, and the pvalink monitor never connects.
-use epics_base_rs::runtime::task::{Interval, interval, sleep, sleep_until};
+// Deadlines here are computed with `Instant::now() + window` and then waited
+// on with `sleep_until`, so they must be stamped in the clock the seam's timer
+// actually runs on — hosted that is tokio's, which is virtual under
+// `start_paused`. Taking `Instant` from the seam alongside the timer is what
+// keeps the two from being different timelines.
+use epics_base_rs::runtime::task::{Instant, Interval, interval, sleep, sleep_until};
 use tracing::debug;
 // `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
 // `exec_backend` — so the import is too, or it is unused there.

@@ -1175,6 +1175,16 @@ measurement shows a real problem do the two closures (enqueue restructure vs
 C-style dedicated thread) come back for a second sign-off, with numbers. Until
 then no code change alters `run_monitor`'s inline `dispatch_external_cp_targets`.
 
+**Measurement taken (2026-07-23): §11.6.** Headline, for the second sign-off:
+at 10.00 Hz on a link whose CP holder runs an 9-record inline FLNK chain, an
+INDEPENDENT `ca://` link on the same band takes **+9.45 ms typical / +15.67 ms
+worst-case** added monitor-to-record delay, and a 200 ms `cbMedium` timer task
+takes **no measurable delay at all** (4.70 tick/s in every phase, identical to
+three significant figures). Nothing in this stage altered
+`dispatch_external_cp_targets`; §11.4's fix ADDS a dispatch on the disconnect
+edge, which is the C behaviour that was missing, not a change to the fan-out
+the sign-off froze.
+
 ### Stage C5 — mount calink in `rtems-ca-ioc` (small) — **DONE** (see §10)
 
 Select the target client feature (stage C2's `client-core`) for
@@ -1195,7 +1205,7 @@ written with `tracing::` is discarded.
 
 **Not sufficient.** This stage's real gate is C6.
 
-### Stage C6 — two IOCs on the wire, one `ca://`-linking to the other (the actual gate)
+### Stage C6 — two IOCs on the wire, one `ca://`-linking to the other (the actual gate) — **DONE** (see §11)
 
 Everything above is `cargo check` and host tests. "Type-checks for RTEMS" and
 "runs on RTEMS" are different claims and this workspace has been bitten by the
@@ -1242,6 +1252,15 @@ target has no iocsh:*
 measurement document, in the shape of
 `doc/rtems-priority-on-target-measurement.md`. Anything short of that is stage
 C5 with extra confidence.
+
+**Status (2026-07-23): all seven criteria PASS on `bb7b40ab`.** Measured on
+the bring-up box, guest image built from that commit ("boot 5"), console at
+`~/rtems-bringup/c6/guest5.log`. Four defects were found on target and fixed at
+source, one commit each, before the criteria could be claimed — two runtime-seam
+holes that panicked `cbMedium` (§§11.1-11.2), a banner that reported a link registry
+still being filled (§11.3), and a `ca://` link disconnect that never processed
+its CP holders, which is criterion 4 itself (§11.4). The stage C4 measurement
+this stage was made a precondition of is §11.6.
 
 **Sequencing against pvalink stage 5:** both need the same box, the same SLIRP
 route and the same `hostfwd` discipline. Whichever runs first should record the
@@ -1783,7 +1802,7 @@ of pvalink stage 4's) and `iocinit_link_phases_run_after_the_mount`.
    `read_loop` (§6 C2, §10.1).~~ **CLOSED — §10.11 item 1.**
 2. ~~The hosted `rtems-exec-model` build cannot exercise either link resolver's
    client path — `AsyncUdpV4` needs a reactor and both RTEMS IOC binaries panic
-   at `net/async_udp_v4.rs:1275`.~~ **CLOSED — §11.** Not by a seam under
+   at `net/async_udp_v4.rs:1275`.~~ **CLOSED — §12.** Not by a seam under
    `AsyncUdpV4`: the transport selection itself was the defect, and it now
    selects on the backend rather than on the target, so the exec backend has no
    UDP transport to reach a reactor with.
@@ -1844,9 +1863,555 @@ Coverage added, because two of these were refactors of code no test reached:
   — pins the premise item 5's `cfg` rests on.
 
 
-## 11. §10.10 item 2 as built — the predicate was the defect
 
-### 11.1 What was actually wrong
+---
+
+## 11. Stage C6 as built — the on-target two-IOC gate
+
+Everything in §§8-10 was `cargo check`, host tests, and one host boot. This
+section is the first time calink ran on the target with a real upstream IOC on
+the other end of a real socket, and it is the only section in this document
+whose claims are observations rather than readings of source.
+
+**Image.** `bb7b40ab`, built on the bring-up box with `~/rtems-bringup/build-c6.sh`:
+
+```
+cargo +nightly build --release --target armv7-rtems-eabihf \
+  -Zbuild-std=std,panic_abort --no-default-features --features client-core \
+  -p epics-ca-rs --bin rtems-ca-ioc
+```
+
+**Rig.** Topology A, the pvalink stage-5 rig (`doc/pvalink-rtems-design.md`
+§12) with the CA substitutions §6 tabulates. Scripts in `~/rtems-bringup/c6/`;
+qemu invocation unchanged from the measured one:
+
+```
+qemu-system-arm -M xilinx-zynq-a9 -m 256M -no-reboot -nographic \
+  -serial null -serial mon:stdio \
+  -nic user,model=cadence_gem,hostfwd=tcp:127.0.0.1:5064-:5064 \
+  -kernel c6ioc.exe
+```
+
+Upstream: C base `softIoc -d upstream.db` on the host, `EPICS_CA_SERVER_PORT`
+and `EPICS_CAS_SERVER_PORT` both `15076`. Guest: DHCP `10.0.2.15`, host
+`10.0.2.2`, `EPICS_CA_NAME_SERVERS=10.0.2.2:15076` compiled in (a `-kernel`
+boot has no filesystem and `rtems_init.c:195` hands `main` a fixed
+one-element argv, so the topology cannot come from the command line —
+`doc/pvalink-rtems-design.md` §12.3's forcing, unchanged for CA).
+
+**Outbound SLIRP is verified** (the sibling's §6 item 4, previously
+UNVERIFIED, recorded here once for both tracks): the guest reaches
+`10.0.2.2:15076` with **no** `hostfwd` for that port. Only the INBOUND
+direction needs one, and there the host port must equal the guest port.
+
+### 11.1 Target finding 1 — `tokio::task::JoinSet`, a fourth spelling of `tokio::spawn`
+
+First boot, console verbatim:
+
+```
+panic on thread cbMedium at crates/epics-ca-rs/src/client/transport.rs:790:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+`JoinSet::spawn` in the transport manager's pending-connect set. Stage C3
+pinned *spawns* and §10.6 pinned *timers*, and this shape is neither: no
+"no bare `tokio::spawn`" needle matches `JoinSet`, and a `JoinSet` field is
+not a `TaskHandle`. It compiles for `armv7-rtems-eabihf` and panics the band
+worker at first use.
+
+Fixed structurally in `a04684bb` by adding `runtime::task::TaskSet` to the
+seam — a join-set with the same shape on both backends — rather than by
+open-coding a `Vec<TaskHandle>` at the one call site. The same commit moved
+`read_loop`/`write_loop`'s timers onto the seam, which required adding
+`runtime::task::Instant` (a `std::time::Instant` handed to a tokio timer is
+a deadline in a different timeline under `#[tokio::test(start_paused = true)]`
+— that surfaced as three host failures and is a latent host bug the target
+found).
+
+### 11.2 Target finding 2 — the channel round-trip bounds
+
+Second boot, four of these:
+
+```
+panic on thread cbMedium at crates/epics-ca-rs/src/client/mod.rs:2605:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+```
+
+`tokio::time::timeout` in the channel read path. The finding-1 sweep missed
+this file because the production slice it used cut at the first
+`#[cfg(test)]`, which in `client/mod.rs` sits above most of the channel API.
+
+Fixed in `0d56cf43`: ten sites in `client/mod.rs` onto the seam, with
+`runtime::task::timeout_at` added because `caget_many` shares ONE deadline
+across N channels and per-call `timeout` would have changed the semantics.
+The seam guard (`runtime_seam_guard`) now runs over a `TARGET_LIVE` table of
+(file, anchors) covering `client/transport.rs` AND `client/mod.rs`, with the
+slice rule corrected to "first column-0 *inline* `mod X {`" so a file that
+opens with eight `mod x;` declarations is sliced correctly. Verified to fail
+on the pre-fix tree:
+
+```
+client/mod.rs: production slice no longer contains `runtime::task::timeout_at(`
+```
+
+**What this commit cost elsewhere, and what caught it.** `timeout_at` needs an
+absolute instant, and on the hosted backend that instant must be tokio's:
+tokio's clock is virtual under `#[tokio::test(start_paused = true)]`, so a
+`std::time::Instant` handed to a tokio timer is a deadline in a different
+timeline. `0d56cf43` therefore named `runtime::task::Instant` as a backend
+alias and re-typed `sleep_until` from `std::time::Instant` to it. That is a
+signature change on a seam function with callers outside the two crates the
+per-crate gate covers, and it broke one: `epics-pva-rs`'s
+`client_native/search_engine.rs` imported `Instant` from `std` and passed it
+to the seam's `sleep_until` (two sites). The crate-scoped
+`clippy -p epics-ca-rs -p epics-base-rs` was green with the workspace not
+compiling. `cargo clippy --workspace --all-targets` caught it; fixed in
+`935c59ac` by taking `Instant` from the seam in that file too — the same
+correction, since it also stamps its deadlines with `now() + window` and waits
+on them with that same `sleep_until`. **The rule this pins: a change to a
+`runtime::task` signature is by definition cross-crate and must be gated at
+workspace scope, never per-crate.**
+
+### 11.3 Target finding 3 — the banner counted a registry that was still filling
+
+Criterion 1, third boot:
+
+```
+iocInit: 4 external CP link subscriptions (3 PVs warmed)
+iocInit: 1 external link opens staged
+rtems-ca-ioc: calink resolver installed — 0 ca:// record links registered; ...
+...
+C6 seq=1 links=4 circuits=Some(1)
+```
+
+Not a display bug. iocInit's two link phases STAGE opens; each open runs on
+the link work owner and registers its `CaLink` only after a `subscribe()`
+round trip to the upstream returns. A count sampled the instant `run()`
+returns is a race against the network, and the banner's own comment ("Taken
+at the last moment before the banner, it is the registry as the first client
+will find it") asserted the opposite of what the target does.
+
+Fixed in `a487dd07`. `PvDatabase::external_link_pv_names` is new: the
+DISTINCT external PV names every link field names, enumerated through
+`record_link_fields` + `external_pv_name`, the same two owners both iocInit
+phases use. That is the set the registry converges to and therefore the only
+honest denominator — iocInit's own counts are per link FIELD (two records
+reading one upstream PV are two links, one registry entry), which is why they
+print 4 and 1 while the registry holds 4 PVs. The banner waits for the
+registry to reach it, bounded at 10 s so an unreachable upstream still boots
+and still prints, with the shortfall named.
+
+### 11.4 Target finding 4 — criterion 4 itself: a dropped link never alarms
+
+Fourth boot, the criterion-4 run. The resolver saw the drop; the records did
+not. Console verbatim during the outage:
+
+```
+C6 seq=30 links=4 circuits=Some(0)
+C6 seq=30 link pv=UPSTREAM:AI connected=false
+C6 seq=30 record RTEMS:CA:DOWN VAL=Ok("133.75") SEVR=Ok("0") STAT=Ok("0")
+```
+
+Across that whole boot: 24 `connected=false` link samples, 6 samples at
+`circuits=Some(0)`, and **63 of 63** `RTEMS:CA:DOWN` samples at `SEVR=0
+STAT=0`. Host side, same window:
+
+```
+$ ss -tn state established '( dport = :15076 )' | wc -l
+0
+```
+
+Root cause. C `connectionCallback` (`dbCa.c:848-873`) does TWO things on a
+disconnect: clears `pca->isConnected` AND sets `CA_DBPROCESS` for a
+`pvlOptCP` link (or a `pvlOptCPP` link whose holder is Passive). The worker
+then runs `db_process(prec)`, `dbCaGetLink` returns `-1` with
+`INVALID_ALARM`/`LINK_ALARM` (`dbCa.c:459-463`), and the record commits
+LINK/INVALID. calink did only the first. A Passive CP holder is by definition
+never scanned, so nothing else could ever notice — the guest served its last
+good value with `SEVR=NO_ALARM` for the entire 65 s outage.
+
+Fixed structurally in `bb7b40ab`. The flag was a bare `Arc<AtomicBool>` with
+three independent `store` sites, which is what let the second half be
+forgotten. `LinkConnState` now owns it:
+
+> **Invariant.** A `ca://` link's servability flag MUST NOT go from connected
+> to disconnected without dispatching that PV's CP/CPP holders.
+> **Owner.** `LinkConnState`. The flag is private; `mark_connected` /
+> `mark_disconnected` / `is_set` are the only surface, and the dispatch lives
+> inside `mark_disconnected` on the true→false EDGE (`swap`), so repeated
+> `Disconnected` events — the watcher's, then `run_monitor`'s
+> subscription-ended tail — dispatch once per outage rather than once per
+> event, and a new fourth site cannot skip it.
+
+Reconnect deliberately does NOT dispatch here: C's connect arm schedules work
+and it is the monitor event that drives processing, which `run_monitor`
+already does.
+
+**Not the same defect, and not fixed here:** C `accessRightsCallback`
+(`dbCa.c:1094-1099`) adds the same `CA_DBPROCESS` when read access is lost.
+calink has no read-access gate in `with_servable` at all, so there is no state
+for a dispatch to expose; closing that is a separate change with its own
+parity work. Recorded in §11.7.
+
+### 11.5 The seven criteria, as measured
+
+All on the boot-5 image (`bb7b40ab`), console `~/rtems-bringup/c6/guest5.log`,
+zero panics for the life of the boot.
+
+**1. Banner reports the resolver and the link count — PASS.**
+
+```
+iocInit: 1 non-local DB link(s) made external
+iocInit: 4 external CP link subscriptions (3 PVs warmed)
+iocInit: 1 external link opens staged
+rtems-ca-ioc: serving 17 records on CA port 5064 (TCP + UDP search), RTEMS execution model, no tokio runtime
+INFO  epics_ca_rs::client: channel connected pv=UPSTREAM:OTHER cid=1 sid=4 server=10.0.2.2:15076
+INFO  epics_ca_rs::client: channel connected pv=UPSTREAM:AI cid=2 sid=5 server=10.0.2.2:15076
+INFO  epics_ca_rs::client: channel connected pv=UPSTREAM:FAST cid=3 sid=6 server=10.0.2.2:15076
+INFO  epics_ca_rs::client: channel connected pv=UPSTREAM:AO cid=4 sid=7 server=10.0.2.2:15076
+rtems-ca-ioc: calink resolver installed — 4/4 ca:// record links registered (UPSTREAM:AI, UPSTREAM:AO, UPSTREAM:FAST, UPSTREAM:OTHER); ` CA`-modified and ca://... INP/OUT resolve over EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out on this target)
+```
+
+**2. `caget` from the host against the guest's downstream record returns the
+upstream's value — PASS**, for BOTH spellings (`INP="UPSTREAM:AI CP"` and
+`INP="ca://UPSTREAM:AI CP"`).
+
+```
+$ . guest-env.sh; caget -a RTEMS:CA:DOWN RTEMS:CA:DOWN2
+RTEMS:CA:DOWN                  <undefined> 1
+RTEMS:CA:DOWN2                 <undefined> 1
+$ . up-env.sh; caget -a UPSTREAM:AI
+UPSTREAM:AI                    <undefined> 1 UDF NO_ALARM
+```
+
+**3. `caput` to the upstream changes the guest record within one scan period,
+through the MONITOR path — PASS.** Both records are `SCAN=Passive`, so no scan
+can be doing it. Latency is host-arrival-to-host-arrival on the wire, because
+the target's `Instant` is 1-second-quantized (§5.5) and cannot resolve this:
+
+```
+$ crit3.sh
+=== upstream (host arrival | server ts | value):
+1784781395.952850 UPSTREAM:AI                    2026-07-23 04:36:35.952601 42.5
+1784781397.993735 UPSTREAM:AI                    2026-07-23 04:36:37.993496 7.25
+1784781400.034792 UPSTREAM:AI                    2026-07-23 04:36:40.034561 133.75
+=== guest   (host arrival | server ts | value):
+1784781395.956926 RTEMS:CA:DOWN                  2026-07-23 04:36:35.952601 42.5
+1784781395.957798 RTEMS:CA:DOWN2                 2026-07-23 04:36:35.952601 42.5
+1784781397.997508 RTEMS:CA:DOWN                  2026-07-23 04:36:37.993496 7.25
+1784781397.998513 RTEMS:CA:DOWN2                 2026-07-23 04:36:37.993496 7.25
+1784781400.039159 RTEMS:CA:DOWN                  2026-07-23 04:36:40.034561 133.75
+1784781400.039978 RTEMS:CA:DOWN2                 2026-07-23 04:36:40.034561 133.75
+=== added latency, upstream arrival -> guest arrival:
+  RTEMS:CA:DOWN    value=42.5      +4.076 ms
+  RTEMS:CA:DOWN2   value=42.5      +4.948 ms
+  RTEMS:CA:DOWN    value=7.25      +3.773 ms
+  RTEMS:CA:DOWN2   value=7.25      +4.778 ms
+  RTEMS:CA:DOWN    value=133.75    +4.367 ms
+  RTEMS:CA:DOWN2   value=133.75    +5.186 ms
+```
+
+2.2-5.2 ms against a fastest-possible scan period of 100 ms. Note the guest
+record adopts the UPSTREAM's timestamp verbatim (`04:36:35.952601` on both
+sides) — the link timestamp is propagated, not restamped locally, which is
+also why the guest's own 1 s clock quantum does not appear in these records.
+
+**4. Kill the upstream: guest record goes LINK/INVALID. Restart it: the record
+recovers WITHOUT rebooting the guest — PASS** (after §11.4).
+
+```
+== BEFORE: upstream alive (04:04:45)
+RTEMS:CA:DOWN                  <undefined> 1
+RTEMS:CA:DOWN2                 <undefined> 1
+RTEMS:CA:OTHER                 <undefined> 0
+FD_CNT FD_FREE CA_CONN_CNT = 10 140 0
+guest->upstream TCP (all states): 2
+
+##### KILL upstream softIoc pid=2633251
+== AFTER KILL +15 s (04:05:00)
+RTEMS:CA:DOWN                  <undefined> 1 LINK INVALID
+RTEMS:CA:DOWN2                 <undefined> 1 LINK INVALID
+RTEMS:CA:OTHER                 <undefined> 0 LINK INVALID
+FD_CNT FD_FREE CA_CONN_CNT = 9 141 0
+guest->upstream TCP (all states): 0
+== AFTER KILL +35 s (04:05:20)              [unchanged: LINK INVALID, 9 141 0, 0]
+
+##### RESTART upstream
+== AFTER RESTART +30 s (04:05:50)
+RTEMS:CA:DOWN                  <undefined> 1
+RTEMS:CA:DOWN2                 <undefined> 1
+RTEMS:CA:OTHER                 <undefined> 0
+FD_CNT FD_FREE CA_CONN_CNT = 9 141 0
+guest->upstream TCP (all states): 2
+== AFTER RESTART +55 s (04:06:16)
+FD_CNT FD_FREE CA_CONN_CNT = 10 140 0
+guest->upstream TCP (all states): 2
+
+##### proof the guest never rebooted:
+RTEMS:UPTIME = 00:02:34
+boot markers in guest5.log = 1
+```
+
+`RTEMS:UPTIME` is monotonic across the whole outage and `rtems-boot: main()
+reached` appears exactly once, so the recovery is a reconnect, not a restart.
+The alarm clears and the value returns with the upstream, and this survives
+the 1 s clock quantum (§5.5) — the reconnect ladder is
+`EPICS_CA_CONN_TMO`-paced (30 s default), comfortably above it.
+
+**5. An OUT link writes and is observed upstream, in BOTH `LinkPutOp`
+flavours — PASS.** One `ao` covers both because the op is chosen by the
+originating write, not by the link: `Database::external_put_op`
+(`database/links.rs:1801-1806`) returns `Async` when the source record carries
+a put-notify wait-set and `Plain` otherwise, so `caput` exercises `put_nowait`
+and `caput -c` exercises `put`.
+
+```
+$ crit5.sh
+--- caput (plain -> put_nowait) RTEMS:CA:UPLNK 21.5
+21.5
+--- caput -c (put-notify -> put) RTEMS:CA:UPLNK 64.25
+64.25
+--- guest-side readback of the OUT record:
+RTEMS:CA:UPLNK                 2014-04-14 08:02:36.416902 64.25
+=== UPSTREAM:AO at the upstream IOC (host arrival | server ts | value):
+1784781361.519473 UPSTREAM:AO                    2026-07-23 04:36:01.519244 21.5
+1784781364.570160 UPSTREAM:AO                    2026-07-23 04:36:04.569948 64.25
+```
+
+The `caput -c` returned, which is the put-notify completing end to end through
+the guest's async external put. (The guest record's own timestamp reads
+`2014-04-14` — the 1 s-quantized target clock with no NTP, §5.5. It does not
+affect the write, and the upstream restamps.)
+
+**6. Thread and stack census matches §5.2's arithmetic, and the circuit count
+to the upstream is 1 regardless of link count — PASS.**
+
+```
+TASKDUMP begin tag=c6-180 count=30 scheduler_sc=0
+TASKDUMP id=0x0b010002 core=140 posix= 115 thread=cbLow
+TASKDUMP id=0x0b010003 core=135 posix= 120 thread=cbMedium
+TASKDUMP id=0x0b010004 core=128 posix= 127 thread=cbHigh
+TASKDUMP id=0x0b010005 core=129 posix= 126 thread=cbTimer
+TASKDUMP id=0x0b010006 core=132 posix= 123 thread=scanOnce
+TASKDUMP id=0x0b010007 core=189 posix=  66 thread=status-pv
+TASKDUMP id=0x0b010008 core=181 posix=  74 thread=CAS-TCP
+TASKDUMP id=0x0b010009 core=183 posix=  72 thread=CAS-UDP
+TASKDUMP id=0x0b01000c core=150 posix= 105 thread=CAC-reader 10.0
+TASKDUMP id=0x0b010010 core=189 posix=  66 thread=c6-probe
+TASKDUMP id=0x0b010014 core=148 posix= 107 thread=CAC-writer 10.0
+TASKDUMP id=0x0b010015 core=148 posix= 107 thread=CAC-writer 10.0
+TASKDUMP id=0x0b01001d core=150 posix= 105 thread=CAC-reader 10.0
+
+ID         NAME                  AVAIL     USED
+0x0b010003 cbMedium            1048560   266296
+0x0b01000c CAC-reader 10.0      262128     1576
+0x0b010014 CAC-writer 10.0      262128     2264
+0x0b010015 CAC-writer 10.0      262128     2264
+0x0b01001d CAC-reader 10.0      262128     1288
+```
+
+* **4 CAC threads**, in two reader/writer pairs, for **4 links** — the
+  per-peer-not-per-link property (§2.4), on target. §5.2's arithmetic is
+  2 threads per upstream circuit + 2 per name-server circuit = 4; measured 4,
+  stable across every census in the boot.
+* **`AVAIL 262128` = `StackSizeClass::Small`** (262,144 − 16 bytes of guard),
+  exactly §5.2's table. Peak use 1,288-2,264 bytes, i.e. under 1 % — the CA
+  client's per-circuit stack is nowhere near its class.
+* **The data circuit is 1**: `C6 seq=185 links=4 circuits=Some(1)` on the
+  console (`CaClient::ioc_connection_count`), with 4 links open and connected.
+  Host side, `ss -tn '( dport = :15076 )'` shows **2** guest→upstream sockets:
+  the one IOC data circuit plus the name-server circuit. Those are the same 2
+  peers the 4 CAC threads serve.
+* **Base census is 30 tasks.** A census taken while an inbound CA client is
+  connected reads 32; the delta is exactly `CAS-client-bloc` and
+  `CAS-event-block`, the per-client server pair. §5.2's arithmetic is about
+  the CLIENT side and is met to the thread.
+* `cbMedium`'s 266,296-byte peak against a `Big` 1,048,560-byte stack is the
+  inline CP fan-out running record chains on the band — the §5.4 shape,
+  visible in the stack numbers. 25 % of a `Big` stack, on a 9-record chain.
+
+**7. `FD_CNT` equals the pre-link value plus exactly the circuits opened —
+PASS, arithmetic in every sample.**
+
+```
+$ crit7.sh
+== baseline: links up, only the reading caget inbound
+FD_CNT FD_FREE FD_MAX = 10 140 150
+guest->upstream TCP  = 2
++1 inbound camonitor: FD_CNT FD_FREE FD_MAX = 11 139 150
++2 inbound camonitor: FD_CNT FD_FREE FD_MAX = 12 138 150
++3 inbound camonitor: FD_CNT FD_FREE FD_MAX = 13 137 150
++4 inbound camonitor: FD_CNT FD_FREE FD_MAX = 15 135 150
+back to 0 extra inbound: FD_CNT FD_FREE FD_MAX = 11 139 150
+
+-- with only the reading caget inbound:
+CA_CONN_CNT FD_CNT = 0 10
++1 inbound: CA_CONN_CNT FD_CNT = 1 11
++2 inbound: CA_CONN_CNT FD_CNT = 2 12
++3 inbound: CA_CONN_CNT FD_CNT = 4 14
+back to 0 extra: CA_CONN_CNT FD_CNT = 1 10
+```
+
+* `FD_CNT + FD_FREE = FD_MAX = 150` in **every** sample — the configured
+  `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` (§5.3), confirmed on target.
+* `FD_CNT − CA_CONN_CNT = 10` in every sample: the descriptor cost of an
+  inbound client is exactly 1 and it is exactly what `CA_CONN_CNT` counts.
+  (The two samples reading `4 14` and `1 10` are a teardown not yet reaped —
+  the invariant still holds in both.)
+* **The link cost, isolated by the criterion-4 outage:** with both outbound
+  circuits up `FD_CNT` is 10, with both closed it is 9, `CA_CONN_CNT`
+  unchanged at 0. Stated exactly: the two circuits account for **one
+  descriptor more** than the reconnecting client holds. The absolute per-
+  circuit cost is NOT isolated by this measurement, because a client with a
+  link configured never sits at zero descriptors — it retains one while
+  retrying. §5.3's table ("+1 fd per circuit, +2 for name server + upstream")
+  is therefore an upper bound that this image meets or beats; the fd wall it
+  predicts (140 inbound clients with links) is not lowered by anything
+  measured here.
+
+### 11.6 The stage C4 band-occupancy measurement — THE DECISION INPUT
+
+This is the measurement the C4 sign-off (§6, 2026-07-23) made a precondition
+of C6 and of any second sign-off on the two closures.
+
+**What is loaded.** `UPSTREAM:FAST` → `RTEMS:CA:FAST` (a `ca:// … CP` link)
+→ `FLNK` chain `RTEMS:CA:C1 … C8`: **9 records processed inline** on the
+`cbMedium` worker that received the monitor event, which is exactly
+`run_monitor`'s inline `dispatch_external_cp_targets` (§5.4).
+
+**What is watched, and why two victims.**
+
+1. `UPSTREAM:OTHER` → `RTEMS:CA:OTHER`, an **independent `ca://` link** whose
+   monitor task shares the same one-worker band. Latency is (host arrival of
+   the guest's update) − (host arrival of the same value from the upstream).
+   Both hops are the same host over loopback, so the SLIRP term is common to
+   every sample and cancels out of the baseline-vs-load comparison.
+2. `RTEMS:CA:TICK`, written every 200 ms by a `runtime::task::spawn` +
+   `runtime::task::sleep` loop, which on this target **is** a `cbMedium` band
+   task. This is the timer half of the question.
+
+Everything is timestamped on the WIRE from the host: the target's `Instant`
+is 1-second-quantized (§5.5) and can resolve none of this.
+
+**Method.** 90 s baseline (load link idle) → 90 s load → 30 s recovery, one
+continuous pair of monitors across all three phases. The load is driven by a
+host-side `calcout` at `.1 second`, flipped on and off with
+`caput UPSTREAM:DRV.SCAN`. The victim link is driven by a second host-side
+`calcout` at `1 second`, so every phase collects the same number of
+independent latency samples. `RTEMS:CA:TICK` is POLLED rather than monitored,
+because the probe writes it through `put_pv`, which posts no CA monitor;
+polling and differentiating gives tick RATE, which on a one-worker band is a
+better occupancy measure than jitter anyway — occupancy shows up as ticks the
+timer task could not take.
+
+**Results.**
+
+```
+== victim 1: independent ca:// link  UPSTREAM:OTHER -> RTEMS:CA:OTHER
+   (monitor-to-record latency, host wire timestamps)
+   baseline  n= 90  median=   2.98 ms  mean=   3.06 ms  p95=   3.50 ms  max=   4.54 ms
+   load      n= 90  median=  12.43 ms  mean=  12.62 ms  p95=  13.71 ms  max=  18.65 ms
+   recovery  n= 30  median=   2.92 ms  mean=   3.03 ms  p95=   4.01 ms  max=   4.39 ms
+   ADDED DELAY  typical (median-median) = +9.45 ms
+   ADDED DELAY  worst   (max-max)       = +14.11 ms
+   ADDED DELAY  worst   (load max - baseline median) = +15.67 ms
+   load link UPSTREAM:FAST during baseline    0 events
+   load link UPSTREAM:FAST during load      900 events /  89.9 s = 10.00 Hz
+   load link UPSTREAM:FAST during recovery    0 events
+
+== victim 2: cbMedium timer task  RTEMS:CA:TICK  (nominal 5.00 tick/s)
+   baseline  n= 27  median= 4.70 tick/s  min= 4.64  max= 5.18
+   load      n= 42  median= 4.70 tick/s  min= 4.67  max= 5.17
+   recovery  n= 14  median= 4.70 tick/s  min= 4.69  max= 5.17
+   TICK RATE  baseline 4.70/s -> load 4.70/s  (+0.0 %)
+   implied per-tick period  baseline 212.8 ms -> load 212.8 ms  (added -0.0 ms)
+   worst 2 s window under load: 4.67 tick/s = 214.0 ms/tick
+
+== chain end RTEMS:CA:C8 monitor events: 902
+```
+
+**The numbers, stated for the sign-off.**
+
+| quantity | value |
+|---|---|
+| load actually applied | **10.00 Hz**, 900 events over 89.9 s |
+| chains actually run | **902** (`RTEMS:CA:C8` monitor events) — one per event |
+| victim link, typical added delay | **+9.45 ms** (median 2.98 → 12.43 ms) |
+| victim link, worst-case added delay | **+15.67 ms** (baseline median → load max 18.65 ms) |
+| victim link, worst-vs-worst | +14.11 ms (max 4.54 → 18.65 ms) |
+| `cbMedium` 200 ms timer, added delay | **0.0 ms** (4.70 tick/s in all three phases) |
+| recovery | complete and immediate: median back to 2.92 ms |
+
+**Reading these numbers.**
+
+* The occupancy is **real and it is measurable** — a 4× rise in an independent
+  link's monitor-to-record latency is not noise, and it is caused by nothing
+  but the other link's chain, since the victim's own rate, path and payload
+  are identical in all three phases and recovery is complete.
+* It is **bounded and small in absolute terms**: mid-teens milliseconds at the
+  worst, against a fastest EPICS scan period of 100 ms. No sample in any phase
+  came close to one scan period.
+* The load distribution is **tight**, not long-tailed (median 12.43, mean
+  12.62, p95 13.71). Every victim update under load is delayed by about the
+  same amount. That is the signature of a band whose run queue always has
+  pending work at 10 Hz — the victim waits its turn behind queued chain work —
+  rather than of occasional collisions with an in-flight chain.
+* The **timer half is unaffected**, which is the more surprising result and
+  the one that most constrains the interpretation: the cooperative executor
+  releases the worker between chains (§5.4 point 3), so a 200 ms timer never
+  misses its slot even at 10 chains/s. The 4.70 tick/s (vs a nominal 5.00) is
+  a constant present in ALL three phases — sleep granularity and probe
+  overhead, not load.
+* Stack evidence agrees: `cbMedium` peaks at 266,296 bytes of its `Big`
+  1,048,560-byte stack (§11.5) — the chain runs on the band, deeply, but well
+  inside its class.
+
+**What this does NOT settle.** The measurement is one shape: 9 records, one
+loaded link, 10 Hz, on an otherwise-idle IOC. It does not bound a 50-record
+chain, a chain containing an async record, several loaded links at once, or a
+band that also carries QSRV group forwarders and pvalink forwarders (the
+generalisation §5.4's structural option was argued from). The invariant in
+§5.4 remains stated and remains unenforced by construction. What the numbers
+say is that on the C6 topology the *urgency* is low: nothing here is a missed
+deadline, a starved timer, or an unbounded occupancy — it is a single-digit-
+to-mid-teens millisecond latency tax on other links sharing the band.
+
+### 11.7 Open after C6
+
+1. **Read-access loss does not process CP holders.** C
+   `accessRightsCallback` (`dbCa.c:1094-1099`) adds `CA_DBPROCESS` when read
+   or write access is lost, the same as the disconnect path §11.4 closed.
+   calink has no read-access gate in `with_servable` at all, so both halves
+   are missing: the gate and the dispatch. Distinct from §11.4 and not fixed
+   here.
+2. **`RTEMS:CA:TICK` is UDF/INVALID and posts no CA monitor.** The C6 probe
+   writes it through `PvDatabase::put_pv`, which neither clears UDF nor posts
+   a monitor. Harmless for the probe (the measurement polls instead) but it
+   means `put_pv` is not a record-processing write; anything that needs a
+   monitor must not use it.
+3. **The C6 probe records and threads are in `rtems-ca-ioc`.** `DEMO_DB`
+   carries 14 probe records and `main` starts two probe threads (`c6-probe`,
+   the tick task). They are the measurement rig, not IOC content, and should
+   come out — or move behind a feature — before the binary is anything but a
+   bring-up image.
+4. **§5.3's fd table is an upper bound, not an equality.** §11.5 criterion 7
+   could not isolate the absolute per-circuit descriptor cost because a client
+   with a link configured never holds zero descriptors. Isolating it needs an
+   image built with no link configured at all.
+5. **Stage C4's second sign-off** is now unblocked with numbers (§11.6). The
+   two closures (enqueue restructure vs C-style dedicated thread) are
+   unchanged and still not picked.
+6. Everything in §10.10 that C6 did not touch remains as §10.10/§10.11/§12
+   record it. Item 2's boot panic is CLOSED (§12: transport selection now keys
+   on the backend, and both IOC binaries boot feature-ON), but the narrower
+   gap stands: the hosted `rtems-exec-model` build still stands up no live
+   upstream, so neither link resolver's *resolution* path runs on a host. That
+   gap is precisely why all four defects in this section had to be found by
+   booting the target.
+
+## 12. §10.10 item 2 as built — the predicate was the defect
+
+### 12.1 What was actually wrong
 
 §10.10 item 2 read the panic as a missing seam: `AsyncUdpV4` needs a reactor,
 so give UDP a runtime seam in `epics-base-rs` the way `dial` and the timers
@@ -1880,7 +2445,7 @@ constructed. The compiled surface on target is unchanged, because
 exec-model build now reproduces the target's configuration instead of
 approximating it, which is the only reason it is worth booting.
 
-### 11.2 The drift the rule invites, and the guard for it
+### 12.2 The drift the rule invites, and the guard for it
 
 Three copies of a four-line rule (`epics-base-rs`, `epics-ca-rs`,
 `epics-pva-rs`) is two too many to trust, and cargo features unify per
@@ -1898,7 +2463,7 @@ first run: `epics-bridge-rs`'s `rtems-exec-model` forwarded to `epics-base-rs`
 and nothing else, so `rtems-pva-ioc` — the binary that feature exists for — was
 built in exactly that state.
 
-### 11.3 The gate
+### 12.3 The gate
 
 `rtems-ca-ioc` and `rtems-pva-ioc` are each booted as a child process over a
 temporary database (`epics-ca-rs/tests/rtems_ca_ioc_boots.rs`,
@@ -1921,9 +2486,9 @@ alone proves nothing. Both tests fail on the pre-fix tree, each on
 | `rtems_exec_model_gate` census, all three crates | pass |
 | `rtems-ca-ioc` / `rtems-pva-ioc` boot feature-ON | no panic; pre-fix tree panics at `net/async_udp_v4.rs:1275` |
 
-### 11.4 What this does not do
+### 12.4 What this does not do
 
-The dial reached in §11.3 is refused, not completed: no upstream server is
+The dial reached in §12.3 is refused, not completed: no upstream server is
 stood up, so neither resolver's *resolution* is verified feature-ON, only that
 its client path runs. Driving a link to `connected` on the host exec model is
 the next step and is not this change.

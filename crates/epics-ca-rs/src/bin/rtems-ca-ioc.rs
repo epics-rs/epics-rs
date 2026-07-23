@@ -91,6 +91,84 @@ mod ioc {
         "record(ao, \"RTEMS:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
         "record(longout, \"RTEMS:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
         "record(stringout, \"RTEMS:MSG\") { field(VAL, \"rtems-ca-ioc\") }\n",
+        // ---- C6 PROBE (doc/calink-rtems-design.md §6 stage C6, topology A) ----
+        //
+        // The records the gate is about. They live in `DEMO_DB` rather than
+        // in a `.db` file because a `-kernel` boot has no filesystem to name
+        // one on and `rtems_init.c:195` hands `main` a fixed one-element
+        // argv — the same forcing the pvalink probe recorded
+        // (`doc/pvalink-rtems-design.md` §12.3).
+        //
+        // NOT `@ca://…`: a leading `@` is INST_IO and `dbCanSetLink`
+        // (`record/link.rs:487`, C `dbStaticLib.c:2400`) refuses INST_IO on
+        // a record whose bound device support declares CONSTANT — a soft
+        // `ai`. Measured on target for the PVA twin (§12.2 there), and the
+        // §6 table for this stage already spells both surviving forms:
+        //
+        //   * `INP=UPSTREAM:AI CP`      — the bare ` CA`-modifier spelling,
+        //     C `pvlOptCA`. A `Db` link until `initialize_link_locality`
+        //     turns it into a `Ca` link, which is exactly why the entry
+        //     point runs that phase.
+        //   * `INP=ca://UPSTREAM:AI CP` — this tree's scheme form.
+        //
+        // Both resolve through `strip_ca_scheme`, and §6 asks for both.
+        "record(ai, \"RTEMS:CA:DOWN\") {\n",
+        "  field(INP, \"UPSTREAM:AI CP\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
+        "}\n",
+        "record(ai, \"RTEMS:CA:DOWN2\") {\n",
+        "  field(INP, \"ca://UPSTREAM:AI CP\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
+        "}\n",
+        // The OUT link. One record covers both `LinkPutOp` flavours
+        // because the op is chosen by the *originating* write, not by the
+        // link: `Database::external_put_op` (`database/links.rs:1801-1806`)
+        // returns `Async` when the source record carries a put-notify
+        // wait-set and `Plain` otherwise. So `caput` exercises `put_nowait`
+        // and `caput -c` exercises `put`, through the same field.
+        "record(ao, \"RTEMS:CA:UPLNK\") {\n",
+        "  field(OUT, \"ca://UPSTREAM:AO\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
+        "  field(SCAN, \"Passive\")\n",
+        "}\n",
+        // ---- C6 PROBE: the stage-C4 band-occupancy measurement ----
+        //
+        // §6 stage C4's sign-off (2026-07-23) deferred the semantic change
+        // and made this measurement the decision input: a deep CP→FLNK
+        // chain on ONE link, and the delay it inflicts on a SECOND,
+        // independent link's monitor→record latency and on timer callbacks
+        // sharing the `cbMedium` band (§5.4).
+        //
+        // `RTEMS:CA:FAST` is the chain head — an external CP link, so
+        // `run_monitor`'s inline `dispatch_external_cp_targets` is what
+        // processes it, on the band worker that received the event. Its
+        // FLNK runs C1..C8: nine records processed inline per upstream
+        // event, which is the shape §5.4 says is unbounded.
+        "record(ai, \"RTEMS:CA:FAST\") {\n",
+        "  field(INP, \"ca://UPSTREAM:FAST CP\")\n",
+        "  field(PREC, \"3\") field(SCAN, \"Passive\") field(FLNK, \"RTEMS:CA:C1\")\n",
+        "}\n",
+        "record(calc, \"RTEMS:CA:C1\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:FAST\") field(FLNK, \"RTEMS:CA:C2\") }\n",
+        "record(calc, \"RTEMS:CA:C2\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C1\") field(FLNK, \"RTEMS:CA:C3\") }\n",
+        "record(calc, \"RTEMS:CA:C3\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C2\") field(FLNK, \"RTEMS:CA:C4\") }\n",
+        "record(calc, \"RTEMS:CA:C4\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C3\") field(FLNK, \"RTEMS:CA:C5\") }\n",
+        "record(calc, \"RTEMS:CA:C5\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C4\") field(FLNK, \"RTEMS:CA:C6\") }\n",
+        "record(calc, \"RTEMS:CA:C6\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C5\") field(FLNK, \"RTEMS:CA:C7\") }\n",
+        "record(calc, \"RTEMS:CA:C7\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C6\") field(FLNK, \"RTEMS:CA:C8\") }\n",
+        "record(calc, \"RTEMS:CA:C8\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C7\") }\n",
+        // The victim: a second, independent `ca://` link whose
+        // monitor→record latency is what the measurement reads. No FLNK,
+        // no chain — every millisecond it gains under load is a
+        // millisecond the chain took from the band.
+        "record(ai, \"RTEMS:CA:OTHER\") {\n",
+        "  field(INP, \"ca://UPSTREAM:OTHER CP\")\n",
+        "  field(PREC, \"3\") field(SCAN, \"Passive\")\n",
+        "}\n",
+        // The other victim: a timer callback on the same band. Driven by
+        // the probe's `runtime::task::sleep` loop, which on this target is
+        // a `cbMedium` task — so the interval between successive values a
+        // host `camonitor` sees IS the band's timer jitter.
+        "record(ai, \"RTEMS:CA:TICK\") { field(PREC, \"0\") field(SCAN, \"Passive\") }\n",
     );
 
     /// The namespace the status PVs are published under, matching [`DEMO_DB`]'s.
@@ -106,6 +184,87 @@ mod ioc {
     /// from the environment the way `cas_server_port` takes the port, and this
     /// note is here so the next reader does not have to rediscover why.
     const STATUS_PREFIX: &str = "RTEMS";
+
+    /// C6 PROBE: the upstream CA name server the guest's `ca://` links
+    /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
+    /// host-side upstream IOC's CA port, which cannot be the guest's own
+    /// 5064 because that belongs to the inbound `hostfwd`.
+    const C6_NAME_SERVER: &str = "10.0.2.2:15076";
+
+    /// C6 PROBE: the record the band-occupancy tick writes, and the
+    /// interval it aims for. 200 ms is well inside the upstream's 10 Hz
+    /// burst rate, so a burst overlaps several ticks.
+    const C6_TICK_RECORD: &str = "RTEMS:CA:TICK";
+    const C6_TICK_PERIOD_MS: u64 = 200;
+
+    /// C6 PROBE: how long the banner waits for iocInit's staged link opens
+    /// to reach the declared external-PV set before reporting the count.
+    /// Bounded on purpose — an unreachable upstream must still boot the IOC
+    /// and still print a banner, with the shortfall visible.
+    const C6_LINK_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const C6_LINK_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    // C6 PROBE: the C task census and stack-usage report — see
+    // `epics-rtems-boot/csrc/rtems_stats.c`, the same pair the pvalink
+    // stage-5 probe used, reused verbatim so both measurements read the
+    // same listing. Present only on a linked RTEMS image.
+    // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
+    // document extern blocks.)
+    #[cfg(target_os = "rtems")]
+    unsafe extern "C" {
+        fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
+        fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
+    }
+
+    /// C6 PROBE: `rt top` + `rt stackuse`, from inside the image — this
+    /// image configures the shell's commands but starts no shell.
+    fn c6_task_and_stack_report(tag: &str) {
+        #[cfg(target_os = "rtems")]
+        {
+            let c = std::ffi::CString::new(tag).unwrap_or_default();
+            // SAFETY: both take a NUL-terminated tag and only read it; the
+            // C side does its own bounds-checked iteration.
+            unsafe {
+                epics_rtems_boot_dump_tasks(c.as_ptr());
+                epics_rtems_boot_stack_report(c.as_ptr());
+            }
+        }
+        #[cfg(not(target_os = "rtems"))]
+        let _ = tag;
+    }
+
+    /// C6 PROBE: one console report — the link registry, the shared
+    /// client's circuit count, and every record the gate reads.
+    ///
+    /// The guest half of criteria 1, 3, 4 and 6: with no iocsh on the
+    /// target the console is the only place the circuit count and a
+    /// record's alarm state can be read from *inside* the IOC, next to
+    /// what `caget` reads from outside.
+    fn c6_report(seq: u32, resolver: &epics_ca_rs::calink::CaLinkResolver, db: &Arc<PvDatabase>) {
+        let conns = block_on_sync(resolver.client_connection_count())
+            .ok()
+            .flatten();
+        println!(
+            "C6 seq={seq} links={} circuits={conns:?}",
+            resolver.link_count(),
+        );
+        for (pv, connected) in resolver.link_report() {
+            println!("C6 seq={seq} link pv={pv} connected={connected}");
+        }
+        for rec in [
+            "RTEMS:CA:DOWN",
+            "RTEMS:CA:DOWN2",
+            "RTEMS:CA:UPLNK",
+            "RTEMS:CA:FAST",
+            "RTEMS:CA:C8",
+            "RTEMS:CA:OTHER",
+        ] {
+            let val = db.get_pv(rec).map(|v| v.to_string());
+            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
+            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
+            println!("C6 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
+        }
+    }
 
     /// Load the database: every command-line argument is a `.db` file path
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
@@ -139,6 +298,26 @@ mod ioc {
         //     By the time this runs, `POSIX_Init` has already brought up the
         //     console, the clock, libbsd and DHCP, and called us.
         epics_rtems_boot::link_anchor();
+
+        // (0-probe) C6 PROBE: the target's CA search configuration.
+        // `rtems_init.c:195` hands `main` a fixed one-element argv and
+        // `POSIX_Init` calls `setenv` zero times, so nothing outside the
+        // image can configure it — the values are compiled in here. §4.5's
+        // three variables, together: the name server to dial, and the two
+        // that shut the broadcast path off so a resolution can only have
+        // come over TCP.
+        //
+        // Set before `install_calink_resolver`, because the client the
+        // resolver lazily builds reads them once at construction.
+        //
+        // SAFETY (edition 2024): this runs on the single init thread
+        // before `background_init` starts any other thread, so no
+        // concurrent reader or writer of the environment exists.
+        unsafe {
+            std::env::set_var("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER);
+            std::env::set_var("EPICS_CA_ADDR_LIST", "");
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        }
 
         // (0b) Make the IOC audible. Every diagnostic below — and every one in
         //      the CA server, the database and the runtime — is a `tracing`
@@ -355,22 +534,114 @@ mod ioc {
         // broadcast will not resolve, and `EPICS_CA_ADDR_LIST` is not even
         // parsed here.
         //
-        // Read here rather than at install time: `install_calink_resolver`
-        // registers the link set and nothing else — C's `dbCaLinkInit`
-        // likewise creates no channel — so a count taken at the mount reports
-        // the resolver's own health, not the database's links. Taken at the
-        // last moment before the banner, it is the registry as the first
-        // client will find it.
+        // Counted against the database's DECLARED external PV set, after
+        // waiting for the registry to reach it.
+        //
+        // iocInit's two link phases STAGE opens (`setup_cp_links` ->
+        // `resolve_external_pv`, `setup_external_link_opens` ->
+        // `stage_external_link_open_by_name`); each open then runs on the
+        // link work owner and only registers its `CaLink` after a
+        // `subscribe()` round-trip to the upstream IOC completes. A count
+        // sampled the instant `run()` returns is therefore a race against the
+        // network, and stage C6 boot 3 read it as the useless `0` while the
+        // registry was on its way to 4. Waiting until the registry reaches
+        // the declared set turns the banner from a sample into a report; the
+        // deadline bounds it so an unreachable upstream still boots and still
+        // prints, with the shortfall named.
+        //
+        // `external_link_pv_names` is per-PV, matching what a link set holds;
+        // iocInit's own lines above count link FIELDS, which is why they read
+        // 4 and 1 while this reads 4.
+        let declared = block_on_sync(db_for_names.external_link_pv_names())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let deadline = std::time::Instant::now() + C6_LINK_SETTLE_TIMEOUT;
+        while resolver.link_count() < declared.len() && std::time::Instant::now() < deadline {
+            std::thread::sleep(C6_LINK_SETTLE_POLL);
+        }
         let link_count = resolver.link_count();
         println!(
-            "rtems-ca-ioc: calink resolver installed — {link_count} ca:// record \
-             link{} registered; ` CA`-modified and ca://... INP/OUT resolve over \
+            "rtems-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
+             link{} registered ({}); ` CA`-modified and ca://... INP/OUT resolve over \
              EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
              on this target)",
-            if link_count == 1 { "" } else { "s" },
+            declared.len(),
+            if declared.len() == 1 { "" } else { "s" },
+            if declared.is_empty() {
+                "none declared".to_string()
+            } else {
+                declared.join(", ")
+            },
         );
         for name in &names {
             println!("rtems-ca-ioc: {name}");
+        }
+
+        // ---- C6 PROBE: the two measurement threads ----
+        //
+        // (a) The band-occupancy tick. A `runtime::task::spawn` +
+        //     `runtime::task::sleep` loop, which on this target IS a
+        //     `cbMedium` band task — the same band `run_monitor` and its
+        //     inline `dispatch_external_cp_targets` run on (§5.4). Each
+        //     wake writes an incrementing count to `RTEMS:CA:TICK`, so a
+        //     host `camonitor` on that record measures the band's timer
+        //     jitter directly: `Instant` is 1-second-quantized on target
+        //     (§5.5), so the sub-second numbers have to be read off the
+        //     wire, not off the guest's clock.
+        {
+            let tick_db = db_for_names.clone();
+            println!(
+                "C6 probe: tick task on the callback band writing {C6_TICK_RECORD} \
+                 every {C6_TICK_PERIOD_MS} ms",
+            );
+            epics_base_rs::runtime::task::spawn(async move {
+                let mut n = 0i64;
+                loop {
+                    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(
+                        C6_TICK_PERIOD_MS,
+                    ))
+                    .await;
+                    n += 1;
+                    let _ = tick_db
+                        .put_pv(C6_TICK_RECORD, EpicsValue::Double(n as f64))
+                        .await;
+                }
+            });
+        }
+
+        // (b) The console reporter, in the shape the pvalink stage-5 probe
+        //     used (`doc/pvalink-rtems-design.md` §12.4): one line group
+        //     every 10 s, and the task census + stack-usage report every
+        //     6th pass (~1 min), which is the `rt top` / `rt stackuse`
+        //     reading criterion 6 asks for on a target that starts no
+        //     shell. Its own thread with a stated stack class, like every
+        //     other thread this entry point starts.
+        {
+            let probe_db = db_for_names.clone();
+            let probe_resolver = resolver.clone();
+            println!(
+                "C6 probe: EPICS_CA_NAME_SERVERS={C6_NAME_SERVER} (compiled in), \
+                 EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s",
+            );
+            match thread::Builder::new()
+                .name("c6-probe".to_string())
+                .stack_size(StackSizeClass::Medium.bytes())
+                .spawn(move || {
+                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
+                        epics_base_rs::runtime::task::ThreadPriority::Low,
+                    );
+                    let mut seq = 0u32;
+                    loop {
+                        thread::sleep(std::time::Duration::from_secs(10));
+                        seq += 1;
+                        c6_report(seq, &probe_resolver, &probe_db);
+                        if seq.is_multiple_of(6) {
+                            c6_task_and_stack_report(&format!("c6-{seq}"));
+                        }
+                    }
+                }) {
+                Ok(_) => {}
+                Err(e) => eprintln!("C6 probe: cannot start the reporter thread: {e}"),
+            }
         }
 
         // Runs until the process is killed: an IOC has no self-shutdown path

@@ -1754,7 +1754,7 @@ impl CaChannel {
             cid: self.cid,
             reply: reply_tx,
         });
-        tokio::time::timeout(timeout, reply_rx)
+        epics_base_rs::runtime::task::timeout(timeout, reply_rx)
             .await
             .map_err(|_| CaError::ChannelNotFound(self.pv_name.to_string()))?
             .map_err(|_| CaError::Shutdown)
@@ -2317,14 +2317,14 @@ impl CaChannel {
         // Phase 2: scalar plain reads are decoded in the read loop, so
         // the hot path avoids allocating/copying one payload Vec per PV.
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::task::Instant::now() + timeout;
         for p in pending {
             let Pending {
                 index,
                 reply_rx,
                 kind,
             } = p;
-            let result = tokio::time::timeout_at(deadline, reply_rx).await;
+            let result = epics_base_rs::runtime::task::timeout_at(deadline, reply_rx).await;
             let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
                 Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
                 Ok(Ok(Err(e))) => Err(e),
@@ -2503,7 +2503,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         // Always remove the registry entry when control returns —
         // covers the timeout path (response would never arrive) and
         // the success path (already removed by read_loop, the
@@ -2627,7 +2627,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(Duration::from_secs(30), reply_rx).await;
         self.in_flight.reads.remove(&ioid);
         let reply = result
             .map_err(|_| CaError::Timeout)?
@@ -2668,7 +2668,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2695,7 +2695,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2752,7 +2752,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2804,7 +2804,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2852,7 +2852,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?

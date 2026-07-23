@@ -1,4 +1,9 @@
-// RTEMS-EXEC-MODEL-ALLOW(18): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// Was 18: the nine that left are the three virtual-time watchdog modules
+// (read_loop_tests, recv_watchdog_tests, write_loop_timeout_tests), now gated
+// off under the feature because the circuit path's deadlines moved onto the
+// runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
+// DOWN, never up, without running the survivors under the feature.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -803,14 +808,23 @@ pub(crate) async fn run_transport_manager(
     // TCP circuits (libca `caServerID`).
     let mut connections: HashMap<CircuitKey, ServerConnection> = HashMap::new();
     // Pending connect_server tasks. Spawning each connect into a
-    // JoinSet (rather than `.await`-ing inline) is what lets a
+    // task set (rather than `.await`-ing inline) is what lets a
     // slow TCP/TLS handshake on circuit A stop blocking unrelated
     // commands: BeaconArrivalNotify for already-connected
     // circuits, fast-path CreateChannel for circuit B, etc. The
     // task returns its `CircuitKey` alongside the result so
     // `join_next` can pair completion with the right state.
-    let mut pending_connects: tokio::task::JoinSet<(CircuitKey, Option<ServerConnection>)> =
-        tokio::task::JoinSet::new();
+    //
+    // `runtime::task::TaskSet`, not `tokio::task::JoinSet`: this loop runs on
+    // a callback band on the RTEMS target, where `JoinSet::spawn` — which is
+    // `tokio::spawn` under another name — panics with *"there is no reactor
+    // running"* at the first connect and takes the band worker with it
+    // (measured, `doc/calink-rtems-design.md` §11.1). The seam type keeps
+    // the concurrency, the completion pairing and the abort-on-drop.
+    let mut pending_connects: epics_base_rs::runtime::task::TaskSet<(
+        CircuitKey,
+        Option<ServerConnection>,
+    )> = epics_base_rs::runtime::task::TaskSet::new();
     // Commands waiting on a pending connect. Keyed by the command's
     // target circuit. CreateChannel is the only command that *causes*
     // a connect to start; subsequent CreateChannels for the same
@@ -1522,7 +1536,17 @@ async fn connect_server(
         // enough to fall through to the next NAME_SERVER candidate.
         let hs_timeout = tls_handshake_timeout();
         let tls_stream =
-            match tokio::time::timeout(hs_timeout, connector.connect(server_name, stream)).await {
+            // Seam, for the same reason as the two pumps below: this is on the
+            // circuit path, and a tokio timer there panics on a target with no
+            // reactor. Not reached in today's target build (the TLS feature is
+            // off there), but leaving one tokio timer on the circuit path is
+            // what re-opens the family.
+            match epics_base_rs::runtime::task::timeout(
+                hs_timeout,
+                connector.connect(server_name, stream),
+            )
+            .await
+            {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(server = %server_addr, error = %e, "TLS handshake failed");
@@ -1719,8 +1743,10 @@ impl UnresponsiveGate {
         }
     }
 
-    /// Test-only read of the current unresponsive state.
-    #[cfg(test)]
+    /// Test-only read of the current unresponsive state. Gated exactly like
+    /// its only callers (`write_loop_timeout_tests`), which the virtual clock
+    /// keeps out of the feature-ON suite.
+    #[cfg(all(test, not(feature = "rtems-exec-model")))]
     fn is_unresponsive(&self) -> bool {
         *self.state.lock().unwrap()
     }
@@ -1771,7 +1797,16 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         // without abandoning a partial frame.
         let mut written = 0usize;
         while written < batch.len() {
-            match tokio::time::timeout(send_timeout, writer.write(&batch[written..])).await {
+            // The `runtime::task` seam, not `tokio::time::timeout`: on the
+            // RTEMS target this pump runs with no tokio reactor anywhere in
+            // the process, and a tokio timer panics the task rather than
+            // firing (§11.1).
+            match epics_base_rs::runtime::task::timeout(
+                send_timeout,
+                writer.write(&batch[written..]),
+            )
+            .await
+            {
                 Ok(Ok(0)) => {
                     // Peer will accept no more bytes — dead socket.
                     let _ = event_tx.send(TransportEvent::TcpClosed {
@@ -1971,15 +2006,21 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // carries the running count for observability.
     let mut cap_warned = false;
 
-    // Single long-lived `Sleep` whose deadline we mutate in place
-    // via `Sleep::reset`. This is what makes the libca model
-    // expressible: we can extend the watchdog deadline on healthy
-    // beacons and data arrival without restarting the read future,
-    // and we can leave the deadline untouched on anomaly beacons so
-    // the timer still expires on its original schedule.
-    let mut deadline = tokio::time::Instant::now() + idle_timeout;
-    let sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(sleep);
+    // The watchdog deadline is the state; the sleep future is derived from
+    // it inside the `select!` below. This is what makes the libca model
+    // expressible: we extend the watchdog deadline on healthy beacons and on
+    // data arrival, and we leave it untouched on anomaly beacons so the timer
+    // still expires on its original schedule.
+    //
+    // An **absolute** `std::time::Instant` re-slept each iteration, not a
+    // pinned `tokio::time::Sleep` mutated by `Sleep::reset`: the seam's
+    // `sleep_until` has no `reset`, and it does not need one — re-deriving a
+    // future for the *same* absolute deadline is the same deadline. Leaving
+    // `deadline` alone is still "do not touch the watchdog". The seam is not
+    // optional here: on the RTEMS target this loop runs with no tokio reactor
+    // in the process, and `tokio::time::sleep_until` panics the task instead
+    // of firing (§11.1).
+    let mut deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
 
     loop {
         // Refresh the suspend-detection anchor at the top of each
@@ -2023,8 +2064,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         // anomaly outstanding) and aren't already
                         // probing.
                         if !beacon_anomaly && !echo_pending {
-                            deadline = tokio::time::Instant::now() + idle_timeout;
-                            sleep.as_mut().reset(deadline);
+                            deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
                         }
                     }
                     None => {
@@ -2038,7 +2078,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             // Watchdog deadline expired. Disabled while the watchdog is
             // cancelled (C: unresponsive circuit, timer not restarted).
-            _ = &mut sleep, if watchdog_armed => {
+            _ = epics_base_rs::runtime::task::sleep_until(deadline), if watchdog_armed => {
                 // libca Issue #190: detect suspend wake. If wall-clock
                 // skipped far more than expected for this sleep, the
                 // tokio reactor was paused (laptop suspend / VM stop).
@@ -2102,8 +2142,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 } else {
                     echo_timeout
                 };
-                deadline = tokio::time::Instant::now() + probe;
-                sleep.as_mut().reset(deadline);
+                deadline = epics_base_rs::runtime::task::Instant::now() + probe;
                 continue;
             }
             // Data from the server.
@@ -2131,8 +2170,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
         // an unresponsive circuit's cancelled timer comes back here).
         watchdog_armed = true;
-        deadline = tokio::time::Instant::now() + idle_timeout;
-        sleep.as_mut().reset(deadline);
+        deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
         // Phase D: bump the per-server "last RX" stamp before any
         // protocol parsing so that even ECHO replies and frames the
         // parser later rejects still count as proof of liveness.
@@ -2791,7 +2829,20 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod read_loop_tests {
     //! Virtual-time tests for the libca-style lazy-echo watchdog.
     //!
@@ -3719,7 +3770,20 @@ mod flow_control_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod recv_watchdog_tests {
     //! R6-16: an echo-probe timeout on the receive watchdog must mark the
     //! circuit unresponsive and KEEP the socket. C `tcpRecvWatchdog::expire`
@@ -3951,7 +4015,20 @@ mod recv_watchdog_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod write_loop_timeout_tests {
     //! R2-40: a send-side stall in `write_loop` must mark the circuit
     //! unresponsive (`CircuitUnresponsive`) and KEEP the socket, resuming
@@ -4945,5 +5022,139 @@ mod framing_tests {
             7,
             "the torn header must be left in the buffer for the next read"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_seam_guard {
+    //! The CA circuit path must reach the runtime only through the seam.
+    //!
+    //! This module is the CA-client twin of `calink`'s
+    //! `calink_production_spawns_go_through_the_runtime_seam` and of the two
+    //! PVA/pvalink timer guards, and it exists because those guards had a
+    //! hole this file fell straight through. Stage C3 pinned *spawns*; the
+    //! pvalink stage-5 measurement then found that a task moved onto the
+    //! callback pool takes its **timers** with it and grew a timer half. Two
+    //! shapes were still unpinned here, and the target found both
+    //! (`doc/calink-rtems-design.md` §11.1):
+    //!
+    //! * `tokio::task::JoinSet::spawn` — a fourth spelling of `tokio::spawn`,
+    //!   which no "no bare `tokio::spawn`" needle matches;
+    //! * `tokio::time::*` on `read_loop` / `write_loop`, the two pumps that
+    //!   run on *every* circuit on the target.
+    //!
+    //! Both panic at runtime, on the target, with a green `cargo check` and a
+    //! green host suite — the exact failure mode a source guard is for.
+
+    /// Production slice: everything before the first column-0 *inline* `mod`
+    /// (`mod name {`) — every one of which, in both files below, is a test
+    /// module. A column-0 `mod name;` declaration is not a boundary:
+    /// `client/mod.rs` opens with eight of them.
+    ///
+    /// NOT "the first `#[cfg(test)]`": `transport.rs` has a `#[cfg(test)]`
+    /// *fn* at column 0 near the top (`drained_socket_probe`), and cutting
+    /// there would shrink the slice past every line this guard exists to
+    /// cover. Nor "the first `#[cfg(test)] mod`", which silently skips a
+    /// module gated `#[cfg(all(test, …))]` and swallows it into the
+    /// production slice — a slice rule that *grows* the covered region when a
+    /// test module is gated is the wrong shape. Cutting at the `mod` line
+    /// itself is invariant to which attribute precedes it. The MUST_CONTAIN
+    /// anchors below fail closed if this ever slips again.
+    fn production(src: &'static str) -> &'static str {
+        let mut off = 0usize;
+        for line in src.split_inclusive('\n') {
+            if line.starts_with("mod ") && line.trim_end().ends_with('{') {
+                return &src[..off];
+            }
+            off += line.len();
+        }
+        src
+    }
+
+    /// Every file the target actually runs on a callback band, each with the
+    /// anchors its production slice must still contain. The anchors are two
+    /// kinds at once and deliberately so: structural ones (`async fn
+    /// read_loop`) make a slice rule that silently shrinks fail here instead
+    /// of passing vacuously, and seam ones (`runtime::task::TaskSet`) assert
+    /// the positive — that this path reaches the runtime *through* the seam,
+    /// not merely that it avoids the banned spellings by having no timers at
+    /// all.
+    const TARGET_LIVE: [(&str, &str, &[&str]); 2] = [
+        (
+            // The transport manager plus both circuit pumps: one instance of
+            // each per virtual circuit, all on `cbMedium` on the target.
+            "client/transport.rs",
+            include_str!("transport.rs"),
+            &[
+                "async fn run_transport_manager",
+                "async fn read_loop",
+                "async fn write_loop",
+                concat!("runtime::task", "::TaskSet"),
+                concat!("runtime::task", "::sleep_until("),
+            ],
+        ),
+        (
+            // Every channel operation's round-trip bound. Target finding 2
+            // (`doc/calink-rtems-design.md` §11.2): four `cbMedium` panics
+            // from `tokio::time::timeout` in the channel read path, which the
+            // transport-only guard could not see.
+            "client/mod.rs",
+            include_str!("mod.rs"),
+            &[
+                "impl CaChannel {",
+                concat!("runtime::task", "::timeout("),
+                concat!("runtime::task", "::timeout_at("),
+            ],
+        ),
+    ];
+
+    /// Drop whole-line comments, so the prose *explaining* why a shape is
+    /// banned cannot itself trip the check. Trailing comments are kept —
+    /// dropping them would need to parse string literals, and a needle in a
+    /// trailing comment is a false positive worth taking over a false
+    /// negative in code.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("*/") || t.starts_with("* "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn circuit_path_reaches_the_runtime_only_through_the_seam() {
+        for (label, src, must_contain) in TARGET_LIVE {
+            let code = code_only(production(src));
+
+            for anchor in must_contain {
+                assert!(
+                    code.contains(anchor),
+                    "{label}: production slice no longer contains `{anchor}`; either \
+                     the slice rule broke before this guard could check anything, or \
+                     this path stopped reaching the runtime through the seam"
+                );
+            }
+
+            // Negative: no shape that needs a tokio runtime survives on the
+            // target-live path. Each of these compiles fine for
+            // `armv7-rtems-eabihf` and panics the callback-band worker at
+            // runtime.
+            for needle in [
+                concat!("tokio::task", "::JoinSet"),
+                concat!("tokio::time", "::"),
+                concat!("tokio", "::spawn("),
+            ] {
+                assert_eq!(
+                    code.matches(needle).count(),
+                    0,
+                    "{label} must not name `{needle}`: on the RTEMS target this file \
+                     runs on a callback band with no tokio runtime in the process, \
+                     and the failure is a runtime panic on the target, not a build \
+                     error"
+                );
+            }
+        }
     }
 }

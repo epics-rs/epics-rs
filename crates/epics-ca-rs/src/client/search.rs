@@ -8,6 +8,14 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+// The UDP SEARCH transport is compiled out on the RTEMS target: `AsyncUdpV4`
+// is itself `#[cfg(not(target_os = "rtems"))]` in `epics-base-rs`, because
+// newlib has no `recvmsg`/`IP_PKTINFO` receive path and cannot read a socket's
+// `local_addr()` back. The target resolves every PV over TCP name servers
+// through `SearchTransport::NameServersOnly` (design §4.2, §4.5), and the whole
+// UDP surface below carries this gate so "no UDP on target" holds by
+// construction rather than by a runtime branch.
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::net::AsyncUdpV4;
 use epics_base_rs::runtime::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,10 +32,29 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// `handle_udp_response` parser as plain UDP search replies.
 type ParsedDatagram = (Vec<u8>, SocketAddr);
 
+/// What the engine's SEARCH-receive arm needs from one datagram.
+///
+/// The three fields `epics_base_rs::net::RecvMeta` carries that this loop
+/// reads, restated as a transport-neutral type — because `RecvMeta` is part of
+/// the UDP stack and does not exist for `armv7-rtems-eabihf`, while the
+/// `select!` arm that consumes it must still compile there (a `select!` branch
+/// cannot carry a `#[cfg]`). On the target the arm parks forever, so no value
+/// of this type is ever produced; what matters is that its *type* is nameable.
+struct SearchDatagram {
+    /// Datagram length in the caller's buffer.
+    n: usize,
+    /// Sender address.
+    src: SocketAddr,
+    /// IPv4 address of the NIC that received it — the key the per-NIC
+    /// `SO_RXQ_OVFL` drop counters are tracked under.
+    iface_ip: Ipv4Addr,
+}
+
 /// Send `buf` toward `addr`, expanding to a per-NIC fanout when the
 /// destination is the limited broadcast `255.255.255.255` or an IPv4
 /// multicast group (`224.0.0.0/4`). Per-subnet broadcasts and
 /// unicast destinations route via the NIC chosen by [`AsyncUdpV4`].
+#[cfg(not(target_os = "rtems"))]
 async fn send_with_fanout(
     socket: &AsyncUdpV4,
     buf: &[u8],
@@ -502,6 +529,7 @@ impl SearchEngineState {
 /// `prev_drops_per_iface` keys the `SO_RXQ_OVFL` transition log by the NIC
 /// of the socket that received the datagram. None of the three survives the
 /// socket's absence.
+#[cfg(not(target_os = "rtems"))]
 struct UdpTransport {
     /// libca-style multi-NIC bundle: one bound socket per IPv4 interface so
     /// `255.255.255.255` and per-subnet broadcasts each leave via the
@@ -542,12 +570,32 @@ struct UdpTransport {
 /// available at all, because `AsyncUdpV4` is `#[cfg(not(target_os = "rtems"))]`.
 enum SearchTransport {
     /// UDP SEARCH fanout and reply receive, alongside any TCP name servers.
+    ///
+    /// Compiled out on the RTEMS target, so there `NameServersOnly` is the
+    /// *only* variant: "this build binds no UDP socket" is then a property of
+    /// the type, which no later edit can reintroduce a branch around.
+    #[cfg(not(target_os = "rtems"))]
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`run_nameserver_connection`), replies
     /// arrive on those same circuits, and the UDP `select!` arm parks
     /// forever.
     NameServersOnly,
+}
+
+/// One line for a UDP-only address-list mutation that arrived at an engine
+/// with no UDP socket.
+///
+/// `site` names the caller so the record says *which* operation was dropped.
+/// Callers that legitimately do nothing without UDP and would repeat per tick
+/// (the SEARCH fanout, the DNS refresh) match on the variant without logging.
+fn log_dropped_udp_mutation(site: &'static str) {
+    tracing::debug!(
+        target: "epics_ca_rs::client::search",
+        site,
+        "ignoring UDP address-list change: this search engine binds \
+         no UDP socket (EPICS_CA_NAME_SERVERS-only mode)"
+    );
 }
 
 impl SearchTransport {
@@ -558,6 +606,7 @@ impl SearchTransport {
     /// `None` when the bind fails — the caller's only sane response is to
     /// abandon the engine, which is what `run_search_engine` did before this
     /// type existed.
+    #[cfg(not(target_os = "rtems"))]
     fn bind_udp(addr_list: Vec<super::AddrEntry>) -> Option<Self> {
         // SO_REUSEADDR + (Linux) IP_MULTICAST_ALL=0 are applied to every
         // per-NIC socket inside `AsyncUdpV4::bind`.
@@ -610,40 +659,25 @@ impl SearchTransport {
         Ok(Self::NameServersOnly)
     }
 
-    /// The UDP half, when there is one.
-    ///
-    /// `site` names the caller so the one-line debug records *which* UDP-only
-    /// operation was dropped on a [`Self::NameServersOnly`] engine. Callers
-    /// that legitimately do nothing without UDP (the SEARCH fanout, the DNS
-    /// refresh) match on the variant directly instead of logging per tick.
-    fn udp_mut(&mut self, site: &'static str) -> Option<&mut UdpTransport> {
-        match self {
-            Self::Udp(u) => Some(u),
-            Self::NameServersOnly => {
-                tracing::debug!(
-                    target: "epics_ca_rs::client::search",
-                    site,
-                    "ignoring UDP address-list change: this search engine binds \
-                     no UDP socket (EPICS_CA_NAME_SERVERS-only mode)"
-                );
-                None
-            }
-        }
-    }
-
     /// Append a unicast UDP SEARCH destination — libca
     /// `addAddrToChannelAccessAddressList` (`iocinf.cpp:45`).
     fn add_address(&mut self, addr: SocketAddr) {
-        let Some(u) = self.udp_mut("AddAddress") else {
-            return;
-        };
-        if !u.addr_list.iter().any(|e| e.sock == addr) {
-            let port = match addr {
-                SocketAddr::V4(a) => a.port(),
-                SocketAddr::V6(a) => a.port(),
-            };
-            u.addr_list.push(super::AddrEntry::new(addr, None, port));
-            tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                if !u.addr_list.iter().any(|e| e.sock == addr) {
+                    let port = match addr {
+                        SocketAddr::V4(a) => a.port(),
+                        SocketAddr::V6(a) => a.port(),
+                    };
+                    u.addr_list.push(super::AddrEntry::new(addr, None, port));
+                    tracing::info!(?addr, "ca-rs: addr_list += (programmatic)");
+                }
+            }
+            Self::NameServersOnly => {
+                let _ = addr;
+                log_dropped_udp_mutation("AddAddress");
+            }
         }
     }
 
@@ -651,33 +685,45 @@ impl SearchTransport {
     /// `DiscoveryEvent::Removed`).
     #[cfg(feature = "client")]
     fn remove_address(&mut self, addr: SocketAddr) {
-        let Some(u) = self.udp_mut("RemoveAddress") else {
-            return;
-        };
-        let before = u.addr_list.len();
-        u.addr_list.retain(|e| e.sock != addr);
-        if u.addr_list.len() != before {
-            tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                let before = u.addr_list.len();
+                u.addr_list.retain(|e| e.sock != addr);
+                if u.addr_list.len() != before {
+                    tracing::info!(?addr, "ca-rs: addr_list -= (discovery removal)");
+                }
+            }
+            Self::NameServersOnly => {
+                let _ = addr;
+                log_dropped_udp_mutation("RemoveAddress");
+            }
         }
     }
 
     /// Replace the whole UDP SEARCH destination list — libca
     /// `configureChannelAccessAddressList` (`iocinf.cpp:166`).
     fn set_address_list(&mut self, list: Vec<SocketAddr>) {
-        let Some(u) = self.udp_mut("SetAddressList") else {
-            return;
-        };
-        tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
-        u.addr_list = list
-            .into_iter()
-            .map(|sock| {
-                let port = match sock {
-                    SocketAddr::V4(a) => a.port(),
-                    SocketAddr::V6(a) => a.port(),
-                };
-                super::AddrEntry::new(sock, None, port)
-            })
-            .collect();
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
+                u.addr_list = list
+                    .into_iter()
+                    .map(|sock| {
+                        let port = match sock {
+                            SocketAddr::V4(a) => a.port(),
+                            SocketAddr::V6(a) => a.port(),
+                        };
+                        super::AddrEntry::new(sock, None, port)
+                    })
+                    .collect();
+            }
+            Self::NameServersOnly => {
+                let _ = list;
+                log_dropped_udp_mutation("SetAddressList");
+            }
+        }
     }
 
     /// `select!` arm: the next SEARCH reply datagram, with its receiving-NIC
@@ -686,10 +732,27 @@ impl SearchTransport {
     /// Parks forever without a UDP transport — the degradation shape the
     /// PVA client's optional beacon socket already used, and the reason the
     /// arm needs no `if` of its own.
-    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(epics_base_rs::net::RecvMeta, u32)> {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(SearchDatagram, u32)> {
         match self {
-            Self::Udp(u) => u.socket.recv_with_meta_with_drops(buf).await,
-            Self::NameServersOnly => std::future::pending().await,
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => u
+                .socket
+                .recv_with_meta_with_drops(buf)
+                .await
+                .map(|(meta, drops)| {
+                    (
+                        SearchDatagram {
+                            n: meta.n,
+                            src: meta.src,
+                            iface_ip: meta.iface_ip,
+                        },
+                        drops,
+                    )
+                }),
+            Self::NameServersOnly => {
+                let _ = buf;
+                std::future::pending().await
+            }
         }
     }
 
@@ -697,16 +760,23 @@ impl SearchTransport {
     /// pvxs `udp_collector.cpp:55-67` logs at debug on
     /// `prev != current && current != 0`.
     fn note_drops(&mut self, iface_ip: Ipv4Addr, drops: u32) {
-        let Self::Udp(u) = self else { return };
-        let prev = u.prev_drops_per_iface.insert(iface_ip, drops).unwrap_or(0);
-        if drops != 0 && drops != prev {
-            tracing::debug!(
-                target: "epics_ca_rs::client::search",
-                %iface_ip,
-                prev,
-                drops,
-                "CA client SEARCH per-NIC socket buffer overflow"
-            );
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                let prev = u.prev_drops_per_iface.insert(iface_ip, drops).unwrap_or(0);
+                if drops != 0 && drops != prev {
+                    tracing::debug!(
+                        target: "epics_ca_rs::client::search",
+                        %iface_ip,
+                        prev,
+                        drops,
+                        "CA client SEARCH per-NIC socket buffer overflow"
+                    );
+                }
+            }
+            Self::NameServersOnly => {
+                let _ = (iface_ip, drops);
+            }
         }
     }
 
@@ -716,17 +786,24 @@ impl SearchTransport {
     /// would go to live inside [`UdpTransport`], so there is no list to walk
     /// rather than a list that must be checked for emptiness.
     async fn fanout(&mut self, frame: &[u8], site: &'static str) {
-        let Self::Udp(u) = self else { return };
-        // Split-borrow so the per-destination error-suppression map can be
-        // updated while the socket is borrowed for the send.
-        let UdpTransport {
-            socket,
-            addr_list,
-            send_errors,
-            ..
-        } = &mut **u;
-        for entry in addr_list.iter() {
-            send_with_fanout(socket, frame, entry.sock, site, send_errors).await;
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                // Split-borrow so the per-destination error-suppression map can
+                // be updated while the socket is borrowed for the send.
+                let UdpTransport {
+                    socket,
+                    addr_list,
+                    send_errors,
+                    ..
+                } = &mut **u;
+                for entry in addr_list.iter() {
+                    send_with_fanout(socket, frame, entry.sock, site, send_errors).await;
+                }
+            }
+            Self::NameServersOnly => {
+                let _ = (frame, site);
+            }
         }
     }
 
@@ -734,32 +811,37 @@ impl SearchTransport {
     /// hostname rather than an IP literal. No-op without a UDP transport —
     /// the entries being refreshed are UDP destinations.
     fn refresh_dns(&mut self) {
-        let Self::Udp(u) = self else { return };
-        // `refresh_dns()` is a no-op for IP-literal entries; for DNS
-        // entries it does a fresh `to_socket_addrs()` and replaces the
-        // cached IP when it differs. Changes are logged at info so
-        // operators can correlate an IOC migration with the client's
-        // discovery of the new address.
-        for entry in u.addr_list.iter_mut() {
-            let prev_sock = entry.sock;
-            match entry.refresh_dns() {
-                Ok(new_sock) if new_sock != prev_sock => {
-                    tracing::info!(
-                        hostname = ?entry.hostname,
-                        old = %prev_sock,
-                        new = %new_sock,
-                        "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        hostname = ?entry.hostname,
-                        error = %e,
-                        "ca-rs: DNS refresh failed; keeping cached IP"
-                    );
+        match self {
+            // `refresh_dns()` is a no-op for IP-literal entries; for DNS
+            // entries it does a fresh `to_socket_addrs()` and replaces the
+            // cached IP when it differs. Changes are logged at info so
+            // operators can correlate an IOC migration with the client's
+            // discovery of the new address.
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                for entry in u.addr_list.iter_mut() {
+                    let prev_sock = entry.sock;
+                    match entry.refresh_dns() {
+                        Ok(new_sock) if new_sock != prev_sock => {
+                            tracing::info!(
+                                hostname = ?entry.hostname,
+                                old = %prev_sock,
+                                new = %new_sock,
+                                "ca-rs: EPICS_CA_ADDR_LIST entry re-resolved"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                hostname = ?entry.hostname,
+                                error = %e,
+                                "ca-rs: DNS refresh failed; keeping cached IP"
+                            );
+                        }
+                    }
                 }
             }
+            Self::NameServersOnly => {}
         }
     }
 
@@ -778,6 +860,7 @@ impl SearchTransport {
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => u.socket.local_addrs(),
         }
     }
@@ -788,6 +871,7 @@ impl SearchTransport {
     fn addr_list(&self) -> &[super::AddrEntry] {
         match self {
             Self::NameServersOnly => &[],
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => &u.addr_list,
         }
     }
@@ -799,6 +883,10 @@ impl SearchTransport {
 
 /// The ordinary client engine: bind the UDP SEARCH bundle and additionally
 /// use any `EPICS_CA_NAME_SERVERS` TCP circuits.
+///
+/// Host-only, because binding that bundle is: the RTEMS target selects
+/// [`name_servers_only_search_engine`] instead (design §4.5).
+#[cfg(not(target_os = "rtems"))]
 pub(crate) async fn run_search_engine(
     addr_list: Vec<super::AddrEntry>,
     nameserver_addrs: Vec<SocketAddr>,
@@ -847,19 +935,19 @@ pub(crate) async fn run_search_engine(
 /// Returns the engine future rather than running it, so the empty-name-server
 /// refusal is observed by the caller **before** anything is spawned.
 ///
-/// No production caller selects this yet — stage C1 builds the capability, and
-/// the RTEMS mount (stage C5, `doc/calink-rtems-design.md` §6) is what will
-/// choose it. Its only current exerciser is the host gate test, which is per-test
-/// gated off under `rtems-exec-model`; so the function is dead in every
-/// configuration except a host (`not(feature)`) test build, and the `expect`
-/// covers exactly the others.
+/// On the RTEMS target this is the *only* engine: `CaClient` selects it there
+/// (`client/mod.rs`), because `SearchTransport` has no UDP variant compiled in.
+/// On a host it stays capability-only — the client binds UDP — so it is dead
+/// code in every host configuration except the gate test, which is itself
+/// per-test gated off under `rtems-exec-model`. The `expect` covers exactly
+/// those, and is *not* applied on the target, where the call is live.
 #[cfg_attr(
-    any(not(test), feature = "rtems-exec-model"),
+    all(not(target_os = "rtems"), any(not(test), feature = "rtems-exec-model")),
     expect(
         dead_code,
         reason = "\
-    stage C1 builds the capability; the RTEMS mount (stage C5, \
-    doc/calink-rtems-design.md §6) is what selects it"
+    a host client binds UDP; this entry point is what the RTEMS target selects \
+    (doc/calink-rtems-design.md §4.5, §6 stage C5)"
     )
 )]
 pub(crate) fn name_servers_only_search_engine(

@@ -704,9 +704,12 @@ impl CaClient {
         // `mut` only for the discovery merge below, which `client-core` does
         // not have — stated as two bindings rather than one binding and a
         // silenced lint.
-        #[cfg(feature = "client")]
+        // `EPICS_CA_ADDR_LIST` names UDP SEARCH destinations, so it is parsed
+        // only where there is a UDP SEARCH socket to send from — see
+        // `search::SearchTransport` and the engine selection below.
+        #[cfg(all(feature = "client", not(target_os = "rtems")))]
         let mut addr_list = parse_addr_list_with_hostnames()?;
-        #[cfg(not(feature = "client"))]
+        #[cfg(all(not(feature = "client"), not(target_os = "rtems")))]
         let addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
@@ -789,6 +792,21 @@ impl CaClient {
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
         let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
+        // Which search engine this client gets is a property of the target, not
+        // of its configuration. A hosted build binds the per-NIC UDP SEARCH
+        // bundle and *additionally* uses any `EPICS_CA_NAME_SERVERS` circuits;
+        // the RTEMS target has no UDP SEARCH transport compiled in at all
+        // (`search::SearchTransport` has one variant there), so it selects C's
+        // documented TCP-only name-resolution mode explicitly — the entry point
+        // stage C1 built for exactly this call site
+        // (`doc/calink-rtems-design.md` §4.5, §6 stage C5).
+        //
+        // The refusal is the point of selecting it by entry point: with no UDP
+        // socket and no name server the engine could reach nothing, so an RTEMS
+        // IOC booted without `EPICS_CA_NAME_SERVERS` fails *here*, at client
+        // construction, instead of presenting as every `ca://` link timing out
+        // forever.
+        #[cfg(not(target_os = "rtems"))]
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
@@ -796,6 +814,15 @@ impl CaClient {
             search_resp_tx,
             search_attempts.clone(),
         ));
+        #[cfg(target_os = "rtems")]
+        let search_task = {
+            epics_base_rs::runtime::task::spawn(search::name_servers_only_search_engine(
+                nameserver_addrs,
+                search_rx,
+                search_resp_tx,
+                search_attempts.clone(),
+            )?)
+        };
 
         // Wire each discovery backend's live-update stream into the
         // search engine. `discover()` above was a one-shot scan;
@@ -4772,6 +4799,12 @@ fn remove_server_channel(
     }
 }
 
+/// UDP-only, and gated with the transport that uses it: the addresses it
+/// resolves are `EPICS_CA_ADDR_LIST` SEARCH destinations, and the RTEMS target
+/// binds no UDP socket to send to them (`search::SearchTransport`).
+/// `EPICS_CA_NAME_SERVERS` entries go through `parse_nameserver_list`, which is
+/// live on every target.
+#[cfg(not(target_os = "rtems"))]
 fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
     // Try direct IP parse first (fast path)
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
@@ -4801,6 +4834,9 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
 /// re-resolve. `hostname == Some(name)` means the entry started life
 /// as a DNS name and a reconnection path may call `resolve_host`
 /// again to refresh `sock`.
+/// UDP-only; see [`resolve_host`] for why this is not compiled for the RTEMS
+/// target.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Debug, Clone)]
 pub(crate) struct AddrEntry {
     pub sock: SocketAddr,
@@ -4808,6 +4844,7 @@ pub(crate) struct AddrEntry {
     pub port: u16,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl AddrEntry {
     pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
         Self {
@@ -4845,6 +4882,7 @@ impl AddrEntry {
 /// instead of permanently pinning the client to the first-resolved
 /// IP. Closes the long-standing upstream-tracking item for
 /// epics-base#488.
+#[cfg(not(target_os = "rtems"))]
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
     let default_port = epics_base_rs::runtime::net::ca_server_port();
@@ -4912,6 +4950,7 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
 /// Rust-only limited-broadcast safety net. Extracted from
 /// `parse_addr_list_with_hostnames` so the bcast list can be injected
 /// in unit tests (real-NIC enumeration is environment-dependent).
+#[cfg(not(target_os = "rtems"))]
 fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], server_port: u16) {
     for bcast in bcasts {
         let sock = SocketAddr::V4(SocketAddrV4::new(*bcast, server_port));

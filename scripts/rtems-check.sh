@@ -416,12 +416,25 @@ fi
 #     10  name-server dial       `run_nameserver_connection` came through the
 #                               same seam, so `tokio::net` is gone from the
 #                               client entirely
+#      0  stage C5              UDP SEARCH cfg-gated out of the target build
+#
+# Stage C5 closed the remaining 10 the way PVA stage 4 closed its 28, and for
+# the same reason: they were all UDP. On the target `search::SearchTransport`
+# has the single `NameServersOnly` variant — `UdpTransport`, `bind_udp`, the
+# fanout/DNS-refresh helpers, `run_search_engine` and the whole
+# `EPICS_CA_ADDR_LIST` parse (`AddrEntry`, `resolve_host`,
+# `parse_addr_list_with_hostnames`, `append_auto_addr_entries`) are
+# `#[cfg(not(target_os = "rtems"))]`. "No UDP socket" is a fact about the type,
+# not a runtime branch, and `CaClient::new_with_config` reaches
+# `name_servers_only_search_engine` by `cfg` rather than by choice.
 #
 # Bidirectional for the same reason the binary census is: MORE is a regression
 # that moved the client further from the target; FEWER means someone did the
 # work and left the bound behind, at which point it stops measuring and becomes
-# decoration.
-CA_CLIENT_TARGET_ERRORS=10
+# decoration. It stays pinned AT ZERO, and it is what keeps `tokio::net`,
+# `socket2` and a raw `FIONREAD` out of the target client: re-introducing any of
+# them raises the count and this comparison names it.
+CA_CLIENT_TARGET_ERRORS=0
 
 log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
 export RUSTFLAGS="$BASE_RUSTFLAGS"

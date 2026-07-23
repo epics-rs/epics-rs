@@ -2042,7 +2042,44 @@ CAServerLow−1 = 19, §9.15) remains a deliberate, documented divergence
 rather than a measured one — nothing in run 4 stresses it, since the
 drain never saturated the band it no longer runs on. BIG's 6 Hz vs
 10 Hz on QEMU is drain-side `read_group` cost, unmeasured on real
-silicon.
+silicon. **The 17-vs-19 half is now measured — §9.15.3.**
+
+### 9.15.3 The 17-vs-19 attribution — C's priority kills this target, 17 is measured-justified
+
+q8 run 5: identical image to run 4 except one constant —
+`QSRV_GROUP_PUMP_PRIORITY` temporarily set to `Custom(19)`, the exact C
+parity value (`CAServerLow−1`, above the connection threads at 18).
+Same target, same phases (90/90/30), same instrument.
+
+**Victim `V0` inter-arrival gaps (ms), per phase (run 5, drain@19):**
+
+| phase    | n   | median | mean   | p99     | max     |
+|----------|-----|--------|--------|---------|---------|
+| BASELINE | 901 | 99.93  | 100.00 | 104.41  | 167.43  |
+| LOAD     | 883 | 0.86   | 100.04 | 5130.08 | 5152.72 |
+| RECOVERY | 318 | 99.83  | 84.13  | 103.65  | 103.98  |
+
+The LOAD row is the §9.14 shape back from the dead: multi-second
+stalls (p99 5.13 s, max 5.15 s) followed by delivery bursts (median
+0.86 ms — queued updates flushed back-to-back after each stall).
+**Group `BIG`:** 31 updates in 89.9 s = **0.34 Hz** — run 4's 6.02 Hz
+collapsed back to §9.14's 0.35 Hz level; gap median 2780 ms, max
+5197 ms; the `f00` step histogram reaches **97** (against run 4's max
+of 3), i.e. the drain falls ~10 s of ticks behind between deliveries.
+
+**Reading.** On a single-core SCHED_FIFO target, a drain above the
+connection threads (19 > 18) preempts the very threads that consume
+its output: `read_group`-heavy drain work (~166 ms/event on QEMU)
+runs ahead of connection `send`/`recv`, so delivery to the wire stalls
+in ~5 s bands for victim and group alike. C tolerates 19 because pvxs
+drains onto a multi-core host or a target where the server reactor and
+the pump interleave differently; on this target the C value reproduces
+the starvation family the GroupPump was built to close. The deviation
+to **17** (below connections 18, above UDP search 16) is therefore no
+longer a documented guess but the measured requirement: run 4 (17) and
+run 5 (19) differ only in that constant, and only run 4 holds the
+victim at baseline. Restored to 17 immediately after the run; the
+patched image never existed outside the measurement box.
 
 ### 9.16 Scan ownership as built — SCAN was dead on the PVA-only target, now core-owned
 

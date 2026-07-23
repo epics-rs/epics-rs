@@ -585,7 +585,7 @@ async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
     let client = client_for(tcp);
 
     let handle = client
-        .pvmonitor_handle("STAB:ONSTART", move |_desc, _value| {})
+        .pvmonitor_handle("STAB:ONSTART", move |_desc, _value| {}, |_| {})
         .await
         .expect("subscribe");
 
@@ -641,7 +641,7 @@ async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
     let client = client_for(tcp);
 
     let handle = client
-        .pvmonitor_handle("STAB:ONSTART2", move |_desc, _value| {})
+        .pvmonitor_handle("STAB:ONSTART2", move |_desc, _value| {}, |_| {})
         .await
         .expect("subscribe");
     assert_eq!(wait_starts(&source, "STAB:ONSTART2", 1).await, vec![true]);
@@ -683,13 +683,17 @@ async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     let received = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
     let cb = received.clone();
     let handle = client
-        .pvmonitor_handle("STAB:PAUSE", move |_desc, value| {
-            if let PvField::Structure(s) = value
-                && let Some(ScalarValue::Double(v)) = s.get_value()
-            {
-                cb.lock().push(*v);
-            }
-        })
+        .pvmonitor_handle(
+            "STAB:PAUSE",
+            move |_desc, value| {
+                if let PvField::Structure(s) = value
+                    && let Some(ScalarValue::Double(v)) = s.get_value()
+                {
+                    cb.lock().push(*v);
+                }
+            },
+            |_| {},
+        )
         .await
         .expect("subscribe");
 
@@ -790,11 +794,11 @@ async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
     // Both monitors come from the SAME client (as the CLI now clones one
     // shared client into every task).
     let a = client
-        .pvmonitor_handle("STAB:MON166A", |_d, _v| {})
+        .pvmonitor_handle("STAB:MON166A", |_d, _v| {}, |_| {})
         .await
         .expect("subscribe A");
     let b = client
-        .pvmonitor_handle("STAB:MON166B", |_d, _v| {})
+        .pvmonitor_handle("STAB:MON166B", |_d, _v| {}, |_| {})
         .await
         .expect("subscribe B");
 
@@ -2238,13 +2242,17 @@ async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
     let received = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
     let cb = received.clone();
     let handle = client
-        .pvmonitor_handle("STAB:SEED155", move |_desc, value| {
-            if let PvField::Structure(s) = value
-                && let Some(ScalarValue::Double(v)) = s.get_value()
-            {
-                cb.lock().push(*v);
-            }
-        })
+        .pvmonitor_handle(
+            "STAB:SEED155",
+            move |_desc, value| {
+                if let PvField::Structure(s) = value
+                    && let Some(ScalarValue::Double(v)) = s.get_value()
+                {
+                    cb.lock().push(*v);
+                }
+            },
+            |_| {},
+        )
         .await
         .expect("subscribe");
 

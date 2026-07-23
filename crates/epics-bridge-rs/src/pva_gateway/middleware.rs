@@ -29,9 +29,9 @@ use std::sync::Arc;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
-    ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, SourceRead, WatermarkEvent,
+    ChannelSource, DynSource, MonitorStream, OpError, OpErrorKind, RawMonitorEvent, SourceRead,
+    WatermarkEvent,
 };
-use tokio::sync::mpsc;
 
 /// Wrap a [`ChannelSource`] and produce a new one with extra
 /// behaviour. Implementations override only the methods they need;

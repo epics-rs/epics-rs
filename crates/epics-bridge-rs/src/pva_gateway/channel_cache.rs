@@ -989,7 +989,7 @@ impl ChannelCache {
             let max_backoff = Duration::from_secs(30);
             // Whether the current subscription delivered any upstream event
             // before it ended. Set by `raw_cb` on the first frame, read +
-            // reset after `handle.wait()` to decide whether to re-arm the
+            // reset after `handle.wait_terminal()` to decide whether to re-arm the
             // backoff floor (healthy connection that dropped) or keep the
             // grown backoff (a clean MONITOR FINISH that ended without ever
             // delivering an event must not tight-loop).
@@ -1107,6 +1107,47 @@ impl ChannelCache {
                         // Fan out raw body — refcount only, no copy.
                         let _ = tx_raw_inner.send(raw_ev);
                     };
+                // The upstream monitor's CONNECTION-STATE stream — where
+                // this task learns that the upstream came or went.
+                //
+                // It must not be inferred from the subscription handle
+                // terminating: `spawn_raw_frames_handle` re-subscribes
+                // INTERNALLY on `MonitorEnd::ConnectionLost` (announce, sleep
+                // 200 ms, loop), so a plain upstream loss never makes the
+                // handle's task return and the boundary below never fired —
+                // downstream monitors kept being served the cached value of a
+                // dead IOC at NoAlarm (doc/pvalink-rtems-design.md §12.10).
+                // pva2pva surfaces a lost upstream as downstream *unlisten*
+                // (`moncache.cpp:212-235`); `signal_disconnect_boundary` is
+                // that unlisten and is idempotent per outage, so calling it
+                // from both observers (here and after the terminal end
+                // below) fires it exactly once — the same two-observer,
+                // one-owner shape `inp_disconnect_scan` has in pvalink.
+                let state_conn = state_for_task.clone();
+                let latest_raw_conn = latest_raw_for_task.clone();
+                let tx_conn = tx_for_task.clone();
+                let tx_raw_conn = tx_raw_for_task.clone();
+                let pv_name_conn = pv_name_owned.clone();
+                let conn_cb = move |ev: epics_pva_rs::client_native::ops_v2::MonitorConnEvent| {
+                    use epics_pva_rs::client_native::ops_v2::MonitorConnEvent;
+                    match ev {
+                        MonitorConnEvent::Connected { .. } => {}
+                        MonitorConnEvent::Disconnected | MonitorConnEvent::Finished => {
+                            tracing::debug!(
+                                pv = %pv_name_conn,
+                                "pva-gateway: upstream monitor left the connected state — \
+                                 revoking the cached value with a monitor-unlisten boundary"
+                            );
+                            signal_disconnect_boundary(
+                                &state_conn,
+                                &latest_raw_conn,
+                                &tx_conn,
+                                &tx_raw_conn,
+                            );
+                        }
+                    }
+                };
+
                 // Open the upstream monitor with the downstream's
                 // forwarded pvRequest when one was captured (so the
                 // upstream server applies the same field projection /
@@ -1117,12 +1158,17 @@ impl ChannelCache {
                 let handle_result = match pv_request_for_task.clone() {
                     Some(req) => {
                         client
-                            .pvmonitor_raw_frames_handle_with_request(&pv_name_owned, req, raw_cb)
+                            .pvmonitor_raw_frames_handle_with_request(
+                                &pv_name_owned,
+                                req,
+                                raw_cb,
+                                conn_cb,
+                            )
                             .await
                     }
                     None => {
                         client
-                            .pvmonitor_raw_frames_handle(&pv_name_owned, raw_cb)
+                            .pvmonitor_raw_frames_handle(&pv_name_owned, raw_cb, conn_cb)
                             .await
                     }
                 };
@@ -1159,21 +1205,29 @@ impl ChannelCache {
                         continue;
                     }
                 };
-                let raw_result = handle.wait().await;
-                // Upstream disconnected — surface it to downstream PVA
+                // Why the subscription ENDED — never why it disconnected.
+                // `MonitorTermination` carries no connection state by
+                // construction; the disconnect already reached `conn_cb`
+                // above, whether or not the loop ended.
+                let raw_result = handle.wait_terminal().await;
+                // The subscription ended for good, which is also a departure
+                // from the connected state: surface it to downstream PVA
                 // monitors as a subscription boundary (MONITOR FINISH →
                 // reopen), mirroring pva2pva moncache.cpp unlisten rather than
-                // fabricating an INVALID alarm value. The subscription stays
-                // alive for transparent reconnect; the first real upstream
-                // event after reconnect repopulates the snapshot via the
-                // normal monitor callback path.
+                // fabricating an INVALID alarm value. Idempotent per outage,
+                // so this is a no-op when `conn_cb` already fired for the same
+                // outage. The gateway's own loop re-subscribes; the first real
+                // upstream event after reconnect repopulates the snapshot via
+                // the normal monitor callback path.
                 signal_disconnect_boundary(
                     &state_for_task,
                     &latest_raw_for_task,
                     &tx_for_task,
                     &tx_raw_for_task,
                 );
-                if let Err(e) = raw_result {
+                if let epics_pva_rs::client_native::ops_v2::MonitorTermination::Failed(e) =
+                    raw_result
+                {
                     tracing::warn!(
                         pv = %pv_name_owned,
                         error = %e,

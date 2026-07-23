@@ -152,9 +152,12 @@ async fn pva_client_close_is_terminal_no_reuse() {
         .expect("post-close pvput must fail fast");
     assert!(put.is_err(), "post-close pvput must fail, got {put:?}");
 
-    let mon = tokio::time::timeout(fast, client.pvmonitor_handle("dut", |_: &_, _: &_| {}))
-        .await
-        .expect("post-close pvmonitor must fail fast");
+    let mon = tokio::time::timeout(
+        fast,
+        client.pvmonitor_handle("dut", |_: &_, _: &_| {}, |_| {}),
+    )
+    .await
+    .expect("post-close pvmonitor must fail fast");
     assert!(mon.is_err(), "post-close pvmonitor must fail");
 
     let conn = tokio::time::timeout(fast, client.pvconnect("dut"))

@@ -114,9 +114,13 @@ async fn lazy_first_connect_pv_serves_monitor_on_creating_channel() {
     let (tx, rx) = std::sync::mpsc::channel::<PvField>();
     let _handle = tokio::time::timeout(
         Duration::from_secs(3),
-        client.pvmonitor_handle("dut", move |_: &FieldDesc, v: &PvField| {
-            let _ = tx.send(v.clone());
-        }),
+        client.pvmonitor_handle(
+            "dut",
+            move |_: &FieldDesc, v: &PvField| {
+                let _ = tx.send(v.clone());
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("pvmonitor_handle timed out")

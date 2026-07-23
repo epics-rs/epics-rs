@@ -1853,6 +1853,127 @@ impl Default for MonitorEventMask {
     }
 }
 
+/// A monitor's CONNECTION-STATE transition — the transition-only subset of
+/// [`MonitorEvent`], carried by the handle-based monitors
+/// ([`op_monitor_handle`], [`op_monitor_raw_frames_handle`],
+/// [`op_monitor_raw_frames_handle_with_request`]).
+///
+/// **Invariant.** A monitor consumer MUST learn connection transitions from
+/// this stream and MUST NOT infer them from the subscription
+/// handle/future terminating. The handle loops re-subscribe INTERNALLY on
+/// [`MonitorEnd::ConnectionLost`] (deliver the transition, sleep 200 ms,
+/// loop), so a dead upstream never makes the handle's task return — a
+/// consumer that watches only the task reports a dead upstream as connected
+/// and keeps serving its last value. That was the defect family closed here
+/// (doc/pvalink-rtems-design.md §12.8, §12.10); [`SubscriptionHandle::
+/// wait_terminal`] returns a [`MonitorTermination`], which by type is not a
+/// connection state.
+///
+/// pvxs shape: `pvaLinkChannel` drives its connected/disconnected state from
+/// the monitor's event stream and its `catch(client::Disconnect&)` branch
+/// (`pvalink_channel.cpp:335-373`), never from a subscription call returning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorConnEvent {
+    /// The subscription's channel reached Active and INIT/START were
+    /// confirmed. Fires once per connect cycle, carrying the server
+    /// endpoint (pvxs `tools/monitor.cpp:152`).
+    Connected { peer: std::net::SocketAddr },
+    /// The subscription left Active without a clean end-of-stream: the
+    /// circuit died, the channel closed, or the loop hit a fatal/remote
+    /// error. The loop re-subscribes transparently unless the channel is
+    /// closed for good.
+    Disconnected,
+    /// The server signalled a clean end-of-stream (subcmd `0x10`); no
+    /// further updates arrive on this subscription.
+    Finished,
+}
+
+/// Why a handle monitor's inner loop ended — the return of
+/// [`SubscriptionHandle::wait_terminal`].
+///
+/// **This is NOT a connection-state transition** and must never be read as
+/// one: the loop re-subscribes internally on connection loss, so it does not
+/// return when the upstream merely goes away. Connect / disconnect
+/// transitions come from [`MonitorConnEvent`] — the only sanctioned source.
+/// The type exists so that reading is not expressible: there is no
+/// `Disconnected` variant to match and no `Err` arm to mistake for one.
+#[derive(Debug)]
+#[must_use]
+pub enum MonitorTermination {
+    /// The loop finished for a non-error reason: a clean server
+    /// end-of-stream, the channel closed, or [`SubscriptionHandle::stop`]
+    /// was called.
+    Ended,
+    /// The loop died on a fatal (circuit-level) or remote (per-subscription)
+    /// error and will not re-subscribe.
+    Failed(PvaError),
+}
+
+impl MonitorTermination {
+    fn from_result(r: PvaResult<()>) -> Self {
+        match r {
+            Ok(()) => Self::Ended,
+            Err(e) => Self::Failed(e),
+        }
+    }
+}
+
+/// The single owner of a handle monitor's connection-state transitions.
+///
+/// Every [`MonitorConnEvent`] a handle monitor emits goes through this
+/// type, and it makes the alternation an invariant BY CONSTRUCTION rather
+/// than by convention spread over the loops' match arms:
+///
+/// * `Connected` is emitted only from the disconnected state, so a
+///   reconnect cycle cannot double-announce;
+/// * exactly one of `Disconnected` / `Finished` is emitted per `Connected`,
+///   so a consumer that treats either as "the upstream is gone" can neither
+///   miss an outage nor see a phantom one.
+///
+/// Both handle loops (typed and raw-frames) drive it identically — one
+/// uniform rule, no per-path special case.
+struct ConnEventOwner<C> {
+    callback: C,
+    connected: bool,
+}
+
+impl<C: FnMut(MonitorConnEvent)> ConnEventOwner<C> {
+    fn new(callback: C) -> Self {
+        Self {
+            callback,
+            connected: false,
+        }
+    }
+
+    /// The subscription became active on `peer`.
+    fn enter_connected(&mut self, peer: std::net::SocketAddr) {
+        if self.connected {
+            return;
+        }
+        self.connected = true;
+        (self.callback)(MonitorConnEvent::Connected { peer });
+    }
+
+    /// The subscription left Active for any reason other than a clean
+    /// end-of-stream (circuit lost, channel closed, fatal/remote error).
+    fn leave_disconnected(&mut self) {
+        if !self.connected {
+            return;
+        }
+        self.connected = false;
+        (self.callback)(MonitorConnEvent::Disconnected);
+    }
+
+    /// The server closed the stream cleanly (subcmd `0x10`).
+    fn leave_finished(&mut self) {
+        if !self.connected {
+            return;
+        }
+        self.connected = false;
+        (self.callback)(MonitorConnEvent::Finished);
+    }
+}
+
 /// Per-subscription metrics, mirroring pvxs `SubscriptionStat`
 /// (client.h:165-178).
 ///
@@ -2048,19 +2169,28 @@ impl SubscriptionHandle {
         }
     }
 
-    /// Await the inner task without signalling stop. Returns whatever
-    /// the loop returned (Ok on clean channel close, Err on fatal).
-    /// Used by long-lived consumers (the bridge gateway) that want to
-    /// observe the natural lifetime of the subscription while still
+    /// Await the inner task without signalling stop, and report WHY it
+    /// ended. Used by long-lived consumers (the bridge gateway) that want
+    /// to observe the natural lifetime of the subscription while still
     /// holding a [`Pauser`] cloned out beforehand.
-    pub async fn wait(mut self) -> PvaResult<()> {
+    ///
+    /// **Not a disconnect signal.** The loop re-subscribes internally on
+    /// [`MonitorEnd::ConnectionLost`], so this does NOT return when the
+    /// upstream goes away — a consumer that infers "the upstream is gone"
+    /// from this returning learns nothing and serves a stale value as good
+    /// (doc/pvalink-rtems-design.md §12.8, §12.10). Connection transitions
+    /// come from the handle's [`MonitorConnEvent`] callback, and
+    /// [`MonitorTermination`] carries no variant that could stand in for
+    /// one. Named `wait_terminal` (and not `wait`) so the distinction is at
+    /// the call site, not only in this doc comment.
+    pub async fn wait_terminal(mut self) -> MonitorTermination {
         if let Some(t) = self.task.take() {
             match t.await {
-                Ok(r) => r,
-                Err(_) => Ok(()),
+                Ok(r) => MonitorTermination::from_result(r),
+                Err(_) => MonitorTermination::Ended,
             }
         } else {
-            Ok(())
+            MonitorTermination::Ended
         }
     }
 
@@ -2380,17 +2510,32 @@ where
 /// monitor loop runs in a spawned task so the bridge gateway can wire
 /// downstream watermark events into upstream pipeline-pause control
 /// messages without an intermediate decode/encode pass.
-pub fn op_monitor_raw_frames_handle<F>(
+///
+/// `on_conn` receives this subscription's connection-state transitions
+/// ([`MonitorConnEvent`]) — the ONLY place a consumer may learn that the
+/// upstream came or went. It is a required parameter, not an option, so no
+/// call site can open a raw monitor with no way to observe a disconnect
+/// (the shape that produced the §12.8 defect family).
+pub fn op_monitor_raw_frames_handle<F, C>(
     channel: Arc<Channel>,
     fields: &[&str],
     pipeline_size: u32,
     callback: F,
+    on_conn: C,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+    C: FnMut(MonitorConnEvent) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    spawn_raw_frames_handle(channel, fields_owned, None, pipeline_size, callback)
+    spawn_raw_frames_handle(
+        channel,
+        fields_owned,
+        None,
+        pipeline_size,
+        callback,
+        on_conn,
+    )
 }
 
 /// Raw-frame monitor handle that forwards a caller-supplied pvRequest
@@ -2403,14 +2548,16 @@ where
 /// downstream pvRequest rather than a gateway-default request, and
 /// `moncache.cpp:34-37` caches one upstream monitor per distinct
 /// request.
-pub fn op_monitor_raw_frames_handle_with_request<F>(
+pub fn op_monitor_raw_frames_handle_with_request<F, C>(
     channel: Arc<Channel>,
     pv_request: PvField,
     pipeline_size: u32,
     callback: F,
+    on_conn: C,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+    C: FnMut(MonitorConnEvent) + Send + 'static,
 {
     spawn_raw_frames_handle(
         channel,
@@ -2418,18 +2565,21 @@ where
         Some(pv_request),
         pipeline_size,
         callback,
+        on_conn,
     )
 }
 
-fn spawn_raw_frames_handle<F>(
+fn spawn_raw_frames_handle<F, C>(
     channel: Arc<Channel>,
     fields_owned: Vec<String>,
     pv_request: Option<PvField>,
     pipeline_size: u32,
     mut callback: F,
+    on_conn: C,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+    C: FnMut(MonitorConnEvent) + Send + 'static,
 {
     // Flow control shares one origin with the wire request: a forwarded
     // pvRequest's own `record._options.{pipeline,queueSize,ackAny}` drive
@@ -2460,6 +2610,8 @@ where
     let state_for_task = state.clone();
 
     let task = epics_base_rs::runtime::task::spawn(async move {
+        // Single owner of this subscription's connection-state transitions.
+        let mut conn = ConnEventOwner::new(on_conn);
         loop {
             if state_for_task
                 .stop
@@ -2483,6 +2635,7 @@ where
                     continue;
                 }
             };
+            conn.enter_connected(server.addr);
             match run_raw_monitor_loop(
                 server.clone(),
                 sid,
@@ -2494,10 +2647,17 @@ where
             )
             .await
             {
-                Ok(()) => return Ok(()),
-                Err(MonitorEnd::ChannelClosed) => return Ok(()),
+                Ok(()) => {
+                    conn.leave_finished();
+                    return Ok(());
+                }
+                Err(MonitorEnd::ChannelClosed) => {
+                    conn.leave_disconnected();
+                    return Ok(());
+                }
                 Err(MonitorEnd::ConnectionLost) => {
                     state_for_task.active.lock().take();
+                    conn.leave_disconnected();
                     if matches!(
                         channel.current_state(),
                         super::channel::ChannelState::Closed
@@ -2511,7 +2671,16 @@ where
                 // only in what already happened to the circuit: `Fatal` closed it
                 // (pvxs `bev.reset()`), `Remote` left it serving its other
                 // channels (pvxs `RemoteError`).
-                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
+                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => {
+                    // The subscription left Active. Unlike `op_monitor_events`
+                    // — whose caller receives the error in-band because the
+                    // future itself resolves `Err` — a handle consumer is
+                    // forbidden to read the termination as a connection state
+                    // (`MonitorTermination`), so the departure must be
+                    // announced here or it is announced nowhere.
+                    conn.leave_disconnected();
+                    return Err(e);
+                }
             }
         }
     });
@@ -2850,14 +3019,22 @@ where
 /// pause/resume/stats. The inner monitor loop runs in a spawned task
 /// and stops when the handle's `stop()` is called or when the channel
 /// is closed.
-pub fn op_monitor_handle<F>(
+///
+/// `on_conn` receives this subscription's connection-state transitions
+/// ([`MonitorConnEvent`]) — the ONLY place a consumer may learn that the
+/// upstream came or went. It is a required parameter, not an option, so no
+/// call site can open a handle monitor with no way to observe a disconnect
+/// (the shape that produced the §12.8 defect family).
+pub fn op_monitor_handle<F, C>(
     channel: Arc<Channel>,
     fields: &[&str],
     pipeline_size: u32,
     mut callback: F,
+    on_conn: C,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, &PvField) + Send + 'static,
+    C: FnMut(MonitorConnEvent) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     let flow = MonitorFlow::window(pipeline_size);
@@ -2874,6 +3051,8 @@ where
     let state_for_task = state.clone();
 
     let task = epics_base_rs::runtime::task::spawn(async move {
+        // Single owner of this subscription's connection-state transitions.
+        let mut conn = ConnEventOwner::new(on_conn);
         loop {
             if state_for_task
                 .stop
@@ -2896,6 +3075,7 @@ where
                     continue;
                 }
             };
+            conn.enter_connected(server.addr);
             // Adapt the public `FnMut(&FieldDesc, &PvField)` callback to the
             // inner loop's marked-set-carrying signature; the handle API
             // delivers the merged value and does not surface the changed set.
@@ -2916,10 +3096,17 @@ where
             )
             .await
             {
-                Ok(()) => return Ok(()),
-                Err(MonitorEnd::ChannelClosed) => return Ok(()),
+                Ok(()) => {
+                    conn.leave_finished();
+                    return Ok(());
+                }
+                Err(MonitorEnd::ChannelClosed) => {
+                    conn.leave_disconnected();
+                    return Ok(());
+                }
                 Err(MonitorEnd::ConnectionLost) => {
                     state_for_task.active.lock().take();
+                    conn.leave_disconnected();
                     if matches!(
                         channel.current_state(),
                         super::channel::ChannelState::Closed
@@ -2933,7 +3120,13 @@ where
                 // only in what already happened to the circuit: `Fatal` closed it
                 // (pvxs `bev.reset()`), `Remote` left it serving its other
                 // channels (pvxs `RemoteError`).
-                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => return Err(e),
+                Err(MonitorEnd::Fatal(e) | MonitorEnd::Remote(e)) => {
+                    // See the raw-frames twin: a handle consumer may not read
+                    // the termination as a connection state, so the departure
+                    // from Active is announced here.
+                    conn.leave_disconnected();
+                    return Err(e);
+                }
             }
         }
     });

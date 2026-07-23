@@ -39,7 +39,7 @@
 //! # `pva://` record links resolve on this target (design stage 4)
 //!
 //! A C IOC linked against pvxs gets pvalink through `pvalink_enable()`
-//! (`ioc/iochooks.cpp:495`), so `INP=@pva://...` resolves. This one does too:
+//! (`ioc/iochooks.cpp:495`), so `INP=pva://...` resolves. This one does too:
 //! [`install_pvalink_resolver`](epics_bridge_rs::pvalink::install_pvalink_resolver)
 //! mounts the pva:// external record-link resolver on the database as a fourth
 //! step at init, and the startup banner reports it installed and the link count
@@ -348,7 +348,7 @@ mod ioc {
         };
 
         // (2c) The pvalink resolver: install the pva:// external record-link
-        //      resolver on the database so `INP=@pva://...` / `OUT=@pva://...`
+        //      resolver on the database so `INP=pva://...` / `OUT=pva://...`
         //      fields resolve. C does the equivalent at `pvalink_enable()`
         //      (ioc/iochooks.cpp:495) during iocInit, after the database exists.
         //      Installed here — after the database and the QSRV mount, before the
@@ -530,7 +530,7 @@ mod ioc {
                 " only (set PVXS_QSRV_ENABLE=YES for groups)"
             },
         );
-        // The pvalink resolver is mounted, so `@pva://...` INP/OUT links
+        // The pvalink resolver is mounted, so `pva://...` INP/OUT links
         // resolve. Reported at every boot — including `link_count == 0`, when
         // the loaded database configured none — because on a target with no
         // shell the console is the only place an operator can confirm the
@@ -540,7 +540,7 @@ mod ioc {
         // link to a server reachable only by broadcast will not resolve.
         println!(
             "rtems-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
-             link{} pre-registered; @pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS \
+             link{} pre-registered; pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS \
              (TCP name servers; UDP search is compiled out on this target)",
             if link_count == 1 { "" } else { "s" },
         );
@@ -867,7 +867,7 @@ mod tests {
     /// This is the stage-4 counterpart of the group-source guard: a regression
     /// that dropped the `install_pvalink_resolver` call would leave an IOC that
     /// still boots, still serves every record and still answers searches — and
-    /// silently resolves no `@pva://...` INP/OUT link at all, with no shell on
+    /// silently resolves no `pva://...` INP/OUT link at all, with no shell on
     /// the target to notice. The banner line is the only place an operator can
     /// confirm from the console that the resolver came up and how many links it
     /// pre-registered, so it is checked too.
@@ -881,7 +881,7 @@ mod tests {
         // `concat!` so this assertion cannot match its own source text.
         assert!(
             prod.contains(concat!("install_pvalink_", "resolver(&db)")),
-            "the pvalink resolver is no longer installed; @pva://... record links \
+            "the pvalink resolver is no longer installed; pva://... record links \
              would silently never resolve, and there is no shell on the target to say so"
         );
         assert!(

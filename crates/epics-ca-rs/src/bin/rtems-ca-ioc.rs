@@ -22,7 +22,7 @@
 //! 3. **`ca://` record links** —
 //!    [`install_calink_resolver`](epics_ca_rs::calink::install_calink_resolver)
 //!    mounts the CA external record-link resolver on the database (C
-//!    `dbCaLinkInit`, `dbCa.c:1071`), so a ` CA`-modified or `@ca://...`
+//!    `dbCaLinkInit`, `dbCa.c:1071`), so a ` CA`-modified or `ca://...`
 //!    INP/OUT field resolves through a live `CaClient`. The client dials
 //!    `EPICS_CA_NAME_SERVERS` over TCP; the UDP SEARCH transport is compiled
 //!    out on this target.
@@ -181,7 +181,7 @@ mod ioc {
         };
 
         // (2b) The calink resolver: install the `ca://` record-link resolver on
-        //      the database so ` CA`-modified / `@ca://...` INP/OUT fields
+        //      the database so ` CA`-modified / `ca://...` INP/OUT fields
         //      resolve. C reaches the same state through `dbCaLinkInit`
         //      (`dbCa.c:1071`) during iocInit, after the database exists.
         //      Installed here — after the database, before the CA front-end —
@@ -344,7 +344,7 @@ mod ioc {
              RTEMS execution model, no tokio runtime",
             names.len()
         );
-        // The calink resolver is mounted, so ` CA`-modified and `@ca://...`
+        // The calink resolver is mounted, so ` CA`-modified and `ca://...`
         // INP/OUT links resolve. Reported at every boot — including
         // `link_count == 0`, when the loaded database configured none —
         // because on a target with no shell the console is the only place an
@@ -364,7 +364,7 @@ mod ioc {
         let link_count = resolver.link_count();
         println!(
             "rtems-ca-ioc: calink resolver installed — {link_count} ca:// record \
-             link{} registered; ` CA`-modified and @ca://... INP/OUT resolve over \
+             link{} registered; ` CA`-modified and ca://... INP/OUT resolve over \
              EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
              on this target)",
             if link_count == 1 { "" } else { "s" },
@@ -495,7 +495,7 @@ mod tests {
     /// exists for the same reason: a regression that dropped the
     /// `install_calink_resolver` call would leave an IOC that still boots,
     /// still serves every record and still answers searches — and silently
-    /// resolves no ` CA`-modified or `@ca://...` INP/OUT link at all, with no
+    /// resolves no ` CA`-modified or `ca://...` INP/OUT link at all, with no
     /// shell on the target to notice. The banner line is the only place an
     /// operator can confirm from the console that the resolver came up and how
     /// many links it registered, so it is checked too.
@@ -510,7 +510,7 @@ mod tests {
         assert!(
             prod.contains(concat!("install_calink_", "resolver(&db)")),
             "the calink resolver is no longer installed; ` CA`-modified and \
-             @ca://... record links would silently never resolve, and there is no \
+             ca://... record links would silently never resolve, and there is no \
              shell on the target to say so"
         );
         assert!(

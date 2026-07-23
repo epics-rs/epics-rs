@@ -30,7 +30,7 @@ fn tools() -> CTools {
 }
 
 fn dbd() -> Dbd {
-    Dbd::parse_file(std::path::Path::new(CTools::DEFAULT_DBD)).expect("expanded softIoc.dbd parses")
+    Dbd::parse_file(&CTools::dbd_path()).expect("expanded softIoc.dbd parses")
 }
 
 /// The denominator is derived from the spec, and it is not empty or absurd.

@@ -300,12 +300,22 @@ for config in "${CONFIGS[@]}"; do
         # `epics-bridge-rs:rtems-pva-ioc` the feature is also `required-features`,
         # so omitting it here does not quietly build the wrong thing — it fails
         # the run outright, which is the direction this gate wants to fail in.
-        feats=()
-        [[ -n "${CRATE_FEATURES[$crate]:-}" ]] && feats=(--features "${CRATE_FEATURES[$crate]}")
-        log "== [$config] $crate --bin $bin ${feats[*]-}"
-        if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin" ${feats[@]+"${feats[@]}"}; then
-            failed+=("[$config] $crate --bin $bin")
-        fi
+        #
+        # Each target binary is checked twice: once as shipped by default (a
+        # clean IOC — no probe records, no probe threads) and once with
+        # `bringup-probes`, the measurement rig the bring-up box's build
+        # scripts select (doc/calink-rtems-design.md §11.7 item 3). Both are
+        # real images someone boots, so both are census, not choice.
+        for probe in "" bringup-probes; do
+            sel="${CRATE_FEATURES[$crate]:-}"
+            [[ -n "$probe" ]] && sel="${sel:+$sel,}$probe"
+            feats=()
+            [[ -n "$sel" ]] && feats=(--features "$sel")
+            log "== [$config] $crate --bin $bin ${feats[*]-}"
+            if ! cargo "${COMMON[@]}" -p "$crate" --bin "$bin" ${feats[@]+"${feats[@]}"}; then
+                failed+=("[$config] $crate --bin $bin ${feats[*]-}")
+            fi
+        done
     done
 done
 

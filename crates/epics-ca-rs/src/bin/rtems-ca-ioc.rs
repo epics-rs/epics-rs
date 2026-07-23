@@ -65,39 +65,42 @@
 
 use std::process::ExitCode;
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
-mod ioc {
-    use std::collections::HashMap;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::process::ExitCode;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Instant;
-
-    use epics_base_rs::error::CaResult;
-    use epics_base_rs::runtime::net::cas_server_port;
-    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
-    use epics_base_rs::server::database::PvDatabase;
-    use epics_base_rs::server::ioc_builder::IocBuilder;
-    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
-    use epics_base_rs::types::EpicsValue;
-    use epics_ca_rs::calink::install_calink_resolver;
-    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
-
-    /// The built-in database loaded when no `.db` file is given on the command
-    /// line — small enough to run on a bare target, wide enough to exercise
-    /// the scalar read, write and monitor paths over CA.
-    const DEMO_DB: &str = concat!(
+/// The built-in database, kept **outside** `mod ioc` deliberately, mirroring
+/// `rtems-pva-ioc`'s `demo_db` and for its reason: it is data, not RTEMS
+/// code, and the part the *default* host selection can check for real — with
+/// no feature flag, so a typo below cannot reach a reader as a silent "no
+/// such PV" on a serial console with no shell to ask. The `test` arm is what
+/// lets the guards at the bottom of this file parse it; the `rtems` and
+/// `rtems-exec-model` arms are the production use.
+#[cfg(any(target_os = "rtems", feature = "rtems-exec-model", test))]
+mod demo_db {
+    /// The database loaded when no `.db` file is given on the command line —
+    /// small enough to run on a bare target, wide enough to exercise the
+    /// scalar read, write and monitor paths over CA.
+    ///
+    /// IOC content only, and **link-free** by construction: no record here
+    /// carries an INP/OUT field, so a default build is the no-`ca://`-link
+    /// image `doc/calink-rtems-design.md` §11.7 item 4 asks for. The C6
+    /// measurement rig — every probe record and both probe threads — is
+    /// behind the `bringup-probes` feature ([`C6_PROBE_DB`]).
+    pub const DEMO_DB: &str = concat!(
         "record(ao, \"RTEMS:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
         "record(longout, \"RTEMS:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
         "record(stringout, \"RTEMS:MSG\") { field(VAL, \"rtems-ca-ioc\") }\n",
-        // ---- C6 PROBE (doc/calink-rtems-design.md §6 stage C6, topology A) ----
-        //
-        // The records the gate is about. They live in `DEMO_DB` rather than
-        // in a `.db` file because a `-kernel` boot has no filesystem to name
-        // one on and `rtems_init.c:195` hands `main` a fixed one-element
-        // argv — the same forcing the pvalink probe recorded
-        // (`doc/pvalink-rtems-design.md` §12.3).
+    );
+
+    /// C6 PROBE (doc/calink-rtems-design.md §6 stage C6, topology A): the 14
+    /// measurement-rig records, loaded on top of [`DEMO_DB`] only under the
+    /// `bringup-probes` feature (§11.7 item 3 — they are the measurement rig,
+    /// not IOC content).
+    ///
+    /// They live in a compiled-in constant rather than in a `.db` file
+    /// because a `-kernel` boot has no filesystem to name one on and
+    /// `rtems_init.c:195` hands `main` a fixed one-element argv — the same
+    /// forcing the pvalink probe recorded (`doc/pvalink-rtems-design.md`
+    /// §12.3).
+    #[cfg(feature = "bringup-probes")]
+    pub const C6_PROBE_DB: &str = concat!(
         //
         // NOT `@ca://…`: a leading `@` is INST_IO and `dbCanSetLink`
         // (`record/link.rs:487`, C `dbStaticLib.c:2400`) refuses INST_IO on
@@ -170,6 +173,28 @@ mod ioc {
         // host `camonitor` sees IS the band's timer jitter.
         "record(ai, \"RTEMS:CA:TICK\") { field(PREC, \"0\") field(SCAN, \"Passive\") }\n",
     );
+}
+
+#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+mod ioc {
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::process::ExitCode;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+
+    use epics_base_rs::error::CaResult;
+    use epics_base_rs::runtime::net::cas_server_port;
+    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
+    use epics_base_rs::types::EpicsValue;
+    use epics_ca_rs::calink::install_calink_resolver;
+    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
+
+    use crate::demo_db::DEMO_DB;
 
     /// The namespace the status PVs are published under, matching [`DEMO_DB`]'s.
     ///
@@ -189,20 +214,25 @@ mod ioc {
     /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
     /// host-side upstream IOC's CA port, which cannot be the guest's own
     /// 5064 because that belongs to the inbound `hostfwd`.
+    #[cfg(feature = "bringup-probes")]
     const C6_NAME_SERVER: &str = "10.0.2.2:15076";
 
     /// C6 PROBE: the record the band-occupancy tick writes, and the
     /// interval it aims for. 200 ms is well inside the upstream's 10 Hz
     /// burst rate, so a burst overlaps several ticks.
+    #[cfg(feature = "bringup-probes")]
     const C6_TICK_RECORD: &str = "RTEMS:CA:TICK";
+    #[cfg(feature = "bringup-probes")]
     const C6_TICK_PERIOD_MS: u64 = 200;
 
-    /// C6 PROBE: how long the banner waits for iocInit's staged link opens
-    /// to reach the declared external-PV set before reporting the count.
-    /// Bounded on purpose — an unreachable upstream must still boot the IOC
-    /// and still print a banner, with the shortfall visible.
-    const C6_LINK_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    const C6_LINK_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    /// How long the banner waits for iocInit's staged link opens to reach
+    /// the declared external-PV set before reporting the count. Bounded on
+    /// purpose — an unreachable upstream must still boot the IOC and still
+    /// print a banner, with the shortfall visible. (Introduced by the C6
+    /// bring-up, kept unconditionally: it is what makes the banner a report
+    /// rather than a race, whatever database was loaded.)
+    const LINK_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const LINK_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
     // C6 PROBE: the C task census and stack-usage report — see
     // `epics-rtems-boot/csrc/rtems_stats.c`, the same pair the pvalink
@@ -210,7 +240,7 @@ mod ioc {
     // same listing. Present only on a linked RTEMS image.
     // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
     // document extern blocks.)
-    #[cfg(target_os = "rtems")]
+    #[cfg(all(target_os = "rtems", feature = "bringup-probes"))]
     unsafe extern "C" {
         fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
         fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
@@ -218,6 +248,7 @@ mod ioc {
 
     /// C6 PROBE: `rt top` + `rt stackuse`, from inside the image — this
     /// image configures the shell's commands but starts no shell.
+    #[cfg(feature = "bringup-probes")]
     fn c6_task_and_stack_report(tag: &str) {
         #[cfg(target_os = "rtems")]
         {
@@ -240,6 +271,7 @@ mod ioc {
     /// target the console is the only place the circuit count and a
     /// record's alarm state can be read from *inside* the IOC, next to
     /// what `caget` reads from outside.
+    #[cfg(feature = "bringup-probes")]
     fn c6_report(seq: u32, resolver: &epics_ca_rs::calink::CaLinkResolver, db: &Arc<PvDatabase>) {
         let conns = block_on_sync(resolver.client_connection_count())
             .ok()
@@ -278,6 +310,13 @@ mod ioc {
         let mut builder = IocBuilder::new();
         if db_files.is_empty() {
             builder = builder.db_string(DEMO_DB, &macros)?;
+            // C6 PROBE records ride along whenever the built-in database is
+            // the source — a bare `-kernel` boot cannot choose — but only on
+            // a build that asked for the measurement rig.
+            #[cfg(feature = "bringup-probes")]
+            {
+                builder = builder.db_string(crate::demo_db::C6_PROBE_DB, &macros)?;
+            }
         } else {
             for path in db_files {
                 builder = builder.db_file(path, &macros)?;
@@ -318,6 +357,7 @@ mod ioc {
         // SAFETY (edition 2024): this runs on the single init thread
         // before `background_init` starts any other thread, so no
         // concurrent reader or writer of the environment exists.
+        #[cfg(feature = "bringup-probes")]
         for (var, compiled_in) in [
             ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
             ("EPICS_CA_ADDR_LIST", ""),
@@ -576,9 +616,9 @@ mod ioc {
         // 4 and 1 while this reads 4.
         let declared = block_on_sync(db_for_names.external_link_pv_names())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-        let deadline = std::time::Instant::now() + C6_LINK_SETTLE_TIMEOUT;
+        let deadline = std::time::Instant::now() + LINK_SETTLE_TIMEOUT;
         while resolver.link_count() < declared.len() && std::time::Instant::now() < deadline {
-            std::thread::sleep(C6_LINK_SETTLE_POLL);
+            std::thread::sleep(LINK_SETTLE_POLL);
         }
         let link_count = resolver.link_count();
         println!(
@@ -609,6 +649,7 @@ mod ioc {
         //     jitter directly: `Instant` is 1-second-quantized on target
         //     (§5.5), so the sub-second numbers have to be read off the
         //     wire, not off the guest's clock.
+        #[cfg(feature = "bringup-probes")]
         {
             let tick_db = db_for_names.clone();
             println!(
@@ -652,6 +693,7 @@ mod ioc {
         //     reading criterion 6 asks for on a target that starts no
         //     shell. Its own thread with a stated stack class, like every
         //     other thread this entry point starts.
+        #[cfg(feature = "bringup-probes")]
         {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
@@ -896,6 +938,119 @@ mod tests {
             prod.contains(concat!("install_panic_", "hook()")),
             "this entry point installs no panic hook, so a panicking worker \
              thread leaves an IOC that still looks healthy from the network"
+        );
+    }
+
+    /// The default binary is IOC content only: no C6 measurement-rig records,
+    /// and — `doc/calink-rtems-design.md` §11.7 item 4's enabler — no link
+    /// fields at all, so a default image holds zero client-side descriptors
+    /// and the per-circuit fd cost can be isolated against it.
+    ///
+    /// Runs in every host test pass (the probe rig moved to `C6_PROBE_DB`,
+    /// which only exists under `bringup-probes`), so a probe record leaking
+    /// back into `DEMO_DB` fails the default `--workspace` suite, not just a
+    /// feature slice.
+    #[test]
+    fn the_default_database_is_clean_and_link_free() {
+        use std::collections::HashMap;
+
+        let recs =
+            epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
+                .expect("the built-in database must parse");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["RTEMS:AO", "RTEMS:LO", "RTEMS:MSG"],
+            "the default database is the three demo records and nothing else"
+        );
+        for rec in &recs {
+            assert!(
+                !rec.name.starts_with("RTEMS:CA:"),
+                "{} is a C6 probe record; the measurement rig belongs behind \
+                 `bringup-probes`, not in the default image",
+                rec.name
+            );
+            for (field, _) in &rec.fields {
+                assert!(
+                    !matches!(field.as_str(), "INP" | "OUT" | "INPA" | "FLNK"),
+                    "{}.{field} is a link field: the default image must be \
+                     link-free (§11.7 item 4) — put link-bearing records behind \
+                     `bringup-probes` or in a loaded .db",
+                    rec.name
+                );
+            }
+        }
+    }
+
+    /// The probe ride-along in `load_database` is behind the feature gate.
+    ///
+    /// The parse tests pin what each constant *contains*; this pins what the
+    /// binary *loads*: an edit that loads `C6_PROBE_DB` unconditionally would
+    /// pass both parse tests and ship the rig in the default image.
+    #[test]
+    fn the_probe_db_loads_only_behind_the_feature() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let load_at = prod
+            .find(concat!("crate::demo_db::C6_PROBE_", "DB, &macros"))
+            .expect("the probe database is loaded somewhere in load_database");
+        let before = &prod[load_at.saturating_sub(400)..load_at];
+        assert!(
+            before.contains(concat!("#[cfg(feature = \"bringup-", "probes\")]")),
+            "the C6_PROBE_DB load site is not feature-gated: the measurement \
+             rig would ship in the default image"
+        );
+    }
+
+    /// With the feature on, the rig is exactly the 14 records the C6
+    /// measurement was built from (`doc/calink-rtems-design.md` §11.7 item
+    /// 3), on top of the same clean demo set — so the bring-up image is one
+    /// cargo flag away, not a code edit away.
+    #[cfg(feature = "bringup-probes")]
+    #[test]
+    fn the_probe_rig_defines_the_c6_records() {
+        use std::collections::HashMap;
+
+        let full = format!("{}{}", crate::demo_db::DEMO_DB, crate::demo_db::C6_PROBE_DB);
+        let recs = epics_base_rs::server::db_loader::parse_db(&full, &HashMap::new())
+            .expect("the demo + probe database must parse");
+        assert_eq!(recs.len(), 17, "3 demo records plus the 14-record rig");
+        for name in [
+            "RTEMS:CA:DOWN",
+            "RTEMS:CA:DOWN2",
+            "RTEMS:CA:UPLNK",
+            "RTEMS:CA:FAST",
+            "RTEMS:CA:C1",
+            "RTEMS:CA:C2",
+            "RTEMS:CA:C3",
+            "RTEMS:CA:C4",
+            "RTEMS:CA:C5",
+            "RTEMS:CA:C6",
+            "RTEMS:CA:C7",
+            "RTEMS:CA:C8",
+            "RTEMS:CA:OTHER",
+            "RTEMS:CA:TICK",
+        ] {
+            assert!(
+                recs.iter().any(|r| r.name == name),
+                "probe record {name} is missing from the rig"
+            );
+        }
+        // Both link spellings the C6 stage table asks for survive the split:
+        // the bare ` CA`-modifier and the `ca://` scheme.
+        let inp = |name: &str| {
+            recs.iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.fields.iter().find(|(f, _)| f == "INP"))
+                .map(|(_, v)| v.to_string())
+        };
+        assert_eq!(inp("RTEMS:CA:DOWN").as_deref(), Some("UPSTREAM:AI CP"));
+        assert_eq!(
+            inp("RTEMS:CA:DOWN2").as_deref(),
+            Some("ca://UPSTREAM:AI CP")
         );
     }
 }

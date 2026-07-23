@@ -50,6 +50,7 @@ mod exec_model {
     /// How long the IOC then gets to report that its client is searching. The
     /// binary's STAGE-5 probe reports every 10 s, so this has to clear one full
     /// reporting period with margin.
+    #[cfg(feature = "bringup-probes")]
     const SEARCH_BUDGET: Duration = Duration::from_secs(45);
 
     fn free_tcp_port() -> u16 {
@@ -60,6 +61,17 @@ mod exec_model {
     fn free_udp_port() -> u16 {
         let udp = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral UDP port");
         udp.local_addr().unwrap().port()
+    }
+
+    /// A port with nothing listening on it, for the name server the default
+    /// build is pointed at — the compiled-in SLIRP address is part of the
+    /// probe rig, so a clean build must be told where to dial.
+    #[cfg(not(feature = "bringup-probes"))]
+    fn closed_port() -> u16 {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+        let port = tcp.local_addr().unwrap().port();
+        drop(tcp);
+        port
     }
 
     struct Killed(Child);
@@ -87,22 +99,29 @@ mod exec_model {
         let log = std::fs::File::create(&log_path).expect("create the console log");
         let log_err = log.try_clone().expect("clone the console log handle");
 
-        // No `EPICS_PVA_NAME_SERVERS` here on purpose: the binary compiles its own
-        // default in and, with the variable unset, uses it before it builds the
-        // client — the same path the target takes, where nothing outside the
-        // image can configure it (`rtems-pva-ioc.rs` `STAGE5_NAME_SERVER`).
-        // Whatever it points at, the dial to it is the seam under test.
-        let child = Command::new(env!("CARGO_BIN_EXE_rtems-pva-ioc"))
-            .arg(&db)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rtems-pva-ioc"));
+        cmd.arg(&db)
             .env("EPICS_PVA_SERVER_PORT", free_tcp_port().to_string())
             .env("EPICS_PVAS_SERVER_PORT", free_tcp_port().to_string())
             .env("EPICS_PVA_BROADCAST_PORT", free_udp_port().to_string())
             .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err))
-            .spawn()
-            .expect("spawn rtems-pva-ioc");
+            .stderr(Stdio::from(log_err));
+        // With the probe rig compiled in, no `EPICS_PVA_NAME_SERVERS` here on
+        // purpose: the binary compiles its own default in and, with the
+        // variable unset, uses it before it builds the client — the same path
+        // the target takes, where nothing outside the image can configure it
+        // (`rtems-pva-ioc.rs` `STAGE5_NAME_SERVER`). Whatever it points at,
+        // the dial to it is the seam under test. The clean build compiles no
+        // default in (the SLIRP address is rig topology), so it is pointed at
+        // a closed local port, like the CA boot test always is.
+        #[cfg(not(feature = "bringup-probes"))]
+        cmd.env(
+            "EPICS_PVA_NAME_SERVERS",
+            format!("127.0.0.1:{}", closed_port()),
+        );
+        let child = cmd.spawn().expect("spawn rtems-pva-ioc");
         let mut child = Killed(child);
 
         let read_log = || {
@@ -143,23 +162,70 @@ mod exec_model {
         // got that far. Waiting for it rather than for a timer means a future
         // change that stops the client short of the seam cannot pass this test by
         // simply not panicking.
-        let deadline = Instant::now() + SEARCH_BUDGET;
-        while !console.contains("searching=1") {
-            assert!(
-                !console.contains("panic"),
-                "rtems-pva-ioc panicked after init:\n{console}"
-            );
-            assert!(
-                child.0.try_wait().expect("poll the child").is_none(),
-                "rtems-pva-ioc exited after init:\n{console}"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "rtems-pva-ioc never started searching for its pva:// link \
-                 within {SEARCH_BUDGET:?}:\n{console}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        //
+        // Probe-rig builds only: the reporter that prints `searching=` IS the
+        // stage-5 probe, so the clean build has no console line to wait on —
+        // the NS dial logs at debug, below the console subscriber's INFO
+        // floor. The seam is still crossed there (the client and its dial are
+        // production code, driven by the same `pva://` link); the *evidence*
+        // is only asserted in the `bringup-probes` run of this test, which is
+        // why the feature-ON gate runs both configurations.
+        #[cfg(feature = "bringup-probes")]
+        {
+            let deadline = Instant::now() + SEARCH_BUDGET;
+            while !console.contains("searching=1") {
+                assert!(
+                    !console.contains("panic"),
+                    "rtems-pva-ioc panicked after init:\n{console}"
+                );
+                assert!(
+                    child.0.try_wait().expect("poll the child").is_none(),
+                    "rtems-pva-ioc exited after init:\n{console}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "rtems-pva-ioc never started searching for its pva:// link \
+                     within {SEARCH_BUDGET:?}:\n{console}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                console = read_log();
+            }
+        }
+
+        // Clean builds — wait for the record listing instead, which `main`
+        // prints after everything the probe rig would have announced, then
+        // assert the rig's reporter is absent. (Record-level absence is pinned
+        // by the bin's own parse tests: this process test loads its own `.db`,
+        // so the built-in database is not in this listing either way.)
+        #[cfg(not(feature = "bringup-probes"))]
+        {
+            let deadline = Instant::now() + INIT_BUDGET;
+            while !console.contains("rtems-pva-ioc: LOCAL:PAI") {
+                assert!(
+                    !console.contains("panic"),
+                    "rtems-pva-ioc panicked after init:\n{console}"
+                );
+                assert!(
+                    child.0.try_wait().expect("poll the child").is_none(),
+                    "rtems-pva-ioc exited after init:\n{console}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "rtems-pva-ioc never listed its records within \
+                     {INIT_BUDGET:?}:\n{console}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                console = read_log();
+            }
+            // One settle read: `main` prints sequentially, so anything it was
+            // ever going to print lands within this margin of the listing.
+            std::thread::sleep(Duration::from_secs(1));
             console = read_log();
+            assert!(
+                !console.contains("STAGE5"),
+                "the default build must not start the stage-5 measurement rig; \
+                 it belongs behind `--features bringup-probes`:\n{console}"
+            );
         }
 
         assert!(

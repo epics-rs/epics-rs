@@ -1721,7 +1721,10 @@ that runs it.
 ### 9.14 §8 items 2 and 5, measured on the target — one group subscriber starves monitor delivery
 
 **Setup.** Probe commit `8e70b6f8` compiles a 20-member `Q:group`
-`RTEMS:PVA:BIG` into `rtems-pva-ioc`'s demo DB: members `B00..B19` are
+`RTEMS:PVA:BIG` into `rtems-pva-ioc`'s demo DB (since gated: the probe
+DB is now behind the `bringup-probes` feature —
+`doc/calink-rtems-design.md` §11.7 item 3; a default build carries no
+probe records): members `B00..B19` are
 self-driven calcs (`SCAN ".1 second"`, `CALC "VAL+1"`), plus an
 out-of-group victim `RTEMS:PVA:V0` with the same 10 Hz self-drive.
 Scanning on the PVA-only target is alive via `51f60ed0` (the scan-owner

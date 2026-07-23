@@ -2427,15 +2427,71 @@ to-mid-teens millisecond latency tax on other links sharing the band.
    writes through `put_record_field_from_ca_no_notify`, whose process cycle
    clears the UDF alarm and posts the monitor. `put_pv` remains a
    non-processing write; what changed is that it is no longer a *silent* one.
-3. **The C6 probe records and threads are in `rtems-ca-ioc`.** `DEMO_DB`
+3. ~~**The C6 probe records and threads are in `rtems-ca-ioc`.** `DEMO_DB`
    carries 14 probe records and `main` starts two probe threads (`c6-probe`,
    the tick task). They are the measurement rig, not IOC content, and should
    come out — or move behind a feature — before the binary is anything but a
-   bring-up image.
+   bring-up image.~~ **CLOSED**: the rig moved behind an opt-in cargo
+   feature, `bringup-probes`, declared on BOTH `epics-ca-rs` and
+   `epics-bridge-rs` — the same defect lived in `rtems-pva-ioc`, which
+   compiled the pvalink stage-5 link records and the §8 qsrv load-probe
+   group (`doc/qsrv-rtems-design.md` §9.14, commit `8e70b6f8`)
+   unconditionally. What is behind the flag, per binary:
+   * `rtems-ca-ioc`: the 14 probe records (now `demo_db::C6_PROBE_DB` —
+     DOWN, DOWN2, UPLNK, FAST, C1..C8, OTHER, TICK), both probe threads
+     (the tick task and the `c6-probe` reporter, with `c6_report` and the
+     `rtems_stats.c` extern bindings), and the compiled-in
+     `EPICS_CA_NAME_SERVERS`/`EPICS_CA_ADDR_LIST`/`EPICS_CA_AUTO_ADDR_LIST`
+     SLIRP topology defaults. The banner's link-settle wait stayed
+     unconditional: it is what makes the banner a report rather than a
+     race (§11.6 boot 3), whatever database was loaded.
+   * `rtems-pva-ioc`: the stage-5 link records (now
+     `demo_db::STAGE5_PROBE_DB` — RTEMS:PVA:DOWN, DOWN2, UPLNK), the §8
+     load-probe group (`qsrv_load_probe_db()` — victim `RTEMS:PVA:V0`
+     plus the 20-member `RTEMS:PVA:BIG`), the `stage5-probe` reporter
+     thread, and the compiled-in `EPICS_PVA_NAME_SERVERS` default.
+   A default build is clean IOC content — the three demo records per
+   binary, no probe records, no probe threads — and the C6/§8 measurement
+   capability is one cargo flag away, not a code edit away: the box
+   build scripts (`~/rtems-bringup/build-c6.sh` and the qsrv
+   equivalent) add `bringup-probes` to their `--features` list to get
+   exactly the measured images back:
+
+   ```
+   cargo +nightly build --release --target armv7-rtems-eabihf \
+     -Zbuild-std=std,panic_abort --no-default-features \
+     --features client-core,bringup-probes -p epics-ca-rs --bin rtems-ca-ioc
+
+   cargo +nightly build --release --target armv7-rtems-eabihf \
+     -Zbuild-std=std,panic_abort --no-default-features \
+     --features qsrv-core,pvalink,bringup-probes \
+     -p epics-bridge-rs --bin rtems-pva-ioc
+   ```
+
+   `scripts/rtems-check.sh` compiles each target binary in both
+   configurations (with and without `bringup-probes`, in both the
+   portability and image configuration). The split is pinned per binary:
+   `the_default_database_is_clean_and_link_free` (absence, runs in the
+   default suite), `the_probe_db_loads_only_behind_the_feature` /
+   `the_probe_dbs_load_only_behind_the_feature` (the load site is
+   gated), `the_probe_rig_defines_the_c6_records` /
+   `the_stage5_rig_defines_the_three_link_records` (feature-ON
+   presence), and the two boot tests' console asserts (`C6 probe` /
+   `STAGE5` lines must appear with the feature and must not without).
 4. **§5.3's fd table is an upper bound, not an equality.** §11.5 criterion 7
    could not isolate the absolute per-circuit descriptor cost because a client
    with a link configured never holds zero descriptors. Isolating it needs an
-   image built with no link configured at all.
+   image built with no link configured at all. *Enabler landed with item 3's
+   closure:* the **default** (`bringup-probes` off) build IS that image —
+   every link-bearing record in the built-in database was probe rig, so a
+   default `rtems-ca-ioc` image configures no `ca://` link at all (and the
+   default `rtems-pva-ioc` no `pva://` link), with zero client-side
+   descriptors. No second knob was needed;
+   `the_default_database_is_clean_and_link_free` refuses any INP/OUT field
+   in `DEMO_DB`, so the property cannot silently erode. The measurement
+   itself is still owed: build the default image, boot it, read
+   `RTEMS:FD_CNT`, then diff against the same image with a link added via
+   a loaded `.db` (host) or a `bringup-probes` build (target).
 5. **Stage C4's second sign-off** is now unblocked with numbers (§11.6). The
    two closures (enqueue restructure vs C-style dedicated thread) are
    unchanged and still not picked.

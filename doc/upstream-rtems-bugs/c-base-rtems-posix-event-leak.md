@@ -139,8 +139,13 @@ One line; mirrors `os/posix/osdEvent.c:79` and the same directory's
 ## Relation to our own finding
 
 Our Rust port leaks 176–179 B per `std::thread` creation on RTEMS for a
-*different* root cause (TLS key freed before its destructor runs;
-upstream-libc issue, measured on target 2026-07-22). This C defect means the
+*different* root cause: a Rust `std` ↔ RTEMS-kernel interaction, not a libc
+bug — rustc emits no `target_thread_local` for `armv7-rtems-eabihf`, so std
+falls back to a destructor-less pthread key for `CURRENT`, and RTEMS's
+`_POSIX_Keys_Run_destructors` (`cpukit/posix/src/keycreate.c:113-158`) frees
+each key/value pair *before* invoking its destructor, so the deferred
+`drop_current()` reads NULL in round 2 and the `Arc<Thread::Inner>` is
+orphaned (measured on target 2026-07-22, `--wrap=malloc` + addr2line). This C defect means the
 prior comparison claim "C leaks 0 per thread" holds only for raw pthreads and
 the Linux port — an RTEMS ≥5 **C** IOC also leaks per thread cycle, via a
 missing `free`. The two defects are independent and both upstream.

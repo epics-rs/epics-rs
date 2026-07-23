@@ -81,6 +81,59 @@ pub struct PvaOperation<T: Send + 'static> {
     terminated_rx: watch::Receiver<()>,
 }
 
+/// The spawned task's body: the operation future and the RAII termination
+/// guard bound into **one value whose drop order the language fixes**.
+///
+/// This type exists because an `async move` block does not have *a* drop
+/// order — it has two, and they are opposites:
+///
+/// - A generator that has been polled at least once drops its **saved
+///   locals** in reverse declaration order. Writing `let _guard = guard;`
+///   ahead of `fut.await` therefore drops the operation future *first* and
+///   the guard *second* — the order the contract needs.
+/// - A generator that has **never been polled** still holds its captures as
+///   **upvars**, and upvars drop in *capture* order. The same source text
+///   then drops the guard *first* and the operation future *second*.
+///
+/// The exec-model backend takes that second path routinely: `abort()` is
+/// latched and the task scheduled, and the flag is observed at the top of
+/// the task's *first* `run()` — so the generator is dropped un-started
+/// (`future_exec.rs` `Task::run`'s abort arm, and `Entry::drop` for a ring
+/// entry dropped un-run). The guard then closed the watch channel while the
+/// operation future and everything it captured were still alive, waking
+/// [`PvaOperation::cancel`] early and breaking its synchronization-point
+/// contract. Hosted, the task is almost always polled before the abort
+/// lands, which is why the same code passes on tokio.
+///
+/// Struct fields drop in declaration order, and that rule holds in **every**
+/// state, polled or not. `fut` is declared first and `_guard` second, so
+/// "the operation future has been dropped" and "the channel has closed" are
+/// the same event by construction — one uniform rule instead of a
+/// per-state one.
+struct Terminating {
+    /// Dropped **first**. Boxed so this struct is `Unpin` and [`Future::poll`]
+    /// needs no unsafe pin projection.
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    /// Dropped **last**, closing the watch channel that [`PvaOperation::cancel`]
+    /// awaits and [`PvaOperation::is_done`] reads. Never read directly — its
+    /// `Drop` is the entire point, so it must stay the final field.
+    _guard: watch::Sender<()>,
+}
+
+impl std::future::Future for Terminating {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // `Pin<Box<_>>` and `watch::Sender` are both `Unpin`, so `Self` is
+        // `Unpin` and `get_mut` is safe: the boxed future owns its own
+        // stable address, independent of where this struct lives.
+        self.get_mut().fut.as_mut().poll(cx)
+    }
+}
+
 impl<T: Send + 'static> PvaOperation<T> {
     /// Spawn `fut` and return a handle. Dropping the handle aborts the
     /// spawned task — pvxs RAII `~Operation` performs the same implied
@@ -92,16 +145,22 @@ impl<T: Send + 'static> PvaOperation<T> {
         F: std::future::Future<Output = PvaResult<T>> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        // The sender moves into the task and is its RAII termination guard:
-        // it drops exactly when the future stops running (completion,
-        // abort, or panic-unwind), closing the channel.
+        // The sender is the task's RAII termination guard: it drops exactly
+        // when the future stops running (completion, abort, or panic-unwind),
+        // closing the channel. It is paired with the operation future inside
+        // `Terminating` rather than bound by a `let` inside an async block,
+        // because only a struct gives the two a drop order that holds whether
+        // or not the task was ever polled — see `Terminating`'s docs.
         let (term_tx, terminated_rx) = watch::channel(());
-        let join = epics_base_rs::runtime::task::spawn(async move {
-            let _term_tx = term_tx;
-            let v = fut.await;
-            let _ = tx.send(v);
-            // `_term_tx` drops here (or on abort/unwind), closing the
-            // watch channel and unblocking any `cancel()` waiter.
+        let join = epics_base_rs::runtime::task::spawn(Terminating {
+            // The result send stays *inside* the guarded future, so a normal
+            // completion still publishes the result strictly before the
+            // channel closes — unchanged from the previous shape.
+            fut: Box::pin(async move {
+                let v = fut.await;
+                let _ = tx.send(v);
+            }),
+            _guard: term_tx,
         });
         Self {
             join,
@@ -391,6 +450,82 @@ mod tests {
             StdArc::strong_count(&held),
             1,
             "cancel() must block until the operation future has been dropped"
+        );
+    }
+
+    /// The drop-order invariant `cancel()` rests on, asserted directly and
+    /// backend-independently: **the operation future must be dropped while the
+    /// termination channel is still open**, so the channel closing is proof
+    /// the future is already gone.
+    ///
+    /// Both generator states are covered, because they used to disagree. A
+    /// bare `async move { let _guard = guard; fut.await }` gets this right
+    /// only once it has been polled — un-started, its upvars drop in capture
+    /// order and the guard goes first. That un-started case is the one the
+    /// exec-model backend hits when `abort()` is observed before the first
+    /// poll, and it is what made
+    /// `cancel_is_a_sync_point_resource_released` fail intermittently.
+    #[test]
+    fn guard_closes_only_after_the_operation_future_is_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Reports, from inside the operation future's own drop, whether the
+        /// termination channel was still open at that instant.
+        struct Witness(watch::Receiver<()>, Arc<AtomicBool>);
+        impl Drop for Witness {
+            fn drop(&mut self) {
+                self.1.store(self.0.has_changed().is_ok(), Ordering::SeqCst);
+            }
+        }
+
+        // Build exactly what `spawn` builds, and drop it in a given state.
+        fn probe(poll_first: bool) -> (bool, bool) {
+            let (term_tx, terminated_rx) = watch::channel(());
+            let open_at_future_drop = Arc::new(AtomicBool::new(false));
+            let witness = Witness(terminated_rx.clone(), open_at_future_drop.clone());
+            let mut body = Terminating {
+                fut: Box::pin(async move {
+                    let _witness = witness;
+                    std::future::pending::<()>().await
+                }),
+                _guard: term_tx,
+            };
+            if poll_first {
+                let waker = futures_util::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                let polled = std::pin::Pin::new(&mut body).poll(&mut cx);
+                assert!(polled.is_pending(), "the probe future never completes");
+            }
+            drop(body);
+            (
+                open_at_future_drop.load(Ordering::SeqCst),
+                terminated_rx.has_changed().is_err(),
+            )
+        }
+
+        // Un-started — the state the exec backend drops an aborted-before-
+        // first-poll task in.
+        let (open_at_drop, closed_after) = probe(false);
+        assert!(
+            open_at_drop,
+            "un-started: the operation future must be dropped while the \
+             termination channel is still open"
+        );
+        assert!(
+            closed_after,
+            "un-started: the guard must close the channel once the future is gone"
+        );
+
+        // Polled once — the state the hosted backend almost always drops in.
+        let (open_at_drop, closed_after) = probe(true);
+        assert!(
+            open_at_drop,
+            "polled: the operation future must be dropped while the \
+             termination channel is still open"
+        );
+        assert!(
+            closed_after,
+            "polled: the guard must close the channel once the future is gone"
         );
     }
 

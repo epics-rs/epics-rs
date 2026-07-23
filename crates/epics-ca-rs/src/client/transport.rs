@@ -962,6 +962,55 @@ impl Drop for ServerConnection {
     }
 }
 
+/// Reports a circuit pump's exit to its single owner, [`run_transport_manager`].
+///
+/// A circuit dies when either of its pumps stops running: `read_loop` returning
+/// on an EOF / read error / malformed frame, `write_loop` returning on a send
+/// error, or either task being aborted or unwinding on panic. Every one of
+/// those is an exit of the pump future, so a guard whose `Drop` fires the
+/// circuit key covers them all — there is no way to run a pump without also
+/// holding the guard that reports its exit, which is what makes "a pump exited
+/// but the manager still holds a live-looking circuit" unrepresentable.
+///
+/// The manager retiring the circuit on this signal is what frees a reader pump
+/// still parked in a blocking `read` that a peer RST never woke (RTEMS libbsd,
+/// measured): removing the `ServerConnection` runs its `Drop`, which aborts the
+/// sibling task and drops the [`GuardedReader`]/[`GuardedWriter`] guards, and
+/// those `shutdown(Both)` the socket — the only thing that returns that read.
+/// Before this signal the circuit was retired only lazily, at the next
+/// `CreateChannel`; during a prolonged upstream outage that reconnect never
+/// arrives (its search is blocked on the also-down name-service circuit), so
+/// the dead circuit — socket and all — leaked for the whole outage.
+struct CircuitDeathGuard {
+    dead_tx: mpsc::UnboundedSender<CircuitKey>,
+    circuit: CircuitKey,
+}
+
+impl Drop for CircuitDeathGuard {
+    fn drop(&mut self) {
+        // The manager may already be gone (shutdown); a failed send is then
+        // the correct no-op — there is no circuit registry left to retire.
+        let _ = self.dead_tx.send(self.circuit);
+    }
+}
+
+/// Spawn a circuit pump future under a [`CircuitDeathGuard`], so its exit —
+/// however it exits — retires the circuit through the transport manager. Used
+/// for both the read and write pumps of every established circuit.
+fn spawn_guarded_pump<F>(
+    dead_tx: mpsc::UnboundedSender<CircuitKey>,
+    circuit: CircuitKey,
+    fut: F,
+) -> epics_base_rs::runtime::task::TaskHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    epics_base_rs::runtime::task::spawn(async move {
+        let _death = CircuitDeathGuard { dead_tx, circuit };
+        fut.await;
+    })
+}
+
 /// Per-task transport manager.
 ///
 /// `in_flight` is the Option-C Phase-A shared in-flight read/write
@@ -1023,6 +1072,16 @@ pub(crate) async fn run_transport_manager(
     // arrive before connect completes) all queue here and get drained
     // when the connect resolves.
     let mut queued_per_server: HashMap<CircuitKey, Vec<TransportCommand>> = HashMap::new();
+
+    // Circuit death funnel: every established circuit's pumps hold a
+    // `CircuitDeathGuard` that fires this channel on exit (return, `?`, panic,
+    // or abort). This is the ONLY circuit-death signal the manager acts on for
+    // retirement, so a dead circuit is retired the moment a pump stops — not
+    // deferred to the next `CreateChannel`. A pump also still emits
+    // `TransportEvent::TcpClosed` to the coordinator for the redial decision;
+    // the two are independent, and the manager owns retirement while the
+    // coordinator owns reconnect.
+    let (circuit_dead_tx, mut circuit_dead_rx) = mpsc::unbounded_channel::<CircuitKey>();
 
     // Helper: resolve the right SNI / cert-verification name for a
     // particular target address. Lookup order:
@@ -1101,6 +1160,7 @@ pub(crate) async fn run_transport_manager(
                         let in_flight_clone = in_flight.clone();
                         let last_rx_clone = last_rx_at.clone();
                         let identity_clone = client_identity.clone();
+                        let circuit_dead_clone = circuit_dead_tx.clone();
                         pending_connects.spawn(async move {
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
@@ -1110,6 +1170,7 @@ pub(crate) async fn run_transport_manager(
                                 in_flight_clone,
                                 last_rx_clone,
                                 identity_clone,
+                                circuit_dead_clone,
                                 tls_clone.as_ref(),
                                 sni.as_deref(),
                             )
@@ -1122,6 +1183,7 @@ pub(crate) async fn run_transport_manager(
                                 in_flight_clone,
                                 last_rx_clone,
                                 identity_clone,
+                                circuit_dead_clone,
                             )
                             .await;
                             (circuit, conn)
@@ -1194,6 +1256,27 @@ pub(crate) async fn run_transport_manager(
                         }
                         let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                     }
+                }
+            }
+            Some(dead) = circuit_dead_rx.recv() => {
+                // A pump of this circuit exited, so the circuit is dead. Retire
+                // it here, in its single owner, the instant it dies — the
+                // structural close for the wedge where a circuit killed by a
+                // peer RST lingered until the next `CreateChannel` (which, on a
+                // prolonged upstream outage, never comes because its reconnect
+                // search is blocked on the also-down name-service circuit).
+                //
+                // Removing the `ServerConnection` runs its `Drop`, which aborts
+                // the sibling pump and drops the reader/writer guards; those
+                // `shutdown(Both)` the socket, which is the only thing that
+                // frees a reader pump still parked in a blocking `read` that
+                // the RST never woke (RTEMS libbsd). Idempotent: the sibling
+                // pump's guard fires a second `dead` for the same key, and the
+                // `remove` then finds nothing — so exactly one retirement runs
+                // per circuit. `server_writers` is cleared in lockstep so no
+                // command is framed onto a socket that is being torn down.
+                if connections.remove(&dead).is_some() {
+                    server_writers.remove(&dead);
                 }
             }
         }
@@ -1648,9 +1731,15 @@ async fn connect_server(
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
     identity: super::types::ClientIdentitySlot,
+    // Fires the circuit key back to the transport manager the moment either
+    // pump exits, so the manager — the single owner of the `connections` map —
+    // retires the dead circuit at once rather than waiting for the next
+    // `CreateChannel`. See [`CircuitDeathGuard`].
+    circuit_dead: mpsc::UnboundedSender<CircuitKey>,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<&ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
+    let circuit: CircuitKey = (server_addr, priority);
     tracing::debug!(server = %server_addr, "establishing TCP virtual circuit");
     // The dial, its socket options and its receive-queue probe are one step
     // and one seam — see `dial_ca`. It selects the transport at compile time,
@@ -1751,81 +1840,105 @@ async fn connect_server(
             };
         tracing::debug!(server = %server_addr, "TLS handshake complete");
         let (reader, writer) = tokio::io::split(tls_stream);
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     } else {
         let (reader, writer) = split_circuit(stream);
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     };
 
     #[cfg(not(feature = "experimental-rust-tls"))]
     let (read_task, write_task) = {
         let (reader, writer) = split_circuit(stream);
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     };
 
@@ -4554,6 +4667,7 @@ mod connect_deadline_tests {
         let (addr, _listener, _filler) = syn_blackhole();
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (circuit_dead_tx, _circuit_dead_rx) = mpsc::unbounded_channel();
         let identity = Arc::new(parking_lot::RwLock::new(
             crate::client::types::ClientIdentity::from_env(),
         ));
@@ -4564,6 +4678,7 @@ mod connect_deadline_tests {
             InFlightOps::new(),
             ServerLastRxAt::default(),
             identity,
+            circuit_dead_tx,
             #[cfg(feature = "experimental-rust-tls")]
             None,
             #[cfg(feature = "experimental-rust-tls")]
@@ -5207,6 +5322,230 @@ mod priority_circuit_tests {
             "surviving priority-5 circuit must still carry frames after the sibling closed"
         );
         let _ = s5.shutdown().await;
+    }
+}
+
+// Host/tokio-only: drives the real `run_transport_manager`, which spawns its
+// per-circuit tasks with `tokio::spawn` and has no reactor under
+// `rtems-exec-model` (same reason as `priority_circuit_tests`' async cases).
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
+mod circuit_retirement_tests {
+    //! The wedge measured on the RTEMS target (topology-B, an 11-minute
+    //! upstream outage, `~/rtems-bringup/topoB/wedge-fd3-*`): a data circuit's
+    //! socket was killed by a SLIRP-forged RST after it had sent CREATE_CHAN,
+    //! and it was never retired for the whole outage — leaked as a zombie fd
+    //! (mode 0140000, peer=none/ENOTCONN) while the name-service circuit
+    //! redialed normally.
+    //!
+    //! Root cause, host-reproducible here: `run_transport_manager` retired a
+    //! dead `ServerConnection` only lazily, at the next `CreateChannel`. That
+    //! reconnect never arrives during a prolonged outage — the search that
+    //! would produce it is itself blocked on the also-down name-service
+    //! circuit — so the dead circuit, its pump tasks and its socket lingered.
+    //!
+    //! Invariant: an established circuit MUST be retired the moment either of
+    //! its pumps exits, through the manager (its single owner), independent of
+    //! any later `CreateChannel`.
+    use super::*;
+    use crate::client::types::{InFlightOps, ServerLastRxAt};
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    fn spawn_manager() -> (
+        mpsc::UnboundedSender<TransportCommand>,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        DirectServerWriters,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let in_flight = InFlightOps::new();
+        let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
+        let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
+        let observable = server_writers.clone();
+        let identity = Arc::new(parking_lot::RwLock::new(
+            crate::client::types::ClientIdentity::from_env(),
+        ));
+        #[cfg(not(feature = "experimental-rust-tls"))]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+            identity,
+        ));
+        #[cfg(feature = "experimental-rust-tls")]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+            identity,
+            None,
+            None,
+            std::collections::HashMap::new(),
+        ));
+        (cmd_tx, event_rx, observable)
+    }
+
+    /// Accept one client, drain its handshake + CREATE_CHAN, then force an RST
+    /// with `SO_LINGER 0` — the forged-RST-after-establish shape libslirp
+    /// produced on the box, reproduced locally with a real socket.
+    fn accept_then_rst_after_create_chan(listener: std::net::TcpListener) {
+        let (sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        // The client's handshake is 80 bytes here (VERSION + CLIENT_NAME +
+        // HOST_NAME for this process's identity); wait until CREATE_CHAN's
+        // 16-byte header is also in before killing the socket.
+        for _ in 0..8 {
+            match (&sock).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= 80 + 16 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let s2 = socket2::Socket::from(sock);
+        s2.set_linger(Some(Duration::ZERO)).expect("SO_LINGER 0");
+        drop(s2);
+    }
+
+    /// Wait for `ServerConnected` (establishment) and `TcpClosed` (death) on
+    /// the event stream, then poll the writer map for retirement. Shared by
+    /// both cases. Returns `(established, saw_closed, retired)`.
+    async fn observe_establish_close_retire(
+        event_rx: &mut mpsc::UnboundedReceiver<TransportEvent>,
+        sw: &DirectServerWriters,
+        circuit: CircuitKey,
+    ) -> (bool, bool, bool) {
+        let mut established = false;
+        let mut saw_closed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline && !(established && saw_closed) {
+            match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                Ok(Some(TransportEvent::ServerConnected { .. })) => established = true,
+                Ok(Some(TransportEvent::TcpClosed { .. })) => saw_closed = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        // Retirement: with NO reconnect CreateChannel sent, the writer entry
+        // must become absent on its own. Pre-fix it lingers until a later
+        // CreateChannel (which a prolonged outage never delivers) → this poll
+        // times out and `retired` stays false → the test fails, as it must on
+        // the pre-fix commit.
+        let retire_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < retire_by && sw.contains_key(&circuit) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let retired = !sw.contains_key(&circuit);
+        (established, saw_closed, retired)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rst_after_create_chan_retires_the_circuit_without_a_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(false).unwrap();
+
+        let (cmd_tx, mut event_rx, sw) = spawn_manager();
+
+        let l1 = std_listener.try_clone().unwrap();
+        let peer = std::thread::spawn(move || accept_then_rst_after_create_chan(l1));
+
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "WEDGE:PV".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+
+        let (established, saw_closed, retired) =
+            observe_establish_close_retire(&mut event_rx, &sw, (addr, 0)).await;
+        peer.join().unwrap();
+
+        assert!(
+            established,
+            "the circuit must establish (ServerConnected) before it can wedge"
+        );
+        assert!(saw_closed, "the RST must be classified as TcpClosed");
+        assert!(
+            retired,
+            "a circuit killed by a peer RST must be retired by the manager the \
+             moment its pump exits — not left registered until the next \
+             CreateChannel that a prolonged outage never delivers"
+        );
+    }
+
+    /// The owner path: a clean peer close (FIN, no lingering data) must retire
+    /// the circuit the same way — the death guard fires on the read pump's EOF
+    /// exit, not only on an RST. Guards against a fix that keyed on the RST
+    /// error specifically rather than on "the pump exited".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clean_peer_close_also_retires_the_circuit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let std_listener = listener.into_std().unwrap();
+        std_listener.set_nonblocking(false).unwrap();
+
+        let (cmd_tx, mut event_rx, sw) = spawn_manager();
+
+        let l1 = std_listener.try_clone().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = l1.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 4096];
+            // Establish fully first — drain handshake + CREATE_CHAN — so the
+            // circuit registers before we close; only then a plain FIN.
+            let mut total = 0usize;
+            for _ in 0..8 {
+                match (&sock).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        if total >= 80 + 16 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Plain FIN: drop without SO_LINGER.
+            drop(sock);
+        });
+
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "WEDGE:PV".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+
+        let (established, saw_closed, retired) =
+            observe_establish_close_retire(&mut event_rx, &sw, (addr, 0)).await;
+        peer.join().unwrap();
+
+        assert!(established, "the circuit must establish first");
+        assert!(saw_closed, "a clean close must be classified as TcpClosed");
+        assert!(
+            retired,
+            "a circuit whose peer closed cleanly must also be retired at once"
+        );
     }
 }
 

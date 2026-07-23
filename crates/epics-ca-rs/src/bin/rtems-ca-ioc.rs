@@ -255,6 +255,29 @@ mod ioc {
     unsafe extern "C" {
         fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
         fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
+        fn epics_rtems_boot_fd_census(tag: *const std::ffi::c_char);
+    }
+
+    /// C6 PROBE: name every open descriptor, not just count them.
+    ///
+    /// `FD_CNT` says how many; during an upstream outage the question is
+    /// *which* — the count settles one above the boot value and nothing in the
+    /// IOC's own accounting says what that descriptor is. This prints the
+    /// classification for each, from the same table `fd_usage` counts.
+    #[cfg(feature = "bringup-probes")]
+    fn c6_fd_census(tag: &str) {
+        #[cfg(target_os = "rtems")]
+        {
+            let c = std::ffi::CString::new(tag).unwrap_or_default();
+            // SAFETY: takes a NUL-terminated tag and only reads it; the C side
+            // walks the descriptor table under its own bounds check and only
+            // issues read-only queries on the descriptors it finds open.
+            unsafe {
+                epics_rtems_boot_fd_census(c.as_ptr());
+            }
+        }
+        #[cfg(not(target_os = "rtems"))]
+        let _ = tag;
     }
 
     /// C6 PROBE: `rt top` + `rt stackuse`, from inside the image — this
@@ -283,10 +306,27 @@ mod ioc {
     /// record's alarm state can be read from *inside* the IOC, next to
     /// what `caget` reads from outside.
     #[cfg(feature = "bringup-probes")]
-    fn c6_report(seq: u32, resolver: &epics_ca_rs::calink::CaLinkResolver, db: &Arc<PvDatabase>) {
+    fn c6_report(
+        seq: u32,
+        resolver: &epics_ca_rs::calink::CaLinkResolver,
+        db: &Arc<PvDatabase>,
+        server: &Arc<BlockingCaServer>,
+    ) {
         let conns = block_on_sync(resolver.client_connection_count())
             .ok()
             .flatten();
+        // The descriptor reading, in the shape the topology-B rig already logs
+        // it: the count against the ceiling, beside the *server* connection
+        // count, so a descriptor that belongs to an inbound client is not
+        // mistaken for one the client half is holding.
+        let (fd_cnt, fd_max) = match epics_rtems_boot::stats::fd_usage() {
+            Some(f) => (f.used as i64, f.max as i64),
+            None => (-1, -1),
+        };
+        println!(
+            "FDPROBE seq={seq} FD_CNT={fd_cnt} FD_MAX={fd_max} CA_CONN_CNT={}",
+            server.active_connections()
+        );
         println!(
             "C6 seq={seq} links={} circuits={conns:?}",
             resolver.link_count(),
@@ -723,6 +763,7 @@ mod ioc {
         {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
+            let probe_server = server.clone();
             println!(
                 "C6 probe: EPICS_CA_NAME_SERVERS={C6_NAME_SERVER} (compiled in), \
                  EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s",
@@ -738,8 +779,14 @@ mod ioc {
                     loop {
                         thread::sleep(std::time::Duration::from_secs(10));
                         seq += 1;
-                        c6_report(seq, &probe_resolver, &probe_db);
+                        c6_report(seq, &probe_resolver, &probe_db, &probe_server);
+                        // The census is one line per open descriptor, so it
+                        // runs on the same 1-minute pass as the task census
+                        // rather than every 10 s: an outage measurement wants
+                        // the identity to be re-read as the phases change, not
+                        // to bury the per-tick lines it is read against.
                         if seq.is_multiple_of(6) {
+                            c6_fd_census(&format!("c6-{seq}"));
                             c6_task_and_stack_report(&format!("c6-{seq}"));
                         }
                     }

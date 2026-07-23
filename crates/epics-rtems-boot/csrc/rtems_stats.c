@@ -216,3 +216,115 @@ void epics_rtems_boot_stack_report(const char *tag) {
   printf("STACKUSE end tag=%s\n", tag == NULL ? "?" : tag);
   fflush(stdout);
 }
+
+/*
+ * BRING-UP PROBE — the descriptor census behind `epics_rtems_boot_fd_usage`.
+ *
+ * `fd_usage` answers *how many* descriptors are open, which is the number that
+ * predicts the connection ceiling. It cannot answer *which*, and an outage
+ * measurement needs exactly that: a client whose circuits are all down still
+ * holds one descriptor more than it held at boot, and "one unexplained fd" is
+ * only a finding once the other seven are named.
+ *
+ * The walk is the same one `epics_rtems_boot_fd_usage` does — the same table,
+ * the same LIBIO_FLAGS_OPEN test — so the census cannot disagree with the count
+ * beside it. Each open descriptor is then classified through POSIX rather than
+ * through libio internals:
+ *
+ *   * `SO_TYPE` succeeds only on a socket, and names it TCP or UDP.
+ *   * `SO_ACCEPTCONN` separates a listening socket from a connected one
+ *     without inferring it from a `getpeername` failure.
+ *   * `getsockname`/`getpeername` give the addresses, formatted from the
+ *     `sockaddr_in` bytes here rather than through `inet_ntop`, so the
+ *     printout does not depend on the length-byte handling that has already
+ *     bitten this target once.
+ *   * anything that is not a socket gets `fstat`'s mode, which is what
+ *     distinguishes the console from a file.
+ *
+ * Read-only on every descriptor it touches: it can run while the pumps own
+ * their sockets.
+ */
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+
+static void epics_rtems_fmt_sockaddr(const struct sockaddr_storage *ss,
+                                     char *out, size_t outlen) {
+  if (ss->ss_family == AF_INET) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+    const unsigned char *b = (const unsigned char *)&sin->sin_addr.s_addr;
+    snprintf(out, outlen, "%u.%u.%u.%u:%u", (unsigned)b[0], (unsigned)b[1],
+             (unsigned)b[2], (unsigned)b[3], (unsigned)ntohs(sin->sin_port));
+  } else {
+    snprintf(out, outlen, "family=%u", (unsigned)ss->ss_family);
+  }
+}
+
+void epics_rtems_boot_fd_census(const char *tag) {
+  uint32_t i;
+  uint32_t open_count = 0;
+  const char *t = tag == NULL ? "?" : tag;
+
+  printf("FDCENSUS begin tag=%s\n", t);
+  for (i = 0; i < rtems_libio_number_iops; i++) {
+    int fd;
+    int type = 0;
+    int listening = 0;
+    socklen_t len;
+    char local[48];
+    char peer[48];
+    struct sockaddr_storage addr;
+    struct stat st;
+
+    if ((rtems_libio_iop_flags(&rtems_libio_iops[i]) & LIBIO_FLAGS_OPEN) == 0) {
+      continue;
+    }
+    fd = (int)i;
+    open_count++;
+
+    len = (socklen_t)sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) {
+      int sockerr = errno;
+      if (fstat(fd, &st) == 0) {
+        printf("FDCENSUS tag=%s fd=%d kind=nonsocket mode=0%o so_type_errno=%d\n",
+               t, fd, (unsigned)st.st_mode, sockerr);
+      } else {
+        printf("FDCENSUS tag=%s fd=%d kind=unknown so_type_errno=%d "
+               "fstat_errno=%d\n",
+               t, fd, sockerr, errno);
+      }
+      continue;
+    }
+
+    len = (socklen_t)sizeof(listening);
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &len) != 0) {
+      listening = -1;
+    }
+
+    strcpy(local, "-");
+    strcpy(peer, "-");
+    len = (socklen_t)sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) == 0) {
+      epics_rtems_fmt_sockaddr(&addr, local, sizeof(local));
+    }
+    len = (socklen_t)sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) == 0) {
+      epics_rtems_fmt_sockaddr(&addr, peer, sizeof(peer));
+    } else {
+      snprintf(peer, sizeof(peer), "none(errno=%d)", errno);
+    }
+
+    printf("FDCENSUS tag=%s fd=%d kind=%s listening=%d local=%s peer=%s\n", t,
+           fd,
+           type == SOCK_STREAM  ? "tcp"
+           : type == SOCK_DGRAM ? "udp"
+                                : "socket",
+           listening, local, peer);
+  }
+  printf("FDCENSUS end tag=%s open=%lu max=%lu\n", t,
+         (unsigned long)open_count, (unsigned long)rtems_libio_number_iops);
+  fflush(stdout);
+}

@@ -147,7 +147,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> CaLinkResolver {
-        CaLinkResolver::new(tokio::runtime::Handle::current())
+        CaLinkResolver::new()
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -16,6 +16,7 @@ use crate::DbFieldType;
 use crate::client::{CaChannel, CaClient};
 use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
+use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
     LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
 };
@@ -124,9 +125,13 @@ pub struct CaLink {
     _conn_task: AbortOnDrop,
 }
 
-/// Abort the wrapped tokio task when dropped. A bare `JoinHandle`
-/// detaches on drop and would leak the monitor task.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Abort the wrapped task when dropped. A bare handle detaches on drop
+/// and would leak the monitor task. Typed on the `runtime::task` spawn
+/// seam ([`task::TaskHandle`]) so the monitor/watcher tasks route through
+/// the same executor on both backends — `tokio::spawn` on the host, the
+/// callback-band future executor on RTEMS — rather than a bare
+/// `tokio::task::JoinHandle` that pins calink to the tokio runtime.
+struct AbortOnDrop(task::TaskHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -266,7 +271,6 @@ pub struct CaLinkResolver {
     /// likewise only created once a link is added). Seeded eagerly by
     /// [`Self::with_client`] when a caller wants to share/pin a client.
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
-    handle: tokio::runtime::Handle,
     /// Open links keyed by bare PV name (`ca://` scheme stripped).
     links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
     /// Database handle the monitor callback uses to process external
@@ -279,16 +283,21 @@ pub struct CaLinkResolver {
     db: Arc<RwLock<Option<PvDatabase>>>,
 }
 
+impl Default for CaLinkResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CaLinkResolver {
     /// Build a resolver whose shared [`CaClient`] is created lazily on
     /// the first link [`Self::open`]. Infallible — an IOC with no CA
     /// links never constructs a client, and any client-init failure
     /// surfaces at the first `open` (mirroring `pvalink`'s lazy client),
     /// so installation cannot fail and never aborts the IOC.
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
+    pub fn new() -> Self {
         Self {
             client: Arc::new(tokio::sync::OnceCell::new()),
-            handle,
             links: Arc::new(RwLock::new(HashMap::new())),
             db: Arc::new(RwLock::new(None)),
         }
@@ -299,10 +308,9 @@ impl CaLinkResolver {
     /// CA links, or pin the client to a specific server in tests. The
     /// client is seeded eagerly, so the lazy-init path in [`Self::open`]
     /// is bypassed.
-    pub fn with_client(client: Arc<CaClient>, handle: tokio::runtime::Handle) -> Self {
+    pub fn with_client(client: Arc<CaClient>) -> Self {
         Self {
             client: Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
-            handle,
             links: Arc::new(RwLock::new(HashMap::new())),
             db: Arc::new(RwLock::new(None)),
         }
@@ -380,15 +388,14 @@ impl CaLinkResolver {
         // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
         // re-fetches the remote CTRL attributes into `meta` on each
         // connect.
-        let conn_task = self.handle.spawn(run_connection_watcher(
+        let conn_task = task::spawn(run_connection_watcher(
             conn_rx,
             connected.clone(),
             channel.clone(),
-            self.handle.clone(),
             meta.clone(),
             pv_name.to_string(),
         ));
-        let task = self.handle.spawn(run_monitor(
+        let monitor_task = task::spawn(run_monitor(
             monitor,
             cache.clone(),
             connected.clone(),
@@ -401,7 +408,7 @@ impl CaLinkResolver {
             connected,
             meta,
             channel,
-            _monitor_task: AbortOnDrop(task),
+            _monitor_task: AbortOnDrop(monitor_task),
             _conn_task: AbortOnDrop(conn_task),
         });
         // Re-check under the write lock so two concurrent first-callers
@@ -554,7 +561,6 @@ async fn run_connection_watcher(
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     connected: Arc<AtomicBool>,
     channel: Arc<CaChannel>,
-    handle: tokio::runtime::Handle,
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
     pv_name: String,
 ) {
@@ -565,7 +571,7 @@ async fn run_connection_watcher(
             // the watcher from seeing a later disconnect.
             Ok(evt) => {
                 if note_conn_event(&evt, &connected) {
-                    handle.spawn(fetch_link_metadata(
+                    task::spawn(fetch_link_metadata(
                         channel.clone(),
                         meta.clone(),
                         pv_name.clone(),
@@ -874,11 +880,8 @@ fn strip_ca_scheme(name: &str) -> &str {
 /// and never fails — a database with no CA links is fully serviceable
 /// and an IOC must not be aborted by CA-client init. This is the
 /// CA-side twin of the bridge's infallible `install_pvalink_resolver`.
-pub async fn install_calink_resolver(
-    db: &PvDatabase,
-    handle: tokio::runtime::Handle,
-) -> CaLinkResolver {
-    let resolver = CaLinkResolver::new(handle);
+pub async fn install_calink_resolver(db: &PvDatabase) -> CaLinkResolver {
+    let resolver = CaLinkResolver::new();
     // Attach the DB before registering the lset, so the monitor callback
     // can drive `dispatch_external_cp_targets` from the first event on.
     // This runs before iocInit's `setup_cp_links` warms any external CP

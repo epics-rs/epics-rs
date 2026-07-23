@@ -89,7 +89,7 @@ async fn ca_link_resolves_remote_value() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     // Open the link + wait for the first monitor event to populate
     // the cache.
@@ -129,7 +129,7 @@ async fn ca_link_resolves_with_scheme_prefix() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("ca://CALINK:SCHEME", Duration::from_secs(5))
@@ -165,7 +165,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     let client = Arc::new(pinned_client(port).await);
     let db = PvDatabase::new();
     // Register the CA link set on the database.
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
 
     // Pre-open the link and wait so the synchronous lset read serves
@@ -263,7 +263,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // the monitor callback can dispatch CP holders (this
     // fix). Uses its own client, which picks
     // up the pinned env set above.
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    let _resolver = install_calink_resolver(&db).await;
 
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
@@ -342,7 +342,7 @@ async fn ca_link_out_write_updates_remote_pv() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     // Open the link + wait for the first monitor event so the channel
     // is connected and the OUT write has a live circuit to push on.
@@ -418,7 +418,7 @@ async fn ca_link_out_write_async_waits_for_completion() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("CALINK:OUT:ASYNC", Duration::from_secs(5))
@@ -469,7 +469,7 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("ca://CALINK:OUT:SCHEME", Duration::from_secs(5))
@@ -528,7 +528,7 @@ async fn ca_link_exposes_remote_metadata() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("CALINK:META:SRC", Duration::from_secs(5))
@@ -590,7 +590,7 @@ async fn install_registers_ca_scheme() {
     pin_env(port);
 
     let db = PvDatabase::new();
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    let _resolver = install_calink_resolver(&db).await;
     let schemes = db.registered_link_schemes().await;
     assert!(
         schemes.contains(&"ca".to_string()),

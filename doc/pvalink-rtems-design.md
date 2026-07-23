@@ -1553,11 +1553,28 @@ visible in the caller's own error. This is the price of the bound and is
 not removable without renaming the thread per request.
 
 `dropped_dial_future_retires_the_dial_thread` was renamed to
-`dropped_dial_future_finalizes_its_socket_and_returns_its_worker`: "the
-thread exits" is no longer the property — it is the opposite of the fix —
-so the assertion became its stronger replacement, that the socket is
-finalised (EOF on the accepted side) *and* the same worker serves the next
-dial.
+`dropped_dial_future_leaks_no_socket_and_returns_its_worker`: "the thread
+exits" is no longer the property — it is the opposite of the fix — so the
+assertion became its stronger replacement, that no socket is left open
+*and* the same worker serves the next dial.
+
+**An abandoned dial has two correct outcomes, and the first cut of that
+test only knew one.** It asserted that the worker's connect resolves into
+a dropped receiver and the worker closes the socket. That is one branch.
+The other is a designed `DialPool` property: the worker can reach the
+request *after* the caller has gone, see `Sender::is_closed()` and skip
+the connect entirely, so no SYN is ever sent — and a blocking `accept`
+waiting for that connection waits forever. Between this test's single
+`poll` and its `drop` there is a `/proc` scan, which is milliseconds of
+window for exactly that. The CA twin (`doc/calink-rtems-design.md` §13.6)
+hung on it in 2 of 4 loaded runs and was instrumented to confirm the
+cause; **this test never took the skip branch in ~14 loaded runs**, but
+the sequence is identical, so the hazard was closed here too rather than
+left to timing. A timed `accept` (`SO_RCVTIMEO`, honoured by `accept` on
+Linux) discriminates and each branch gets the assertion true of it; the
+reuse assertion stays unconditional and is the one that fails on the
+per-attempt shape. Net effect is a stronger test — the skip path was a
+documented property nothing exercised before.
 
 **The CA client had the same defect — closed separately.**
 `epics-ca-rs/src/client/transport.rs` carried the identical per-attempt
@@ -1573,7 +1590,7 @@ rather than failing at a bound.
 | gate | result |
 |---|---|
 | `sequential_failed_dials_do_not_grow_the_dial_thread_count` (new) | pass — verified by mutation: **12 threads for 12 sequential failed dials** on the per-attempt shape, 4 on the pool |
-| `dropped_dial_future_finalizes_its_socket_and_returns_its_worker` | pass — also fails on the per-attempt shape (worker retired: 0 threads where 1 is owed) |
+| `dropped_dial_future_leaks_no_socket_and_returns_its_worker` | pass — also fails on the per-attempt shape (worker retired: 0 threads where 1 is owed) |
 | `blocking_io::tests::sequential_dials_reuse_one_worker` (new) | pass — 8 sequential dials, `worker_count() == 1` asserted after every one |
 | `cargo nextest run -p epics-pva-rs` | 1389 passed, 0 failed, 2 skipped |
 | `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1351 passed, 0 failed, 2 skipped |

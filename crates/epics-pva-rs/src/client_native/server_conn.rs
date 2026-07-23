@@ -3408,18 +3408,35 @@ mod tests {
             );
         }
 
-        /// Boundary: a caller that goes away mid-dial leaks nothing. The
-        /// dial worker is the single finalizer for the socket it opens: when
-        /// the connect finally resolves, its send to the dropped receiver
-        /// fails and the fresh socket is dropped — and closed — before the
-        /// worker takes its next request. Nothing else has to reap either.
+        /// Boundary: a caller that goes away mid-dial leaks nothing.
+        ///
+        /// An abandoned dial leaves the pool in one of exactly two states, and
+        /// **both are correct** — which is why this test branches rather than
+        /// assuming one of them:
+        ///
+        /// * the worker was already inside its `connect`, so a socket exists
+        ///   and the worker must be its single finalizer — its send to the
+        ///   dropped receiver fails and the fresh socket is dropped, and
+        ///   closed, before it takes its next request;
+        /// * the worker only reached the request *after* the caller had gone,
+        ///   saw `Sender::is_closed()` and skipped the connect, so no socket
+        ///   was ever opened.
+        ///
+        /// The first was asserted unconditionally until the CA twin of this
+        /// test hung on it in 2 of 4 loaded runs: between the single `poll`
+        /// and the `drop` there is a `/proc` scan, milliseconds of window for
+        /// the worker not to have popped the request yet, and the blocking
+        /// `accept` then waited forever for a connection that was correctly
+        /// never made. The race was never observed here — ~14 loaded runs of
+        /// this suite all took the first branch — but the sequence is
+        /// identical, so the hazard is closed in both rather than left to
+        /// timing.
         ///
         /// The worker itself deliberately does **not** retire; that is the
-        /// bound. So the assertion that used to be "the thread exits" is now
-        /// its stronger replacement: the socket is finalised *and* the same
-        /// worker goes on to serve the next dial.
+        /// bound. So the tail asserts the stronger property unconditionally:
+        /// the same worker goes on to serve the next dial.
         #[test]
-        fn dropped_dial_future_finalizes_its_socket_and_returns_its_worker() {
+        fn dropped_dial_future_leaks_no_socket_and_returns_its_worker() {
             let (addr, listener, fillers) = syn_blackhole();
             let mut fut = Box::pin(dial_pva(
                 addr,
@@ -3443,28 +3460,46 @@ mod tests {
             // The caller goes away mid-dial.
             drop(fut);
 
-            // Un-blackhole: drain the fillers so the abandoned dial's SYN
-            // retry (~1 s, ~3 s) completes. The worker's blocking connect
-            // resolves, its send fails, and it must close the socket before
-            // going back for its next request.
+            // Un-blackhole: drain the fillers so that, if the worker did enter
+            // its connect, the abandoned dial's SYN retry (~1 s, ~3 s)
+            // completes.
             for _ in 0..fillers.len() {
                 let _ = listener.accept().expect("drain a filler");
             }
             drop(fillers);
-            let (ours, _) = listener.accept().expect("accept the abandoned dial");
-            let ours: std::net::TcpStream = ours.into();
 
-            // Single finalizer: the worker closed the socket it opened, so
-            // the accepted side reads EOF, not a half-open connection.
-            ours.set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("read timeout");
-            use std::io::Read;
-            let mut buf = [0u8; 1];
-            let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
-            assert_eq!(
-                n, 0,
-                "the dial worker must close the socket whose receiver is gone"
-            );
+            // `accept` honours `SO_RCVTIMEO` on Linux, so this is the branch
+            // discriminator: a connection means the worker was mid-connect,
+            // and `WouldBlock` past the SYN ladder's first two retries means
+            // it skipped. Either way nothing may be left open.
+            listener
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .expect("accept timeout");
+            match listener.accept() {
+                Ok((ours, _)) => {
+                    // Single finalizer: the worker closed the socket it
+                    // opened, so the accepted side reads EOF, not a half-open
+                    // connection.
+                    let ours: std::net::TcpStream = ours.into();
+                    ours.set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("read timeout");
+                    use std::io::Read;
+                    let mut buf = [0u8; 1];
+                    let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
+                    assert_eq!(
+                        n, 0,
+                        "the worker was inside its connect, so it owns the \
+                         socket it opened and must close it once its receiver \
+                         is gone"
+                    );
+                }
+                Err(e) if epics_base_rs::runtime::blocking_io::is_socket_timeout(e.kind()) => {
+                    // The worker reached the request after the caller had gone
+                    // and skipped the connect: no socket was opened, so there
+                    // is none to finalise.
+                }
+                Err(e) => panic!("accept on the abandoned dial: {e}"),
+            }
 
             // …and it is back in service rather than retired: the next dial
             // is served without a second thread being created.

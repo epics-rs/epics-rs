@@ -88,10 +88,10 @@ mod exec_model {
         let log_err = log.try_clone().expect("clone the console log handle");
 
         // No `EPICS_PVA_NAME_SERVERS` here on purpose: the binary compiles its own
-        // in and overwrites the variable before it builds the client, because on
-        // target nothing outside the image can configure it (`rtems-pva-ioc.rs`
-        // `STAGE5_NAME_SERVER`). Whatever it points at, the dial to it is the seam
-        // under test.
+        // default in and, with the variable unset, uses it before it builds the
+        // client — the same path the target takes, where nothing outside the
+        // image can configure it (`rtems-pva-ioc.rs` `STAGE5_NAME_SERVER`).
+        // Whatever it points at, the dial to it is the seam under test.
         let child = Command::new(env!("CARGO_BIN_EXE_rtems-pva-ioc"))
             .arg(&db)
             .env("EPICS_PVA_SERVER_PORT", free_tcp_port().to_string())

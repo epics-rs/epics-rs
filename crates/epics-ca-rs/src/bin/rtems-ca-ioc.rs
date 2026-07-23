@@ -301,11 +301,16 @@ mod ioc {
 
         // (0-probe) C6 PROBE: the target's CA search configuration.
         // `rtems_init.c:195` hands `main` a fixed one-element argv and
-        // `POSIX_Init` calls `setenv` zero times, so nothing outside the
-        // image can configure it — the values are compiled in here. §4.5's
-        // three variables, together: the name server to dial, and the two
-        // that shut the broadcast path off so a resolution can only have
-        // come over TCP.
+        // `POSIX_Init` calls `setenv` zero times, so on the target nothing
+        // outside the image can configure it — the values compiled in here
+        // are the ones that take effect. §4.5's three variables, together:
+        // the name server to dial, and the two that shut the broadcast path
+        // off so a resolution can only have come over TCP.
+        //
+        // Defaults, not overrides: a variable that is already set stays as
+        // set. On the target that is the same thing (nothing can set one);
+        // on a host it is what lets `tests/rtems_ca_ioc_boots.rs` point the
+        // dial at its own closed port instead of the image's SLIRP address.
         //
         // Set before `install_calink_resolver`, because the client the
         // resolver lazily builds reads them once at construction.
@@ -313,10 +318,14 @@ mod ioc {
         // SAFETY (edition 2024): this runs on the single init thread
         // before `background_init` starts any other thread, so no
         // concurrent reader or writer of the environment exists.
-        unsafe {
-            std::env::set_var("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER);
-            std::env::set_var("EPICS_CA_ADDR_LIST", "");
-            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        for (var, compiled_in) in [
+            ("EPICS_CA_NAME_SERVERS", C6_NAME_SERVER),
+            ("EPICS_CA_ADDR_LIST", ""),
+            ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
+        ] {
+            if std::env::var_os(var).is_none() {
+                unsafe { std::env::set_var(var, compiled_in) };
+            }
         }
 
         // (0b) Make the IOC audible. Every diagnostic below — and every one in

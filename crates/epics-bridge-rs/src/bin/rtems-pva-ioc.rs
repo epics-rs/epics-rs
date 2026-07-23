@@ -404,17 +404,21 @@ mod ioc {
 
         // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
         // `rtems_init.c:195` hands `main` a fixed one-element argv and
-        // `POSIX_Init` calls `setenv` zero times, so nothing outside the
-        // image can configure it — the value is compiled in here. Set before
-        // `install_pvalink_resolver` builds the ONE client, because
-        // `PvaClientBuilder`'s default reads the variable once at
-        // construction (`client_native/context.rs:171`).
+        // `POSIX_Init` calls `setenv` zero times, so on the target nothing
+        // outside the image can configure it — the value compiled in here is
+        // the one that takes effect. Set before `install_pvalink_resolver`
+        // builds the ONE client, because `PvaClientBuilder`'s default reads
+        // the variable once at construction (`client_native/context.rs:171`).
+        //
+        // A default, not an override: an already-set variable stays as set,
+        // so a host harness (`tests/rtems_pva_ioc_boots.rs`) can point the
+        // dial somewhere it controls instead of the image's SLIRP address.
         //
         // SAFETY (edition 2024): this runs on the single init thread before
         // `background_init` starts any other thread, so no concurrent
         // reader/writer of the environment exists.
-        unsafe {
-            std::env::set_var("EPICS_PVA_NAME_SERVERS", STAGE5_NAME_SERVER);
+        if std::env::var_os("EPICS_PVA_NAME_SERVERS").is_none() {
+            unsafe { std::env::set_var("EPICS_PVA_NAME_SERVERS", STAGE5_NAME_SERVER) };
         }
 
         // (0b) Make the IOC audible. Every diagnostic below is a `tracing`

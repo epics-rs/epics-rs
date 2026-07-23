@@ -100,18 +100,31 @@ const ECHO_TIMEOUT_SECS: u64 = 5;
 /// occupancy source (or none, in tests).
 type OsRecvQueueProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD`; a failed
-/// ioctl reports "nothing pending", which is the safe answer — it can only
-/// clear flow control early, never latch it on.
+/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD` through the
+/// workspace's one owner of that ioctl
+/// ([`epics_base_rs::runtime::blocking_io::pending_bytes`], which is also C
+/// `rsrv`'s batch-up gate); a failed ioctl reports "nothing pending", which is
+/// the safe answer — it can only clear flow control early, never latch it on.
+///
+/// Reached through the shared owner rather than a local `libc::ioctl` because
+/// the constant is not the same everywhere: `libc` omits `FIONREAD` for
+/// `armv7-rtems-eabihf` entirely, and the value newlib defines there had to be
+/// derived by hand. A second copy of that derivation is a second thing to get
+/// wrong.
 #[cfg(unix)]
 fn fd_recv_queue_probe(fd: std::os::fd::RawFd) -> OsRecvQueueProbe {
+    /// `AsRawFd` over a borrowed descriptor this probe does not own. The fd
+    /// belongs to the reader half held by the `read_loop` that holds this
+    /// closure, so it stays open for the closure's life; wrapping it (rather
+    /// than an `OwnedFd`) is what keeps that ownership where it is.
+    struct BorrowedSocket(std::os::fd::RawFd);
+    impl std::os::fd::AsRawFd for BorrowedSocket {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.0
+        }
+    }
     std::sync::Arc::new(move || {
-        let mut pending: libc::c_int = 0;
-        // SAFETY: `fd` belongs to the reader half owned by the `read_loop`
-        // that holds this closure, so it stays open for the closure's life.
-        // FIONREAD writes a single `c_int`.
-        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
-        rc == 0 && pending > 0
+        epics_base_rs::runtime::blocking_io::pending_bytes(&BorrowedSocket(fd)).is_ok_and(|n| n > 0)
     })
 }
 

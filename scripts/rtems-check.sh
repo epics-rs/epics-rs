@@ -406,12 +406,15 @@ fi
 #                               un-gated: 7 of them are the discovery stack's
 #     15  after the split       11 primary + a 4-error [u8] cascade in
 #                               `search.rs`'s select! (design §1.3)
+#     14  FIONREAD single owner  the client's flow-control probe now reaches
+#                               `runtime::blocking_io::pending_bytes`, which
+#                               supplies the constant `libc` omits for RTEMS
 #
 # Bidirectional for the same reason the binary census is: MORE is a regression
 # that moved the client further from the target; FEWER means someone did the
 # work and left the bound behind, at which point it stops measuring and becomes
 # decoration.
-CA_CLIENT_TARGET_ERRORS=15
+CA_CLIENT_TARGET_ERRORS=14
 
 log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
 export RUSTFLAGS="$BASE_RUSTFLAGS"

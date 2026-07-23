@@ -2166,12 +2166,12 @@ pub(crate) enum MemberEventKind {
 /// A PVA monitor for a group PV that subscribes to all member records.
 ///
 /// Corresponds to C++ QSRV's `PDBGroupMonitor` + `pdb_group_event()`.
-/// [`PvaMonitor::start`] opens the member subscriptions and registers them
-/// with the server-wide [`group_pump::GroupPump`](super::group_pump) — the
+/// `PvaMonitor::start` opens the member subscriptions and registers them
+/// with the server-wide `group_pump::GroupPump` — the
 /// port of pvxs's single `qsrvGroup` event pump (`ioc/groupsource.cpp:96`).
 /// The pump is the only consumer of member events: it resolves the marked
 /// leaves, assembles the atomic snapshot and posts the assembled update
-/// into this monitor's bounded update queue, which [`PvaMonitor::poll`]
+/// into this monitor's bounded update queue, which `PvaMonitor::poll`
 /// drains. No per-member task exists anywhere — the task cost of a group
 /// tick is O(1), not O(members) (doc/qsrv-rtems-design.md §9.15).
 pub struct GroupMonitor {

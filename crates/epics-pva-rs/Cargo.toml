@@ -104,6 +104,14 @@ client = []
 # hosted target, which is what compiles `rtems-pva-ioc`'s real entry point
 # off RTEMS so it can be linted and tested here. OFF by default.
 rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
+# The RTEMS bring-up measurement rig's client-side instrumentation — the twin
+# of `epics-ca-rs/bringup-probes`, and forwarded from
+# `epics-bridge-rs/bringup-probes` so `rtems-pva-ioc`'s probe image can read
+# it. Compiles a dial-attempt counter and `client_native::dial_pool_probe()`,
+# which is how `doc/pvalink-rtems-design.md` §9.11's `MAX_DIAL_WORKERS` bound
+# is read on a target with no shell and no reachable `caget`. OFF by default:
+# a default build compiles neither the counter nor the accessor.
+bringup-probes = []
 # TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
 # drops rustls/tokio-rustls/rustls-pemfile/x509-parser — and with them `ring`
 # and `getrandom 0.2`, the crate that does not build for RTEMS. With the

@@ -30,6 +30,13 @@ mod types;
 
 pub use sync_group::{SyncGroup, SyncGroupResults, SyncGroupStat, SyncGroupStatus};
 
+/// BRING-UP PROBE: the CA dial pool's `(workers, attempts)`, for
+/// `rtems-ca-ioc`'s console reporter. `transport` is private, and a bin target
+/// is a separate crate, so the rig's one accessor is re-exported here rather
+/// than the module being opened up for it.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+pub use transport::dial_pool_probe;
+
 pub use circuit_breaker::{BreakerConfig, BreakerState};
 
 use std::collections::{HashMap, HashSet, VecDeque};

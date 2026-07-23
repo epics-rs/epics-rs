@@ -454,6 +454,20 @@ mod ioc {
                 d.pv_name, d.direction, d.connected, d.records,
             );
         }
+        // The §9.11 dial-pool bound, and the heap it was said to stop eating.
+        // Both on one line so a console reader can see the attempt count that
+        // the worker count is bounded *against* — a worker count of 1 proves
+        // nothing next to an attempt count of 1.
+        let (dial_workers, dial_attempts) =
+            epics_pva_rs::client_native::server_conn::dial_pool_probe();
+        let (mem_free, mem_used) = match epics_rtems_boot::stats::mem_usage() {
+            Some(m) => (m.free as i64, m.used as i64),
+            None => (-1, -1),
+        };
+        println!(
+            "STAGE5 seq={seq} dialpool workers={dial_workers} attempts={dial_attempts} \
+             MEM_FREE={mem_free} MEM_USED={mem_used}",
+        );
         for rec in ["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"] {
             let val = db.get_pv(rec).map(|v| v.to_string());
             let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());

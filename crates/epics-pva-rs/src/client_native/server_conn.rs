@@ -251,6 +251,29 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 static PVA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
     epics_base_rs::runtime::blocking_io::DialPool::new("PVAC-dial", PVA_CLIENT_PRIORITY);
 
+/// BRING-UP PROBE: dial attempts submitted to [`PVA_DIAL_POOL`] since boot.
+///
+/// The denominator of the on-target bound measurement. `worker_count()` alone
+/// cannot distinguish "bounded" from "never dialled twice", so the rig needs
+/// the attempt count next to it — and `ns_task`'s own per-attempt diagnostic
+/// is a `debug!`, which the target's console subscriber (INFO) drops.
+#[cfg(feature = "bringup-probes")]
+static PVA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the PVA
+/// client's dial pool.
+///
+/// Behind `bringup-probes` with the rest of the measurement rig
+/// (`doc/pvalink-rtems-design.md` §12): a default image compiles neither the
+/// counter nor this accessor.
+#[cfg(feature = "bringup-probes")]
+pub fn dial_pool_probe() -> (usize, usize) {
+    (
+        PVA_DIAL_POOL.worker_count(),
+        PVA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Dial `target` and drive it with two blocking pump threads.
 ///
 /// Compiled on every target, not only the ones that select it: the RTEMS build
@@ -330,6 +353,8 @@ async fn dial_blocking(
     // Plain blocking `connect` on a pooled worker; the application bound is
     // applied by the awaiting side below. See "Why the thread's connect is
     // plain-blocking" above.
+    #[cfg(feature = "bringup-probes")]
+    PVA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dialed_rx = PVA_DIAL_POOL.dial(target).map_err(PvaError::Io)?;
     let stream = match timeout(connect_timeout, dialed_rx).await {
         // The pvxs `operationTimeout` bound: the dial fails now; the worker

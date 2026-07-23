@@ -213,6 +213,29 @@ const CAC_SEND_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 static CA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
     epics_base_rs::runtime::blocking_io::DialPool::new("CAC-dial", CAC_RECV_PRIORITY);
 
+/// BRING-UP PROBE: dial attempts submitted to [`CA_DIAL_POOL`] since boot.
+///
+/// The denominator of the on-target bound measurement. `worker_count()` alone
+/// cannot distinguish "bounded" from "never dialled twice", so the rig needs
+/// the attempt count next to it — and on a target with no shell and no
+/// reachable `caget` the only place to read either is the serial console.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+static CA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the CA
+/// client's dial pool.
+///
+/// Behind `bringup-probes` with the rest of the measurement rig
+/// (`doc/calink-rtems-design.md` §11.7 item 3): a default image compiles
+/// neither the counter nor this accessor.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+pub fn dial_pool_probe() -> (usize, usize) {
+    (
+        CA_DIAL_POOL.worker_count(),
+        CA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Apply the circuit keepalive ladder to a connected socket.
 ///
 /// `socket2` is the portability owner for this on every host: the option
@@ -666,6 +689,8 @@ pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRec
 async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
 
+    #[cfg(feature = "bringup-probes")]
+    CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dialed_rx = match CA_DIAL_POOL.dial(server_addr) {
         Ok(rx) => rx,
         Err(e) => {

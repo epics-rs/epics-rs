@@ -2808,7 +2808,74 @@ there: the hosted arm of `dial_ca` is `tokio::net::TcpStream::connect` and has
 no thread to bound. Their coverage therefore comes from the feature-ON run,
 not the default one.
 
-Not verified: the bound has not been measured on the real RTEMS target. The
-128 B/creation figure is the one already measured there; its removal is argued
-from the pooling structure plus the host-side thread counts above, not from an
-on-target heap measurement.
+### 13.5 Measured on the RTEMS target
+
+The gates above run on Linux. What follows is the same two claims read off a
+QEMU guest's serial console, from the `bringup-probes` reporter's
+`dialpool workers=N attempts=M MEM_FREE=…` line (the accessor and its
+attempt counter compile only under that feature; a default image has
+neither). Rig: topology A, one guest, the C6 image's compiled-in
+`EPICS_CA_NAME_SERVERS=10.0.2.2:15076` with **nothing listening** on the
+host — SLIRP returns RST, so each dial fails fast and
+`run_nameserver_connection` redials at its shipped `EPICS_CA_CONN_TMO`
+(30 s, unchanged) rather than pinning a worker in the OS ladder. 1200 s per
+run, 118 samples.
+
+**The bound holds, and the attempt count is what makes that mean anything:
+40 dial attempts, `worker_count` = 1 in every one of the 118 samples.**
+`MAX_DIAL_WORKERS = 4` was never approached, and §13.3's reasoning says why
+it could not be: one name server is one dial at a time, so the concurrency
+that would create a second worker never arises. The pre-`9daff491` shape,
+rebuilt as a mutation image and booted beside it on the same workload,
+creates one thread per attempt — 40 creations for the same 40 attempts, its
+`worker_count` reading 0 because the pool is never entered.
+
+**The leak.** The readout is `MEM_FREE`: the RTEMS malloc-heap free total
+from `epics_rtems_boot::stats::mem_usage()`, the source behind the
+`RTEMS:MEM_FREE` status PV, printed every 10 s. Byte-granular — but the
+limit on this measurement is not quantisation, it is workload drift, and
+that drift is large enough to have produced a **false confirmation**:
+
+> the *pooled* image's own free heap falls **-124.5 B/attempt** over its
+> full run (a second run: -117.1), while the pool created exactly **one**
+> thread.
+
+That is within 3% of the 128 B/attempt the per-attempt shape was supposed to
+cost. A single image's `MEM_FREE` read against the expected slope would have
+"confirmed" the leak on a build that does not have it, which is the reason
+this section reports a differential instead: the same image, same refused
+name server, same duration, differing only in the dial shape, so the drift
+they share cancels. Steady window, samples 30-118 (attempts 11 → 40, after
+warm-up):
+
+| | `MEM_FREE` over 29 attempts | slope |
+|---|---:|---:|
+| pooled (this tip) | **-1456 B** | -50.2 B/attempt |
+| per-attempt (pre-`9daff491`, mutation) | **-6560 B** | -226.2 B/attempt |
+| difference — what the pool removes | **-5104 B** | **-176.0 B/attempt** |
+
+Resolution, stated because the conclusion depends on it: repeating the
+pooled configuration end-to-end gave -54.6 and -50.2 B/attempt, so the
+method resolves a per-attempt cost to about **±5 B/attempt** — the 176
+B/attempt difference is ~40× that. The PVA half of the same rig
+(`doc/pvalink-rtems-design.md` §9.11) reads 179.1 B/attempt over 87
+attempts with a ±3 B/attempt spread, independently.
+
+That the readout can see thread cost at all is evidenced directly rather
+than assumed: the per-attempt image idles ~264 kB *above* the pooled one
+until its first stack is retained, and its series carries a single
+**264,304 B** step — one `Small` stack (262,144 B) plus overhead, which is
+exactly what a dial thread alive at a sampling instant costs.
+
+**The measured per-creation residue is 176 B, not 128 B.** §13.1's table
+prices a creation at the TLS key, which is the part that was measured in
+isolation; the heap loses that plus the remaining per-thread bookkeeping.
+The row "the per-attempt port — 1 per attempt, unbounded" was therefore
+understated by ~40%, and the fix removes correspondingly more. Nothing about
+the argument changes; the number does.
+
+**Still not measured:** the bound *at* `MAX_DIAL_WORKERS`. Both adopters
+reached one worker, because neither rig produces four concurrent dials to
+distinct servers, so "4, and no more" remains a construction argument (the
+`q.workers >= MAX_DIAL_WORKERS` gate plus the host test) rather than an
+on-target reading.

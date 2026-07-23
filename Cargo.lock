@@ -3217,6 +3217,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-probe"
+version = "0.24.3"
+dependencies = [
+ "clap",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "epics-pva-rs",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "rtems-exec-gate"
 version = "0.0.0"
 

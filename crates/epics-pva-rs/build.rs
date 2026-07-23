@@ -42,8 +42,11 @@
 // # `pva_blocking_client` — forcing the blocking client transport on a host
 //
 // The PVA client dials through one seam with two implementations: the tokio
-// `TcpStream` on a hosted target, and `runtime::blocking_io`'s two-thread pump
-// on RTEMS, which has no reactor. Showing that the second one leaves the frame
+// `TcpStream` on `tokio_backend`, and `runtime::blocking_io`'s two-thread pump
+// on `exec_backend`, which gives a spawned future no reactor. This `--cfg`
+// forces the second one on a build that would otherwise take the first; it is
+// the only way to reach that arm without also moving the whole crate onto the
+// exec backend. Showing that the second one leaves the frame
 // pipeline untouched means running the *whole* host client suite against it,
 // including the integration tests in `tests/`, which are separate crates and so
 // cannot see anything `#[cfg(test)]`.
@@ -81,18 +84,66 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
     "illumos",
 ];
 
+// # `exec_backend` / `tokio_backend` — does a spawned future get a reactor?
+//
+// `epics-base-rs`'s `build.rs` defines this rule and this script repeats it,
+// for this crate's own compilation:
+//
+//     exec_backend  ⟺  target_os == "rtems"  ||  feature "rtems-exec-model"
+//     tokio_backend ⟺  otherwise
+//
+// Why the PVA client needs it. Every client task is started through
+// `runtime::task::spawn`. On `exec_backend` that lands on a callback-pool
+// worker with **no tokio reactor entered**, so any `tokio::net` socket the
+// task opens panics — including in a hosted process that has a tokio runtime
+// elsewhere, because the runtime is not entered on that worker. The client's
+// UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
+// the target when the fact it needs is the *backend*; a host build with
+// `--features rtems-exec-model` compiled the UDP transport in and panicked on
+// it at `rtems-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
+// §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
+// exists", so the transport takes that one and `SearchTransport` has the
+// single `NameServersOnly` variant on `exec_backend` — the target's shape,
+// now reached by the host build that models the target.
+//
+// This is a third copy of a four-line rule, so it is pinned rather than
+// trusted: a `const` assertion in `src/lib.rs` checks it against
+// `epics_base_rs::runtime::task::HAS_TOKIO_REACTOR` at compile time. A build
+// that enables `epics-base-rs/rtems-exec-model` without this crate's own
+// `rtems-exec-model` fails to compile instead of panicking at boot.
+
+/// The `local_account_db` capability decision, as one named predicate.
+///
+/// Named, rather than written inline in `main`, because it is the thing
+/// `auth::plain`'s `the_capability_is_owned_by_an_allowlist_in_the_build_script`
+/// guard is about: the guard reads this function's body and nothing else, so it
+/// tests the decision rather than the file. `unix` is a precondition rather
+/// than a synonym — it is what puts `libc` in the dependency graph at all
+/// (`Cargo.toml`, meaning 1 above) — so it is stated separately from the
+/// account-database question the allowlist answers.
+fn local_account_db(unix: bool, os: &str) -> bool {
+    unix && LOCAL_ACCOUNT_DB_TARGETS.contains(&os)
+}
+
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(local_account_db)");
     // Declared, never emitted here. See the note above `PVA_BLOCKING_CLIENT`.
     println!("cargo::rustc-check-cfg=cfg(pva_blocking_client)");
+    println!("cargo::rustc-check-cfg=cfg(exec_backend)");
+    println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
 
-    // `unix` is a precondition rather than a synonym: it is what puts `libc`
-    // in the dependency graph at all (`Cargo.toml`, meaning 1 above). Stating
-    // it explicitly keeps the two meanings visibly separate.
+    let rtems = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("rtems");
+    let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
+    if rtems || host_exec_model {
+        println!("cargo::rustc-cfg=exec_backend");
+    } else {
+        println!("cargo::rustc-cfg=tokio_backend");
+    }
+
     let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    if unix && LOCAL_ACCOUNT_DB_TARGETS.contains(&os.as_str()) {
+    if local_account_db(unix, &os) {
         println!("cargo::rustc-cfg=local_account_db");
     }
 }

@@ -325,6 +325,23 @@ mod tests {
     /// The capability is decided in one place, by allowlist. An exclusion list
     /// would fix RTEMS and inherit the same defect on the next unix-family
     /// target without an account database.
+    ///
+    /// # Scope: the predicate, not the file
+    ///
+    /// The excluded-target check reads `fn local_account_db`'s body alone.
+    /// It used to read the whole (comment-stripped) build script, which made
+    /// it assert something it does not mean: that *no rule anywhere* in the
+    /// script may name RTEMS. `build.rs` has since acquired a second, unrelated
+    /// rule — the `exec_backend` / `tokio_backend` task-backend decision, which
+    /// is `target_os == "rtems" || feature "rtems-exec-model"` and therefore
+    /// *must* name the target, exactly as `epics-base-rs`'s own `build.rs`
+    /// does. A whole-file scan rejected that correct rule.
+    ///
+    /// Narrowing it to the named predicate makes the guard stricter about the
+    /// thing it is for, not laxer: an exclusion-list `os != "rtems"` inside
+    /// `local_account_db` still fails, and now an exclusion list smuggled in
+    /// *around* the allowlist call would fail too, because the guard also pins
+    /// that `main` reaches the capability only through this function.
     #[test]
     fn the_capability_is_owned_by_an_allowlist_in_the_build_script() {
         // Comment lines are stripped: the build script's own docs quote the
@@ -337,12 +354,25 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(build.contains("cargo::rustc-check-cfg=cfg(local_account_db)"));
+        assert!(build.contains("    \"linux\","));
+        // `main` must not decide the capability itself — it asks the predicate.
+        assert!(
+            build.contains("if local_account_db(unix, &os) {"),
+            "the capability emission must go through `fn local_account_db`"
+        );
+
+        let decl = "fn local_account_db(unix: bool, os: &str) -> bool {";
+        let start = build
+            .find(decl)
+            .expect("the capability predicate must be a named function");
+        let body = &build[start + decl.len()..];
+        let body = &body[..body.find("\n}").expect("predicate body must close")];
+
         // The decision must go through the allowlist...
         assert!(
-            build.contains("LOCAL_ACCOUNT_DB_TARGETS.contains("),
+            body.contains("LOCAL_ACCOUNT_DB_TARGETS.contains("),
             "the capability must be decided by consulting the allowlist"
         );
-        assert!(build.contains("    \"linux\","));
         // ...and this is what separates an allowlist from an exclusion list:
         // an exclusion list has to NAME the targets it excludes. An allowlist
         // never mentions them, which is precisely why the next unix-family
@@ -350,7 +380,7 @@ mod tests {
         // nobody had to remember to update.
         for excluded in ["rtems", "vxworks"] {
             assert!(
-                !build.contains(&format!("{excluded:?}")),
+                !body.contains(&format!("{excluded:?}")),
                 "the predicate names {excluded}, so it is an exclusion list; \
                  a target that is not on the allowlist must simply not be on it"
             );

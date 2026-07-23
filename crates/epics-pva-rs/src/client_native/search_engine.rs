@@ -18,7 +18,10 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these four run and pass in the feature-ON
+// suite. The other two drive the UDP SEARCH transport, which only exists on
+// `tokio_backend`, so they carry that gate and the census no longer vouches for
+// them feature-ON.
 // (11 tests that spin the live UDP search engine gated out feature-ON below;
 // §4.2 defers UDP search, so their spawned timers/socket cannot run on the
 // reactor-less callback pool — stage 3.)
@@ -30,17 +33,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-// The UDP SEARCH/beacon transport is compiled out on the RTEMS target: newlib
-// has no `recvmsg`/`IP_PKTINFO` original-destination recovery and `local_addr()`
-// cannot be read back to stamp a SEARCH response port, so a UDP search would
-// advertise port 0 and never be answered (doc/pvalink-rtems-design.md §4.2).
-// Everything the target reaches goes over TCP name servers via the
-// `SearchTransport::NameServersOnly` seam; the `AsyncUdpV4`/`UdpSocket` surface
-// below is gated to match, so "no UDP on target" holds by construction.
-#[cfg(not(target_os = "rtems"))]
+// The UDP SEARCH/beacon transport is compiled out wherever a spawned future
+// has no tokio reactor — `cfg(exec_backend)`, which is the RTEMS target *and*
+// a host `--features rtems-exec-model` build. Two facts, one gate:
+//
+//   * On the target newlib has no `recvmsg`/`IP_PKTINFO` original-destination
+//     recovery and `local_addr()` cannot be read back to stamp a SEARCH
+//     response port, so a UDP search would advertise port 0 and never be
+//     answered (doc/pvalink-rtems-design.md §4.2).
+//   * On either backend-free build this engine runs on a callback-pool worker
+//     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
+//     "there is no reactor running" — even when the process has a runtime
+//     somewhere else, because it is not entered on that worker.
+//
+// Gating this on `not(target_os = "rtems")` named the first fact and missed
+// the second, so a hosted `rtems-exec-model` build compiled the UDP transport
+// in, selected it, and panicked in `bind_ephemeral_udp` at `rtems-pva-ioc`'s
+// first search (`doc/calink-rtems-design.md` §10.10 item 2, measured).
+// `tokio_backend` is the predicate that means "a reactor exists" and is the
+// one the whole `AsyncUdpV4`/`UdpSocket` surface below carries, so "no UDP in
+// this build" holds by construction. The target's compiled surface is
+// unchanged: `target_os = "rtems"` implies `exec_backend`.
+//
+// Either way everything the client reaches goes over TCP name servers via the
+// `SearchTransport::NameServersOnly` seam.
+#[cfg(tokio_backend)]
 use epics_base_rs::net::AsyncUdpV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 // The periodic/one-shot timers come from the `runtime::task` seam, NOT from
@@ -52,8 +72,8 @@ use tokio::sync::{mpsc, oneshot};
 use epics_base_rs::runtime::task::{Interval, interval, sleep, sleep_until};
 use tracing::debug;
 // `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
-// the RTEMS target — so the import is too, or it is unused there.
-#[cfg(not(target_os = "rtems"))]
+// `exec_backend` — so the import is too, or it is unused there.
+#[cfg(tokio_backend)]
 use tracing::warn;
 
 use crate::codec::PvaCodec;
@@ -346,7 +366,7 @@ impl Default for ClientSearchConfig {
 /// cannot be configured independently, and so the per-client
 /// `EPICS_PVA_*` UDP knobs are resolved once at bind time rather than
 /// re-read from the process environment each tick.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 struct UdpTransport {
     /// Ephemeral all-NIC v4 SEARCH socket: sends SEARCH, receives the
     /// unicast SEARCH_RESPONSE.
@@ -399,10 +419,11 @@ struct UdpTransport {
 enum SearchTransport {
     /// UDP SEARCH and beacon receive, alongside any TCP name servers.
     ///
-    /// Compiled out on the RTEMS target — there is no UDP transport to hold,
+    /// Compiled out on `exec_backend` — there is no UDP transport to hold,
     /// so `NameServersOnly` is the only variant and "no UDP socket" is a fact
-    /// about the type rather than a runtime branch (§4.2).
-    #[cfg(not(target_os = "rtems"))]
+    /// about the type rather than a runtime branch (§4.2). See the module-head
+    /// note on why the gate is the backend and not the target.
+    #[cfg(tokio_backend)]
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`ns_task`), and every UDP arm parks
@@ -419,7 +440,7 @@ impl SearchTransport {
     /// `addr_list` is merged into them here (pva2pva client-config
     /// semantics: address-list entries are UDP SEARCH destinations on
     /// `broadcast_port`, never TCP name servers).
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(tokio_backend)]
     fn bind_udp(
         config: &ClientSearchConfig,
         mut extra_targets: Vec<SocketAddr>,
@@ -535,7 +556,7 @@ impl SearchTransport {
     fn has_no_udp_destinations(&self) -> bool {
         match self {
             Self::NameServersOnly => true,
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => u.extra_targets.is_empty() && !u.auto_addr_list,
         }
     }
@@ -577,7 +598,7 @@ impl SearchTransport {
     /// socket already used.
     async fn recv_search(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => u.search_socket.recv_from(buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
@@ -590,7 +611,7 @@ impl SearchTransport {
     /// without a UDP transport, and equally when v6 is unavailable.
     async fn recv_search_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => recv_from_v6(u.search_socket_v6.as_ref(), buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
@@ -602,7 +623,7 @@ impl SearchTransport {
     /// `select!` arm: the next v4 BEACON datagram.
     async fn recv_beacon(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => match &u.beacon_socket {
                 Some(s) => s.recv_from(buf).await,
                 None => std::future::pending().await,
@@ -617,7 +638,7 @@ impl SearchTransport {
     /// `select!` arm: the next v6 multicast BEACON datagram.
     async fn recv_beacon_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => recv_from_v6(u.beacon_socket_v6.as_ref(), buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
@@ -637,7 +658,7 @@ impl SearchTransport {
         send_errs: &mut HashSet<SocketAddr>,
     ) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Pack the same entries with each family's response port. The
                 // port field is fixed-width, so the two sets batch identically
@@ -663,7 +684,7 @@ impl SearchTransport {
     /// nature — discovery has no name-server equivalent.
     async fn broadcast_discover(&self, codec: &PvaCodec, send_errs: &mut HashSet<SocketAddr>) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Stamp the fixed pvxs `search_seq` ("find") rather than a fresh
                 // randomized id: the discovery-pong receive path gates on this
@@ -710,17 +731,17 @@ impl SearchEngine {
     }
 
     /// Build the SEARCH transport from the process environment: a bound UDP
-    /// socket bundle on a host, and [`SearchTransport::NameServersOnly`] on the
-    /// RTEMS target, where no UDP socket can be bound (§4.2). The single place
-    /// the target's transport choice is made, so the three UDP-config spawn
-    /// entry points collapse to name-servers-only there rather than each
-    /// naming `bind_udp` (which does not exist on the target).
-    #[cfg(not(target_os = "rtems"))]
+    /// socket bundle on `tokio_backend`, and
+    /// [`SearchTransport::NameServersOnly`] on `exec_backend`, where no UDP
+    /// socket can be bound (§4.2). The single place that choice is made, so
+    /// the three UDP-config spawn entry points collapse to name-servers-only
+    /// there rather than each naming `bind_udp` (which does not exist there).
+    #[cfg(tokio_backend)]
     fn env_transport(extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
         SearchTransport::bind_udp(&ClientSearchConfig::from_env(), extra_targets)
     }
 
-    #[cfg(target_os = "rtems")]
+    #[cfg(exec_backend)]
     fn env_transport(_extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
         Ok(SearchTransport::NameServersOnly)
     }
@@ -750,12 +771,12 @@ impl SearchEngine {
     }
 
     /// Build the SEARCH transport from an explicit per-client
-    /// [`ClientSearchConfig`]: a bound UDP socket bundle on a host,
-    /// [`SearchTransport::NameServersOnly`] on the RTEMS target (§4.2). The
-    /// config's UDP knobs (address list, ports, auto-addr) have no effect on the
-    /// target, where there is no UDP socket to apply them to; the caller's TCP
+    /// [`ClientSearchConfig`]: a bound UDP socket bundle on `tokio_backend`,
+    /// [`SearchTransport::NameServersOnly`] on `exec_backend` (§4.2). The
+    /// config's UDP knobs (address list, ports, auto-addr) have no effect
+    /// there, where there is no UDP socket to apply them to; the caller's TCP
     /// name servers still reach every server.
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(tokio_backend)]
     fn config_transport(
         config: ClientSearchConfig,
         extra_targets: Vec<SocketAddr>,
@@ -763,7 +784,7 @@ impl SearchEngine {
         SearchTransport::bind_udp(&config, extra_targets)
     }
 
-    #[cfg(target_os = "rtems")]
+    #[cfg(exec_backend)]
     fn config_transport(
         _config: ClientSearchConfig,
         _extra_targets: Vec<SocketAddr>,
@@ -998,7 +1019,7 @@ impl SearchEngine {
 
 // ── UDP socket helpers ──────────────────────────────────────────────────
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
@@ -1028,7 +1049,7 @@ fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
 /// Sets `IPV6_V6ONLY=true` explicitly so the v6 socket cannot accept
 /// v4-mapped traffic that would otherwise duplicate what the
 /// `AsyncUdpV4` search socket already handles.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1070,7 +1091,7 @@ fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
 /// `select!`-friendly recv helper: yields the next datagram from the
 /// optional v6 socket, or parks forever when v6 is disabled. Shared by the
 /// v6 search and v6 beacon arms of [`SearchTransport`].
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 async fn recv_from_v6(
     sock: Option<&Arc<UdpSocket>>,
     buf: &mut [u8],
@@ -1081,7 +1102,7 @@ async fn recv_from_v6(
     }
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<AsyncUdpV4> {
     // Skip the loopback NIC: any local pva-rs *server* has its UDP
     // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
@@ -1113,7 +1134,7 @@ fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<A
 /// default v6 PVA multicast group `ff0e::400`. Returns `None` when the
 /// host lacks v6 or the bind fails — fast-reconnect via v6 beacons is
 /// best-effort, the v4 beacon socket keeps doing its job.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1195,7 +1216,7 @@ fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
 /// An unresolvable `@iface` spec is skipped (logged). Pure given IP-literal
 /// `@iface` forms (`resolve_iface_v4` passthrough), so the projection is
 /// testable without real NIC multicast.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn addr_list_multicast_targets(
     endpoints: &[crate::config::Endpoint],
 ) -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
@@ -1236,7 +1257,7 @@ fn addr_list_multicast_targets(
 /// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
 /// group — the same `@iface`-dropping defect as the server beacon-join
 /// path, fixed here in the same change.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4, endpoints: &[crate::config::Endpoint]) {
     // The endpoints were resolved once at config-build time through the
     // single address-list parser (`parse_endpoints_with_port`): split on
@@ -2141,14 +2162,14 @@ async fn maybe_poke(
 /// unicast target); `false` for broadcast / multicast.
 /// [`UdpTransport::broadcast`] uses it to pick which pre-built frame variant
 /// to send.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 #[derive(Clone, Copy, Debug)]
 struct SearchTarget {
     addr: SocketAddr,
     unicast: bool,
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 impl SearchTarget {
     fn broadcast(addr: SocketAddr) -> Self {
         Self {
@@ -2164,7 +2185,7 @@ impl SearchTarget {
     }
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
@@ -2270,7 +2291,7 @@ fn search_targets(
 /// the egress of the pre-fix interface-constrained bundle's `fanout_to`,
 /// while leaving explicit unicast to route across the full bundle via
 /// `pick_nic`.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 async fn fanout_on_interfaces(
     socket: &AsyncUdpV4,
     packet: &[u8],
@@ -2300,7 +2321,7 @@ async fn fanout_on_interfaces(
     }
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 impl UdpTransport {
     async fn broadcast(
         &self,
@@ -3259,6 +3280,7 @@ mod tests {
     /// (`None`). The pre-fix code projected every group to the all-NIC
     /// `join_multicast_v4`, dropping the interface entirely. IP-literal
     /// `@iface` forms make `resolve_iface_v4` a pure passthrough.
+    #[cfg(tokio_backend)]
     #[test]
     fn addr_list_multicast_targets_preserves_iface_modifier() {
         let modifierless: crate::config::Endpoint =
@@ -5255,6 +5277,7 @@ mod tests {
     /// with the default v6 multicast group joined. Confirms the
     /// plumbing — without it the recv arm in `run_engine` never
     /// fires for v6 beacons.
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
     async fn v6_beacon_socket_binds_and_joins_default_group() {
@@ -5913,6 +5936,7 @@ mod tests {
 
     /// Test helper: the address set of a target list (drops the per-target
     /// unicast classification).
+    #[cfg(tokio_backend)]
     fn target_addrs(targets: &[SearchTarget]) -> Vec<SocketAddr> {
         targets.iter().map(|t| t.addr).collect()
     }
@@ -5922,6 +5946,7 @@ mod tests {
     /// (empty) addressList, so no SEARCH is emitted at all. The pre-fix
     /// code unconditionally pushed 255.255.255.255, leaking broadcast onto
     /// a LAN the operator intentionally restricted.
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_empty_when_auto_off_and_no_extras() {
         let targets = search_targets(5076, false, &[], &[]);
@@ -5939,6 +5964,7 @@ mod tests {
     /// Before the fix, a loopback-only interface list bound a loopback-only
     /// bundle, so `pick_nic` forced an explicit non-loopback target onto the
     /// loopback socket (last-resort) where it could never reach the IOC.
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn search_socket_bundle_not_reduced_by_intf_addr_list() {
         // The defect can only manifest where the host actually has a
@@ -5969,6 +5995,7 @@ mod tests {
     /// EPICS_PVA_INTF_ADDR_LIST=127.0.0.1 with AUTO_ADDR_LIST=YES must
     /// produce no non-loopback broadcast target — the interface list
     /// constrains auto address expansion (pvxs `config.cpp:624-648`).
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_loopback_only_interface_list_no_broadcast() {
         let targets = search_targets(5076, true, &[], &[Ipv4Addr::LOCALHOST]);
@@ -5996,6 +6023,7 @@ mod tests {
 
     /// AUTO_ADDR_LIST=NO sends only to the explicitly configured targets,
     /// never the limited broadcast.
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_auto_off_sends_only_configured_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
@@ -6019,6 +6047,7 @@ mod tests {
     /// is NOT a unicast destination (pvxs `isucast = !isMCast()`), so its
     /// SEARCH keeps the Unicast bit clear; a plain host alongside it is
     /// unicast.
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_multicast_extra_is_not_unicast() {
         let mcast: SocketAddr = "224.0.2.3:5076".parse().unwrap();
@@ -6036,6 +6065,7 @@ mod tests {
 
     /// AUTO_ADDR_LIST=YES (the default) still includes the limited
     /// broadcast destination, and the configured extras are appended.
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
@@ -6063,6 +6093,7 @@ mod tests {
     /// broadcast addresses (`config.cpp:624-648` → `evhelper.cpp:625-660`);
     /// loopback-only discovery requires an explicit address-list entry,
     /// which arrives via `extra_targets`, not the auto path.
+    #[cfg(tokio_backend)]
     #[test]
     fn search_targets_default_auto_path_has_no_implicit_loopback() {
         let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
@@ -6119,6 +6150,7 @@ mod tests {
     /// beacon-socket multicast join, with any `@iface` modifier honoured —
     /// the join no longer reads `EPICS_PVA_ADDR_LIST` from the environment
     /// (pvxs joins per-listener groups, `udp_collector.cpp:186-196`).
+    #[cfg(tokio_backend)]
     #[test]
     fn client_search_config_multicast_endpoint_drives_join() {
         let endpoints = vec![

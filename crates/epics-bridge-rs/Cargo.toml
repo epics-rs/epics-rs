@@ -49,7 +49,26 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # the *host* half — and with it the `rtems-exec-gate` census below, which is
 # the price of the feature and the reason it landed as its own stage
 # (doc/qsrv-rtems-design.md §6.3, §7 stage 4).
-rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
+#
+# The two client crates are in this list, and forwarding to `epics-base-rs`
+# alone was a defect. Cargo unifies features per *package*, so
+# `epics-base-rs/rtems-exec-model` moved `runtime::task::spawn` onto the
+# reactor-free background executor while `epics-ca-rs` and `epics-pva-rs`
+# still compiled — and selected — their reactor-backed UDP SEARCH transports:
+# exactly the split that panicked `rtems-pva-ioc` at boot with "there is no
+# reactor running" (`doc/calink-rtems-design.md` §10.10 item 2). Each client
+# crate now asserts the agreement in its own `lib.rs`, so this line cannot
+# regress silently — it would fail to compile.
+#
+# `?/` on both: neither is a hard dependency (`epics-pva-rs` arrives with
+# `qsrv-core`, `epics-ca-rs` with `qsrv`/`ca-gateway`), and a plain `/` would
+# turn this feature into one that pulls them in. `rtems-pva-ioc` requires
+# `qsrv-core` + `pvalink`, so both are present in the build that produces it.
+rtems-exec-model = [
+    "epics-base-rs/rtems-exec-model",
+    "epics-ca-rs?/rtems-exec-model",
+    "epics-pva-rs?/rtems-exec-model",
+]
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is

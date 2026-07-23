@@ -1239,7 +1239,7 @@ pub(crate) enum TransportCommand {
     /// a beacon is a per-server UDP signal, but the watchdog it
     /// pets lives on each circuit, so the notify fans out to every
     /// priority circuit for `server_addr` (see `process_command`).
-    #[cfg(feature = "client")]
+    #[cfg(ca_beacon_monitor)]
     BeaconArrivalNotify {
         server_addr: SocketAddr,
         anomaly: bool,

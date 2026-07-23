@@ -36,6 +36,11 @@
 //! 3. a per-test `#[cfg(not(feature = "rtems-exec-model"))]` directly above it
 //!    — the `protocol_tests.rs` precedent, which keeps that file's pure
 //!    wire-format tests running feature-ON;
+//!
+//! Either gate may also be spelled `cfg(tokio_backend)`, which selects the
+//! same host builds and additionally excludes the target — see
+//! [`BACKEND_GATE_PREDICATE`] for why a test whose subject is UDP has to be
+//! spelled that way;
 //! 4. a file-level census marker declaring how many ungated sites the file
 //!    has and why they may stay ungated — either they were checked to pass
 //!    feature-ON, or the file does not build or run in that configuration at
@@ -73,6 +78,22 @@ use std::path::{Path, PathBuf};
 pub const GATE_ATTR: &str = r#"#[cfg(not(feature = "rtems-exec-model"))]"#;
 pub const FILE_GATE_ATTR: &str = r#"#![cfg(not(feature = "rtems-exec-model"))]"#;
 pub const GATE_PREDICATE: &str = r#"not(feature = "rtems-exec-model")"#;
+/// The second spelling of the same gate, and the one a *source* item uses.
+///
+/// `tokio_backend` is emitted by the crate's `build.rs` as the negation of
+/// `exec_backend` — `target_os = "rtems"` or the `rtems-exec-model` feature —
+/// so `cfg(tokio_backend)` and `cfg(not(feature = "rtems-exec-model"))` select
+/// the same set of host builds. They are not interchangeable, though: only
+/// `tokio_backend` also excludes the target, which is why the items a test
+/// like this reaches for (a `SearchTransport::Udp`, an `AsyncUdpV4`) carry it.
+/// A test that names such an item has to carry the same predicate its subject
+/// does, or it fails to compile — so this guard has to count it as a gate,
+/// otherwise the census would keep vouching feature-ON for tests that do not
+/// run there.
+///
+/// `not(tokio_backend)` is deliberately *not* a gate: it selects the exec
+/// backend, which is the configuration the census is about.
+pub const BACKEND_GATE_PREDICATE: &str = "tokio_backend";
 pub const CENSUS_MARKER: &str = "RTEMS-EXEC-MODEL-ALLOW(";
 
 /// Printed with every violation so the failure explains itself without the
@@ -82,7 +103,9 @@ rtems-exec-model gating rule: every #[tokio::test] and every hand-built tokio
 runtime in test code must be accounted for by exactly one of
   (1) file-level #![cfg(not(feature = \"rtems-exec-model\"))]
   (2) an enclosing column-0 mod gated with not(feature = \"rtems-exec-model\")
-  (3) a per-test #[cfg(not(feature = \"rtems-exec-model\"))] directly above it
+      or with tokio_backend
+  (3) a per-test #[cfg(not(feature = \"rtems-exec-model\"))] — or #[cfg(..
+      tokio_backend ..)] — directly above it
   (4) a file-level census marker `// RTEMS-EXEC-MODEL-ALLOW(N): why`, where N
       is exactly the number of ungated sites in the file
 Pick (1)-(3) if the test needs a tokio reactor the feature does not start. Pick
@@ -142,7 +165,7 @@ pub fn audit_source(path: &str, text: &str, integration: bool) -> Audit {
             } else if is_mod_open(raw) {
                 region = Region {
                     is_test: base.is_test || pending.iter().any(|a| a.contains("cfg(test)")),
-                    is_gated: pending.iter().any(|a| a.contains(GATE_PREDICATE)),
+                    is_gated: pending.iter().any(|a| is_gate_attr(a)),
                 };
                 pending.clear();
             } else if raw.starts_with('}') {
@@ -230,7 +253,7 @@ fn builds_a_runtime(trimmed: &str) -> bool {
 fn per_test_gated(lines: &[&str], idx: usize) -> bool {
     for above in lines[..idx].iter().rev() {
         let t = above.trim();
-        if t == GATE_ATTR {
+        if is_gate_attr(t) {
             return true;
         }
         if t.is_empty() || t.starts_with("#[") || t.starts_with("//") {
@@ -239,6 +262,21 @@ fn per_test_gated(lines: &[&str], idx: usize) -> bool {
         return false;
     }
     false
+}
+
+/// Does this attribute select *away* from the exec backend?
+///
+/// Either spelling counts — see [`BACKEND_GATE_PREDICATE`]. `tokio_backend`
+/// under a `not(...)` does the opposite and is rejected, so a test gated to
+/// run **only** on the exec backend stays in the census where it belongs.
+fn is_gate_attr(attr: &str) -> bool {
+    if !attr.starts_with("#[") || !attr.contains("cfg(") {
+        return false;
+    }
+    if attr.contains(GATE_PREDICATE) {
+        return true;
+    }
+    attr.contains(BACKEND_GATE_PREDICATE) && !attr.contains(concat!("not(", "tokio_backend", ")"))
 }
 
 /// `// RTEMS-EXEC-MODEL-ALLOW(N): why` — recognised only at the start of a
@@ -389,6 +427,41 @@ mod fixtures {
         let audit = audit_source("src/x.rs", &src, false);
         assert_eq!(audit.ungated.len(), 1, "only the second test is exposed");
         assert_eq!(audit.violations.len(), 1);
+    }
+
+    /// The backend spelling of option 2, which is what a test whose subject
+    /// only exists on `tokio_backend` has to carry.
+    #[test]
+    fn a_backend_gated_column_zero_module_accounts_for_its_tests() {
+        let src = format!(
+            "#[cfg(all(test, {BACKEND_GATE_PREDICATE}))]\nmod tests {{\n    {a}\n    async fn t() {{}}\n}}\n",
+            a = tokio_test()
+        );
+        let audit = audit_source("src/x.rs", &src, false);
+        assert!(audit.violations.is_empty(), "{:?}", audit.violations);
+    }
+
+    /// ...and the backend spelling of option 3.
+    #[test]
+    fn a_backend_gated_per_test_attribute_accounts_for_just_that_test() {
+        let src = format!(
+            "// why\n#[cfg({BACKEND_GATE_PREDICATE})]\n{a}\nasync fn gated() {{}}\n\n{a}\nasync fn open() {{}}\n",
+            a = tokio_test()
+        );
+        let audit = audit_source("t.rs", &src, true);
+        assert_eq!(audit.ungated.len(), 1, "only the ungated test is counted");
+    }
+
+    /// The inverse selects the exec backend, so it is not a gate: a test
+    /// carrying it *does* run feature-ON and stays in the census.
+    #[test]
+    fn the_exec_backend_predicate_is_not_a_gate() {
+        let src = format!(
+            "#[cfg(not({BACKEND_GATE_PREDICATE}))]\n{a}\nasync fn t() {{}}\n",
+            a = tokio_test()
+        );
+        let audit = audit_source("t.rs", &src, true);
+        assert_eq!(audit.ungated.len(), 1, "{:?}", audit);
     }
 
     /// Option 3: per-test gate — the `protocol_tests.rs` shape, which is what

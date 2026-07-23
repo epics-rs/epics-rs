@@ -26,10 +26,19 @@
 use std::process::Command;
 
 fn run(bin: &str, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(bin)
-        .args(args)
-        .output()
-        .expect("spawn the CA tool");
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    // On `exec_backend` (this crate built with `--features rtems-exec-model`,
+    // or for the RTEMS target) the client has no UDP SEARCH transport, so
+    // `CaClient::new` refuses an empty `EPICS_CA_NAME_SERVERS` rather than
+    // spawning an engine that could reach nothing — see
+    // `search::SearchTransport::name_servers_only`. These tests are about
+    // getopt argument consumption, not about reaching a server, so give the
+    // tool a syntactically valid name server it will never connect to. Port
+    // 1 is reserved (`tcpmux`) and nothing in this workspace binds it.
+    #[cfg(exec_backend)]
+    cmd.env("EPICS_CA_NAME_SERVERS", "127.0.0.1:1");
+    let out = cmd.output().expect("spawn the CA tool");
     (
         out.status.code().expect("the tool exited normally"),
         String::from_utf8_lossy(&out.stdout).into_owned(),

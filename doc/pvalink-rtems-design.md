@@ -1490,7 +1490,21 @@ never on target.
 The forcing experiment confirmed it is not a blanket-fixable timing issue:
 `--cfg pva_blocking_client` with `--features rtems-exec-model` still fails,
 because `search_engine`'s own `tokio::time` (the UDP-search half §4.2
-defers) runs on the pool regardless of transport. The reactor-dependent
+defers) runs on the pool regardless of transport.
+
+> **Superseded — the combination is no longer constructible.** This section's
+> conclusion, that exec-backend + hosted-transport "exists only in the host
+> test suite", was the diagnosis stopping one step short: the combination
+> existed because the transport was selected by `target_os`, not by the
+> backend. Both selections — the UDP SEARCH transport here and the TCP dial in
+> `client_native/server_conn.rs` — now take `cfg(tokio_backend)`, emitted by
+> `build.rs` as the negation of `exec_backend` (`target_os = "rtems"` **or**
+> the `rtems-exec-model` feature). On the exec backend `SearchTransport` has
+> the single `NameServersOnly` variant and the dial is the blocking one, on
+> the host exactly as on target. The eleven tests this section gated stay
+> gated; they now carry `cfg(tokio_backend)`, the predicate their subject
+> carries, which the census tool recognises as a gate. Full account:
+> `doc/calink-rtems-design.md` §11. The reactor-dependent
 tests are therefore genuinely gated, per the rtems-exec-gate contract and
 the `server_native/tcp.rs` precedent — each `#[cfg(not(feature =
 "rtems-exec-model"))]`, each census marker reduced to match, helpers used
@@ -1539,6 +1553,16 @@ feature-ON. This is the "suppressed-error question" §5's stage-2 gate
 warned to budget for, surfacing one seam behaviour the conversion exposed.
 
 ### 10.5 §5's stage-3 risk is stale: the bridge already carries the feature
+
+> **Not stale enough, as it turned out.** The declaration this section found —
+> `rtems-exec-model = ["epics-base-rs/rtems-exec-model"]` — forwards to
+> `epics-base-rs` and to neither client. Cargo features unify per *package*, so
+> `-p epics-bridge-rs --features rtems-exec-model` moved `runtime::task::spawn`
+> onto the reactor-free backend while `epics-pva-rs` still compiled its
+> reactor-backed UDP transport in and selected it: `rtems-pva-ioc`, the binary
+> the feature exists for, was built in the one state that panics at boot. The
+> `const` assertion described in `doc/calink-rtems-design.md` §11.2 is what
+> found it; the manifest now forwards to both clients.
 
 §5 warned that `rtems-exec-model` was not declared on `epics-bridge-rs`
 and that this stage would be gated behind `doc/qsrv-rtems-design.md` §7's

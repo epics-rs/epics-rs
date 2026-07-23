@@ -9,11 +9,11 @@ use std::time::Duration;
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-// The hosted transport only: `tokio::net` does not compile for
+// The reactor-driven transport only: `tokio::net` does not compile for
 // `armv7-rtems-eabihf`, and the blocking transport reaches `std::net` through
 // `runtime::blocking_io` instead. Every use of this name is inside a
-// `not(any(target_os = "rtems", ca_blocking_client))` arm of the `dial_ca` seam.
-#[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
+// `not(any(exec_backend, ca_blocking_client))` arm of the `dial_ca` seam.
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
 use tokio::net::TcpStream;
 
 use crate::channel::AccessRights;
@@ -172,7 +172,7 @@ const CIRCUIT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// `dbCaLink` worker at `epicsThreadPriorityMedium`
 /// (`dbCa.c:340`). On RTEMS `epicsThreadHighestPriorityLevelBelow` is exactly
 /// `p - 1` (`RTEMS-score/osdThread.c:120-131`), so this is **49**.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 const CAC_RECV_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
     epics_base_rs::runtime::task::ThreadPriority::Custom(
         epics_base_rs::runtime::task::ThreadPriority::Medium.value() - 1,
@@ -186,7 +186,7 @@ const CAC_RECV_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 /// than the [receive thread]" (`tcpiiu.cpp:1716`), so a circuit whose receive
 /// side is busy still drains its send queue promptly. Collapsing the two onto
 /// one band would make a PUT wait behind an unrelated monitor burst.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 const CAC_SEND_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
     epics_base_rs::runtime::task::ThreadPriority::Custom(
         epics_base_rs::runtime::task::ThreadPriority::Medium.value() + 1,
@@ -200,7 +200,7 @@ const CAC_SEND_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 /// at all, so hand-rolling it here would trade one working call for a per-OS
 /// table. See [`set_circuit_keepalive`]'s RTEMS sibling for the one target
 /// where `socket2` is not in the dependency graph.
-#[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
 fn set_circuit_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
@@ -223,7 +223,7 @@ fn set_circuit_keepalive(stream: &TcpStream) {
 /// Failures are ignored, exactly as on the `socket2` path: keepalive is a
 /// backstop under CA's own echo watchdog (`ECHO_TIMEOUT_SECS`), not the
 /// mechanism that detects a dead circuit.
-#[cfg(all(unix, any(target_os = "rtems", ca_blocking_client)))]
+#[cfg(all(unix, any(exec_backend, ca_blocking_client)))]
 fn set_circuit_keepalive(stream: &std::net::TcpStream) {
     use std::os::fd::AsRawFd;
 
@@ -263,13 +263,13 @@ fn set_circuit_keepalive(stream: &std::net::TcpStream) {
 /// One value rather than a loose pair so the dial seam has one return type on
 /// both transports, and so the TLS path — which needs a duplex, not two halves
 /// — can wrap it exactly as it wraps a `TcpStream`.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 pub(super) struct PumpedCircuit {
     reader: epics_base_rs::runtime::blocking_io::GuardedReader,
     writer: epics_base_rs::runtime::blocking_io::GuardedWriter,
 }
 
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 impl AsyncRead for PumpedCircuit {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -280,7 +280,7 @@ impl AsyncRead for PumpedCircuit {
     }
 }
 
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 impl AsyncWrite for PumpedCircuit {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -307,10 +307,10 @@ impl AsyncWrite for PumpedCircuit {
 
 /// What [`dial_ca`] returns: a `tokio::net::TcpStream` on a hosted build, a
 /// [`PumpedCircuit`] where there is no reactor to register one with.
-#[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) type CaCircuit = TcpStream;
 /// See the hosted definition.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 pub(super) type CaCircuit = PumpedCircuit;
 
 /// Split a dialled circuit into the two halves `read_loop` / `write_loop` take.
@@ -320,7 +320,7 @@ pub(super) type CaCircuit = PumpedCircuit;
 /// `AsyncRead`/`AsyncWrite`, so neither boxing nor a trait object is needed on
 /// either side. The hosted arm keeps `into_split`'s owned halves (no `BiLock`,
 /// unchanged from before this seam existed).
-#[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
@@ -331,7 +331,7 @@ pub(super) fn split_circuit(
 }
 
 /// See the hosted definition.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
@@ -443,13 +443,25 @@ pub(super) fn next_frame(buf: &[u8]) -> Frame {
 ///
 /// Two implementations, selected at compile time and never at runtime:
 ///
-/// * hosted — `tokio::net::TcpStream`, the reactor-driven socket this client
-///   has always used;
-/// * `target_os = "rtems"` or `--cfg ca_blocking_client` —
+/// * `tokio_backend` — `tokio::net::TcpStream`, the reactor-driven socket this
+///   client has always used;
+/// * `exec_backend` or `--cfg ca_blocking_client` —
 ///   `runtime::blocking_io`'s two pump threads over one `Arc<TcpStream>`
 ///   (never `try_clone`: `F_DUPFD` fails `ENXIO` on any libbsd socket,
-///   measured on target). RTEMS has no tokio reactor and `tokio::net` does not
-///   compile for the triple, so there this is not a preference.
+///   measured on target).
+///
+/// The arm is chosen by the *backend*, not by the target. `exec_backend` is
+/// `target_os = "rtems"` **or** `--features rtems-exec-model` (`build.rs`), and
+/// what both share is that a future started through `runtime::task::spawn`
+/// runs with no tokio reactor entered — on RTEMS because there is none and
+/// `tokio::net` does not compile for the triple, on a host exec-model build
+/// because the future lands on a callback-pool worker the runtime was never
+/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
+/// reactor running") even though the process has a runtime elsewhere. Gating
+/// this seam on `target_os = "rtems"` named the target where the fact it needs
+/// is the backend, which is why `rtems-ca-ioc` still panicked on its first
+/// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
+/// item 2).
 ///
 /// Both return the OS receive-queue probe alongside the circuit, because the
 /// fd it reads has to be captured *before* the socket is split or wrapped —
@@ -460,7 +472,7 @@ pub(super) fn next_frame(buf: &[u8]) -> Frame {
 /// address on its own cadence, which is what C's `disconnectNotify` + `break`
 /// leaves to the same layer.
 pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
-    #[cfg(not(any(target_os = "rtems", ca_blocking_client)))]
+    #[cfg(not(any(exec_backend, ca_blocking_client)))]
     {
         // No application-level connect deadline. C `tcpRecvThread::connect`
         // (`tcpiiu.cpp:606-661`) issues a *blocking* `::connect()` and lets the
@@ -481,7 +493,7 @@ pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRec
         let probe = recv_queue_probe_for(&stream);
         Some((stream, probe))
     }
-    #[cfg(any(target_os = "rtems", ca_blocking_client))]
+    #[cfg(any(exec_backend, ca_blocking_client))]
     {
         dial_blocking(server_addr).await
     }
@@ -511,7 +523,7 @@ pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRec
 /// connect resolves, and the pumps that outlive it are the primitive's — which
 /// makes it strictly cheaper in threads and one `std::thread` TLS-key
 /// allocation (128 B on RTEMS, measured) more expensive per connect attempt.
-#[cfg(any(target_os = "rtems", ca_blocking_client))]
+#[cfg(any(exec_backend, ca_blocking_client))]
 async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
     use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread};
@@ -726,7 +738,7 @@ struct ServerConnection {
     /// causing the watchdog to expire on schedule and probe the
     /// circuit then). Mirrors libca's `tcpRecvWatchdog` model — see
     /// `TransportCommand::BeaconArrivalNotify` for full rationale.
-    #[cfg(feature = "client")]
+    #[cfg(ca_beacon_monitor)]
     beacon_arrival_tx: mpsc::UnboundedSender<bool>,
     // Spawned via `runtime::task::spawn`, so typed as the seam handle.
     // Byte-identical to `tokio::task::JoinHandle` under the hosted default;
@@ -1028,7 +1040,7 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             priority,
             ..
         } => Some((*server_addr, *priority)),
-        #[cfg(feature = "client")]
+        #[cfg(ca_beacon_monitor)]
         TransportCommand::BeaconArrivalNotify { .. } => None,
     }
 }
@@ -1278,7 +1290,7 @@ fn process_command(
                 event_tx,
             );
         }
-        #[cfg(feature = "client")]
+        #[cfg(ca_beacon_monitor)]
         TransportCommand::BeaconArrivalNotify {
             server_addr,
             anomaly,
@@ -1465,13 +1477,14 @@ async fn connect_server(
     // of a `CircuitUnresponsive` still in flight from the write loop.
     let unresponsive = std::sync::Arc::new(UnresponsiveGate::new());
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
-    // `client-core` has no beacon facility, so nothing will ever send on
+    // A build with no beacon monitor has nothing that will ever send on
     // this. Dropping the sender here puts `read_loop`'s arrival arm in the
     // state a shutdown leaves it in — closed on first poll, then disarmed —
     // rather than leaving a channel alive that no code can feed. (The arm
     // itself cannot be `cfg`'d: `tokio::select!` does not accept attributes
-    // on a branch.)
-    #[cfg(not(feature = "client"))]
+    // on a branch.) That is `client-core`, and equally the reactor-free
+    // `exec_backend`, where the monitor's UDP socket cannot exist.
+    #[cfg(not(ca_beacon_monitor))]
     drop(beacon_arrival_tx);
 
     // Build initial CA handshake.
@@ -1605,7 +1618,7 @@ async fn connect_server(
         write_tx,
         pending_frames,
         server_minor,
-        #[cfg(feature = "client")]
+        #[cfg(ca_beacon_monitor)]
         beacon_arrival_tx,
         _read_task: read_task,
         _write_task: write_task,
@@ -3007,14 +3020,14 @@ mod server_connection_drop_tests {
         let write_abort = write_task.abort_handle();
 
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        #[cfg(feature = "client")]
+        #[cfg(ca_beacon_monitor)]
         let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
 
         let conn = ServerConnection {
             server_minor: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             write_tx,
             pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            #[cfg(feature = "client")]
+            #[cfg(ca_beacon_monitor)]
             beacon_arrival_tx,
             _read_task: read_task,
             _write_task: write_task,

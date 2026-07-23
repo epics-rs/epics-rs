@@ -163,6 +163,29 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
 // reproduce exactly the subset of the tokio surface the call sites use.
 // ---------------------------------------------------------------------------
 
+/// `true` when [`spawn`] lands the future on the tokio runtime, `false` when it
+/// lands on the reactor-free background executor (`exec_backend` — the RTEMS
+/// target, or a host build with `--features rtems-exec-model`).
+///
+/// # What this is for
+///
+/// It is the *exported* form of `build.rs`'s backend decision, and the reason
+/// it is exported is that a spawned future's access to a tokio **reactor** is
+/// decided here and consumed in other crates. A future handed to [`spawn`] on
+/// `exec_backend` runs on a callback-pool worker with no reactor entered, so
+/// every `tokio::net` socket it opens panics — *even in a process that has a
+/// tokio runtime somewhere else*, because the runtime is not entered on that
+/// worker.
+///
+/// `epics-ca-rs` and `epics-pva-rs` therefore have to make the same decision
+/// this crate makes, for their own compilation, and they make it in their own
+/// `build.rs` from the same two inputs (target OS, `rtems-exec-model` feature).
+/// That is three copies of one rule, so each of them pins the copy against this
+/// constant with a `const` assertion — a build where the two disagree (say,
+/// `epics-base-rs/rtems-exec-model` enabled without `epics-ca-rs`'s) fails to
+/// compile instead of panicking at boot.
+pub const HAS_TOKIO_REACTOR: bool = cfg!(tokio_backend);
+
 /// Handle to a spawned task — `await` for its result, `abort()` to cancel.
 #[cfg(tokio_backend)]
 pub type TaskHandle<T> = tokio::task::JoinHandle<T>;

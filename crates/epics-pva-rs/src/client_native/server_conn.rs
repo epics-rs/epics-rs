@@ -299,12 +299,24 @@ fn dial_blocking(
 ///
 /// Two implementations, selected at compile time and never at runtime:
 ///
-/// * hosted — `tokio::net::TcpStream`, split into its two owned halves. What
-///   shipped before this seam existed, unchanged.
-/// * `target_os = "rtems"` or `--cfg pva_blocking_client` —
+/// * `tokio_backend` — `tokio::net::TcpStream`, split into its two owned
+///   halves. What shipped before this seam existed, unchanged.
+/// * `exec_backend` or `--cfg pva_blocking_client` —
 ///   `runtime::blocking_io`'s two blocking pump threads over one
-///   `Arc<TcpStream>`. RTEMS has no tokio reactor (`tokio::net` does not even
-///   compile for the target), so on that target this is not a preference.
+///   `Arc<TcpStream>`.
+///
+/// The arm is chosen by the *backend*, not by the target. `exec_backend` is
+/// `target_os = "rtems"` **or** `--features rtems-exec-model` (`build.rs`), and
+/// what both share is that a future started through `runtime::task::spawn`
+/// runs with no tokio reactor entered — on RTEMS because there is none and
+/// `tokio::net` does not compile for the triple, on a host exec-model build
+/// because the future lands on a callback-pool worker the runtime was never
+/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
+/// reactor running") even though the process has a runtime elsewhere. Gating
+/// this seam on `target_os = "rtems"` named the target where the fact it needs
+/// is the backend, which is why `rtems-pva-ioc` still panicked on its first
+/// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
+/// item 2).
 ///
 /// The returned halves are the same `DynRead`/`DynWrite` the TLS path produces,
 /// which is the whole reason the client needed no protocol change to gain a
@@ -329,7 +341,7 @@ pub(crate) async fn dial_pva(
     connect_timeout: Duration,
     write_deadline: Duration,
 ) -> PvaResult<(DynRead, DynWrite)> {
-    #[cfg(not(any(target_os = "rtems", pva_blocking_client)))]
+    #[cfg(not(any(exec_backend, pva_blocking_client)))]
     {
         // The hosted transport has no per-frame write bound to apply.
         let _ = write_deadline;
@@ -341,7 +353,7 @@ pub(crate) async fn dial_pva(
         let (reader, writer) = stream.into_split();
         Ok((Box::new(reader), Box::new(writer)))
     }
-    #[cfg(any(target_os = "rtems", pva_blocking_client))]
+    #[cfg(any(exec_backend, pva_blocking_client))]
     {
         dial_blocking(target, connect_timeout, write_deadline)
     }

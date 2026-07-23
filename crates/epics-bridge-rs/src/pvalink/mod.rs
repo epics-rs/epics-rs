@@ -13,8 +13,9 @@
 //! \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* — because a soft record's
 //! device support declares CONSTANT. Measured on the target;
 //! `doc/pvalink-rtems-design.md` §12.2, `doc/calink-rtems-design.md`
-//! §10.7. [`config::PvaLinkConfig::parse`] still tolerates the `@`
-//! prefix, but no record can deliver one to it.
+//! §10.7. [`config::PvaLinkConfig::parse`] refuses the `@` prefix
+//! outright — one rule with the record loader, not a laxer second one
+//! on a path no record can reach.
 //!
 //! Mirror of pvxs `ioc/pvalink*.cpp`. Pure Rust.
 //!

@@ -2478,20 +2478,41 @@ to-mid-teens millisecond latency tax on other links sharing the band.
    `the_stage5_rig_defines_the_three_link_records` (feature-ON
    presence), and the two boot tests' console asserts (`C6 probe` /
    `STAGE5` lines must appear with the feature and must not without).
-4. **§5.3's fd table is an upper bound, not an equality.** §11.5 criterion 7
-   could not isolate the absolute per-circuit descriptor cost because a client
-   with a link configured never holds zero descriptors. Isolating it needs an
-   image built with no link configured at all. *Enabler landed with item 3's
-   closure:* the **default** (`bringup-probes` off) build IS that image —
-   every link-bearing record in the built-in database was probe rig, so a
-   default `rtems-ca-ioc` image configures no `ca://` link at all (and the
-   default `rtems-pva-ioc` no `pva://` link), with zero client-side
-   descriptors. No second knob was needed;
-   `the_default_database_is_clean_and_link_free` refuses any INP/OUT field
-   in `DEMO_DB`, so the property cannot silently erode. The measurement
-   itself is still owed: build the default image, boot it, read
-   `RTEMS:FD_CNT`, then diff against the same image with a link added via
-   a loaded `.db` (host) or a `bringup-probes` build (target).
+4. ~~**§5.3's fd table is an upper bound, not an equality.**~~ **MEASURED
+   on the target — the per-circuit cost is exactly 1, and the equality
+   holds.** §11.5 criterion 7 could not isolate the absolute per-circuit
+   descriptor cost because a client with a link configured never holds
+   zero descriptors. Item 3's closure provided the isolating image: the
+   **default** (`bringup-probes` off) build configures no link at all
+   (`the_default_database_is_clean_and_link_free` refuses any INP/OUT
+   field in `DEMO_DB`, so the property cannot silently erode). Measured
+   on the QEMU target (default `rtems-ca-ioc`, hostfwd, raw CA circuits
+   held open while `RTEMS:FD_CNT` is read through one additional
+   transient `caget` circuit):
+
+   | held circuits | `FD_CNT` | `CA_CONN_CNT` |
+   |---|---|---|
+   | 0 | 8 | 0 |
+   | 1 | 9 | 1 |
+   | 2 | 10 | 2 |
+   | 5 | 13 | 5 |
+   | 10 | 18 | 10 |
+   | 20 | 28 | 20 |
+
+   Slope exactly **+1 fd per inbound circuit**, no hidden per-circuit
+   descriptors; all values return to the floor when the circuits close.
+   The idle floor is **7 fds** (the 8 above includes the reading
+   `caget`'s own circuit), against `FD_MAX = 150` — an inbound capacity
+   of ~143 circuits for the link-free image, consistent with §5.3's 142
+   for the link-configured one. And the client side of the diff: the
+   `bringup-probes` image (4 `ca://` links, compiled-in name-server
+   config, upstream *down*) idles at the **same** `FD_CNT = 8` — the
+   link machinery holds zero descriptors while disconnected, because
+   the NS retry opens and closes its socket per attempt; §5.3's "+1 per
+   circuit, +2 for name server + upstream" is a *connected-state* hold,
+   exactly as its table states. What remains unmeasured is only the
+   live-upstream idle hold on *this* tip, which §5.3 already measured
+   on the C6 image.
 5. **Stage C4's second sign-off** is now unblocked with numbers (§11.6). The
    two closures (enqueue restructure vs C-style dedicated thread) are
    unchanged and still not picked.

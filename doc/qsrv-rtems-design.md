@@ -1988,6 +1988,47 @@ of the mechanism, not target numbers. The on-target rerun — this
 regression's re-verification AND §9.14's q8 table — has not been run
 against this branch and remains the gate.
 
+### 9.15.2 On-target re-measurement — the §9.14 defect is closed
+
+Merge `24e5ace2` (the thread drain), q8 run 4, same probe, same
+target, same instrument as §9.14's run 2. Survival probe first: with
+the BIG monitor open, the victim delivered 101 updates in 10 s, the
+group delivered continuously, and a fresh `pvxget` completed mid-flood
+— the §9.15.1 kill scenario, alive.
+
+**Victim `V0` inter-arrival gaps (ms), per phase (run 4):**
+
+| phase    | n   | median | mean   | p99    | max    |
+|----------|-----|--------|--------|--------|--------|
+| BASELINE | 900 | 99.98  | 100.00 | 104.51 | 158.28 |
+| LOAD     | 901 | 99.97  | 100.00 | 105.30 | 117.23 |
+| RECOVERY | 301 | 99.99  | 100.00 | 103.48 | 104.75 |
+
+Zero value jumps in any phase: every 10 Hz tick was delivered,
+including all ~900 during the load window. LOAD is statistically
+indistinguishable from BASELINE — against §9.14's 41 delivered
+updates, 16.9 s stalls, and 224-tick coalescing holes. The unrelated
+PV no longer knows the group exists.
+
+**Group `BIG` during load (run 4):** 541 delivered updates in 89.8 s =
+6.02 Hz (§9.14: ~0.35 Hz — 17×); gap median 172.39 ms, p99 184.23 ms,
+max 247.99 ms (§9.14 max: 5883 ms). Posting stayed at 10 Hz (`f00`
+span 898 ticks in 89.8 s); the delivery deficit is benign newest-wins
+coalescing — the step histogram is 183× step-1 / 356× step-2 / 1×
+step-3, i.e. the QEMU-speed drain (one atomic 20-record `read_group` +
+NT assembly per event, ~166 ms) skips at most every other tick and
+never falls behind by more than 3. No starvation, no stall, bounded
+lag by construction (queueSize-4 replace-in-place).
+
+**Still open after run 4:** §8 item 5's attribution experiment is moot
+in its original form (the forwarders it asked to re-band no longer
+exist), but the C-vs-Rust drain-priority deviation (17 vs
+CAServerLow−1 = 19, §9.15) remains a deliberate, documented divergence
+rather than a measured one — nothing in run 4 stresses it, since the
+drain never saturated the band it no longer runs on. BIG's 6 Hz vs
+10 Hz on QEMU is drain-side `read_group` cost, unmeasured on real
+silicon.
+
 ### 9.16 Scan ownership as built — SCAN was dead on the PVA-only target, now core-owned
 
 **The defect (found by the §8 load probe).** The probe's self-counting

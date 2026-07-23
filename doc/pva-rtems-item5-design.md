@@ -1,6 +1,12 @@
 # PVA phase 6 item 5 — reader / operation / writer split: settled design
 
-**Status:** design only. No file edited, no commit made.
+**Status:** COMPLETE as built (2026-07-23). Stages 1–5 all landed:
+`ad268398` (stage 1), `93590517` (stage 2), `44681c76` (stage 3, as built
+§10), `ab97461f` (stage 4, as built §11), stage 5 closed by the executable
+gate `scripts/rtems-check.sh` (as built §12). The post-merge owed rename
+landed as `04cdf6fa`. §§0–9 are preserved as written — design-time text
+whose line numbers reference the pva-cs-ring worktree; §§10–12 record
+where the landed code deviated.
 **Bases read:**
 - PVA (items 4+6 applied): `/home/stevek/work/epics-rs/.caucus/worktrees/pva-cs-ring`, branch `phase6/pva-channelsource-ring` @ `e278088c`.
 - CA reference + new base runtime: `/home/stevek/work/epics-rs/.caucus/worktrees/manual-ca-sans-io` @ `d704087d`.
@@ -558,9 +564,9 @@ Every stage is independently workspace-green
 |---|---|---|---|---|
 | 1 | `runtime::task::timeout(dur, fut)` in `epics-base-rs` — the one seam gap. `tokio_backend` → `tokio::time::timeout`; `exec_backend` → `select(timer_sleep::sleep(dur), fut)`. Boundary tests: fires, does-not-fire, already-elapsed, cancel-drop. | ✅ | ✅ | 1–2 d |
 | 2 | PVA server-native seam swap: 11 `tokio::spawn` → `runtime::task::spawn`; `AbortOnDrop(TaskAbortHandle)` (`tcp.rs:783`); 3 timer sites (`:3280`, `:3323`, `:5509`) onto the seam. Aliases on hosted ⇒ zero behaviour change. | ✅ | ✅ | 3–4 d |
-| 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. | ✅ | ✅ (additive) | 1–1.5 wk |
-| 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. | ✅ | ⚠️ timing only, flagged | 3–4 d |
-| 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. | ✅ | ✅ | 2–3 d |
+| 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. **DONE** (`44681c76`; as built: §10) | ✅ | ✅ (additive) | 1–1.5 wk |
+| 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. **DONE** (`ab97461f`; as built: §11 — the `oneshot` arm was NOT taken, the sign-off item dissolved) | ✅ | ✅ as landed (no hosted timing change) | 3–4 d |
+| 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. **DONE** (superseded in shape by `scripts/rtems-check.sh`; the owed `--extern` record is §12.2) | ✅ | ✅ | 2–3 d |
 
 Sequencing note: stages 1–2 are desktop-neutral and can land **before** the CA
 merge lands stage 3's prerequisites… except stage 1 *is* an `epics-base-rs`
@@ -610,7 +616,209 @@ and reopens the TypeCache question — call it +1 wk of downside risk.
 1. **Writer-exit `oneshot` arm (§4.2b).** Removes a 15 s teardown window on
    both builds; changes hosted timing. Land it, or preserve today's timing and
    accept the window on RTEMS too?
+   **RESOLVED in stage 4 (`ab97461f`): neither.** The dichotomy was false —
+   waking through the socket closes the window on the blocking driver
+   without a seventh arm and without touching hosted timing. See §11.1;
+   the sign-off item dissolved instead of being decided.
 2. **Frame channel depth (§1.4).** `N = 1` for behavioural identity, or a
    larger depth for read-ahead throughput? I recommend 1 and measuring later.
+   **RESOLVED in stage 3 (`44681c76`): depth = 1**, for the reason §1.4 gives —
+   the hosted read is demand-driven, so 1 reproduces it and a deeper queue
+   would be a behaviour change, not an optimisation.
 3. **Writer deadline loop (§3.3)** vs plain SO_SNDTIMEO. I recommend the loop —
    SO_SNDTIMEO alone silently weakens a stated anti-DoS property.
+   **RESOLVED in stage 3 (`44681c76`): the deadline loop**, mutation-proved —
+   deleting the deadline check and leaving only SO_SNDTIMEO left the
+   trickle-client test never returning (killed at 120 s). §3.3's argument,
+   executed. The loop lives at `write_frame_deadline`, since `8024b175` in
+   `epics-base-rs`'s `runtime::blocking_io` (§10.3).
+
+---
+
+## 10. Stage 3 as built — where reality deviated from §1/§3/§7
+
+Stage 3 landed as `44681c76` (`server_native/blocking.rs`, 1,071 lines +
+the `mod.rs` mount) on the integration branch. The load-bearing shape
+held exactly as designed: three threads per connection, the threads hand
+**bytes not frames** (§1.3 — the `0xFD`-define / `0xFE`-reference
+cross-frame test is in the landed test list, end to end), `ChannelReader`
+is a new `SrvRead` implementor rather than a new seam, no `cfg` is
+threaded through the 21,000-line protocol module, and the hosted driver
+is untouched. Both §9 decisions this stage owned were resolved as
+recommended (depth = 1; deadline loop — see §9 for the mutation
+evidence). Four points did not survive contact unchanged:
+
+### 10.1 Teardown determinism is a WeakSender rule, not just a drop order
+
+§3.4 said the writer-side adapter "pushes into a bounded mpsc" and §4.3
+step 2 said "drop every `Sender` clone". As built the rule is stronger
+and structural: **the driver holds the only strong `Sender` of the frame
+channel; `ChannelWriter` holds a `mpsc::WeakSender`.** That is what makes
+dropping the driver end the writer pump deterministically instead of
+whenever the runtime reaps an aborted task. Mutation-proved: giving the
+adapter a strong `Sender` hangs teardown while every end-to-end test
+still passes, which is why the rule has its own test.
+
+### 10.2 The hosted host-runtime boundary is a refusal, not a footnote
+
+§1.4 named `block_on_sync` as the reader-side send primitive and left it
+at that. As built, `serve_connection_blocking` on a *hosted* build must
+run on a multi-thread runtime worker (the connection future still awaits
+tokio-backed seam primitives there), and a current-thread runtime is
+**refused with an error rather than deadlocked** — the boundary has its
+own test. On RTEMS the exec backend supplies both halves and the same
+call runs on a bare thread.
+
+### 10.3 The byte-source primitive did not stay in `epics-pva-rs`
+
+The design put `ChannelReader`/`ChannelWriter` in
+`server_native/blocking.rs` (§1.2). They landed there, and then
+`8024b175` promoted them — both pump bodies, `write_frame_deadline`, and
+both thread-lifecycle guards — into **`epics_base_rs::runtime::blocking_io`**,
+because the PVA client's `connect_blocking` and the coming blocking CA
+client need the identical primitive and `epics-ca-rs` structurally cannot
+depend on `epics-pva-rs` (`doc/calink-rtems-design.md` §3.3 measured
+this and named the destination). `blocking.rs` keeps what is
+server-side: `ConnRegistry`, `serve_connection_blocking`,
+`BlockingPvaServer`. One follow-up the move cost: the file's
+RTEMS-EXEC-MODEL-ALLOW census marker went stale (18 → 16) and the
+feature-ON gate caught it; corrected in `2c5155c6`.
+
+### 10.4 §1.5's one unexecuted claim was executed, and held
+
+The confidence caveat in §8 — `ChannelReader` cancel-safety "reasoned
+about but not executed" — is closed. The landed adapter test covers both
+boundaries (mid-chunk and pending) and is mutation-checked: dropping the
+parked tail instead of keeping it in `cur`/`pos` hangs the named test
+while **every end-to-end test still passes** — exactly the silent,
+intermittent failure mode §1.5 predicted, which is why the adapter has
+its own test rather than relying on the e2e suite. The +1 wk downside
+risk (frame-channel fallback) was not spent.
+
+---
+
+## 11. Stage 4 as built — where reality deviated from §4/§7
+
+Stage 4 landed as `ab97461f` (connection registry + socket-shutdown
+teardown, `server_native/blocking.rs` +608 lines). The §4.2c mechanism
+held exactly: one way to wake a parked connection thread —
+`shutdown(Shutdown::Both)` — and an owner for it. `ConnRegistry` carries
+the invariant as MUST/MUST-NOT with both halves holding by construction
+(`ConnWake` constructible only by `ConnRegistry::register`;
+`serve_connection_blocking` takes `&ConnRegistry` by value, not option;
+`ConnRegistration::drop` is the only remover). `stop` is a one-way
+latch: a connection registering after it is woken as it registers.
+Mutation-checked at the invariant's three boundaries (wake as no-op;
+drop skipping deregister; writer dropping its exit wake). Three
+deviations:
+
+### 11.1 The writer-exit `oneshot` arm was not taken — §4.2b's fix dissolved
+
+The design proposed a `oneshot` plus a seventh `select!` arm in the
+shared connection loop, and flagged it for sign-off because it would
+speed *hosted* teardown too. As built, **neither branch of that
+trade-off was taken**: a dead writer shuts the socket down, the reader's
+blocking `read` returns 0, and the connection unwinds down the existing
+EOF path (§4.4's first row). `tcp.rs` and `accept.rs` are untouched, so
+the hosted `select!` is byte-identical, hosted teardown timing is
+unchanged, and the ≤15 s window §4.2b described is closed on the
+blocking driver anyway. This also honours the item-7 design's §6 rule
+the `oneshot` variant would have bent: no `cfg`-ed arm inside the
+protocol module. The §4.4 error-propagation table's "write error"
+row therefore routes through the same vehicle as EOF, not a new arm.
+
+### 11.2 `PvaServer::stop` is deliberately not wired to the registry
+
+The design's §4.2c implied server shutdown walks the registry from the
+server object. As built the hosted `PvaServer` does not: `mod.rs` gates
+`runtime` and `accept` out of RTEMS while `blocking` is ungated, so a
+`PvaServer::stop` arm reaching blocking connections would be dead code
+on host and absent on RTEMS. The registry's caller is item 7's blocking
+accept loop (`BlockingPvaServer`, landed later as `1c27465c`), which
+owns the `ConnRegistry` precisely because `serve_connection_blocking`
+cannot be called without one.
+
+### 11.3 `8024b175` narrowed the wake authority after the stage landed
+
+As landed, the writer pump took a registry-issued `ConnWake` (and the
+reader guard another). The byte-source promotion (§10.3) separated
+plumbing from authority: both pumps now derive their self-retirement
+wake from the `Arc<TcpStream>` they already hold, and
+`ConnRegistration::wake_handle` is gone with its last caller. The
+registry keeps exactly what §4 gave it — the server-WIDE stop — and
+nothing else can shut a connection's socket through it.
+
+---
+
+## 12. Stage 5 as built — the one-off check became an executable gate
+
+### 12.1 Superseded in shape: `scripts/rtems-check.sh` is the stage
+
+The stage row asked for a one-off `cargo +nightly check --target
+armv7-rtems-eabihf` run over the blocking driver's module set, recorded
+the way `15f1fc6c` recorded the CA entry point's. Between design and
+close, the gate became an executable census instead of a prose
+invocation: `scripts/rtems-check.sh` compiles `epics-pva-rs --lib`
+(`server_native::blocking` is ungated in `mod.rs`, so the blocking
+driver IS in that module set) with `--locked --no-default-features
+-Zbuild-std`, in **both** the portability and the image
+(`rtems_boot_linked`) configurations, plus the binary census and the
+client-features ratchet. That is strictly stronger than the designed
+one-off: it cannot drift, and it already carried the interim records —
+stage 3's commit measured exit 0 with the module's dead-code warnings
+dropping 116 → 4 (the driver is the RTEMS-side entry point into `tcp`
+that the accept-split gate re-point had left missing), stage 4's
+measured exit 0 with the count unchanged at 4.
+
+Measured at close (2026-07-23, this tree): `./scripts/rtems-check.sh`
+exit 0 — every crate and target binary, both configurations, PVA client
+ratchet at 0.
+
+### 12.2 The owed `--extern` record
+
+From the `epics_pva_rs` rustc invocation of `cargo +nightly check
+--locked --no-default-features -Zbuild-std=std,panic_abort --target
+armv7-rtems-eabihf -p epics-pva-rs --lib -v` (portability
+configuration, exit 0):
+
+```
+bytes  chrono  clap  dashmap  epics_base_rs  futures_util  hostname
+libc  parking_lot  serde_json  thiserror  tokio  tokio_util  tracing
+tracing_subscriber
+(+ epics_macros_rs as a host-side proc-macro .so; sysroot crates from
+-Zbuild-std: std/alloc/core/compiler_builtins/panic_abort/panic_unwind)
+```
+
+**No `socket2`, no `if-addrs`, no `getrandom`, no `mio`** — the §8.1.1
+lib gating holds at the blocking driver's scope, the same four absences
+`15f1fc6c` recorded for `rtems-ca-ioc`. `tokio` is present and stays:
+the driver awaits `tokio::sync` primitives through the seam; what the
+target excludes is the reactor (`tokio::net`, and mio under it), not
+the sync surface. The invocation carries `--cfg exec_backend` — since
+the CA merge, transport/dial selection keys on that cfg rather than on
+`target_os` directly, which is why the same flag drives the
+host-selectable `rtems-exec-model` feature.
+
+### 12.3 Post-merge seam growth the stages absorbed without reshaping
+
+§7's prerequisite list (`spawn`, `TaskHandle`, `TaskAbortHandle`,
+`interval`, `background_init`, `future_exec`, `timer_sleep`) arrived
+with the CA merge and kept growing: stage 1's `timeout` is no longer a
+thin tokio delegation but a dual-backend pair (`task.rs:508`/`:515`),
+and the seam now also carries `timeout_at`, a backend-selected
+`Instant` alias, and `TaskSet`. None of it changed any stage's shape —
+the connection loop's three timer sites still name only the seam.
+
+### 12.4 Item close-out: the owed rename landed; what remains is item 9
+
+The rename this design carried as "owed post-merge" — `AbortOnDrop` and
+the `finish_exec_data_task` abort parameter naming
+`tokio::task::AbortHandle` — landed as `04cdf6fa`: three annotations
+onto the seam aliases (`AbortOnDrop(TaskAbortHandle)`, the abort
+parameter, and `spawn_monitor_subscriber`'s `TaskHandle<()>` return),
+no behaviour change, 11 of the 14 RTEMS errors the module reported
+closed by it. The direct tokio-handle namings that remain in the
+workspace are all in host-only modules — `server_native/{udp,runtime}.rs`
+(cfg-gated off RTEMS), `epics-ca-rs`'s hosted async server
+(`server/tcp.rs`), and the PVA gateway's `channel_cache.rs` — which is
+item 9's sweep (§6), its scope unchanged by item 5's close.

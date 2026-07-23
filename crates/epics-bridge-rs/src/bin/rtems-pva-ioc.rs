@@ -549,6 +549,30 @@ mod ioc {
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
         let link_count = resolver.link_count();
 
+        // (2b) Periodic scan + PINI. C `iocInit` owns `scanInit` (`dbScan.c`)
+        //      independent of any network server; in this tree the
+        //      `ScanScheduler` is driven only by the CA server's run loop
+        //      (`epics-ca-rs` `ca_server.rs:1313`) — a server this binary
+        //      does not have, so without this step every periodic `SCAN`
+        //      field in the database is silently dead on the PVA-only
+        //      target (found by the §8 load probe, whose self-counting
+        //      members never counted). Safe against doubling by
+        //      construction: `try_claim_scan_start` makes any second
+        //      scheduler on the same database a non-owner that parks, so a
+        //      process runs exactly one set of `scan-%g` threads no matter
+        //      how many entry points start one. The handle is dropped
+        //      deliberately — `runtime::task::spawn`'s handle does not
+        //      abort on drop (the C6 tick task relies on the same fact,
+        //      measured on target).
+        {
+            let scan_db = db.clone();
+            epics_base_rs::runtime::task::spawn(async move {
+                epics_base_rs::server::scan::ScanScheduler::new(scan_db)
+                    .run()
+                    .await;
+            });
+        }
+
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.
         //

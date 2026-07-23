@@ -55,8 +55,31 @@ spec whose only difference from that nightly's builtin is the one key.
 |---|---|---|
 | `scripts/rtems-check.sh` (the portability gate) | default `TARGET="$(./scripts/rtems-tls-spec.sh)"` + `-Zjson-target-spec`; `RTEMS_USE_STOCK_SPEC=1` reverts to the builtin | yes |
 | `scripts/rtems-tls-spec.sh` | the generator itself | yes |
-| box `~/rtems-bringup/build-*.sh`, `build-measure.sh` (real image + measurement builds) | `--target "$(…/rtems-tls-spec.sh)" -Zjson-target-spec` + `CARGO_TARGET_ARMV7_RTEMS_EABIHF_TLS_LINKER=arm-rtems6-gcc` | no — box tooling, not tracked here; updated on the box the same day |
+| box `~/rtems-bringup/build-{ca,measure,qsrv,stage5,pva}.sh` (real image + measurement builds) | `--target "$(…/rtems-tls-spec.sh)" -Zjson-target-spec` + `CARGO_TARGET_ARMV7_RTEMS_EABIHF_TLS_LINKER=arm-rtems6-gcc`, all behind `RTEMS_USE_STOCK_SPEC=1` | no — box tooling, not tracked here; updated on the box the same day. `build-ca.sh`/`build-measure.sh` 2026-07-24 morning, the other three the same evening (they were left alone while a measurement panel was mid-run). See §3.1 for `build-pva.sh`. |
 | CI (`.github/workflows/rust.yml`) | **nothing to wire.** CI does not build the RTEMS target: its RTEMS coverage is the `rtems-exec-model` feature compiled for the *host* (linux), which is spec-independent, and `rtems-check.sh` is deliberately excluded from CI (it is red on stock `libc`, unrelated to this spec). The spec gate runs on the box. | n/a |
+
+### 3.1 `build-pva.sh` is dead, and was reporting success while dead
+
+Wiring the last three box scripts turned up a pre-existing false green.
+`build-pva.sh` builds `-p epics-pva-rs --bin rtems-pva-ioc`, but that binary
+moved to `epics-bridge-rs` (`doc/qsrv-rtems-design.md` §9.7) and now declares
+`required-features = ["qsrv-core", "pvalink"]`; `epics-pva-rs` produces no
+RTEMS binary at all, which its own `Cargo.toml` says in two comments. So
+`cargo build` has been failing with `no bin target named rtems-pva-ioc in
+epics-pva-rs`.
+
+The script had no `set -e` and piped cargo into `tail`, so the failure was
+swallowed twice over: it went on to `cp` and re-stage the *previous*
+`pvaioc.exe` and exited **0**. Measured 2026-07-24: the pre-change script
+exits 0 while staging a binary dated the day before; with the spec wiring and
+`set -e -o pipefail` (as `build-ca.sh` has always had) it exits 101 and stages
+nothing.
+
+The script is not repaired here, because it has no role left to repair *to*:
+its distinguishing feature was a PVA server image without `qsrv-core`, and
+that target no longer exists. `build-qsrv.sh` (`qsrv-core,pvalink,
+bringup-probes`) and `build-stage5.sh` (`qsrv-core,pvalink`) cover what
+remains. It should be deleted rather than re-pointed.
 
 `cargo check` does not link, so the gate needs no BSP/linker; a real image
 build does, hence the `CARGO_TARGET_..._LINKER` env on the box (the checkout's

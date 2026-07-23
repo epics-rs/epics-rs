@@ -22,8 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::TaskHandle;
 use tokio::sync::{Notify, oneshot, watch};
-use tokio::task::JoinHandle;
 
 use crate::error::{PvaError, PvaResult};
 
@@ -44,8 +44,12 @@ enum WaitOutcome<T> {
 /// Handle to an in-flight operation. Pairs with the operation type
 /// returned by `PvaClient::start_*` async methods.
 pub struct PvaOperation<T: Send + 'static> {
-    /// Spawned task running the underlying op.
-    join: JoinHandle<()>,
+    /// Spawned task running the underlying op. The seam's handle type
+    /// (`tokio::task::JoinHandle` hosted, the runtime-free mirror on RTEMS) —
+    /// it is what [`crate::client_native::operation`]'s `spawn` hands back and
+    /// the only three methods used here (`abort`, `is_finished`, `await`) are
+    /// the ones the mirror reproduces.
+    join: TaskHandle<()>,
     /// Receiver for the op's final result. held by value (not
     /// `take`-n out per wait) and polled by `&mut`, so a `wait` that
     /// times out or is interrupted leaves the receiver in place and a
@@ -92,7 +96,7 @@ impl<T: Send + 'static> PvaOperation<T> {
         // it drops exactly when the future stops running (completion,
         // abort, or panic-unwind), closing the channel.
         let (term_tx, terminated_rx) = watch::channel(());
-        let join = tokio::spawn(async move {
+        let join = epics_base_rs::runtime::task::spawn(async move {
             let _term_tx = term_tx;
             let v = fut.await;
             let _ = tx.send(v);
@@ -163,7 +167,7 @@ impl<T: Send + 'static> PvaOperation<T> {
         let outcome = match timeout {
             // On timeout the body (and its `&mut` borrow of `result_rx`)
             // is dropped, leaving the receiver intact in `self`.
-            Some(d) => match tokio::time::timeout(d, body).await {
+            Some(d) => match epics_base_rs::runtime::task::timeout(d, body).await {
                 Ok(o) => o,
                 Err(_) => return Err(PvaError::Timeout),
             },
@@ -221,7 +225,18 @@ impl<T: Send + 'static> PvaOperation<T> {
 
     /// True iff the spawned task has finished.
     pub fn is_done(&self) -> bool {
-        self.join.is_finished()
+        // Same source of truth as [`Self::cancel`]'s synchronization point:
+        // the operation's RAII termination guard (`terminated_rx`). Its
+        // `watch::Sender` lives inside the spawned task and drops exactly when
+        // the future stops running (completion, abort, or unwind), so a closed
+        // channel is the operation's own definition of "no longer running"
+        // (see the `terminated_rx` field doc). `join.is_finished()` is a
+        // second, weaker signal: under the exec-model seam the task's
+        // finished flag flips at a *different* instant than the guard drop, so
+        // `cancel()` — which awaits the guard — could return while
+        // `is_finished()` still read `false`. Reading the guard here keeps the
+        // two in lockstep by construction rather than by timing.
+        self.terminated_rx.has_changed().is_err()
     }
 }
 
@@ -236,7 +251,7 @@ impl<T: Send + 'static> Drop for PvaOperation<T> {
 
 async fn wait_for_cancel(flag: Arc<std::sync::atomic::AtomicBool>) {
     while !flag.load(std::sync::atomic::Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -255,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn wait_times_out() {
         let mut op = PvaOperation::<()>::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
         let r = op.wait(Some(Duration::from_millis(50))).await;
@@ -265,12 +280,12 @@ mod tests {
     #[tokio::test]
     async fn interrupt_wakes_waiter_op_continues() {
         let mut op = PvaOperation::<i32>::spawn(async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(7)
         });
         let interrupter = op.interrupt.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
         let r = op.wait(Some(Duration::from_secs(5))).await;
@@ -294,7 +309,7 @@ mod tests {
     async fn timeout_and_interrupt_are_distinct_variants() {
         // Real deadline: op never completes within the window.
         let mut slow = PvaOperation::<()>::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
         let deadline = slow.wait(Some(Duration::from_millis(30))).await;
@@ -303,12 +318,12 @@ mod tests {
 
         // Interrupt path: woken before completion.
         let mut op = PvaOperation::<i32>::spawn(async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(1)
         });
         let interrupter = op.interrupt.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
         let interrupted = op.wait(Some(Duration::from_secs(5))).await;
@@ -319,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_aborts_op() {
         let mut op = PvaOperation::<i32>::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(0)
         });
         // Cancelling an in-flight op reports it was active and, as a
@@ -364,7 +379,7 @@ mod tests {
         let op = PvaOperation::<()>::spawn(async move {
             // Keep the Arc alive until the task is dropped/aborted.
             let _inner = inner;
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
         assert_eq!(StdArc::strong_count(&held), 2, "task holds the resource");
@@ -389,7 +404,7 @@ mod tests {
         let inner = held.clone();
         let op = PvaOperation::<()>::spawn(async move {
             let _inner = inner;
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
         assert_eq!(StdArc::strong_count(&held), 2);
@@ -399,7 +414,7 @@ mod tests {
             if StdArc::strong_count(&held) == 1 {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
             StdArc::strong_count(&held),
@@ -414,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_then_wait_again_recovers_result() {
         let mut op = PvaOperation::<i32>::spawn(async {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
             Ok(99)
         });
         // First wait deadline expires before the op completes.
@@ -430,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_timeouts_do_not_consume() {
         let mut op = PvaOperation::<i32>::spawn(async {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
             Ok(5)
         });
         for _ in 0..3 {
@@ -452,7 +467,7 @@ mod tests {
         // Let the task fully terminate without consuming the result: once
         // it is finished the result has been sent and is buffered.
         while !op.is_done() {
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
         }
         // Completed → cancel reports not-active and is a no-op for the result.
         assert!(
@@ -472,7 +487,7 @@ mod tests {
     async fn cancel_after_complete_preserves_err_result() {
         let mut op = PvaOperation::<i32>::spawn(async { Err(PvaError::Protocol("boom".into())) });
         while !op.is_done() {
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
         }
         assert!(!op.cancel().await);
         let r = op.wait(Some(Duration::from_secs(1))).await;

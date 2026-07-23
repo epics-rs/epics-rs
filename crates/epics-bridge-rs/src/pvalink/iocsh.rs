@@ -410,7 +410,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> PvaLinkResolver {
-        PvaLinkResolver::new(tokio::runtime::Handle::current())
+        PvaLinkResolver::new()
     }
 
     #[tokio::test]

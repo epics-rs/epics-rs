@@ -120,10 +120,12 @@ impl TickDriver {
         {
             match crate::runtime::task::block_on_sync(fut) {
                 Ok(out) => out,
-                // `NotBlockable` means a current-thread tokio runtime is
-                // entered on this thread — impossible on a thread this
-                // module just spawned with `std::thread::Builder`.
-                Err(e) => unreachable!("periodic scan thread cannot be inside a runtime: {e}"),
+                // Both `NotBlockable` variants name a thread this is not: a
+                // current-thread tokio runtime's own thread, or a
+                // background-facility worker. A periodic scan thread is
+                // neither — this module just spawned it with
+                // `std::thread::Builder` and it runs no facility loop.
+                Err(e) => unreachable!("a periodic scan thread is blockable: {e}"),
             }
         }
     }

@@ -9,18 +9,38 @@ use tokio::runtime::RuntimeFlavor;
 pub use tokio::runtime::Handle as RuntimeHandle;
 
 /// A synchronous caller asked to block on an async operation from a thread
-/// where blocking cannot be made sound: a **current-thread** tokio runtime.
+/// where blocking cannot be made sound.
 ///
-/// Parking that thread stops every task on that runtime, including whichever
-/// one holds the state the awaited future is waiting for — so the block would
-/// never be woken. No blocking mechanism can fix this; the caller has to `await`
-/// the async operation instead of blocking on it.
+/// Both variants are the same defect seen through two executors: the calling
+/// thread is one the awaited future needs in order to make progress, so parking
+/// it parks the thing that would wake it. No blocking mechanism can fix that;
+/// the caller has to `await` the async operation instead of blocking on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotBlockable;
+pub enum NotBlockable {
+    /// A **current-thread** tokio runtime is entered on this thread. Parking it
+    /// stops every task on that runtime, including whichever one holds the
+    /// state the awaited future is waiting for.
+    CurrentThreadRuntime,
+    /// This thread is a background-facility worker — a callback band, the
+    /// delayed-callback timer, or the scanOnce worker
+    /// ([`crate::runtime::background`]). Each facility has a bounded worker set
+    /// and every unit of work it carries is enqueued for those workers, so a
+    /// parked worker is waiting for work only it could have run. On RTEMS
+    /// [`spawn`] routes here, which makes the callback bands the one other
+    /// place where parking is unsound.
+    BackgroundWorker,
+}
 
 impl std::fmt::Display for NotBlockable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cannot block a current-thread runtime")
+        match self {
+            NotBlockable::CurrentThreadRuntime => {
+                f.write_str("cannot block a current-thread runtime")
+            }
+            NotBlockable::BackgroundWorker => {
+                f.write_str("cannot block a background-facility worker thread")
+            }
+        }
     }
 }
 
@@ -98,23 +118,35 @@ fn park_on<F: Future>(fut: F) -> F::Output {
 /// the thread we are actually on.
 ///
 /// This is the single owner of "sync call over async state" in this crate; the
-/// three caller contexts are not interchangeable and picking one mechanism for
+/// four caller contexts are not interchangeable and picking one mechanism for
 /// all of them is what makes such bridges panic:
 ///
+/// - **A background-facility worker** —
+///   [`Err(BackgroundWorker)`](NotBlockable::BackgroundWorker), checked first,
+///   because it is a property of the *thread* and holds whatever runtime is or
+///   is not entered on it. See
+///   [`background::facility::on_facility_thread`](crate::runtime::background)
+///   for why parking one is unsound.
 /// - **No runtime entered** (a plain `std::thread`, an iocsh thread) — park the
 ///   thread. Nothing else runs here, so there is nothing to starve; the tasks
 ///   that will wake us live on some other runtime's threads.
 /// - **Multi-thread runtime worker** — [`tokio::task::block_in_place`], which
 ///   hands this worker's remaining tasks to a sibling before it is parked.
-/// - **Current-thread runtime** — [`Err(NotBlockable)`](NotBlockable). Parking
+/// - **Current-thread runtime** —
+///   [`Err(CurrentThreadRuntime)`](NotBlockable::CurrentThreadRuntime). Parking
 ///   the only thread of that runtime halts every task on it, including the one
-///   that would wake us. This is unsound for *any* blocking mechanism, so it is
-///   reported to the caller instead of being panicked on (today) or deadlocked
-///   on (the worse alternative).
+///   that would wake us.
+///
+/// The two refusals are reported to the caller rather than panicked on (today)
+/// or deadlocked on (the worse alternative) — an illegal blocking bridge is a
+/// value the caller must handle, not a review item.
 pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
+    if crate::runtime::background::facility::on_facility_thread() {
+        return Err(NotBlockable::BackgroundWorker);
+    }
     match RuntimeHandle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
-            RuntimeFlavor::CurrentThread => Err(NotBlockable),
+            RuntimeFlavor::CurrentThread => Err(NotBlockable::CurrentThreadRuntime),
             _ => Ok(tokio::task::block_in_place(|| handle.block_on(fut))),
         },
         Err(_) => Ok(park_on(fut)),
@@ -1312,7 +1344,8 @@ where
 ///
 /// Nothing is lost by declining it. What inheriting buys is stated above —
 /// `spawn` and the timer inside `block_on_sync` — and under a `CurrentThread`
-/// ambient `block_on_sync` returns `Err(NotBlockable)`, so every one of those
+/// ambient `block_on_sync` returns
+/// [`Err(CurrentThreadRuntime)`](NotBlockable::CurrentThreadRuntime), so every one of those
 /// powers is unreachable anyway. Inheriting it can only convert a thread that
 /// would have worked into one that cannot block at all. Measured as exactly
 /// that: the PVA client's blocking byte pumps
@@ -1584,6 +1617,110 @@ mod tests {
         assert_eq!(name.as_deref(), Some("dedicated-no-runtime"));
         assert_eq!(value, Some(5));
         joined.join().expect("dedicated thread joined");
+    }
+
+    // --- The band-blocking invariant (doc/pvalink-rtems-design.md §2.3) ------
+    //
+    // MUST NOT: work running on a background-facility worker thread — a
+    // callback band, the delayed timer, the scanOnce worker — block that
+    // thread on async progress. The gate is `block_on_sync`; the mark is set
+    // by `background::facility::run_facility_loop`, the one function every
+    // worker loop goes through.
+    //
+    // Each of the three cases below is written so that a *broken* gate fails
+    // the test instead of hanging it: the awaited future is completable from
+    // the test thread, so a worker that parked can always be released before
+    // the assertion runs and the pool's `Drop` can still join it.
+
+    /// The case the invariant exists for: a future spawned onto a callback
+    /// band. On RTEMS this is exactly what [`spawn`] produces, and the band has
+    /// one worker — parking it stops every deferred callback, every FLNK tail
+    /// and every other monitor on that band.
+    #[test]
+    fn a_future_on_a_callback_band_is_refused_a_blocking_bridge() {
+        use crate::runtime::background::callback_executor::CallbackPool;
+        use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_future};
+
+        let pool = CallbackPool::new();
+        // Held by the test: `recv()` never completes until we send, so a gate
+        // that does not refuse leaves the worker parked here.
+        let (release, mut park_here) = tokio::sync::mpsc::channel::<()>(1);
+        let (report, outcome) = std::sync::mpsc::channel();
+
+        let _handle = spawn_future(&pool.handle(), DEFAULT_SPAWN_PRIORITY, async move {
+            let _ = report.send(block_on_sync(async move { park_here.recv().await }));
+        });
+
+        let got = outcome.recv_timeout(Duration::from_secs(5));
+        // Release a worker the gate failed to protect, so the assertions below
+        // report a failure instead of hanging `CallbackPool::drop`'s join.
+        let _ = release.try_send(());
+
+        match got {
+            Ok(result) => assert_eq!(
+                result.map(|v| v.is_some()),
+                Err(NotBlockable::BackgroundWorker),
+                "a band worker must be refused the blocking bridge, not given one"
+            ),
+            Err(_) => panic!(
+                "the band worker parked inside block_on_sync instead of being \
+                 refused — the band has one worker, so this is the deadlock the \
+                 invariant exists to prevent"
+            ),
+        }
+    }
+
+    /// The same thread, reached the other way: `spawn_blocking` also lands on a
+    /// band worker under the exec backend, and a blocking closure holds that
+    /// worker for its whole run. The rule is a property of the thread, so it
+    /// must not depend on which spawn put the work there.
+    #[test]
+    fn a_blocking_closure_on_a_callback_band_is_refused_too() {
+        use crate::runtime::background::callback_executor::CallbackPool;
+        use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
+
+        let pool = CallbackPool::new();
+        let (release, mut park_here) = tokio::sync::mpsc::channel::<()>(1);
+        let (report, outcome) = std::sync::mpsc::channel();
+
+        let _handle = spawn_blocking_on(&pool.handle(), DEFAULT_SPAWN_PRIORITY, move || {
+            let _ = report.send(block_on_sync(async move { park_here.recv().await }));
+        });
+
+        let got = outcome.recv_timeout(Duration::from_secs(5));
+        let _ = release.try_send(());
+
+        match got {
+            Ok(result) => assert_eq!(
+                result.map(|v| v.is_some()),
+                Err(NotBlockable::BackgroundWorker),
+                "the refusal keys on the thread, not on how work reached it"
+            ),
+            Err(_) => panic!("the band worker parked instead of being refused"),
+        }
+    }
+
+    /// The other side of the boundary, so the gate cannot be satisfied by
+    /// refusing everything: an ordinary thread that merely *submits* to the
+    /// pool still blocks. The mark covers the worker loop's own thread and
+    /// nothing else.
+    #[test]
+    fn a_thread_that_only_submits_to_a_band_still_blocks() {
+        use crate::runtime::background::callback_executor::{CallbackPool, CallbackPriority};
+
+        let pool = CallbackPool::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pool.request(
+            CallbackPriority::Medium,
+            Box::new(move || tx.send(1u32).unwrap()),
+        )
+        .expect("the band accepts the callback");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        assert_eq!(
+            block_on_sync(async { 5u32 }),
+            Ok(5),
+            "the submitting thread runs no facility loop, so it may still park"
+        );
     }
 
     #[tokio::test]

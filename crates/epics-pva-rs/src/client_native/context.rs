@@ -15,7 +15,8 @@
 //! Public API stays compatible with the previous shape so existing callers
 //! (pvget-rs, pvput-rs, pvmonitor-rs, pvinfo-rs) keep working.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -508,12 +509,17 @@ pub enum CacheAction {
 /// searches are held only by an awaiting caller's `oneshot` receiver), so
 /// dropping it here cannot orphan engine state.
 async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration) {
-    let mut tick = tokio::time::interval(period);
+    // Through the seam so this loop runs on the RTEMS callback band as well as
+    // the tokio runtime (stage 3). The seam ticker is `MissedTickBehavior::
+    // Burst`, not `Delay`; for a periodic cache sweeper the two differ only in
+    // how a *missed* deadline is made up (Burst fires the backlog immediately,
+    // Delay spreads it) and the work is idempotent — an extra sweep removes
+    // nothing a later one would have — so the distinction is immaterial here.
+    let mut tick = epics_base_rs::runtime::task::interval(period);
     // pvxs arms the timer with `event_add(cacheCleaner, &channelCacheCleanInterval)`
     // (client.cpp:666), i.e. the first sweep fires after one interval, not at
     // startup. Consume the immediate first tick so the first real sweep is one
     // `period` away.
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tick.tick().await;
@@ -738,7 +744,7 @@ impl PvaClient {
         // `Weak<ClientInner>` and is spawned inside the Tokio runtime that
         // every channel op already runs in; `Once` guarantees a single task.
         self.inner.cache_cleaner.call_once(|| {
-            tokio::spawn(cache_clean_loop(
+            epics_base_rs::runtime::task::spawn(cache_clean_loop(
                 Arc::downgrade(&self.inner),
                 CHANNEL_CACHE_CLEAN_INTERVAL,
             ));
@@ -2987,7 +2993,7 @@ impl<'a> ConnectBuilder<'a> {
         // held under the cancel select, so dropping the handle stops it.
         let ch_drive = ch.clone();
         let cancel_drive = cancel.clone();
-        let driver = tokio::spawn(async move {
+        let driver = epics_base_rs::runtime::task::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -3010,7 +3016,7 @@ impl<'a> ConnectBuilder<'a> {
             }
         });
 
-        let task = tokio::spawn(async move {
+        let task = epics_base_rs::runtime::task::spawn(async move {
             // pvxs invokes the initial callback right after building the
             // channel: `onConnect` if already active, otherwise
             // `onDisconnect` once (client.cpp:274-282). A fresh channel
@@ -3116,7 +3122,7 @@ impl<'a> ConnectBuilder<'a> {
 ///   [`ConnectHandle::wait`].
 pub struct ConnectHandle {
     cancel: tokio_util::sync::CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<epics_base_rs::runtime::task::TaskHandle<()>>,
     /// Teardown mode selected by [`ConnectBuilder::sync_cancel`]; consulted
     /// only by `Drop` (an explicit `wait()` is always synchronous).
     sync_cancel: bool,
@@ -3402,6 +3408,11 @@ mod tests {
     /// which guards the same invariant at the `ensure_active` layer; this
     /// guards that the public `context.rs` one-shot APIs actually route
     /// through the op-timeout owner rather than bare `ensure_active`.
+    // Drives a search that never resolves and asserts the op-timeout owner
+    // fires; the search engine's spawned tick `interval` now runs on the
+    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     async fn pva_fr_12_one_shot_ops_fail_at_op_timeout_not_hang() {
         use std::time::Duration;
@@ -3530,7 +3541,7 @@ mod tests {
         let reached_end = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let flag = reached_end.clone();
                 let c = cancel.clone();
                 async move {
@@ -3561,7 +3572,7 @@ mod tests {
         let did_complete = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let flag = did_complete.clone();
                 async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3600,7 +3611,7 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let g = gate.clone();
                 let s = started.clone();
                 let f = finished.clone();
@@ -3634,7 +3645,7 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let c = cancel2.clone();
                 let d = done.clone();
                 async move {

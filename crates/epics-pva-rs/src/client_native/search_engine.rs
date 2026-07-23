@@ -18,7 +18,10 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-// RTEMS-EXEC-MODEL-ALLOW(17): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// (11 tests that spin the live UDP search engine gated out feature-ON below;
+// §4.2 defers UDP search, so their spawned timers/socket cannot run on the
+// reactor-less callback pool — stage 3.)
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -519,6 +522,9 @@ impl SearchTransport {
     /// (`stage1_name_servers_only_resolves_without_binding_udp`) rather
     /// than being production surface that happens to be tested.
     #[cfg(test)]
+    // Only consumer is the gated `stage1_name_servers_only_resolves_without_binding_udp`,
+    // so it carries the same predicate — otherwise dead code feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
@@ -749,7 +755,7 @@ impl SearchEngine {
         }
 
         let beacons_clone = beacons.clone();
-        tokio::spawn(run_engine(
+        epics_base_rs::runtime::task::spawn(run_engine(
             cmd_rx,
             transport,
             beacons_clone,
@@ -1403,7 +1409,7 @@ async fn run_engine(
             queued_bytes: Arc::clone(&queued_bytes),
         });
         let resp_tx = ns_response_tx.clone();
-        tokio::spawn(ns_task(
+        epics_base_rs::runtime::task::spawn(ns_task(
             ns_addr,
             search_rx,
             resp_tx,
@@ -3076,7 +3082,10 @@ fn _suppress(_: PvaHeader) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
+    use crate::proto::{ByteOrder, WriteExt, encode_string_into};
+    // Used only by the gated TCP-name-server tests (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
+    use crate::proto::ControlCommand;
     use serial_test::serial;
 
     /// Client half, same
@@ -4527,6 +4536,10 @@ mod tests {
     /// the Multi responder at deadline even with empty `accumulated`,
     /// so the user-visible future resolves to `Vec::new()` and any
     /// outer `PvaClient::timeout` gets a chance to apply.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn find_all_returns_empty_when_no_responder() {
@@ -4572,6 +4585,10 @@ mod tests {
     /// placed in a sid-hashed bucket up to 30 s away and never
     /// fired (the channel-layer timeout would have cancelled the
     /// caller's oneshot before any tick processed it).
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn reconnect_search_broadcasts_within_one_tick() {
@@ -4663,6 +4680,10 @@ mod tests {
     /// reintroduce a caller-side timeout (or change `find_all`'s
     /// empty-deadline behaviour to fire for `find` too) and
     /// silently revive the disconnect-storm bug.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn reconnect_find_does_not_complete_without_response() {
@@ -4742,6 +4763,10 @@ mod tests {
     /// We observe the BEHAVIOUR (SEARCH packet timing on a sniffer),
     /// not internal state, because internal fields aren't part of
     /// the engine's public contract.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn hurry_up_kicks_pending_searches_at_fast_tick_cadence() {
@@ -4834,6 +4859,10 @@ mod tests {
     ///
     /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
     /// loaded CI. Total runtime ~4 s.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn retry_escalation_pvxs_pattern() {
@@ -4904,6 +4933,10 @@ mod tests {
     /// `extra_targets`, and verifies `find()` resolves to the server's
     /// TCP endpoint. Regression guard against the v6 send path being
     /// dropped or the v6 recv arm losing the SEARCH_RESPONSE.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn client_search_resolves_over_ipv6() {
@@ -4994,6 +5027,10 @@ mod tests {
     /// port, and the advertised `response_port` inside the frame must
     /// equal it. Before the fix the v6 frame carried the v4 socket port
     /// (≠ source) and this assertion fails.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
     async fn v6_search_advertises_v6_socket_port() {
@@ -5091,6 +5128,10 @@ mod tests {
     /// recv arm decodes the beacon, the BeaconTracker observes the
     /// (server_addr, guid) pair, and `beacon_guid_for(addr)` returns
     /// the GUID we sent. Guards the full recv-decode-track chain.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn v6_beacon_arriving_at_engine_is_observed_by_tracker() {
@@ -5198,6 +5239,9 @@ mod tests {
     /// Shared by every test that needs a name server to resolve against, so
     /// the handshake byte layout is written once. The caller owns the returned
     /// handle and is expected to `abort()` it.
+    // Every caller is a gated TCP-name-server test, so it carries the same
+    // predicate — otherwise dead code feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn spawn_mock_name_server(
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
@@ -5346,6 +5390,10 @@ mod tests {
     /// With EPICS_PVA_AUTO_ADDR_LIST=NO the only resolution path is the TCP
     /// NS — pre-fix find() would time out because the NS was never wired into
     /// the search path; post-fix it resolves within the timeout.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn pva_r4_tcp_nameserver_persistent_peer() {
@@ -5412,6 +5460,10 @@ mod tests {
     ///
     /// The resolution half is what proves the degradation is not merely inert:
     /// SEARCH still goes out (over TCP) and the response still lands.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn stage1_name_servers_only_resolves_without_binding_udp() {
@@ -5486,6 +5538,10 @@ mod tests {
     /// name-server connections exactly as on normal servers (clientconn.cpp:215-263),
     /// rather than forcing anonymous. Captures the client's CONNECTION_VALIDATION
     /// reply on the mock NS and asserts the negotiated method + credentials.
+    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
+    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
+    // deferred). Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn pva_rs_51_tcp_nameserver_selects_ca_with_credentials() {

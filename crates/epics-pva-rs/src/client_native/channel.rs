@@ -19,7 +19,8 @@
 //! [`crate::client_native::ops_v2::op_monitor_handle`] for the loop that
 //! re-issues INIT/START on each new server conn.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1259,6 +1260,11 @@ mod tests {
     /// which guards the same invariant for the `Reconnect` reason at the
     /// engine layer; this guards the `Initial` reason at the
     /// `ensure_active` layer where the cap actually lived.
+    // Drives a search that never resolves and asserts the op-timeout owner
+    // fires; the search engine's spawned tick `interval` now runs on the
+    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(epics_env)]
     async fn initial_search_failure_is_owned_by_op_timeout_not_200ms() {

@@ -38,8 +38,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // without that zero meaning anything (`doc/pvalink-rtems-design.md` §1.2, §6
 // item 1). Both remaining uses sit inside `cfg` blocks that the target does not
 // compile, so they name the type by full path and the module resolves cleanly.
+use epics_base_rs::runtime::task::{interval, timeout};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -509,7 +509,7 @@ impl ServerConn {
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
         let bytes_tx_writer = bytes_tx.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut batch = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
@@ -550,7 +550,7 @@ impl ServerConn {
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let out_order_reader = out_order.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
             // client-side segmented-message reassembly. Mirror
@@ -810,7 +810,7 @@ impl ServerConn {
         let last_rx_hb = last_rx_nanos.clone();
         let writer_tx_hb = writer_tx.clone();
         let out_order_hb = out_order.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
             // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
             let hb_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(

@@ -698,7 +698,7 @@ mod ioc {
                         thread::sleep(std::time::Duration::from_secs(10));
                         seq += 1;
                         stage5_report(seq, &probe_resolver, &probe_db);
-                        if seq % 6 == 0 {
+                        if seq.is_multiple_of(6) {
                             stage5_task_and_stack_report(&format!("s5-{seq}"));
                         }
                     }

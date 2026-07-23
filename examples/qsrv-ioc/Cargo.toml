@@ -9,6 +9,11 @@ publish = false
 default = ["ioc"]
 ioc = ["dep:epics-base-rs", "dep:epics-pva-rs", "dep:epics-ca-rs", "dep:epics-bridge-rs", "epics-bridge-rs/qsrv"]
 
+[[bin]]
+name = "qsrv-ioc"
+path = "src/main.rs"
+required-features = ["ioc"]
+
 [dependencies]
 epics-base-rs = { workspace = true, optional = true }
 epics-pva-rs = { workspace = true, optional = true }

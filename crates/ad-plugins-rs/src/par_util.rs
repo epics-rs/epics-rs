@@ -8,6 +8,7 @@ pub const PAR_THRESHOLD: usize = 4096;
 
 /// Number of CPU cores reserved for driver threads, tokio runtime, etc.
 /// The rayon pool will use `available_cores - RESERVED_CORES` threads (minimum 1).
+#[cfg(feature = "parallel")]
 const RESERVED_CORES: usize = 2;
 
 /// Returns true if the data size warrants parallel processing.

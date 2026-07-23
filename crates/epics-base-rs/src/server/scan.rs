@@ -1,10 +1,11 @@
-// RTEMS-EXEC-MODEL-ALLOW(5): the teardown test drives the scheduler from a
-// tokio task (spawn/abort are its cancellation instrument) and the four
-// ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run) use
-// the tokio test runtime only as the start-context `ScanOwner::start`
-// requires; the scan/owner threads under test go through the exec seam
-// (`block_on_sync` → `park_on`) when the feature is on — all five verified
-// passing under --features rtems-exec-model.
+// RTEMS-EXEC-MODEL-ALLOW(6): the teardown test drives the scheduler from a
+// tokio task (spawn/abort are its cancellation instrument) and the five
+// ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run,
+// tick-runs-on-its-own-thread) use the tokio test runtime only as the
+// start-context `ScanOwner::start` requires; the scan/owner threads under
+// test go through the exec seam (`block_on_sync` → `park_on`) when the
+// feature is on — all six verified passing under --features
+// rtems-exec-model.
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -459,6 +460,83 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// `doc/pi-lock-evaluation.md` §6 step 2 — the periodic scan's *record
+    /// processing* must run on the rate's own banded `scan-%g` thread, not
+    /// on a shared tokio worker. Under the previous `JoinSet::spawn` shape
+    /// each tick body ran on whatever pool worker picked the task up, so
+    /// the `ScanLow + ind` ladder applied to nothing that did work: the
+    /// scan inherited the pool's scheduling class (measured tail in
+    /// `doc/rtlinux-rt-measurement.md` §2). Pinning the *executing* thread
+    /// is what makes the band load-bearing; asserting the thread merely
+    /// exists (`periodic_ladder_matches_dbscan`) does not.
+    ///
+    /// Observed from inside `Record::process`, which the framework calls
+    /// synchronously on whichever thread drives the tick's future.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_tick_processes_on_its_own_banded_scan_thread() {
+        use crate::error::CaResult;
+        use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+        use crate::types::EpicsValue;
+
+        /// Records the name of the thread its `process()` ran on.
+        struct ThreadProbe(Arc<Mutex<Option<String>>>);
+
+        impl Record for ThreadProbe {
+            fn record_type(&self) -> &'static str {
+                "scan_thread_probe"
+            }
+            fn process(&mut self) -> CaResult<ProcessOutcome> {
+                let name = std::thread::current().name().map(str::to_string);
+                *self.0.lock().expect("probe mutex") = name;
+                Ok(ProcessOutcome::complete())
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "VAL" => Some(EpicsValue::Double(0.0)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+                Ok(())
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &[]
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SCAN:THREAD", Box::new(ThreadProbe(Arc::clone(&seen))))
+            .await
+            .unwrap();
+        // The fastest rate, so one tick lands in ~100 ms.
+        {
+            let rec = db.get_record("SCAN:THREAD").unwrap();
+            rec.write().common.scan = ScanType::Sec01;
+        }
+        db.update_scan_index("SCAN:THREAD", ScanType::Passive, ScanType::Sec01, 0, 0);
+
+        let owner = ScanOwner::start(Arc::clone(&db));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let name = loop {
+            if let Some(n) = seen.lock().expect("probe mutex").clone() {
+                break n;
+            }
+            assert!(Instant::now() < deadline, "the record was never scanned");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        drop(owner);
+
+        let expected = periodic_thread_name(ScanType::Sec01.interval().unwrap());
+        assert_eq!(
+            name, expected,
+            "the .1 second tick processed on `{name}`, not on its own \
+             banded `{expected}` thread — periodic scan is back on a \
+             shared pool"
+        );
     }
 
     /// Wait until `db`'s strong count satisfies `pred`, or panic after 10s.

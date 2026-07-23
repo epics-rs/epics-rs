@@ -222,17 +222,25 @@ static CA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
 #[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
 static CA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the CA
-/// client's dial pool.
+/// BRING-UP PROBE: `(workers created, dial attempts submitted, dials queued,
+/// workers dialing)` for the CA client's dial pool.
 ///
 /// Behind `bringup-probes` with the rest of the measurement rig
 /// (`doc/calink-rtems-design.md` §11.7 item 3): a default image compiles
 /// neither the counter nor this accessor.
+///
+/// The last two are what make the `MAX_DIAL_WORKERS` bound readable rather
+/// than inferable: at the bound the worker count stops climbing, and the only
+/// way to tell that from "no more dials were offered" is that `queued` is
+/// non-zero while `dialing` sits at the bound.
 #[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
-pub fn dial_pool_probe() -> (usize, usize) {
+pub fn dial_pool_probe() -> (usize, usize, usize, usize) {
+    let (queued, dialing) = CA_DIAL_POOL.queue_depth();
     (
         CA_DIAL_POOL.worker_count(),
         CA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        queued,
+        dialing,
     )
 }
 
@@ -690,7 +698,7 @@ async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueu
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
 
     #[cfg(feature = "bringup-probes")]
-    CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let attempt = CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let dialed_rx = match CA_DIAL_POOL.dial(server_addr) {
         Ok(rx) => rx,
         Err(e) => {
@@ -698,7 +706,36 @@ async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueu
             return None;
         }
     };
-    let stream = match dialed_rx.await {
+    // BRING-UP PROBE: how long one dial holds a worker, printed at submit and
+    // at resolve so a console reader can pair them. The target installs no
+    // tracing subscriber, so `println!` is the only reader; the pair is what
+    // distinguishes a dial that was pinned in the OS connect ladder from one
+    // that waited in the pool's queue behind four that were.
+    #[cfg(feature = "bringup-probes")]
+    let submitted = std::time::Instant::now();
+    #[cfg(feature = "bringup-probes")]
+    {
+        let (workers, _, queued, dialing) = dial_pool_probe();
+        println!(
+            "DIALPROBE submit n={attempt} target={server_addr} \
+             workers={workers} queued={queued} dialing={dialing}"
+        );
+    }
+    let dialed = dialed_rx.await;
+    #[cfg(feature = "bringup-probes")]
+    {
+        let outcome = match &dialed {
+            Ok(Ok(_)) => "connected".to_string(),
+            Ok(Err(e)) => format!("error:{e}"),
+            Err(_) => "worker-gone".to_string(),
+        };
+        println!(
+            "DIALPROBE resolve n={attempt} target={server_addr} \
+             elapsed_ms={} outcome={outcome}",
+            submitted.elapsed().as_millis()
+        );
+    }
+    let stream = match dialed {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");

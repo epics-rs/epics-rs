@@ -214,8 +214,19 @@ mod ioc {
     /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
     /// host-side upstream IOC's CA port, which cannot be the guest's own
     /// 5064 because that belongs to the inbound `hostfwd`.
+    ///
+    /// Overridable at *build* time through `C6_NAME_SERVERS`, because the
+    /// measurement rigs differ only in this string and a target image has no
+    /// configuration surface to differ in at runtime: topology B points it at
+    /// the peer guest (`10.0.2.15:5064`), and the `MAX_DIAL_WORKERS` rig needs
+    /// several blackholed addresses at once (`EPICS_CA_NAME_SERVERS` is a
+    /// space-separated list, so `"192.0.2.1:5064 192.0.2.2:5064 …"` is one
+    /// value here). A build that sets nothing keeps the C6 address.
     #[cfg(feature = "bringup-probes")]
-    const C6_NAME_SERVER: &str = "10.0.2.2:15076";
+    const C6_NAME_SERVER: &str = match option_env!("C6_NAME_SERVERS") {
+        Some(s) => s,
+        None => "10.0.2.2:15076",
+    };
 
     /// C6 PROBE: the record the band-occupancy tick writes, and the
     /// interval it aims for. 200 ms is well inside the upstream's 10 Hz

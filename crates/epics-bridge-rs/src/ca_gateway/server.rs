@@ -885,8 +885,8 @@ impl GatewayServer {
         let cache_for_cleanup = cache.clone();
         let upstream_for_cleanup = upstream.clone();
         let stats_for_cleanup = stats.clone();
-        let cleanup_handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(cleanup_interval);
+        let cleanup_handle = epics_base_rs::runtime::task::spawn(async move {
+            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // first tick is immediate, skip
             loop {
                 tick.tick().await;
@@ -909,8 +909,8 @@ impl GatewayServer {
         let upstream_for_stats = upstream.clone();
         let stats_for_refresh = stats.clone();
         let db_for_stats = shadow_db.clone();
-        let stats_handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(stats_interval);
+        let stats_handle = epics_base_rs::runtime::task::spawn(async move {
+            let mut tick = epics_base_rs::runtime::task::interval(stats_interval);
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -926,8 +926,8 @@ impl GatewayServer {
         let heartbeat_handle = if let Some(period) = heartbeat_interval {
             let stats_hb = stats.clone();
             let db_hb = shadow_db.clone();
-            Some(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(period);
+            Some(epics_base_rs::runtime::task::spawn(async move {
+                let mut tick = epics_base_rs::runtime::task::interval(period);
                 tick.tick().await;
                 loop {
                     tick.tick().await;
@@ -1006,7 +1006,7 @@ impl GatewayServer {
             // downstream monitor. Cached mode never touches these.
             let upstream_for_conn = self.upstream.clone();
             let cache_mode = self.config.cache_mode;
-            Some(tokio::spawn(async move {
+            Some(epics_base_rs::runtime::task::spawn(async move {
                 use super::downstream::ConnEventRecv;
                 use epics_ca_rs::protocol::DBE_PROPERTY;
                 use epics_ca_rs::server::ServerConnectionEvent;
@@ -1276,7 +1276,7 @@ impl GatewayServer {
     /// Returns None only on non-Unix. On Unix the watcher is always armed
     /// (SIGUSR2 needs no command file); the handle is aborted at shutdown.
     #[cfg(unix)]
-    fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
+    fn spawn_signal_handler(&self) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
         let cmd_path = self.config.command_path.clone();
         let pvlist_path = self.config.pvlist_path.clone();
         let access_path = self.config.access_path.clone();
@@ -1288,7 +1288,7 @@ impl GatewayServer {
         let beacon_anomaly = self.beacon_anomaly.clone();
         let stats = self.stats.clone();
 
-        Some(tokio::spawn(async move {
+        Some(epics_base_rs::runtime::task::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let mut sigusr1 = match signal(SignalKind::user_defined1()) {
                 Ok(s) => s,
@@ -1365,7 +1365,7 @@ impl GatewayServer {
 
     /// Stub for non-Unix platforms (no SIGUSR1/SIGUSR2).
     #[cfg(not(unix))]
-    fn spawn_signal_handler(&self) -> Option<tokio::task::JoinHandle<()>> {
+    fn spawn_signal_handler(&self) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
         None
     }
 }

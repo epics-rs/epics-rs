@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
+use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::server::snapshot::DbrClass;
@@ -57,7 +58,6 @@ use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
 use epics_ca_rs::protocol::DBE_PROPERTY;
 use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 
 use crate::error::{BridgeError, BridgeResult};
 
@@ -168,7 +168,7 @@ struct UpstreamSubscription {
     /// no-cache PV with no current monitor interest — GETs are still
     /// served via the shadow PV's read hook (fresh upstream fetch), no
     /// persistent subscription needed.
-    task: Option<JoinHandle<()>>,
+    task: Option<TaskHandle<()>>,
     /// The property-monitor-forwarding task — the distinct upstream
     /// `DBE_PROPERTY` subscription that refreshes the shadow PV's
     /// display/control/enum metadata and fans `DBE_PROPERTY` events out
@@ -180,7 +180,7 @@ struct UpstreamSubscription {
     /// [`UpstreamManager::release_prop_monitor`]). `None` otherwise.
     /// Mirrors C ca-gateway's separate `pv->propMonitor()`
     /// (`gatePv.cc:1705`, `:1749-1752`).
-    prop_task: Option<JoinHandle<()>>,
+    prop_task: Option<TaskHandle<()>>,
     /// Whether the connect-time DBR_CTRL metadata seed actually landed.
     /// When `false` (the 500 ms seed timed out or errored), a
     /// [`Self::prop_task`] spawned later (the no-cache lazy path in
@@ -603,7 +603,9 @@ impl UpstreamManager {
             _ => EpicsValue::Double(0.0),
         };
         let initial_value =
-            match tokio::time::timeout(Duration::from_millis(500), channel.get()).await {
+            match epics_base_rs::runtime::task::timeout(Duration::from_millis(500), channel.get())
+                .await
+            {
                 Ok(Ok((_dbf, v))) => v,
                 Ok(Err(e)) => {
                     tracing::info!(
@@ -747,7 +749,7 @@ impl UpstreamManager {
             // metadata too fast to time out.
             false
         } else {
-            match tokio::time::timeout(
+            match epics_base_rs::runtime::task::timeout(
                 self.metadata_seed_timeout,
                 channel.get_with_metadata(DbrClass::Ctrl),
             )
@@ -920,7 +922,7 @@ impl UpstreamManager {
         served_name: &str,
         channel: Arc<CaChannel>,
         initial_monitor: Option<MonitorHandle>,
-    ) -> JoinHandle<()> {
+    ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let stats_for_task = self.write_env.stats.clone();
@@ -933,7 +935,7 @@ impl UpstreamManager {
         // alarm post by `served_name` — the same key the shadow PV and
         // cache were registered under above.
         let name = served_name.to_string();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // Seed the first iteration with the monitor the caller
@@ -969,7 +971,7 @@ impl UpstreamManager {
                             if cache_clone.read().await.get(&name).is_none() {
                                 return;
                             }
-                            tokio::time::sleep(backoff).await;
+                            epics_base_rs::runtime::task::sleep(backoff).await;
                             backoff = std::cmp::min(backoff * 2, max_backoff);
                             continue;
                         }
@@ -1072,7 +1074,7 @@ impl UpstreamManager {
                 // entry has been evicted (nobody cares anymore). The
                 // CaChannel itself drives reconnect under the hood; this
                 // loop merely re-arms the monitor stream once it is back.
-                tokio::time::sleep(backoff).await;
+                epics_base_rs::runtime::task::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
                 if cache_clone.read().await.get(&name).is_none() {
                     return;
@@ -1123,11 +1125,11 @@ impl UpstreamManager {
         served_name: &str,
         channel: Arc<CaChannel>,
         seed_succeeded: bool,
-    ) -> JoinHandle<()> {
+    ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let name = served_name.to_string();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // The very first event of the FIRST subscription is the
@@ -1161,7 +1163,7 @@ impl UpstreamManager {
                         if cache_clone.read().await.get(&name).is_none() {
                             return;
                         }
-                        tokio::time::sleep(backoff).await;
+                        epics_base_rs::runtime::task::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
                     }
@@ -1201,7 +1203,7 @@ impl UpstreamManager {
                 // Subscription closed (upstream disconnect). Back off, then
                 // the top of the loop re-subscribes. Bail if the cache entry
                 // was evicted (nobody cares anymore).
-                tokio::time::sleep(backoff).await;
+                epics_base_rs::runtime::task::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
                 if cache_clone.read().await.get(&name).is_none() {
                     return;

@@ -298,7 +298,7 @@ struct ReplayState {
     replay: Arc<ConnEventReplay>,
     /// Forwarder task: drains the CaServer broadcast, sequence-numbers
     /// each event, appends to the log, and re-broadcasts on `tx`.
-    forwarder: tokio::task::JoinHandle<()>,
+    forwarder: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 impl DownstreamServer {
@@ -498,8 +498,8 @@ fn spawn_conn_event_forwarder(
     mut raw_rx: broadcast::Receiver<ServerConnectionEvent>,
     tx: broadcast::Sender<SeqConnEvent>,
     replay: Arc<ConnEventReplay>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
+    epics_base_rs::runtime::task::spawn(async move {
         // Sequence numbers start at 1 so a consumer's initial
         // `last_seq = 0` means "I have seen nothing"; `events_since(0)`
         // then returns the whole log.

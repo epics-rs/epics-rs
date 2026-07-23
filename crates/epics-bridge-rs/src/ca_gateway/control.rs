@@ -236,8 +236,8 @@ pub fn spawn_control_owner(
     db: Arc<PvDatabase>,
     command_path: Option<std::path::PathBuf>,
     shutdown: Arc<Notify>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
+    epics_base_rs::runtime::task::spawn(async move {
         loop {
             flags.wake.notified().await;
 

@@ -30,7 +30,8 @@ use epics_pva_rs::client::{AssertedIdentity, MarkedRead, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
-    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, SourceRead,
+    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, MonitorStream, OpError,
+    SourceRead,
 };
 
 use super::channel_cache::{
@@ -1015,7 +1016,7 @@ impl GatewayChannelSource {
 /// MONITOR FINISH.
 fn monitor_updates_to_values(
     mut rx: mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
-) -> mpsc::Receiver<PvField> {
+) -> MonitorStream<PvField> {
     let (tx, out) = mpsc::channel(64);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
@@ -1027,7 +1028,7 @@ fn monitor_updates_to_values(
             }
         }
     });
-    out
+    MonitorStream::Channel(out)
 }
 
 impl ChannelSource for GatewayChannelSource {
@@ -1695,7 +1696,7 @@ impl ChannelSource for GatewayChannelSource {
         // single-seed server path uses `subscribe_raw_seeded`).
         self.subscribe_raw_inner(self.cache.clone(), name, None)
             .await
-            .map(|(_initial, updates)| updates)
+            .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
     async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
@@ -1814,7 +1815,7 @@ impl ChannelSource for GatewayChannelSource {
             ctx.pv_request.as_ref(),
         )
         .await
-        .map(|(_initial, updates)| updates)
+        .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
     /// decoded MONITOR with the downstream's event-affecting
@@ -1913,7 +1914,7 @@ impl ChannelSource for GatewayChannelSource {
             // other rule — they carry the upstream event's own changed bitset
             // through `MonitorUpdate::marked` (`moncache.cpp:142`).
             initial,
-            updates,
+            updates: MonitorStream::Channel(updates),
             on_start: None,
         })
     }
@@ -1948,7 +1949,7 @@ impl ChannelSource for GatewayChannelSource {
             // through the decoded path, so it goes on the wire with exactly
             // that bitset.
             initial,
-            updates,
+            updates: MonitorStream::Channel(updates),
             on_start: None,
         })
     }

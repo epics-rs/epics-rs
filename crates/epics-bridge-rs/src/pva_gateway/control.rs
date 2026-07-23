@@ -56,8 +56,10 @@ use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, A
 use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue};
 use epics_pva_rs::server::native_source::AcfCell;
-use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
-use tokio::sync::{RwLock, mpsc};
+use epics_pva_rs::server_native::source::{
+    AccessChecked, ChannelContext, ChannelSource, MonitorStream, OpError,
+};
+use tokio::sync::mpsc;
 
 use super::source::GatewayChannelSource;
 
@@ -668,7 +670,7 @@ impl ChannelSource for ControlSource {
                 }
             }
         });
-        Some(rx)
+        Some(MonitorStream::Channel(rx))
     }
 }
 

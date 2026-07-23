@@ -2340,7 +2340,7 @@ impl ChannelSource for MarkedMonitorSource {
     > {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         self.updates.lock().unwrap().push(tx);
-        Some(rx)
+        Some(epics_pva_rs::server_native::MonitorStream::Channel(rx))
     }
     async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only fixture"))

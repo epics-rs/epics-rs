@@ -977,12 +977,16 @@ Everything here is a claim this document could not settle from source.
    under load (multi-second delivery stalls) but cannot yet attribute it
    between band priority and delivery-path saturation; the attribution
    experiment is listed there. Latency-only, load-only, as predicted.
-6. **The 250-site census count.** Stage 4's bill is derived from
-   `#[tokio::test]` occurrences. The tool also counts hand-built runtimes
-   in test code, which this document did not grep for. The real number is
-   ≥ 250. UNVERIFIED whether `tests/pva_gateway.rs`'s 24 sites count at
-   all, given the module is feature-gated out of the RTEMS selection
-   (§6.3.3).
+6. ~~**The 250-site census count.**~~ **MEASURED — see §9.13.** The
+   as-built census is **392 sites across 33 files**, not 250; the ≥ 250
+   prediction held. The specific open question is also answered:
+   `tests/pva_gateway.rs`'s sites **do** count — §9.13 books `pva_gateway`
+   at 92 (68 in-module plus the 24 in `tests/pva_gateway.rs`), carried
+   under a file-level `RTEMS-EXEC-MODEL-ALLOW` marker ("not built
+   feature-ON by default — behind the `pva-gateway` feature") rather than
+   excluded. The file's marker reads 25 today — one site added since the
+   §9.13 count; the census gate tracks the marker, so the drift is
+   accounted, not silent.
 7. ~~**`scripts/rtems-check.sh` census spelling.**~~ **VERIFIED (stage 1,
    `a6ae5e9b`): underscores.** The census pairs are
    `epics-bridge-rs:ca_gateway_rs`, `:dual_gateway_rs`, `:dual_ioc_rs`,

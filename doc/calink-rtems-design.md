@@ -1890,6 +1890,24 @@ on the pre-fix tree:
 client/mod.rs: production slice no longer contains `runtime::task::timeout_at(`
 ```
 
+**What this commit cost elsewhere, and what caught it.** `timeout_at` needs an
+absolute instant, and on the hosted backend that instant must be tokio's:
+tokio's clock is virtual under `#[tokio::test(start_paused = true)]`, so a
+`std::time::Instant` handed to a tokio timer is a deadline in a different
+timeline. `0d56cf43` therefore named `runtime::task::Instant` as a backend
+alias and re-typed `sleep_until` from `std::time::Instant` to it. That is a
+signature change on a seam function with callers outside the two crates the
+per-crate gate covers, and it broke one: `epics-pva-rs`'s
+`client_native/search_engine.rs` imported `Instant` from `std` and passed it
+to the seam's `sleep_until` (two sites). The crate-scoped
+`clippy -p epics-ca-rs -p epics-base-rs` was green with the workspace not
+compiling. `cargo clippy --workspace --all-targets` caught it; fixed in
+`935c59ac` by taking `Instant` from the seam in that file too — the same
+correction, since it also stamps its deadlines with `now() + window` and waits
+on them with that same `sleep_until`. **The rule this pins: a change to a
+`runtime::task` signature is by definition cross-crate and must be gated at
+workspace scope, never per-crate.**
+
 ### 11.3 Target finding 3 — the banner counted a registry that was still filling
 
 Criterion 1, third boot:

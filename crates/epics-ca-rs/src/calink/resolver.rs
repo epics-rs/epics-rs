@@ -159,8 +159,40 @@ pub struct CaLink {
 /// Reconnect does NOT dispatch here, matching C: `connectionCallback`'s
 /// connect arm schedules attribute and monitor work, and it is the monitor
 /// event that drives processing — which [`run_monitor`] already does.
+///
+/// The same owner also carries the read half of C's cached access rights
+/// (`pca->hasReadAccess`, `dbCa.c:875`/`:1089`). [`Self::note_access_rights`]
+/// is its only writer, and it performs C `accessRightsCallback`'s two steps
+/// (`dbCa.c:1076-1102`) — cache the new rights, then dispatch the CP/CPP
+/// holders when a right is lost while connected — as one owned transition,
+/// for the same reason the disconnect dispatch lives inside
+/// [`Self::mark_disconnected`]: a second site that stored the rights without
+/// dispatching would be the §11.4 defect again on the access axis.
 struct LinkConnState {
     flag: AtomicBool,
+    /// C `pca->hasReadAccess` (`dbCa.c:875`, `:1089`) — the read half of the
+    /// last server-granted access rights. Consulted ONLY by the value read
+    /// ([`CaLink::value`]), exactly as C consults it only in `dbCaGetLink`
+    /// (`dbCa.c:459`); the severity/timestamp/metadata getters (`pcaGetCheck`,
+    /// `dbCa.c:650-660`) and the lset `isConnected` (`dbCa.c:633-641`) check
+    /// `isConnected` alone. The write half (`pca->hasWriteAccess`, consulted
+    /// by `dbCaPutLinkCallback`, `dbCa.c:558`) is deliberately NOT stored
+    /// here: this port enforces it inside the client's put path itself
+    /// (`send_write_notify_fast` / `send_write_nowait_fast` refuse on the
+    /// cached rights — the libca `nciu::write` ECA_NOWTACCESS parity), so a
+    /// second stored copy would have no consumer.
+    ///
+    /// `true` at rest, NOT C's calloc-FALSE. C sets `isConnected` and both
+    /// access flags inside one `pca->lock` critical section
+    /// (`dbCa.c:861-876`), so a connected link never shows the calloc
+    /// default. Here `Connected` and the rights that follow it are two
+    /// broadcast events, and [`run_monitor`] may open the connected gate
+    /// first (a delivered event is proof of liveness), so a `false` default
+    /// would refuse the first monitor value of every ordinary full-rights
+    /// link until the watcher caught up — a spurious startup LINK alarm C
+    /// never shows. The coordinator broadcasts the real rights immediately
+    /// after every `Connected`, so the default only lives for that gap.
+    read_access: AtomicBool,
     /// The database whose CP/CPP holders of `pv_name` must be processed on a
     /// disconnect. Attached after the resolver is mounted, hence the lock and
     /// the `Option`; a `None` here is a link opened with no database, which
@@ -173,6 +205,7 @@ impl LinkConnState {
     fn new(db: Arc<RwLock<Option<PvDatabase>>>, pv_name: String) -> Self {
         Self {
             flag: AtomicBool::new(false),
+            read_access: AtomicBool::new(true),
             db,
             pv_name,
         }
@@ -197,6 +230,56 @@ impl LinkConnState {
         // Drop the read guard before dispatching: the dispatch runs record
         // processing, and holding a lock across it is the deadlock shape
         // `run_monitor` already avoids on the value path.
+        let db_handle = self.db.read().clone();
+        if let Some(db_handle) = db_handle {
+            db_handle.dispatch_external_cp_targets(&self.pv_name);
+        }
+        true
+    }
+
+    /// The read half of the cached access rights — C `dbCaGetLink`'s
+    /// `!pca->hasReadAccess` operand (`dbCa.c:459`).
+    fn has_read_access(&self) -> bool {
+        self.read_access.load(Ordering::Acquire)
+    }
+
+    /// C `accessRightsCallback` (`dbCa.c:1076-1102`) as one owned
+    /// transition. Returns `true` iff the CP/CPP holders were dispatched.
+    ///
+    /// * **Not connected:** do nothing at all — C returns before touching
+    ///   the cached flags (`dbCa.c:1084-1085`, "connectionCallback will
+    ///   handle"). Safe here for the same reason it is in C: the
+    ///   coordinator re-broadcasts the current rights immediately after
+    ///   `Connected` on every (re)connect, so a skipped event is always
+    ///   superseded, and skipping is what keeps a stale rights event
+    ///   queued behind a `Disconnected` from double-dispatching an outage
+    ///   the disconnect edge already dispatched.
+    /// * **Connected:** cache the new read right, then dispatch the
+    ///   holders UNLESS both read and write are held (`dbCa.c:1091`
+    ///   `if (hasReadAccess && hasWriteAccess) goto done`). C processes on
+    ///   the loss of EITHER right — not read loss alone — and processes
+    ///   NOTHING on a full regain: the holder's alarm clears on the next
+    ///   monitor event, not here. The dispatch is per rights change (one
+    ///   `accessRightsCallback` per change in C), not edge-deduplicated.
+    ///
+    /// A dispatched holder whose link lost READ access fails its value
+    /// read ([`CaLink::value`] gates on [`Self::has_read_access`]) and
+    /// commits LINK/INVALID — `dbCa.c:459-463`. A holder whose link lost
+    /// only WRITE access still reads a good value and lands no alarm,
+    /// which is C's outcome too (`dbCaGetLink` does not consult
+    /// `hasWriteAccess`).
+    fn note_access_rights(&self, read: bool, write: bool) -> bool {
+        if !self.flag.load(Ordering::Acquire) {
+            return false;
+        }
+        self.read_access.store(read, Ordering::Release);
+        if read && write {
+            return false;
+        }
+        // Drop the read guard before dispatching — same rule as
+        // `mark_disconnected`: the dispatch runs record processing, and
+        // holding a lock across it is the deadlock shape `run_monitor`
+        // avoids on the value path.
         let db_handle = self.db.read().clone();
         if let Some(db_handle) = db_handle {
             db_handle.dispatch_external_cp_targets(&self.pv_name);
@@ -284,13 +367,26 @@ impl CaLink {
     }
 
     /// Current cached value, or `None` when the link is not servable: no
-    /// event yet, the circuit is down, or the cached snapshot's type/count
-    /// no longer matches the channel after an upstream type/count change
-    /// (C `dbCaGetLink` "not connected" / invalid-cache paths). A
-    /// non-servable link serves no value, so a downstream IOC outage or
-    /// type change does not leak a stale/mis-shaped value into the owning
-    /// record.
+    /// event yet, the circuit is down, READ access is denied, or the cached
+    /// snapshot's type/count no longer matches the channel after an
+    /// upstream type/count change (C `dbCaGetLink` "not connected" /
+    /// invalid-cache paths). A non-servable link serves no value, so a
+    /// downstream IOC outage or type change does not leak a stale/
+    /// mis-shaped value into the owning record.
     pub fn value(&self) -> Option<EpicsValue> {
+        // C `dbCaGetLink`'s full gate is `!pca->isConnected ||
+        // !pca->hasReadAccess` (`dbCa.c:459-463`). The read-access half
+        // lives HERE and not in `with_servable`, because C consults
+        // `hasReadAccess` only for the value read — `pcaGetCheck`
+        // (severity/timestamp/DBF getters, `dbCa.c:650-660`) and the lset
+        // `isConnected` (`dbCa.c:633-641`) check `isConnected` alone. A
+        // read-denied link therefore still reports connected (its circuit
+        // is up; writes may proceed) but serves no value, so a dispatched
+        // CP holder's link read fails and commits LINK/INVALID exactly as
+        // on the disconnect edge.
+        if !self.connected.has_read_access() {
+            return None;
+        }
         self.with_servable(|s| s.value.clone())
     }
 
@@ -703,14 +799,18 @@ async fn run_connection_watcher(
     }
 }
 
-/// Apply one connection event to the live-connection `flag`, returning
+/// Apply one connection event to the [`LinkConnState`] owner, returning
 /// `true` iff this was a `Connected` transition (the caller then kicks
 /// off a metadata refetch). `Disconnected` clears the flag — an echo
 /// timeout arrives as `Disconnected` too, exactly as `CA_OP_CONN_DOWN`
-/// does in C; `AccessRightsChanged`/`NativeTypeChanged` leave it untouched.
-/// Factored out of [`run_connection_watcher`] so the flag logic — the
-/// disconnect-tracking regression — is unit-testable without a live CA
-/// channel.
+/// does in C. `AccessRightsChanged` never touches the flag; it routes
+/// into [`LinkConnState::note_access_rights`] — the C
+/// `accessRightsCallback` (`dbCa.c:1076-1102`), which caches the read
+/// right and dispatches the CP/CPP holders on a rights loss while
+/// connected. `NativeTypeChanged` leaves the state untouched.
+/// Factored out of [`run_connection_watcher`] so the transition logic —
+/// the disconnect-tracking regression — is unit-testable without a live
+/// CA channel.
 fn note_conn_event(evt: &crate::client::ConnectionEvent, state: &LinkConnState) -> bool {
     use crate::client::ConnectionEvent;
     match evt {
@@ -720,6 +820,10 @@ fn note_conn_event(evt: &crate::client::ConnectionEvent, state: &LinkConnState) 
         }
         ConnectionEvent::Disconnected => {
             state.mark_disconnected();
+            false
+        }
+        ConnectionEvent::AccessRightsChanged { read, write } => {
+            state.note_access_rights(*read, *write);
             false
         }
         _ => false,
@@ -1075,17 +1179,78 @@ mod tests {
         assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
         assert!(!connected.is_set());
 
-        // An access-rights change is neutral: it leaves the flag as-is
-        // and signals no refetch.
+        // An access-rights change never touches the connection flag and
+        // signals no refetch — but it is not neutral: it routes into
+        // `note_access_rights` (the C `accessRightsCallback`), which
+        // caches the read right. The flag staying set while the read
+        // gate closes is exactly the read-denied-but-connected state.
         connected.mark_connected();
         assert!(!note_conn_event(
             &ConnectionEvent::AccessRightsChanged {
-                read: true,
-                write: false,
+                read: false,
+                write: true,
             },
             &connected,
         ));
         assert!(connected.is_set());
+        assert!(
+            !connected.has_read_access(),
+            "the watcher must route AccessRightsChanged into note_access_rights"
+        );
+    }
+
+    /// §11.7 item 1: C `accessRightsCallback` (`dbCa.c:1076-1102`) as the
+    /// owner decides it, per invariant boundary — not per narrative:
+    ///
+    /// * rights event while DISCONNECTED → no dispatch AND no flag update
+    ///   (`dbCa.c:1084-1085` returns before touching the cache;
+    ///   "connectionCallback will handle"), so a stale rights event queued
+    ///   behind a `Disconnected` cannot double-dispatch the outage;
+    /// * read lost while connected → dispatch, read gate closes;
+    /// * write lost ALONE while connected → dispatch too: the C gate is
+    ///   `if (hasReadAccess && hasWriteAccess) goto done` (`dbCa.c:1091`),
+    ///   i.e. C processes on the loss of EITHER right, not read alone —
+    ///   but the read gate stays open, so the dispatched holder reads a
+    ///   good value and lands no alarm;
+    /// * full regain → NO dispatch (`dbCa.c:1091`): the holder's alarm
+    ///   clears on the next monitor event, not on the rights edge.
+    #[test]
+    fn access_rights_transitions_follow_dbca() {
+        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+
+        // Disconnected: C's early return. No dispatch, no cache update.
+        assert!(!state.note_access_rights(false, false));
+        assert!(
+            state.has_read_access(),
+            "rights must not change while disconnected — the reconnect \
+             re-delivers the real rights right after Connected"
+        );
+
+        assert!(state.mark_connected());
+
+        // Read lost while connected: dispatch, and the value gate closes.
+        assert!(state.note_access_rights(false, true));
+        assert!(!state.has_read_access());
+
+        // A further change while still degraded (now both lost): C runs
+        // accessRightsCallback once per rights change and dispatches each
+        // time the rights are not fully held — per change, not per edge.
+        assert!(state.note_access_rights(false, false));
+        assert!(!state.has_read_access());
+
+        // Full regain: no dispatch, gate reopens.
+        assert!(!state.note_access_rights(true, true));
+        assert!(state.has_read_access());
+
+        // Write lost alone: dispatch (dbCa.c:1091), read gate stays open.
+        assert!(state.note_access_rights(true, false));
+        assert!(state.has_read_access());
+
+        // The disconnect edge owns its own dispatch; a rights event
+        // arriving after it is the disconnected early-return again — one
+        // outage, one dispatch.
+        assert!(state.mark_disconnected());
+        assert!(!state.note_access_rights(false, false));
     }
 
     /// Stage C6 criterion 4 regression, at the level the invariant is

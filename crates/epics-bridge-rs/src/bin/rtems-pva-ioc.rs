@@ -168,12 +168,21 @@ mod demo_db {
         "  info(Q:group, {\"RTEMS:PVA:GRP\":",
         "{\"message\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":2}}})\n",
         "}\n",
-        // STAGE-5 PROBE (doc/pvalink-rtems-design.md §5 stage 5, topology A).
-        // The records the gate is about: two INP links with `CP` (the monitor
-        // path) and one OUT link (the put path), all naming PVs served by the
-        // host-side upstream IOC. They are in `DEMO_DB` rather than in a `.db`
-        // file because a `-kernel` boot has no filesystem to name one on and
-        // `rtems_init.c:195` hands `main` a fixed one-element argv.
+    );
+
+    /// STAGE-5 PROBE (doc/pvalink-rtems-design.md §5 stage 5, topology A),
+    /// loaded on top of [`DEMO_DB`] only under the `bringup-probes` feature
+    /// (`doc/calink-rtems-design.md` §11.7 item 3's family: measurement rig,
+    /// not IOC content — and the records below are the *only* link-bearing
+    /// records in the built-in set, so a default build is also link-free).
+    ///
+    /// The records the stage-5 gate is about: two INP links with `CP` (the
+    /// monitor path) and one OUT link (the put path), all naming PVs served
+    /// by the host-side upstream IOC. They are compiled in rather than in a
+    /// `.db` file because a `-kernel` boot has no filesystem to name one on
+    /// and `rtems_init.c:195` hands `main` a fixed one-element argv.
+    #[cfg(feature = "bringup-probes")]
+    pub const STAGE5_PROBE_DB: &str = concat!(
         //
         // NOT `@pva://…`, which §5 stage 5 spells: a leading `@` is INST_IO,
         // and `dbCanSetLink` (`record/link.rs:487`, C `dbStaticLib.c:2400`)
@@ -221,6 +230,7 @@ mod demo_db {
     /// `RTEMS:PVA:V0` is the victim: the same self-driven shape, in no
     /// group, monitored across all three phases — its wire cadence is the
     /// jitter readout, since the guest clock is 1-second-quantized.
+    #[cfg(feature = "bringup-probes")]
     pub fn qsrv_load_probe_db() -> String {
         use std::fmt::Write as _;
         let mut db = String::with_capacity(4096);
@@ -321,9 +331,14 @@ mod ioc {
         let mut builder = IocBuilder::new();
         if db_files.is_empty() {
             builder = builder.db_string(DEMO_DB, &macros)?;
-            // QSRV LOAD PROBE members ride along whenever the built-in
-            // database is the source — a bare `-kernel` boot cannot choose.
-            builder = builder.db_string(&crate::demo_db::qsrv_load_probe_db(), &macros)?;
+            // The STAGE-5 and QSRV LOAD probe records ride along whenever the
+            // built-in database is the source — a bare `-kernel` boot cannot
+            // choose — but only on a build that asked for the measurement rig.
+            #[cfg(feature = "bringup-probes")]
+            {
+                builder = builder.db_string(crate::demo_db::STAGE5_PROBE_DB, &macros)?;
+                builder = builder.db_string(&crate::demo_db::qsrv_load_probe_db(), &macros)?;
+            }
         } else {
             for path in db_files {
                 builder = builder.db_file(path, &macros)?;
@@ -364,6 +379,7 @@ mod ioc {
     /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
     /// host-side upstream IOC's TCP port (the guest's own 5075 is taken by
     /// the inbound `hostfwd`, so the upstream cannot also use it).
+    #[cfg(feature = "bringup-probes")]
     const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
 
     // STAGE-5 PROBE: the C task census and stack-usage report — see
@@ -371,13 +387,14 @@ mod ioc {
     // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
     // document extern blocks, and the target build is the only one that
     // compiles this.)
-    #[cfg(target_os = "rtems")]
+    #[cfg(all(target_os = "rtems", feature = "bringup-probes"))]
     unsafe extern "C" {
         fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
         fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
     }
 
     /// STAGE-5 PROBE: `rt top` + `rt stackuse`, from inside the image.
+    #[cfg(feature = "bringup-probes")]
     fn stage5_task_and_stack_report(tag: &str) {
         #[cfg(target_os = "rtems")]
         {
@@ -400,6 +417,7 @@ mod ioc {
     /// on the target the console is the only place the connection count and
     /// the record's alarm state can be read from *inside* the IOC, next to
     /// what `pvxget` reads from outside.
+    #[cfg(feature = "bringup-probes")]
     fn stage5_report(
         seq: u32,
         resolver: &epics_bridge_rs::pvalink::PvaLinkResolver,
@@ -467,6 +485,7 @@ mod ioc {
         // SAFETY (edition 2024): this runs on the single init thread before
         // `background_init` starts any other thread, so no concurrent
         // reader/writer of the environment exists.
+        #[cfg(feature = "bringup-probes")]
         if std::env::var_os("EPICS_PVA_NAME_SERVERS").is_none() {
             unsafe { std::env::set_var("EPICS_PVA_NAME_SERVERS", STAGE5_NAME_SERVER) };
         }
@@ -755,6 +774,7 @@ mod ioc {
         // is the `rt top` / `rt stackuse` reading criterion 6 asks for on a
         // target that starts no shell. Its own thread with a stated stack
         // class, like every other thread this entry point starts.
+        #[cfg(feature = "bringup-probes")]
         {
             let probe_db = db.clone();
             let probe_resolver = resolver.clone();
@@ -1169,14 +1189,9 @@ mod tests {
         let recs =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the built-in database must parse");
-        // STAGE-5 PROBE: three group members plus the three link-bearing
-        // records the stage-5 gate is about (`RTEMS:PVA:DOWN` INP,
-        // `RTEMS:PVA:DOWN2`, `RTEMS:PVA:UPLNK`), which carry no `Q:group` tag.
-        assert_eq!(
-            recs.len(),
-            6,
-            "three group members plus the three pva:// links"
-        );
+        // The three group members and nothing else: the stage-5 link-bearing
+        // records moved to `STAGE5_PROBE_DB`, behind `bringup-probes`.
+        assert_eq!(recs.len(), 3, "the three group members, nothing else");
 
         let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
         for rec in &recs {
@@ -1229,10 +1244,116 @@ mod tests {
         }
     }
 
+    /// The default binary is IOC content only: no stage-5 link records, no
+    /// QSRV load-probe group — and no link fields at all, the same link-free
+    /// default `rtems-ca-ioc` keeps (`doc/calink-rtems-design.md` §11.7
+    /// items 3 and 4).
+    ///
+    /// Runs in every host test pass (the probe rig moved to
+    /// `STAGE5_PROBE_DB` / `qsrv_load_probe_db`, which only exist under
+    /// `bringup-probes`), so a probe record leaking back into `DEMO_DB`
+    /// fails the default `--workspace` suite, not just a feature slice.
+    #[test]
+    fn the_default_database_is_clean_and_link_free() {
+        use std::collections::HashMap;
+
+        let recs =
+            epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
+                .expect("the built-in database must parse");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["RTEMS:PVA:AO", "RTEMS:PVA:LO", "RTEMS:PVA:MSG"],
+            "the default database is the three group members and nothing else"
+        );
+        for rec in &recs {
+            for (field, _) in &rec.fields {
+                assert!(
+                    !matches!(field.as_str(), "INP" | "OUT" | "FLNK"),
+                    "{}.{field} is a link field: the default image must be \
+                     link-free — put link-bearing records behind `bringup-probes` \
+                     or in a loaded .db",
+                    rec.name
+                );
+            }
+        }
+    }
+
+    /// The probe ride-along in `load_database` is behind the feature gate.
+    ///
+    /// The parse tests pin what each constant *contains*; this pins what the
+    /// binary *loads*: an edit that loads the probe databases unconditionally
+    /// would pass every parse test and ship the rig in the default image.
+    #[test]
+    fn the_probe_dbs_load_only_behind_the_feature() {
+        let src = include_str!("rtems-pva-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        for needle in [
+            concat!("crate::demo_db::STAGE5_PROBE_", "DB, &macros"),
+            concat!("crate::demo_db::qsrv_load_probe_", "db(), &macros"),
+        ] {
+            let load_at = prod
+                .find(needle)
+                .expect("the probe database is loaded somewhere in load_database");
+            let before = &prod[load_at.saturating_sub(500)..load_at];
+            assert!(
+                before.contains(concat!("#[cfg(feature = \"bringup-", "probes\")]")),
+                "the `{needle}` load site is not feature-gated: the measurement \
+                 rig would ship in the default image"
+            );
+        }
+    }
+
+    /// With the feature on, the stage-5 rig is exactly the three link
+    /// records the pvalink gate measured with, in both surviving spellings
+    /// (`doc/pvalink-rtems-design.md` §12.2).
+    #[cfg(feature = "bringup-probes")]
+    #[test]
+    fn the_stage5_rig_defines_the_three_link_records() {
+        use std::collections::HashMap;
+
+        let recs = epics_base_rs::server::db_loader::parse_db(
+            crate::demo_db::STAGE5_PROBE_DB,
+            &HashMap::new(),
+        )
+        .expect("the stage-5 probe database must parse");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"],
+            "the stage-5 rig is the two INP links and the OUT link"
+        );
+        let field = |name: &str, field: &str| {
+            recs.iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.fields.iter().find(|(f, _)| f == field))
+                .map(|(_, v)| v.to_string())
+        };
+        assert_eq!(
+            field("RTEMS:PVA:DOWN", "INP").as_deref(),
+            Some("{pva: { pv: 'UPSTREAM:AI', proc: 'CP' }}"),
+            "the pvxs JSON longhand spelling"
+        );
+        assert_eq!(
+            field("RTEMS:PVA:DOWN2", "INP").as_deref(),
+            Some("pva://UPSTREAM:AI CP"),
+            "this tree's scheme+suffix spelling"
+        );
+        assert_eq!(
+            field("RTEMS:PVA:UPLNK", "OUT").as_deref(),
+            Some("{pva: { pv: 'UPSTREAM:AO' }}"),
+            "the put-path OUT link"
+        );
+    }
+
     /// The QSRV load probe (`doc/qsrv-rtems-design.md` §8 items 2/5) must
     /// survive the same offline reading as the demo group: a typo in a
     /// generated fragment would otherwise surface only as a missing PV on a
     /// serial console with no shell to ask.
+    #[cfg(feature = "bringup-probes")]
     #[test]
     fn the_load_probe_defines_the_twenty_member_group() {
         use epics_bridge_rs::qsrv::group_config::{merge_group_defs, parse_info_group};

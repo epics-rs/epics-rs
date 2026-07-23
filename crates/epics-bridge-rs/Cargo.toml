@@ -69,6 +69,17 @@ rtems-exec-model = [
     "epics-ca-rs?/rtems-exec-model",
     "epics-pva-rs?/rtems-exec-model",
 ]
+# The RTEMS bring-up measurement rig for `rtems-pva-ioc` (the family twin of
+# `epics-ca-rs/bringup-probes` — doc/calink-rtems-design.md §11.7 item 3): the
+# stage-5 pvalink probe records (doc/pvalink-rtems-design.md §12), the §8 QSRV
+# load-probe group (doc/qsrv-rtems-design.md §9.14: victim `RTEMS:PVA:V0` plus
+# the 20-member `RTEMS:PVA:BIG`), the `stage5-probe` reporter thread and the
+# compiled-in SLIRP name-server default. OFF by default — the default binary
+# is a clean IOC with no probe records, no probe thread and no link fields at
+# all. The bring-up box's build scripts add this flag to get exactly the
+# measured stage-5/§8 image back. NOT forwarded to `epics-ca-rs`: each target
+# binary's rig rides its own crate's feature.
+bringup-probes = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is

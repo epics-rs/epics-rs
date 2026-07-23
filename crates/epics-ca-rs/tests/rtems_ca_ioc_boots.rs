@@ -204,5 +204,37 @@ mod exec_model {
             child.0.try_wait().expect("poll the child").is_none(),
             "rtems-ca-ioc exited after init:\n{console}"
         );
+
+        // Phase 3 — the measurement rig is a build-time choice
+        // (`doc/calink-rtems-design.md` §11.7 item 3): the `bringup-probes`
+        // build starts the C6 probe threads and announces them; the default
+        // build must start neither. Both announcements are printed from
+        // `main` right after the record listing, so by the end of phase 2 —
+        // which waited on a background thread's dial, well after `main`
+        // finished printing — an absent line is a gated line, not a race.
+        #[cfg(feature = "bringup-probes")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !console.contains("C6 probe") {
+                assert!(
+                    Instant::now() < deadline,
+                    "a bringup-probes build must announce its probe threads:\n{console}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                console = read_log();
+            }
+        }
+        #[cfg(not(feature = "bringup-probes"))]
+        {
+            // One settle read: `main` prints sequentially and finished long
+            // ago, so anything it was ever going to print is on disk by now.
+            std::thread::sleep(Duration::from_secs(1));
+            console = read_log();
+            assert!(
+                !console.contains("C6 probe"),
+                "the default build must not start the C6 measurement rig; \
+                 it belongs behind `--features bringup-probes`:\n{console}"
+            );
+        }
     }
 }

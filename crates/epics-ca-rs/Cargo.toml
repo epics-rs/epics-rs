@@ -136,6 +136,14 @@ client = ["client-core"]
 # the same backend the RTEMS build uses. OFF by default; the hosted default
 # is byte-identical without it. See `crates/epics-base-rs/build.rs`.
 rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
+# The RTEMS bring-up measurement rig (doc/calink-rtems-design.md §6 stage C6,
+# gated by §11.7 item 3): the 14 C6 probe records in `rtems-ca-ioc`'s built-in
+# database, its two probe threads (the tick task and the `c6-probe` reporter),
+# and the compiled-in SLIRP search topology. OFF by default — the default
+# binary is a clean IOC with no probe records, no probe threads and no link
+# fields at all (the link-free image §11.7 item 4 needs). The bring-up box's
+# build scripts add this flag to get exactly the measured C6 image back.
+bringup-probes = []
 # Bundled Prometheus exporter + tracing-subscriber init helpers.
 # Without this feature consumers wire up their own observability
 # stack via the bare `metrics` and `tracing` facades.

@@ -16,6 +16,7 @@ pub mod sync;
 pub mod task;
 pub mod time;
 pub mod version;
+pub mod worker_pool;
 
 // Re-export tokio::select! macro through the runtime facade.
 pub use tokio::select;

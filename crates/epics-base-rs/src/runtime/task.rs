@@ -1536,9 +1536,7 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    let ambient = tokio::runtime::Handle::try_current()
-        .ok()
-        .filter(|h| h.runtime_flavor() != RuntimeFlavor::CurrentThread);
+    let ambient = InheritedRuntime::capture();
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
@@ -1546,10 +1544,66 @@ where
             // Held for the whole body: it is what makes `tokio::spawn` and the
             // timer reachable from this thread, and therefore what lets a future
             // written for the hosted driver run unchanged under `block_on_sync`.
-            let _ambient = ambient.as_ref().map(|h| h.enter());
-            let _ = enter_ioc_thread(priority);
-            f()
+            ambient.run(move || {
+                let _ = enter_ioc_thread(priority);
+                f()
+            })
         })
+}
+
+/// The ambient async context a worker body should run under — captured on the
+/// thread that *submitted* the work, applied on the thread that runs it.
+///
+/// **One owner for the question `spawn_dedicated_thread`'s docs above answer at
+/// length.** Two callers need it and they differ in *when* they capture:
+/// `spawn_dedicated_thread` captures once, at spawn, because the thread it
+/// creates serves exactly one body; `runtime::worker_pool` captures per **job**,
+/// because a pooled worker outlives the runtime that first used it. A pooled
+/// worker that inherited its ambient at creation would hold a `Handle` to a
+/// runtime that has since been dropped — every `#[tokio::test]` builds and drops
+/// its own — and enter it for every later connection.
+///
+/// The `CurrentThread` filter is the rule stated above and must not be
+/// re-derived: a current-thread ambient is *not* inherited, because
+/// `block_on_sync` cannot distinguish "I am that runtime's thread" from "I have
+/// merely entered its handle" and must refuse to park under it.
+#[cfg(tokio_backend)]
+pub(crate) struct InheritedRuntime(Option<tokio::runtime::Handle>);
+
+#[cfg(tokio_backend)]
+impl InheritedRuntime {
+    /// Capture the calling thread's runtime, if it is one a dedicated thread
+    /// may enter.
+    pub(crate) fn capture() -> Self {
+        Self(
+            tokio::runtime::Handle::try_current()
+                .ok()
+                .filter(|h| h.runtime_flavor() != RuntimeFlavor::CurrentThread),
+        )
+    }
+
+    /// Run `f` with the captured context entered for its whole duration.
+    pub(crate) fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _entered = self.0.as_ref().map(|h| h.enter());
+        f()
+    }
+}
+
+/// RTEMS: the exec backend's spawn pool and timer are process-global, so there
+/// is no per-thread context to capture or enter. Same shape so the callers need
+/// no `cfg` of their own.
+#[cfg(exec_backend)]
+pub(crate) struct InheritedRuntime;
+
+#[cfg(exec_backend)]
+impl InheritedRuntime {
+    pub(crate) fn capture() -> Self {
+        Self
+    }
+
+    pub(crate) fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 
 /// RTEMS: a plain thread is already complete — the exec backend's spawn pool
@@ -1627,6 +1681,7 @@ mod tests {
                 "runtime/background/callback_executor.rs",
                 include_str!("background/callback_executor.rs"),
             ),
+            ("runtime/worker_pool.rs", include_str!("worker_pool.rs")),
             ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
             ("server/scan.rs", include_str!("../server/scan.rs")),
         ];

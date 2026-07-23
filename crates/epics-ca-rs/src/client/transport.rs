@@ -213,6 +213,37 @@ const CAC_SEND_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 static CA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
     epics_base_rs::runtime::blocking_io::DialPool::new("CAC-dial", CAC_RECV_PRIORITY);
 
+/// The most concurrent CA circuits this process serves with blocking pumps.
+///
+/// A bound on *creations*, like the dial pool's: every circuit that opens
+/// borrows one two-thread set from [`CA_CIRCUIT_POOL`] and returns it when the
+/// circuit drops, so a client that reconnects to the same server over and over
+/// reuses threads rather than leaking 2 × 176 B per reconnect on RTEMS. Past
+/// the bound a new circuit's pumps are refused (`EAGAIN`), which surfaces as a
+/// failed dial the search engine re-offers — the same shape a refused dial
+/// takes. Generous, because a CA client legitimately holds a circuit per
+/// distinct server.
+#[cfg(any(exec_backend, ca_blocking_client))]
+const CA_CIRCUIT_POOL_CAPACITY: usize = 64;
+
+/// The pumps for every CA circuit, borrowed from a bounded set of permanent
+/// threads. Two bands, asymmetric like C's: the receive pump at
+/// `CAC_RECV_PRIORITY` and the send pump one level above at `CAC_SEND_PRIORITY`
+/// (`tcpiiu.cpp:677-682`), so a client that stops reading cannot starve the
+/// sender. Per band, so it is a separate pool from the PVA client's.
+#[cfg(any(exec_backend, ca_blocking_client))]
+static CA_CIRCUIT_POOL: std::sync::LazyLock<epics_base_rs::runtime::worker_pool::WorkerPool<2>> =
+    std::sync::LazyLock::new(|| {
+        epics_base_rs::runtime::worker_pool::WorkerPool::new(
+            "CAC",
+            epics_base_rs::runtime::blocking_io::circuit_roster(
+                CAC_RECV_PRIORITY,
+                CAC_SEND_PRIORITY,
+            ),
+            CA_CIRCUIT_POOL_CAPACITY,
+        )
+    });
+
 /// BRING-UP PROBE: dial attempts submitted to [`CA_DIAL_POOL`] since boot.
 ///
 /// The denominator of the on-target bound measurement. `worker_count()` alone
@@ -766,11 +797,9 @@ async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueu
     // is the bound on writing one whole frame, which is the same number
     // `write_loop` already applies to its own send.
     let (reader, writer) = match drive_socket_blocking(
+        &CA_CIRCUIT_POOL,
         stream,
-        "CAC",
         &server_addr.to_string(),
-        CAC_RECV_PRIORITY,
-        CAC_SEND_PRIORITY,
         &PumpConfig {
             send_timeout: connection_timeout(),
             ..PumpConfig::default()

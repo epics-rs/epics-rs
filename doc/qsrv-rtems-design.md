@@ -1016,16 +1016,20 @@ Everything here is a claim this document could not settle from source.
    the `signal` feature, so if `ca_gateway` were ever selected for the
    target this would be an unresolved-import error rather than a wrong
    path taken quietly. It is still the arm to fix first if that changes.
-10. **The referenced design docs are not in this repository.**
-   `doc/rtems-priority-locks-design.md` and `doc/pi-lock-evaluation.md`
-   are cited by the H7/H9/L33 commit messages
-   (`e8b6cd50`, `6db95afc`, `5d46ce3b`) and by
-   `epics-base-rs/src/server/database/record_lock.rs`, but
-   `git ls-tree -r` over **all 51 branches** finds neither file. This
-   document therefore quotes L33's disposition from `5d46ce3b`'s own diff
-   text (which reproduces it verbatim in `record_lock.rs`) rather than
-   from §1.1/§5 of the design doc. If those docs exist elsewhere, §5's
-   L33 row should be re-checked against them.
+10. ~~**The referenced design docs are not in this repository.**~~
+   **RESOLVED — both docs exist now, and the L33 re-check is done.**
+   `doc/rtems-priority-locks-design.md` landed on this branch with the
+   scope-B merges; `doc/pi-lock-evaluation.md` is on `main`. The re-check
+   this item asked for: §5's L33 row (written pre-flip: "stays
+   `tokio::sync::Mutex`, blocked on L1's step-4 type flip") is confirmed
+   superseded exactly as §9.1 already records. The design doc's §5.4
+   addendum is written by the panel that *executed* the steps 5–6 type
+   flip on L1, L33 and L7, and the code agrees: `group_config.rs:75`
+   declares `atomic_write_lock:
+   Arc<PriorityInheritanceMutex<()>>`, with its doc comment stating the
+   critical section contains no suspension point since the L1 flip.
+   Nothing in §5's table needs further correction beyond the STALE
+   marking §9.1 put there.
 
 ---
 

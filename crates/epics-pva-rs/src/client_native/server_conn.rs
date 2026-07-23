@@ -269,14 +269,14 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 ///
 /// # Why the thread's connect is plain-blocking, and where the bound lives
 ///
-/// The thread issues `TcpStream::connect`, **not** `connect_timeout`. Measured
-/// on the RTEMS target (QEMU guest-to-guest packet capture): std's
-/// `connect_timeout` — a nonblocking connect plus a `poll` wait — aborts the
-/// attempt immediately instead of honouring its bound, so the kernel answers
-/// the peer's SYN-ACK (~5 ms later) with an RST and every dial with real
-/// network latency fails, while an instant-RST refusal "works". A plain
-/// blocking `connect` demonstrably completes outbound on the same target —
-/// the CA client's dial, C parity with `tcpiiu.cpp`'s blocking `::connect()`.
+/// The thread issues `TcpStream::connect`, **not** `connect_timeout`: the
+/// plain blocking connect is the CA client's proven on-target dial, C parity
+/// with `tcpiiu.cpp`'s blocking `::connect()`, and a thread that owns its
+/// blocking needs no poll machinery. (An earlier measurement blamed
+/// `connect_timeout` for aborting on the RTEMS target; that RST was forged
+/// by the QEMU rig's SLIRP hub port, not sent by the guest, and the claim is
+/// withdrawn — `doc/pvalink-rtems-design.md` §6 item 4. The same target
+/// dials out and connects once the rig is fixed.)
 ///
 /// The application-level bound (`connect_timeout`, pvxs `operationTimeout`)
 /// therefore moves to the awaiting side: `runtime::task::timeout` around the
@@ -307,8 +307,7 @@ async fn dial_blocking(
         move || {
             // Plain blocking `connect`; the application bound is applied by
             // the awaiting side below. See "Why the thread's connect is
-            // plain-blocking" above — `connect_timeout`'s poll path is
-            // broken on the RTEMS target.
+            // plain-blocking" above.
             let _ = dialed_tx.send(std::net::TcpStream::connect(target));
         },
     )

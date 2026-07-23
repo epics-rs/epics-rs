@@ -1688,11 +1688,11 @@ only caller is `server::tcp::handle_client`, itself off-target; `replay.rs:236`
 is reachable only from `ca-replay-rs` (HOST_ONLY); `sync_group.rs:259,306` and
 `bin/*` are tests and host CLIs.
 
-**What this does not do, stated:** the hosted `rtems-exec-model` build still
-cannot boot a link. `AsyncUdpV4` needs a reactor, the host build compiles the UDP
-SEARCH transport in and selects it, so the same boot panics one layer down at
-`net/async_udp_v4.rs:1275` — and `rtems-pva-ioc` panics **identically at the same
-line**, measured. That is a property of the hosted exec-model build, not of this
+**What this does not do, stated** (closed since, §10.11): the hosted
+`rtems-exec-model` build still cannot boot a link. `AsyncUdpV4` needs a reactor,
+the host build compiles the UDP SEARCH transport in and selects it, so the same
+boot panics one layer down at `net/async_udp_v4.rs:1275` — and `rtems-pva-ioc`
+panics **identically at the same line**, measured. That is a property of the hosted exec-model build, not of this
 stage; on the target the UDP transport does not exist. It also means §6 C6 is not
 merely the *better* gate for the client path, it is the **only** one.
 
@@ -1766,10 +1766,12 @@ of pvalink stage 4's) and `iocinit_link_phases_run_after_the_mount`.
 
 1. `run_nameserver_connection`'s inline framing loop is still not folded into
    `read_loop` (§6 C2, §10.1).
-2. The hosted `rtems-exec-model` build cannot exercise either link resolver's
+2. ~~The hosted `rtems-exec-model` build cannot exercise either link resolver's
    client path — `AsyncUdpV4` needs a reactor and both RTEMS IOC binaries panic
-   at `net/async_udp_v4.rs:1275`. Closing it means putting UDP on a runtime seam
-   in `epics-base-rs`, shared with the PVA track and outside this stage.
+   at `net/async_udp_v4.rs:1275`.~~ **Closed, §10.11.** Not by a seam under
+   `AsyncUdpV4`: the transport selection itself was the defect, and it now
+   selects on the backend rather than on the target, so the exec backend has no
+   UDP transport to reach a reactor with.
 3. `epics-bridge-rs/Cargo.toml`'s comment on its `epics-ca-rs` dependency still
    says the crate's "default feature list is empty"; `274a734b` gave it
    `default = ["client"]`.
@@ -1780,3 +1782,91 @@ of pvalink stage 4's) and `iocinit_link_phases_run_after_the_mount`.
    inline `dispatch_external_cp_targets` or any CP fan-out semantics; the three
    iocInit phases in §10.5 are existing functions called unchanged.
 5. Stage C6 is the gate for everything above.
+
+## 11. §10.10 item 2 as built — the predicate was the defect
+
+### 11.1 What was actually wrong
+
+§10.10 item 2 read the panic as a missing seam: `AsyncUdpV4` needs a reactor,
+so give UDP a runtime seam in `epics-base-rs` the way `dial` and the timers
+have one. That is one layer too low. The seam already existed — `SearchTransport`
+is a two-variant sum type and its `NameServersOnly` variant needs no socket at
+all — and what was broken was the predicate that chose between the variants.
+
+Both clients gated UDP on `not(target_os = "rtems")`, which is a true statement
+about the target (no `recvmsg`/`IP_PKTINFO`, `tokio::net` does not build for the
+triple) and the wrong fact. What a `tokio::net` socket needs is a **reactor on
+the thread its future runs on**, and that is a property of the *task backend*:
+every client task starts through `runtime::task::spawn`, and under the exec
+backend that lands on a callback-pool worker the runtime was never entered on.
+A hosted process with a tokio runtime elsewhere does not help — which is also
+why no `#[tokio::test]` in either crate could ever see this, since the test's
+own thread has a reactor.
+
+So the rule is now emitted by each client's `build.rs`,
+
+```text
+exec_backend  <=>  target_os == "rtems" || feature "rtems-exec-model"
+tokio_backend <=>  otherwise
+```
+
+and the UDP transport, the CA beacon monitor and the TCP dial all take
+`tokio_backend`. On `exec_backend` `SearchTransport` has the single
+`NameServersOnly` variant in both crates. The illegal state — exec backend plus
+a reactor-needing socket — is not checked for at runtime; it cannot be
+constructed. The compiled surface on target is unchanged, because
+`target_os = "rtems"` implies `exec_backend`; what changed is that the host
+exec-model build now reproduces the target's configuration instead of
+approximating it, which is the only reason it is worth booting.
+
+### 11.2 The drift the rule invites, and the guard for it
+
+Three copies of a four-line rule (`epics-base-rs`, `epics-ca-rs`,
+`epics-pva-rs`) is two too many to trust, and cargo features unify per
+*package*: a manifest could turn on `epics-base-rs/rtems-exec-model` alone,
+giving `spawn` a reactor-free backend while a client still compiled the
+reactor-backed transport in and selected it — precisely the panicking
+configuration, reachable without anyone meaning to. `SearchTransport`'s type
+cannot rule that out, because the two crates disagree about which variants
+exist.
+
+`epics-base-rs` therefore exports `runtime::task::HAS_TOKIO_REACTOR` and both
+clients assert their own view against it in a `const`. A split build fails to
+compile instead of panicking at boot. The guard found a live instance on its
+first run: `epics-bridge-rs`'s `rtems-exec-model` forwarded to `epics-base-rs`
+and nothing else, so `rtems-pva-ioc` — the binary that feature exists for — was
+built in exactly that state.
+
+### 11.3 The gate
+
+`rtems-ca-ioc` and `rtems-pva-ioc` are each booted as a child process over a
+temporary database (`epics-ca-rs/tests/rtems_ca_ioc_boots.rs`,
+`epics-bridge-rs/tests/rtems_pva_ioc_boots.rs`), watched to the resolver-install
+line and then to positive evidence that the client reached the seam — the CA
+IOC's refused name-server dial, the PVA IOC's STAGE-5 probe reporting a search
+in flight. The assertion is liveness *and* a clean console: a panic on a
+callback-pool worker kills that worker and leaves the IOC serving, so liveness
+alone proves nothing. Both tests fail on the pre-fix tree, each on
+`net/async_udp_v4.rs:1275`.
+
+| gate | result |
+|---|---|
+| `cargo fmt --all` | clean |
+| `cargo clippy -p epics-base-rs -p epics-ca-rs -p epics-pva-rs -p epics-bridge-rs -p rtems-exec-gate --all-targets -- -D warnings` | clean |
+| … `--features …/rtems-exec-model` (all four) | clean |
+| `cargo nextest run -p epics-base-rs -p epics-ca-rs -p epics-pva-rs -p epics-bridge-rs -p rtems-exec-gate` | 6337 passed, 2 skipped |
+| … `--features …/rtems-exec-model` (all four) | 6126 passed, 2 skipped |
+| `./scripts/rtems-check.sh` (portability + image) | exit 0; PVA client probe 0 target errors (ratchet held) |
+| `rtems_exec_model_gate` census, all three crates | pass |
+| `rtems-ca-ioc` / `rtems-pva-ioc` boot feature-ON | no panic; pre-fix tree panics at `net/async_udp_v4.rs:1275` |
+
+### 11.4 What this does not do
+
+The dial reached in §11.3 is refused, not completed: no upstream server is
+stood up, so neither resolver's *resolution* is verified feature-ON, only that
+its client path runs. Driving a link to `connected` on the host exec model is
+the next step and is not this change.
+
+Two warnings in `epics-pva-rs` remain, both pre-existing and both outside this
+change: a deprecated `fetch_update` and the never-constructed
+`Origin::{FromOriginTag, Forwarded}` in `server_native/search_engine.rs`.

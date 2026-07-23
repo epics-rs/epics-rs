@@ -148,10 +148,12 @@ hits each. (RTEMS target support is recent, tier 3.)
 
 ## What a fix could look like (candidates, for the hand-written report)
 
-- **Compiler:** set `has_thread_local: true` for the RTEMS targets *if*
-  `#[thread_local]` codegen works there (untested — see open items); native
-  TLS takes the `#[cfg(target_thread_local)]` arm, whose destructor list
-  does not depend on reading another key's value in a later round.
+- **Compiler:** set `has_thread_local: true` for the RTEMS targets —
+  **validated on target 2026-07-23** (see "The spec-flip experiment" below):
+  native TLS codegen, link, boot, destructors and isolation all work on
+  `armv7-rtems-eabihf`, and the leak goes to exactly 0. Native TLS takes
+  the `#[cfg(target_thread_local)]` arm, whose destructor list does not
+  depend on reading another key's value in a later round.
 - **std:** make the key-based fallback robust to a platform that frees
   pairs before invoking destructors — e.g. `CLEANUP`'s round-1 arm could
   capture the `CURRENT` pointer into the key's own value (the destructor
@@ -161,13 +163,50 @@ hits each. (RTEMS target support is recent, tier 3.)
   destructor-less pairs readable until destructor iteration completes —
   a POSIX-interpretation discussion, not a clear-cut defect.
 
+## The spec-flip experiment — `has_thread_local: true` measured VIABLE (2026-07-23)
+
+Same toolchain (nightly `87e5904f5`), same box, standalone RTEMS image
+(`~/rtems-bringup/tlsdtor/`): the stock spec was dumped to JSON and exactly
+one key added (`"has-thread-local": true`; diff vs stock: that key only).
+Three images from the same source: stock target, custom-JSON *control*
+(spec dumped verbatim, nothing added — isolates the JSON-spec build path),
+and custom-JSON *native* (the one key added). Built with
+`-Zbuild-std=std,panic_abort` + `-Zjson-target-spec`.
+
+- **Codegen/link:** clean. Native image gets real TLS segments
+  (`.tdata 0x38`, `.tbss 0x630`, `PT_TLS memsz 0x668`, `__aeabi_read_tp`
+  present, zero unresolved TLS relocations).
+- **Boot:** all three images boot and exit 0; no faults.
+- **Leak, N=50 spawn/join after 5 warm-up cycles** (RTEMS `malloc_info`,
+  console-verified by hand from `stock.log`/`native.log`):
+
+  | image | named threads | unnamed threads |
+  |---|---|---|
+  | stock | 160.64 B / **2.000 blocks** per thread | **136.00 B / 1.000 block** |
+  | control (JSON path, flag off) | 160.64 / 2.000 | 136.00 / 1.000 |
+  | native (flag on) | **0.00 / 0.000** | **0.00 / 0.000** — `used.total`/`used.number` byte-identical at n0/n25/n50 |
+
+  136 B = the attributed 128 B `Arc<Thread::Inner>` + 8 B RTEMS heap
+  header; the named phase adds exactly the predicted second (name
+  `CString`) block. Control ≡ stock rules out the JSON-spec build path as
+  the variable.
+- **TLS semantics:** user-level `thread_local!` destructors ran 110/110
+  and cross-thread isolation held on **both** stock and native — sharpening
+  the defect statement: user TLS was never broken; only std's own
+  `CURRENT` handle cleanup is.
+
+Caveats: the flag was applied via a custom JSON spec, not an upstream
+`armv7_rtems_eabihf.rs` patch (same codegen path, but the one-line upstream
+change itself was not built); panic-unwind through TLS, `const`-init
+`thread_local!`, TLS from C-created threads, and a full IOC workload were
+not exercised.
+
 ## Not measured / open
 
-- The ~48–51 B gap between the attributed `Arc` block (128 B) and the total
-  per-creation residue (176–179 B) is unattributed.
-- Whether `has_thread_local: true` actually works on `armv7-rtems-eabihf`
-  (`#[thread_local]` codegen + `__aeabi` TLS relocs under RTEMS) — never
-  tried.
+- The ~48–51 B gap between the attributed `Arc`+header (136 B measured on
+  bare threads) and the total per-*connection-attempt* residue (176–179 B)
+  is unattributed — different measurements; the spec-flip experiment does
+  not speak to it.
 - Current rust master was inspected (target spec), not executed; the
   measured toolchain is nightly `87e5904f5` (2026-07-20).
 - The 2026-07-22 attribution transcript was not re-run on 2026-07-23; its
@@ -186,3 +225,4 @@ hits each. (RTEMS target support is recent, tier 3.)
 | 128 B/thread, +named block, joined=detached, raw-pthread 0.000, `round1=50 round2=50` | 2026-07-22 attribution run; artefacts on the box: `~/rtems-bringup/rtems-ca-ioc.instrumented*.rs`, `rtems-*-ioc.heapinstr.rs`, `leak.log`, `leak2.log`; recorded in session memory the same day; **not re-run today** |
 | 176.0 ± 5 / 179.1 ± 3 B per creation, differential method | in-repo `doc/calink-rtems-design.md` §13.2–13.3 and `doc/pvalink-rtems-design.md` §9.11 (commits `913f96fc`/`4d366800`), measured 2026-07-23 |
 | no existing rust-lang report | `gh search issues`, three queries, 2026-07-23 |
+| spec-flip: 136.00→0.00 B/thread, TLS segments, dtor 110/110, iso clean | experiment run 2026-07-23 in `~/rtems-bringup/tlsdtor/` (source, both specs, three images, `stock*.log`/`native*.log`/`control.log`, `RESULT.md`); slope and counter lines re-read directly from `stock.log`/`native.log` console output and recomputed by hand — not quoted from the experiment panel's summary alone |

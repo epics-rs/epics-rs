@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(18): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(20): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2857,6 +2857,39 @@ impl PvDatabase {
             .collect()
     }
 
+    /// Every DISTINCT external PV name this database's link fields name, in
+    /// any direction and under any policy — the set the link registry
+    /// converges to once iocInit's staged opens have all landed.
+    ///
+    /// Distinct from [`Self::external_cp_pv_names`], which is the CP/CPP
+    /// subset, and from the counts [`Self::setup_cp_links`] and
+    /// [`Self::setup_external_link_opens`] print: those count *link fields*
+    /// (two records pointing at one upstream PV are two links), whereas a
+    /// link set holds one entry per PV. Reporting a registry count against a
+    /// field count would never agree.
+    ///
+    /// The enumeration goes through [`super::PvDatabase::record_link_fields`]
+    /// and `external_pv_name`, the same two owners both iocInit link phases
+    /// use, so "what is an external link" cannot diverge between staging a
+    /// link and counting it.
+    ///
+    /// Sorted, so a caller can print it as a stable operator-facing list.
+    pub async fn external_link_pv_names(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for record_name in &self.all_record_names().await {
+            for (_field, _raw, parsed) in self.record_link_fields(record_name) {
+                let Some(pv) = parsed.external_pv_name() else {
+                    continue;
+                };
+                if !seen.iter().any(|s| s == pv.as_ref()) {
+                    seen.push(pv.into_owned());
+                }
+            }
+        }
+        seen.sort();
+        seen
+    }
+
     /// C `dbInitLink`'s locality decision for ONE parsed link — the single
     /// owner of "a DB link whose target is not in this IOC is a CA link".
     ///
@@ -3628,6 +3661,67 @@ mod cp_link_locality_tests {
             !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
             "a local CP target must not be registered as an external CP link"
         );
+    }
+}
+
+#[cfg(test)]
+mod external_link_pv_name_tests {
+    use crate::server::database::PvDatabase;
+    use crate::server::records::ai::AiRecord;
+    use crate::server::records::ao::AoRecord;
+
+    /// The declared external-PV set is per-PV and direction-agnostic, which
+    /// is what makes it the right thing to count a link registry against:
+    /// a link set holds one entry per PV, so two records reading one
+    /// upstream PV are one entry, and an OUT link counts exactly like an IN
+    /// link. iocInit's own console counts are per link FIELD and therefore
+    /// disagree by construction — `rtems-ca-ioc`'s banner used to compare a
+    /// registry count against nothing at all and print `0`.
+    #[tokio::test]
+    async fn declared_external_pvs_are_deduped_direction_agnostic_and_sorted() {
+        let db = PvDatabase::new();
+        for (name, rec) in [
+            ("IN1", Box::new(AiRecord::new(0.0)) as Box<_>),
+            ("IN2", Box::new(AiRecord::new(0.0)) as Box<_>),
+            ("LOCAL_SRC", Box::new(AiRecord::new(1.0)) as Box<_>),
+            ("LOCAL_HOLDER", Box::new(AiRecord::new(0.0)) as Box<_>),
+        ] {
+            db.add_record(name, rec).await.unwrap();
+        }
+        db.add_record("OUT1", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        // Two records, one upstream PV, two spellings: the bare ` CA`
+        // modifier and the explicit scheme. One registry entry.
+        db.get_record("IN1").unwrap().write().common.inp = "UP:ZED CP".to_string();
+        db.get_record("IN2").unwrap().write().common.inp = "ca://UP:ZED CP".to_string();
+        // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
+        db.get_record("OUT1").unwrap().write().common.out = "ca://UP:ALPHA".to_string();
+        // A link to a record this IOC does have is local and must not count.
+        db.get_record("LOCAL_HOLDER").unwrap().write().common.inp = "LOCAL_SRC CP".to_string();
+
+        db.initialize_link_locality().await;
+
+        assert_eq!(
+            db.external_link_pv_names().await,
+            vec!["UP:ALPHA".to_string(), "UP:ZED".to_string()],
+            "the declared set must be deduped across spellings, hold OUT links, \
+             exclude local targets, and come back sorted"
+        );
+    }
+
+    /// A database with no external link declares the empty set — the case
+    /// the banner reports as `0/0`, which is a healthy boot, not a failure
+    /// to connect.
+    #[tokio::test]
+    async fn a_database_with_no_external_link_declares_none() {
+        let db = PvDatabase::new();
+        db.add_record("PLAIN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.initialize_link_locality().await;
+        assert!(db.external_link_pv_names().await.is_empty());
     }
 }
 

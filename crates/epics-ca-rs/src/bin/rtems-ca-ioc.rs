@@ -197,6 +197,13 @@ mod ioc {
     const C6_TICK_RECORD: &str = "RTEMS:CA:TICK";
     const C6_TICK_PERIOD_MS: u64 = 200;
 
+    /// C6 PROBE: how long the banner waits for iocInit's staged link opens
+    /// to reach the declared external-PV set before reporting the count.
+    /// Bounded on purpose — an unreachable upstream must still boot the IOC
+    /// and still print a banner, with the shortfall visible.
+    const C6_LINK_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const C6_LINK_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
     // C6 PROBE: the C task census and stack-usage report — see
     // `epics-rtems-boot/csrc/rtems_stats.c`, the same pair the pvalink
     // stage-5 probe used, reused verbatim so both measurements read the
@@ -527,19 +534,43 @@ mod ioc {
         // broadcast will not resolve, and `EPICS_CA_ADDR_LIST` is not even
         // parsed here.
         //
-        // Read here rather than at install time: `install_calink_resolver`
-        // registers the link set and nothing else — C's `dbCaLinkInit`
-        // likewise creates no channel — so a count taken at the mount reports
-        // the resolver's own health, not the database's links. Taken at the
-        // last moment before the banner, it is the registry as the first
-        // client will find it.
+        // Counted against the database's DECLARED external PV set, after
+        // waiting for the registry to reach it.
+        //
+        // iocInit's two link phases STAGE opens (`setup_cp_links` ->
+        // `resolve_external_pv`, `setup_external_link_opens` ->
+        // `stage_external_link_open_by_name`); each open then runs on the
+        // link work owner and only registers its `CaLink` after a
+        // `subscribe()` round-trip to the upstream IOC completes. A count
+        // sampled the instant `run()` returns is therefore a race against the
+        // network, and stage C6 boot 3 read it as the useless `0` while the
+        // registry was on its way to 4. Waiting until the registry reaches
+        // the declared set turns the banner from a sample into a report; the
+        // deadline bounds it so an unreachable upstream still boots and still
+        // prints, with the shortfall named.
+        //
+        // `external_link_pv_names` is per-PV, matching what a link set holds;
+        // iocInit's own lines above count link FIELDS, which is why they read
+        // 4 and 1 while this reads 4.
+        let declared = block_on_sync(db_for_names.external_link_pv_names())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let deadline = std::time::Instant::now() + C6_LINK_SETTLE_TIMEOUT;
+        while resolver.link_count() < declared.len() && std::time::Instant::now() < deadline {
+            std::thread::sleep(C6_LINK_SETTLE_POLL);
+        }
         let link_count = resolver.link_count();
         println!(
-            "rtems-ca-ioc: calink resolver installed — {link_count} ca:// record \
-             link{} registered; ` CA`-modified and ca://... INP/OUT resolve over \
+            "rtems-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
+             link{} registered ({}); ` CA`-modified and ca://... INP/OUT resolve over \
              EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
              on this target)",
-            if link_count == 1 { "" } else { "s" },
+            declared.len(),
+            if declared.len() == 1 { "" } else { "s" },
+            if declared.is_empty() {
+                "none declared".to_string()
+            } else {
+                declared.join(", ")
+            },
         );
         for name in &names {
             println!("rtems-ca-ioc: {name}");

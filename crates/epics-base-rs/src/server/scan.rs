@@ -1,7 +1,10 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): the teardown test drives the scheduler from a
-// tokio task (spawn/abort are its cancellation instrument), but the scan
-// threads under test go through the exec seam (`block_on_sync` → `park_on`)
-// when the feature is on — verified passing under --features rtems-exec-model.
+// RTEMS-EXEC-MODEL-ALLOW(5): the teardown test drives the scheduler from a
+// tokio task (spawn/abort are its cancellation instrument) and the four
+// ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run) use
+// the tokio test runtime only as the start-context `ScanOwner::start`
+// requires; the scan/owner threads under test go through the exec seam
+// (`block_on_sync` → `park_on`) when the feature is on — all five verified
+// passing under --features rtems-exec-model.
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};

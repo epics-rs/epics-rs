@@ -763,7 +763,7 @@ impl Channel {
             }
         };
         if let Some(d) = wait {
-            tokio::time::sleep(d).await;
+            epics_base_rs::runtime::task::sleep(d).await;
         }
 
         // Re-check after acquiring the lock.
@@ -1056,7 +1056,7 @@ impl Channel {
         let waiter = server.register_cid_waiter(self.cid);
         server.send(req).await?;
 
-        let frame = tokio::time::timeout(self.op_timeout, waiter)
+        let frame = epics_base_rs::runtime::task::timeout(self.op_timeout, waiter)
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(|_| PvaError::Protocol("create_channel response cancelled".into()))?;

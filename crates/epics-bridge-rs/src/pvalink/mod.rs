@@ -37,3 +37,49 @@ pub use iocsh::{
 };
 pub use link::{PvaLink, PvaLinkError};
 pub use registry::PvaLinkRegistry;
+
+#[cfg(test)]
+mod seam_guard {
+    /// Every timer pvalink arms in production comes from
+    /// `epics_base_rs::runtime::task::{sleep, interval, timeout}`, never from
+    /// `tokio::time` — the pvalink twin of `epics-pva-rs`'s
+    /// `client_scope_timers_go_through_the_runtime_seam`.
+    ///
+    /// MEASURED on the stage-5 target image: `link.rs`'s monitor re-subscribe
+    /// backoff called `tokio::time::sleep` on the callback pool, panicking the
+    /// `cbMedium` worker with *"there is no reactor running"*. The whole
+    /// pvalink module runs on the target (it is what `rtems-pva-ioc` mounts),
+    /// so the scope here is every file, with no host-only exception.
+    #[test]
+    fn pvalink_scope_timers_go_through_the_runtime_seam() {
+        let files: &[(&str, &str)] = &[
+            (include_str!("link.rs"), "impl PvaLink"),
+            (include_str!("integration.rs"), "impl PvaLinkResolver"),
+            (include_str!("registry.rs"), "impl PvaLinkRegistry"),
+            (include_str!("config.rs"), "pub struct PvaLinkConfig"),
+        ];
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::time::");
+        for (src, anchor) in files {
+            let prod = match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            };
+            assert!(
+                prod.contains(anchor),
+                "production slice no longer covers `{anchor}` — the guard would pass vacuously"
+            );
+            let hits = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(literal))
+                .count();
+            assert_eq!(
+                hits, 0,
+                "pvalink production scope must arm timers through `runtime::task`; \
+                 found {hits} bare `{literal}` near `{anchor}` — on RTEMS that panics \
+                 the callback worker at runtime"
+            );
+        }
+    }
+}

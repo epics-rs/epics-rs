@@ -437,7 +437,7 @@ impl PvaLink {
                             "pvalink: INP monitor failed, will retry"
                         ),
                     }
-                    tokio::time::sleep(backoff).await;
+                    task::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
             });
@@ -508,7 +508,7 @@ impl PvaLink {
                             "pvalink: OUT connection monitor failed, will retry"
                         ),
                     }
-                    tokio::time::sleep(backoff).await;
+                    task::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
             });

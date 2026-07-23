@@ -43,7 +43,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(not(target_os = "rtems"))]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Interval, interval};
+// The periodic/one-shot timers come from the `runtime::task` seam, NOT from
+// `tokio::time`: this loop is spawned through `runtime::task::spawn`, which on
+// the RTEMS target lands it on the callback pool where no tokio timer wheel
+// exists. Measured on target: a direct `tokio::time::interval` panics the
+// `cbMedium` worker with *"there is no reactor running"* the moment the engine
+// starts, and the pvalink monitor never connects.
+use epics_base_rs::runtime::task::{Interval, interval, sleep, sleep_until};
 use tracing::debug;
 // `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
 // the RTEMS target — so the import is too, or it is unused there.
@@ -1559,7 +1565,7 @@ async fn run_engine(
             .min();
         let deadline_arm = async {
             match next_multi_deadline {
-                Some(d) => tokio::time::sleep_until(d.into()).await,
+                Some(d) => sleep_until(d).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -1569,7 +1575,7 @@ async fn run_engine(
         // armed, so this arm parks forever.
         let initial_arm = async {
             match initial_deadline {
-                Some(d) => tokio::time::sleep_until(d.into()).await,
+                Some(d) => sleep_until(d).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -3043,7 +3049,7 @@ async fn ns_task(
                 "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
             );
         }
-        tokio::time::sleep(RECONNECT_INTERVAL).await;
+        sleep(RECONNECT_INTERVAL).await;
     }
 }
 

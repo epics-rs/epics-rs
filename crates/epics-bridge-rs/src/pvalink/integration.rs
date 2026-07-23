@@ -747,7 +747,7 @@ impl PvaLinkResolver {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            task::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 

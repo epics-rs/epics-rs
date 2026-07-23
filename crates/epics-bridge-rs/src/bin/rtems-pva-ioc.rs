@@ -371,7 +371,10 @@ mod ioc {
                 c.alive,
                 c.bytes_rx,
                 c.bytes_tx,
-                c.channels.iter().map(|ch| ch.name.as_str()).collect::<Vec<_>>(),
+                c.channels
+                    .iter()
+                    .map(|ch| ch.name.as_str())
+                    .collect::<Vec<_>>(),
             );
         }
         for d in resolver.channel_diagnostics() {
@@ -1093,7 +1096,11 @@ mod tests {
         // STAGE-5 PROBE: three group members plus the three link-bearing
         // records the stage-5 gate is about (`RTEMS:PVA:DOWN` INP,
         // `RTEMS:PVA:DOWN2`, `RTEMS:PVA:UPLNK`), which carry no `Q:group` tag.
-        assert_eq!(recs.len(), 6, "three group members plus the three pva:// links");
+        assert_eq!(
+            recs.len(),
+            6,
+            "three group members plus the three pva:// links"
+        );
 
         let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
         for rec in &recs {

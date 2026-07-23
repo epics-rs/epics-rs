@@ -423,6 +423,19 @@ mod ioc {
         })
         .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
+        // (2d) Periodic scan + PINI. C `iocInit` owns `scanInit`/
+        //      `initialProcess` (`dbScan.c`, `iocInit.c:653`) independent
+        //      of RSRV — and until the scan-ownership hoist this binary
+        //      had NO scan start at all (the scheduler lived only in the
+        //      hosted async CA server's run loop, which this blocking
+        //      target never runs), so every periodic `SCAN` field and
+        //      every `PINI=YES` record was silently dead here. The core
+        //      `ScanOwner` runs the PINI pass and the `scan-%g` threads on
+        //      a dedicated owner thread (exec-backend safe: a parked
+        //      detached task would be dropped by the executor). Held to
+        //      the end of `main`: this IOC scans for as long as it serves.
+        let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:491-499). No ACF is
         //     configured, so access control is the permissive default.

@@ -1723,8 +1723,8 @@ that runs it.
 self-driven calcs (`SCAN ".1 second"`, `CALC "VAL+1"`), plus an
 out-of-group victim `RTEMS:PVA:V0` with the same 10 Hz self-drive.
 Scanning on the PVA-only target is alive via `51f60ed0` (the scan-owner
-thread; without it SCAN was dead entirely — see the scan-ownership
-note). Target: QEMU `xilinx_zynq_a9` on the build box, reached over
+thread; without it SCAN was dead entirely — see §9.16 for the
+structural closure). Target: QEMU `xilinx_zynq_a9` on the build box, reached over
 SLIRP hostfwd to `127.0.0.1:5075`. Instrument: host-side `pvxmonitor`
 arrival timestamps in microseconds (the guest clock is
 1-second-quantized, so host wire time is the only usable clock), one
@@ -1775,3 +1775,53 @@ combined effect only. Separating band-priority inversion from
 delivery-path saturation needs an attribution experiment — e.g. rerun
 with the forwarders spawned in the High band, or with a single drain
 task — before concluding which lever closes it.
+
+### 9.16 Scan ownership as built — SCAN was dead on the PVA-only target, now core-owned
+
+**The defect (found by the §8 load probe).** The probe's self-counting
+members never counted: every periodic `SCAN` field in the database was
+silently dead on the PVA-only target. Root cause: the `ScanScheduler`
+(periodic `scan-%g` threads + the PINI=YES pass) was constructed and
+driven only inside the protocol servers' run loops — the hosted async CA
+server (`epics-ca-rs` `ca_server.rs`, construction + a `tokio::select!`
+arm) and the hosted `PvaServer` wrapper. `rtems-pva-ioc` runs neither,
+so nothing ever started scanning. `rtems-ca-ioc` (blocking CA front-end)
+had the same gap. In C this cannot happen: `scanInit`/`initialProcess`/
+`scanRun` are owned by `iocInit`/`iocRun` (`dbScan.c`, `iocInit.c`),
+fully independent of RSRV.
+
+**The interim fix (51f60ed0).** `rtems-pva-ioc` step (2b) spawned a
+dedicated `scan-owner` thread that `block_on_sync`'d
+`ScanScheduler::run()`. A thread and NOT `runtime::task::spawn`, because
+of the exec-backend detached-task lifetime divergence: the scheduler's
+owner path parks on a forever-pending future whose only job is keeping
+the `ScanStopGuard` alive, and on the exec backend a task that returns
+`Pending` with its waker registered nowhere has no strong holder — the
+executor drops it (tokio keeps detached tasks alive), the dropped guard
+trips the stop flag, and every scan thread exits within one tick.
+Measured on the host exec model: probes reached the spawn point while
+the thread census showed zero `scan-*` threads, with the handle both
+dropped and `mem::forget`-ed. This worked but was a per-binary patch.
+
+**The structural closure (this branch, `unfixed3/scan-hoist`).** Scan
+ownership is hoisted into the IOC core:
+
+* `epics_base_rs::server::scan::ScanOwner` is the single public owner —
+  `start(db)` spawns the proven thread shape (`scan-owner`, Medium
+  stack, `ThreadPriority::Low`, `handle.block_on` on the tokio backend /
+  `block_on_sync` on the exec backend), and `Drop` stops the owner and
+  every scan thread.
+* `IocApplication::run` starts it at the C `scanRun` point (after the
+  PINI=RUN pass, before `initHookAfterDatabaseRunning`), so every
+  `IocApplication`-built IOC scans regardless of protocol runner.
+* The CA and PVA servers no longer own scanning at all, and
+  `ScanScheduler` is `pub(crate)` — a protocol server *cannot* re-own it
+  (visibility, not convention). Entry points that assemble an IOC by
+  hand (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
+  `rtems-ca-ioc`, `rtems-pva-ioc` — the interim thread replaced) start
+  their own `ScanOwner`.
+* The PINI=YES pass is exactly-once by construction: the owner skips it
+  when the IOC init path already ran it (`PvDatabase::pini_done`,
+  published by `mark_pini_done`) — C's `initialProcess` runs once,
+  inside `iocBuild`. Redundant owners stay harmless:
+  `try_claim_scan_start` parks every scheduler after the first.

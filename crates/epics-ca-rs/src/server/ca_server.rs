@@ -16,7 +16,6 @@ use epics_base_rs::types::EpicsValue;
 use super::stats::ServerStats;
 use super::{addr_list, beacon, tcp, udp};
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::scan::ScanScheduler;
 use epics_base_rs::server::{access_security, autosave, device_support, ioc_builder, iocsh};
 
 /// Builder for CaServer configuration.
@@ -310,7 +309,6 @@ impl CaServerBuilder {
             autosave_config,
             autosave_manager: None,
             conn_events: Some(conn_tx),
-            after_init_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "experimental-rust-tls")]
             tls,
             #[cfg(feature = "experimental-rust-tls")]
@@ -433,8 +431,6 @@ pub struct CaServer {
     /// Optional broadcast channel for connection lifecycle events.
     /// Subscribers (e.g. ca-gateway) get one event per accept/disconnect.
     conn_events: Option<tokio::sync::broadcast::Sender<crate::server::tcp::ServerConnectionEvent>>,
-    /// Callbacks to run after PINI processing (e.g., start pollers).
-    after_init_hooks: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Optional TLS configuration. When set, accepted TCP connections
     /// are wrapped in a `tokio_rustls::server::TlsStream` before the
     /// CA handshake runs. mTLS configurations additionally extract a
@@ -549,7 +545,6 @@ impl CaServer {
             autosave_config,
             autosave_manager,
             conn_events: Some(conn_tx),
-            after_init_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "experimental-rust-tls")]
             tls: None,
             #[cfg(feature = "experimental-rust-tls")]
@@ -684,11 +679,6 @@ impl CaServer {
         AccessRightsNotifier {
             tx: self.acf_reload_tx.clone(),
         }
-    }
-
-    /// Set callbacks to run after PINI processing completes.
-    pub fn set_after_init_hooks(&mut self, hooks: Vec<Box<dyn FnOnce() + Send>>) {
-        *self.after_init_hooks.lock().unwrap() = hooks;
     }
 
     /// Install a TLS server config on a CaServer that was constructed
@@ -921,7 +911,6 @@ impl CaServer {
 
         let db_udp = self.db.clone();
         let db_tcp = self.db.clone();
-        let db_scan = self.db.clone();
         let acf = self.acf.clone();
         let port = self.port;
         // Sockets were bound at construction (`bind_sockets`), so the
@@ -932,7 +921,14 @@ impl CaServer {
         let bound_tcp = self.tcp.clone();
         let bound_udp = self.udp.clone();
 
-        let scanner = ScanScheduler::new(db_scan);
+        // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
+        // is owned by the IOC core — `epics_base_rs::server::scan::
+        // ScanOwner`, started by `IocApplication::run` at the C `scanRun`
+        // point or by the IOC entry binary — never by a protocol server.
+        // The "PINI before after-init hooks" ordering the scheduler arm
+        // used to provide lives in `IocApplication::run` (Phase 2b.6 runs
+        // PINI, H3 drains the hooks after it, both before this server can
+        // accept a client).
 
         // Spawn autosave: prefer existing manager, otherwise build one from SaveSetConfig
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
@@ -1309,10 +1305,6 @@ impl CaServer {
             ) => {
                 eprintln!("Beacon emitter exited: {r:?}");
                 r
-            }
-            _ = scanner.run_with_hooks(self.after_init_hooks.lock().unwrap().drain(..).collect()) => {
-                eprintln!("Scan scheduler exited");
-                Ok(())
             }
         };
 

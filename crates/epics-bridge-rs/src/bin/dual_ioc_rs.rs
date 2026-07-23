@@ -172,6 +172,13 @@ async fn main() -> ExitCode {
     };
     let _ = autosave_cfg;
 
+    // C iocInit owns scan start (scanInit/scanRun) — neither the CA nor
+    // the PVA front-end scans. One core-owned scan owner covers whichever
+    // subset of the two servers is enabled; `try_claim_scan_start` keeps
+    // any redundant start parked, so the shared database never
+    // double-scans. Held to process end.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
     // Flag > EPICS environment > compiled default. `from_parts` takes a
     // literal port, so the environment fallback is resolved here.
     let ca_port = args

@@ -138,7 +138,7 @@ pub(super) fn apply_long_string_mode(
 /// ```
 #[cfg(not(target_os = "rtems"))]
 pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
-    let mut server = CaServer::from_parts(
+    let server = CaServer::from_parts(
         config.db,
         config.port,
         config.tcp_port,
@@ -147,7 +147,10 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
         config.autosave_manager,
     )
     .await?;
-    server.set_after_init_hooks(config.after_init_hooks);
+    // `config.after_init_hooks` is always handed over EMPTY —
+    // `IocApplication::run` drains the hooks itself after PINI (H3) and
+    // owns scanning via the core `ScanOwner`, so the CA server neither
+    // runs hooks nor scans.
     let casr = iocsh::casr_command(server.stats());
     server
         .run_with_shell(move |shell| {

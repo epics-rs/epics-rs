@@ -829,7 +829,7 @@ impl PvDatabase {
 
     /// Atomically claim the right to start the scan scheduler for this DB.
     /// Returns `true` on the first call, `false` on subsequent calls.
-    /// Used by `ScanScheduler::run_with_hooks` to prevent duplicate scan tasks
+    /// Used by `ScanScheduler::run` to prevent duplicate scan tasks
     /// when multiple protocol servers (CA + PVA) both try to start scanning.
     pub fn try_claim_scan_start(&self) -> bool {
         self.inner
@@ -850,6 +850,18 @@ impl PvDatabase {
             .pini_done
             .store(true, std::sync::atomic::Ordering::Release);
         self.inner.pini_notify.notify_waiters();
+    }
+
+    /// True once the PINI=YES pass has completed for this database —
+    /// published by [`Self::mark_pini_done`]. The scan owner reads this
+    /// to keep the pass exactly-once (C `initialProcess`, iocInit.c:653
+    /// runs once, inside iocBuild): when the IOC init path already ran
+    /// PINI, the owner skips its own pass instead of re-processing every
+    /// PINI record.
+    pub fn pini_done(&self) -> bool {
+        self.inner
+            .pini_done
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Wait until the scan owner has completed PINI processing.

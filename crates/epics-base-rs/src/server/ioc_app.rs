@@ -977,12 +977,11 @@ impl IocApplication {
         {
             // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
             db.pini_process(crate::server::record::PiniMode::Yes).await;
-            // Publish completion so any scan scheduler started by the
-            // protocol runner sees PINI as already done and its
-            // non-owner branch does not block. The scheduler's owner
-            // branch still re-runs the PINI burst; that is benign
-            // (PINI records simply recompute) and avoids touching
-            // `scan.rs`, which is outside this change's file scope.
+            // Publish completion: a later-started scan owner (or a
+            // non-owner scheduler) sees PINI as already done — the
+            // owner branch then skips its own PINI pass (exactly-once,
+            // as C's `initialProcess`) and non-owners run their hooks
+            // without blocking.
             db.mark_pini_done();
         }
         announce!(InitHookState::AfterInitialProcess);
@@ -1022,6 +1021,17 @@ impl IocApplication {
         // `initHookAtIocRun` is announced. PINI=RUN records are processed
         // here and NOT in the PINI=YES pass above.
         db.pini_process(crate::server::record::PiniMode::Run).await;
+        // C `scanRun` (iocInit.c, iocRun: after the PINI=RUN hook, before
+        // `initHookAfterDatabaseRunning`): periodic scanning is owned by
+        // the IOC core, not by any protocol server — a PVA-only or
+        // server-less IOC scans all the same. The owner's PINI=YES pass
+        // is skipped (Phase 2b.6 already ran it and published
+        // completion); the `try_claim_scan_start` claim it takes keeps a
+        // protocol runner or embedded harness that starts another owner
+        // parked and harmless. Held across the runner handoff: when
+        // `run` returns (or its future is dropped), the drop stops every
+        // scan-%g thread.
+        let _scan_owner = crate::server::scan::ScanOwner::start(db.clone());
         announce!(InitHookState::AfterDatabaseRunning);
         announce!(InitHookState::AfterCaServerRunning);
 

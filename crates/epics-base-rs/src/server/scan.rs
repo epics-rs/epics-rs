@@ -1,7 +1,10 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): the teardown test drives the scheduler from a
-// tokio task (spawn/abort are its cancellation instrument), but the scan
-// threads under test go through the exec seam (`block_on_sync` → `park_on`)
-// when the feature is on — verified passing under --features rtems-exec-model.
+// RTEMS-EXEC-MODEL-ALLOW(5): the teardown test drives the scheduler from a
+// tokio task (spawn/abort are its cancellation instrument) and the four
+// ScanOwner tests (drop-teardown, redundant-owner, PINI-skip, PINI-run) use
+// the tokio test runtime only as the start-context `ScanOwner::start`
+// requires; the scan/owner threads under test go through the exec seam
+// (`block_on_sync` → `park_on`) when the feature is on — all five verified
+// passing under --features rtems-exec-model.
 use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +15,13 @@ use crate::server::database::PvDatabase;
 use crate::server::record::ScanType;
 
 /// Scan scheduler that processes records at their configured scan rates.
-pub struct ScanScheduler {
+///
+/// `pub(crate)` by design: scanning is owned by the IOC core, and the
+/// only public way to start it is [`ScanOwner::start`] — a protocol
+/// server (CA, PVA) cannot construct or drive a scheduler of its own,
+/// which is what used to leave server-less targets with every periodic
+/// `SCAN` field dead.
+pub(crate) struct ScanScheduler {
     db: Arc<PvDatabase>,
 }
 
@@ -60,11 +69,11 @@ fn periodic_thread_name(period: Duration) -> String {
 /// Shutdown signal shared by the periodic scan threads.
 ///
 /// The single owner of the stop transition is [`ScanStopGuard`], held
-/// by the `run_with_hooks` future: dropping that future (tokio
-/// cancellation, runtime teardown) trips the flag and wakes every
-/// sleeper, preserving the teardown contract the previous
-/// `JoinSet`-abort implementation provided. No other path may set the
-/// flag.
+/// by the `ScanScheduler::run` future: dropping that future (the
+/// [`ScanOwner`] thread unblocking, tokio cancellation, runtime
+/// teardown) trips the flag and wakes every sleeper, preserving the
+/// teardown contract the previous `JoinSet`-abort implementation
+/// provided. No other path may set the flag.
 struct ScanStop {
     stopped: Mutex<bool>,
     wake: Condvar,
@@ -84,7 +93,7 @@ impl Drop for ScanStopGuard {
 /// processing on its own (banded) thread.
 ///
 /// Hosted: [`tokio::runtime::Handle::block_on`], the handle captured
-/// from the async context that called `run_with_hooks` — record
+/// from the async context that called `run` — record
 /// processing may spawn tasks and start timers, which need a runtime
 /// context a plain `std` thread does not otherwise have. RTEMS:
 /// `block_on_sync` → `park_on`, the same seam every blocking CA/PVA
@@ -101,8 +110,8 @@ struct TickDriver {
 
 impl TickDriver {
     /// Capture from the current async context. Hosted callers reach
-    /// `run_with_hooks` inside a tokio runtime (the previous
-    /// `JoinSet::spawn` implementation already required exactly that).
+    /// `run` inside a tokio runtime (the previous `JoinSet::spawn`
+    /// implementation already required exactly that).
     fn capture() -> Self {
         Self {
             #[cfg(tokio_backend)]
@@ -182,48 +191,21 @@ fn periodic_loop(
 }
 
 impl ScanScheduler {
-    pub fn new(db: Arc<PvDatabase>) -> Self {
+    pub(crate) fn new(db: Arc<PvDatabase>) -> Self {
         Self { db }
     }
 
-    /// Run all scan tasks. Also processes PINI records at startup.
-    /// This function runs indefinitely.
-    pub async fn run(&self) {
-        self.run_with_hooks(Vec::new()).await;
-    }
-
-    /// Run all scan tasks with post-PINI hooks.
+    /// Run the PINI=YES pass (unless the IOC init path already ran it —
+    /// see the exactly-once gate below) and all periodic scan tasks.
+    /// Never returns; dropping the future stops every scan thread (see
+    /// [`ScanStopGuard`]).
     ///
-    /// After PINI records are processed, the hooks are invoked before
-    /// periodic scan tasks begin. This ensures pollers start only after
-    /// the initial record processing burst is complete.
-    ///
-    /// If another `ScanScheduler` has already started for the same DB (e.g.
-    /// CA server already running when PVA server starts in a QSRV setup),
-    /// this call still runs the provided hooks but does NOT spawn duplicate
-    /// scan tasks. It then awaits forever so the caller's `tokio::select!`
-    /// behaves as expected.
-    pub async fn run_with_hooks(&self, hooks: Vec<Box<dyn FnOnce() + Send>>) {
+    /// If another `ScanScheduler` has already started for the same DB
+    /// (e.g. an IOC entry point and an embedded harness both starting a
+    /// [`ScanOwner`]), this call parks as a non-owner and spawns no
+    /// duplicate scan tasks.
+    pub(crate) async fn run(&self) {
         let is_first = self.db.try_claim_scan_start();
-
-        if is_first {
-            // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
-            self.db
-                .pini_process(crate::server::record::PiniMode::Yes)
-                .await;
-            // Release non-owner schedulers so they can run their hooks now.
-            self.db.mark_pini_done();
-        } else {
-            // Non-owner: wait for the owner to finish PINI before running hooks.
-            // This preserves the "PINI before after-init hooks" contract.
-            self.db.wait_for_pini().await;
-        }
-
-        // Run the caller's after-init hooks (protocol-specific, e.g. registering
-        // PVA PVs after the DB is loaded). Always AFTER PINI is done.
-        for hook in hooks {
-            hook();
-        }
 
         if !is_first {
             // Another ScanScheduler already owns the periodic tasks for this DB.
@@ -231,6 +213,20 @@ impl ScanScheduler {
             std::future::pending::<()>().await;
             return;
         }
+
+        // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
+        // Exactly once per database, as in C (initialProcess runs once,
+        // inside iocBuild): when the IOC init path (`IocApplication::run`
+        // Phase 2b.6) already ran it and published completion, skip the
+        // re-run instead of re-processing every PINI record.
+        if !self.db.pini_done() {
+            self.db
+                .pini_process(crate::server::record::PiniMode::Yes)
+                .await;
+        }
+        // Publish completion — `PvDatabase::wait_for_pini` subscribers
+        // (anything ordering itself "after PINI") unblock here.
+        self.db.mark_pini_done();
 
         // C `spawnPeriodic` (`dbScan.c:943-959`): one **dedicated,
         // banded thread per periodic rate**, `scan-%g` at
@@ -275,6 +271,124 @@ impl ScanScheduler {
     }
 }
 
+/// Single owner of "this IOC scans": starts the periodic scan machinery
+/// (and, when not already done by the IOC init path, the PINI=YES pass)
+/// on a dedicated thread, independent of every network server.
+///
+/// C parity: `scanInit`/`scanRun` are owned by `iocInit`/`iocRun`
+/// (`dbScan.c`, `iocInit.c`) — RSRV has no hand in scanning. The Rust
+/// analog of that owner is here:
+///
+/// * [`crate::server::ioc_app::IocApplication::run`] starts one at the C
+///   `scanRun` point (after the PINI=RUN pass, before
+///   `initHookAfterDatabaseRunning`), so every `IocApplication`-built IOC
+///   scans no matter which protocol runner it hands off to.
+/// * Entry-point binaries that assemble an IOC without `IocApplication`
+///   (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
+///   `rtems-ca-ioc`, `rtems-pva-ioc`) start one themselves, right where
+///   their hand-rolled iocInit sequence ends.
+///
+/// Protocol servers must NOT start scanning — that was the defect this
+/// type closes: the `ScanScheduler` used to be constructed and driven
+/// only inside the CA/PVA server run loops, so a PVA-only RTEMS target
+/// had every periodic `SCAN` field silently dead. Redundant starts stay
+/// harmless by construction: `PvDatabase::try_claim_scan_start` makes any
+/// second owner a parked non-owner, so an IOC plus an embedded harness
+/// (or two servers on one database) never double-scan.
+///
+/// # Why a dedicated thread, not a spawned task
+///
+/// The owner future parks forever holding the [`ScanStopGuard`]. On the
+/// exec backend (`rtems-exec-model` / RTEMS) a spawned task that returns
+/// `Pending` with its waker registered nowhere has no strong holder — the
+/// executor drops it (tokio keeps detached tasks alive), the guard drops,
+/// and every scan thread exits within one tick. Measured on target:
+/// probes reached the spawn point while the thread census showed zero
+/// `scan-*` threads, with the handle both dropped and `mem::forget`-ed.
+/// A thread keeps the future (and guard) alive on its own stack on both
+/// backends. On the tokio backend the thread drives the future via the
+/// handle captured at [`ScanOwner::start`] (so `start` must be called
+/// inside a tokio runtime there); on the exec backend it drives it via
+/// `block_on_sync` → `park_on`, the same seam every blocking CA/PVA
+/// connection thread uses.
+///
+/// # Teardown
+///
+/// Dropping the handle wakes the owner thread, which drops the scheduler
+/// future — tripping the stop flag through the [`ScanStopGuard`] — and
+/// joins the owner thread (the `scan-%g` threads themselves exit within
+/// one tick, unjoined, exactly as under the previous server-driven
+/// cancellation).
+pub struct ScanOwner {
+    stop: Option<crate::runtime::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScanOwner {
+    /// Start the scan owner thread for `db`. See the type docs for who
+    /// calls this and why redundant calls are harmless.
+    pub fn start(db: Arc<PvDatabase>) -> Self {
+        let (stop_tx, stop_rx) = crate::runtime::sync::oneshot::channel::<()>();
+        // Captured on the caller's thread: the owner thread itself has no
+        // runtime, and `TickDriver::capture` inside `run` needs one on
+        // the tokio backend. Same contract `ScanScheduler::run` always
+        // had ("must be called inside a tokio runtime"), surfaced at the
+        // start call instead of inside the thread.
+        #[cfg(tokio_backend)]
+        let handle = tokio::runtime::Handle::try_current()
+            .expect("ScanOwner::start on the tokio backend must be called inside a tokio runtime");
+        let join = std::thread::Builder::new()
+            .name("scan-owner".to_string())
+            // The owner thread runs the PINI pass's record processing on
+            // its own stack (the `scan-%g` threads it spawns carry Big
+            // stacks of their own, dbScan.c:950). Medium is the proven
+            // shape from the interim per-binary owner thread, measured on
+            // the RTEMS target.
+            .stack_size(StackSizeClass::Medium.bytes())
+            .spawn(move || {
+                // Below every scan band: the owner only parks after the
+                // PINI pass; the ladder the `scan-%g` threads hold is the
+                // measured one (`periodic_priority`).
+                let _ = enter_ioc_thread(ThreadPriority::Low);
+                let scheduler = ScanScheduler::new(db);
+                let owner = async move {
+                    tokio::select! {
+                        _ = scheduler.run() => {}
+                        _ = stop_rx => {}
+                    }
+                };
+                #[cfg(tokio_backend)]
+                handle.block_on(owner);
+                #[cfg(exec_backend)]
+                match crate::runtime::task::block_on_sync(owner) {
+                    Ok(()) => {}
+                    // Freshly spawned plain std thread: not a facility
+                    // worker, no runtime entered — always blockable.
+                    Err(e) => unreachable!("the scan-owner thread is a plain std thread: {e}"),
+                }
+            })
+            .expect("failed to spawn the scan-owner thread");
+        Self {
+            stop: Some(stop_tx),
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for ScanOwner {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            // Bounded: the send above wakes the parked owner future, the
+            // thread drops the scheduler (tripping the stop flag) and
+            // returns without waiting on the scan threads.
+            let _ = join.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,7 +428,7 @@ mod tests {
         }
     }
 
-    /// Cancelling `run_with_hooks` must tear the scan threads down —
+    /// Cancelling `run` must tear the scan threads down —
     /// the contract the previous `JoinSet` implementation provided via
     /// task abort. Observed through the `Arc<PvDatabase>` strong count:
     /// every scan thread holds a clone, so the count returns to the
@@ -345,5 +459,148 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Wait until `db`'s strong count satisfies `pred`, or panic after 10s.
+    async fn wait_for_count(db: &Arc<PvDatabase>, what: &str, pred: impl Fn(usize) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pred(Arc::strong_count(db)) {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {} Arc holders",
+                Arc::strong_count(db)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The core-owned start: `ScanOwner::start` brings every rate's
+    /// thread up, and dropping the handle tears them all down — the same
+    /// teardown contract the server-driven `tokio::select!` cancellation
+    /// used to provide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_scan_owner_stops_the_scan_threads() {
+        let db = Arc::new(PvDatabase::new());
+        let owner = ScanOwner::start(Arc::clone(&db));
+
+        // Test handle + scheduler (owner thread) + one clone per rate.
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+
+        drop(owner);
+        wait_for_count(&db, "scan threads still alive after ScanOwner drop", |n| {
+            n == 1
+        })
+        .await;
+    }
+
+    /// PINI exactly-once boundary: when the IOC init path already ran the
+    /// PINI=YES pass and published completion (`mark_pini_done`, as
+    /// `IocApplication::run` Phase 2b.6 does), the scan owner must NOT
+    /// re-run it — C's `initialProcess` (iocInit.c:653) runs once, inside
+    /// iocBuild. Sync point: once every scan thread is up the owner is
+    /// past its PINI stage, so a re-run would already have advanced the
+    /// record's TIME.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_skips_pini_when_the_init_path_already_ran_it() {
+        use crate::server::record::PiniMode;
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PINI:ONCE", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("PINI:ONCE").unwrap();
+            let mut inst = rec.write();
+            inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+                .unwrap();
+            inst.common.udf = 0;
+        }
+
+        // The IOC init path's own pass + publication (Phase 2b.6 shape).
+        db.pini_process(PiniMode::Yes).await;
+        db.mark_pini_done();
+        let t_init = db.get_record("PINI:ONCE").unwrap().read().common.time;
+
+        let owner = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+        let t_owner = db.get_record("PINI:ONCE").unwrap().read().common.time;
+        assert_eq!(
+            t_owner, t_init,
+            "the owner re-ran the PINI=YES pass the init path already ran"
+        );
+        drop(owner);
+    }
+
+    /// The other side of the boundary: with NO init-path pass, the owner
+    /// runs PINI itself — the direct-entry-point contract (`softioc-rs`,
+    /// the rtems binaries, oracle) where nothing pre-runs PINI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_runs_pini_when_nothing_pre_ran_it() {
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PINI:OWNED", Box::new(AiRecord::new(2.5)))
+            .await
+            .unwrap();
+        let t_unprocessed = {
+            let rec = db.get_record("PINI:OWNED").unwrap();
+            let mut inst = rec.write();
+            inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+                .unwrap();
+            inst.common.udf = 0;
+            inst.common.time
+        };
+
+        let owner = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+        let t_owner = db.get_record("PINI:OWNED").unwrap().read().common.time;
+        assert!(
+            t_owner > t_unprocessed,
+            "the owner must run the PINI=YES pass when the init path did not"
+        );
+        drop(owner);
+    }
+
+    /// Redundant-start boundary: a second `ScanOwner` on the same DB is a
+    /// parked non-owner (`try_claim_scan_start` dedup), and dropping it
+    /// must not disturb the first owner's scan threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redundant_scan_owner_parks_and_its_drop_is_harmless() {
+        let db = Arc::new(PvDatabase::new());
+        let first = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+        let with_first = Arc::strong_count(&db) - 1;
+
+        let second = ScanOwner::start(Arc::clone(&db));
+        drop(second);
+        // The second owner's scheduler clone is gone; every scan thread
+        // (and the first owner) is still holding.
+        wait_for_count(&db, "second owner's drop leaked or killed holders", |n| {
+            n == with_first + 1
+        })
+        .await;
+
+        drop(first);
+        wait_for_count(
+            &db,
+            "scan threads still alive after first owner drop",
+            |n| n == 1,
+        )
+        .await;
     }
 }

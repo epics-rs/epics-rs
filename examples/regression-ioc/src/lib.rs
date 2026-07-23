@@ -50,6 +50,9 @@ pub struct RegressionIoc {
     pub pva_addr: SocketAddr,
     _ca_task: tokio::task::JoinHandle<epics_base_rs::error::CaResult<()>>,
     _pva_server: PvaServer,
+    /// Core-owned scan start (PINI pass + periodic scan-%g threads) —
+    /// the servers do not scan; dropping this stops the scan threads.
+    _scan_owner: epics_base_rs::server::scan::ScanOwner,
     /// Kept alive so the motor poll loop's command channel stays open.
     _motor_poll_tx: mpsc::Sender<PollCommand>,
 }
@@ -109,9 +112,14 @@ impl RegressionIoc {
         // Arm motor polling after iocInit (C arms the poller post-PINI).
         let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
 
+        // Scanning is core-owned (C iocInit), not the servers': the scan
+        // owner runs the PINI pass and the periodic scan-%g threads for
+        // the shared database, whichever protocol serves it.
+        let scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
         // CA server on a kernel-assigned port: `from_parts` binds the
         // sockets and reports the port it got, so nothing can take the
-        // number in between. run() spawns the SCAN scheduler.
+        // number in between.
         let ca_server = CaServer::from_parts(db.clone(), 0, None, None, None, None).await?;
         let ca_port = ca_server.udp_port();
         let _ca_task = tokio::spawn(async move { ca_server.run().await });
@@ -130,6 +138,7 @@ impl RegressionIoc {
             pva_addr,
             _ca_task,
             _pva_server: pva_server,
+            _scan_owner: scan_owner,
             _motor_poll_tx: poll_cmd_tx,
         })
     }

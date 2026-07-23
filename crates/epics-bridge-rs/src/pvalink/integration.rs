@@ -681,6 +681,12 @@ impl PvaLinkResolver {
         self.registry.len()
     }
 
+    /// STAGE-5 PROBE: a snapshot of the one IOC-wide client, so a target
+    /// console can report how many upstream TCP connections back N links.
+    pub fn client_report(&self) -> epics_pva_rs::client_native::context::ClientReport {
+        self.registry.client().report_zeroed(false)
+    }
+
     /// Per-channel pvalink diagnostics, backing the `dbpvar` IOC shell
     /// command (pvxs `dbpvxr`, `pvxs/ioc/pvalink.cpp:184-316`).
     pub fn channel_diagnostics(&self) -> Vec<super::registry::ChannelDiag> {

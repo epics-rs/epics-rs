@@ -163,6 +163,14 @@ impl PvaLinkRegistry {
         }
     }
 
+    /// STAGE-5 PROBE: the IOC-wide client, so a target image with no shell
+    /// can print `PvaClient::report()` on its console — the only way to
+    /// observe "one upstream connection regardless of link count" from the
+    /// guest side.
+    pub fn client(&self) -> &PvaClient {
+        &self.client
+    }
+
     /// Record that `record`'s link attached to the channel identified by
     /// `config`. The channel may not be open yet (or may be shared by
     /// several records); the back-index keys by the same

@@ -168,6 +168,36 @@ mod demo_db {
         "  info(Q:group, {\"RTEMS:PVA:GRP\":",
         "{\"message\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":2}}})\n",
         "}\n",
+        // STAGE-5 PROBE (doc/pvalink-rtems-design.md §5 stage 5, topology A).
+        // The records the gate is about: two INP links with `CP` (the monitor
+        // path) and one OUT link (the put path), all naming PVs served by the
+        // host-side upstream IOC. They are in `DEMO_DB` rather than in a `.db`
+        // file because a `-kernel` boot has no filesystem to name one on and
+        // `rtems_init.c:195` hands `main` a fixed one-element argv.
+        //
+        // NOT `@pva://…`, which §5 stage 5 spells: a leading `@` is INST_IO,
+        // and `dbCanSetLink` (`record/link.rs:487`, C `dbStaticLib.c:2400`)
+        // rejects INST_IO on a record whose bound device support declares
+        // CONSTANT — a soft `ai`. Measured on the target: iocInit fails with
+        // *"ai.INP: can't initialize link type CONSTANT with
+        // \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* and the image exits. C
+        // refuses the same `.db`. The two spellings that do load are both
+        // exercised here: pvxs's documented JSON longhand
+        // (`documentation/pvalink.rst:124-135`) and this tree's `pva://`
+        // scheme+suffix form, which parses to `ParsedLink::Pva`.
+        "record(ai, \"RTEMS:PVA:DOWN\") {\n",
+        "  field(INP, \"{pva: { pv: 'UPSTREAM:AI', proc: 'CP' }}\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
+        "}\n",
+        "record(ai, \"RTEMS:PVA:DOWN2\") {\n",
+        "  field(INP, \"pva://UPSTREAM:AI CP\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
+        "}\n",
+        "record(ao, \"RTEMS:PVA:UPLNK\") {\n",
+        "  field(OUT, \"{pva: { pv: 'UPSTREAM:AO' }}\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
+        "  field(SCAN, \"Passive\")\n",
+        "}\n",
     );
 }
 
@@ -280,6 +310,84 @@ mod ioc {
         }
     }
 
+    /// STAGE-5 PROBE: the upstream name server the guest's `pva://` links
+    /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
+    /// host-side upstream IOC's TCP port (the guest's own 5075 is taken by
+    /// the inbound `hostfwd`, so the upstream cannot also use it).
+    const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
+
+    /// STAGE-5 PROBE: the C task census and stack-usage report — see
+    /// `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
+    #[cfg(target_os = "rtems")]
+    unsafe extern "C" {
+        fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
+        fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
+    }
+
+    /// STAGE-5 PROBE: `rt top` + `rt stackuse`, from inside the image.
+    fn stage5_task_and_stack_report(tag: &str) {
+        #[cfg(target_os = "rtems")]
+        {
+            let c = std::ffi::CString::new(tag).unwrap_or_default();
+            // SAFETY: both take a NUL-terminated tag and only read it; the
+            // C side does its own bounds-checked iteration.
+            unsafe {
+                epics_rtems_boot_dump_tasks(c.as_ptr());
+                epics_rtems_boot_stack_report(c.as_ptr());
+            }
+        }
+        #[cfg(not(target_os = "rtems"))]
+        let _ = tag;
+    }
+
+    /// STAGE-5 PROBE: one console report — the link registry, the ONE
+    /// client's connection list, and the two link-bearing records.
+    ///
+    /// This is the guest half of pass criteria 1, 3, 4 and 6: with no shell
+    /// on the target the console is the only place the connection count and
+    /// the record's alarm state can be read from *inside* the IOC, next to
+    /// what `pvxget` reads from outside.
+    fn stage5_report(
+        seq: u32,
+        resolver: &epics_bridge_rs::pvalink::PvaLinkResolver,
+        db: &Arc<PvDatabase>,
+    ) {
+        let rep = resolver.client_report();
+        println!(
+            "STAGE5 seq={seq} links={} channels_total={} active={} searching={} \
+             connecting={} name_servers={} connections={}",
+            resolver.link_count(),
+            rep.channels_total,
+            rep.channels_active,
+            rep.channels_searching,
+            rep.channels_connecting,
+            rep.name_servers,
+            rep.connections.len(),
+        );
+        for c in &rep.connections {
+            println!(
+                "STAGE5 seq={seq} conn peer={} alive={} rx={} tx={} channels={:?}",
+                c.peer,
+                c.alive,
+                c.bytes_rx,
+                c.bytes_tx,
+                c.channels.iter().map(|ch| ch.name.as_str()).collect::<Vec<_>>(),
+            );
+        }
+        for d in resolver.channel_diagnostics() {
+            println!(
+                "STAGE5 seq={seq} link pv={} dir={:?} connected={} records={:?}",
+                d.pv_name, d.direction, d.connected, d.records,
+            );
+        }
+        for rec in ["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"] {
+            let val = db.get_pv(rec).map(|v| v.to_string());
+            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
+            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
+            println!("STAGE5 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
+        }
+    }
+
     pub fn main() -> ExitCode {
         // (0) Pull the RTEMS boot shim into the link. Measured: rustc forwards
         //     a dependency's `rustc-link-lib` entries only when the binary
@@ -287,6 +395,21 @@ mod ioc {
         //     shim archive, `-lbsd -lm -lz` and `POSIX_Init` itself are all
         //     absent from the image. Compiles to nothing on a host build.
         epics_rtems_boot::link_anchor();
+
+        // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
+        // `rtems_init.c:195` hands `main` a fixed one-element argv and
+        // `POSIX_Init` calls `setenv` zero times, so nothing outside the
+        // image can configure it — the value is compiled in here. Set before
+        // `install_pvalink_resolver` builds the ONE client, because
+        // `PvaClientBuilder`'s default reads the variable once at
+        // construction (`client_native/context.rs:171`).
+        //
+        // SAFETY (edition 2024): this runs on the single init thread before
+        // `background_init` starts any other thread, so no concurrent
+        // reader/writer of the environment exists.
+        unsafe {
+            std::env::set_var("EPICS_PVA_NAME_SERVERS", STAGE5_NAME_SERVER);
+        }
 
         // (0b) Make the IOC audible. Every diagnostic below is a `tracing`
         //      event, and an event with no subscriber is discarded, not
@@ -546,6 +669,40 @@ mod ioc {
         );
         for name in &names {
             println!("rtems-pva-ioc: {name}");
+        }
+
+        // STAGE-5 PROBE: the console reporter. One line group every 10 s, and
+        // the task census + stack-usage report every 6th pass (~1 min), which
+        // is the `rt top` / `rt stackuse` reading criterion 6 asks for on a
+        // target that starts no shell. Its own thread with a stated stack
+        // class, like every other thread this entry point starts.
+        {
+            let probe_db = db.clone();
+            let probe_resolver = resolver.clone();
+            println!(
+                "STAGE5 probe: EPICS_PVA_NAME_SERVERS={} (compiled in), reporting every 10 s",
+                STAGE5_NAME_SERVER,
+            );
+            match thread::Builder::new()
+                .name("stage5-probe".to_string())
+                .stack_size(StackSizeClass::Medium.bytes())
+                .spawn(move || {
+                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
+                        epics_base_rs::runtime::task::ThreadPriority::Low,
+                    );
+                    let mut seq = 0u32;
+                    loop {
+                        thread::sleep(std::time::Duration::from_secs(10));
+                        seq += 1;
+                        stage5_report(seq, &probe_resolver, &probe_db);
+                        if seq % 6 == 0 {
+                            stage5_task_and_stack_report(&format!("s5-{seq}"));
+                        }
+                    }
+                }) {
+                Ok(_) => {}
+                Err(e) => eprintln!("STAGE5 probe: cannot start the reporter thread: {e}"),
+            }
         }
 
         // Runs until the board is reset: an IOC has no self-shutdown path on
@@ -933,16 +1090,21 @@ mod tests {
         let recs =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the built-in database must parse");
-        assert_eq!(recs.len(), 3, "the demo database is three records");
+        // STAGE-5 PROBE: three group members plus the three link-bearing
+        // records the stage-5 gate is about (`RTEMS:PVA:DOWN` INP,
+        // `RTEMS:PVA:DOWN2`, `RTEMS:PVA:UPLNK`), which carry no `Q:group` tag.
+        assert_eq!(recs.len(), 6, "three group members plus the three pva:// links");
 
         let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
         for rec in &recs {
-            let json = rec
+            let Some(json) = rec
                 .info_tags
                 .iter()
                 .find(|(k, _)| k == "Q:group")
                 .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| panic!("record {} carries no Q:group tag", rec.name));
+            else {
+                continue;
+            };
             let defs = parse_info_group(&rec.name, &json)
                 .unwrap_or_else(|e| panic!("record {}: {e}", rec.name));
             merge_group_defs(&mut groups, defs);

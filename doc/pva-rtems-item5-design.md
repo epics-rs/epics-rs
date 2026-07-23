@@ -1,6 +1,12 @@
 # PVA phase 6 item 5 — reader / operation / writer split: settled design
 
-**Status:** design only. No file edited, no commit made.
+**Status:** COMPLETE as built (2026-07-23). Stages 1–5 all landed:
+`ad268398` (stage 1), `93590517` (stage 2), `44681c76` (stage 3, as built
+§10), `ab97461f` (stage 4, as built §11), stage 5 closed by the executable
+gate `scripts/rtems-check.sh` (as built §12). The post-merge owed rename
+landed as `04cdf6fa`. §§0–9 are preserved as written — design-time text
+whose line numbers reference the pva-cs-ring worktree; §§10–12 record
+where the landed code deviated.
 **Bases read:**
 - PVA (items 4+6 applied): `/home/stevek/work/epics-rs/.caucus/worktrees/pva-cs-ring`, branch `phase6/pva-channelsource-ring` @ `e278088c`.
 - CA reference + new base runtime: `/home/stevek/work/epics-rs/.caucus/worktrees/manual-ca-sans-io` @ `d704087d`.
@@ -560,7 +566,7 @@ Every stage is independently workspace-green
 | 2 | PVA server-native seam swap: 11 `tokio::spawn` → `runtime::task::spawn`; `AbortOnDrop(TaskAbortHandle)` (`tcp.rs:783`); 3 timer sites (`:3280`, `:3323`, `:5509`) onto the seam. Aliases on hosted ⇒ zero behaviour change. | ✅ | ✅ | 3–4 d |
 | 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. **DONE** (`44681c76`; as built: §10) | ✅ | ✅ (additive) | 1–1.5 wk |
 | 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. **DONE** (`ab97461f`; as built: §11 — the `oneshot` arm was NOT taken, the sign-off item dissolved) | ✅ | ✅ as landed (no hosted timing change) | 3–4 d |
-| 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. | ✅ | ✅ | 2–3 d |
+| 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. **DONE** (superseded in shape by `scripts/rtems-check.sh`; the owed `--extern` record is §12.2) | ✅ | ✅ | 2–3 d |
 
 Sequencing note: stages 1–2 are desktop-neutral and can land **before** the CA
 merge lands stage 3's prerequisites… except stage 1 *is* an `epics-base-rs`
@@ -741,3 +747,78 @@ wake from the `Arc<TcpStream>` they already hold, and
 `ConnRegistration::wake_handle` is gone with its last caller. The
 registry keeps exactly what §4 gave it — the server-WIDE stop — and
 nothing else can shut a connection's socket through it.
+
+---
+
+## 12. Stage 5 as built — the one-off check became an executable gate
+
+### 12.1 Superseded in shape: `scripts/rtems-check.sh` is the stage
+
+The stage row asked for a one-off `cargo +nightly check --target
+armv7-rtems-eabihf` run over the blocking driver's module set, recorded
+the way `15f1fc6c` recorded the CA entry point's. Between design and
+close, the gate became an executable census instead of a prose
+invocation: `scripts/rtems-check.sh` compiles `epics-pva-rs --lib`
+(`server_native::blocking` is ungated in `mod.rs`, so the blocking
+driver IS in that module set) with `--locked --no-default-features
+-Zbuild-std`, in **both** the portability and the image
+(`rtems_boot_linked`) configurations, plus the binary census and the
+client-features ratchet. That is strictly stronger than the designed
+one-off: it cannot drift, and it already carried the interim records —
+stage 3's commit measured exit 0 with the module's dead-code warnings
+dropping 116 → 4 (the driver is the RTEMS-side entry point into `tcp`
+that the accept-split gate re-point had left missing), stage 4's
+measured exit 0 with the count unchanged at 4.
+
+Measured at close (2026-07-23, this tree): `./scripts/rtems-check.sh`
+exit 0 — every crate and target binary, both configurations, PVA client
+ratchet at 0.
+
+### 12.2 The owed `--extern` record
+
+From the `epics_pva_rs` rustc invocation of `cargo +nightly check
+--locked --no-default-features -Zbuild-std=std,panic_abort --target
+armv7-rtems-eabihf -p epics-pva-rs --lib -v` (portability
+configuration, exit 0):
+
+```
+bytes  chrono  clap  dashmap  epics_base_rs  futures_util  hostname
+libc  parking_lot  serde_json  thiserror  tokio  tokio_util  tracing
+tracing_subscriber
+(+ epics_macros_rs as a host-side proc-macro .so; sysroot crates from
+-Zbuild-std: std/alloc/core/compiler_builtins/panic_abort/panic_unwind)
+```
+
+**No `socket2`, no `if-addrs`, no `getrandom`, no `mio`** — the §8.1.1
+lib gating holds at the blocking driver's scope, the same four absences
+`15f1fc6c` recorded for `rtems-ca-ioc`. `tokio` is present and stays:
+the driver awaits `tokio::sync` primitives through the seam; what the
+target excludes is the reactor (`tokio::net`, and mio under it), not
+the sync surface. The invocation carries `--cfg exec_backend` — since
+the CA merge, transport/dial selection keys on that cfg rather than on
+`target_os` directly, which is why the same flag drives the
+host-selectable `rtems-exec-model` feature.
+
+### 12.3 Post-merge seam growth the stages absorbed without reshaping
+
+§7's prerequisite list (`spawn`, `TaskHandle`, `TaskAbortHandle`,
+`interval`, `background_init`, `future_exec`, `timer_sleep`) arrived
+with the CA merge and kept growing: stage 1's `timeout` is no longer a
+thin tokio delegation but a dual-backend pair (`task.rs:508`/`:515`),
+and the seam now also carries `timeout_at`, a backend-selected
+`Instant` alias, and `TaskSet`. None of it changed any stage's shape —
+the connection loop's three timer sites still name only the seam.
+
+### 12.4 Item close-out: the owed rename landed; what remains is item 9
+
+The rename this design carried as "owed post-merge" — `AbortOnDrop` and
+the `finish_exec_data_task` abort parameter naming
+`tokio::task::AbortHandle` — landed as `04cdf6fa`: three annotations
+onto the seam aliases (`AbortOnDrop(TaskAbortHandle)`, the abort
+parameter, and `spawn_monitor_subscriber`'s `TaskHandle<()>` return),
+no behaviour change, 11 of the 14 RTEMS errors the module reported
+closed by it. The direct tokio-handle namings that remain in the
+workspace are all in host-only modules — `server_native/{udp,runtime}.rs`
+(cfg-gated off RTEMS), `epics-ca-rs`'s hosted async server
+(`server/tcp.rs`), and the PVA gateway's `channel_cache.rs` — which is
+item 9's sweep (§6), its scope unchanged by item 5's close.

@@ -826,6 +826,37 @@ impl PvaLinkResolver {
     }
 }
 
+/// Report a link that the install scan could not open, on the one channel
+/// an IOC operator actually sees.
+///
+/// The scan used to discard every open result with `let _ =`, so a link
+/// rejected at init (bad options, `local=true` naming a PV this IOC does not
+/// hold) left NO trace: the record simply never linked, and the only visible
+/// difference was a link count one lower than the database implies. That cost
+/// a full cross-build / image-copy / qemu-boot cycle to notice on the RTEMS
+/// target, where the pre-open of `RTEMS:PVA:UPLNK` was believed to be failing
+/// (it was in fact never attempted — `44c4ef3e`).
+///
+/// `eprintln!` rather than `tracing::warn!` deliberately, on two grounds:
+/// pvxs reports the same class of init-time link refusal with
+/// `fprintf(stderr, "%s Error: local:true link to '%s' can't be fulfilled\n")`
+/// (`ioc/pvalink_lset.cpp:70-76`), and the sibling QSRV group loader in this
+/// crate already reports config-load failures the same way
+/// (`qsrv/group_config.rs`, `qsrv/provider.rs:1071`). It is also the only
+/// path that reaches an RTEMS console: the target installs no `tracing`
+/// subscriber, so a `warn!` here would be discarded exactly like the
+/// diagnostic it replaces.
+fn report_open_failure(
+    record: &str,
+    field: &str,
+    channel: &str,
+    result: PvaLinkResult<Arc<PvaLink>>,
+) {
+    if let Err(e) = result {
+        eprintln!("{record}.{field} Error: pvalink to '{channel}' not opened: {e}");
+    }
+}
+
 /// Install a [`PvaLinkResolver`] on `db`. Returns the resolver so the
 /// caller can pre-open links and query stats (`db_pvxr` /
 /// `pvalinkrefdiff` iocsh commands lean on this).
@@ -896,11 +927,12 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // banner reported 1 link for 3 link-bearing records.
                 ParsedLink::Pva(s) => {
                     let link_str = format!("pva://{s}");
-                    if field_name == "OUT" {
-                        let _ = resolver.open_out_link(&link_str, Some(&record_name)).await;
+                    let opened = if field_name == "OUT" {
+                        resolver.open_out_link(&link_str, Some(&record_name)).await
                     } else {
-                        let _ = resolver.open_link_for_record(&link_str, &record_name).await;
-                    }
+                        resolver.open_link_for_record(&link_str, &record_name).await
+                    };
+                    report_open_failure(&record_name, &field_name, &link_str, opened);
                 }
                 // pvxs-parity JSON longhand `{pva:{pv,…}}`: the options
                 // are structured JLink members, read directly without a
@@ -909,15 +941,16 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // precisely to carry options (a pv-only longhand yields a
                 // plain `Pva`), so there is no bare-PV early-out here.
                 ParsedLink::PvaJson(j) => {
-                    if field_name == "OUT" {
-                        let _ = resolver
+                    let opened = if field_name == "OUT" {
+                        resolver
                             .open_json_out_link(&j.pv, &j.options, Some(&record_name))
-                            .await;
+                            .await
                     } else {
-                        let _ = resolver
+                        resolver
                             .open_json_link_for_record(&j.pv, &j.options, &record_name)
-                            .await;
-                    }
+                            .await
+                    };
+                    report_open_failure(&record_name, &field_name, &j.pv, opened);
                 }
                 _ => {}
             }

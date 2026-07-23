@@ -80,12 +80,17 @@ CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
 #
 # So the selection is stated rather than defaulted, and stated per crate rather
 # than globally: it says out loud that this crate's target configuration is a
-# CHOICE. `qsrv-core` and not `qsrv` because `qsrv` implies `pvalink`, which
-# needs `epics_pva_rs::client_native` — 47 errors on this target
-# (doc/qsrv-rtems-design.md §0 probe D). See that document §2.2 for why the
-# split is a named feature rather than an absence.
+# CHOICE. `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
+# implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
+# pva:// record-link resolver — is now on the target (design stage 4). It pulls
+# `epics-pva-rs/client`, whose UDP transport is cfg-gated out so the client
+# compiles for the triple (the ratchet probe below measures zero), and does NOT
+# pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
+# `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
+# was `qsrv-core` alone, because `client_native` was 47 errors on this target
+# (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
 declare -A CRATE_FEATURES=(
-    [epics-bridge-rs]="qsrv-core"
+    [epics-bridge-rs]="qsrv-core,pvalink"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.
@@ -98,8 +103,8 @@ BINS=(
     # doc/qsrv-rtems-design.md §9.7). It is still the only target PVA binary, so
     # this stays one entry, not two.
     #
-    # It carries `required-features = ["qsrv-core"]`, which the loop below
-    # supplies from CRATE_FEATURES. That combination is safe here and was
+    # It carries `required-features = ["qsrv-core", "pvalink"]`, which the loop
+    # below supplies from CRATE_FEATURES. That combination is safe here and was
     # measured, because the manifest comment the binary arrived with warned the
     # opposite: an unmet `required-features` makes cargo silently SKIP the
     # target for the plural forms (`--bins`, `--all-targets`), but an explicit
@@ -329,18 +334,28 @@ fi
 #     47  before stage 1        29 primary + an 18-error [u8] cascade
 #     29  after stages 1 and 2  cascade gone with search_engine's TcpStream
 #     28  after server_conn's unconditional tokio::net import was removed
+#      0  after stage 4         UDP transport cfg-gated out of the target build
 #
-# All 28 are UDP: udp.rs 20, search_engine.rs 7, search.rs 1. `server_conn.rs`
-# and `ops_v2.rs` are at zero, and — since `ops_v2.rs` names nothing from
-# `search_engine`/`udp` — that zero is now a real result rather than a
-# suppressed one, which settles §6 item 1 for that file. `channel.rs` and
-# `context.rs` are also at zero but still name `search_engine::SearchEngine`,
-# so theirs stays suppressed until the UDP stage lands.
+# Stage 4 closed the remaining 28 (§5): the whole UDP SEARCH/beacon transport —
+# `client_native::udp`, the legacy `client_native::search`, and every UDP-only
+# item in `search_engine.rs` (the `SearchTransport::Udp` variant, `UdpTransport`
+# and its `bind_udp`/broadcast, the bind/join/fanout helpers, `SearchTarget`) —
+# is `#[cfg(not(target_os = "rtems"))]`. On the target `SearchTransport` has the
+# single `NameServersOnly` variant, so "no UDP socket" is a fact about the type
+# rather than a runtime branch, and the three UDP-config spawn entry points
+# construct `NameServersOnly` through `env_transport`/`config_transport`. This is
+# what lets the `epics-bridge-rs:rtems-pva-ioc --features qsrv-core,pvalink` bin
+# above pull `epics-pva-rs/client` and still compile for the target.
 #
-# Portability configuration only: every error is name resolution, which
+# The count stays pinned even at zero: a probe that regressed the client back
+# off the target would raise it, and this comparison is what turns that into a
+# named failure rather than a silently-red build. With zero errors rustc emits
+# no "due to N previous errors" line, which the extraction below reads as 0.
+#
+# Portability configuration only: every gate is name resolution / `cfg`, which
 # `rtems_boot_linked` does not reach, so the second configuration would cost a
 # full build to re-measure an identical number.
-PVA_CLIENT_TARGET_ERRORS=28
+PVA_CLIENT_TARGET_ERRORS=0
 
 log "== [probe] epics-pva-rs --lib --features client (ratchet)"
 export RUSTFLAGS="$BASE_RUSTFLAGS"
@@ -370,4 +385,4 @@ fi
 
 log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
 log "the portability and the image configuration."
-log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors, all UDP."
+log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."

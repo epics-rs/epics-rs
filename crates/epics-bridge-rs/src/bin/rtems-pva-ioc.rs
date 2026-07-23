@@ -36,16 +36,22 @@
 //! of the source-text guards at the bottom of this file, one `STATUS_PREFIX`,
 //! and no extra `-Zbuild-std` build in the portability gate.
 //!
-//! # `pva://` record links do not resolve on this target
+//! # `pva://` record links resolve on this target (design stage 4)
 //!
 //! A C IOC linked against pvxs gets pvalink through `pvalink_enable()`
-//! (`ioc/iochooks.cpp:495`), so `INP=@pva://...` resolves. This one does not,
-//! and cannot yet: pvalink is a PVA *client*, there is no blocking/sans-io PVA
-//! client driver, and standing one up is a measured 47 compile errors over a
-//! 23,881-line `client_native` tree (design §3.4, stage 5). The startup banner
-//! says so out loud rather than leaving an operator to discover that a link
-//! silently never connects — the failure mode is indistinguishable from a slow
-//! remote IOC from the record's side.
+//! (`ioc/iochooks.cpp:495`), so `INP=@pva://...` resolves. This one does too:
+//! [`install_pvalink_resolver`](epics_bridge_rs::pvalink::install_pvalink_resolver)
+//! mounts the pva:// external record-link resolver on the database as a fourth
+//! step at init, and the startup banner reports it installed and the link count
+//! it pre-registered.
+//!
+//! The client that backs it is the blocking PVA client (design stages 1-3): on
+//! the target it dials over TCP and reaches upstream servers through
+//! `EPICS_PVA_NAME_SERVERS` alone, because the UDP SEARCH transport is compiled
+//! out (`SearchTransport::NameServersOnly`, design §4.2) — there is no
+//! `recvmsg`/`IP_PKTINFO` receive path and no `local_addr()` readback to stamp a
+//! response port. A `pva://` link to a server reachable only by UDP broadcast
+//! will therefore not resolve; one named by a TCP name server will.
 //!
 //! # The server is reachable with the UDP responder down, deliberately
 //!
@@ -181,6 +187,7 @@ mod ioc {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
+    use epics_bridge_rs::pvalink::install_pvalink_resolver;
     use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
     use epics_pva_rs::server::PvDatabaseSource;
     use epics_pva_rs::server_native::blocking::{BlockingPvaServer, bind_udp_search};
@@ -339,6 +346,25 @@ mod ioc {
                 return ExitCode::FAILURE;
             }
         };
+
+        // (2c) The pvalink resolver: install the pva:// external record-link
+        //      resolver on the database so `INP=@pva://...` / `OUT=@pva://...`
+        //      fields resolve. C does the equivalent at `pvalink_enable()`
+        //      (ioc/iochooks.cpp:495) during iocInit, after the database exists.
+        //      Installed here — after the database and the QSRV mount, before the
+        //      PVA front-end — so every record's link fields are pre-registered
+        //      before the server answers its first client.
+        //
+        //      On this target the PVA client reaches upstream servers over TCP
+        //      name servers alone (`EPICS_PVA_NAME_SERVERS`): the UDP SEARCH
+        //      transport is compiled out (design §4.2, `SearchTransport::
+        //      NameServersOnly`), and every task the resolver spawns lands on the
+        //      callback pool `background_init` started above via
+        //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
+        //      number of pva:// links pre-registered from the loaded database.
+        let resolver = block_on_sync(install_pvalink_resolver(&db))
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        let link_count = resolver.link_count();
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.
@@ -504,16 +530,19 @@ mod ioc {
                 " only (set PVXS_QSRV_ENABLE=YES for groups)"
             },
         );
-        // Said at every boot, not only when a link is configured: this IOC
-        // cannot detect that a `pva://` link exists — the resolver that would
-        // see one is the thing that is missing. An operator whose `INP=@pva://`
-        // never connects has no other way to learn it is unimplemented rather
-        // than slow, so the gap is stated unconditionally. Remove this line in
-        // design stage 5, together with the pvalink mount it describes.
+        // The pvalink resolver is mounted, so `@pva://...` INP/OUT links
+        // resolve. Reported at every boot — including `link_count == 0`, when
+        // the loaded database configured none — because on a target with no
+        // shell the console is the only place an operator can confirm the
+        // resolver came up and how many links it pre-registered. The client
+        // reaches upstream servers over `EPICS_PVA_NAME_SERVERS` (TCP); the UDP
+        // SEARCH transport is compiled out on this target (design §4.2), so a
+        // link to a server reachable only by broadcast will not resolve.
         println!(
-            "rtems-pva-ioc: NOTE pva:// record links do NOT resolve on this target — pvalink \
-             needs a blocking PVA client, which does not exist yet (design stage 5). \
-             An INP/OUT of the form @pva://... will never connect. ca:// links are unaffected."
+            "rtems-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
+             link{} pre-registered; @pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS \
+             (TCP name servers; UDP search is compiled out on this target)",
+            if link_count == 1 { "" } else { "s" },
         );
         for name in &names {
             println!("rtems-pva-ioc: {name}");
@@ -833,24 +862,37 @@ mod tests {
         );
     }
 
-    /// The startup banner states the pvalink gap.
+    /// The pvalink resolver is mounted, and the banner reports it.
     ///
-    /// A `pva://` link on this target never connects, and the IOC cannot
-    /// detect that one was configured — the resolver that would see it is the
-    /// missing piece. So the only place an operator can learn this is the
-    /// boot console, unconditionally. Design stage 5 removes both the gap and
-    /// this guard.
+    /// This is the stage-4 counterpart of the group-source guard: a regression
+    /// that dropped the `install_pvalink_resolver` call would leave an IOC that
+    /// still boots, still serves every record and still answers searches — and
+    /// silently resolves no `@pva://...` INP/OUT link at all, with no shell on
+    /// the target to notice. The banner line is the only place an operator can
+    /// confirm from the console that the resolver came up and how many links it
+    /// pre-registered, so it is checked too.
     #[test]
-    fn the_banner_states_that_pva_links_do_not_resolve() {
+    fn the_pvalink_resolver_is_mounted_and_the_banner_reports_it() {
         let src = include_str!("rtems-pva-ioc.rs");
         let prod = match src.find("\n    #[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
         };
+        // `concat!` so this assertion cannot match its own source text.
         assert!(
-            prod.contains("pva:// record links do NOT resolve"),
-            "the boot banner no longer warns that pva:// links are unimplemented on \
-             this target; an operator's INP=@pva://... would silently never connect"
+            prod.contains(concat!("install_pvalink_", "resolver(&db)")),
+            "the pvalink resolver is no longer installed; @pva://... record links \
+             would silently never resolve, and there is no shell on the target to say so"
+        );
+        assert!(
+            prod.contains("pvalink resolver installed"),
+            "the boot banner no longer reports the pvalink resolver; on a target with \
+             no shell the console is the only place an operator can confirm it came up"
+        );
+        assert!(
+            prod.contains("link_count"),
+            "the banner no longer reports the pre-registered link count, the one number \
+             that tells an operator whether the database's pva:// links were seen"
         );
     }
 

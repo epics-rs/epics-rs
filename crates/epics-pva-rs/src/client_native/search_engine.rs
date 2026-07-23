@@ -3044,8 +3044,20 @@ struct NsConnParams {
 }
 
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
-/// Loops forever: connect, handshake, forward SEARCHes / receive responses,
-/// reconnect after 10 s on any failure. pvxs client.cpp:651-667 + 1295-1305.
+/// Loops until the engine is gone: connect, handshake, forward SEARCHes /
+/// receive responses, reconnect after 10 s on any failure.
+/// pvxs client.cpp:651-667 + 1295-1305.
+///
+/// The engine dropping `search_tx` is the shutdown signal, and it must
+/// *terminate* the task, not just the current connection: `Ok(())` from
+/// [`ns_run_once`] means exactly that, and treating it like a disconnect sent
+/// every `ns_task` of a dropped client into a reconnect loop for the life of
+/// the process — one fresh dial (and, on the blocking transport, one dial
+/// thread and two pump threads) per `RECONNECT_INTERVAL`, forever, per name
+/// server, per dropped client. The `is_closed` check covers the paths that
+/// never reach a `recv` on the channel — an unreachable NS whose dial or
+/// handshake keeps failing — so a dead engine's task exits within one
+/// reconnect cycle instead of never noticing.
 async fn ns_task(
     ns_addr: SocketAddr,
     mut search_rx: mpsc::Receiver<Vec<u8>>,
@@ -3070,13 +3082,24 @@ async fn ns_task(
         // this NS for every tick until the next CONNECTION_VALIDATED, rather
         // than enqueuing frames into a channel nobody is draining.
         ready.store(false, Ordering::SeqCst);
-        if let Err(e) = res {
-            debug!(
-                target: "epics_pva_rs::client",
-                "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
-            );
+        match res {
+            // The engine dropped the sender — shut down for good.
+            Ok(()) => return,
+            Err(e) => {
+                debug!(
+                    target: "epics_pva_rs::client",
+                    "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
+                );
+            }
         }
         sleep(RECONNECT_INTERVAL).await;
+        // The engine can also go away while this NS is unreachable: the
+        // failing dial/handshake path above never touches the channel, so
+        // closure is checked here rather than waited for on a `recv` that a
+        // dead NS never lets us reach.
+        if search_rx.is_closed() {
+            return;
+        }
     }
 }
 
@@ -5659,6 +5682,75 @@ mod tests {
                  the server at its tcpTimeout",
             )
             .expect("mock NS dropped the echo notifier");
+    }
+
+    /// Shutdown: when the engine drops its `search_tx`, `ns_task` must
+    /// terminate — not treat the closed channel like a disconnect and
+    /// re-dial every `RECONNECT_INTERVAL` forever. Pre-fix, `ns_run_once`'s
+    /// `Ok(())` ("engine gone, shut down cleanly") fell into the same
+    /// reconnect arm as an error, so every dropped client leaked one
+    /// permanently re-dialling task per configured name server.
+    ///
+    /// Exit is observed at the task's own boundary: `ns_task` holds the only
+    /// `response_tx`, so `response_rx` yielding `None` *is* the task having
+    /// returned. Pre-fix the recv times out instead (the looping task keeps
+    /// the sender alive through its 10 s sleep).
+    // Reactor-dependent: `dial_pva`'s tokio arm and `sleep` inside `ns_task`
+    // land on the reactor-less callback pool feature-ON. Gated out
+    // feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ns_task_exits_when_the_engine_is_gone() {
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+        let _ns_handle = spawn_mock_name_server(ns_listener, ns_addr);
+
+        let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let ready = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(ns_task(
+            ns_addr,
+            search_rx,
+            response_tx,
+            Arc::clone(&ready),
+            Arc::new(AtomicUsize::new(0)),
+            NsConnParams {
+                user: String::new(),
+                host: String::new(),
+                handshake_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        // Wait for CONNECTION_VALIDATED: `ready` flips true only then.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "NS circuit must validate against the mock name server"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The engine goes away.
+        drop(search_tx);
+
+        // The task must shut down for good, promptly (well under the 10 s
+        // reconnect interval a mis-classified shutdown would sleep through).
+        let end = tokio::time::timeout(Duration::from_secs(5), response_rx.recv()).await;
+        assert_eq!(
+            end,
+            Ok(None),
+            "ns_task must drop its response sender by returning; anything else \
+             means it is still looping after the engine dropped the channel"
+        );
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("ns_task future must complete")
+            .expect("ns_task must not panic");
     }
 
     /// Regression: TCP name servers must resolve PVs via persistent

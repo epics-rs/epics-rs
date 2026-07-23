@@ -148,24 +148,45 @@ epicsEventDestroy(epicsEventId pSem)
 One line; mirrors `os/posix/osdEvent.c:79` and the same directory's
 `osdMessageQueue.c:74`.
 
+## Measured on target (2026-07-23)
+
+The first two items below were open when this package was written. They were
+measured the next day on the bring-up box; the full write-up, with raw logs and
+checksums, is
+[`measurement-c-event-leak-bytes-on-rtems-6.md`](measurement-c-event-leak-bytes-on-rtems-6.md).
+
+- **Bytes per leaked block: 32.** Measured directly — 2 × 10,000
+  `epicsEventCreate`/`epicsEventDestroy` pairs cost exactly 10,000 heap blocks
+  and 320,000 bytes each time. `sizeof(rtems_binary_semaphore)` is **24** on this
+  target, so the remaining 8 bytes are RTEMS heap-block overhead and alignment.
+  The allocator's own counters record 10,000 allocations against zero matching
+  frees, which is this defect stated in the allocator's terms.
+- **Per rsrv client connect/disconnect cycle: exactly 5 blocks and 160 bytes**
+  — the predicted count of 5 is hit exactly, not merely bracketed, and
+  5 × 32 = 160 accounts for the measured bytes with no residual. Reproduced
+  across two boots of the stock `cioc-fd64.exe` and four batches (250 and 600
+  cycles each), with the thread census back to its idle count at every reading,
+  so the growth is retained memory and not lingering threads. On-target repro of
+  the C IOC is therefore no longer open either.
+- The **"+1 per cancelled monitor"** row above is real but **conditional**:
+  `db_cancel_event` only reaches `db_sync_event` when a callback is in flight
+  concurrently with `event_task` (`dbEvent.c:612-617`). Measured at 2 extra
+  blocks across 600 monitor-carrying cycles (~0.3%), so the per-cycle floor
+  stays at 5.
+
 ## Not measured / open
 
-- ~~Bytes per leaked block~~ **MEASURED 2026-07-23: 32 B per block, 160.0 B
-  per rsrv client cycle** (see the target measurement above). 32 B is the
-  RTEMS heap accounting cost of the `malloc(sizeof(epicsEventOSD))` block,
-  not `sizeof` itself.
-- ~~pthread_setname_np allocation~~ **CLOSED by the same measurement**: the
+- libca-side per-circuit figure (predicted 6 blocks = 192 B) is derived from
+  the measured 32 B block cost, not separately measured.
+- **Which** five blocks: the measurement counts and sizes them and the source
+  pairing above names them, but no block's address was traced back to
+  `epicsEventCreate`. See that document's Limits section.
+- No endurance run: the longest continuous run was 600 cycles.
+- ~~pthread_setname_np allocation~~ **CLOSED by the cycle measurement**: the
   per-cycle block count is exactly 5.000 with two thread creations per
   cycle, so `pthread_setname_np` (run on every create via
   `osdThreadExtra.c:46-47`) leaves no permanent per-thread allocation.
-- ~~No on-target repro~~ **RUN 2026-07-23** on the `~/rtems-cside/` rig; the
-  full measurement document (cycle characterization, driver scripts, raw-log
-  checksums) is being written by the measurement panel and lands with its
-  branch.
-- The direct `epicsEventCreate`/`epicsEventDestroy` loop sizing (isolating
-  the 32 B without the rsrv machinery) is in progress on the same rig.
-- libca-side per-circuit figure (predicted 6 blocks = 192 B) is derived from
-  the same 32 B block cost, not separately measured.
+  Transient allocation inside the call was not separately traced.
 
 ## Relation to our own finding
 

@@ -759,6 +759,18 @@ zero source patches while bring-up continued.
   transcript in `evidence/`, and its drivers are in `repro/priority/`. Unlike
   everything else in this directory, this file and its evidence were produced
   by *running* the box rather than by copying from it.
+* [`measurement-c-event-leak-bytes-on-rtems-6.md`](measurement-c-event-leak-bytes-on-rtems-6.md)
+  — **added 2026-07-23.** How many bytes does the
+  [`epicsEventDestroy` leak](c-base-rtems-posix-event-leak.md) actually cost?
+  Measured on the same stock `cioc-fd64.exe`: **160 bytes and exactly 5 heap
+  blocks per CA client connect/disconnect cycle**, reproduced across two boots
+  and four batches, with **32 bytes per leaked block** measured independently.
+  Closes that document's first "Not measured / open" bullet. The heap instrument
+  is the RTEMS shell's own `malloc` command reached through base's `rt` bridge,
+  so the image carrying every per-cycle number is unmodified; a second image
+  carrying one added iocsh command contributes only the per-block size, and is
+  declared as a deviation. Evidence is three unedited console logs in
+  `evidence/`; drivers are in `repro/evleak/`.
 
 ## Also recovered, and NOT an upstream bug
 
@@ -804,15 +816,21 @@ ever unified; this work deliberately did not edit it. Numbering follows handoff
 ```
 doc/upstream-rtems-bugs/
 ├── README.md     this file — all four bugs, plus these appendices
+├── c-base-rtems-posix-event-leak.md              evidence package: the epicsEventDestroy leak
 ├── measurement-c-thread-priority-on-rtems-6.md   handoff §8.0 gap 1, measured on a boot 2026-07-22
+├── measurement-c-event-leak-bytes-on-rtems-6.md  bytes/cycle for that leak, measured 2026-07-23
 ├── evidence/     four markdown artefacts recovered byte-for-byte, unedited, plus
-│   │             one console log produced by *running* the box rather than copying from it
+│   │             four console logs produced by *running* the box rather than copying from it
 │   ├── FINDING-1-libevent-poll-spin.md        bug 1 (and the pvxs consequence)
 │   ├── FINDING-2-base-rtems-fsimage-null.md   bug 4
 │   ├── FINDING-3-per-connection-heap.md       not a bug; carries its own retraction
 │   ├── DEVIATIONS.md                          declared deviations; sole original home of bug 3
-│   │                                          (re-copied 2026-07-22 with its session-3 section)
-│   └── c-thread-priority-boot-console-2026-07-22.log   the priority boot's whole console
+│   │                                          (re-copied 2026-07-23 with its session-4 section)
+│   ├── c-thread-priority-boot-console-2026-07-22.log   the priority boot's whole console
+│   ├── cioc-evleak-2026-07-23.log             event-leak run 1 (stock image)
+│   ├── cioc-evleak-repeat-evmon-2026-07-23.log  run 2 + the monitor control (stock image)
+│   ├── cioc-evloop-2026-07-23.log             per-block size (variant image)
+│   └── .gitattributes                         `*.log -text`; the logs are CR LF and checksummed
 ├── patches/      the one-line change to each modified upstream file
 │   ├── RTEMS.cmake.orig            pristine upstream file (1,781 B), verbatim
 │   ├── pvxs-RTEMS.cmake.diff       bug 3, one line
@@ -820,7 +838,8 @@ doc/upstream-rtems-bugs/
 └── repro/
     ├── fsbug/    bug 4 — the 12-line application that faults unpatched base at boot
     ├── probe/    bugs 1-2 — the poll-spin probe and its --wrap=poll link flag
-    └── priority/ the six host-side CA load drivers behind the priority measurement
+    ├── priority/ the six host-side CA load drivers behind the priority measurement
+    └── evleak/   the event-leak drivers, plus the one app source the variant image adds
 ```
 
 **Reproducer notes.** `repro/fsbug/` is a `PROD_IOC` whose entire application
@@ -868,20 +887,23 @@ checksummed against the same `diff -u` run piped through `sha256sum` on the box.
 **These sums are the reason `evidence/` must not be edited** — reflowing or
 renaming any of those four files breaks verification against the source of truth.
 
-**One row changed on 2026-07-22 after the recovery.** `evidence/DEVIATIONS.md`
-was re-copied from the box once the priority measurement had appended its
-"Session 3 additions" section to the box's file, so the row below is
-`bcd3a3ed…b00b44` and no longer the recovered `8c3d8109…fbb440`. The earlier
-content is unchanged; the new section is appended after it. The files added by
-that measurement carry their own checksum table, in
-[`measurement-c-thread-priority-on-rtems-6.md`](measurement-c-thread-priority-on-rtems-6.md).
+**One row has changed twice since the recovery, both times for the same reason.**
+`evidence/DEVIATIONS.md` is re-copied from the box whenever a measurement session
+appends its own section to the box's file. It went `8c3d8109…fbb440` (recovered)
+→ `bcd3a3ed…b00b44` (2026-07-22, "Session 3 additions") →
+`796e0973…ab96a5d` (2026-07-23, "Session 4 additions"), which is the row below.
+Earlier content is unchanged in each step; each new section is appended after it.
+The files added by those measurements carry their own checksum tables, in
+[`measurement-c-thread-priority-on-rtems-6.md`](measurement-c-thread-priority-on-rtems-6.md)
+and
+[`measurement-c-event-leak-bytes-on-rtems-6.md`](measurement-c-event-leak-bytes-on-rtems-6.md).
 
 | file in this directory | source on the box | sha256 |
 |---|---|---|
 | `evidence/FINDING-1-libevent-poll-spin.md` | `FINDING-1-libevent-poll-spin.md` | `ed161ccb162b361e381ea85cbbb094b1d3d20866791e9935e20f7804af2255d6` |
 | `evidence/FINDING-2-base-rtems-fsimage-null.md` | `FINDING-2-base-rtems-fsimage-null.md` | `2ad0e20893c5a45a75ed4b0e4a8c3f1d3726683cc3388a233de9c13788d73222` |
 | `evidence/FINDING-3-per-connection-heap.md` | `FINDING-3-per-connection-heap.md` | `18c9fd69a48efc7123a959770fea6e48744bde3a7553a6c8235d5a31f21f02ff` |
-| `evidence/DEVIATIONS.md` | `DEVIATIONS.md` | `bcd3a3ede844cda8ff8296d6e424e57b3f804d4d71f463340328f8769ab00b44` |
+| `evidence/DEVIATIONS.md` | `DEVIATIONS.md` | `796e097350fe4a933dd996454677a5c600c5a9800a03abb06123133dbab96a5d` |
 | `patches/RTEMS.cmake.orig` | `patches/RTEMS.cmake.orig` | `8c66cd3b8cd51d6153d37f00f95d4db7dd406a9d12bf908a87251620c365280b` |
 | `patches/pvxs-RTEMS.cmake.diff` | generated: `diff -u patches/RTEMS.cmake.orig pvxs/bundle/cmake/Platform/RTEMS.cmake` | `3a9adff2382b1ca5a03a70e97a1d49e1e3f489a9414371712e2138b931836210` |
 | `patches/pvxs-evhelper.cpp.diff` | generated: `diff -u -U8 patches/evhelper.cpp.orig pvxs/src/evhelper.cpp` | `90303375b1857a54c605edc6ab373f50834f25da6e050b9a73c10e0406053c0d` |

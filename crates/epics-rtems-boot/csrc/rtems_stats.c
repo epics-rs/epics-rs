@@ -283,17 +283,29 @@ void epics_rtems_boot_fd_census(const char *tag) {
     fd = (int)i;
     open_count++;
 
+    /* `fstat` first, and on EVERY descriptor: measured on target, the console
+     * descriptors answer `getsockopt(SO_TYPE)` with 0 and leave a value behind
+     * that reads as a socket type, so a classification that starts from
+     * `getsockopt` calls fd 0 a UDP socket. `st_mode` is the discriminator
+     * that does not lie — S_IFSOCK vs S_IFCHR — and the raw SO_TYPE value is
+     * printed beside it rather than being trusted. */
+    memset(&st, 0, sizeof(st));
+    if (fstat(fd, &st) != 0) {
+      printf("FDCENSUS tag=%s fd=%d kind=unknown fstat_errno=%d\n", t, fd,
+             errno);
+      continue;
+    }
+
     len = (socklen_t)sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) {
-      int sockerr = errno;
-      if (fstat(fd, &st) == 0) {
-        printf("FDCENSUS tag=%s fd=%d kind=nonsocket mode=0%o so_type_errno=%d\n",
-               t, fd, (unsigned)st.st_mode, sockerr);
-      } else {
-        printf("FDCENSUS tag=%s fd=%d kind=unknown so_type_errno=%d "
-               "fstat_errno=%d\n",
-               t, fd, sockerr, errno);
-      }
+    if (!S_ISSOCK(st.st_mode) ||
+        getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) {
+      printf("FDCENSUS tag=%s fd=%d kind=%s mode=0%o rdev=%ld\n", t, fd,
+             S_ISCHR(st.st_mode)    ? "chardev"
+             : S_ISREG(st.st_mode)  ? "file"
+             : S_ISFIFO(st.st_mode) ? "fifo"
+             : S_ISSOCK(st.st_mode) ? "socket-no-type"
+                                    : "other",
+             (unsigned)st.st_mode, (long)st.st_rdev);
       continue;
     }
 
@@ -317,12 +329,13 @@ void epics_rtems_boot_fd_census(const char *tag) {
       snprintf(peer, sizeof(peer), "none(errno=%d)", errno);
     }
 
-    printf("FDCENSUS tag=%s fd=%d kind=%s listening=%d local=%s peer=%s\n", t,
-           fd,
+    printf("FDCENSUS tag=%s fd=%d kind=%s so_type=%d listening=%d local=%s "
+           "peer=%s mode=0%o\n",
+           t, fd,
            type == SOCK_STREAM  ? "tcp"
            : type == SOCK_DGRAM ? "udp"
                                 : "socket",
-           listening, local, peer);
+           type, listening, local, peer, (unsigned)st.st_mode);
   }
   printf("FDCENSUS end tag=%s open=%lu max=%lu\n", t,
          (unsigned long)open_count, (unsigned long)rtems_libio_number_iops);

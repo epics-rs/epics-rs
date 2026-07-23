@@ -1,0 +1,40 @@
+# Standalone has_thread_local ADOPTION probe #2 for armv7-rtems-eabihf.
+#
+# Rig #1 (`../tlsdtor/`) measured spawn/join + `thread_local!` Drop +
+# isolation and named three cases it did not exercise. This rig is those
+# three: panic UNWINDING through TLS, TLS on a C-created (raw pthread)
+# thread, and `const`-init `thread_local!`. Rig #1's plain spawn/join phase is
+# kept so the 136.00 -> 0.00 control result is reproduced in the same boot.
+#
+# Outside the epics-rs workspace on purpose: the only thing it borrows is the
+# RTEMS boot shim + link contract, which is what turns Rust objects into a
+# bootable .exe.
+[package]
+name = "tlsdtor2"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tlsdtor2"
+path = "src/main.rs"
+
+[dependencies]
+# The C-created-thread phase calls `pthread_create`/`pthread_join` directly.
+libc = "0.2"
+epics-rtems-boot = { path = "/home/coding-agent/epics-rs/crates/epics-rtems-boot" }
+
+[build-dependencies]
+epics-rtems-boot = { path = "/home/coding-agent/epics-rs/crates/epics-rtems-boot" }
+
+# Same pin as the epics-rs workspace: epics-rtems-boot carries hard
+# `const _: () = assert!(...)` guards on the RTEMS libc time/socket layouts,
+# which stock crates.io libc fails.
+[patch.crates-io]
+libc = { git = "https://github.com/physwkim/libc.git", rev = "6f64e70d6a2a03b989380aaa719207236343f093" }
+
+[profile.release]
+debug = true
+
+# Not a member of any workspace.
+[workspace]

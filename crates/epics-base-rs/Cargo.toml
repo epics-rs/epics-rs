@@ -113,7 +113,12 @@ tracing-subscriber = "0.3"
 # threads with no tokio reactor. Compile-time backend switch (see
 # `build.rs`, which turns this into the `exec_backend` cfg). OFF by
 # default: the hosted default is byte-identical without it.
-rtems-exec-model = []
+# Forwards to the dev-dependency `epics-ca-rs` because that crate compiles
+# into this crate's own test graph: without the forward, `cargo test -p
+# epics-base-rs --features rtems-exec-model` builds the split state the
+# `HAS_TOKIO_REACTOR` const guard exists to refuse (base on the exec
+# backend, the ca dev-dep still on tokio), and the guard fails the build.
+rtems-exec-model = ["epics-ca-rs/rtems-exec-model"]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on

@@ -21,7 +21,10 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
-// RTEMS-EXEC-MODEL-ALLOW(18): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(18): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1190,7 +1193,7 @@ impl MpscAuditSink {
     /// `record()` is allowed to block.
     pub fn wrap<A: AuditSink>(capacity: usize, inner: A) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AuditEvent>(capacity.max(1));
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 inner.record(ev);
             }

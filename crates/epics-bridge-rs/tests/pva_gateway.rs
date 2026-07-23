@@ -19,7 +19,10 @@
 
 #![cfg(feature = "pva-gateway")]
 
-// RTEMS-EXEC-MODEL-ALLOW(25): not built feature-ON by default - this file is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(25): checked to pass feature-ON — all 25 run green under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this file.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

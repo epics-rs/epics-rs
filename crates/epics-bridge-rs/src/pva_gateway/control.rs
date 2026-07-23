@@ -48,7 +48,10 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
 
 use std::sync::Arc;
 
@@ -648,8 +651,9 @@ impl ChannelSource for ControlSource {
         let (tx, rx) = mpsc::channel::<PvField>(4);
         let me = self.clone();
         let pv_name = name.to_string();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        epics_base_rs::runtime::task::spawn(async move {
+            let mut tick =
+                epics_base_rs::runtime::task::interval(std::time::Duration::from_secs(1));
             tick.tick().await; // skip the immediate fire — server emits
             // initial via get_value.
             let mut last: Option<PvField> = None;

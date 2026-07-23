@@ -639,13 +639,18 @@ pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRec
 /// It is a *blocking* `::connect()` with **no application-level deadline** —
 /// C's exact shape (`tcpiiu.cpp:606-661`), and the property
 /// `connect_deadline_tests::tcp_connect_has_no_application_level_deadline`
-/// pins for both transports. On Linux the OS bound is `tcp_syn_retries`,
-/// ~130 s of exponentially backed-off SYNs.
+/// pins for both transports. Which OS bound applies is the *target's*
+/// question, not the host's: this arm is the RTEMS/blocking one, where libbsd
+/// ends an unanswered handshake at `TCPTV_KEEP_INIT` (`75 * hz`), measured at
+/// 75 s. A Linux host instead runs `tcp_syn_retries`, ~130 s of exponentially
+/// backed-off SYNs — that is the figure for the async arm above, not for this
+/// one.
 ///
 /// Running that on the calling task's worker would park it for the whole
 /// ladder. On this target the caller is a cooperative-executor worker shared
 /// with every other future on its callback band — record-processing tails
-/// included — so one unreachable server would stall the band for two minutes.
+/// included — so one unreachable server would stall the band for the full
+/// 75 s.
 /// C does not have that problem because its connect is already on the
 /// circuit's own `CAC-TCP-recv` thread (`tcpiiu.cpp:677`), created before the
 /// connect rather than after it.
@@ -686,9 +691,11 @@ pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRec
 /// applies no bound of its own, so the OS remains the only thing that ends a
 /// dial — C's shape (`tcpiiu.cpp:606-661`). The consequence, stated rather
 /// than papered over: a worker pinned against a SYN-blackholed server is held
-/// for the OS ladder (~130 s), and with every worker so pinned a further dial
-/// waits in the queue instead of connecting at once. That is a latency
-/// regression only in a case the contract already permits 130 s for, and it
+/// for the OS ladder — 75 s on the RTEMS target (libbsd `TCPTV_KEEP_INIT`),
+/// ~130 s on a Linux host (`tcp_syn_retries`) — and with every worker so
+/// pinned a further dial waits in the queue instead of connecting at once.
+/// That is a latency regression only in a case the contract already permits
+/// the full ladder for, and it
 /// takes `MAX_DIAL_WORKERS` *distinct* blackholed servers dialed at once to
 /// reach — a circuit is dialed once per address at a time
 /// (`connect_server`'s map lookup), so the re-offer loop cannot produce it by

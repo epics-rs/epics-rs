@@ -1517,8 +1517,11 @@ Five things about it that are load-bearing and should not be re-derived:
 
 * **Four workers, not one.** A worker is occupied for as long as its
   `connect` blocks, and a SYN-blackholed peer holds one for the OS connect
-  ladder (~130 s on Linux) long after the awaiting side gave up at its own
-  bound. A single worker would let one unreachable peer
+  ladder long after the awaiting side gave up at its own bound. The ladder
+  that governs this sizing is the *target's*: on `armv7-rtems-eabihf` libbsd
+  ends an unanswered handshake at `TCPTV_KEEP_INIT` (`75 * hz`), measured at
+  75 s. (~130 s is a *Linux* host's `tcp_syn_retries` ladder and does not
+  bound anything on target.) A single worker would let one unreachable peer
   head-of-line-block every dial in the process — the §9.3 band-starvation
   failure, moved rather than fixed. Four keeps distinct in-flight dials
   independent; the cost is four `Small` stacks (4 × 256 KiB on

@@ -2729,9 +2729,11 @@ hardcoded cap here once made every slow-but-live server permanently
 unreachable. The pool does not add one, and that test still passes.
 
 The consequence, stated rather than papered over: a worker pinned against a
-SYN-blackholed server is held for the OS ladder (~130 s), and with every
-worker so pinned a further dial *waits in the queue* instead of connecting at
-once. Three things bound how bad that is, and they are why the uniform
+SYN-blackholed server is held for the OS ladder — 75 s on the target, where
+libbsd ends an unanswered handshake at `TCPTV_KEEP_INIT` (`75 * hz`, measured);
+~130 s is a *Linux* host's `tcp_syn_retries` ladder and does not bound anything
+here — and with every worker so pinned a further dial *waits in the queue*
+instead of connecting at once. Three things bound how bad that is, and they are why the uniform
 `MAX_DIAL_WORKERS = 4` was kept rather than special-cased for CA:
 
 * It takes `MAX_DIAL_WORKERS` **distinct** blackholed servers dialed at the

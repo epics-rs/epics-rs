@@ -94,17 +94,38 @@ CA and measures `|actual period − 100 ms|`. n=200 per arm.
 distribution is 6× tighter under load). **But the FIFO tail under load is
 worse, not better** (p99.9 8324 vs 3061 µs). That tail is the RT-throttle
 interaction: the callback path is *not* one uninterrupted FIFO thread — the
-scan fires a timer, the CA server serialises the update over tokio worker
+scan fires, the CA server serialises the update over tokio worker
 threads that are **not** all FIFO, and the 95 % RT cap (`sched_rt_runtime_us`)
 periodically parks the FIFO portion for 50 ms/period, landing on the tail
-samples. This is consistent with `pi-lock-evaluation.md` §6 step 2's open item:
-*"periodic scan … is a JoinSet tokio task, so giving it a priority means moving
-it off the tokio pool"* — until that move happens, the scan's worst case
-inherits the tokio pool's SCHED_OTHER tail even when the front of the chain is
-FIFO.
+samples.
 
-**Not measured:** scan jitter with the periodic-scan task actually moved off the
-tokio pool (that refactor is unbuilt); jitter at scan rates other than 10 Hz.
+**Correction (2026-07-24) — the tail is not scan-on-the-pool.** The first
+version of this section attributed the tail to `pi-lock-evaluation.md` §6
+step 2's *"periodic scan … is a JoinSet tokio task"* and called that refactor
+unbuilt. It was already built on the tree these numbers were taken from:
+`6852ea13` (one dedicated `scan-%g` thread per rate at `ScanLow + ind`) and
+`a4781dc0` (`ScanOwner`) are both ancestors of this document's own commit
+`b1d99e04`, and `examples/rt-probe` boots its IOC through `ScanOwner::start`
+(`main.rs:157`). The doc still says otherwise because it and the refactor sit
+on different branches: `pi-lock-evaluation.md` lives on `main`, where none of
+those three commits are present.
+
+So at the measured commit the tick body already ran on `scan-0.1`
+(pinned since by `server::scan::tests::a_periodic_tick_processes_on_its_own_banded_scan_thread`),
+and the 8324 µs p99.9 is **not** scan execution inheriting SCHED_OTHER. What
+this metric measures is CA-monitor *inter-arrival* at an in-process client:
+scan thread → record process → CA server → CA client. The scan leg is banded;
+the two CA legs are tokio-pool tasks and are the remaining SCHED_OTHER
+exposure. Re-attributing the tail to them is consistent with §3, where the CA
+server path is exactly what FIFO scheduling tightens.
+
+**Not measured:** the re-attribution above is an argument from where the
+threads are, not a measurement — the tail was not decomposed per leg (no
+per-stage timestamps between record process, CA server serialisation and
+client delivery), so the split between the RT-throttle and the CA-pool legs is
+unquantified. Also unmeasured: jitter observed at the record rather than
+through CA (which would isolate the scan leg outright); jitter at scan rates
+other than 10 Hz.
 
 ---
 
@@ -283,9 +304,12 @@ compared against the host.
   value, not an upper.
 * **Loopback only, scalar only.** No array payloads, no real network, no
   many-subscriber fan-out in §2/§3.
-* **The scan-tail item in §2 is open.** The FIFO-under-load p99.9 blowup is the
-  tokio-pool tail that `pi-lock-evaluation.md` §6 step 2 flags; it is measured
-  here as still present, not fixed.
+* **The scan-tail item in §2 is open — but not against scan.** The
+  FIFO-under-load p99.9 blowup is measured as present. Its cause is *not*
+  `pi-lock-evaluation.md` §6 step 2 (periodic scan was already off the tokio
+  pool at this commit — see §2's correction); the remaining pool legs in the
+  measured chain are the CA server and CA client, and no per-leg decomposition
+  was run to apportion the tail between them and the RT throttle.
 
 This closes `pi-lock-evaluation.md` §7's *"Nothing was measured"* for the Linux
 PI path and delivers its §6 step 7 measurable-regression: the record gate under

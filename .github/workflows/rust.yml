@@ -73,3 +73,16 @@ jobs:
       run: cargo nextest run -p epics-pva-rs --features rtems-exec-model
     - name: epics-bridge-rs (rtems-exec-model)
       run: cargo nextest run -p epics-bridge-rs --features rtems-exec-model
+    # DO NOT add `./scripts/rtems-check.sh` here. It is deliberately RED on the
+    # committed tree and wiring it in would ship a permanently-red required
+    # check. The image configuration is now compiled and its failure is fatal,
+    # so the gate reports six red `[image]` targets / twelve `error[E0080]` /
+    # both layout refusals — that is the true state of the workspace: with a
+    # stock `libc` it cannot build a bootable image. It goes green the moment a
+    # `libc` carrying the documented workaround is patched in, and it is blocked
+    # on that decision and on nothing else. See
+    # doc/rtems-scope-b-session-handoff.md §8.1 item 3.
+    #
+    # Tolerating "the two refusals we already know about" and exiting 0 was
+    # considered and rejected by measurement: the incident that motivated the
+    # refusals fires exactly one of the two, so an allowlist admits it.

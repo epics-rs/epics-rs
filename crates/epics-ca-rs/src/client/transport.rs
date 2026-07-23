@@ -4916,8 +4916,19 @@ mod dial_pool_tests {
             "a dial toward a blackhole must be pending, not resolved on the \
              caller's thread"
         );
+        // Read the pool's own count, not `/proc`. A thread's OS name is set by
+        // the *child* — `std`'s `Builder::name` is applied inside the spawned
+        // closure — so between `pthread_create` returning to `dial()` and the
+        // worker's first instruction the thread exists under its parent's
+        // `comm` and `dial_threads()` reports 0. `dial()` runs to completion
+        // inside this very poll, so that window is exactly where the sample
+        // below falls, and under a loaded suite the child loses the race often
+        // enough to fail the run. `worker_count()` is incremented under the
+        // pool's lock on *this* thread before `dial()` returns, so it states
+        // the same fact — one worker now owns this connect — with no dependency
+        // on when the child is scheduled.
         assert_eq!(
-            dial_threads(),
+            CA_DIAL_POOL.worker_count(),
             1,
             "the first poll must have handed the connect to a dial worker"
         );

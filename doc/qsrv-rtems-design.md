@@ -947,13 +947,15 @@ Everything here is a claim this document could not settle from source.
    `EPICS_PVA_NAME_SERVERS` (SLIRP forwards TCP; broadcast does not
    cross it).
 2. ~~**Task count against the callback pool.**~~ **MEASURED — see
-   §9.14.** A 20-member group spawns ~40 forwarder tasks
-   (`group.rs:2496`, `:2532`); C runs one `qsrvGroup` thread
-   (`ioc/groupsource.cpp:96`). On the target this is *not* a non-issue:
-   one group subscriber collapses group delivery to ~0.35 Hz and starves
-   an unrelated scalar monitor on its own TCP connection for up to
-   16.9 s, while scanning itself stays at 10 Hz. The single drain loop
-   C has is the structural candidate.
+   §9.14. FIXED — see §9.15.** A 20-member group spawned ~40 forwarder
+   tasks (`group.rs:2496`, `:2532` pre-fix); C runs one `qsrvGroup`
+   thread (`ioc/groupsource.cpp:96`). On the target this was *not* a
+   non-issue: one group subscriber collapsed group delivery to ~0.35 Hz
+   and starved an unrelated scalar monitor on its own TCP connection
+   for up to 16.9 s, while scanning itself stayed at 10 Hz. The single
+   drain loop C has is now implemented (`GroupPump`, §9.15); the
+   on-target re-measurement that would retire §9.14's LOAD numbers is
+   still owed.
 3. **Per-connection memory ceiling with a group source mounted.** The
    measured PVA ceiling is ~1.59 MB per connection, bounded before file
    descriptors. A group GET assembles a whole `PvStructure` from N
@@ -1769,9 +1771,113 @@ shared by both subscriptions.
 with it. C's one-`qsrvGroup`-drain-thread shape
 (`ioc/groupsource.cpp:96`) is the structural candidate; resizing the
 pool or re-banding the forwarders is the patch-shaped alternative.
+**Implemented as the single drain — §9.15.**
 
 **On §8 item 5 (forwarder priority vs C):** this run measures the
 combined effect only. Separating band-priority inversion from
 delivery-path saturation needs an attribution experiment — e.g. rerun
 with the forwarders spawned in the High band, or with a single drain
 task — before concluding which lever closes it.
+
+**Fix:** the single-drain structural candidate is implemented — §9.15.
+The per-member forwarder tasks this section measured no longer exist;
+the on-target q8 rerun that would retire the LOAD numbers above is
+still owed (§9.15 "What is NOT claimed").
+
+### 9.15 The fix as built — one server-wide group drain (`GroupPump`)
+
+Closes §9.14's verdict on §8 item 2. Landed on `unfixed3/group-drain`
+as `74ea6eb1` (poll-based `EvQue` reader) + `a0078c5f` (the drain) +
+`6b472636` (flood regression test).
+
+**Shape.** `crates/epics-bridge-rs/src/qsrv/group_pump.rs` is the port
+of pvxs's one `"qsrvGroup"` event pump (`ioc/groupsource.cpp:96`):
+
+- `BridgeProvider` owns one `GroupPump` (one per served IOC database —
+  C's one `GroupSource` per server). Every `GroupChannel` the provider
+  creates carries it; `GroupMonitor::start()` registers its member
+  `DbSubscription`s with the pump instead of spawning forwarders.
+- ONE drain task (`pump_main`) serves every group subscription. It
+  awaits the command channel plus every member queue in a single
+  `poll_fn` (`next_wake`), commands polled first so a queued
+  `Deregister` beats further member events (the
+  event-during-teardown boundary resolves to teardown), and member
+  readers scanned from a round-robin cursor so a hot member cannot
+  starve other members or other groups.
+- Per member event the drain does what pvxs's
+  `subscriptionValueCallback` does on its pump thread
+  (`groupsource.cpp:307-353`): resolve the `+trigger` marks, assemble
+  the atomic group snapshot (`read_group`, same DBManyLocker-shaped
+  read as before), and post the update; a per-event read failure
+  logs and skips WITHOUT posting, subscription kept open
+  (`groupsource.cpp:350-352` parity, the Q39 rule).
+- Pump → monitor delivery is a bounded per-subscription update queue
+  with C `db_queue_event_log` overflow semantics: append while room
+  (cap = negotiated `queueSize`, ≥ 1), then replace the tail in place —
+  value newest-wins, marked-leaf sets unioned. `push` is synchronous
+  and never blocks, so a slow subscriber coalesces instead of stalling
+  the drain for every other group. `GroupMonitor::poll()` is now just
+  `update_rx.recv().await`.
+
+**The mechanism §9.14 measured is removed**, not tuned: a member tick
+used to wake O(members) forwarder tasks on the shared Medium-band
+callback pool (~400 wakes/s for the 20-member group at 10 Hz — the
+flood that starved `V0`); it now wakes exactly one task, total,
+server-wide. The patch-shaped alternatives §9.14 named — re-banding
+the forwarders or resizing the pool — were rejected: both keep the
+O(members) task population and move the starvation to whichever band
+or pool size is chosen next.
+
+**Enabling primitive.** One task awaiting many member queues without
+per-reader tasks needed a poll-based reader on the C dbEvent port:
+`EvQue::poll_next` / `EventReader::poll_recv` /
+`DbSubscription::poll_recv_event` (`74ea6eb1`), mirroring `next()`'s
+drain gate exactly. `QueInner` grew a `poll_wakers` list and
+`EvQue::wake_readers()` is the SINGLE owner of reader wakeup — post,
+producer-close, reader-close and flow-control-off all route through
+it, so a poll-registered waker can never be skipped.
+
+**Lifecycle invariant.** MUST: `PumpShared::cmd_tx.is_some()` ⟺ the
+drain task is alive and will process every command already sent. Set
+only by `GroupPump::register` (which spawns the task), cleared only by
+the drain's own exit finalizer (`finalize_if_idle`) — both under the
+`PumpShared` lock, and the finalizer drains the command queue under
+that lock before clearing, so a raced `Register` keeps the pump alive
+rather than landing in a channel nothing reads. MUST NOT: the drain
+run with zero registrations (C parity — the pump only works under
+subscription); on last-deregistration the task exits through the
+finalizer. Teardown converges on one removal path: dropping the
+`RegistrationHandle` (held by the monitor) sends `Deregister`; the
+pump observing the consumer side closed on push takes the same
+`regs.remove` route, and the handle's later `Deregister` for that id
+is a no-op.
+
+**Exec-backend liveness** (a task that returns `Pending` with its
+waker held nowhere live is dropped on `rtems-exec-model`): every park
+point of the drain keeps its waker in sender-owned state — the command
+channel's waker lives in channel state whose sender sits in
+`PumpShared` for the pump's whole life; each member queue's waker
+lives in `EvQue::poll_wakers` inside the `Arc<EvQue>` the record's
+subscriber slot keeps alive; `read_group().await` is the pre-existing
+DB await surface the per-monitor path already used; and the update
+queue never parks the drain (push is synchronous). The monitor-side
+consumer waker is stored in the update queue's shared state, which the
+pump's producer half keeps alive.
+
+**Boundary tests** (`group_pump.rs` unit, all also green feature-ON):
+queue overflow replace-in-place + mark union; zero subscriptions run
+no drain; two groups share one drain with a stalled consumer on one;
+last-unsubscribe mid-burst terminates through the finalizer +
+resubscribe restarts; event-during-teardown via the consumer-closed
+path; 20-member flood keeps delivering. Integration
+(`tests/testqgroup.rs`): a 20-member group flooding through the
+provider's shared pump must not stall an unrelated single-record
+monitor's bounded delivery.
+
+**What is NOT claimed.** The host tests prove functional correctness
+and the O(1) task shape, not the target numbers: §9.14's q8
+measurement (victim gaps, group cadence) has NOT been rerun on the
+QEMU/BSP box against this branch. §8 item 5's attribution question is
+mooted in its "which band for the forwarders" form (there are no
+forwarders), but the on-target rerun is still the gate that retires
+§9.14's LOAD table.

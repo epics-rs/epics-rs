@@ -2378,12 +2378,39 @@ to-mid-teens millisecond latency tax on other links sharing the band.
 
 ### 11.7 Open after C6
 
-1. **Read-access loss does not process CP holders.** C
+1. ~~**Read-access loss does not process CP holders.** C
    `accessRightsCallback` (`dbCa.c:1094-1099`) adds `CA_DBPROCESS` when read
    or write access is lost, the same as the disconnect path §11.4 closed.
    calink has no read-access gate in `with_servable` at all, so both halves
    are missing: the gate and the dispatch. Distinct from §11.4 and not fixed
-   here.
+   here.~~ **CLOSED** in `a88e74b4`. Both halves went into the §11.4 owner,
+   not a second path. `LinkConnState` now carries the read half of C's
+   cached rights (`pca->hasReadAccess`), and `note_access_rights` is C's
+   `accessRightsCallback` (`dbCa.c:1076-1102`) as one owned transition:
+   skip when disconnected (`dbCa.c:1084-1085` — which is also what keeps a
+   stale rights event queued behind a `Disconnected` from double-dispatching
+   an outage the disconnect edge already dispatched), cache the right, then
+   `dispatch_external_cp_targets` UNLESS both read and write are held —
+   `dbCa.c:1091` dispatches on the loss of EITHER right, and dispatches
+   nothing on a full regain (the holder's alarm clears on the next monitor
+   event). The gate half went into `CaLink::value()` alone, deliberately not
+   `with_servable`: C consults `hasReadAccess` only in `dbCaGetLink`
+   (`dbCa.c:459-463`); `pcaGetCheck` (`dbCa.c:650-660`) and the lset
+   `isConnected` (`dbCa.c:633-641`) check `isConnected` alone, so a
+   read-denied link still reports connected while a dispatched holder's
+   value read fails and commits LINK/INVALID. The write half is enforced in
+   the client put path itself (`send_write_notify_fast` /
+   `send_write_nowait_fast`, libca `nciu::write` ECA_NOWTACCESS parity) and
+   is not stored twice. No client plumbing was needed — the coordinator
+   already broadcast `AccessRightsChanged` after every `Connected` and on
+   every post-create `CA_PROTO_ACCESS_RIGHTS` frame; the watcher was
+   dropping the event in its `_` arm. Pinned by
+   `access_rights_transitions_follow_dbca` (epics-ca-rs, per boundary:
+   disconnected / read lost / degraded change / full regain / write-only
+   loss / post-disconnect-edge) and `external_cp_access_alarm.rs`
+   (epics-base-rs, the half the resolver cannot see: `is_connected` stays
+   TRUE while the dispatch lands LINK_ALARM/INVALID with VAL untouched, and
+   the alarm clears on the next event after read access returns).
 2. **`RTEMS:CA:TICK` is UDF/INVALID and posts no CA monitor.** The C6 probe
    writes it through `PvDatabase::put_pv`, which neither clears UDF nor posts
    a monitor. Harmless for the probe (the measurement polls instead) but it

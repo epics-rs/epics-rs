@@ -182,6 +182,14 @@ struct QueInner {
     /// C `event_read`'s drain loop is in flight: it empties the queue in one
     /// pass and does not re-consult `flowCtrlMode` per entry.
     draining: bool,
+    /// Wakers registered by [`EvQue::poll_next`] callers parked on this
+    /// queue. The poll-based twin of the `Notify` waiter list: a consumer
+    /// that multiplexes MANY subscriptions from ONE task (the QSRV group
+    /// drain) parks here instead of holding a `Notified` future per queue.
+    /// Flushed — woken and cleared — by [`EvQue::wake_readers`], the single
+    /// owner of reader wakeup, on every transition that can make a parked
+    /// read Ready.
+    poll_wakers: Vec<std::task::Waker>,
     subs: HashMap<u32, SubQ>,
     /// C `event_que::quota` (`dbEvent.c:79`) — ring entries reserved by the
     /// subscriptions attached here, `EVENT_ENTRIES` each. A subscription may
@@ -272,6 +280,7 @@ impl EvQue {
                 total_pending: 0,
                 n_duplicates: 0,
                 draining: false,
+                poll_wakers: Vec::new(),
                 subs: HashMap::new(),
                 quota: 0,
                 size: event_que_size(),
@@ -285,6 +294,25 @@ impl EvQue {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wake every reader parked on this queue — the `Notify` waiters that
+    /// [`Self::next`] suspends on AND the [`Self::poll_next`] wakers held in
+    /// [`QueInner::poll_wakers`].
+    ///
+    /// SINGLE OWNER of reader wakeup: every transition that can make a
+    /// previously-parked read Ready (a post, a producer/reader teardown, an
+    /// EVENTS_ON release) MUST come through here and MUST NOT call
+    /// `wake.notify_waiters()` directly, so the two wake mechanisms cannot
+    /// diverge — a site that woke only the `Notify` would strand a
+    /// `poll_next` consumer forever (and on the RTEMS exec backend a task
+    /// whose waker is held nowhere live is dropped outright).
+    fn wake_readers(&self) {
+        let wakers = std::mem::take(&mut self.lock().poll_wakers);
+        self.wake.notify_waiters();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
     /// C `db_queue_event_log` (`dbEvent.c:776-868`).
@@ -335,7 +363,7 @@ impl EvQue {
             }
         };
         if outcome != PostOutcome::Closed {
-            self.wake.notify_waiters();
+            self.wake_readers();
         }
         outcome
     }
@@ -367,6 +395,52 @@ impl EvQue {
             }
             wake.await;
         }
+    }
+
+    /// Poll-based [`Self::next`]: the same gate and the same delivery, but
+    /// instead of suspending on the queue's `Notify` it registers `cx`'s
+    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`].
+    ///
+    /// This is what lets ONE task await MANY subscriptions — the QSRV group
+    /// drain polls each of its member readers in turn and parks once, its
+    /// waker held by every queue it polled. Registration happens under the
+    /// queue lock and every Ready-making mutation wakes through
+    /// [`Self::wake_readers`] under the same lock, so a post landing between
+    /// the check and the `Pending` return cannot be lost.
+    ///
+    /// [`Poll::Ready`]`(None)` matches [`Self::next`]'s `None`: the
+    /// subscription is detached, or its producer is gone and the queue
+    /// drained. An entry withheld by EVENTS_OFF parks exactly where
+    /// [`Self::next`] suspends (`flowCtrlMode && nDuplicates == 0`, no drain
+    /// pass in flight) and is released by the same [`Self::wake_readers`]
+    /// call `flow_ctrl_off` makes.
+    fn poll_next(
+        &self,
+        sid: u32,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<MonitorEvent>> {
+        use std::task::Poll;
+        let mut q = self.lock();
+        let flow_on = self.flow.is_on();
+        let Some(sub) = q.subs.get(&sid) else {
+            return Poll::Ready(None);
+        };
+        let has_entry = !sub.events.is_empty();
+        let producer_gone = sub.producer_gone;
+        if has_entry {
+            if q.may_drain(flow_on) {
+                q.draining = true;
+                return Poll::Ready(q.remove_front(sid));
+            }
+            // Suspended by EVENTS_OFF: park, C's event_read returns without
+            // delivering.
+        } else if producer_gone {
+            return Poll::Ready(None);
+        }
+        if !q.poll_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            q.poll_wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// Non-blocking [`Self::next`]: same gate, no suspension.
@@ -410,7 +484,7 @@ impl EvQue {
                 q.detach(sid);
             }
         }
-        self.wake.notify_waiters();
+        self.wake_readers();
     }
 
     /// The reader for `sid` is gone: its queued entries leave the ring through
@@ -424,7 +498,7 @@ impl EvQue {
             sub.reader_gone = true;
             q.detach(sid);
         }
-        self.wake.notify_waiters();
+        self.wake_readers();
     }
 
     /// C `nDuplicates` — entries queued beyond the first for their monitor,
@@ -517,7 +591,7 @@ impl EventUser {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for que in ques.iter() {
-            que.wake.notify_waiters();
+            que.wake_readers();
         }
     }
 
@@ -571,6 +645,20 @@ impl EventReader {
     /// Non-blocking [`Self::recv`].
     pub fn try_recv(&mut self) -> Result<MonitorEvent, TryRecvError> {
         self.que.try_next(self.sid)
+    }
+
+    /// Poll-based [`Self::recv`]: `Poll::Ready(None)` where `recv()` returns
+    /// `None`, `Poll::Pending` with `cx`'s waker registered on the queue
+    /// where `recv()` suspends. For consumers that multiplex many
+    /// subscriptions from one task (the QSRV group drain) — the waker stays
+    /// registered until [`EvQue::wake_readers`] flushes it, so a caller that
+    /// polled several readers and parked is woken by whichever queue changes
+    /// first.
+    pub fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<MonitorEvent>> {
+        self.que.poll_next(self.sid, cx)
     }
 
     /// The queue this subscription is attached to — a read-only handle for
@@ -929,5 +1017,118 @@ mod tests {
         drop(sink_b);
         assert_eq!(que.n_duplicates(), 0);
         assert_eq!(que.quota(), 0, "both monitors released their reservation");
+    }
+
+    // -- poll_recv: the poll-based reader the QSRV group drain multiplexes on
+
+    /// A waker that counts its wakes, for driving `poll_recv` without a
+    /// runtime. `std::task::Wake` gives the `RawWaker` plumbing for free.
+    struct CountWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count_waker() -> (Arc<CountWaker>, std::task::Waker) {
+        let counter = Arc::new(CountWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        (counter, waker)
+    }
+
+    /// Boundary empty→posted: a parked `poll_recv` registers its waker, a
+    /// post wakes it exactly through `wake_readers`, and the re-poll drains
+    /// the entry then parks again. Also proves the waker is NOT re-woken by
+    /// its own drain (no self-wake loop for the group drain to spin on).
+    #[test]
+    fn poll_recv_parks_then_delivers_on_post() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 7);
+        let (counter, waker) = count_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(reader.poll_recv(&mut cx).is_pending(), "empty queue parks");
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+
+        sink.post(ev(41));
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the post must flush the registered waker"
+        );
+        match reader.poll_recv(&mut cx) {
+            std::task::Poll::Ready(Some(event)) => assert_eq!(val(&event), 41),
+            other => panic!("expected the posted event, got {other:?}"),
+        }
+        assert!(
+            reader.poll_recv(&mut cx).is_pending(),
+            "drained queue parks"
+        );
+        // Delivering must not have woken the waker again.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// Boundary producer-gone: queued entries still drain through
+    /// `poll_recv`, then the stream ends with `Ready(None)` — same contract
+    /// as `recv()` — and the teardown itself wakes a parked poller.
+    #[test]
+    fn poll_recv_drains_backlog_then_reports_disconnect() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 7);
+        let (counter, waker) = count_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        sink.post(ev(1));
+        sink.post(ev(2));
+        match reader.poll_recv(&mut cx) {
+            std::task::Poll::Ready(Some(event)) => assert_eq!(val(&event), 1),
+            other => panic!("expected first entry, got {other:?}"),
+        }
+        match reader.poll_recv(&mut cx) {
+            std::task::Poll::Ready(Some(event)) => assert_eq!(val(&event), 2),
+            other => panic!("expected second entry, got {other:?}"),
+        }
+        assert!(reader.poll_recv(&mut cx).is_pending());
+        let woken_before = counter.0.load(Ordering::SeqCst);
+        drop(sink);
+        assert!(
+            counter.0.load(Ordering::SeqCst) > woken_before,
+            "producer teardown must wake the parked poller"
+        );
+        assert!(
+            matches!(reader.poll_recv(&mut cx), std::task::Poll::Ready(None)),
+            "producer gone + queue drained ⇒ end of stream"
+        );
+    }
+
+    /// Boundary EVENTS_OFF: an entry withheld by flow control parks
+    /// `poll_recv` exactly where `recv()` suspends (`flowCtrlMode &&
+    /// nDuplicates == 0`), and EVENTS_ON releases it through the same
+    /// `wake_readers` the `Notify` waiters get.
+    #[test]
+    fn poll_recv_respects_events_off_and_wakes_on_events_on() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 7);
+        let (counter, waker) = count_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        user.flow_ctrl_on();
+        sink.post(ev(5)); // npend 0 → appends even under flow control
+        assert!(
+            reader.poll_recv(&mut cx).is_pending(),
+            "EVENTS_OFF with no duplicates suspends the poll-based reader too"
+        );
+        user.flow_ctrl_off();
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the post preceded registration (woke nobody); EVENTS_ON must wake \
+             the parked poller"
+        );
+        match reader.poll_recv(&mut cx) {
+            std::task::Poll::Ready(Some(event)) => assert_eq!(val(&event), 5),
+            other => panic!("expected the withheld entry after EVENTS_ON, got {other:?}"),
+        }
     }
 }

@@ -432,6 +432,34 @@ impl DbSubscription {
         self.next_event().await
     }
 
+    /// Poll-based [`Self::recv_event`] — the same `ignore_origin` filter,
+    /// `Poll::Pending` with the caller's waker registered on the queue where
+    /// `recv_event()` would suspend.
+    ///
+    /// Exists so ONE task can await MANY subscriptions without spawning a
+    /// forwarder per reader: the QSRV group drain polls every member's
+    /// subscription in turn and parks once, its waker held in each polled
+    /// queue's [`EvQue`](crate::server::event_queue::EvQue) until
+    /// `wake_readers` flushes it. A skipped `ignore_origin` event does not
+    /// end the poll — the loop keeps taking until it finds a deliverable
+    /// event or the queue parks it, so a self-origin post cannot be misread
+    /// as "nothing available".
+    pub fn poll_recv_event(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<MonitorEvent>> {
+        loop {
+            match self.reader.poll_recv(cx) {
+                std::task::Poll::Ready(Some(event))
+                    if self.ignore_origin != 0 && event.origin == self.ignore_origin =>
+                {
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+
     pub fn pv_name(&self) -> &str {
         &self.pv_name
     }

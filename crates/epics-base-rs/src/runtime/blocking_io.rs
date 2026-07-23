@@ -102,7 +102,6 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::io::ReadBuf;
@@ -110,6 +109,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread};
+use crate::runtime::worker_pool::{Job, SetLease, Worker, WorkerPool, WorkerRole};
 
 /// One blocking read, sized to match the frame readers that consume it so the
 /// byte arrival pattern is the hosted one.
@@ -203,30 +203,14 @@ pub fn is_socket_timeout(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
 }
 
-/// How one pump thread names itself to the OS and to the operator.
-///
-/// Two strings rather than one because they answer different questions and are
-/// read in different places: `thread_name` is what a target thread census or a
-/// debugger shows, `label` is the subject of the `errlog` line an operator
-/// reads when a pump is lost.
-#[derive(Clone, Debug)]
-pub struct PumpSpec {
-    /// OS thread name, e.g. `"PVAS-reader 10.0.0.1:5075"`.
-    pub thread_name: String,
-    /// Operator-facing subject of any loss report, e.g.
-    /// `"PVA connection 10.0.0.1:5075"`.
-    pub label: String,
-    /// EPICS priority band both pumps of a connection should share.
-    pub priority: ThreadPriority,
-}
-
 /// Announce a pump thread that did not end normally.
 ///
-/// The guards below make both losses *survivable* — the connection is torn
-/// down however a pump ends. They do not make either loss *visible*, and a
-/// process that has lost a thread but reads exactly like a healthy one is what
-/// closes here. Two losses reach this function: the thread could not be created
-/// at all, and the thread panicked.
+/// The guards below make a loss *survivable* — the connection is torn down
+/// however a pump ends. They do not make it *visible*, and a process that has
+/// lost a thread but reads exactly like a healthy one is what closes here. The
+/// loss that reaches this function is a pump that panicked; a pooled worker is
+/// never *created* per connection, so the old "could not be created" loss is
+/// gone with the per-connection spawn.
 ///
 /// Through `errlog` and not `tracing` alone: `errlog_sev_printf` reaches the
 /// console whatever the log configuration — including an RTEMS console whose
@@ -240,27 +224,6 @@ fn pump_thread_lost(role: &str, label: &str, what: &str) {
         ),
     );
     warn!(label, role, what, "blocking socket pump: a thread was lost");
-}
-
-/// Spawn one pump thread, announcing a failure to create it before the error
-/// propagates.
-///
-/// `Small` stack for both: neither builds anything — the reader's whole frame
-/// is a chunk buffer and a `read`/`send` loop, and the writer drains
-/// already-encoded frames from a queue onto the socket. Whatever runs the
-/// protocol state machine is the caller's thread, and is sized by the caller.
-fn spawn_pump(
-    role: &str,
-    spec: &PumpSpec,
-    body: impl FnOnce() + Send + 'static,
-) -> io::Result<thread::JoinHandle<()>> {
-    spawn_dedicated_thread(
-        spec.thread_name.clone(),
-        spec.priority,
-        StackSizeClass::Small,
-        body,
-    )
-    .inspect_err(|e| pump_thread_lost(role, &spec.label, &format!("could not be created ({e})")))
 }
 
 // ---------------------------------------------------------------------------
@@ -627,12 +590,14 @@ pub struct ReaderPumpGuard {
     /// has since handed to someone else.
     sock: Arc<TcpStream>,
     label: String,
-    handle: Option<thread::JoinHandle<()>>,
+    /// The pooled job running `reader_pump`. Joining it returns the worker to
+    /// its pool; the worker itself is not retired, only the job.
+    job: Option<Job>,
 }
 
 impl Drop for ReaderPumpGuard {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(job) = self.job.take() {
             // The pump's `read` is parked behind an effectively-infinite
             // timeout, so the socket has to be shut to return it. `ENOTCONN`
             // when the peer has already gone: there was nothing to wake, which
@@ -643,15 +608,19 @@ impl Drop for ReaderPumpGuard {
             // unwound, and the connection's own error will be a bland
             // channel-closed rather than the cause. Discarding it left the two
             // unlinkable.
-            if handle.join().is_err() {
+            if job.join().is_err() {
                 pump_thread_lost("reader", &self.label, "panicked");
             }
         }
     }
 }
 
-/// Drive `sock`'s read half with a blocking thread, yielding the `AsyncRead`
-/// half of the seam and the guard that retires it.
+/// Drive `sock`'s read half on a pooled `worker`, yielding the `AsyncRead`
+/// half of the seam and the guard that retires the job.
+///
+/// Infallible: the thread already exists — it is the leased `worker` — so there
+/// is no creation to fail. Admission failure now lives in
+/// [`WorkerPool::acquire`], which is where it belongs.
 ///
 /// `queue_depth` is the chunk channel's depth. **One** is the faithful choice
 /// for a demand-driven frame reader — one read per poll, each frame dispatched
@@ -660,25 +629,24 @@ impl Drop for ReaderPumpGuard {
 /// larger depth lets a fast peer queue chunks while a slow consumer blocks: a
 /// behaviour change, not an optimisation.
 pub fn spawn_reader_pump(
+    worker: Worker,
     sock: Arc<TcpStream>,
-    spec: &PumpSpec,
+    label: &str,
     chunk_size: usize,
     queue_depth: usize,
-) -> io::Result<(ChannelReader, ReaderPumpGuard)> {
+) -> (ChannelReader, ReaderPumpGuard) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(queue_depth);
     let pump_sock = sock.clone();
-    let label = spec.label.clone();
-    let handle = spawn_pump("reader", spec, move || {
-        reader_pump(pump_sock, tx, chunk_size, label)
-    })?;
-    Ok((
+    let pump_label = label.to_string();
+    let job = worker.run(move || reader_pump(pump_sock, tx, chunk_size, pump_label));
+    (
         ChannelReader::new(rx),
         ReaderPumpGuard {
             sock,
-            label: spec.label.clone(),
-            handle: Some(handle),
+            label: label.to_string(),
+            job: Some(job),
         },
-    ))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +827,8 @@ fn writer_pump(
 pub struct WriterPumpGuard {
     frames: Option<mpsc::Sender<Vec<u8>>>,
     label: String,
-    handle: Option<thread::JoinHandle<()>>,
+    /// The pooled job running `writer_pump`; joining it returns the worker.
+    job: Option<Job>,
 }
 
 impl Drop for WriterPumpGuard {
@@ -868,19 +837,20 @@ impl Drop for WriterPumpGuard {
         // holds a weak handle. The pump drains what is queued, sees `None`, and
         // exits; on its way out it shuts the socket.
         drop(self.frames.take());
-        if let Some(handle) = self.handle.take() {
+        if let Some(job) = self.job.take() {
             // Same reading as [`ReaderPumpGuard`]'s: an `Err` is a panicked
             // pump, and a pump that unwound with frames still queued dropped
             // them.
-            if handle.join().is_err() {
+            if job.join().is_err() {
                 pump_thread_lost("writer", &self.label, "panicked");
             }
         }
     }
 }
 
-/// Drive `sock`'s write half with a blocking thread, yielding the `AsyncWrite`
-/// half of the seam and the guard that retires it.
+/// Drive `sock`'s write half on a pooled `worker`, yielding the `AsyncWrite`
+/// half of the seam and the guard that retires the job. Infallible for the same
+/// reason as [`spawn_reader_pump`].
 ///
 /// `queue_depth` follows the same reasoning as [`spawn_reader_pump`]'s: a
 /// producer that emits one frame at a time and waits for it gets, at depth 1,
@@ -890,32 +860,31 @@ impl Drop for WriterPumpGuard {
 /// [`send_tick_for`] — so the deadline loop regains control while a peer is
 /// stalled.
 pub fn spawn_writer_pump(
+    worker: Worker,
     sock: Arc<TcpStream>,
-    spec: &PumpSpec,
+    label: &str,
     send_timeout: Duration,
     queue_depth: usize,
-) -> io::Result<(ChannelWriter, WriterPumpGuard)> {
+) -> (ChannelWriter, WriterPumpGuard) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(queue_depth);
     let room = Arc::new(WriteRoom::default());
     let adapter = ChannelWriter {
         tx: tx.downgrade(),
         room: room.clone(),
     };
-    let label = spec.label.clone();
-    let handle = spawn_pump("writer", spec, move || {
-        writer_pump(sock, rx, room, send_timeout, label)
-    })?;
-    Ok((
+    let pump_label = label.to_string();
+    let job = worker.run(move || writer_pump(sock, rx, room, send_timeout, pump_label));
+    (
         adapter,
         WriterPumpGuard {
             // The only strong sender moves into the guard, so it cannot be
             // dropped out of order with the join. `adapter` above already took
             // its weak handle.
             frames: Some(tx),
-            label: spec.label.clone(),
-            handle: Some(handle),
+            label: label.to_string(),
+            job: Some(job),
         },
-    ))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +902,10 @@ pub fn spawn_writer_pump(
 pub struct GuardedReader {
     inner: ChannelReader,
     _guard: ReaderPumpGuard,
+    /// The connection's worker-set lease, shared with [`GuardedWriter`]. The set
+    /// returns to its pool only when both adapters — and both pump jobs they
+    /// hold — are gone, which is exactly when the connection is over.
+    _lease: Arc<SetLease>,
 }
 
 impl tokio::io::AsyncRead for GuardedReader {
@@ -949,6 +922,9 @@ impl tokio::io::AsyncRead for GuardedReader {
 pub struct GuardedWriter {
     inner: ChannelWriter,
     _guard: WriterPumpGuard,
+    /// The other strong reference to the connection's lease; see
+    /// [`GuardedReader`].
+    _lease: Arc<SetLease>,
 }
 
 impl tokio::io::AsyncWrite for GuardedWriter {
@@ -1007,74 +983,93 @@ impl Default for PumpConfig {
 /// getting `SO_SNDTIMEO` wrong silently disarms [`write_frame_deadline`]'s only
 /// way of regaining control.
 ///
-/// # Two priorities, not one
+/// # The pool, and the two bands it carries
 ///
-/// The two pumps take separate bands because at least one caller's upstream C
-/// derives two: libca gives a circuit's receive thread
+/// The two pumps come from one leased worker set of `pool`, taken atomically so
+/// a circuit at capacity can never hold one pump and block for the other. Their
+/// bands are the pool roster's, not this function's: at least one caller's
+/// upstream C derives two — libca gives a circuit's receive thread
 /// `highestPriorityLevelBelow(initializing thread)` and its send thread
 /// `lowestPriorityLevelAbove(...)` (`tcpiiu.cpp:677-682`), so the sender sits
 /// *above* the receiver and can always drain a queue the receiver's work is
-/// filling. A caller whose upstream uses one band for both (pvxs, one reactor
-/// thread) passes the same value twice, which states that sameness rather than
-/// having the API assume it.
+/// filling — and a caller whose upstream uses one band for both (pvxs, one
+/// reactor thread) declares the same band twice in its roster. The `Err` is now
+/// admission's: [`io::ErrorKind::WouldBlock`] when the circuit pool is full,
+/// otherwise a socket-option or thread-creation failure.
 pub fn drive_socket_blocking(
+    pool: &WorkerPool<2>,
     stream: TcpStream,
-    spec_prefix: &str,
     label: &str,
-    reader_priority: ThreadPriority,
-    writer_priority: ThreadPriority,
     config: &PumpConfig,
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(config.read_timeout))?;
     stream.set_write_timeout(Some(send_tick_for(config.send_timeout)))?;
 
+    // Borrow the circuit's two pump workers as one set, or refuse. Roster order
+    // is [reader, writer], the order `acquire` returns them.
+    let (lease, [reader_worker, writer_worker]) = pool.acquire()?;
+    let lease = Arc::new(lease);
+
     // One socket, two roles: the SAME descriptor shared through an `Arc`. See
     // the module docs for why this is not `try_clone`.
     let stream = Arc::new(stream);
 
-    let reader_spec = PumpSpec {
-        thread_name: format!("{spec_prefix}-reader {label}"),
-        label: label.to_string(),
-        priority: reader_priority,
-    };
-    let writer_spec = PumpSpec {
-        thread_name: format!("{spec_prefix}-writer {label}"),
-        label: label.to_string(),
-        priority: writer_priority,
-    };
-
-    // The reader guard is bound first, so a writer-spawn failure below unwinds
-    // through it rather than leaving a pump parked on a socket nobody holds.
     let (reader, reader_guard) = spawn_reader_pump(
+        reader_worker,
         stream.clone(),
-        &reader_spec,
+        label,
         config.chunk_size,
         config.queue_depth,
-    )?;
+    );
     let (writer, writer_guard) = spawn_writer_pump(
+        writer_worker,
         stream,
-        &writer_spec,
+        label,
         config.send_timeout,
         config.queue_depth,
-    )?;
+    );
 
     Ok((
         GuardedReader {
             inner: reader,
             _guard: reader_guard,
+            _lease: lease.clone(),
         },
         GuardedWriter {
             inner: writer,
             _guard: writer_guard,
+            _lease: lease,
         },
     ))
+}
+
+/// The role roster a circuit's [`drive_socket_blocking`] pool must be built
+/// with: `[reader, writer]`, both on `Small` stacks. The two bands are the
+/// caller's to choose (see [`drive_socket_blocking`]'s docs).
+pub fn circuit_roster(
+    reader_priority: ThreadPriority,
+    writer_priority: ThreadPriority,
+) -> [WorkerRole; 2] {
+    [
+        WorkerRole {
+            suffix: "reader",
+            stack: StackSizeClass::Small,
+            priority: reader_priority,
+        },
+        WorkerRole {
+            suffix: "writer",
+            stack: StackSizeClass::Small,
+            priority: writer_priority,
+        },
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream as StdTcpStream};
+    use std::thread;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Production scope of this file: everything before the first column-0
@@ -1329,12 +1324,22 @@ mod tests {
 
     // ── guards ──────────────────────────────────────────────────────────
 
-    fn test_spec(label: &str) -> PumpSpec {
-        PumpSpec {
-            thread_name: format!("test-pump {label}"),
-            label: label.to_string(),
-            priority: ThreadPriority::Low,
-        }
+    /// A process-lifetime circuit pool for the pump/guard tests, so a `#[test]`
+    /// can borrow a worker exactly as a real circuit does. Ample capacity so no
+    /// test refuses; the tests that care about refusal build their own pool.
+    static TEST_POOL: std::sync::LazyLock<WorkerPool<2>> = std::sync::LazyLock::new(|| {
+        WorkerPool::new(
+            "test",
+            circuit_roster(ThreadPriority::Low, ThreadPriority::Low),
+            64,
+        )
+    });
+
+    /// Borrow one set: the lease and its reader/writer workers. The lease must
+    /// be held until both pump jobs are joined, or the set would re-idle early.
+    fn lease_pair() -> (SetLease, Worker, Worker) {
+        let (lease, [reader, writer]) = TEST_POOL.acquire().expect("acquire a test set");
+        (lease, reader, writer)
     }
 
     /// The reader guard's whole purpose: a pump parked in `read` behind a
@@ -1347,8 +1352,8 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(64_000)))
             .expect("rcvtimeo");
-        let (reader, guard) =
-            spawn_reader_pump(Arc::new(client), &test_spec("parked"), 4096, 1).expect("spawned");
+        let (lease, reader_worker, _writer_worker) = lease_pair();
+        let (reader, guard) = spawn_reader_pump(reader_worker, Arc::new(client), "parked", 4096, 1);
         // The peer sends nothing, so the pump is parked in `read`.
         let started = Instant::now();
         drop(reader);
@@ -1357,6 +1362,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the guard's shutdown must return a parked read, not wait out SO_RCVTIMEO"
         );
+        drop(lease);
         drop(server);
     }
 
@@ -1365,13 +1371,14 @@ mod tests {
     #[test]
     fn the_writer_guard_drops_its_sender_before_joining() {
         let (client, server) = socket_pair();
+        let (lease, _reader_worker, writer_worker) = lease_pair();
         let (writer, guard) = spawn_writer_pump(
+            writer_worker,
             Arc::new(client),
-            &test_spec("sender-order"),
+            "sender-order",
             Duration::from_secs(5),
             1,
-        )
-        .expect("spawned");
+        );
         let started = Instant::now();
         drop(writer);
         drop(guard);
@@ -1379,6 +1386,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "dropping the guard must end a pump parked on recv(), not hang"
         );
+        drop(lease);
         drop(server);
     }
 
@@ -1442,11 +1450,12 @@ mod tests {
     #[test]
     fn a_panicked_reader_pump_is_reported_and_not_discarded() {
         let (client, server) = socket_pair();
+        let (lease, reader_worker, _writer_worker) = lease_pair();
         let lines = lines_while(|| {
             let _guard = ReaderPumpGuard {
                 sock: Arc::new(client),
                 label: "PVA connection 127.0.0.1:0".to_string(),
-                handle: Some(thread::spawn(|| panic!("reader blew up"))),
+                job: Some(reader_worker.run(|| panic!("reader blew up"))),
             };
         });
         assert!(
@@ -1457,17 +1466,19 @@ mod tests {
             "a panicked reader must reach errlog, which prints whatever the log \
              configuration is — including an RTEMS console. Captured: {lines:?}"
         );
+        drop(lease);
         drop(server);
     }
 
     #[test]
     fn a_panicked_writer_pump_is_reported_and_not_discarded() {
         let (frames, _rx) = mpsc::channel::<Vec<u8>>(1);
+        let (lease, _reader_worker, writer_worker) = lease_pair();
         let lines = lines_while(|| {
             let _guard = WriterPumpGuard {
                 frames: Some(frames),
                 label: "PVA connection 127.0.0.1:0".to_string(),
-                handle: Some(thread::spawn(|| panic!("writer blew up"))),
+                job: Some(writer_worker.run(|| panic!("writer blew up"))),
             };
         });
         assert!(
@@ -1478,6 +1489,7 @@ mod tests {
             "a panicked writer dropped whatever frames were still queued; that \
              must not be silent. Captured: {lines:?}"
         );
+        drop(lease);
     }
 
     /// The other boundary: an ordinary teardown is not a loss. Every connection
@@ -1486,11 +1498,12 @@ mod tests {
     #[test]
     fn a_pump_that_ends_cleanly_is_not_announced() {
         let (client, server) = socket_pair();
+        let (lease, reader_worker, _writer_worker) = lease_pair();
         let lines = lines_while(|| {
             let _guard = ReaderPumpGuard {
                 sock: Arc::new(client),
                 label: "PVA connection 127.0.0.1:0".to_string(),
-                handle: Some(thread::spawn(|| {})),
+                job: Some(reader_worker.run(|| {})),
             };
         });
         assert!(
@@ -1499,18 +1512,20 @@ mod tests {
                 .any(|l| l.contains("was lost") || l.contains("panicked")),
             "an ordinary connection teardown must print nothing: {lines:?}"
         );
+        drop(lease);
         drop(server);
     }
 
-    /// Structural closure as source, for the one loss no test can force: a
-    /// thread that cannot be created. Both guards and the single spawn site must
-    /// report through the one announcement function.
+    /// Structural closure as source: a pump lost to a panic must be announced.
+    /// Both guards report through the one announcement function; the old
+    /// creation-failure loss is gone with the per-connection spawn — a pooled
+    /// worker is borrowed, never created per connection.
     #[test]
     fn every_pump_loss_goes_through_the_announcement() {
         let prod = production_scope(include_str!("blocking_io.rs"));
         assert_eq!(
             code_only(prod)
-                .matches(concat!("let _ = han", "dle.join()"))
+                .matches(concat!("let _ = jo", "b.join()"))
                 .count(),
             0,
             "a discarded join result is a panicked pump nobody hears about"
@@ -1518,7 +1533,6 @@ mod tests {
         for owner in [
             "impl Drop for ReaderPumpGuard",
             "impl Drop for WriterPumpGuard",
-            "fn spawn_pump(",
         ] {
             let at = prod
                 .find(owner)
@@ -1536,11 +1550,9 @@ mod tests {
     async fn one_descriptor_serves_both_pumps() {
         let (client, mut server) = socket_pair();
         let (mut reader, mut writer) = drive_socket_blocking(
+            &TEST_POOL,
             client,
-            "TEST",
             "127.0.0.1:0",
-            ThreadPriority::Low,
-            ThreadPriority::Low,
             &PumpConfig {
                 read_timeout: Duration::from_secs(5),
                 send_timeout: Duration::from_secs(5),

@@ -251,6 +251,30 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 static PVA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
     epics_base_rs::runtime::blocking_io::DialPool::new("PVAC-dial", PVA_CLIENT_PRIORITY);
 
+/// The most concurrent PVA circuits this process serves with blocking pumps —
+/// a bound on thread *creations*, so a client that redials the same server
+/// reuses its two pump threads rather than leaking 2 × 176 B per reconnect on
+/// RTEMS. Past the bound a circuit's pumps are refused (`EAGAIN`), which the
+/// caller sees as a failed connect. Generous: a PVA client legitimately holds a
+/// circuit per distinct server.
+const PVA_CIRCUIT_POOL_CAPACITY: usize = 64;
+
+/// The pumps for every PVA circuit, borrowed from a bounded set of permanent
+/// threads. pvxs runs one reactor band for both directions, so both roles take
+/// `PVA_CLIENT_PRIORITY`; per band, so it is a separate pool from the CA
+/// client's.
+static PVA_CIRCUIT_POOL: std::sync::LazyLock<epics_base_rs::runtime::worker_pool::WorkerPool<2>> =
+    std::sync::LazyLock::new(|| {
+        epics_base_rs::runtime::worker_pool::WorkerPool::new(
+            "PVAC",
+            epics_base_rs::runtime::blocking_io::circuit_roster(
+                PVA_CLIENT_PRIORITY,
+                PVA_CLIENT_PRIORITY,
+            ),
+            PVA_CIRCUIT_POOL_CAPACITY,
+        )
+    });
+
 /// BRING-UP PROBE: dial attempts submitted to [`PVA_DIAL_POOL`] since boot.
 ///
 /// The denominator of the on-target bound measurement. `worker_count()` alone
@@ -386,11 +410,9 @@ async fn dial_blocking(
     // cancellation token the heartbeat already fires — the same mechanism the
     // server driver relies on for the same reason.
     let (reader, writer) = drive_socket_blocking(
+        &PVA_CIRCUIT_POOL,
         stream,
-        "PVAC",
         &target.to_string(),
-        PVA_CLIENT_PRIORITY,
-        PVA_CLIENT_PRIORITY,
         &PumpConfig {
             send_timeout: write_deadline,
             ..PumpConfig::default()

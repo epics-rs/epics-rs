@@ -118,11 +118,15 @@
 //!
 //! [`BlockingPvaServer`] owns the [`ConnRegistry`] and hands sockets to
 //! [`serve_connection_blocking`], assembling the arguments the hosted
-//! [`super::accept`] assembles for its own driver. Every thread it and this
-//! module create goes through `runtime::task::spawn_dedicated_thread` at
-//! `PVA_SERVER_PRIORITY` — see that constant for why they all share one
-//! number, and the seam function for why a plain `std::thread` is not enough
-//! on a hosted build.
+//! [`super::accept`] assembles for its own driver. It creates **no thread per
+//! connection**: each connection *borrows* its three threads — connection body,
+//! reader pump, writer pump — as one set from a
+//! [`WorkerPool`](epics_base_rs::runtime::worker_pool::WorkerPool), because
+//! every `std::thread` creation leaks 176–179 B permanently on RTEMS
+//! (`doc/rtems-connection-worker-pool-design.md`). All three workers take
+//! `PVA_SERVER_PRIORITY` — see that constant for why they share one number —
+//! and each is created once, with its stack class and band, and reused. A full
+//! pool refuses admission with `EAGAIN`, which *is* the `max_connections` limit.
 //!
 //! # Discovery
 //!
@@ -155,13 +159,12 @@ use std::time::Duration;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io::{
-    DEFAULT_READ_CHUNK, PumpSpec, is_socket_timeout, send_tick_for, spawn_reader_pump,
-    spawn_writer_pump,
+    DEFAULT_READ_CHUNK, is_socket_timeout, send_tick_for, spawn_reader_pump, spawn_writer_pump,
 };
-use epics_base_rs::runtime::task::spawn_dedicated_thread;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
+use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
 use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
@@ -429,12 +432,32 @@ impl Drop for ConnRegistration<'_> {
 // Driver
 // ---------------------------------------------------------------------------
 
+/// The reader and writer slots of a connection's leased worker set, passed to
+/// [`serve_connection_blocking`] as one value.
+///
+/// A pair, not two parameters, because the two are always leased and returned
+/// together — [`start_connection`] takes them from one `acquire`, and neither
+/// pump may run on a worker the connection did not lease. Passing them as a unit
+/// is what makes "you cannot serve with a half-borrowed set" a property of the
+/// signature rather than a convention.
+pub(super) struct PumpWorkers {
+    pub reader: Worker,
+    pub writer: Worker,
+}
+
 /// Serve one PVA connection over a blocking [`TcpStream`], on this thread.
 ///
 /// This call *is* the operation thread: it runs `handle_connection_io` to
-/// completion and returns the connection's result, having joined both child
-/// threads. The reader and writer are its children and neither decides the
+/// completion and returns the connection's result, having joined both pump
+/// jobs. The reader and writer are its children and neither decides the
 /// connection is over — they can only report (§4.1).
+///
+/// `pumps` are two of the three workers this connection borrowed from the pool
+/// ([`start_connection`]); the connection body itself runs on the third. The
+/// pumps run on these two, and their guards join the jobs — returning the
+/// workers to their set — before this function returns, on every exit path
+/// including a panic. The pair is taken by value so a caller cannot run a pump
+/// on a worker it did not lease.
 ///
 /// `peer_entry` is this connection's row in the server report (`pvxsr`) and
 /// `channel_invalidator` is the server-wide out-of-band disconnect channel;
@@ -448,20 +471,19 @@ impl Drop for ConnRegistration<'_> {
 ///
 /// **Hosted callers must run this on a multi-thread runtime worker**; see the
 /// module docs. On RTEMS a bare thread is correct.
-pub fn serve_connection_blocking(
+pub(super) fn serve_connection_blocking(
+    pumps: PumpWorkers,
     stream: TcpStream,
     peer: SocketAddr,
     source: DynSource,
     config: PvaServerConfig,
-    peer_entry: Arc<super::peers::PeerEntry>,
-    channel_invalidator: super::source::ChannelInvalidator,
+    init: ConnInit,
     registry: &ConnRegistry,
 ) -> PvaResult<()> {
-    let init = ConnInit {
-        peer_entry,
-        x509_identity: None,
-        channel_invalidator,
-    };
+    let PumpWorkers {
+        reader: reader_worker,
+        writer: writer_worker,
+    } = pumps;
     let _ = stream.set_nodelay(true);
     // Portable SO_RCVTIMEO / SO_SNDTIMEO (both valid on RTEMS), the same move
     // CA's blocking driver makes. Note the receive timeout is NOT a shutdown
@@ -490,32 +512,34 @@ pub fn serve_connection_blocking(
     // Both pumps come from `runtime::blocking_io`, the workspace's one blocking
     // byte source — the same primitive the PVA *client*'s `connect_blocking`
     // uses, in `epics-base-rs` rather than here because `epics-ca-rs` cannot
-    // reach this crate (`doc/calink-rtems-design.md` §3.3). They run at
-    // `PVA_SERVER_PRIORITY`, like every other thread in this module; see that
+    // reach this crate (`doc/calink-rtems-design.md` §3.3). They run on the two
+    // pump workers of this connection's leased set, whose band is
+    // `PVA_SERVER_PRIORITY` — like every other thread in this module; see that
     // constant for why all of them share one number.
     //
-    // From here on the reader is owned by its guard. Every exit below — the
-    // writer-spawn `?`, and a panic unwinding out of the connection handler —
-    // runs `ReaderPumpGuard::drop`, which wakes and joins it.
-    let pump_spec = |role: &str| PumpSpec {
-        thread_name: format!("PVAS-{role} {peer}"),
-        label: format!("PVA connection {peer}"),
-        priority: PVA_SERVER_PRIORITY,
-    };
+    // Pooled, so infallible: the two threads already exist (they are the leased
+    // workers), so there is no per-connection creation left to fail. Admission
+    // failure moved up to `pool.acquire` in `start_connection`, where a circuit
+    // at capacity is refused before this function is ever entered.
+    //
+    // From here on the reader is owned by its guard. Every exit below — and a
+    // panic unwinding out of the connection handler — runs
+    // `ReaderPumpGuard::drop`, which wakes and joins it back into its pool.
+    let label = format!("PVA connection {peer}");
     let (reader_adapter, reader) = spawn_reader_pump(
+        reader_worker,
         read_sock,
-        &pump_spec("reader"),
+        &label,
         DEFAULT_READ_CHUNK,
         CHUNK_QUEUE_DEPTH,
-    )
-    .map_err(PvaError::Io)?;
+    );
     let (writer_adapter, writer) = spawn_writer_pump(
+        writer_worker,
         write_sock,
-        &pump_spec("writer"),
+        &label,
         send_timeout,
         FRAME_QUEUE_DEPTH,
-    )
-    .map_err(PvaError::Io)?;
+    );
 
     let outcome = block_on_sync(handle_connection_io(
         source,
@@ -600,7 +624,42 @@ pub struct BlockingPvaServer {
     connections: Arc<ConnRegistry>,
     tcp_port: u16,
     active: Arc<AtomicUsize>,
+    /// The connection's three threads — connection body, reader pump, writer
+    /// pump — are borrowed from this pool as one set, never created per accept.
+    /// Its capacity is `max_connections`, so `acquire` refusing with
+    /// `WouldBlock` *is* the connection limit; the old `active >= max` check is
+    /// gone (`doc/rtems-connection-worker-pool-design.md` §5). Dropped after the
+    /// listener and the connections are stopped, in [`shutdown`](Self::shutdown)
+    /// order, so its `Stop`s never queue behind a live connection.
+    conn_pool: WorkerPool<3>,
     shutdown: AtomicBool,
+}
+
+/// The three roles one PVA connection borrows together, in the order
+/// [`serve_connection_blocking`] and [`start_connection`] destructure them:
+/// `[conn, reader, writer]`. All three take `PVA_SERVER_PRIORITY` — see that
+/// constant. The connection body is `Big` (it runs the whole protocol state
+/// machine under `block_on_sync`, the counterpart of C's `epicsThreadStackBig`
+/// `camsgtask`); the two pumps are `Small`, matching
+/// [`circuit_roster`](epics_base_rs::runtime::blocking_io::circuit_roster).
+fn connection_roster() -> [WorkerRole; 3] {
+    [
+        WorkerRole {
+            suffix: "conn",
+            stack: StackSizeClass::Big,
+            priority: PVA_SERVER_PRIORITY,
+        },
+        WorkerRole {
+            suffix: "reader",
+            stack: StackSizeClass::Small,
+            priority: PVA_SERVER_PRIORITY,
+        },
+        WorkerRole {
+            suffix: "writer",
+            stack: StackSizeClass::Small,
+            priority: PVA_SERVER_PRIORITY,
+        },
+    ]
 }
 
 impl BlockingPvaServer {
@@ -659,6 +718,9 @@ impl BlockingPvaServer {
         // still receives it.
         let channel_invalidator = ChannelInvalidator::new();
         source.set_channel_invalidator(channel_invalidator.clone());
+        // Read before `config` is moved into the struct; it is the pool's
+        // capacity, and the pool's capacity is the connection limit.
+        let max_connections = config.max_connections;
         Ok(Self {
             listener,
             source,
@@ -668,6 +730,10 @@ impl BlockingPvaServer {
             connections: Arc::new(ConnRegistry::new()),
             tcp_port,
             active: Arc::new(AtomicUsize::new(0)),
+            // `PVAS`: RTEMS truncates thread names at 16 bytes, and the pool
+            // appends `-{suffix} {index}` (e.g. `PVAS-reader 3`). Capacity is
+            // the connection limit — admission refuses past it.
+            conn_pool: WorkerPool::new("PVAS", connection_roster(), max_connections),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -764,27 +830,42 @@ impl BlockingPvaServer {
         }
     }
 
-    /// Take the slot and the peer entry, then hand the socket to a connection
-    /// thread. The slot is moved into the thread body, so a failed spawn
-    /// returns it exactly as a finished connection would.
+    /// Borrow a worker set, then hand the socket to its connection worker. The
+    /// lease and the slot are both moved into the connection body, so both come
+    /// back however that body ends — clean return, error, or a panic.
+    ///
+    /// Admission lives in [`WorkerPool::acquire`] now, not in an `active` check:
+    /// the pool's capacity *is* `max_connections`, so a full pool refuses with
+    /// [`io::ErrorKind::WouldBlock`], which this maps to the same operator-visible
+    /// warning the old gate produced. Any other `acquire` error is a target out
+    /// of thread resources and propagates to the accept loop's "connection not
+    /// started" path.
     fn start_connection(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
-        if self.active.load(Ordering::Acquire) >= self.config.max_connections {
-            // Dropping the stream closes it. Refusing costs more here than on
-            // the host: each connection is three threads, not two tasks.
-            //
-            // `warn!`, not `debug!`: a client that cannot connect is an
-            // operator-visible event, and at `debug!` this refusal was below
-            // every default filter — including the IOC console subscriber
-            // (`epics_base_rs::runtime::log::install_console_subscriber`),
-            // which is the same silent-refusal defect the CA driver had at its
-            // thread ceiling.
-            warn!(
-                ?peer,
-                limit = self.config.max_connections,
-                "blocking PVA server: refusing connection, max_connections reached"
-            );
-            return Ok(());
-        }
+        // One atomic borrow of all three roles — connection body, reader pump,
+        // writer pump — so a server at capacity can never hold a partial set and
+        // block for the rest.
+        let (lease, [conn_worker, reader_worker, writer_worker]) = match self.conn_pool.acquire() {
+            Ok(set) => set,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Dropping the stream closes it. Refusing costs more here than on
+                // the host: each connection is three threads, not two tasks.
+                //
+                // `warn!`, not `debug!`: a client that cannot connect is an
+                // operator-visible event, and at `debug!` this refusal was below
+                // every default filter — including the IOC console subscriber
+                // (`epics_base_rs::runtime::log::install_console_subscriber`),
+                // which is the same silent-refusal defect the CA driver had at
+                // its thread ceiling.
+                warn!(
+                    ?peer,
+                    limit = self.config.max_connections,
+                    "blocking PVA server: refusing connection, max_connections reached"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
         self.active.fetch_add(1, Ordering::AcqRel);
         let peer_entry = PeerEntry::new(false);
         self.peers.insert(peer, peer_entry.clone());
@@ -798,34 +879,46 @@ impl BlockingPvaServer {
         let config = self.config.clone();
         let invalidator = self.channel_invalidator.clone();
         let connections = self.connections.clone();
-        // Big: this is the deep one. It runs the whole protocol state machine
-        // under `block_on_sync` — channel create, GET/PUT/MONITOR, introspection
-        // and every dispatch into the database, including record processing.
-        // It is the structural counterpart of C's per-client `camsgtask`, which
-        // rsrv creates with `epicsThreadStackBig`
-        // (`rsrv/caservertask.c:109-111`).
-        spawn_dedicated_thread(
-            format!("PVAS-conn {peer}"),
-            PVA_SERVER_PRIORITY,
-            StackSizeClass::Big,
-            move || {
-                // Held for the whole connection: its `Drop` returns the slot and
-                // the peer entry even if the connection panics.
-                let _slot = slot;
-                let outcome = serve_connection_blocking(
-                    stream,
-                    peer,
-                    source,
-                    config,
-                    peer_entry,
-                    invalidator,
-                    &connections,
-                );
-                if let Err(e) = outcome {
-                    debug!(?peer, error = %e, "blocking PVA connection ended with error");
-                }
-            },
-        )?;
+        // The connection body runs on the set's `Big` `conn` worker — the deep
+        // one, running the whole protocol state machine under `block_on_sync`
+        // (channel create, GET/PUT/MONITOR, introspection, and every dispatch
+        // into the database including record processing). It is the structural
+        // counterpart of C's per-client `camsgtask`, which rsrv creates with
+        // `epicsThreadStackBig` (`rsrv/caservertask.c:109-111`).
+        //
+        // `run_detached`: nobody joins this connection; the worker itself
+        // announces a panic through `errlog`, and the two pumps' guards inside
+        // `serve_connection_blocking` join *their* jobs before this body returns.
+        // `_lease` and `_slot` are declared first so they drop last — the lease
+        // returns the whole set to the pool only after the body has returned and
+        // the pumps have been joined.
+        // Plain TCP only (§6): no x509 identity, authentication is through
+        // CONNECTION_VALIDATION. Assembled here so `serve_connection_blocking`
+        // takes one connection-init value rather than its two loose halves.
+        let init = ConnInit {
+            peer_entry,
+            x509_identity: None,
+            channel_invalidator: invalidator,
+        };
+        conn_worker.run_detached(format!("PVA connection {peer}"), move || {
+            let _lease = lease;
+            let _slot = slot;
+            let outcome = serve_connection_blocking(
+                PumpWorkers {
+                    reader: reader_worker,
+                    writer: writer_worker,
+                },
+                stream,
+                peer,
+                source,
+                config,
+                init,
+                &connections,
+            );
+            if let Err(e) = outcome {
+                debug!(?peer, error = %e, "blocking PVA connection ended with error");
+            }
+        });
         Ok(())
     }
 
@@ -844,14 +937,31 @@ impl BlockingPvaServer {
     /// alone retires it within one tick.
     ///
     /// Returns once the wakes are issued; each connection retires on its own
-    /// thread. Those threads are detached, so a caller that must observe them
-    /// gone watches [`active_connections`](Self::active_connections).
+    /// pool worker. Nobody joins those connections, so a caller that must
+    /// observe them gone watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         if let Ok(addr) = self.listener.local_addr() {
             let _ = TcpStream::connect(addr);
         }
         self.connections.stop();
+    }
+}
+
+impl Drop for BlockingPvaServer {
+    /// Stop the connections *before* the worker pool is dropped.
+    ///
+    /// [`WorkerPool`]'s own `Drop` sends one `Stop` per worker and joins every
+    /// thread; a worker still inside a live connection body takes its `Stop`
+    /// only after that body returns. So the pool must not be dropped while a
+    /// connection's socket is still open, or the join would wait on a body that
+    /// never ends. [`shutdown`](Self::shutdown) shuts every live connection's
+    /// socket, which unwinds its body down the existing EOF path; running it
+    /// here — before the `conn_pool` field drops — is what makes the pool's
+    /// join terminate. Idempotent, so a caller that already called `shutdown`
+    /// pays only a redundant self-dial.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1072,11 +1182,36 @@ mod tests {
     use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
     use crate::server_native::search::build_search_response_proto;
     use crate::server_native::{SharedPV, SharedSource};
+    use epics_base_rs::runtime::blocking_io::circuit_roster;
+    use epics_base_rs::runtime::task::spawn_dedicated_thread;
+    use epics_base_rs::runtime::worker_pool::SetLease;
     use std::io::{Cursor, Read, Write};
     use std::net::IpAddr;
+    use std::sync::LazyLock;
     use std::task::{Context, Poll, Waker};
     use std::thread;
     use std::time::Instant;
+
+    /// A process-lifetime pool the pump and connection tests borrow their
+    /// workers from, so no test creates a raw thread. Its roster is the two pump
+    /// roles `[reader, writer]` at `PVA_SERVER_PRIORITY`; the connection-body
+    /// role is not here because these tests run that body on a tokio task
+    /// (hosted) or drive the pump functions directly. Capacity is generous — a
+    /// test borrows a few sets at once and returns them.
+    static TEST_POOL: LazyLock<WorkerPool<2>> = LazyLock::new(|| {
+        WorkerPool::new(
+            "test-pvas",
+            circuit_roster(PVA_SERVER_PRIORITY, PVA_SERVER_PRIORITY),
+            64,
+        )
+    });
+
+    /// Borrow one reader+writer set. The returned [`SetLease`] must outlive the
+    /// jobs the two workers run — hold it until both pump guards have dropped.
+    fn lease_pumps() -> (SetLease, Worker, Worker) {
+        let (lease, [reader, writer]) = TEST_POOL.acquire().expect("test pool acquire");
+        (lease, reader, writer)
+    }
 
     /// Source guard for F2: both PVA accept loops back off through
     /// [`AcceptBackoff`], and the count is pinned so a *new* accept loop
@@ -1313,14 +1448,26 @@ mod tests {
             let client = TestClient::connect(addr);
             let (server_sock, peer) = listener.accept().expect("accept");
             let source = test_source();
+            let (lease, reader_worker, writer_worker) = lease_pumps();
             let conn = tokio::spawn(async move {
+                // Hold the set's lease until the connection — and the two pump
+                // jobs its guards join before `serve_connection_blocking`
+                // returns — is over; dropping it returns the set to the pool.
+                let _lease = lease;
                 serve_connection_blocking(
+                    PumpWorkers {
+                        reader: reader_worker,
+                        writer: writer_worker,
+                    },
                     server_sock,
                     peer,
                     source,
                     config,
-                    PeerEntry::new(false),
-                    ChannelInvalidator::new(),
+                    ConnInit {
+                        peer_entry: PeerEntry::new(false),
+                        x509_identity: None,
+                        channel_invalidator: ChannelInvalidator::new(),
+                    },
                     &registry,
                 )
             });
@@ -1610,13 +1757,21 @@ mod tests {
 
         // `#[tokio::test]` without a flavor IS a current-thread runtime, so
         // this call is already on the thread the guard is about.
+        let (_lease, reader_worker, writer_worker) = lease_pumps();
         let err = serve_connection_blocking(
+            PumpWorkers {
+                reader: reader_worker,
+                writer: writer_worker,
+            },
             server_sock,
             peer,
             test_source(),
             isolated_config(),
-            PeerEntry::new(false),
-            ChannelInvalidator::new(),
+            ConnInit {
+                peer_entry: PeerEntry::new(false),
+                x509_identity: None,
+                channel_invalidator: ChannelInvalidator::new(),
+            },
             &ConnRegistry::new(),
         )
         .expect_err("a current-thread runtime must be refused");
@@ -1756,13 +1911,17 @@ mod tests {
             .set_write_timeout(Some(send_tick_for(DEADLINE)))
             .expect("SO_SNDTIMEO");
 
-        let spec = PumpSpec {
-            thread_name: format!("PVAS-writer {peer}"),
-            label: format!("PVA connection {peer}"),
-            priority: PVA_SERVER_PRIORITY,
-        };
-        let (mut adapter, _guard) =
-            spawn_writer_pump(write_sock, &spec, DEADLINE, FRAME_QUEUE_DEPTH).expect("writer pump");
+        let label = format!("PVA connection {peer}");
+        // `_lease` is declared before `_guard`, so it drops last — after the
+        // guard has joined the pump job and returned the worker.
+        let (_lease, _reader_worker, writer_worker) = lease_pumps();
+        let (mut adapter, _guard) = spawn_writer_pump(
+            writer_worker,
+            write_sock,
+            &label,
+            DEADLINE,
+            FRAME_QUEUE_DEPTH,
+        );
 
         // Bigger than any socket buffer, so the writer really is parked mid
         // frame rather than done before `stop` runs. The depth-1 queue takes
@@ -1937,18 +2096,17 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(200));
 
-        let spec = PumpSpec {
-            thread_name: format!("PVAS-writer {peer}"),
-            label: format!("PVA connection {peer}"),
-            priority: PVA_SERVER_PRIORITY,
-        };
+        let label = format!("PVA connection {peer}");
+        // Held past `drop(guard)` below, so the set returns only after the pump
+        // job is joined.
+        let (_lease, _reader_worker, writer_worker) = lease_pumps();
         let (adapter, guard) = spawn_writer_pump(
+            writer_worker,
             server.clone(),
-            &spec,
+            &label,
             Duration::from_secs(5),
             FRAME_QUEUE_DEPTH,
-        )
-        .expect("writer pump");
+        );
 
         // The pump's last strong sender goes with the guard: it ends, and on the
         // way out it shuts the socket, waking the reader.
@@ -2048,20 +2206,22 @@ mod tests {
         let started = Instant::now();
         {
             let _registration = registry.register(server.clone());
-            let spec = PumpSpec {
-                thread_name: format!("PVAS-reader {peer}"),
-                label: format!("PVA connection {peer}"),
-                priority: PVA_SERVER_PRIORITY,
-            };
+            let label = format!("PVA connection {peer}");
             // An effectively-infinite receive timeout, exactly as `op_timeout`
             // gives the real driver: only the guard's shutdown can end this
             // pump.
             server
                 .set_read_timeout(Some(Duration::from_secs(64_000)))
                 .expect("SO_RCVTIMEO");
-            let (_adapter, _reader) =
-                spawn_reader_pump(server.clone(), &spec, DEFAULT_READ_CHUNK, CHUNK_QUEUE_DEPTH)
-                    .expect("reader pump");
+            // `_lease` drops after `_reader`'s guard has joined the pump job.
+            let (_lease, reader_worker, _writer_worker) = lease_pumps();
+            let (_adapter, _reader) = spawn_reader_pump(
+                reader_worker,
+                server.clone(),
+                &label,
+                DEFAULT_READ_CHUNK,
+                CHUNK_QUEUE_DEPTH,
+            );
             assert_eq!(registry.live_connections(), 1);
             thread::sleep(Duration::from_millis(200));
             // Stand-in for the writer-spawn `?`: leave the scope with the
@@ -2095,14 +2255,15 @@ mod tests {
         let started = Instant::now();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _registration = registry.register(server.clone());
-            let spec = PumpSpec {
-                thread_name: format!("PVAS-reader {peer}"),
-                label: format!("PVA connection {peer}"),
-                priority: PVA_SERVER_PRIORITY,
-            };
-            let (_adapter, _reader) =
-                spawn_reader_pump(server.clone(), &spec, DEFAULT_READ_CHUNK, CHUNK_QUEUE_DEPTH)
-                    .expect("reader pump");
+            let label = format!("PVA connection {peer}");
+            let (_lease, reader_worker, _writer_worker) = lease_pumps();
+            let (_adapter, _reader) = spawn_reader_pump(
+                reader_worker,
+                server.clone(),
+                &label,
+                DEFAULT_READ_CHUNK,
+                CHUNK_QUEUE_DEPTH,
+            );
             panic!("connection handler blew up");
         }));
 
@@ -2227,27 +2388,36 @@ mod tests {
         assert_eq!(PVA_SERVER_PRIORITY.value(), 18);
     }
 
-    /// One rule for every thread in this module: spawned through the runtime
-    /// seam, at `PVA_SERVER_PRIORITY`. A raw `thread::Builder` in production
-    /// would be a thread with no priority and, on the host, no ambient
-    /// runtime — the failure the accept loop's connections would hit first.
+    /// One rule for every thread this module puts a connection on: it comes
+    /// from the worker pool, never a fresh creation. A raw `thread::Builder` in
+    /// production would be a thread with no priority and, on the host, no
+    /// ambient runtime — and, per connection, the very creation whose RTEMS
+    /// residue the pool exists to remove.
     ///
     /// `thread::spawn` is banned for a second reason on top of that one: it
     /// cannot express a stack size at all, so on RTEMS it takes std's generic
-    /// 2 MiB `DEFAULT_MIN_STACK_SIZE` instead of C's class. This module makes
-    /// three threads per connection, so that is the difference between 6 MiB
+    /// 2 MiB `DEFAULT_MIN_STACK_SIZE` instead of C's class. This module puts
+    /// three threads on each connection, so that is the difference between 6 MiB
     /// and 2 MiB of the target's fixed pool per client. The `Builder` ban above
     /// does not cover it — `thread::spawn` is invisible to a check that keys on
     /// `Builder` — which is why it is named separately here, as
     /// `epics-base-rs`'s `every_thread_in_this_crate_states_a_stack_size` does.
+    ///
+    /// And `spawn_dedicated_thread` itself is now banned in production: the
+    /// per-connection operation thread it used to create is exactly the leak
+    /// this change closed. The connection body runs on a *borrowed* worker
+    /// (`conn_pool.acquire` → `run_detached`), and the pumps on the other two
+    /// workers of the same set, so this module creates no thread per accept at
+    /// all — the pool's fixed set of workers is created once and reused.
     #[test]
     fn every_server_thread_goes_through_the_seam() {
         let prod = production_scope(include_str!("blocking.rs"));
         assert_eq!(
             prod.matches(concat!("thread", "::Builder")).count(),
             0,
-            "spawn server threads with `spawn_dedicated_thread`, not directly: \
-             the seam is what applies the priority and carries the ambient runtime"
+            "spawn server threads through the worker pool, not directly: the \
+             pool is what applies the priority, the stack class, and carries the \
+             ambient runtime — and what stops a per-connection creation"
         );
         let bare = concat!("thread", "::spawn(");
         let offenders: Vec<String> = prod
@@ -2265,15 +2435,24 @@ mod tests {
              default — three per connection: {offenders:?}"
         );
         assert_eq!(
-            prod.matches("spawn_dedicated_thread(").count(),
-            1,
-            "the per-connection operation thread is the only thread this module \
-             still spawns itself; the reader and writer pumps go through \
-             `runtime::blocking_io`, which spawns them through the same seam at \
-             the `PumpSpec` priority this module passes it"
+            prod.matches(concat!("spawn_dedi", "cated_thread(")).count(),
+            0,
+            "this module no longer creates a thread per connection: the \
+             connection body runs on a borrowed pool worker via `run_detached`, \
+             not `spawn_dedicated_thread`, which is the per-accept creation the \
+             worker pool was built to remove"
         );
-        // And they really do go through it: a pump spawned any other way would
-        // not be reachable from these two calls.
+        // The connection body is dispatched onto its borrowed worker exactly
+        // once — the counterpart of the single thread this module used to spawn.
+        assert_eq!(
+            prod.matches("run_detached(").count(),
+            1,
+            "the connection body must be dispatched onto its `conn` worker with \
+             exactly one `run_detached` — the pooled replacement for the old \
+             per-connection `spawn_dedicated_thread`"
+        );
+        // And the pumps really do go through the seam: a pump spawned any other
+        // way would not be reachable from these two calls.
         for pump in ["spawn_reader_pump(", "spawn_writer_pump("] {
             assert_eq!(
                 prod.matches(pump).count(),

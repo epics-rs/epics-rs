@@ -81,18 +81,28 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
     "illumos",
 ];
 
+/// The `local_account_db` capability decision, as one named predicate.
+///
+/// Named, rather than written inline in `main`, because it is the thing
+/// `auth::plain`'s `the_capability_is_owned_by_an_allowlist_in_the_build_script`
+/// guard is about: the guard reads this function's body and nothing else, so it
+/// tests the decision rather than the file. `unix` is a precondition rather
+/// than a synonym — it is what puts `libc` in the dependency graph at all
+/// (`Cargo.toml`, meaning 1 above) — so it is stated separately from the
+/// account-database question the allowlist answers.
+fn local_account_db(unix: bool, os: &str) -> bool {
+    unix && LOCAL_ACCOUNT_DB_TARGETS.contains(&os)
+}
+
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(local_account_db)");
     // Declared, never emitted here. See the note above `PVA_BLOCKING_CLIENT`.
     println!("cargo::rustc-check-cfg=cfg(pva_blocking_client)");
 
-    // `unix` is a precondition rather than a synonym: it is what puts `libc`
-    // in the dependency graph at all (`Cargo.toml`, meaning 1 above). Stating
-    // it explicitly keeps the two meanings visibly separate.
     let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    if unix && LOCAL_ACCOUNT_DB_TARGETS.contains(&os.as_str()) {
+    if local_account_db(unix, &os) {
         println!("cargo::rustc-cfg=local_account_db");
     }
 }

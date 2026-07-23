@@ -90,6 +90,11 @@ async fn main() -> CaResult<()> {
     // ── Simulator ──
     spawn_simulator(db.clone());
 
+    // ── Scan start (C iocInit owns it, the servers do not scan) ──
+    // One core-owned scan owner covers both front-ends; held to the end
+    // of main so periodic SCAN fields stay live while the IOC serves.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
     // ── Build both servers from the same database ──
     let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await?;
     let pva_server = PvaServer::from_parts(db, pva_port, None, None, None);

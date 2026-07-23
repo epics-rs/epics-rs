@@ -377,11 +377,12 @@ impl std::fmt::Display for FrameError {
 /// What the bytes at the head of a CA receive buffer are.
 pub(super) enum Frame {
     /// A header was parsed. `hdr_size + body_len` is the message's total
-    /// length on the wire — **the body may not have arrived yet**. Deciding
-    /// what to do about that is the caller's, because it is the one place the
-    /// two circuits legitimately differ: the data circuit drains an
-    /// over-`EPICS_CA_MAX_ARRAY_BYTES` body across reads and keeps going
-    /// (C `tcpiiu.cpp:1269-1283`), the name-service circuit simply waits.
+    /// length on the wire — **the body may not have arrived yet**. What to do
+    /// about that is the caller's business — but the size rule the caller
+    /// applies is not per-circuit: both circuits run [`RecvBodyPolicy`], C's
+    /// over-`EPICS_CA_MAX_ARRAY_BYTES` ignore-and-drain
+    /// (`tcpiiu.cpp:1269-1283`), because C runs `processIncoming` on a
+    /// name-service `tcpiiu` exactly as on a data one.
     Header {
         hdr: CaHeader,
         hdr_size: usize,
@@ -440,6 +441,85 @@ pub(super) fn next_frame(buf: &[u8]) -> Frame {
         hdr,
         hdr_size,
         body_len,
+    }
+}
+
+/// **The CA client's one receive-side body limit**, shared by the upstream
+/// circuit's [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's reader
+/// (`client/search.rs::run_nameserver_connection`) — the body-policy half of
+/// the seam whose framing half is [`next_frame`].
+///
+/// C `tcpiiu::processIncoming`'s limit and its ignore-don't-close policy
+/// (`tcpiiu.cpp:1207-1283`) apply to *every* `tcpiiu`, and a name-service
+/// circuit is a `tcpiiu` (`isNameService()`), so C runs one rule on both.
+/// `None` — the C default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the
+/// circuit accepts any payload the server announces; an operator who turns it
+/// off gets a limit, and over-limit responses are dropped one-by-one with a
+/// single log line per circuit. Neither case ever closes the circuit.
+///
+/// Pre-fix the name-service reader carried no limit at all: with
+/// `EPICS_CA_AUTO_ARRAY_BYTES=NO` the data circuit refused and drained an
+/// over-limit body while the name-server circuit buffered whatever a header
+/// announced — up to 4 GiB from one 24-byte extended header — which is
+/// exactly the "two copies drift" failure the framing seam exists to prevent.
+pub(super) struct RecvBodyPolicy {
+    limit: Option<usize>,
+    /// C `tcpiiu.cpp:1276-1282` drains an ignored oversize body across reads
+    /// with `recvQue.removeBytes` and returns to await the rest. This is that
+    /// counter: while it is non-zero every byte received belongs to a message
+    /// already refused, so it is consumed before framing resumes.
+    bytes_to_drain: usize,
+    oversize_logged: bool,
+}
+
+impl RecvBodyPolicy {
+    pub(super) fn new() -> Self {
+        Self::with_limit(crate::protocol::max_recv_body_bytes())
+    }
+
+    /// Test seam: the boundary table below injects a limit instead of
+    /// mutating the process environment under a parallel test runner.
+    fn with_limit(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            bytes_to_drain: 0,
+            oversize_logged: false,
+        }
+    }
+
+    /// First step of every receive iteration: consume bytes still owed to an
+    /// already-refused message from the head of `accumulated`. Returns `true`
+    /// while the refused message has bytes outstanding beyond this read — the
+    /// caller reads again instead of framing.
+    pub(super) fn drain_refused(&mut self, accumulated: &mut Vec<u8>) -> bool {
+        if self.bytes_to_drain > 0 {
+            let take = self.bytes_to_drain.min(accumulated.len());
+            accumulated.drain(..take);
+            self.bytes_to_drain -= take;
+        }
+        self.bytes_to_drain > 0
+    }
+
+    /// Whether a message announcing `body_len` payload bytes is refused under
+    /// the operator's limit. The first refusal on a circuit logs C's one line
+    /// (`tcpiiu.cpp:1271`); the rest are silent so a misbehaving server
+    /// cannot flood the log.
+    pub(super) fn refuses(&mut self, peer: SocketAddr, body_len: usize) -> bool {
+        let over = self.limit.is_some_and(|limit| body_len > limit);
+        if over && !self.oversize_logged {
+            eprintln!(
+                "CA: {peer}: response with payload size={body_len} \
+                 > EPICS_CA_MAX_ARRAY_BYTES ignored"
+            );
+            self.oversize_logged = true;
+        }
+        over
+    }
+
+    /// Register the still-arriving tail of a refused message, to be consumed
+    /// by [`Self::drain_refused`] on subsequent reads.
+    pub(super) fn owe(&mut self, bytes: usize) {
+        self.bytes_to_drain = bytes;
     }
 }
 
@@ -1906,14 +1986,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
     // C `tcpiiu::processIncoming`'s receive-side body limit and its
-    // ignore-don't-close policy (`tcpiiu.cpp:1207-1283`). `None` — the C
-    // default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the circuit accepts
-    // any payload the server announces; an operator who turns it off gets a
-    // limit, and over-limit responses are dropped one-by-one with a single
-    // log line. Neither case ever closes the circuit.
-    let recv_body_limit = crate::protocol::max_recv_body_bytes();
-    let mut bytes_to_drain: usize = 0;
-    let mut oversize_logged = false;
+    // ignore-don't-close policy — see [`RecvBodyPolicy`], shared with the
+    // name-service circuit's reader.
+    let mut body_policy = RecvBodyPolicy::new();
     let idle_timeout = Duration::from_secs(echo_idle_secs());
     let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
     let mut echo_pending = false;
@@ -2188,18 +2263,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // `bytesArePendingInOS()` (`tcpiiu.cpp:543-546`).
         accumulated.extend_from_slice(&buf[..n]);
 
-        // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1276-1282`) drains an
-        // ignored oversize body across reads with `recvQue.removeBytes` and
-        // returns to await the rest. `bytes_to_drain` is that counter: while
-        // it is non-zero every byte read belongs to a message we already
-        // decided to ignore, so it is consumed before framing resumes.
-        if bytes_to_drain > 0 {
-            let take = bytes_to_drain.min(accumulated.len());
-            accumulated.drain(..take);
-            bytes_to_drain -= take;
-            if bytes_to_drain > 0 {
-                continue;
-            }
+        // Bytes owed to an already-refused oversize message are consumed
+        // before framing resumes (C `recvQue.removeBytes`, see
+        // [`RecvBodyPolicy::drain_refused`]).
+        if body_policy.drain_refused(&mut accumulated) {
+            continue;
         }
 
         let mut offset = 0;
@@ -2235,17 +2303,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1269-1283`): a body the
             // circuit's cache cannot hold is IGNORED — logged once, drained
             // with `recvQue.removeBytes`, circuit kept. Unreachable with C's
-            // default (`recv_body_limit == None`), which is the whole point:
-            // a C client reads a 33 MB waveform from a C IOC without
-            // complaint, so ours must too.
-            if recv_body_limit.is_some_and(|limit| actual_post > limit) {
-                if !oversize_logged {
-                    eprintln!(
-                        "CA: {server_addr}: response with payload size={actual_post} \
-                         > EPICS_CA_MAX_ARRAY_BYTES ignored"
-                    );
-                    oversize_logged = true;
-                }
+            // default (no limit), which is the whole point: a C client reads
+            // a 33 MB waveform from a C IOC without complaint, so ours must
+            // too. The rule itself lives in [`RecvBodyPolicy`].
+            if body_policy.refuses(server_addr, actual_post) {
                 let present = accumulated.len() - offset;
                 if msg_len <= present {
                     offset += msg_len;
@@ -2254,7 +2315,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 // The body is still arriving: consume what is here and carry
                 // the remainder into the next reads (C keeps `curDataBytes`
                 // and returns true to await more).
-                bytes_to_drain = msg_len - present;
+                body_policy.owe(msg_len - present);
                 offset = accumulated.len();
                 break;
             }
@@ -5022,6 +5083,82 @@ mod framing_tests {
             7,
             "the torn header must be left in the buffer for the next read"
         );
+    }
+}
+
+#[cfg(test)]
+mod recv_body_policy_tests {
+    //! Per-boundary coverage of [`RecvBodyPolicy`], the client's one
+    //! receive-side body limit — the body-policy half of the seam whose
+    //! framing half is `framing_tests` above, and shared by the same two
+    //! callers (`read_loop`, the name-service reader). The limit is injected
+    //! (`with_limit`) rather than read from `EPICS_CA_AUTO_ARRAY_BYTES` /
+    //! `EPICS_CA_MAX_ARRAY_BYTES`, because these run under a parallel test
+    //! runner and the environment is process-global.
+    use super::RecvBodyPolicy;
+    use std::net::SocketAddr;
+
+    fn peer() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// `None` is C's default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`): no body is
+    /// ever refused, whatever the header announces.
+    #[test]
+    fn no_limit_refuses_nothing() {
+        let mut policy = RecvBodyPolicy::with_limit(None);
+        assert!(!policy.refuses(peer(), 0));
+        assert!(!policy.refuses(peer(), usize::MAX));
+    }
+
+    /// Boundary: `body_len == limit` is admitted, `limit + 1` is refused —
+    /// C's `if (msgSize > maxBytes)` is strict (`tcpiiu.cpp:1269`), and a
+    /// refusal is sticky per message, not per circuit: the frame after a
+    /// refused one is judged on its own size.
+    #[test]
+    fn refusal_boundary_is_strictly_over_the_limit() {
+        let mut policy = RecvBodyPolicy::with_limit(Some(1024));
+        assert!(!policy.refuses(peer(), 1023));
+        assert!(!policy.refuses(peer(), 1024));
+        assert!(policy.refuses(peer(), 1025));
+        assert!(
+            !policy.refuses(peer(), 1024),
+            "an in-limit frame after a refused one must still be admitted"
+        );
+        assert!(
+            policy.refuses(peer(), 1025),
+            "refusal must not be one-shot — every over-limit frame is dropped"
+        );
+    }
+
+    /// Drain accounting at every boundary of `owed` vs the bytes on hand:
+    /// short reads keep draining, the exact read finishes clean, and an
+    /// over-read leaves the surplus at the head of the buffer for framing.
+    #[test]
+    fn drain_refused_accounts_exactly_at_every_boundary() {
+        // Nothing owed: a no-op that never signals "keep draining".
+        let mut policy = RecvBodyPolicy::with_limit(Some(8));
+        let mut acc = vec![1u8, 2, 3];
+        assert!(!policy.drain_refused(&mut acc));
+        assert_eq!(acc, [1, 2, 3]);
+
+        // owed > present: everything is swallowed and more is owed.
+        policy.owe(5);
+        let mut acc = vec![0u8; 3];
+        assert!(policy.drain_refused(&mut acc));
+        assert!(acc.is_empty());
+
+        // owed == present (the 2 remaining): swallowed, drain complete.
+        let mut acc = vec![0u8; 2];
+        assert!(!policy.drain_refused(&mut acc));
+        assert!(acc.is_empty());
+
+        // owed < present: only the owed prefix goes; the surplus is the next
+        // message's bytes and must survive for the framer.
+        policy.owe(2);
+        let mut acc = vec![9u8, 9, 7, 7];
+        assert!(!policy.drain_refused(&mut acc));
+        assert_eq!(acc, [7, 7], "surplus bytes belong to the next frame");
     }
 }
 

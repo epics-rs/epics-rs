@@ -1233,12 +1233,28 @@ async fn run_nameserver_connection(
         let read_task = epics_base_rs::runtime::task::spawn(async move {
             let mut buf = vec![0u8; 8192];
             let mut accumulated: Vec<u8> = Vec::new();
+            // The client's one receive-side body limit
+            // (`transport::RecvBodyPolicy`), shared with the upstream
+            // circuit's `read_loop`. C applies `processIncoming`'s
+            // over-`EPICS_CA_MAX_ARRAY_BYTES` ignore-and-drain to a
+            // name-service `tcpiiu` exactly as to a data one; pre-fix this
+            // reader had no limit at all, so with
+            // `EPICS_CA_AUTO_ARRAY_BYTES=NO` one 24-byte extended header
+            // from a misbehaving name server could grow `accumulated`
+            // toward the announced 4 GiB while the data circuit refused
+            // the same frame.
+            let mut body_policy = super::transport::RecvBodyPolicy::new();
             loop {
                 let n = match reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
                 accumulated.extend_from_slice(&buf[..n]);
+                // Bytes owed to an already-refused oversize message are
+                // consumed before framing resumes.
+                if body_policy.drain_refused(&mut accumulated) {
+                    continue;
+                }
                 // Forward only the prefix that contains complete CA
                 // messages. Without this framing, the kernel splitting a
                 // server response across read syscalls causes the
@@ -1250,9 +1266,7 @@ async fn run_nameserver_connection(
                 // shared with the upstream circuit's `read_loop`
                 // (`doc/calink-rtems-design.md` §6 C2: "one seam, two
                 // callers"). This loop only measures how long a prefix of
-                // whole messages it can hand on, which is all the
-                // name-service circuit needs: unlike a data circuit it
-                // carries no bodies of its own to size-limit or drain.
+                // whole messages it can hand on.
                 let mut consumed = 0usize;
                 // Distinguishes "wait for more bytes" from "the bytes we
                 // have are definitively malformed". Pre-fix every exit path
@@ -1278,6 +1292,27 @@ async fn run_nameserver_connection(
                             hdr_size, body_len, ..
                         } => {
                             let msg_size = hdr_size + body_len;
+                            // Over-limit message: ignored, never fatal —
+                            // the same `RecvBodyPolicy` rule as the data
+                            // circuit. Ship the clean prefix first so the
+                            // refused bytes never reach the dispatcher,
+                            // then drop the message (across reads if its
+                            // body is still arriving).
+                            if body_policy.refuses(addr, body_len) {
+                                if consumed > 0 {
+                                    let frame_bytes = accumulated[..consumed].to_vec();
+                                    let _ = resp_tx.send((frame_bytes, addr));
+                                    accumulated.drain(..consumed);
+                                    consumed = 0;
+                                }
+                                if msg_size <= accumulated.len() {
+                                    accumulated.drain(..msg_size);
+                                    continue;
+                                }
+                                body_policy.owe(msg_size - accumulated.len());
+                                accumulated.clear();
+                                break;
+                            }
                             if accumulated.len() - consumed < msg_size {
                                 break;
                             }

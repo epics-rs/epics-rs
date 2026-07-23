@@ -698,7 +698,7 @@ async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueu
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
 
     #[cfg(feature = "bringup-probes")]
-    CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let attempt = CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let dialed_rx = match CA_DIAL_POOL.dial(server_addr) {
         Ok(rx) => rx,
         Err(e) => {
@@ -706,7 +706,36 @@ async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueu
             return None;
         }
     };
-    let stream = match dialed_rx.await {
+    // BRING-UP PROBE: how long one dial holds a worker, printed at submit and
+    // at resolve so a console reader can pair them. The target installs no
+    // tracing subscriber, so `println!` is the only reader; the pair is what
+    // distinguishes a dial that was pinned in the OS connect ladder from one
+    // that waited in the pool's queue behind four that were.
+    #[cfg(feature = "bringup-probes")]
+    let submitted = std::time::Instant::now();
+    #[cfg(feature = "bringup-probes")]
+    {
+        let (workers, _, queued, dialing) = dial_pool_probe();
+        println!(
+            "DIALPROBE submit n={attempt} target={server_addr} \
+             workers={workers} queued={queued} dialing={dialing}"
+        );
+    }
+    let dialed = dialed_rx.await;
+    #[cfg(feature = "bringup-probes")]
+    {
+        let outcome = match &dialed {
+            Ok(Ok(_)) => "connected".to_string(),
+            Ok(Err(e)) => format!("error:{e}"),
+            Err(_) => "worker-gone".to_string(),
+        };
+        println!(
+            "DIALPROBE resolve n={attempt} target={server_addr} \
+             elapsed_ms={} outcome={outcome}",
+            submitted.elapsed().as_millis()
+        );
+    }
+    let stream = match dialed {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");

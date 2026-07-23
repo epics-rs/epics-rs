@@ -444,7 +444,11 @@ impl CaLinkResolver {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            // The `runtime::task` seam, not `tokio::time`: on the RTEMS
+            // target this loop runs on the callback pool with no tokio
+            // timer anywhere in the process, and a bare `tokio::time::sleep`
+            // panics the band worker it is polled on.
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 

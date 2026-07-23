@@ -170,7 +170,10 @@ impl SyncGroup {
             }
         };
 
-        match tokio::time::timeout(timeout, collect).await {
+        // `runtime::task::timeout`, not `tokio::time::timeout`: this module
+        // is compiled for the RTEMS target under `client-core`, where no
+        // tokio timer exists to drive the latter.
+        match epics_base_rs::runtime::task::timeout(timeout, collect).await {
             Ok(()) => {
                 // libca: a successful block clears the outstanding set.
                 let mut gets = Vec::new();

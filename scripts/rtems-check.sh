@@ -89,8 +89,18 @@ CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
 # was `qsrv-core` alone, because `client_native` was 47 errors on this target
 # (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
+#
+# `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
+# `rtems-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
+# `calink` drives a live `CaClient`. `client-core`, not `client`: the split is
+# stated in `crates/epics-ca-rs/Cargo.toml` and it is the circuit, the search
+# engine, subscriptions and the resolver WITHOUT the beacon monitor / repeater
+# / service discovery / reverse-DNS stack a record link never reaches. This is
+# the same selection the CA ratchet below measures, so the probe and the built
+# binary agree by construction rather than by two people remembering.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
+    [epics-ca-rs]="client-core"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.
@@ -383,6 +393,58 @@ if [[ "$client_errors" -ne "$PVA_CLIENT_TARGET_ERRORS" ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The CA client had the same RATCHET, and no longer needs one.
+#
+# `doc/calink-rtems-design.md` §6 stage C5 mounts the `ca://` record-link
+# resolver in `rtems-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
+# the target — `calink` drives a live `CaClient` (§2.1). While that was work in
+# progress the selection was MEASURED rather than built, exactly as the PVA one
+# above still is, because a gate red for unstarted work reports nothing:
+#
+# `--no-default-features --features client-core -p epics-ca-rs --lib`:
+#
+#     22  before the split      measured with `client`/`channel`/`calink` merely
+#                               un-gated: 7 of them are the discovery stack's
+#     15  after the split       11 primary + a 4-error [u8] cascade in
+#                               `search.rs`'s select! (design §1.3)
+#     14  FIONREAD single owner  the client's flow-control probe now reaches
+#                               `runtime::blocking_io::pending_bytes`, which
+#                               supplies the constant `libc` omits for RTEMS
+#     11  the `dial_ca` seam     the circuit's dial, its keepalive and its
+#                               receive-queue probe became one compile-time
+#                               transport choice; `tokio::net` and `socket2`
+#                               are named only on the hosted arm
+#     10  name-server dial       `run_nameserver_connection` came through the
+#                               same seam, so `tokio::net` is gone from the
+#                               client entirely
+#      0  stage C5              UDP SEARCH cfg-gated out of the target build
+#
+# Stage C5 closed the remaining 10 the way PVA stage 4 closed its 28, and for
+# the same reason: they were all UDP. On the target `search::SearchTransport`
+# has the single `NameServersOnly` variant — `UdpTransport`, `bind_udp`, the
+# fanout/DNS-refresh helpers, `run_search_engine` and the whole
+# `EPICS_CA_ADDR_LIST` parse (`AddrEntry`, `resolve_host`,
+# `parse_addr_list_with_hostnames`, `append_auto_addr_entries`) are
+# `#[cfg(not(target_os = "rtems"))]`. "No UDP socket" is a fact about the type,
+# not a runtime branch, and `CaClient::new_with_config` reaches
+# `name_servers_only_search_engine` by `cfg` rather than by choice.
+#
+# The probe is RETIRED rather than left pinned at zero, and the replacement is
+# STRICTER, not looser: `CRATE_FEATURES[epics-ca-rs]="client-core"` above makes
+# the crate loop build this exact selection as a hard pass/fail — in BOTH the
+# portability and the image configuration, where the probe only ever ran the
+# first — and the binary loop then links `rtems-ca-ioc` on top of it. A count
+# pinned at 0 and a build that must succeed are the same assertion; keeping
+# both would mean a second check that can only ever fail after the first
+# already did, which is the decoration this script's own census comment warns
+# about. `tokio::net`, `socket2` and a raw `FIONREAD` re-entering the target
+# client still fail the gate — one loop earlier, and twice.
+#
+# The PVA probe above stays, because it is not duplicative: CRATE_FEATURES has
+# no `epics-pva-rs` entry, so `--features client` is built nowhere else.
+
 log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
 log "the portability and the image configuration."
 log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
+log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

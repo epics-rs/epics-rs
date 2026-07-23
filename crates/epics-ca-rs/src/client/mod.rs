@@ -1,5 +1,12 @@
 // RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
 
+// The beacon monitor is a UDP listener on the CA beacon port, fed by the
+// repeater. `client-core` has no UDP client socket at all (the target's
+// search reaches servers over `EPICS_CA_NAME_SERVERS`, §4.1), so there are
+// no beacons to monitor and the module is not compiled. What it buys — a
+// faster rescan after a server restart than the search retry cadence alone —
+// is an optimisation over a transport that does not exist there.
+#[cfg(feature = "client")]
 mod beacon_monitor;
 mod circuit_breaker;
 mod search;
@@ -26,6 +33,7 @@ use parking_lot::Mutex;
 // the methods that return them, so a caller can name what they were given.
 pub use crate::channel::{AccessRights, ChannelInfo};
 use crate::protocol::*;
+#[cfg(feature = "client")]
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
@@ -448,16 +456,19 @@ pub struct CaClient {
     _coordinator: epics_base_rs::runtime::task::TaskHandle<()>,
     _search_task: epics_base_rs::runtime::task::TaskHandle<()>,
     _transport_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    #[cfg(feature = "client")]
     _beacon_task: epics_base_rs::runtime::task::TaskHandle<()>,
     /// Discovery backends retained for their lifetime. mDNS's
     /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
     /// runs only while the backend is alive — dropping it kills live
     /// discovery. Held here so post-startup IOCs keep being found.
+    #[cfg(feature = "client")]
     _discovery_backends: Vec<Box<dyn crate::discovery::Backend>>,
     /// Per-backend forwarder tasks: drain each backend's
     /// `subscribe()` stream and feed `DiscoveryEvent`s into the
     /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
     /// drop so they don't outlive the client.
+    #[cfg(feature = "client")]
     _discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>>,
 }
 
@@ -523,6 +534,7 @@ enum CoordRequest {
     /// libca's split between `udpiiu::beaconAnomalyNotify` (which
     /// only wakes searches) and `tcpRecvWatchdog::beaconAnomalyNotify`
     /// (which only flips a per-circuit flag).
+    #[cfg(feature = "client")]
     ForceRescanServer {
         server_addr: SocketAddr,
         kind: beacon_monitor::BeaconAnomalyKind,
@@ -538,6 +550,7 @@ enum CoordRequest {
     /// which case the watchdog is irrelevant, or we do (we just
     /// pruned the BHE) and the next healthy beacon will refresh it
     /// naturally.
+    #[cfg(feature = "client")]
     BeaconArrival {
         server_addr: SocketAddr,
         anomaly: bool,
@@ -595,6 +608,7 @@ pub struct CaClientConfig {
     /// merges the addresses returned by every active backend into
     /// its `EPICS_CA_ADDR_LIST` at startup. Falls back to the
     /// `EPICS_CA_DISCOVERY` env var when `None`.
+    #[cfg(feature = "client")]
     pub discovery: Option<crate::discovery::DiscoveryConfig>,
 
     /// Pre-built discovery backends to consult in addition to whatever
@@ -603,6 +617,7 @@ pub struct CaClientConfig {
     /// ...) without having to extend `DiscoveryConfig`. Each backend's
     /// `discover()` is called once at startup; addresses are deduped
     /// against `EPICS_CA_ADDR_LIST` and `discovery`-provided sources.
+    #[cfg(feature = "client")]
     pub extra_backends: Vec<Box<dyn crate::discovery::Backend>>,
 }
 
@@ -637,6 +652,13 @@ impl CaClient {
     /// Create a client with explicit configuration. Currently the only
     /// knob is `tls`; future fields will follow the same pattern.
     pub async fn new_with_config(config: CaClientConfig) -> CaResult<Self> {
+        // Every field of this struct belongs to a feature (`client`'s
+        // discovery pair, `experimental-rust-tls`'s two), so in the
+        // `client-core` build with TLS off it has none left. Destructured
+        // rather than ignored: a field added unconditionally later fails to
+        // compile here until someone states which configuration reads it.
+        #[cfg(not(any(feature = "client", feature = "experimental-rust-tls")))]
+        let CaClientConfig {} = config;
         #[cfg(feature = "experimental-rust-tls")]
         if config.tls.is_some() {
             tracing::warn!(
@@ -660,9 +682,15 @@ impl CaClient {
         // the registration helper and the beacon monitor's 1 s retry loop both
         // take this value, so a misconfigured port is diagnosed once — not on
         // every attempt.
+        //
+        // Both are the beacon path, so both belong to the full `client`: the
+        // repeater exists to fan beacons out to every client on the host, and
+        // `client-core` binds no UDP socket to receive them on.
+        #[cfg(feature = "client")]
         let repeater_port = crate::protocol::repeater_port();
 
         // Run repeater registration in background — don't block client startup.
+        #[cfg(feature = "client")]
         epics_base_rs::runtime::task::spawn(async move {
             repeater::ensure_repeater(repeater_port).await
         });
@@ -673,18 +701,31 @@ impl CaClient {
         // after IOC migration. Pre-fix `parse_addr_list()` returned
         // bare `Vec<SocketAddr>` resolved exactly once at startup,
         // permanently pinning the client to the first-resolved IPs.
+        // `mut` only for the discovery merge below, which `client-core` does
+        // not have — stated as two bindings rather than one binding and a
+        // silenced lint.
+        // `EPICS_CA_ADDR_LIST` names UDP SEARCH destinations, so it is parsed
+        // only where there is a UDP SEARCH socket to send from — see
+        // `search::SearchTransport` and the engine selection below.
+        #[cfg(all(feature = "client", not(target_os = "rtems")))]
         let mut addr_list = parse_addr_list_with_hostnames()?;
+        #[cfg(all(not(feature = "client"), not(target_os = "rtems")))]
+        let addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
         // EPICS_CA_DISCOVERY env var. Custom `extra_backends` are then
         // appended. Results are merged with addr_list (deduped by
         // SocketAddr).
+        #[cfg(feature = "client")]
         let discovery_cfg = config.discovery.clone().or_else(crate::discovery::from_env);
+        #[cfg(feature = "client")]
         let mut backends: Vec<Box<dyn crate::discovery::Backend>> = match discovery_cfg {
             Some(cfg) => crate::discovery::build_backends(cfg),
             None => Vec::new(),
         };
+        #[cfg(feature = "client")]
         backends.extend(config.extra_backends);
+        #[cfg(feature = "client")]
         if !backends.is_empty() {
             let mut discovered: Vec<SocketAddr> = Vec::new();
             for b in &backends {
@@ -751,6 +792,21 @@ impl CaClient {
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
         let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
+        // Which search engine this client gets is a property of the target, not
+        // of its configuration. A hosted build binds the per-NIC UDP SEARCH
+        // bundle and *additionally* uses any `EPICS_CA_NAME_SERVERS` circuits;
+        // the RTEMS target has no UDP SEARCH transport compiled in at all
+        // (`search::SearchTransport` has one variant there), so it selects C's
+        // documented TCP-only name-resolution mode explicitly — the entry point
+        // stage C1 built for exactly this call site
+        // (`doc/calink-rtems-design.md` §4.5, §6 stage C5).
+        //
+        // The refusal is the point of selecting it by entry point: with no UDP
+        // socket and no name server the engine could reach nothing, so an RTEMS
+        // IOC booted without `EPICS_CA_NAME_SERVERS` fails *here*, at client
+        // construction, instead of presenting as every `ca://` link timing out
+        // forever.
+        #[cfg(not(target_os = "rtems"))]
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
@@ -758,6 +814,15 @@ impl CaClient {
             search_resp_tx,
             search_attempts.clone(),
         ));
+        #[cfg(target_os = "rtems")]
+        let search_task = {
+            epics_base_rs::runtime::task::spawn(search::name_servers_only_search_engine(
+                nameserver_addrs,
+                search_rx,
+                search_resp_tx,
+                search_attempts.clone(),
+            )?)
+        };
 
         // Wire each discovery backend's live-update stream into the
         // search engine. `discover()` above was a one-shot scan;
@@ -766,8 +831,10 @@ impl CaClient {
         // never discovered. The `backends` Vec — and the `ServiceDaemon`
         // an `MdnsBackend` owns — is retained on `CaClient` so the
         // browse keeps running for the client's lifetime.
+        #[cfg(feature = "client")]
         let mut discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>> =
             Vec::new();
+        #[cfg(feature = "client")]
         for backend in &backends {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
@@ -869,6 +936,7 @@ impl CaClient {
         let diagnostics = Arc::new(CaDiagnostics::default());
         let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
+        #[cfg(feature = "client")]
         let (beacon_ctrl_tx, beacon_ctrl_rx) =
             mpsc::unbounded_channel::<beacon_monitor::BeaconControl>();
 
@@ -885,9 +953,11 @@ impl CaClient {
             diagnostics.clone(),
             exception_slot.clone(),
             search_attempts.clone(),
+            #[cfg(feature = "client")]
             beacon_ctrl_tx,
         ));
 
+        #[cfg(feature = "client")]
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
             beacon_ctrl_rx,
@@ -910,8 +980,11 @@ impl CaClient {
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
+            #[cfg(feature = "client")]
             _beacon_task: beacon_task,
+            #[cfg(feature = "client")]
             _discovery_backends: backends,
+            #[cfg(feature = "client")]
             _discovery_forwarders: discovery_forwarders,
         })
     }
@@ -1007,8 +1080,11 @@ impl CaClient {
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Shutdown { reply: tx });
-        // Wait briefly for the clear commands to be sent
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        // Wait briefly for the clear commands to be sent. Through the
+        // `runtime::task` seam: on the RTEMS target there is no tokio timer
+        // to drive `tokio::time::timeout`, and shutdown would panic instead
+        // of draining.
+        let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
     }
 
     /// Create a persistent channel. Returns immediately (starts searching in background).
@@ -1365,11 +1441,13 @@ impl Drop for CaClient {
         let coord_abort = self._coordinator.abort_handle();
         let search_abort = self._search_task.abort_handle();
         let transport_abort = self._transport_task.abort_handle();
+        #[cfg(feature = "client")]
         let beacon_abort = self._beacon_task.abort_handle();
 
         // Discovery forwarders hold a `search_tx` clone — abort them
         // so they don't outlive the client. The `_discovery_backends`
         // Vec drops with `self`, tearing down any `ServiceDaemon`.
+        #[cfg(feature = "client")]
         for fwd in &self._discovery_forwarders {
             fwd.abort();
         }
@@ -1382,12 +1460,16 @@ impl Drop for CaClient {
             let (tx, rx) = oneshot::channel();
             if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
                 // Bounded so a wedged coordinator doesn't keep
-                // the cleanup task alive indefinitely.
-                let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+                // the cleanup task alive indefinitely. The bound goes
+                // through the same seam as the `spawn` above: this future
+                // is polled on the RTEMS exec backend, where `tokio::time`
+                // has no timer and panics the band worker.
+                let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
             }
             coord_abort.abort();
             transport_abort.abort();
             search_abort.abort();
+            #[cfg(feature = "client")]
             beacon_abort.abort();
         });
     }
@@ -2989,10 +3071,10 @@ impl CaChannel {
     /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
     /// not in the tool.
     ///
-    /// The lookup is [`crate::hostname::ip_addr_to_a`] on a blocking thread:
-    /// this is an `async fn` a caller awaits, so it can wait for the resolver
-    /// exactly as C's `cainfo` does, and no other channel's progress is behind
-    /// it.
+    /// The lookup is [`types::peer_resolved_name`] — `hostname::ip_addr_to_a`
+    /// on a blocking thread: this is an `async fn` a caller awaits, so it can
+    /// wait for the resolver exactly as C's `cainfo` does, and no other
+    /// channel's progress is behind it.
     ///
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
@@ -3000,14 +3082,7 @@ impl CaChannel {
     pub async fn host_name(&self) -> CaResult<String> {
         let info = self.info().await?;
         let addr = info.server_addr;
-        Ok(
-            tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
-                .await
-                // A join failure is a runtime shutdown, not a channel error, and
-                // C's `ipAddrToA` has a well-defined answer for "no name": the
-                // dotted IP. Give that rather than failing a connected channel.
-                .unwrap_or_else(|_| addr.to_string()),
-        )
+        Ok(types::peer_resolved_name(addr).await)
     }
 
     /// Server's CA minor protocol version, parsed from the
@@ -3262,7 +3337,7 @@ async fn run_coordinator(
     diag: Arc<CaDiagnostics>,
     exception_slot: types::CaExceptionSlot,
     search_attempts: types::SearchAttempts,
-    beacon_ctrl_tx: mpsc::UnboundedSender<beacon_monitor::BeaconControl>,
+    #[cfg(feature = "client")] beacon_ctrl_tx: mpsc::UnboundedSender<beacon_monitor::BeaconControl>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
@@ -3605,6 +3680,7 @@ async fn run_coordinator(
                         let _ = reply.send(());
                         return; // Exit coordinator loop
                     }
+                    #[cfg(feature = "client")]
                     CoordRequest::ForceRescanServer { server_addr, kind } => {
                         // FirstSighting is a per-client bookkeeping
                         // event (our beacon map was empty for this
@@ -3676,6 +3752,7 @@ async fn run_coordinator(
                             }
                         }
                     }
+                    #[cfg(feature = "client")]
                     CoordRequest::BeaconArrival { server_addr, anomaly } => {
                         // Pure transport-watchdog signal. The
                         // routing decision (exact match vs.
@@ -4107,7 +4184,7 @@ async fn run_coordinator(
                         } else {
                             format!(
                                 "host={host} ctx={message}",
-                                host = crate::hostname::cached_name(server_addr)
+                                host = types::peer_display_name(server_addr)
                             )
                         };
                         types::dispatch_exception(
@@ -4294,6 +4371,7 @@ async fn run_coordinator(
                         // during TCP handshake; cleared on TcpClosed.
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
+                    #[cfg(feature = "client")]
                     TransportEvent::ServerConnected { server_addr } => {
                         // C hands the peer address to `ipAddrToAsciiEngine` in
                         // the `tcpiiu` constructor, so the name is resolved
@@ -4653,6 +4731,7 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
 ///
 /// The returned `Vec` is what the coordinator forwards to the
 /// transport manager — one `BeaconArrivalNotify` per element.
+#[cfg(feature = "client")]
 fn beacon_arrival_targets<I>(channel_states: I, beacon_addr: SocketAddr) -> Vec<SocketAddr>
 where
     I: IntoIterator<Item = (ChannelState, Option<SocketAddr>)>,
@@ -4726,6 +4805,12 @@ fn remove_server_channel(
     }
 }
 
+/// UDP-only, and gated with the transport that uses it: the addresses it
+/// resolves are `EPICS_CA_ADDR_LIST` SEARCH destinations, and the RTEMS target
+/// binds no UDP socket to send to them (`search::SearchTransport`).
+/// `EPICS_CA_NAME_SERVERS` entries go through `parse_nameserver_list`, which is
+/// live on every target.
+#[cfg(not(target_os = "rtems"))]
 fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
     // Try direct IP parse first (fast path)
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
@@ -4755,6 +4840,9 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
 /// re-resolve. `hostname == Some(name)` means the entry started life
 /// as a DNS name and a reconnection path may call `resolve_host`
 /// again to refresh `sock`.
+/// UDP-only; see [`resolve_host`] for why this is not compiled for the RTEMS
+/// target.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Debug, Clone)]
 pub(crate) struct AddrEntry {
     pub sock: SocketAddr,
@@ -4762,6 +4850,7 @@ pub(crate) struct AddrEntry {
     pub port: u16,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl AddrEntry {
     pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
         Self {
@@ -4799,6 +4888,7 @@ impl AddrEntry {
 /// instead of permanently pinning the client to the first-resolved
 /// IP. Closes the long-standing upstream-tracking item for
 /// epics-base#488.
+#[cfg(not(target_os = "rtems"))]
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
     let default_port = epics_base_rs::runtime::net::ca_server_port();
@@ -4866,6 +4956,7 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
 /// Rust-only limited-broadcast safety net. Extracted from
 /// `parse_addr_list_with_hostnames` so the bcast list can be injected
 /// in unit tests (real-NIC enumeration is environment-dependent).
+#[cfg(not(target_os = "rtems"))]
 fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], server_port: u16) {
     for bcast in bcasts {
         let sock = SocketAddr::V4(SocketAddrV4::new(*bcast, server_port));
@@ -5432,7 +5523,7 @@ pub(crate) fn epics_rs_client_ignore() -> Vec<Ipv4Addr> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client"))]
 mod beacon_arrival_routing_tests {
     use super::*;
 

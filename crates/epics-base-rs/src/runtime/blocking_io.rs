@@ -117,6 +117,75 @@ pub fn send_tick_for(send_timeout: Duration) -> Duration {
     (send_timeout / SEND_TICKS_PER_DEADLINE).max(Duration::from_millis(1))
 }
 
+/// The `FIONREAD` ioctl request — bytes pending in the socket receive queue.
+/// C `rsrv`'s batch-up gate: hold accumulated replies while this is `> 0`,
+/// flush at `0` (`camsgtask.c:55`, `cast_server.c:272`), and libca's flow
+/// control input on the client side (`tcpiiu.cpp:544`).
+///
+/// The `libc` crate exposes `FIONREAD` for hosted Unix but omits it for
+/// `armv7-rtems-eabihf`, so the RTEMS value is supplied here. RTEMS newlib
+/// defines it in `sys/rtems/include/sys/filio.h` as `_IOR('f', 127, int)`;
+/// `sys/ioccom.h` in the same tree encodes
+/// `_IOR(g,n,t) = IOC_OUT | (sizeof(t) << 16) | (g << 8) | n` with
+/// `IOC_OUT = 0x40000000`. For a 4-byte `int` that is
+/// `0x40000000 | (4 << 16) | ('f' << 8) | 127 = 0x4004_667F` — the same value
+/// the `libc` crate hardcodes for the whole BSD family (`unix/bsd/mod.rs`),
+/// which C `rsrv` runs on RTEMS in production. Pending on-target runtime
+/// verification at the QEMU/BSP phase; a wrong value only makes the `ioctl`
+/// error, and every caller then flushes (C's own `status < 0` branch),
+/// degrading to per-datagram / per-iteration flushing — never a hang or a
+/// crash. (Candidate for an upstream `libc` newlib/rtems binding so this
+/// local definition can later be dropped.)
+#[cfg(all(unix, not(target_os = "rtems")))]
+const FIONREAD_REQUEST: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
+#[cfg(target_os = "rtems")]
+const FIONREAD_REQUEST: libc::c_ulong = 0x4004_667F;
+
+/// Bytes pending in the socket receive queue via `FIONREAD`.
+///
+/// **One owner for the whole workspace.** Two callers need this exact
+/// question answered and they are on opposite sides of the protocol: C
+/// `rsrv`'s batch-up gate holds accumulated replies while this is `> 0` and
+/// flushes at `0` (`camsgtask.c:52-67`, `cast_server.c:268-281`), and libca's
+/// `tcpiiu::bytesArePendingInOS()` is the sole input to client flow control
+/// (`tcpiiu.cpp:544-567`). They were two implementations — the server's here,
+/// the client's a bare `libc::FIONREAD` that does not exist on
+/// `armv7-rtems-eabihf` at all — which is one implementation too many for a
+/// constant whose RTEMS value had to be derived from newlib headers by hand.
+///
+/// On any `ioctl` error this returns `Err`, and every caller treats that as
+/// "flush now" / "nothing pending" — matching C's `status < 0` branch — so an
+/// absent or wrong FIONREAD never coalesces (byte-correct, just unbatched),
+/// never latches flow control on, and never hangs.
+#[cfg(unix)]
+pub fn pending_bytes<F: std::os::fd::AsRawFd>(sock: &F) -> io::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: `as_raw_fd()` is a valid open socket fd; FIONREAD writes one
+    // `c_int` count through the out-pointer, whose type and size match.
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            FIONREAD_REQUEST as _,
+            &mut n as *mut libc::c_int,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n.max(0) as usize)
+}
+
+#[cfg(not(unix))]
+pub fn pending_bytes<F>(_sock: &F) -> io::Result<usize> {
+    // No FIONREAD off Unix (RTEMS and the host CI are both Unix-family). Report
+    // "unavailable" so callers flush every iteration — never coalesce — which
+    // is byte-correct, just unbatched.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "FIONREAD unavailable on this platform",
+    ))
+}
+
 /// A blocking socket op hit its `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 ///
 /// Unix reports the expiry as `WouldBlock`, some platforms as `TimedOut`.
@@ -700,11 +769,23 @@ impl Default for PumpConfig {
 /// Both socket timeouts are set here rather than left to the caller, because
 /// getting `SO_SNDTIMEO` wrong silently disarms [`write_frame_deadline`]'s only
 /// way of regaining control.
+///
+/// # Two priorities, not one
+///
+/// The two pumps take separate bands because at least one caller's upstream C
+/// derives two: libca gives a circuit's receive thread
+/// `highestPriorityLevelBelow(initializing thread)` and its send thread
+/// `lowestPriorityLevelAbove(...)` (`tcpiiu.cpp:677-682`), so the sender sits
+/// *above* the receiver and can always drain a queue the receiver's work is
+/// filling. A caller whose upstream uses one band for both (pvxs, one reactor
+/// thread) passes the same value twice, which states that sameness rather than
+/// having the API assume it.
 pub fn drive_socket_blocking(
     stream: TcpStream,
     spec_prefix: &str,
     label: &str,
-    priority: ThreadPriority,
+    reader_priority: ThreadPriority,
+    writer_priority: ThreadPriority,
     config: &PumpConfig,
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
@@ -718,12 +799,12 @@ pub fn drive_socket_blocking(
     let reader_spec = PumpSpec {
         thread_name: format!("{spec_prefix}-reader {label}"),
         label: label.to_string(),
-        priority,
+        priority: reader_priority,
     };
     let writer_spec = PumpSpec {
         thread_name: format!("{spec_prefix}-writer {label}"),
         label: label.to_string(),
-        priority,
+        priority: writer_priority,
     };
 
     // The reader guard is bound first, so a writer-spawn failure below unwinds
@@ -1221,6 +1302,7 @@ mod tests {
             client,
             "TEST",
             "127.0.0.1:0",
+            ThreadPriority::Low,
             ThreadPriority::Low,
             &PumpConfig {
                 read_timeout: Duration::from_secs(5),

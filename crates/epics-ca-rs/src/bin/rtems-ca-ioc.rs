@@ -3,7 +3,7 @@
 //! A runnable `main` that brings up a complete CA IOC on the **RTEMS execution
 //! model** and nothing else: no tokio runtime is ever created, no async
 //! front-end is touched, and every long-lived loop owns a dedicated OS thread.
-//! Three facilities, started in the order C `iocInit` starts its equivalents:
+//! Four facilities, started in the order C `iocInit` starts its equivalents:
 //!
 //! 1. **Background executor** — `runtime::task::background_init()` (C
 //!    `callbackInit`, `callback.c:286`): the callback pool
@@ -19,7 +19,14 @@
 //!    plain thread with no runtime entered that selects `park_on`: the thread
 //!    polls the build future and parks between polls. `build()` awaits only
 //!    runtime-agnostic in-process locks, so nothing here needs a reactor.
-//! 3. **CA front-end** — [`epics_ca_rs::server::blocking::BlockingCaServer`]: the TCP accept loop (C
+//! 3. **`ca://` record links** —
+//!    [`install_calink_resolver`](epics_ca_rs::calink::install_calink_resolver)
+//!    mounts the CA external record-link resolver on the database (C
+//!    `dbCaLinkInit`, `dbCa.c:1071`), so a ` CA`-modified or `ca://...`
+//!    INP/OUT field resolves through a live `CaClient`. The client dials
+//!    `EPICS_CA_NAME_SERVERS` over TCP; the UDP SEARCH transport is compiled
+//!    out on this target.
+//! 4. **CA front-end** — [`epics_ca_rs::server::blocking::BlockingCaServer`]: the TCP accept loop (C
 //!    `CAS-TCP`, `caservertask.c:62`) and the UDP name-search responder (C
 //!    `CAS-UDP`, `cast_server.c:113`), each on its own `std::thread`, with one
 //!    blocking thread per accepted client (C `camsgtask`).
@@ -74,6 +81,7 @@ mod ioc {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
+    use epics_ca_rs::calink::install_calink_resolver;
     use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
 
     /// The built-in database loaded when no `.db` file is given on the command
@@ -171,6 +179,61 @@ mod ioc {
                 return ExitCode::FAILURE;
             }
         };
+
+        // (2b) The calink resolver: install the `ca://` record-link resolver on
+        //      the database so ` CA`-modified / `ca://...` INP/OUT fields
+        //      resolve. C reaches the same state through `dbCaLinkInit`
+        //      (`dbCa.c:1071`) during iocInit, after the database exists.
+        //      Installed here — after the database, before the CA front-end —
+        //      so every record's link fields route through it before the
+        //      server answers its first client.
+        //
+        //      On this target the CA client reaches upstream servers over TCP
+        //      name servers alone (`EPICS_CA_NAME_SERVERS`): the UDP SEARCH
+        //      transport is compiled out (design §6 stage C5,
+        //      `search::SearchTransport::NameServersOnly`), and every task the
+        //      resolver spawns lands on the callback pool `background_init`
+        //      started above via `runtime::task::spawn`, never a tokio runtime.
+        let resolver = block_on_sync(install_calink_resolver(&db))
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+
+        // (2c) iocInit's link phases, in `IocApplication::run`'s order
+        //      (`ioc_app.rs:913-925`) and for its reasons. Without them the
+        //      resolver above is mounted and unreachable:
+        //
+        //      * `initialize_link_locality` commits C `dbInitLink`'s locality
+        //        decision (`dbLink.c:117-129` falling through
+        //        `dbDbInitLink`'s `S_db_notFound`, `dbDbLink.c:94-96`) — a
+        //        `Db` link naming a record this IOC does not have becomes a
+        //        `Ca` link. `INP=UPSTREAM:AI CP`, the bare ` CA`-modifier
+        //        spelling C calls `pvlOptCA`, is a `Db` link until this runs,
+        //        so without it that whole spelling reads nothing forever.
+        //      * `setup_cp_links` warms external CP/CPP links. A Passive
+        //        holder of one is never scanned, so its link never opens
+        //        lazily and its monitor is never created — a chicken-and-egg
+        //        a lazy open cannot break.
+        //      * `setup_external_link_opens` stages the rest, as C's
+        //        `dbInitLink` hands every non-local `PV_LINK` to
+        //        `dbCaAddLink` regardless of direction. Without it every
+        //        other external link pays one cold scan cycle to stage its
+        //        own open.
+        //
+        //      AFTER the mount above, not before: the warm path
+        //      (`resolve_external_pv`) routes through the registered link
+        //      set's lazy open and is a documented no-op when no lset is
+        //      installed, so running these first would silently warm nothing.
+        //
+        //      `rtems-pva-ioc` needs no equivalent: `install_pvalink_resolver`
+        //      walks the whole database itself and pre-registers every
+        //      `pva://` link. `install_calink_resolver` registers the link set
+        //      and scans nothing — C's `dbCaLinkInit` does not scan either —
+        //      because for CA the scan IS these three iocInit passes.
+        block_on_sync(async {
+            db.initialize_link_locality().await;
+            db.setup_cp_links().await;
+            db.setup_external_link_opens().await;
+        })
+        .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:491-499). No ACF is
@@ -280,6 +343,31 @@ mod ioc {
             "rtems-ca-ioc: serving {} records on CA port {port} (TCP + UDP search), \
              RTEMS execution model, no tokio runtime",
             names.len()
+        );
+        // The calink resolver is mounted, so ` CA`-modified and `ca://...`
+        // INP/OUT links resolve. Reported at every boot — including
+        // `link_count == 0`, when the loaded database configured none —
+        // because on a target with no shell the console is the only place an
+        // operator can confirm the resolver came up and how many links it
+        // registered. The client reaches upstream servers over
+        // `EPICS_CA_NAME_SERVERS` (TCP); the UDP SEARCH transport is compiled
+        // out on this target, so a link to a server reachable only by
+        // broadcast will not resolve, and `EPICS_CA_ADDR_LIST` is not even
+        // parsed here.
+        //
+        // Read here rather than at install time: `install_calink_resolver`
+        // registers the link set and nothing else — C's `dbCaLinkInit`
+        // likewise creates no channel — so a count taken at the mount reports
+        // the resolver's own health, not the database's links. Taken at the
+        // last moment before the banner, it is the registry as the first
+        // client will find it.
+        let link_count = resolver.link_count();
+        println!(
+            "rtems-ca-ioc: calink resolver installed — {link_count} ca:// record \
+             link{} registered; ` CA`-modified and ca://... INP/OUT resolve over \
+             EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
+             on this target)",
+            if link_count == 1 { "" } else { "s" },
         );
         for name in &names {
             println!("rtems-ca-ioc: {name}");
@@ -398,6 +486,89 @@ mod tests {
             "this entry point does not hold the status-PV handle, and must not \
              start pretending it needs to"
         );
+    }
+
+    /// The calink resolver is mounted, and the banner reports it.
+    ///
+    /// The CA counterpart of `rtems-pva-ioc`'s
+    /// `the_pvalink_resolver_is_mounted_and_the_banner_reports_it`, and it
+    /// exists for the same reason: a regression that dropped the
+    /// `install_calink_resolver` call would leave an IOC that still boots,
+    /// still serves every record and still answers searches — and silently
+    /// resolves no ` CA`-modified or `ca://...` INP/OUT link at all, with no
+    /// shell on the target to notice. The banner line is the only place an
+    /// operator can confirm from the console that the resolver came up and how
+    /// many links it registered, so it is checked too.
+    #[test]
+    fn the_calink_resolver_is_mounted_and_the_banner_reports_it() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // `concat!` so these assertions cannot match their own source text.
+        assert!(
+            prod.contains(concat!("install_calink_", "resolver(&db)")),
+            "the calink resolver is no longer installed; ` CA`-modified and \
+             ca://... record links would silently never resolve, and there is no \
+             shell on the target to say so"
+        );
+        assert!(
+            prod.contains("calink resolver installed"),
+            "the boot banner no longer reports the calink resolver; on a target with \
+             no shell the console is the only place an operator can confirm it came up"
+        );
+        assert!(
+            prod.contains("link_count"),
+            "the banner no longer reports the registered link count, the one number \
+             that tells an operator whether the database's ca:// links were seen"
+        );
+    }
+
+    /// The mount is not enough on its own: iocInit's three link phases are
+    /// what route the database's links through it.
+    ///
+    /// This binary does not go through `IocApplication::run`, which is the
+    /// only other place these are called, so dropping them here drops them
+    /// entirely — and the failure is silent in exactly the way the target
+    /// cannot survive. Without `initialize_link_locality` the bare
+    /// ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local `Db` link
+    /// to a record that does not exist; without `setup_cp_links` a Passive
+    /// holder of an external CP link never opens it; without
+    /// `setup_external_link_opens` every other external link waits for a cold
+    /// scan. The IOC boots and serves in all three cases.
+    #[test]
+    fn iocinit_link_phases_run_after_the_mount() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // `concat!` so these assertions cannot match their own source text.
+        let mount = concat!("install_calink_", "resolver(&db)");
+        let phases = [
+            concat!("initialize_link_", "locality()"),
+            concat!("setup_cp_", "links()"),
+            concat!("setup_external_link_", "opens()"),
+        ];
+        let mount_at = prod
+            .find(mount)
+            .expect("the mount guard above covers this; if it passed, this cannot fail");
+        for phase in phases {
+            let at = prod.find(phase).unwrap_or_else(|| {
+                panic!(
+                    "this entry point no longer calls `{phase}`; it is not reached by \
+                     `IocApplication::run` either, so the database's ca:// links would \
+                     never be routed through the mounted resolver and the IOC would boot \
+                     and serve with every external link dead"
+                )
+            });
+            assert!(
+                at > mount_at,
+                "`{phase}` must run AFTER the resolver mount: the warm path routes \
+                 through the registered link set and is a no-op with none installed"
+            );
+        }
     }
 
     /// A panic on a per-connection thread kills that thread and leaves the IOC

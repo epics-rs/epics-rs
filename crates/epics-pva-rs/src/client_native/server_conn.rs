@@ -225,6 +225,12 @@ pub(crate) type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// pipeline — so it takes the same number rather than a new one: splitting how
 /// work is scheduled *internally* must not change how it is scheduled relative
 /// to everything else.
+///
+/// Passed to `drive_socket_blocking` for **both** pumps. That primitive takes a
+/// reader and a writer band separately because libca derives two for a CA
+/// circuit (`tcpiiu.cpp:677-682`); pvxs derives one, and passing it twice is
+/// how this side states that its two pumps are one band by intent rather than
+/// by an API that could not express the difference.
 const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
     epics_base_rs::runtime::task::ThreadPriority::Custom(18);
 
@@ -273,6 +279,7 @@ fn dial_blocking(
         stream,
         "PVAC",
         &target.to_string(),
+        PVA_CLIENT_PRIORITY,
         PVA_CLIENT_PRIORITY,
         &PumpConfig {
             send_timeout: write_deadline,

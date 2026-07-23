@@ -121,6 +121,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::accept::AcceptBackoff;
+use epics_base_rs::runtime::blocking_io;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
@@ -613,64 +614,6 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     UdpSocket::bind(addr)
 }
 
-/// The `FIONREAD` ioctl request — bytes pending in the socket receive queue.
-/// C `rsrv`'s batch-up gate: hold accumulated replies while this is `> 0`,
-/// flush at `0` (`camsgtask.c:55`, `cast_server.c:272`).
-///
-/// The `libc` crate exposes `FIONREAD` for hosted Unix but omits it for
-/// `armv7-rtems-eabihf`, so the RTEMS value is supplied here. RTEMS newlib
-/// defines it in `sys/rtems/include/sys/filio.h` as `_IOR('f', 127, int)`;
-/// `sys/ioccom.h` in the same tree encodes
-/// `_IOR(g,n,t) = IOC_OUT | (sizeof(t) << 16) | (g << 8) | n` with
-/// `IOC_OUT = 0x40000000`. For a 4-byte `int` that is
-/// `0x40000000 | (4 << 16) | ('f' << 8) | 127 = 0x4004_667F` — the same value
-/// the `libc` crate hardcodes for the whole BSD family (`unix/bsd/mod.rs`),
-/// which C `rsrv` runs on RTEMS in production. Pending on-target runtime
-/// verification at the QEMU/BSP phase; a wrong value only makes the `ioctl`
-/// error, and every caller then flushes (C's own `status < 0` branch),
-/// degrading to per-datagram / per-iteration flushing — never a hang or a
-/// crash. (Candidate for an upstream `libc` newlib/rtems binding so this
-/// local definition can later be dropped.)
-#[cfg(all(unix, not(target_os = "rtems")))]
-const FIONREAD_REQUEST: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
-#[cfg(target_os = "rtems")]
-const FIONREAD_REQUEST: libc::c_ulong = 0x4004_667F;
-
-/// Bytes pending in the socket receive queue via `FIONREAD` — C `rsrv`'s
-/// batch-up gate. Callers hold accumulated replies while this is `> 0` and
-/// flush at `0` (`camsgtask.c:52-67`, `cast_server.c:268-281`). On any
-/// `ioctl` error this returns `Err`, and every caller treats that as
-/// "flush now" — matching C's `status < 0` branch — so an absent or wrong
-/// FIONREAD never coalesces (byte-correct, just unbatched) and never hangs.
-#[cfg(unix)]
-fn pending_bytes<F: std::os::fd::AsRawFd>(sock: &F) -> std::io::Result<usize> {
-    let mut n: libc::c_int = 0;
-    // SAFETY: `as_raw_fd()` is a valid open socket fd; FIONREAD writes one
-    // `c_int` count through the out-pointer, whose type and size match.
-    let rc = unsafe {
-        libc::ioctl(
-            sock.as_raw_fd(),
-            FIONREAD_REQUEST as _,
-            &mut n as *mut libc::c_int,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(n.max(0) as usize)
-}
-
-#[cfg(not(unix))]
-fn pending_bytes<F>(_sock: &F) -> std::io::Result<usize> {
-    // No FIONREAD off Unix (RTEMS and the host CI are both Unix-family). Report
-    // "unavailable" so callers flush every iteration — never coalesce — which
-    // is byte-correct, just unbatched.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "FIONREAD unavailable on this platform",
-    ))
-}
-
 /// Send one already-shaped SEARCH-reply datagram to `dst` over the blocking
 /// socket. A send failure is logged, never fatal — C `cast_server` keeps
 /// serving after a send error (`caserverio.c:214-222`).
@@ -794,7 +737,7 @@ fn handle_udp_search_blocking(
         // FIONREAD batch-up gate (C `cast_server.c:268-281`): flush the held
         // batch only when the recv queue is drained (or FIONREAD errors);
         // otherwise hold so the next same-source datagram coalesces into it.
-        match pending_bytes(&socket) {
+        match blocking_io::pending_bytes(&socket) {
             Ok(0) | Err(_) => flush_held_batch(&socket, &mut batch, &mut batch_addr),
             Ok(_) => { /* more datagrams pending: hold to coalesce */ }
         }
@@ -1005,7 +948,7 @@ fn handle_client_blocking(
             // bottom is gone — a single request/response still flushes here on the
             // next iteration (the client is then idle, so FIONREAD == 0), while a
             // pipelined burst coalesces into one write.
-            match pending_bytes(reader) {
+            match blocking_io::pending_bytes(reader) {
                 Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
                     Ok(()) => {}
                     Err(ref e) if is_peer_disconnect(e.kind()) => break,

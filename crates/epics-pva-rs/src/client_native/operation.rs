@@ -17,7 +17,7 @@
 //! The handle is constructed from any future that returns
 //! `PvaResult<T>`.
 
-// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,16 +68,27 @@ pub struct PvaOperation<T: Send + 'static> {
     /// One-shot cancellation flag. When set, `wait*` short-circuits
     /// returning the abort error and the spawned task is aborted.
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Set exactly once, by [`ResultPublisher::publish`] inside the task, at
+    /// the instant the operation produces its result — the **same event the
+    /// caller observes** when `wait()` hands that result back. This, not the
+    /// termination guard, is what "the operation completed" means; see
+    /// [`Self::reached_terminal_state`].
+    completed: Arc<std::sync::atomic::AtomicBool>,
     /// Receiver whose paired `watch::Sender` lives **inside** the spawned
     /// task. The sender is the operation's RAII termination guard: when
     /// the task's future stops running for any reason (normal completion,
     /// `abort()`, or panic-unwind) the sender drops and this receiver
-    /// observes the channel as closed. It is the single source of truth
-    /// for "the operation is no longer running"; [`Self::cancel`] awaits
-    /// closure to provide pvxs's "blocks until the in-progress callback
-    /// has completed" guarantee. `watch` is lost-wakeup-safe: a closure
-    /// that races registration is reported by the next `changed()`/
-    /// `has_changed()` rather than missed.
+    /// observes the channel as closed.
+    ///
+    /// Its **one** job is to be the synchronization point [`Self::cancel`]
+    /// awaits, giving pvxs's "blocks until the in-progress callback has
+    /// completed" guarantee — plus, as a corollary, evidence that a task
+    /// which ended *without* a result (abort, panic-unwind) is over. It is
+    /// deliberately NOT the answer to "did this operation complete": the
+    /// result is published strictly before this channel closes, so a closed
+    /// channel lags completion. `watch` is lost-wakeup-safe: a closure that
+    /// races registration is reported by the next `changed()`/`has_changed()`
+    /// rather than missed.
     terminated_rx: watch::Receiver<()>,
 }
 
@@ -114,10 +125,40 @@ struct Terminating {
     /// Dropped **first**. Boxed so this struct is `Unpin` and [`Future::poll`]
     /// needs no unsafe pin projection.
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    /// Dropped **last**, closing the watch channel that [`PvaOperation::cancel`]
-    /// awaits and [`PvaOperation::is_done`] reads. Never read directly — its
-    /// `Drop` is the entire point, so it must stay the final field.
+    /// Dropped **last**, closing the watch channel [`PvaOperation::cancel`]
+    /// awaits as its synchronization point. Never read directly — its `Drop`
+    /// is the entire point, so it must stay the final field. Note this
+    /// instant is strictly *later* than the result publish inside `fut`, so
+    /// it is not what "the operation completed" means; see
+    /// [`PvaOperation::reached_terminal_state`].
     _guard: watch::Sender<()>,
+}
+
+/// The one and only way the spawned task publishes its result.
+///
+/// Publishing the result and recording "this operation completed" have to be
+/// a single, inseparable act, or the two drift apart and callers disagree
+/// about whether the operation finished. [`Self::publish`] consumes `self`,
+/// so the `oneshot::Sender` cannot be reached without also setting the flag —
+/// the illegal state "result delivered but not marked completed" is not
+/// constructible rather than merely avoided by review.
+///
+/// The flag is stored *before* the value is handed over, which fixes the
+/// direction that matters: any observer that can see the result can also see
+/// the completion. The converse gap is unobservable — [`PvaOperation::wait`]
+/// takes `&mut self` while [`PvaOperation::cancel`] takes `&self`, so no two
+/// callers can inspect one handle concurrently.
+struct ResultPublisher<T> {
+    tx: oneshot::Sender<PvaResult<T>>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<T> ResultPublisher<T> {
+    fn publish(self, v: PvaResult<T>) {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.tx.send(v);
+    }
 }
 
 impl std::future::Future for Terminating {
@@ -152,13 +193,19 @@ impl<T: Send + 'static> PvaOperation<T> {
         // because only a struct gives the two a drop order that holds whether
         // or not the task was ever polled — see `Terminating`'s docs.
         let (term_tx, terminated_rx) = watch::channel(());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher = ResultPublisher {
+            tx,
+            completed: completed.clone(),
+        };
         let join = epics_base_rs::runtime::task::spawn(Terminating {
-            // The result send stays *inside* the guarded future, so a normal
-            // completion still publishes the result strictly before the
-            // channel closes — unchanged from the previous shape.
+            // The result publish stays *inside* the guarded future, so a
+            // normal completion still publishes strictly before the channel
+            // closes — the ordering the `Terminating` fix established, and
+            // exactly why completion cannot be inferred from the guard.
             fut: Box::pin(async move {
                 let v = fut.await;
-                let _ = tx.send(v);
+                publisher.publish(v);
             }),
             _guard: term_tx,
         });
@@ -168,8 +215,31 @@ impl<T: Send + 'static> PvaOperation<T> {
             done: false,
             interrupt: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completed,
             terminated_rx,
         }
+    }
+
+    /// **The single owner of "has this operation finished".**
+    ///
+    /// Every caller-visible terminal question — [`Self::cancel`]'s activeness
+    /// answer and [`Self::is_done`] — routes through here, so no site invents
+    /// its own rule. An operation is terminal when either
+    ///
+    /// - it **produced a result** (`completed`, set inseparably with the
+    ///   publish by [`ResultPublisher::publish`]) — the same event `wait()`
+    ///   reports to the caller; or
+    /// - its **task is torn down without one** (the termination guard closed),
+    ///   which is how an abort or a panic-unwind ends the operation.
+    ///
+    /// The guard alone is NOT this question, and using it as one was the
+    /// defect: the result publishes strictly *before* the guard drops, so
+    /// between those two instants an operation that every caller can already
+    /// see as finished still had an open channel. Monotonic — neither
+    /// disjunct ever goes back to false.
+    fn reached_terminal_state(&self) -> bool {
+        self.completed.load(std::sync::atomic::Ordering::Acquire)
+            || self.terminated_rx.has_changed().is_err()
     }
 
     /// Block until the operation completes (matching pvxs
@@ -257,14 +327,17 @@ impl<T: Send + 'static> PvaOperation<T> {
     ///   cancelled")` via the cancellation flag.
     pub async fn cancel(&self) -> bool {
         // `swap` makes the "was active" decision exactly once across
-        // repeated cancels: only the first cancel that finds the flag
-        // clear AND the task still running (channel still open) reports
-        // active. `has_changed()` returns `Err` once the task's sender has
-        // dropped — i.e. the operation already terminated.
+        // repeated cancels: only the first cancel that finds the flag clear
+        // AND the operation not yet terminal reports active.
+        //
+        // Terminality comes from `reached_terminal_state`, never from the
+        // guard directly: the guard closes strictly *after* the result is
+        // published, so reading it here used to report "still active" for an
+        // operation whose result `wait()` had already returned.
         let already_cancelled = self
             .cancelled
             .swap(true, std::sync::atomic::Ordering::AcqRel);
-        let was_active = !already_cancelled && self.terminated_rx.has_changed().is_ok();
+        let was_active = !already_cancelled && !self.reached_terminal_state();
         self.join.abort();
         // Synchronization point: wait until the task's `watch::Sender` has
         // dropped (channel closed), so cancel() returning means the
@@ -282,20 +355,25 @@ impl<T: Send + 'static> PvaOperation<T> {
         self.interrupt.notify_waiters();
     }
 
-    /// True iff the spawned task has finished.
+    /// True iff the operation has reached a terminal state — it produced a
+    /// result, or its task was torn down without one (abort, panic-unwind).
+    ///
+    /// This is deliberately the **same question** [`Self::cancel`] negates to
+    /// answer "was it still active", and it is answered in the one place both
+    /// share, [`Self::reached_terminal_state`]. So `is_done()` is true exactly
+    /// when a `cancel()` would report not-active, and after `wait()` returns a
+    /// value it is true immediately — the result *is* the terminal event.
+    ///
+    /// It is **not** "the spawned task's future has been dropped". That is a
+    /// strictly later instant (the result publishes before the termination
+    /// guard closes), it is `cancel()`'s synchronization point rather than a
+    /// caller-visible state, and reading it here would make `is_done()`
+    /// briefly false for an operation whose result the caller already holds.
+    /// `join.is_finished()` is rejected for the older reason, unchanged:
+    /// under the exec-model seam the join handle's finished flag flips at yet
+    /// another instant, so it agrees with neither.
     pub fn is_done(&self) -> bool {
-        // Same source of truth as [`Self::cancel`]'s synchronization point:
-        // the operation's RAII termination guard (`terminated_rx`). Its
-        // `watch::Sender` lives inside the spawned task and drops exactly when
-        // the future stops running (completion, abort, or unwind), so a closed
-        // channel is the operation's own definition of "no longer running"
-        // (see the `terminated_rx` field doc). `join.is_finished()` is a
-        // second, weaker signal: under the exec-model seam the task's
-        // finished flag flips at a *different* instant than the guard drop, so
-        // `cancel()` — which awaits the guard — could return while
-        // `is_finished()` still read `false`. Reading the guard here keeps the
-        // two in lockstep by construction rather than by timing.
-        self.terminated_rx.has_changed().is_err()
+        self.reached_terminal_state()
     }
 }
 
@@ -425,6 +503,73 @@ mod tests {
         );
         // Idempotent: a second cancel is also not-active.
         assert!(!op.cancel().await, "repeated cancel must be idempotent");
+    }
+
+    /// A published result is terminal **immediately**, without waiting for
+    /// the termination guard to close — asserted deterministically in the
+    /// exact window that used to be decided the other way.
+    ///
+    /// The result is published strictly before the guard drops (the ordering
+    /// `Terminating` preserves on purpose), so between those two instants an
+    /// operation is finished from every caller-visible angle while its
+    /// channel is still open. Deciding activeness from the guard there
+    /// reported "still active" for a completed operation, which is what made
+    /// `cancel_after_completion_reports_not_active` fail intermittently
+    /// feature-ON. The state is built by hand so the window is held open for
+    /// as long as the assertions need, rather than raced for.
+    #[tokio::test]
+    async fn a_published_result_is_terminal_while_the_guard_is_still_open() {
+        use std::sync::atomic::AtomicBool;
+
+        let (tx, result_rx) = oneshot::channel::<PvaResult<i32>>();
+        let (term_tx, terminated_rx) = watch::channel(());
+        let completed = Arc::new(AtomicBool::new(false));
+        let publisher = ResultPublisher {
+            tx,
+            completed: completed.clone(),
+        };
+        let op = PvaOperation::<i32> {
+            join: epics_base_rs::runtime::task::spawn(std::future::pending::<()>()),
+            result_rx,
+            done: false,
+            interrupt: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completed,
+            terminated_rx,
+        };
+
+        // Nothing has happened yet: neither terminal event.
+        assert!(!op.is_done(), "an un-finished operation is not terminal");
+
+        // The operation produces its result. `term_tx` is still held here —
+        // this IS the window between publish and task teardown.
+        publisher.publish(Ok(11));
+        assert!(
+            op.terminated_rx.has_changed().is_ok(),
+            "the termination guard must still be open — that is the window under test"
+        );
+        assert!(
+            op.is_done(),
+            "a published result is terminal even though the guard is still open"
+        );
+
+        // `cancel()` decides activeness before it parks on the guard, so poll
+        // it once while the guard is still held: the answer it computed in
+        // the window is the one it must return.
+        let mut cancel = Box::pin(op.cancel());
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            cancel.as_mut().poll(&mut cx).is_pending(),
+            "cancel() parks on the still-open termination guard"
+        );
+        // Release the guard so the synchronization point can complete.
+        drop(term_tx);
+        assert!(
+            !cancel.await,
+            "cancel of an operation that already published its result must \
+             report not-active, even though the guard was open when it was called"
+        );
     }
 
     /// cancel() is a synchronization point: a resource held by the

@@ -1726,7 +1726,8 @@ that runs it.
 * The `pva-gateway` `MonitorStream` break (72 errors) is untouched —
   pre-existing, and out of this stage's scope by construction: it is not
   in the RTEMS closure and not reachable from any configuration this
-  stage's gates build.
+  stage's gates build. — **retired: fixed at `8810cb8a`, and the owed
+  combo run + marker promotion is discharged in §9.17.**
 * Nothing was re-measured on the target. Stage 4 changes no production
   code path — the only production-side edit is a widened `cfg` predicate
   on an entry point whose RTEMS arm is byte-identical — so §9.11's
@@ -2133,3 +2134,48 @@ ownership is hoisted into the IOC core:
   published by `mark_pini_done`) — C's `initialProcess` runs once,
   inside `iocBuild`. Redundant owners stay harmless:
   `try_claim_scan_start` parks every scheduler after the first.
+
+### 9.17 The `pva-gateway` break is closed, and §9.13's owed run is discharged
+
+Two corrections to the §9.9/§9.13 record, then the closure.
+
+**The 72-error compile break no longer exists** — it was fixed at
+`8810cb8a` (the calink-c6 merge), which moved the gateway's
+`ChannelSource` implementations onto `MonitorStream` exactly as §9.9
+diagnosed (a missing import / un-migrated widening, not a missing gate).
+`cargo check -p epics-bridge-rs --all-targets --features pva-gateway` is
+clean, with and without `rtems-exec-model` — so the §9.13 "Not done
+here" bullet is retired, and the break was never an *interaction* with
+`rtems-exec-model` at all (§9.13 already measured the 72 errors as
+feature-independent).
+
+**§9.13's debt clause is now discharged, in two parts.** The owed run —
+`--features rtems-exec-model,pva-gateway` — did NOT pass as found:
+803 tests ran, 20 failed, all 20 in `tests/pva_gateway.rs` and all with
+one root cause. The gateway's production code reached the tokio runtime
+directly — `tokio::spawn` (`channel_cache.rs` cleanup + upstream-monitor
+tasks, `source.rs` forwarder tasks, `control.rs` diag poller,
+`middleware.rs` audit drainer) and `tokio::time::{interval,sleep,timeout}`
+— so the first gateway call that executed on an exec-backend `cbMedium`
+worker panicked "there is no reactor running"
+(`ChannelCache::with_max_entries`'s cleanup spawn), and every test that
+stood up a live gateway failed downstream of that panic. The fix is the
+same seam port the PVA client took (§5 stage 4 / `e76f6e3a`): every
+spawn/timer in `src/pva_gateway/` now rides
+`epics_base_rs::runtime::task::{spawn,interval,sleep,timeout}`, and the
+stored handles are the seam's `TaskHandle`/`TaskAbortHandle` aliases.
+`tokio::sync` primitives stay, per the seam's own contract. After the
+port the combination runs 803/803 green.
+
+**The seven census markers are promoted to `checked`** as §9.13
+required: all 93 reactor-dependent sites (68 in `src/pva_gateway/`, 25
+in `tests/pva_gateway.rs` — the file gained one since §9.13 counted 92)
+pass under `--features rtems-exec-model,pva-gateway`. The markers keep
+the second half of the old stable reason as a caveat: the default
+feature-ON gate (`-p epics-bridge-rs --features rtems-exec-model`) still
+does not *build* these files, so the census checks their counts but only
+the explicit combo runs them — whoever touches the gateway owes that
+combo run, and the marker text now says so. `scripts/rtems-check.sh` is
+untouched and stays exit 0: `pva-gateway` is not in the RTEMS closure
+(the target selection is `qsrv-core,pvalink`), and this change removes
+no cfg-gate the target build depends on.

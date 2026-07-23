@@ -8,7 +8,10 @@
 //! through a per-entry tokio broadcast channel so multiple downstream
 //! clients share one upstream subscription.
 
-// RTEMS-EXEC-MODEL-ALLOW(24): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(24): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -828,7 +831,7 @@ impl GatewayChannelSource {
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -943,7 +946,7 @@ impl GatewayChannelSource {
         let initial = entry.snapshot();
         let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             struct CounterGuard(Arc<AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -1018,7 +1021,7 @@ fn monitor_updates_to_values(
     mut rx: mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
 ) -> MonitorStream<PvField> {
     let (tx, out) = mpsc::channel(64);
-    tokio::spawn(async move {
+    epics_base_rs::runtime::task::spawn(async move {
         while let Some(update) = rx.recv().await {
             if update.type_changed {
                 continue;
@@ -1108,10 +1111,13 @@ impl ChannelSource for GatewayChannelSource {
         // (`p2pApp/channel.cpp:99-148`); `pvinfo` issues a one-shot
         // GET_FIELD that reuses the client's connection pool and no longer
         // waits on a first monitor event (see `has_pv`).
-        tokio::time::timeout(self.connect_timeout, self.cache.client().pvinfo(name))
-            .await
-            .ok()?
-            .ok()
+        epics_base_rs::runtime::task::timeout(
+            self.connect_timeout,
+            self.cache.client().pvinfo(name),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     /// a credentialed downstream CREATE_CHANNEL resolves existence by
@@ -1147,7 +1153,7 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
-        tokio::time::timeout(
+        epics_base_rs::runtime::task::timeout(
             self.connect_timeout,
             self.upstream_client_for(&ctx).pvinfo(name),
         )
@@ -1388,7 +1394,7 @@ impl ChannelSource for GatewayChannelSource {
         // No monitor-gated preflight (see `put_value`): the RPC forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
-        let result = tokio::time::timeout(
+        let result = epics_base_rs::runtime::task::timeout(
             self.rpc_timeout,
             self.cache
                 .client()
@@ -1463,7 +1469,7 @@ impl ChannelSource for GatewayChannelSource {
                 None => client.pvrpc(name, &request_desc, &request_value).await,
             }
         };
-        let result = tokio::time::timeout(self.rpc_timeout, call).await;
+        let result = epics_base_rs::runtime::task::timeout(self.rpc_timeout, call).await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
             Ok(Err(e)) => Err(upstream_op_error(e)),

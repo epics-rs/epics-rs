@@ -66,7 +66,10 @@
 //! # Ok(()) }
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not built feature-ON by default - this module is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
 
 use std::sync::Arc;
 use std::time::Duration;

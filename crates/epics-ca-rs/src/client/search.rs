@@ -1198,92 +1198,60 @@ async fn run_nameserver_connection(
                 };
                 accumulated.extend_from_slice(&buf[..n]);
                 // Forward only the prefix that contains complete CA
-                // messages. Without this framing, kernel splitting a
+                // messages. Without this framing, the kernel splitting a
                 // server response across read syscalls causes the
                 // dispatcher to miss leading frames (when the partial
-                // buffer is < 16 bytes) and misalign subsequent
-                // parses. Each CA message is 16-byte header +
-                // align8(postsize) — no extended-postsize support
-                // here because the dispatcher itself ignores it.
+                // buffer is < 16 bytes) and misalign subsequent parses.
+                //
+                // Where the message boundaries are is NOT decided here —
+                // `transport::next_frame` is the client's one framing step,
+                // shared with the upstream circuit's `read_loop`
+                // (`doc/calink-rtems-design.md` §6 C2: "one seam, two
+                // callers"). This loop only measures how long a prefix of
+                // whole messages it can hand on, which is all the
+                // name-service circuit needs: unlike a data circuit it
+                // carries no bodies of its own to size-limit or drain.
                 let mut consumed = 0usize;
-                // Distinguishes "wait for more bytes" (the legitimate
-                // `break`s out of the inner loop) from "the bytes we
-                // have are definitively malformed". Pre-fix every
-                // exit path used the same `break`, so a parse error
-                // or a misaligned `m_postsize` left the bad prefix
-                // sitting at the head of `accumulated`; the next
-                // socket read appended fresh bytes but the inner
-                // loop re-parsed the same bad prefix on every
+                // Distinguishes "wait for more bytes" from "the bytes we
+                // have are definitively malformed". Pre-fix every exit path
+                // used the same `break`, so a parse error or a misaligned
+                // `m_postsize` left the bad prefix sitting at the head of
+                // `accumulated`; the next socket read appended fresh bytes
+                // but the inner loop re-parsed the same bad prefix on every
                 // iteration, wedging the circuit. C client
-                // `tcpiiu.cpp::processIncoming:1197-1202` returns
-                // `false` on a misaligned payload — the surrounding
-                // tcpiiu shuts the connection. We mirror by exiting
-                // the outer read loop, which drops the read_task
-                // and lets the reconnect path rebuild.
-                let mut bad_frame = false;
+                // `tcpiiu.cpp::processIncoming:1197-1202` returns `false` on
+                // a misaligned payload — the surrounding tcpiiu shuts the
+                // connection. We mirror by exiting the outer read loop,
+                // which drops the read_task and lets the reconnect path
+                // rebuild.
+                let mut bad_frame = None;
                 loop {
-                    if accumulated.len() - consumed < CaHeader::SIZE {
-                        break;
-                    }
-                    // handle extended postsize (postsize=0xFFFF,
-                    // count=0 → 8 extra header bytes + true u32 size).
-                    // Pure 16-byte parse would consume 65,540 bytes for
-                    // a frame whose true size is 24 + payload.
-                    //
-                    // Pre-check how many header bytes the base
-                    // `m_postsize` demands so a transient "need 8 more
-                    // bytes for the annex" can be distinguished from a
-                    // definitive parse failure on a header whose bytes
-                    // are all present.
-                    let base_post =
-                        u16::from_be_bytes([accumulated[consumed + 2], accumulated[consumed + 3]]);
-                    let header_needed = if base_post == 0xFFFF { 24 } else { 16 };
-                    if accumulated.len() - consumed < header_needed {
-                        break;
-                    }
-                    let (hdr, hdr_size) =
-                        match CaHeader::from_bytes_extended(&accumulated[consumed..]) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                // 16/24 header bytes present yet
-                                // `from_bytes_extended` rejected them
-                                // ⇒ definitively malformed (e.g. the
-                                // declared payload exceeds
-                                // max_frame_body_bytes()). Close circuit
-                                // per C `tcpiiu.cpp:1197-1202`.
-                                bad_frame = true;
+                    match super::transport::next_frame(&accumulated[consumed..]) {
+                        super::transport::Frame::Incomplete => break,
+                        super::transport::Frame::Malformed(e) => {
+                            bad_frame = Some(e);
+                            break;
+                        }
+                        super::transport::Frame::Header {
+                            hdr_size, body_len, ..
+                        } => {
+                            let msg_size = hdr_size + body_len;
+                            if accumulated.len() - consumed < msg_size {
                                 break;
                             }
-                        };
-                    let actual_post = hdr.actual_postsize();
-                    // C `tcpiiu.cpp::processIncoming:1198` rejects
-                    // misaligned `m_postsize` by closing the
-                    // connection. Silently rounding up (the prior
-                    // `align8`) would let a hostile name server slide
-                    // our framer into the middle of the next message;
-                    // silently breaking out (the pre-fix behaviour)
-                    // wedged the circuit, since the bad prefix stayed
-                    // in `accumulated` and was re-parsed on every
-                    // subsequent read. Close circuit, let the
-                    // reconnect path rebuild.
-                    if actual_post & 0x7 != 0 {
-                        bad_frame = true;
-                        break;
+                            consumed += msg_size;
+                        }
                     }
-                    let msg_size = hdr_size + actual_post;
-                    if accumulated.len() - consumed < msg_size {
-                        break;
-                    }
-                    consumed += msg_size;
                 }
                 if consumed > 0 {
                     let frame_bytes = accumulated[..consumed].to_vec();
                     let _ = resp_tx.send((frame_bytes, addr));
                     accumulated.drain(..consumed);
                 }
-                if bad_frame {
+                if let Some(reason) = bad_frame {
                     tracing::warn!(
                         addr = ?addr,
+                        %reason,
                         "TCP nameserver framing error; closing circuit \
                          (C tcpiiu.cpp:1197-1202 parity)"
                     );
@@ -3098,6 +3066,133 @@ mod tests {
             }
             None => panic!("search-response channel closed before a reply arrived"),
         }
+    }
+
+    /// The name-service circuit reassembles a reply the kernel tore across
+    /// read syscalls — the property its reader's framing exists for, and the
+    /// one the fold onto `transport::next_frame` had to preserve.
+    ///
+    /// `stage_c1_name_servers_only_resolves_without_binding_udp` above proves
+    /// the circuit resolves, but it lets the mock name server write the reply
+    /// in one `write_all`, so it passes against a reader with **no framing at
+    /// all**: one read delivers the whole 24-byte message and the dispatcher
+    /// parses it. That is why the inline framing loop's rules had no
+    /// regression cover, and why fixing them twice (once per copy) was
+    /// possible.
+    ///
+    /// Here the mock writes byte by byte with a yield between each, so the
+    /// reader is guaranteed to observe every prefix length: 0..15 (short of a
+    /// header), 16..23 (header present, body still in flight), and finally the
+    /// whole message. A reader that forwarded on any of those prefixes hands
+    /// the dispatcher a truncated frame and the cid never resolves; a reader
+    /// that mis-measured the message length desyncs and never resolves the
+    /// *second* message, which is why two are sent.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nameserver_reply_torn_across_reads_still_resolves() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock name-server listener bind");
+        let ns_addr = ns_listener.local_addr().expect("mock name-server addr");
+
+        // Two cids, two distinct servers: the second only resolves if the
+        // reader measured the first message's length exactly right.
+        let first: (u32, SocketAddr) = (7001, "10.0.0.11:5064".parse().unwrap());
+        let second: (u32, SocketAddr) = (7002, "10.0.0.12:5064".parse().unwrap());
+        let pvs = ["TEST:CA:TORN:ONE", "TEST:CA:TORN:TWO"];
+
+        let ns_handle = tokio::spawn(async move {
+            let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            let mut buf = vec![0u8; 8192];
+            let mut seen: Vec<u8> = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                seen.extend_from_slice(&buf[..n]);
+                // Answer once both PV names have been searched for, so the
+                // two replies leave together and share the torn stream.
+                if !pvs
+                    .iter()
+                    .all(|pv| seen.windows(pv.len()).any(|w| w == pv.as_bytes()))
+                {
+                    continue;
+                }
+                let mut wire = search_reply(first.0, first.1);
+                wire.extend_from_slice(&search_reply(second.0, second.1));
+                for byte in wire {
+                    if stream.write_all(&[byte]).await.is_err() {
+                        return;
+                    }
+                    // Force the write out on its own so the client's reader
+                    // wakes on a one-byte read rather than a coalesced one.
+                    let _ = stream.flush().await;
+                    tokio::task::yield_now().await;
+                }
+                // Hold the connection open; closing here would let a reader
+                // that only reassembles on EOF pass.
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+        let engine = name_servers_only_search_engine(
+            vec![ns_addr],
+            req_rx,
+            resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
+        )
+        .expect("name-servers-only engine must build with a non-empty NS list");
+        let engine_handle = tokio::spawn(engine);
+
+        for ((cid, _), pv) in [first, second].iter().zip(pvs) {
+            req_tx
+                .send(SearchRequest::Schedule {
+                    cid: *cid,
+                    pv_name: pv.into(),
+                    reason: SearchReason::Initial,
+                })
+                .expect("schedule send");
+        }
+
+        let mut found: Vec<(u32, SocketAddr)> = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            while found.len() < 2 {
+                match resp_rx.recv().await {
+                    Some(SearchResponse::Found { cid, server_addr }) => {
+                        if !found.iter().any(|(c, _)| *c == cid) {
+                            found.push((cid, server_addr));
+                        }
+                    }
+                    Some(SearchResponse::MultiplyDefined { pv_name, .. }) => {
+                        panic!("{pv_name} resolved as MultiplyDefined; one reply each was sent")
+                    }
+                    None => panic!("search-response channel closed before both replies arrived"),
+                }
+            }
+        })
+        .await;
+
+        engine_handle.abort();
+        ns_handle.abort();
+
+        outcome.unwrap_or_else(|_| {
+            panic!(
+                "both cids must resolve from a byte-at-a-time reply stream; \
+                 resolved {found:?}"
+            )
+        });
+        found.sort_by_key(|(cid, _)| *cid);
+        assert_eq!(
+            found,
+            vec![first, second],
+            "each cid must resolve to the server its own message named"
+        );
     }
 
     /// Build a single-message CA_PROTO_SEARCH reply datagram naming

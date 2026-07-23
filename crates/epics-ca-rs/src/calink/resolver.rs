@@ -1157,4 +1157,88 @@ mod tests {
         assert_eq!(map_dbf_type(DbFieldType::Int64), LinkDbfType::Int64);
         assert_eq!(map_dbf_type(DbFieldType::UInt64), LinkDbfType::UInt64);
     }
+
+    /// Stage C3 guard, mirroring the PVA connection-scope guard
+    /// (`epics-pva-rs/src/server_native/tcp.rs`
+    /// `connection_scope_spawns_go_through_the_runtime_seam`): every task
+    /// the `calink` production surface spawns must go through
+    /// `runtime::task::spawn`, never a bare `tokio::spawn`, a
+    /// `tokio::runtime::Handle::spawn`, or a `tokio::runtime::Handle`
+    /// field pinned into a production type. A bare `tokio::spawn` panics
+    /// on a thread with no tokio runtime — which is exactly the
+    /// callback-band worker the RTEMS exec backend runs these tasks on —
+    /// and it panics at *runtime*, on the target, not here. So pin it as
+    /// source inspection over the whole calink module (`resolver.rs`,
+    /// `mod.rs`, `iocsh.rs`).
+    ///
+    /// Before Stage C3 the CA client passed this guard and calink did
+    /// not (design doc §5.1, §6 Stage C3); that asymmetry is what the
+    /// guard exists to close and keep closed.
+    ///
+    /// The needles are assembled with `concat!` so this test's own source
+    /// text cannot satisfy the check it performs.
+    #[test]
+    fn calink_production_spawns_go_through_the_runtime_seam() {
+        // Production scope of a calink file ends at its first column-0
+        // `#[cfg(test)]` (whole file when there is none — `mod.rs`).
+        fn prod(src: &str) -> &str {
+            match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            }
+        }
+
+        let resolver = prod(include_str!("resolver.rs"));
+        let module = prod(include_str!("mod.rs"));
+        let iocsh = prod(include_str!("iocsh.rs"));
+
+        // Fail closed: an earlier `#[cfg(test)]` helper must not shrink a
+        // slice past the code this guard is meant to cover.
+        assert!(
+            resolver.contains("pub async fn open"),
+            "resolver production slice no longer covers the link-open path"
+        );
+        assert!(
+            module.contains("calink_link_set_install"),
+            "mod production slice no longer covers the link-set installer"
+        );
+        assert!(
+            iocsh.contains("ca_caxr_command"),
+            "iocsh production slice no longer covers the caxr command"
+        );
+
+        // Positive: calink production actually spawns through the seam.
+        assert!(
+            resolver.contains(concat!("task", "::spawn(")),
+            "resolver production must spawn through `runtime::task::spawn`"
+        );
+
+        // Negative: none of the three forbidden spawn shapes appear in any
+        // calink production slice.
+        let bare_spawn = concat!("tokio", "::spawn(");
+        let handle_spawn = concat!("handle", ".spawn(");
+        let handle_type = concat!("tokio::runtime", "::Handle");
+        for (name, src) in [
+            ("resolver.rs", resolver),
+            ("mod.rs", module),
+            ("iocsh.rs", iocsh),
+        ] {
+            assert_eq!(
+                src.matches(bare_spawn).count(),
+                0,
+                "{name}: production must spawn through `runtime::task::spawn`; \
+                 found bare `{bare_spawn}`"
+            );
+            assert_eq!(
+                src.matches(handle_spawn).count(),
+                0,
+                "{name}: production must not call `{handle_spawn}` — spawn through the seam"
+            );
+            assert_eq!(
+                src.matches(handle_type).count(),
+                0,
+                "{name}: production must hold no `{handle_type}` field or call"
+            );
+        }
+    }
 }

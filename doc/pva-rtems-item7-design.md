@@ -99,11 +99,11 @@ ChannelInvalidator) -> PvaResult<()>`.
 
 | site | today | under a blocking driver |
 |---|---|---|
-| `:20` `use tokio::net::TcpListener` | reactor listener | `std::net::TcpListener`; CA `blocking.rs:139-148` holds it as a plain struct field |
+| `:20` `use tokio::net::TcpListener` | reactor listener | `std::net::TcpListener`; CA `blocking.rs:297-298` holds it as a plain struct field |
 | `:2487` `active = Arc<AtomicUsize>` | per-conn admission counter | unchanged — `Arc<AtomicUsize>` is target-neutral |
 | `:2489-2492` `tls_acceptor` | `tokio_rustls::TlsAcceptor::from(...)` | absent on RTEMS — §4 |
-| `:2501` `conn_tasks: JoinSet<()>` | reaps finished conn tasks via `join_next()` | **no analogue.** CA does not keep join handles at all: `blocking.rs:176-227` spawns a detached `thread::Builder::new().name(format!("CAS-client-blocking {peer}"))` per client and never joins it. The reap arm exists only to bound `JoinSet` growth; a detached thread self-reaps. |
-| `:2503-2512` `select!{ biased; listener.accept(), conn_tasks.join_next() }` | two-arm select | one blocking `for stream in listener.incoming()` (CA `blocking.rs:180`) |
+| `:2501` `conn_tasks: JoinSet<()>` | reaps finished conn tasks via `join_next()` | **no analogue.** CA keeps no join handle for a client: `blocking.rs:454-478` borrows the client's two threads from `CAS_CLIENT_POOL` and dispatches the body with `Worker::run_detached`, which nobody joins. The reap arm exists only to bound `JoinSet` growth, and the pool needs no reaping — a set returns itself when its lease drops and its jobs finish (`doc/rtems-connection-worker-pool-design.md` §7). *(Before that conversion CA spawned a detached `thread::Builder::new().name(format!("CAS-client-blocking {peer}"))` per client; the conclusion is unchanged, the mechanism is not.)* |
+| `:2503-2512` `select!{ biased; listener.accept(), conn_tasks.join_next() }` | two-arm select | one blocking `for stream in listener.incoming()` (CA `blocking.rs:420`) |
 | `:2523-2532` `active.fetch_add` / `max_connections` gate | admission | unchanged, moves above the thread spawn |
 | `:2533-2538` capture set | `src, cfg, active_dec, acceptor, peers_for_task, conn_invalidator` | identical `move` set into `thread::spawn`; every member is `Clone + Send + 'static` already (`DynSource` is `Arc`, `PvaServerConfig: Clone`, `PeerRegistry` is `Arc`, `ChannelInvalidator` is a channel handle). **No capture needs reshaping** — the closure body is the only thing that changes. |
 | `:2539` `conn_tasks.spawn(async move {...})` | task | `thread::Builder::new().name(format!("PVAS-client {peer}")).spawn(move || ...)` |

@@ -106,7 +106,15 @@ calls `process_record_with_links` (`scan.rs:166`), which takes L1
    | side | thread | EPICS band | reaches L1 via |
    |---|---|---|---|
    | **high** | `scan-1` | 63 (`scan.rs:48-50`) | `scan.rs:121` `block_on_sync` → `scan.rs:166` → `processing.rs:1295` |
-   | **low** | `CAS-client-blocking <peer>` | 20 (`ThreadPriority::CaServerLow`, `task.rs:430`) | `ca .../blocking.rs:1244` `block_on_sync(serve_write_head)` → `ca .../tcp.rs:3792` → `:4305`/`:4316` → `field_io.rs:1392` |
+   | **low** | `CAS-client <n>` | 20 (`ThreadPriority::CaServerLow`, `task.rs:430`) | `ca .../blocking.rs:1283` `block_on_sync(serve_write_head)` → `ca .../tcp.rs:3792` → `:4305`/`:4316` → `field_io.rs:1392` |
+
+   (`CAS-client <n>` is a **pooled worker**, not a thread created for one
+   client: the CA server borrows each client's two threads from
+   `CAS_CLIENT_POOL` and the name carries the worker's index, not the peer —
+   `epics-ca-rs/src/server/blocking.rs`, `doc/rtems-connection-worker-pool-design.md`
+   §9. The band is unchanged; it is now the `client` role's, applied once at
+   worker creation. Target measurements taken before that conversion name the
+   same thread `CAS-client-blocking <peer>`.)
 
    Both sit in `std::thread::park()` while waiting. Neither is visible to the
    kernel as waiting on an owned resource. This is no longer a hypothetical
@@ -538,7 +546,7 @@ L9.
 threads: `field_io.rs:493`, `:595`, `:790`, `:804`, `:826`, `:851`, `:877`,
 `:2182`; `mod.rs:801`, `:1473`, `:1565`, `:1645`, `:1739`, `:1853`.
 
-* *Who reads concurrently:* one `CAS-client-blocking <peer>` thread per CA TCP
+* *Who reads concurrently:* one `CAS-client <n>` pooled worker per live CA TCP
   connection, one `PVAS-conn` per PVA connection, the UDP search responders via
   `has_name_from` (`mod.rs:1645`), and the scan/callback bands through the put
   paths. On the RTEMS target that population is bounded in the **single digits**

@@ -38,3 +38,38 @@ jobs:
         cargo nextest run -p asyn-rs --features epics
         cargo nextest run -p ad-core-rs --features ioc
         cargo nextest run -p ad-plugins-rs --features ioc
+
+  # `rtems-exec-model` is a *different feature resolution*, not an extra file:
+  # it routes the `runtime::task` seam off the tokio reactor onto the std-thread
+  # background executor — the backend the RTEMS build actually runs. The `checks`
+  # job above builds only the default-feature workspace, so nothing there
+  # compiles, let alone exercises, that backend. Every exec-backend regression
+  # found so far (scan ownership, group drain starvation, gateway spawns) was
+  # caught by hand. This job is the standing gate.
+  #
+  # Its own job rather than a step in `checks`: the feature resolution differs,
+  # so the artifacts cannot be shared with the default build anyway, and a
+  # separate job reports the failure under its own name.
+  #
+  # These are the four crates that declare the feature. `epics-base-rs` forwards
+  # to `epics-ca-rs` (see crates/epics-base-rs/Cargo.toml) and `epics-bridge-rs`
+  # forwards to all three, because Cargo unifies features per package and a
+  # partial forward builds the split state the `HAS_TOKIO_REACTOR` const guard
+  # exists to refuse.
+  rtems-exec-model:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - name: epics-base-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-base-rs --features rtems-exec-model
+    - name: epics-ca-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-ca-rs --features rtems-exec-model
+    - name: epics-pva-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-pva-rs --features rtems-exec-model
+    - name: epics-bridge-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-bridge-rs --features rtems-exec-model

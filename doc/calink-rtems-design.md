@@ -1049,7 +1049,7 @@ nothing forever.
 that `select!` is already fragile. Expect the arm-shape change to surface real
 type errors the cascade was hiding. That is the point.
 
-### Stage C2 — the blocking byte source, in `epics-base-rs` (medium; **shared with the PVA track**)
+### Stage C2 — the blocking byte source, in `epics-base-rs` (medium; **shared with the PVA track**) — **DONE, inside C5** (see §10)
 
 Add to `epics-base-rs` a blocking-socket → `AsyncRead`/`AsyncWrite` adapter
 pair plus the two facts that must not be re-derived: `Arc<TcpStream>` with
@@ -1164,7 +1164,7 @@ measurement shows a real problem do the two closures (enqueue restructure vs
 C-style dedicated thread) come back for a second sign-off, with numbers. Until
 then no code change alters `run_monitor`'s inline `dispatch_external_cp_targets`.
 
-### Stage C5 — mount calink in `rtems-ca-ioc` (small)
+### Stage C5 — mount calink in `rtems-ca-ioc` (small) — **DONE** (see §10)
 
 Select the target client feature (stage C2's `client-core`) for
 `epics-ca-rs` in `scripts/rtems-check.sh`'s `CRATE_FEATURES`, un-gate `calink`
@@ -1200,7 +1200,7 @@ substitutions are:
 |---|---|
 | upstream `softIocPVX` on the host | upstream `softIoc` (C base) on the host, serving one `ai` and one `ao` |
 | `EPICS_PVA_NAME_SERVERS=10.0.2.2:5075` | `EPICS_CA_NAME_SERVERS=10.0.2.2:5064` **plus** `EPICS_CA_ADDR_LIST=` and `EPICS_CA_AUTO_ADDR_LIST=NO` (§4.5) |
-| `INP=@pva://UPSTREAM:AI CP` | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=@ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
+| `INP=pva://UPSTREAM:AI CP` (spelled `@pva://` in that doc — see §10.7) | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
 | `pvxget` / `pvxput` from the host | `caget` / `caput` from the host |
 | forwarded `tcp::5075-:5075` | forwarded `tcp::5064-:5064` |
 
@@ -1216,7 +1216,7 @@ target has no iocsh:*
 4. Kill the upstream: guest record goes `LINK`/`INVALID`. Restart it: the
    record recovers **without** rebooting the guest — proving reconnect
    survives the 1 s clock quantum (§5.5).
-5. An OUT link (`OUT=@ca://UPSTREAM:AO`) writes and is observed upstream —
+5. An OUT link (`OUT=ca://UPSTREAM:AO`) writes and is observed upstream —
    and both `LinkPutOp::Plain` (`put_nowait`) and `LinkPutOp::Async` (`put`)
    are exercised, because `resolver.rs:810-811` routes them to different wire
    operations and only the C-parity split makes that distinction meaningful.
@@ -1545,3 +1545,238 @@ extra plain test; the census floor is untouched.
 Stage C4's `dispatch_external_cp_targets` CP fan-out semantics are
 deliberately untouched — that change awaits sign-off (§6 Stage C4); C3 is
 spawn plumbing only.
+
+## 10. Stage C5 as built — where reality deviated from §6
+
+Ten commits, `d28b1c6d..11175169`. §6 sized C5 as "small: select the feature,
+un-gate `calink`, install the resolver, replace the banner". Four of the ten do
+that. The other six are what stood between the mount and a client that could
+compile for the target at all — stage C2's CA half, which had never landed —
+plus three defects the first boot of the mounted binary surfaced.
+
+### 10.1 C5 subsumed stage C2's CA half
+
+§6 C2 is written as a `epics-base-rs` primitive plus a CA consumer. The base
+primitive landed with the PVA track; the CA consumer did not, so C5 opened with
+the client still naming `tokio::net` and `socket2` and still 15 errors from the
+target. Four commits closed it, all through the `SearchTransport`/`dial_ca`
+shapes §6 asked for:
+
+| commit | what |
+|---|---|
+| `274a734b` | the `client-core` / `client` feature split C2 called for as a *stated* split; ratchet opened at 15 |
+| `a58322d7` | `FIONREAD_REQUEST`/`pending_bytes` hoisted to `runtime::blocking_io` — one owner for the receive-queue probe (C2 item 1). 15 → 14 |
+| `8d834de3` | `dial_ca`: one seam, `tokio::net::TcpStream` hosted / `runtime::blocking_io`'s two-thread pump on target, with the `socket2` keepalive replaced by raw `libc::setsockopt` there. 14 → 11 |
+| `aa91860b` | `run_nameserver_connection`'s dial through the same seam. 11 → 10 |
+
+**Deviation from C2's text, stated:** the inline framing loop in
+`run_nameserver_connection` (`search.rs:783-890`) was **not** folded into the
+generic `read_loop`. C2 asks for "one seam, two callers, not two seams and three
+framing loops". The dial is now one seam; the framing is still two loops. Left
+open deliberately — the fold is a behaviour-preserving refactor of ~100 lines
+with no target consequence, and doing it inside the stage that had to keep the
+target build moving would have mixed a refactor into a portability change.
+
+**Deviation, measured, worth keeping:** the first `dial_blocking` used
+`std::net::TcpStream::connect_timeout(addr, connection_timeout())` and failed
+`tcp_connect_has_no_application_level_deadline` — a test that exists precisely
+to forbid an application deadline on connect (C parity: connect is the OS's
+business). The structural answer is not a longer timeout: the unbounded
+`std::net::TcpStream::connect` runs on a dedicated thread
+(`spawn_dedicated_thread`, `CAC_RECV_PRIORITY`, `StackSizeClass::Small`) and
+delivers over a `oneshot`, so no shared cooperative-executor worker is parked
+and no deadline is invented.
+
+**Priorities, from C, not chosen:** libca gives a circuit's recv and send pumps
+*different* priorities — `tcpiiu.cpp:677-682` takes the highest-below and
+lowest-above of the initializing thread. `drive_socket_blocking` therefore takes
+two priorities rather than one; `CAC_RECV_PRIORITY` = Medium−1 = 49,
+`CAC_SEND_PRIORITY` = Medium+1 = 51, around `dbCa.c:340`'s
+`epicsThreadPriorityMedium`.
+
+### 10.2 The last 10 errors were UDP, and closed like PVA's 28
+
+`2db37555`. Identical shape to pvalink stage 4: on the target
+`search::SearchTransport` has the single `NameServersOnly` variant, so "no UDP
+socket" is a fact about the type. `UdpTransport`, `bind_udp`, the
+fanout/`note_drops`/DNS-refresh helpers, `run_search_engine`, and the whole
+`EPICS_CA_ADDR_LIST` parse (`AddrEntry`, `resolve_host`,
+`parse_addr_list_with_hostnames`, `append_auto_addr_entries`) are
+`#[cfg(not(target_os = "rtems"))]`.
+
+Two mechanical consequences §6 did not anticipate:
+
+* `tokio::select!` rejects `#[cfg]` on a branch (measured). The receive arm's
+  payload became an unconditional `SearchDatagram { n, src, iface_ip }` returned
+  by a cfg'd `recv`, so the `select!` body has one shape on both targets.
+* `add_address`/`remove_address`/`set_address_list` stay public and callable on
+  the target; their `NameServersOnly` arm routes through one
+  `log_dropped_udp_mutation` so a mutation nothing will read says so once.
+
+### 10.3 The ratchet was retired, not pinned at zero
+
+`afe3c812`. §6 asks for `CRATE_FEATURES[epics-ca-rs]="client-core"`. Once that
+lands, the `--lib` loop builds exactly what `CA_CLIENT_TARGET_ERRORS` measured —
+in **both** configurations, where the probe only ever ran the portability one —
+and the `--bin` loop then links `rtems-ca-ioc` on top of it. "The count is 0" and
+"the build must succeed" are the same assertion, so keeping both would leave a
+check that can only fail after another already has. The measured history
+(22 → 15 → 14 → 11 → 10 → 0) stays in the script: it is not reconstructible from
+the code. The PVA probe stays, because `CRATE_FEATURES` has no `epics-pva-rs`
+entry and `--features client` is built nowhere else.
+
+This is stricter than the pin, not looser. Nothing was allowed to regress.
+
+### 10.4 `lib.rs` needed no un-gating
+
+§6 says "un-gate `calink` in `lib.rs:37-38`". By the time C5 reached the mount,
+`274a734b` had already put `calink` behind `feature = "client-core"` with no
+target predicate, which is the un-gated state. No further edit.
+
+### 10.5 The mount alone is inert — iocInit's link phases were missing
+
+`fb62f164`, and the largest deviation from "small".
+
+`initialize_link_locality`, `setup_cp_links` and `setup_external_link_opens` are
+called from exactly one place in the workspace: `IocApplication::run`
+(`ioc_app.rs:913-925`). `rtems-ca-ioc` does not go through it — it assembles the
+database with `IocBuilder::build`, which runs none of them. So a resolver
+installed by itself is registered and unreachable:
+
+* without `initialize_link_locality`, `INP=UPSTREAM:AI CP` — the bare
+  ` CA`-modifier spelling, C `pvlOptCA`, and one of the two spellings §6 C6
+  gates on — stays a local `Db` link to a record that does not exist;
+* without `setup_cp_links`, a Passive holder of an external CP link never opens
+  it (never scanned ⇒ never lazily opened ⇒ no monitor);
+* without `setup_external_link_opens`, every other external link waits for a
+  cold scan cycle C does not spend.
+
+In all three the IOC boots, serves and answers searches with its links dead.
+They run **after** the mount: `setup_cp_links`' warm path goes through
+`resolve_external_pv`, documented as a no-op when no link set is installed.
+
+Family audit. `rtems-pva-ioc` is **distinct** — `install_pvalink_resolver` walks
+the database itself and pre-registers every `pva://` link including its CP/CPP
+scan targets, so its mount is not inert; `install_calink_resolver` scans nothing
+because for CA the scan *is* these three passes. `dual_ioc_rs` and `oracle_ioc`
+are distinct: neither mounts an external link resolver at all.
+
+### 10.6 The target client's timers were tokio's — measured by booting it
+
+`46942711`. Booting the mounted binary with `--features rtems-exec-model` and a
+`ca://` link panics a callback-pool worker: *"there is no reactor running, must
+be called from the context of a Tokio 1.x runtime"*. This entry point starts no
+runtime, so every `tokio::time::*` the client reaches is a panic on target.
+
+`runtime::task` already owns `sleep`/`interval`/`timeout`. Anchor
+`tokio::time::`, every production site classified against the target build:
+
+**Routed through the seam** — `client/search.rs:22,1011,1028,1109,1113` (the
+search engine's tick and DNS-refresh intervals; `run_engine` is *not* UDP-gated,
+it is the shared engine the name-servers-only path runs too),
+`client/search.rs:1153,1183,1339` (name-server reconnect backoff, including the
+one `aa91860b` added), `client/mod.rs:1084` and `:1461` (the two drain bounds —
+`:1461` sits *inside* a future already spawned through `runtime::task::spawn`, so
+§5.1 fixed the spawn and left the timer in it), `client/sync_group.rs:173`,
+`calink/resolver.rs:447`.
+
+**Distinct** — `server/tcp.rs:58` and `server/udp.rs:773` are already
+`cfg(not(target_os = "rtems"))`; `repeater`, `discovery/*`, `server/ca_server`,
+`server/introspection`, `client/beacon_monitor` are module-gated off the target
+or behind the full `client` feature; `chaos.rs:137` compiles on target but its
+only caller is `server::tcp::handle_client`, itself off-target; `replay.rs:236`
+is reachable only from `ca-replay-rs` (HOST_ONLY); `sync_group.rs:259,306` and
+`bin/*` are tests and host CLIs.
+
+**What this does not do, stated:** the hosted `rtems-exec-model` build still
+cannot boot a link. `AsyncUdpV4` needs a reactor, the host build compiles the UDP
+SEARCH transport in and selects it, so the same boot panics one layer down at
+`net/async_udp_v4.rs:1275` — and `rtems-pva-ioc` panics **identically at the same
+line**, measured. That is a property of the hosted exec-model build, not of this
+stage; on the target the UDP transport does not exist. It also means §6 C6 is not
+merely the *better* gate for the client path, it is the **only** one.
+
+### 10.7 Both banners named a link spelling the loader rejects
+
+`11175169`. Measured:
+
+```
+rtems-ca-ioc: iocInit failed: invalid value: ai.INP: can't initialize link
+type CONSTANT with "@ca://UPSTREAM:AI CP" (type INST_IO)
+```
+
+`@` is the INST_IO sigil: `try_parse_hw_link` (`link.rs:1074-1086`) claims any
+field starting with `@` and returns `ParsedLink::Hw` before the scheme arm
+(`link.rs:1343`) is consulted. Only `ca://PV` reaches it. Twelve sites across
+`rtems-ca-ioc.rs` and `rtems-pva-ioc.rs` said `@ca://` / `@pva://`; `@pva://` is
+rejected identically (`try_parse_hw_link` is protocol-agnostic), measured with
+the same boot. All twelve corrected.
+
+**§6's C6 table carries the same error** — it specifies
+`INP=@ca://UPSTREAM:AI CP` as the second spelling to gate. Corrected in place
+below; the two spellings C6 must exercise are `UPSTREAM:AI CP` and
+`ca://UPSTREAM:AI CP`.
+
+### 10.8 What the mount does on a host, measured
+
+Booting with three links (`UPSTREAM:AI CP` bare, `ca://UPSTREAM:AI CP`,
+`OUT=ca://UPSTREAM:AO`), `EPICS_CA_NAME_SERVERS=127.0.0.1:15999`,
+`EPICS_CA_ADDR_LIST=` and `AUTO_ADDR_LIST=NO`:
+
+```
+iocInit: 1 non-local DB link(s) made external
+iocInit: 2 external CP link subscriptions (1 PVs warmed)
+iocInit: 1 external link opens staged
+rtems-ca-ioc: calink resolver installed — 0 ca:// record links registered; ...
+```
+
+Every link was seen and classified: the bare form converted, both CP links
+subscribed, the OUT link staged. `link_count` is 0 because the open that would
+populate the registry is the one the host build's UDP panic kills — on target
+that path does not exist. Turning that 0 into a non-zero number on the wire is
+C6 criterion 1.
+
+### 10.9 The gate as measured
+
+| gate | result |
+|---|---|
+| `cargo fmt --all` | clean |
+| `./scripts/rtems-check.sh` (portability + image) | pass; `epics-ca-rs --lib` and `--bin rtems-ca-ioc` both `--features client-core` |
+| `cargo +nightly check --target armv7-rtems-eabihf -p epics-ca-rs --lib --features client-core` | 0 errors, 0 warnings |
+| `cargo clippy -p epics-ca-rs --all-targets -- -D warnings` | clean |
+| … `--features rtems-exec-model` | clean |
+| … `--no-default-features --features client-core` | clean |
+| … `--no-default-features --features client-core,rtems-exec-model` | clean |
+| `cargo clippy -p epics-base-rs -p epics-bridge-rs --all-targets -- -D warnings` | clean |
+| `cargo nextest run -p epics-ca-rs` | 727 passed, 0 skipped |
+| `cargo nextest run -p epics-ca-rs --features rtems-exec-model` | 611 passed, 0 skipped |
+| `RUSTFLAGS="--cfg ca_blocking_client" cargo nextest run -p epics-ca-rs` | 727 passed, 0 skipped |
+| `cargo nextest run -p epics-ca-rs -p epics-bridge-rs` | 1411 passed, 0 skipped |
+| `cargo nextest run -p epics-base-rs` | 3522 passed, 0 skipped |
+| `cargo test --doc -p epics-ca-rs` | pass |
+| `rtems_exec_model_gate::every_reactor_dependent_test_is_accounted_for` | pass (no census marker needed: the two new guards are plain `#[test]`) |
+
+Source-text guards on `rtems-ca-ioc.rs`, five now:
+`entry_point_never_starts_a_runtime`, `the_entry_point_publishes_its_status`,
+`a_panic_reaches_the_errlog_and_says_what_it_costs`, and new here
+`the_calink_resolver_is_mounted_and_the_banner_reports_it` (the CA counterpart
+of pvalink stage 4's) and `iocinit_link_phases_run_after_the_mount`.
+
+### 10.10 Open after C5
+
+1. `run_nameserver_connection`'s inline framing loop is still not folded into
+   `read_loop` (§6 C2, §10.1).
+2. The hosted `rtems-exec-model` build cannot exercise either link resolver's
+   client path — `AsyncUdpV4` needs a reactor and both RTEMS IOC binaries panic
+   at `net/async_udp_v4.rs:1275`. Closing it means putting UDP on a runtime seam
+   in `epics-base-rs`, shared with the PVA track and outside this stage.
+3. `epics-bridge-rs/Cargo.toml`'s comment on its `epics-ca-rs` dependency still
+   says the crate's "default feature list is empty"; `274a734b` gave it
+   `default = ["client"]`.
+3b. `doc/pvalink-rtems-design.md` still spells the link `@pva://` throughout.
+   The binaries it produced were corrected (§10.7); that doc was not, because
+   it belongs to the PVA track.
+4. Stage C4 remains deferred by sign-off. Nothing here touches `run_monitor`'s
+   inline `dispatch_external_cp_targets` or any CP fan-out semantics; the three
+   iocInit phases in §10.5 are existing functions called unchanged.
+5. Stage C6 is the gate for everything above.

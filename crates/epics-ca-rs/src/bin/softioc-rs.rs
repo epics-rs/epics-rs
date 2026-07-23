@@ -460,6 +460,13 @@ async fn main() -> CaResult<()> {
 
     let server = builder.build().await?;
 
+    // C iocInit owns scanInit/initialProcess — not RSRV. Start the
+    // core-owned scan owner (periodic scan-%g threads + the PINI=YES
+    // pass) here, where this binary's iocInit sequence ends; the CA
+    // server itself never scans. Held to process end so the scan
+    // threads live as long as the IOC serves.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(server.database().clone());
+
     if args.shell {
         server.run_with_shell(|_shell| {}).await
     } else {

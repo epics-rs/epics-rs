@@ -135,6 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return serve_pva(db).await;
     }
 
+    // C iocInit owns scanInit/initialProcess — the CA server does not
+    // scan. The harness compares against a C softIoc whose iocInit runs
+    // initialProcess and scanRun, so the Rust IOC starts the core-owned
+    // scan owner (PINI pass + scan-%g threads) itself, before serving.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
     // Port 0 => the kernel assigns; `from_parts` binds first and reports the
     // port it actually bound. This is the bind-and-read-back the harness
     // requires, not a probe-then-rebind.

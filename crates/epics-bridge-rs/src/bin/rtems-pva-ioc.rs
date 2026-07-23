@@ -199,6 +199,53 @@ mod demo_db {
         "  field(SCAN, \"Passive\")\n",
         "}\n",
     );
+
+    /// QSRV LOAD PROBE (`doc/qsrv-rtems-design.md` §8 items 2 and 5): the
+    /// 20-member group whose monitor spawns the ~40 forwarder tasks the
+    /// spawn-count asymmetry is about (`group.rs:2496`, `:2532`; C runs ONE
+    /// `qsrvGroup` pump thread, `ioc/groupsource.cpp:96`).
+    ///
+    /// Every member drives itself: `SCAN ".1 second"` + `CALC "VAL+1"`, the
+    /// standard counter idiom (`VAL` is `FETCH_VAL`, calcPerform.c:73-74).
+    /// Periodic scan is record *processing*, so monitors post on the same
+    /// path a production IOC uses — deliberately NOT a probe thread calling
+    /// `put_pv`, which posts no monitor event at all (the §11.7-item-2
+    /// defect `doc/calink-rtems-design.md` records; the C6 tick had to be
+    /// read by polling because of it). No load-driver code exists on the
+    /// guest: the members always self-count, and the *load* is switched
+    /// from the host side by opening and closing a MONITOR on the group —
+    /// forwarders only work when a subscription exists, so
+    /// baseline / load / recovery is a host-side choice, C4-measurement
+    /// style.
+    ///
+    /// `RTEMS:PVA:V0` is the victim: the same self-driven shape, in no
+    /// group, monitored across all three phases — its wire cadence is the
+    /// jitter readout, since the guest clock is 1-second-quantized.
+    pub fn qsrv_load_probe_db() -> String {
+        use std::fmt::Write as _;
+        let mut db = String::with_capacity(4096);
+        db.push_str(
+            "record(calc, \"RTEMS:PVA:V0\") { field(SCAN, \".1 second\") \
+             field(CALC, \"VAL+1\") field(PREC, \"0\") }\n",
+        );
+        for n in 0..20 {
+            // `+id`/`+atomic` ride on the first fragment only; the pvxs
+            // merge pattern forbids restating them per member.
+            let head = if n == 0 {
+                "\"+id\":\"rtems:demo/Big:1.0\",\"+atomic\":true,"
+            } else {
+                ""
+            };
+            let _ = write!(
+                db,
+                "record(calc, \"RTEMS:PVA:B{n:02}\") {{ field(SCAN, \".1 second\") \
+                 field(CALC, \"VAL+1\") field(PREC, \"0\")\n  \
+                 info(Q:group, {{\"RTEMS:PVA:BIG\":{{{head}\"f{n:02}\":\
+                 {{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":{n}}}}}}})\n}}\n"
+            );
+        }
+        db
+    }
 }
 
 #[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
@@ -274,6 +321,9 @@ mod ioc {
         let mut builder = IocBuilder::new();
         if db_files.is_empty() {
             builder = builder.db_string(DEMO_DB, &macros)?;
+            // QSRV LOAD PROBE members ride along whenever the built-in
+            // database is the source — a bare `-kernel` boot cannot choose.
+            builder = builder.db_string(&crate::demo_db::qsrv_load_probe_db(), &macros)?;
         } else {
             for path in db_files {
                 builder = builder.db_file(path, &macros)?;
@@ -1158,5 +1208,58 @@ mod tests {
                 m.field_name
             );
         }
+    }
+
+    /// The QSRV load probe (`doc/qsrv-rtems-design.md` §8 items 2/5) must
+    /// survive the same offline reading as the demo group: a typo in a
+    /// generated fragment would otherwise surface only as a missing PV on a
+    /// serial console with no shell to ask.
+    #[test]
+    fn the_load_probe_defines_the_twenty_member_group() {
+        use epics_bridge_rs::qsrv::group_config::{merge_group_defs, parse_info_group};
+        use std::collections::HashMap;
+
+        let src = crate::demo_db::qsrv_load_probe_db();
+        let recs = epics_base_rs::server::db_loader::parse_db(&src, &HashMap::new())
+            .expect("the load-probe database must parse");
+        assert_eq!(recs.len(), 21, "the victim plus twenty group members");
+
+        let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
+        for rec in &recs {
+            let Some(json) = rec
+                .info_tags
+                .iter()
+                .find(|(k, _)| k == "Q:group")
+                .map(|(_, v)| v.clone())
+            else {
+                continue;
+            };
+            let defs = parse_info_group(&rec.name, &json)
+                .unwrap_or_else(|e| panic!("record {}: {e}", rec.name));
+            merge_group_defs(&mut groups, defs);
+        }
+
+        assert_eq!(groups.len(), 1, "twenty fragments name one group");
+        let grp = groups.get("RTEMS:PVA:BIG").expect("the load-probe group");
+        assert_eq!(grp.struct_id.as_deref(), Some("rtems:demo/Big:1.0"));
+        assert!(grp.atomic, "the group is declared +atomic");
+        assert_eq!(grp.members.len(), 20, "every member fragment merged");
+        for (n, m) in grp.members.iter().enumerate() {
+            assert_eq!(m.field_name, format!("f{n:02}"));
+            assert_eq!(m.channel, format!("RTEMS:PVA:B{n:02}.VAL"));
+            assert_eq!(m.put_order, Some(n as i64));
+        }
+
+        // The victim must stay OUT of the group: it is the control the
+        // load phases are read against.
+        assert!(
+            recs.iter()
+                .find(|r| r.name == "RTEMS:PVA:V0")
+                .expect("the victim record")
+                .info_tags
+                .iter()
+                .all(|(k, _)| k != "Q:group"),
+            "RTEMS:PVA:V0 must carry no Q:group tag"
+        );
     }
 }

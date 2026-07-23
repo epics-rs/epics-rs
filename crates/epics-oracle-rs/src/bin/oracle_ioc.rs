@@ -173,6 +173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve_pva(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Same reasoning as the CA path: scanning is core-owned (C iocInit),
+    // not the PVA server's — the harness's Scanned drive records need it.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
     let server = PvaServer::from_parts(db, 0, None, None, None);
 
     // Announce from a side task rather than by racing the server future: a

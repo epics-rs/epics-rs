@@ -89,6 +89,12 @@ async fn run(args: Args) -> Result<(), String> {
     let server = builder.build().await.map_err(|e| e.to_string())?;
     let db = server.database().clone();
 
+    // C iocInit owns scan start (scanInit/initialProcess) — the PVA
+    // front-end does not scan. Start the core-owned scan owner here,
+    // where this binary's iocInit sequence ends; held to process end so
+    // periodic SCAN fields stay live as long as the server serves.
+    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+
     let provider = BridgeProvider::new(db);
     if let Some(path) = args.group_file.as_ref() {
         provider

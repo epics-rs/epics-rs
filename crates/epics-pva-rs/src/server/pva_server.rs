@@ -11,7 +11,6 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder;
 use epics_base_rs::server::record::Record;
-use epics_base_rs::server::scan::ScanScheduler;
 use epics_base_rs::server::{access_security, autosave, iocsh};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::watch;
@@ -252,7 +251,10 @@ impl PvaServer {
             config.udp_port = if port == 0 { 0 } else { port + 1 };
         }
 
-        let scanner = ScanScheduler::new(self.db.clone());
+        // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
+        // is owned by the IOC core — `epics_base_rs::server::scan::
+        // ScanOwner`, started by `IocApplication::run` at the C `scanRun`
+        // point or by the IOC entry binary — never by a protocol server.
 
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             Some(mgr.clone().start(self.db.clone()))
@@ -269,23 +271,19 @@ impl PvaServer {
             None
         };
 
-        let result = tokio::select! {
-            res = crate::server_native::runtime::run_pva_server_reporting(
-                source,
-                config,
-                move |handle| {
-                    if let Some(tx) = report_tx {
-                        // Best-effort: a dropped receiver (no shell) just
-                        // means nobody is watching the report.
-                        let _ = tx.send(Some(handle));
-                    }
-                },
-            ) => res.map_err(|e| CaError::InvalidValue(e.to_string())),
-            _ = scanner.run() => {
-                eprintln!("Scan scheduler exited");
-                Ok(())
-            }
-        };
+        let result = crate::server_native::runtime::run_pva_server_reporting(
+            source,
+            config,
+            move |handle| {
+                if let Some(tx) = report_tx {
+                    // Best-effort: a dropped receiver (no shell) just
+                    // means nobody is watching the report.
+                    let _ = tx.send(Some(handle));
+                }
+            },
+        )
+        .await
+        .map_err(|e| CaError::InvalidValue(e.to_string()));
 
         if let Some(h) = autosave_handle {
             h.abort();

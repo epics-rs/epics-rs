@@ -559,7 +559,7 @@ Every stage is independently workspace-green
 | 1 | `runtime::task::timeout(dur, fut)` in `epics-base-rs` — the one seam gap. `tokio_backend` → `tokio::time::timeout`; `exec_backend` → `select(timer_sleep::sleep(dur), fut)`. Boundary tests: fires, does-not-fire, already-elapsed, cancel-drop. | ✅ | ✅ | 1–2 d |
 | 2 | PVA server-native seam swap: 11 `tokio::spawn` → `runtime::task::spawn`; `AbortOnDrop(TaskAbortHandle)` (`tcp.rs:783`); 3 timer sites (`:3280`, `:3323`, `:5509`) onto the seam. Aliases on hosted ⇒ zero behaviour change. | ✅ | ✅ | 3–4 d |
 | 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. **DONE** (`44681c76`; as built: §10) | ✅ | ✅ (additive) | 1–1.5 wk |
-| 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. | ✅ | ⚠️ timing only, flagged | 3–4 d |
+| 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. **DONE** (`ab97461f`; as built: §11 — the `oneshot` arm was NOT taken, the sign-off item dissolved) | ✅ | ✅ as landed (no hosted timing change) | 3–4 d |
 | 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. | ✅ | ✅ | 2–3 d |
 
 Sequencing note: stages 1–2 are desktop-neutral and can land **before** the CA
@@ -610,6 +610,10 @@ and reopens the TypeCache question — call it +1 wk of downside risk.
 1. **Writer-exit `oneshot` arm (§4.2b).** Removes a 15 s teardown window on
    both builds; changes hosted timing. Land it, or preserve today's timing and
    accept the window on RTEMS too?
+   **RESOLVED in stage 4 (`ab97461f`): neither.** The dichotomy was false —
+   waking through the socket closes the window on the blocking driver
+   without a seventh arm and without touching hosted timing. See §11.1;
+   the sign-off item dissolved instead of being decided.
 2. **Frame channel depth (§1.4).** `N = 1` for behavioural identity, or a
    larger depth for read-ahead throughput? I recommend 1 and measuring later.
    **RESOLVED in stage 3 (`44681c76`): depth = 1**, for the reason §1.4 gives —
@@ -684,3 +688,56 @@ while **every end-to-end test still passes** — exactly the silent,
 intermittent failure mode §1.5 predicted, which is why the adapter has
 its own test rather than relying on the e2e suite. The +1 wk downside
 risk (frame-channel fallback) was not spent.
+
+---
+
+## 11. Stage 4 as built — where reality deviated from §4/§7
+
+Stage 4 landed as `ab97461f` (connection registry + socket-shutdown
+teardown, `server_native/blocking.rs` +608 lines). The §4.2c mechanism
+held exactly: one way to wake a parked connection thread —
+`shutdown(Shutdown::Both)` — and an owner for it. `ConnRegistry` carries
+the invariant as MUST/MUST-NOT with both halves holding by construction
+(`ConnWake` constructible only by `ConnRegistry::register`;
+`serve_connection_blocking` takes `&ConnRegistry` by value, not option;
+`ConnRegistration::drop` is the only remover). `stop` is a one-way
+latch: a connection registering after it is woken as it registers.
+Mutation-checked at the invariant's three boundaries (wake as no-op;
+drop skipping deregister; writer dropping its exit wake). Three
+deviations:
+
+### 11.1 The writer-exit `oneshot` arm was not taken — §4.2b's fix dissolved
+
+The design proposed a `oneshot` plus a seventh `select!` arm in the
+shared connection loop, and flagged it for sign-off because it would
+speed *hosted* teardown too. As built, **neither branch of that
+trade-off was taken**: a dead writer shuts the socket down, the reader's
+blocking `read` returns 0, and the connection unwinds down the existing
+EOF path (§4.4's first row). `tcp.rs` and `accept.rs` are untouched, so
+the hosted `select!` is byte-identical, hosted teardown timing is
+unchanged, and the ≤15 s window §4.2b described is closed on the
+blocking driver anyway. This also honours the item-7 design's §6 rule
+the `oneshot` variant would have bent: no `cfg`-ed arm inside the
+protocol module. The §4.4 error-propagation table's "write error"
+row therefore routes through the same vehicle as EOF, not a new arm.
+
+### 11.2 `PvaServer::stop` is deliberately not wired to the registry
+
+The design's §4.2c implied server shutdown walks the registry from the
+server object. As built the hosted `PvaServer` does not: `mod.rs` gates
+`runtime` and `accept` out of RTEMS while `blocking` is ungated, so a
+`PvaServer::stop` arm reaching blocking connections would be dead code
+on host and absent on RTEMS. The registry's caller is item 7's blocking
+accept loop (`BlockingPvaServer`, landed later as `1c27465c`), which
+owns the `ConnRegistry` precisely because `serve_connection_blocking`
+cannot be called without one.
+
+### 11.3 `8024b175` narrowed the wake authority after the stage landed
+
+As landed, the writer pump took a registry-issued `ConnWake` (and the
+reader guard another). The byte-source promotion (§10.3) separated
+plumbing from authority: both pumps now derive their self-retirement
+wake from the `Arc<TcpStream>` they already hold, and
+`ConnRegistration::wake_handle` is gone with its last caller. The
+registry keeps exactly what §4 gave it — the server-WIDE stop — and
+nothing else can shut a connection's socket through it.

@@ -288,7 +288,7 @@ Selects the wire-level TLS negotiation mode when TLS is enabled.
   with C tooling.
 - `ca-secure-draft`: placeholder for upstream `epics-base` 7
   ca-secure spec interop. Currently falls back to `rust-only` with a
-  debug log; see `doc/11-tls-design.md` and `src/tls/ca_secure.rs`
+  debug log; see `crates/epics-ca-rs/doc/11-tls-design.md` and `src/tls/ca_secure.rs`
   for the design path.
 
 ### `EPICS_CA_RS_CHAOS` (rust-only)

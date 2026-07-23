@@ -20,6 +20,14 @@ jobs:
         toolchain: 1.94.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    # Cargo registry + target cache. Placed after the toolchain step
+    # because the cache key includes the rustc version. The explicit
+    # `key` names the *feature resolution* this job builds: each job in
+    # this file resolves features differently, so their target dirs are
+    # not interchangeable and must not share a cache entry.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: default-features
     - name: Clippy
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Build
@@ -65,6 +73,9 @@ jobs:
       with:
         toolchain: 1.94.0
     - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-exec-model
     - name: epics-base-rs (rtems-exec-model)
       run: cargo nextest run -p epics-base-rs --features rtems-exec-model
     - name: epics-ca-rs (rtems-exec-model)
@@ -103,5 +114,8 @@ jobs:
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.94.0
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: no-default-features
     - name: Check (no default features)
       run: cargo check --workspace --no-default-features

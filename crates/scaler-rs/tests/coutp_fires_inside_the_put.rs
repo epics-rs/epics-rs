@@ -140,6 +140,15 @@ async fn r10_64_coutp_target_sees_the_scaler_before_it_is_armed() {
 /// (`:463`, after the stop). The target therefore latches 2 and then 0 — the
 /// deferred port collapsed both writes into the post-process point and the
 /// target only ever saw 0.
+///
+/// Each COUTP put is a `dbPutLink` → `dbPut` landing CNT in the target's VAL,
+/// and a calc's VAL is NOT `pp(TRUE)` — so C's `dbPut` tail
+/// (`dbAccess.c:1414-1418`) posts the RAW link write (the CNT value, 0)
+/// unconditionally before the `PP` process re-latches SS and the deadband
+/// posts that. Four events per stop, interleaved put/process/put/process.
+/// (An earlier revision expected only the two process posts — that encoded
+/// the port's missing `dbPut` post, `doc/calink-rtems-design.md` §11.7
+/// item 2, not C.)
 #[tokio::test]
 async fn r10_64_a_user_stop_runs_the_two_coutp_puts_in_c_order() {
     let db = db_with_link_targets().await;
@@ -150,9 +159,19 @@ async fn r10_64_a_user_stop_runs_the_two_coutp_puts_in_c_order() {
 
     assert_eq!(
         drain(&mut trigp),
-        vec![SCALER_STATE_COUNTING, SCALER_STATE_IDLE],
+        vec![
+            // :624 put of CNT=0 into TRIGP.VAL — dbPut's own post…
+            0.0,
+            // …then the PP process latches SS, still COUNTING.
+            SCALER_STATE_COUNTING,
+            // :463 put of CNT=0 again after the stop…
+            0.0,
+            // …and its process latches the now-IDLE scaler.
+            SCALER_STATE_IDLE,
+        ],
         "special()'s put fires first, with the count still running (:624); \
-         process()'s second put fires after the stop (:463)"
+         process()'s second put fires after the stop (:463); each put also \
+         posts its raw write per C dbPut:1414-1418 (calc VAL is not pp)"
     );
 }
 

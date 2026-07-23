@@ -1670,6 +1670,14 @@ in `server_native/` (outside this change): `tcp.rs:1407` deprecated
 `fetch_update`, and `search_engine.rs:501` dead `Origin::{FromOriginTag,
 Forwarded}` variants. Neither is client-side; neither moved.
 
+*Both are now fixed at source — `f9008445` and `7235e6a5`, recorded with
+their before/after warning text in `doc/calink-rtems-design.md` §10.11
+items 4 and 5. `./scripts/rtems-check.sh` emits no warning at all in
+either configuration. This section, §9.9 and §8.7 are left as written:
+each was a true statement about the stage that measured it, and "the
+gate carried two warnings for this long" is the fact those rows exist to
+record.*
+
 ### 11.8 The gate as measured
 
 | gate | result |

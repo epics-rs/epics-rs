@@ -1404,9 +1404,24 @@ impl MonitorPipelineCredit<'_> {
         let Some(w) = self.window else {
             return;
         };
-        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_sub(1))
-        });
+        // Saturating decrement, spelled as the CAS loop `fetch_update` was
+        // compiling to anyway. Not the deprecation's suggested rename:
+        // `try_update` — and its infallible sibling `update` — are unstable
+        // (`atomic_try_update`, rust#135894), so on this workspace's pinned
+        // 1.94 toolchain neither is reachable. `fetch_sub` is not the answer
+        // either: it wraps to `u32::MAX` at zero, which would hand the emit
+        // gate four billion credits at exactly the moment the window is
+        // empty. Same shape `epics-ca-rs` uses to drain `pending_frames`
+        // (`client/transport.rs`), and for the same missing primitive.
+        let mut cur = w.load(Ordering::Relaxed);
+        while let Err(observed) = w.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            cur = observed;
+        }
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND

@@ -296,6 +296,17 @@ generic `read_loop`. It is ~60 lines of re-implemented CA framing
 (`search.rs:783-885`). Stage C2 should route it through the same primitive
 rather than growing a third framing loop — one seam, two callers.
 
+**Both halves are now closed.** The dial at `aa91860b` (`transport::dial_ca`),
+the framing at `36102cc7` (`transport::next_frame`) — §10.11 item 1. The
+primitive is header-level by design: it answers how long a message is and
+whether the peer is still speaking CA, and leaves the receive-side body policy
+(`EPICS_CA_MAX_ARRAY_BYTES`, the drain-across-reads) with the loop that owns
+the buffer, because that policy genuinely differs between a data circuit and a
+name-service circuit. Wholesale reuse of `read_loop` would have been the wrong
+fold for the reason its own code states — the echo watchdog and libca flow
+control are properties of a *data* circuit, and a name-service circuit carries
+only SEARCH and its reply.
+
 ---
 
 ## 2. calink's actual client surface
@@ -1200,7 +1211,7 @@ substitutions are:
 |---|---|
 | upstream `softIocPVX` on the host | upstream `softIoc` (C base) on the host, serving one `ai` and one `ao` |
 | `EPICS_PVA_NAME_SERVERS=10.0.2.2:5075` | `EPICS_CA_NAME_SERVERS=10.0.2.2:5064` **plus** `EPICS_CA_ADDR_LIST=` and `EPICS_CA_AUTO_ADDR_LIST=NO` (§4.5) |
-| `INP=pva://UPSTREAM:AI CP` (spelled `@pva://` in that doc — see §10.7) | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
+| `INP=pva://UPSTREAM:AI CP` (that doc spelled it `@pva://` when this row was written; corrected there — see §10.7 and `doc/pvalink-rtems-design.md` §12.2) | `INP=UPSTREAM:AI CP` (the bare ` CA`-modifier form, C `pvlOptCA`) **and** a second record with `INP=ca://UPSTREAM:AI CP` — both spellings resolve through `strip_ca_scheme`, and both should be in the gate |
 | `pvxget` / `pvxput` from the host | `caget` / `caput` from the host |
 | forwarded `tcp::5075-:5075` | forwarded `tcp::5064-:5064` |
 
@@ -1577,6 +1588,10 @@ open deliberately — the fold is a behaviour-preserving refactor of ~100 lines
 with no target consequence, and doing it inside the stage that had to keep the
 target build moving would have mixed a refactor into a portability change.
 
+*Closed at `36102cc7`, as its own change and with the coverage the refactor
+needed: §10.11 item 1. The deviation stood for exactly as long as this
+paragraph said it would.*
+
 **Deviation, measured, worth keeping:** the first `dial_blocking` used
 `std::net::TcpStream::connect_timeout(addr, connection_timeout())` and failed
 `tcp_connect_has_no_application_level_deadline` — a test that exists precisely
@@ -1764,19 +1779,64 @@ of pvalink stage 4's) and `iocinit_link_phases_run_after_the_mount`.
 
 ### 10.10 Open after C5
 
-1. `run_nameserver_connection`'s inline framing loop is still not folded into
-   `read_loop` (§6 C2, §10.1).
+1. ~~`run_nameserver_connection`'s inline framing loop is still not folded into
+   `read_loop` (§6 C2, §10.1).~~ **CLOSED — §10.11 item 1.**
 2. The hosted `rtems-exec-model` build cannot exercise either link resolver's
    client path — `AsyncUdpV4` needs a reactor and both RTEMS IOC binaries panic
    at `net/async_udp_v4.rs:1275`. Closing it means putting UDP on a runtime seam
    in `epics-base-rs`, shared with the PVA track and outside this stage.
-3. `epics-bridge-rs/Cargo.toml`'s comment on its `epics-ca-rs` dependency still
-   says the crate's "default feature list is empty"; `274a734b` gave it
-   `default = ["client"]`.
-3b. `doc/pvalink-rtems-design.md` still spells the link `@pva://` throughout.
+3. ~~`epics-bridge-rs/Cargo.toml`'s comment on its `epics-ca-rs` dependency
+   still says the crate's "default feature list is empty"; `274a734b` gave it
+   `default = ["client"]`.~~ **CLOSED — §10.11 item 2.**
+3b. ~~`doc/pvalink-rtems-design.md` still spells the link `@pva://` throughout.
    The binaries it produced were corrected (§10.7); that doc was not, because
-   it belongs to the PVA track.
+   it belongs to the PVA track.~~ **CLOSED — §10.11 item 3.**
 4. Stage C4 remains deferred by sign-off. Nothing here touches `run_monitor`'s
    inline `dispatch_external_cp_targets` or any CP fan-out semantics; the three
    iocInit phases in §10.5 are existing functions called unchanged.
 5. Stage C6 is the gate for everything above.
+
+### 10.11 The five small UNFIXED items, closed
+
+One commit each, off `5b4ad849`. Items 1–3 are this document's own open rows
+above; items 4–5 are the two warnings every stage record in this document and
+in `doc/pvalink-rtems-design.md` has had to repeat as "unchanged in count and
+identity" (§8.5, pvalink §8.7, §9.9, §11.7). Those stage records stay as
+written — each was true of the stage that measured it.
+
+| # | item | commit | what closed it |
+|---|---|---|---|
+| 1 | the name-server circuit's inline framing loop (§6 C2, §10.1, §10.10 item 1) | `36102cc7` | `client/transport.rs::next_frame` — one framing step, two callers. The dial became one seam at `aa91860b`; this is the framing half, so C2's "one seam, two callers, not two seams and three framing loops" now holds in both halves. |
+| 2 | the stale `epics-ca-rs` "default feature list is empty" comment (§10.10 item 3) | `61756a31` | Restated on the true reason — no target-selectable feature of `epics-bridge-rs` pulls the crate. The same false premise in `doc/qsrv-rtems-design.md` §9.2 went with it. |
+| 3 | `doc/pvalink-rtems-design.md`'s `@pva://` spelling (§10.10 item 3b, §10.7) | `74122e72` | §5 stage 5's records now read `pva://`, as do seven `epics-bridge-rs` module/API doc comments carrying the same claim. Kept verbatim: §12.2's record of the refusal, the quoted `iocInit` error, and two quoted boot consoles. This document's `@ca://` was swept the same way and has **no** stale site — all three hits are §10.7 naming the rejected form. |
+| 4 | `server_native/tcp.rs:1407` deprecated `fetch_update` | `f9008445` | The CAS loop `fetch_update` compiled to. Not the suggested rename: `try_update`/`update` are unstable (`atomic_try_update`, rust#135894) and do not build on the pinned 1.94 toolchain; `fetch_sub` wraps where the code needs saturation. |
+| 5 | `server_native/search_engine.rs:501` dead `Origin::{FromOriginTag, Forwarded}` | `7235e6a5` | **Investigated, not deleted.** pvxs `udp_collector.cpp:63-68` does distinguish these and acts on it at `:373-374`, `:385-389`, `:508`, `:524`, so the hosted server needs them for anti-loop parity. They are dead only on the target, where their sole producer (`server_native::udp`) is not compiled and `blocking.rs`'s responder can emit `Origin::Direct` alone. Gated `#[cfg(not(target_os = "rtems"))]`, the shape `SearchTransport::NameServersOnly` took (§10.1). |
+
+**The two long-carried warnings are gone.** Before, on every `rtems-check.sh`
+run, six times each — once per lib check across both configurations:
+
+```
+warning: use of deprecated method `std::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/epics-pva-rs/src/server_native/tcp.rs:1407:19
+warning: variants `FromOriginTag` and `Forwarded` are never constructed
+   --> crates/epics-pva-rs/src/server_native/search_engine.rs:501:5
+warning: `epics-pva-rs` (lib) generated 2 warnings (run `cargo fix --lib -p epics-pva-rs` to apply 1 suggestion)
+```
+
+After: `./scripts/rtems-check.sh` exit 0 with **zero** lines matching `^warning`
+in the whole run, both the portability and the image configuration.
+
+Coverage added, because two of these were refactors of code no test reached:
+
+* `client/transport.rs::framing_tests` — seven per-boundary cases on
+  `next_frame` (short header 0..15, exactly 16, partial extended annex 16..23,
+  header-before-body, every misaligned base postsize, misaligned extended
+  postsize, chained base+extended with a torn tail). The rules were previously
+  reachable only through a live socket, which is how the two copies drifted.
+* `client/search.rs::nameserver_reply_torn_across_reads_still_resolves` — two
+  chained replies written one byte at a time. Measured: with framing stubbed
+  out this fails ("resolved []") while the pre-existing
+  `stage_c1_name_servers_only_resolves_without_binding_udp` still passes, which
+  is why the inline loop had no regression cover.
+* `server_native/search_engine.rs::the_blocking_udp_responder_produces_only_a_direct_origin`
+  — pins the premise item 5's `cfg` rests on.

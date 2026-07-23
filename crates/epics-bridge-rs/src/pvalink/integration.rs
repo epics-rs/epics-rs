@@ -7,7 +7,7 @@
 //!    `epics_base_rs::runtime::task` spawn seam — `tokio::spawn` on the host,
 //!    the callback pool on the RTEMS target where no tokio runtime exists.
 //! 2. [`install_pvalink_resolver`] hooks the resolver into the database via
-//!    `PvDatabase::set_external_resolver`. Records with `INP=@pva://...`
+//!    `PvDatabase::set_external_resolver`. Records with `INP=pva://...`
 //!    will then resolve through the registry instead of returning `None`.
 //! 3. INP links are pre-warmed via [`PvaLinkResolver::open`] (also exposed
 //!    as the `pvxr` iocsh command) so the synchronous resolver path can
@@ -54,7 +54,7 @@ pub struct PvaLinkResolver {
     enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Per-PV link-option overrides.
     ///
-    /// The `epics-base-rs` link parser collapses `@pva://X?sevr=MS`
+    /// The `epics-base-rs` link parser collapses `pva://X?sevr=MS`
     /// (and the legacy `pva://X MS` suffix form) down to a bare PV
     /// name in `ParsedLink::Pva`, dropping every query option before
     /// the bridge resolver is consulted. To keep B2 (`MS`/`NMS`) and
@@ -239,7 +239,7 @@ impl PvaLinkResolver {
         self.registry.get_or_open(self.inp_cfg_for(pv_name)).await
     }
 
-    /// Open / cache a link from a full `@pva://...` link string,
+    /// Open / cache a link from a full `pva://...` link string,
     /// parsing and retaining its options (`sevr`, `Q`, `pipeline`,
     /// `monorder`, ...). The parsed [`PvaLinkConfig`] is stashed under
     /// the bare PV name so the steady-state resolver hot path —
@@ -605,7 +605,7 @@ impl PvaLinkResolver {
         PvaLinkConfig::defaults_for(bare, LinkDirection::Out)
     }
 
-    /// Open / cache an OUT link from a full `@pva://...` link string,
+    /// Open / cache an OUT link from a full `pva://...` link string,
     /// parsing and retaining its options (`proc`, `field`, `defer`,
     /// `retry`, ...). The parsed [`PvaLinkConfig`] is stashed under the
     /// bare PV name so the `put_value` resolver hot-path picks up the

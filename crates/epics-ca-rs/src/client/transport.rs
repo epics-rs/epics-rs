@@ -341,6 +341,103 @@ pub(super) fn split_circuit(
     (stream.reader, stream.writer)
 }
 
+// ---------------------------------------------------------------------------
+// The CA client's one TCP framing path
+// ---------------------------------------------------------------------------
+
+/// Why [`next_frame`] refuses the bytes at the head of a receive buffer.
+///
+/// Both variants mean the same thing to a caller — C
+/// `tcpiiu.cpp::processIncoming:1197-1202` closes the circuit — and the
+/// `Display` text is what each caller logs, so the two loops report the same
+/// two failures in the same two words.
+pub(super) enum FrameError {
+    /// The header bytes are all present and the parser still rejected them.
+    Header(epics_base_rs::error::CaError),
+    /// `m_postsize & 0x7 != 0`. The wire spec requires an 8-byte-aligned
+    /// payload; silently rounding up (an earlier `align8`) lets a hostile peer
+    /// slide the framer into the middle of the next message.
+    MisalignedPayload(usize),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header(e) => write!(f, "malformed TCP header ({e})"),
+            Self::MisalignedPayload(n) => write!(f, "misaligned payload (postsize={n})"),
+        }
+    }
+}
+
+/// What the bytes at the head of a CA receive buffer are.
+pub(super) enum Frame {
+    /// A header was parsed. `hdr_size + body_len` is the message's total
+    /// length on the wire — **the body may not have arrived yet**. Deciding
+    /// what to do about that is the caller's, because it is the one place the
+    /// two circuits legitimately differ: the data circuit drains an
+    /// over-`EPICS_CA_MAX_ARRAY_BYTES` body across reads and keeps going
+    /// (C `tcpiiu.cpp:1269-1283`), the name-service circuit simply waits.
+    Header {
+        hdr: CaHeader,
+        hdr_size: usize,
+        body_len: usize,
+    },
+    /// Not enough bytes to decide yet — read more, keep what is here.
+    Incomplete,
+    /// Definitively malformed. C closes the circuit; so do both callers.
+    Malformed(FrameError),
+}
+
+/// **The CA client's one TCP framing step**, shared by the upstream circuit's
+/// [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's reader
+/// (`client/search.rs::run_nameserver_connection`).
+///
+/// The name-service circuit used to carry its own ~100-line copy of these
+/// rules, which is the shape `doc/calink-rtems-design.md` §6 C2 named: "one
+/// seam, two callers, not two seams and three framing loops". The dial became
+/// one seam in `aa91860b` ([`dial_ca`]); this is the framing half. The two
+/// copies had already drifted apart once — the misaligned-postsize close and
+/// the partial-extended-header wait were fixed twice, separately — which is
+/// the cost this function removes.
+///
+/// It answers **only** the header-level question, deliberately: how many bytes
+/// this message occupies and whether the peer is still speaking CA. Body
+/// policy (the receive-side size limit, the drain-across-reads) stays with the
+/// loop that owns the receive buffer, because that policy is genuinely
+/// per-circuit — see [`Frame::Header`].
+pub(super) fn next_frame(buf: &[u8]) -> Frame {
+    if buf.len() < CaHeader::SIZE {
+        return Frame::Incomplete;
+    }
+    // C `tcpiiu.cpp::processIncoming` distinguishes a *partial* extended
+    // header (await more bytes) from a *definitively malformed* one (close).
+    // Extended form is `m_postsize == 0xffff` alone (`tcpiiu.cpp:1168`), and
+    // it demands 24 header bytes rather than 16; fewer than that present is
+    // the one legitimate "await more" case beyond a short base header.
+    let base_post = u16::from_be_bytes([buf[2], buf[3]]);
+    if base_post == 0xFFFF && buf.len() < CaHeader::SIZE + 8 {
+        return Frame::Incomplete;
+    }
+    let (hdr, hdr_size) = match CaHeader::from_bytes_extended(buf) {
+        Ok(v) => v,
+        // `from_bytes_extended` rejects exactly two inputs — under 16 bytes,
+        // and `0xFFFF` with under 24 — and both are excluded above, so this
+        // arm is unreachable today. It is C's close rather than an
+        // `unreachable!` on purpose: a parser that later grows a rejection
+        // must reach the peer-is-malformed path, not panic the circuit's task.
+        Err(e) => return Frame::Malformed(FrameError::Header(e)),
+    };
+    let body_len = hdr.actual_postsize();
+    if body_len & 0x7 != 0 {
+        return Frame::Malformed(FrameError::MisalignedPayload(body_len));
+    }
+    Frame::Header {
+        hdr,
+        hdr_size,
+        body_len,
+    }
+}
+
 /// **The CA client's one TCP dial**, and the one place a circuit's socket
 /// options are set.
 ///
@@ -2055,59 +2152,33 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         }
 
         let mut offset = 0;
-        while offset + CaHeader::SIZE <= accumulated.len() {
-            let frame = &accumulated[offset..];
-            // C `tcpiiu.cpp::processIncoming` distinguishes a *partial*
-            // extended header (await more bytes) from a *definitively
-            // malformed* one (close the connection). Detect the only
-            // legitimate "await more" case — an extended-form header
-            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present —
-            // and treat every other parse error as a hard close.
-            let is_partial_extended_header =
-                frame.len() >= 4 && frame[2] == 0xFF && frame[3] == 0xFF && frame.len() < 24;
-            let (hdr, hdr_size) = match CaHeader::from_bytes_extended(frame) {
-                Ok(v) => v,
-                Err(_) if is_partial_extended_header => {
-                    // Genuine TCP segment boundary inside an extended
-                    // header — wait for the remaining bytes.
-                    break;
-                }
-                Err(e) => {
-                    // The parser carries no size policy (an oversize body is
-                    // a valid header — see `max_recv_body_bytes`, and the
-                    // ignore-don't-close handling below), so the only way to
-                    // land here is a header too short to parse, which the
-                    // loop condition and the partial-annex arm above have
-                    // already excluded. Treat it as a malformed peer.
-                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+        loop {
+            // The shared framing step (`next_frame`) — "await more bytes" and
+            // "this peer is definitively malformed" are its answer, not this
+            // loop's, so the name-service circuit's reader cannot drift away
+            // from these rules again (§6 C2).
+            let (hdr, hdr_size, actual_post) = match next_frame(&accumulated[offset..]) {
+                Frame::Incomplete => break,
+                Frame::Malformed(e) => {
+                    // C `tcpiiu.cpp::processIncoming:1197-1202` closes the
+                    // connection on either a header it cannot parse or a
+                    // misaligned `m_postsize`. Silently rounding the latter
+                    // via `align8` (the prior behavior) lets a malicious
+                    // server desync our framer; drop the circuit so the
+                    // reconnect loop rebuilds from a clean state.
+                    eprintln!("CA: {server_addr}: {e}, closing");
                     let _ = event_tx.send(TransportEvent::TcpClosed {
                         server_addr,
                         priority,
                     });
                     return;
                 }
+                Frame::Header {
+                    hdr,
+                    hdr_size,
+                    body_len,
+                } => (hdr, hdr_size, body_len),
             };
-            let actual_post = hdr.actual_postsize();
-            // C `tcpiiu.cpp::processIncoming` (line 1198) closes the
-            // connection if `m_postsize & 0x7 != 0`. The wire spec
-            // requires every payload to be 8-byte aligned; an
-            // unaligned postsize is either a malformed peer or an
-            // attempt to push our parser into reading the next
-            // message's header as the tail of this one. Silently
-            // rounding via `align8` (the prior behavior) lets a
-            // malicious server desync our framer. Match C: drop the
-            // connection so the reconnect loop can rebuild from a
-            // clean state.
-            if actual_post & 0x7 != 0 {
-                eprintln!(
-                    "CA: {server_addr}: misaligned payload (postsize={actual_post}), closing"
-                );
-                let _ = event_tx.send(TransportEvent::TcpClosed {
-                    server_addr,
-                    priority,
-                });
-                return;
-            }
             let msg_len = hdr_size + actual_post;
 
             // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1269-1283`): a body the
@@ -4685,5 +4756,181 @@ mod conn_tmo_env_tests {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    //! Per-boundary coverage of [`next_frame`], the CA client's one TCP
+    //! framing step.
+    //!
+    //! These cases used to have no home. The rules lived twice — once in
+    //! `read_loop`, once inline in `client/search.rs::run_nameserver_connection`
+    //! — and each copy was only reachable through a live socket, so both were
+    //! tested (when at all) end to end through whichever circuit owned them.
+    //! That is exactly how the two copies drifted: the misaligned-postsize
+    //! close and the partial-extended-header wait were each fixed twice,
+    //! separately. One function, one boundary table, both callers.
+    //!
+    //! By boundary, not by scenario: the input is a byte prefix and the
+    //! interesting values are the lengths at which the answer changes —
+    //! 15/16 for the base header, 23/24 for the extended annex — plus the
+    //! alignment predicate on either header form.
+    use super::{Frame, FrameError, next_frame};
+    use crate::protocol::{CA_PROTO_SEARCH, CaHeader};
+
+    /// A 16-byte base header with the given raw `postsize`, no annex.
+    fn base_header(postsize: u16) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_SEARCH);
+        hdr.postsize = postsize;
+        hdr.to_bytes().to_vec()
+    }
+
+    /// A 24-byte extended header (`postsize == 0xFFFF`) declaring
+    /// `ext_postsize` payload bytes.
+    fn extended_header(ext_postsize: u32) -> Vec<u8> {
+        let mut buf = base_header(0xFFFF);
+        buf.extend_from_slice(&ext_postsize.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // extended count
+        buf
+    }
+
+    fn header_of(frame: Frame) -> (usize, usize) {
+        match frame {
+            Frame::Header {
+                hdr_size, body_len, ..
+            } => (hdr_size, body_len),
+            Frame::Incomplete => panic!("expected a parsed header, got Incomplete"),
+            Frame::Malformed(e) => panic!("expected a parsed header, got Malformed({e})"),
+        }
+    }
+
+    /// Boundary: 0..=15 bytes cannot name a message. Every length below the
+    /// base header is "read more", never a close — a TCP segment boundary in
+    /// the middle of a header is ordinary.
+    #[test]
+    fn under_a_base_header_is_incomplete_at_every_length() {
+        let full = base_header(0);
+        for n in 0..CaHeader::SIZE {
+            assert!(
+                matches!(next_frame(&full[..n]), Frame::Incomplete),
+                "{n} bytes is short of a 16-byte header and must be Incomplete"
+            );
+        }
+    }
+
+    /// The other side of that boundary: exactly 16 bytes with an empty body
+    /// is a whole message, and the body it declares is zero — so a caller
+    /// that adds `hdr_size + body_len` consumes 16 and no more.
+    #[test]
+    fn exactly_a_base_header_with_no_body_is_a_whole_message() {
+        assert_eq!(header_of(next_frame(&base_header(0))), (16, 0));
+    }
+
+    /// Boundary: `postsize == 0xFFFF` promises an 8-byte annex, so 16..=23
+    /// bytes are still "read more". This is the case a pure 16-byte parse
+    /// gets catastrophically wrong — it would read the sentinel as a literal
+    /// size and consume 65,540 bytes for a message whose true length is
+    /// `24 + payload`.
+    #[test]
+    fn a_partial_extended_annex_is_incomplete_not_malformed() {
+        let full = extended_header(8);
+        for n in CaHeader::SIZE..24 {
+            assert!(
+                matches!(next_frame(&full[..n]), Frame::Incomplete),
+                "{n} bytes is short of the 24-byte extended header and must be \
+                 Incomplete, not a close"
+            );
+        }
+        assert_eq!(header_of(next_frame(&full)), (24, 8));
+    }
+
+    /// The header is complete the moment its own bytes are present; the body
+    /// arriving later is the caller's business, not the framer's.
+    ///
+    /// This is the contract that lets one function serve both circuits: the
+    /// data circuit needs the length of a body it has not received yet (to
+    /// decide whether to drain it past `EPICS_CA_MAX_ARRAY_BYTES`), the
+    /// name-service circuit just waits. A framer that returned `Incomplete`
+    /// here could not serve the first caller at all.
+    #[test]
+    fn a_header_parses_before_its_body_arrives() {
+        let mut buf = base_header(64);
+        buf.extend_from_slice(&[0u8; 8]); // 8 of the 64 body bytes
+        assert_eq!(header_of(next_frame(&buf)), (16, 64));
+    }
+
+    /// C `tcpiiu.cpp::processIncoming:1198` closes the connection when
+    /// `m_postsize & 0x7 != 0`. Every unaligned value below 8 must reach that
+    /// close — rounding one of them up (the pre-fix `align8`) is what let a
+    /// hostile peer slide the framer into the middle of the next message.
+    #[test]
+    fn every_misaligned_base_postsize_is_malformed() {
+        for postsize in 1..8u16 {
+            match next_frame(&base_header(postsize)) {
+                Frame::Malformed(FrameError::MisalignedPayload(n)) => {
+                    assert_eq!(n as u16, postsize)
+                }
+                Frame::Header { body_len, .. } => {
+                    panic!("postsize={postsize} is misaligned but parsed as body_len={body_len}")
+                }
+                Frame::Incomplete => panic!("a whole 16-byte header is not Incomplete"),
+                Frame::Malformed(e) => panic!("wrong refusal for postsize={postsize}: {e}"),
+            }
+        }
+    }
+
+    /// The alignment rule applies to the *actual* payload size, so it must
+    /// still bite when that size came from the extended annex rather than
+    /// from the base header's `m_postsize`.
+    #[test]
+    fn a_misaligned_extended_postsize_is_malformed() {
+        assert!(matches!(
+            next_frame(&extended_header(12)),
+            Frame::Malformed(FrameError::MisalignedPayload(12))
+        ));
+        // The aligned neighbour on either side is accepted, so the assertion
+        // above is about alignment and not about the annex.
+        assert_eq!(header_of(next_frame(&extended_header(8))), (24, 8));
+        assert_eq!(header_of(next_frame(&extended_header(16))), (24, 16));
+    }
+
+    /// Walking a buffer of chained messages is what both callers actually do,
+    /// and the answer must be positional: the same bytes at a different
+    /// offset yield the same framing. Mixed base and extended forms, because
+    /// a stream that alternates is where a wrong `hdr_size` desyncs.
+    #[test]
+    fn chained_messages_are_consumed_one_at_a_time() {
+        let mut stream = Vec::new();
+        let mut expected = Vec::new();
+        for (hdr, body) in [(base_header(8), 8usize), (extended_header(16), 16)] {
+            expected.push(hdr.len() + body);
+            stream.extend_from_slice(&hdr);
+            stream.extend(std::iter::repeat_n(0u8, body));
+        }
+        stream.extend_from_slice(&base_header(0)[..7]); // a torn third header
+
+        let mut offset = 0;
+        let mut consumed = Vec::new();
+        loop {
+            match next_frame(&stream[offset..]) {
+                Frame::Header {
+                    hdr_size, body_len, ..
+                } => {
+                    let msg_len = hdr_size + body_len;
+                    assert!(offset + msg_len <= stream.len(), "body must be present");
+                    consumed.push(msg_len);
+                    offset += msg_len;
+                }
+                Frame::Incomplete => break,
+                Frame::Malformed(e) => panic!("well-formed chain refused: {e}"),
+            }
+        }
+        assert_eq!(consumed, expected);
+        assert_eq!(
+            stream.len() - offset,
+            7,
+            "the torn header must be left in the buffer for the next read"
+        );
     }
 }

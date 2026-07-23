@@ -45,7 +45,7 @@
 //!
 //! ## pvalink (PVA links for record INP/OUT)
 //!
-//! Resolves record INP/OUT link strings of the form `@pva://<remote-pv>`
+//! Resolves record INP/OUT link strings of the form `pva://<remote-pv>`
 //! to a live PVA client that periodically reads the remote PV (INP) or
 //! pushes record output to it (OUT). Mirrors pvxs `ioc/pvalink*.cpp`.
 //!

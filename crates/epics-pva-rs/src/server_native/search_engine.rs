@@ -495,10 +495,38 @@ pub(crate) async fn search_matched_cids(
 ///   processing rules as `FromOriginTag`: do NOT re-forward (anti-loop)
 ///   and reject `server.isAny()` reply addresses. There is no peeled
 ///   destination, so the reply NIC is left to OS routing.
+///
+/// # Why two of the three are `cfg`-gated
+///
+/// Both forwarded origins exist only where a **loopback multicast socket**
+/// does, because that socket is the only thing that can deliver one:
+/// [`super::udp`] joins `224.0.0.128` on loopback and classifies what arrives
+/// there ([`super::udp::classify_loopback_datagram`]). That module is
+/// `#[cfg(not(target_os = "rtems"))]`, and the driver that replaces it on the
+/// target — [`super::blocking`]'s UDP responder — serves one plain
+/// `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and can
+/// therefore only ever produce [`Origin::Direct`].
+///
+/// So on the target these are not merely unused, they are unreachable, and
+/// carrying them there made the RTEMS gate print `variants FromOriginTag and
+/// Forwarded are never constructed` on every run. The fix is neither
+/// `#[allow(dead_code)]` nor deletion: pvxs upstream does distinguish these
+/// (`udp_collector.cpp:63-68` `origin_t`, acted on at `:373-374`, `:385-389`,
+/// `:508`, `:524`), so the hosted server needs them for parity. Gating instead
+/// states the target's actual property in the type — "this server has exactly
+/// one search origin" — the same shape `epics-ca-rs` took with
+/// `SearchTransport::NameServersOnly` ("no UDP socket is a fact about the
+/// type, not a runtime branch", `doc/calink-rtems-design.md` §10.1).
+///
+/// A target build that ever grows a loopback multicast socket must bring these
+/// back with it; the `cfg` is what makes that a compile error rather than a
+/// silently missing anti-loop rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     Direct,
+    #[cfg(not(target_os = "rtems"))]
     FromOriginTag,
+    #[cfg(not(target_os = "rtems"))]
     Forwarded,
 }
 
@@ -585,6 +613,53 @@ mod tests {
             prod.matches(r#"#[cfg(unix)]"#).count(),
             0,
             "a bare cfg(unix) arm would capture RTEMS again — that is the defect"
+        );
+    }
+
+    /// **Proven by inspection, pinned by source guard.** The two forwarded
+    /// origins are `cfg`-gated off the RTEMS target, and this pins the fact
+    /// that makes that sound: the driver that serves UDP there constructs
+    /// only [`Origin::Direct`].
+    ///
+    /// The gate is not cosmetic. `Forwarded` and `FromOriginTag` carry pvxs's
+    /// anti-loop rule and its refusal of an `isAny()` reply address
+    /// (`udp_collector.cpp:367-371`), and both are reachable only through the
+    /// loopback multicast socket `super::udp` binds — a module the target does
+    /// not compile. `super::blocking`'s responder has one plain
+    /// `std::net::UdpSocket` and passes `origin_tag_forwarding = false`, so an
+    /// origin-tagged datagram cannot reach it.
+    ///
+    /// What would break silently without this guard: a future blocking
+    /// responder that starts peeling CMD_ORIGIN_TAG, or joins the multicast
+    /// group, while the variants encoding "do not re-forward this" remain
+    /// `cfg`-ed away on that target. It fails here, on a host, rather than as
+    /// a forwarding loop on a board.
+    #[test]
+    fn the_blocking_udp_responder_produces_only_a_direct_origin() {
+        let prod = production_scope(include_str!("blocking.rs"));
+        assert_eq!(
+            prod.matches("Origin::Direct").count(),
+            1,
+            "the blocking responder passes exactly one origin, and it is Direct"
+        );
+        for gated in ["Origin::FromOriginTag", "Origin::Forwarded"] {
+            assert_eq!(
+                prod.matches(gated).count(),
+                0,
+                "`{gated}` is `#[cfg(not(target_os = \"rtems\"))]`; naming it \
+                 from the target's own UDP responder cannot compile there, and \
+                 doing so means the loopback-multicast path arrived without \
+                 the anti-loop rules that go with it"
+            );
+        }
+        // The other half of the same claim, from the other side: the responder
+        // must keep declining to forward. `origin_tag_forwarding` is what
+        // stands in for "a loopback multicast socket is bound".
+        assert!(
+            prod.contains("Origin::Direct,\n            tcp_port,"),
+            "the origin argument must still sit where process_search_datagram \
+             takes it; this guard reads position, so a reordered call must \
+             re-state the claim rather than pass by accident"
         );
     }
 

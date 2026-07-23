@@ -263,10 +263,31 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 /// band as the two pumps it precedes, and the caller parks on a oneshot
 /// instead: the receiver registers the task's waker, the send from the dial
 /// thread wakes it, and the band worker is released for the whole dial. The
-/// thread is *transient*: its body is one syscall and a channel send, its
-/// lifetime is bounded by `connect_timeout`, and a receiver dropped by an
-/// aborted caller only makes the send fail — the socket it opened closes with
-/// the thread, which is the socket's single finalizer.
+/// thread is *transient*: its body is one syscall and a channel send, and a
+/// receiver dropped by an aborted caller only makes the send fail — the socket
+/// it opened closes with the thread, which is the socket's single finalizer.
+///
+/// # Why the thread's connect is plain-blocking, and where the bound lives
+///
+/// The thread issues `TcpStream::connect`, **not** `connect_timeout`. Measured
+/// on the RTEMS target (QEMU guest-to-guest packet capture): std's
+/// `connect_timeout` — a nonblocking connect plus a `poll` wait — aborts the
+/// attempt immediately instead of honouring its bound, so the kernel answers
+/// the peer's SYN-ACK (~5 ms later) with an RST and every dial with real
+/// network latency fails, while an instant-RST refusal "works". A plain
+/// blocking `connect` demonstrably completes outbound on the same target —
+/// the CA client's dial, C parity with `tcpiiu.cpp`'s blocking `::connect()`.
+///
+/// The application-level bound (`connect_timeout`, pvxs `operationTimeout`)
+/// therefore moves to the awaiting side: `runtime::task::timeout` around the
+/// oneshot — the timer mechanism the exec backend already runs everywhere on
+/// target — fails the *dial* at the deadline while the thread keeps blocking
+/// under the OS's own connect ladder (Linux `tcp_syn_retries`, ~130 s). A
+/// timed-out dial's thread lingers until that OS bound, still the socket's
+/// single finalizer: if the connect completes after the caller gave up, the
+/// failed send drops the fresh socket. The lingering is bounded (one thread
+/// per in-flight dial, OS-capped) and only occurs on a blackholed peer — a
+/// refused or reachable peer resolves the connect promptly.
 async fn dial_blocking(
     target: SocketAddr,
     connect_timeout: Duration,
@@ -284,26 +305,27 @@ async fn dial_blocking(
         PVA_CLIENT_PRIORITY,
         StackSizeClass::Small,
         move || {
-            // `connect_timeout` rather than `connect`: pvxs bounds the dial
-            // with the client's per-operation deadline, and the bound is also
-            // what caps this thread's lifetime.
-            let _ = dialed_tx.send(std::net::TcpStream::connect_timeout(
-                &target,
-                connect_timeout,
-            ));
+            // Plain blocking `connect`; the application bound is applied by
+            // the awaiting side below. See "Why the thread's connect is
+            // plain-blocking" above — `connect_timeout`'s poll path is
+            // broken on the RTEMS target.
+            let _ = dialed_tx.send(std::net::TcpStream::connect(target));
         },
     )
     .map_err(PvaError::Io)?;
-    let stream = match dialed_rx.await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let stream = match timeout(connect_timeout, dialed_rx).await {
+        // The pvxs `operationTimeout` bound: the dial fails now; the thread
+        // finishes under the OS connect ladder and closes whatever it opens.
+        Err(_) => return Err(PvaError::Timeout),
+        Ok(Ok(Ok(s))) => s,
+        Ok(Ok(Err(e))) => {
             return Err(match e.kind() {
                 std::io::ErrorKind::TimedOut => PvaError::Timeout,
                 _ => PvaError::Io(e),
             });
         }
         // The thread ended without sending: it panicked.
-        Err(_) => {
+        Ok(Err(_)) => {
             return Err(PvaError::Io(std::io::Error::other(
                 "circuit dial thread ended without a result",
             )));
@@ -3289,9 +3311,10 @@ mod tests {
         }
 
         /// Boundary: a caller that goes away mid-dial leaks nothing. The
-        /// dial thread is the single finalizer for the socket it opens — it
-        /// is bounded by `connect_timeout`, its send to the dropped receiver
-        /// fails, and the socket closes with the thread.
+        /// dial thread is the single finalizer for the socket it opens: when
+        /// the connect finally resolves, its send to the dropped receiver
+        /// fails, the fresh socket closes with the thread, and the thread
+        /// exits — nothing else has to reap either.
         #[test]
         fn dropped_dial_future_retires_the_dial_thread() {
             // `comm` is truncated to 15 bytes, so match on the stable prefix.
@@ -3306,11 +3329,11 @@ mod tests {
                     .count()
             }
 
-            let (addr, _listener, _fillers) = syn_blackhole();
+            let (addr, listener, fillers) = syn_blackhole();
             let mut fut = Box::pin(dial_pva(
                 addr,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
             ));
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             // The first poll spawns the dial thread and parks on the oneshot.
@@ -3329,16 +3352,119 @@ mod tests {
             // The caller goes away mid-dial.
             drop(fut);
 
-            // The thread finishes on its own within its connect bound (2 s)
-            // plus slack; nothing else has to reap it.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Un-blackhole: drain the fillers so the abandoned dial's SYN
+            // retry (~1 s, ~3 s) completes. The thread's blocking connect
+            // resolves, its send fails, and it must close the socket and
+            // exit on its own.
+            for _ in 0..fillers.len() {
+                let _ = listener.accept().expect("drain a filler");
+            }
+            drop(fillers);
+            let (ours, _) = listener.accept().expect("accept the abandoned dial");
+            let ours: std::net::TcpStream = ours.into();
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
             while dial_threads() > 0 {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "dial thread leaked past its connect_timeout bound"
+                    "dial thread leaked after its connect resolved into a \
+                     dropped receiver"
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
+
+            // Single finalizer: the thread closed the socket it opened, so
+            // the accepted side reads EOF, not a half-open connection.
+            ours.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
+            assert_eq!(
+                n, 0,
+                "the dial thread must close the socket whose receiver is gone"
+            );
+        }
+
+        /// Boundary: the application-level bound (pvxs `operationTimeout`)
+        /// still applies with the plain-blocking connect — it is enforced by
+        /// the awaiting side's `timeout`, not by the (target-broken)
+        /// `connect_timeout` poll path, so a blackholed dial fails the
+        /// caller at the deadline even while the dial thread is still
+        /// blocking under the OS connect ladder.
+        #[test]
+        fn dial_times_out_at_the_application_bound() {
+            let (addr, _listener, _fillers) = syn_blackhole();
+
+            let started = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(addr, Duration::from_millis(500), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the dial must resolve at its application bound");
+            assert!(
+                matches!(res, Err(PvaError::Timeout)),
+                "a blackholed dial must fail with Timeout at the application \
+                 bound, got {res:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "the bound took {:?}; it must fire at ~500 ms, not wait out \
+                 the OS connect ladder",
+                started.elapsed()
+            );
+        }
+
+        /// A dial against a live listener that answers succeeds and the
+        /// returned halves carry bytes — the plain-blocking connect path,
+        /// end to end. (SYN-ACK latency proper cannot be injected on
+        /// loopback without privileges; delayed *completion* is covered by
+        /// `dial_completing_after_syn_retry_is_usable`.)
+        #[test]
+        fn dial_to_live_listener_succeeds() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let (bytes_tx, bytes_rx) = std::sync::mpsc::channel();
+            let acceptor = std::thread::spawn(move || {
+                let (ours, _) = listener.accept().expect("accept the dial");
+                ours.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                use std::io::Read;
+                let mut buf = [0u8; 4];
+                (&ours).read_exact(&mut buf).expect("read the dialed bytes");
+                let _ = bytes_tx.send(buf);
+            });
+
+            let (dial_tx, dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let res =
+                    match dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10)).await {
+                        Ok((reader, mut writer)) => writer
+                            .write_all(b"live")
+                            .await
+                            .map(|()| (reader, writer))
+                            .map_err(PvaError::Io),
+                        Err(e) => Err(e),
+                    };
+                let _ = dial_tx.send(res);
+            });
+
+            let _halves = dial_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("dial must resolve")
+                .expect("a dial to a live listener must succeed");
+            let got = bytes_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the dialed connection must carry bytes");
+            assert_eq!(&got, b"live");
+            acceptor.join().expect("acceptor thread");
         }
     }
 }

@@ -119,3 +119,65 @@ jobs:
         key: no-default-features
     - name: Check (no default features)
       run: cargo check --workspace --no-default-features
+
+  # Every job above runs each test exactly ONCE, and that is the hole two
+  # exec-backend defects walked through: `cancel_is_a_sync_point_resource_released`
+  # (fixed by 96b0d3fb) and `cancel_after_completion_reports_not_active` (fixed by
+  # 5d5e5b04). Both were probabilistic and feature-ON only — measured on the
+  # defective tree at 3-5 failures per 50 runs and 2-5 per 50 respectively. A
+  # single-run gate sees such a defect with probability ~1/25 and reports green
+  # the other ~96% of the time, which is exactly what happened: the fixes came
+  # from hand-repetition, not from CI.
+  #
+  # This job gates the CLASS, not those two names. It repeats the whole
+  # cancel/termination test module, whose members all turn on the same
+  # abort-versus-drop ordering the two defects lived in.
+  #
+  # Why 50 iterations: for a per-run failure probability p, N clean iterations
+  # miss the defect with probability (1-p)^N. At the lower end of the measured
+  # band, p = 2/50 = 1/25:
+  #     N=10 → 0.96^10 = 0.66 (34% detection — worse than useless)
+  #     N=25 → 0.96^25 = 0.36 (64%)
+  #     N=50 → 0.96^50 = 0.13 (>85% detection)
+  # 50 is the smallest round count clearing 85% at the weakest reproducer's
+  # rate; the stronger one (5/50) is caught >99% of the time at that N. The
+  # module runs in ~1 s, so 50 iterations cost under two minutes.
+  #
+  # Why a shell loop: cargo-nextest has no repeat-until-N-runs mode for PASSING
+  # tests. `--retries` only re-runs tests that already failed, which is the
+  # opposite of what a flake hunt needs. `--retries 0` is passed explicitly so
+  # this job can never inherit a retrying profile — a retry would convert the
+  # red iteration this gate exists to produce back into a green run.
+  exec-backend-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-exec-model-stress
+    # Compile once up front so a build break reports as a build break rather
+    # than as "iteration 1 failed".
+    - name: Build test binary (rtems-exec-model)
+      run: cargo build -p epics-pva-rs --features rtems-exec-model --lib --tests
+    - name: Stress cancel/termination tests, 50 iterations (exec backend ON)
+      run: |
+        set -u
+        iterations=50
+        for i in $(seq 1 "$iterations"); do
+          echo "::group::iteration $i/$iterations"
+          if ! cargo nextest run -p epics-pva-rs --features rtems-exec-model \
+               --lib --retries 0 \
+               -E 'test(/^client_native::operation::tests::/)'; then
+            echo "::endgroup::"
+            echo "::error::exec-backend stress FAILED on iteration $i of $iterations"
+            exit 1
+          fi
+          echo "::endgroup::"
+        done
+        echo "exec-backend stress: $iterations/$iterations iterations green"

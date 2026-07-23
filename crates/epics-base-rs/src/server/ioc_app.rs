@@ -700,11 +700,11 @@ impl IocApplication {
                 // callback bands get, so the same class they use.
                 .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
-                    // No EPICS band: this runs the startup script once and
-                    // exits, it is not a scheduled IOC role. It still names
-                    // itself, because a startup script that hangs is exactly
-                    // what an RTEMS task listing is consulted about.
-                    crate::runtime::task::name_current_thread();
+                    // C bands the thread that runs iocsh, and for the reason
+                    // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
+                    let _ = crate::runtime::task::enter_ioc_thread(
+                        crate::runtime::task::ThreadPriority::Iocsh,
+                    );
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in startup_commands {
                         shell.register(cmd);
@@ -1074,7 +1074,9 @@ impl IocApplication {
                 .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
                     // Same reasoning as "iocsh-startup" above.
-                    crate::runtime::task::name_current_thread();
+                    let _ = crate::runtime::task::enter_ioc_thread(
+                        crate::runtime::task::ThreadPriority::Iocsh,
+                    );
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in shell_cmds_clone {
                         shell.register(cmd);
@@ -1544,6 +1546,79 @@ mod tests {
     /// two tests announcing at once would observe each other's
     /// callbacks. The state machine here is small; a mutex is enough.
     static INIT_HOOK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: every thread this module creates take its band **and** its OS
+    /// name through `enter_ioc_thread`. MUST NOT: an iocsh thread run at the
+    /// priority it inherited from `POSIX_Init`.
+    ///
+    /// Both threads here run iocsh command bodies — the startup script, and
+    /// the `afterIocRunning` queue (epics-base PR #558). In C that is one
+    /// thread, the shell, and base-on-RTEMS bands it explicitly:
+    /// `epicsThreadSetPriority(epicsThreadGetIdSelf(), epicsThreadPriorityIocsh)`
+    /// (`libcom/RTEMS/posix/rtems_init.c:1002`), under the comment *"Override
+    /// RTEMS Posix configuration, it gets started with posix prio 2"*. That is
+    /// the same inheritance defect the port has: RTEMS pthreads inherit their
+    /// creator's parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58`)
+    /// and the boot shim runs `POSIX_Init` at `RTEMS_MAXIMUM_PRIORITY - 1`, so
+    /// a thread that skips the prologue runs one level above idle.
+    ///
+    /// `Iocsh` = 91 is the top of the EPICS range — above `High`(90) and every
+    /// scan and callback band. That is C's choice and it is the right one for
+    /// both callers: `run` **awaits** each of these threads, so with an
+    /// inherited near-idle band the whole of iocInit sits behind every scan
+    /// thread and callback worker already running. The startup script is
+    /// bounded (it runs once and exits); the post-init queue is as bounded as
+    /// the command an operator would have typed at the C console, which C runs
+    /// at this same 91.
+    ///
+    /// Source inspection, because the defect is a call that is *absent*.
+    #[test]
+    fn iocsh_threads_take_the_iocsh_band() {
+        let prod = production_scope(include_str!("ioc_app.rs"));
+
+        assert_eq!(
+            prod.matches("enter_ioc_thread(").count(),
+            2,
+            "the startup-script thread and the afterIocRunning thread"
+        );
+        assert_eq!(
+            prod.matches("name_current_thread(").count(),
+            0,
+            "naming without banding leaves the thread one level above idle on \
+             the target; `enter_ioc_thread` is the whole prologue"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(").count(),
+            0,
+            "banding without naming leaves an RTEMS-anonymous thread"
+        );
+        for name in ["iocsh-startup", "iocsh-after-ioc-running"] {
+            let at = prod
+                .find(&format!(".name(\"{name}\""))
+                .unwrap_or_else(|| panic!("the {name} thread moved; update this guard"));
+            let head = &prod[at..(at + 700).min(prod.len())];
+            assert!(
+                head.contains("enter_ioc_thread(") && head.contains("ThreadPriority::Iocsh"),
+                "{name} must enter its IOC thread role at `ThreadPriority::Iocsh` \
+                 (rtems_init.c:1002)"
+            );
+        }
+    }
+
+    /// `epicsThread.h:86` — the band the guard above pins is C's constant.
+    #[test]
+    fn the_iocsh_band_is_epics_thread_priority_iocsh() {
+        assert_eq!(crate::runtime::task::ThreadPriority::Iocsh.value(), 91);
+    }
 
     /// The `dbLoadGroup` startup command queues `(filename, macros)`
     /// pairs (NOT bound to any provider), with pvxs removal

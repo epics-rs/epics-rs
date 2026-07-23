@@ -550,49 +550,23 @@ mod ioc {
         let link_count = resolver.link_count();
 
         // (2b) Periodic scan + PINI. C `iocInit` owns `scanInit` (`dbScan.c`)
-        //      independent of any network server; in this tree the
-        //      `ScanScheduler` is driven only by the CA server's run loop
-        //      (`epics-ca-rs` `ca_server.rs:1313`) — a server this binary
-        //      does not have, so without this step every periodic `SCAN`
-        //      field in the database is silently dead on the PVA-only
-        //      target (found by the §8 load probe, whose self-counting
-        //      members never counted). Safe against doubling by
-        //      construction: `try_claim_scan_start` makes any second
-        //      scheduler on the same database a non-owner that parks, so a
-        //      process runs exactly one set of `scan-%g` threads no matter
-        //      how many entry points start one.
-        //
-        //      A dedicated thread and NOT `runtime::task::spawn`: after the
-        //      scheduler spawns its `scan-%g` threads it parks on a
-        //      forever-pending future whose only job is keeping the
-        //      `ScanStopGuard` alive — and on the exec backend a task that
-        //      returns `Pending` while registering its waker with no wake
-        //      source is held by nobody, so the executor drops it and the
-        //      dropped guard trips the stop flag: every scan thread exits
-        //      within one tick. Measured on the host exec model — probes
-        //      reached "spawning periodic threads" while the thread census
-        //      showed zero `scan-*` threads, with the spawn handle both
-        //      dropped and `mem::forget`ed. Parking a real thread keeps the
-        //      future (and guard) alive on its stack on both backends. The
-        //      scan-ownership hoist replaces this shape.
-        {
-            let scan_db = db.clone();
-            if let Err(e) = thread::Builder::new()
-                .name("scan-owner".to_string())
-                .stack_size(StackSizeClass::Medium.bytes())
-                .spawn(move || {
-                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
-                        epics_base_rs::runtime::task::ThreadPriority::Low,
-                    );
-                    let _ = block_on_sync(
-                        epics_base_rs::server::scan::ScanScheduler::new(scan_db).run(),
-                    );
-                })
-            {
-                eprintln!("rtems-pva-ioc: cannot start the scan owner thread: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+        //      independent of any network server; without this step every
+        //      periodic `SCAN` field in the database is silently dead on
+        //      the PVA-only target (found by the §8 load probe, whose
+        //      self-counting members never counted — the scheduler used to
+        //      be driven only by the CA server's run loop, a server this
+        //      binary does not have). `ScanOwner` is the core-owned form of
+        //      the dedicated scan-owner thread this binary first proved on
+        //      target: a thread (not `runtime::task::spawn`) because on the
+        //      exec backend a task parked on a forever-pending future with
+        //      its waker registered nowhere is dropped by the executor,
+        //      taking the `ScanStopGuard` — and every `scan-%g` thread —
+        //      with it. Redundant starts stay parked non-owners
+        //      (`try_claim_scan_start`), so exactly one set of `scan-%g`
+        //      threads exists no matter how many entry points start one.
+        //      Held to the end of `main`: this IOC scans for as long as it
+        //      serves.
+        let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
 
         // (3) The PVA front-end. `bind` consumes the config, so the two ports
         //     are read off it first.

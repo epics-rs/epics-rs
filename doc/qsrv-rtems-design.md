@@ -2179,3 +2179,53 @@ combo run, and the marker text now says so. `scripts/rtems-check.sh` is
 untouched and stays exit 0: `pva-gateway` is not in the RTEMS closure
 (the target selection is `qsrv-core,pvalink`), and this change removes
 no cfg-gate the target build depends on.
+
+### 9.18 The `ca-gateway` twin: the same raw-tokio family, closed the same way
+
+§9.17 fixed `src/pva_gateway/`. `src/ca_gateway/` had the identical
+family, and — unlike its PVA twin — `ca-gateway` **is** in the crate's
+`default` feature list, so its production code is built (and run) by the
+plain `-p epics-bridge-rs --features rtems-exec-model` gate that §9.17's
+module never reaches. The gateway's own spawns and timers therefore had
+to stop naming `tokio` regardless of whether the CA gateway is ever in
+the RTEMS closure.
+
+**Anchor and census.** `rg -n 'tokio::(spawn|time::)'
+crates/epics-bridge-rs/src/ca_gateway/`, widened to
+`tokio::task::JoinHandle` because the seam owns the handle type too
+(§9.17's precedent, commit `e328719d`), returned 49 hits across the five
+files in scope — 39 from the base pattern, 10 more from the widening. 28
+were production, 21 were inside `#[cfg(test)]`:
+
+| file | `#[cfg(test)]` at | production sites |
+| --- | --- | --- |
+| `upstream.rs` | 1893 | `JoinHandle` import + 4 uses, 2 `timeout`, 2 `spawn`, 4 `sleep` |
+| `server.rs` | 1373 | 5 `spawn`, 3 `interval`, 2 `JoinHandle` signatures |
+| `control.rs` | 332 | `spawn_control_owner`: 1 `JoinHandle`, 1 `spawn` |
+| `downstream.rs` | 545 | `forwarder` field + `spawn_conn_event_forwarder`: 2 `JoinHandle`, 1 `spawn` |
+| `beacon.rs` | 99 | **none** — all three hits are test-only |
+
+**The fix is the §9.17 fix.** Every production site now calls
+`epics_base_rs::runtime::task::{spawn,interval,sleep,timeout}` and every
+stored handle is the seam's `TaskHandle<()>` alias. `tokio::sync`
+primitives stay (seam contract), and so does `tokio::signal::unix`
+inside `CaGatewayServer::spawn_signal_handler` — signals are not part of
+the spawn/time family, and that function is already `#[cfg(unix)]`, so
+only the `spawn` wrapping it moved to the seam. Test bodies are
+untouched by design.
+
+**Measured.** `-p epics-bridge-rs`: 697 tests run, 697 passed, 0
+skipped. `-p epics-bridge-rs --features rtems-exec-model`: 685 tests
+run, 685 passed, 0 skipped. `cargo clippy -p epics-bridge-rs
+--all-targets -- -D warnings` clean.
+
+**What this does NOT close.** The 12-test delta between the two runs is
+unchanged and unrelated: those are `upstream.rs` tests carrying
+`#[cfg(not(feature = "rtems-exec-model"))]` because they stand up an
+in-process async `epics_ca_rs::server::CaServer`, whose *own*
+`tokio::net` calls need a reactor the exec backend does not start. That
+is a test-harness dependency, not a gateway one, so porting the
+gateway's spawns cannot make those tests runnable feature-ON; the
+`rtems_exec_model_gate` census test still accounts for them and passes.
+The `RTEMS-EXEC-MODEL-ALLOW` markers on the five files already read
+`checked` and their counts are unchanged, so no marker text moved.

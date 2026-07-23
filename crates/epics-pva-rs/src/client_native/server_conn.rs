@@ -244,26 +244,71 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 ///
 /// The two bounds are deliberately different values and must not be collapsed
 /// into one; see [`dial_pva`] for what each one is.
-fn dial_blocking(
+///
+/// # Why the connect gets a thread
+///
+/// The connect is a *blocking* syscall bounded by `connect_timeout`, and every
+/// caller of this function is a task — `ns_task` and the channel pool through
+/// [`dial_pva`], and [`ServerConn::connect_blocking`] directly. On the exec
+/// backend a task runs on a cooperative callback-band worker shared with every
+/// other future on its band, so running the connect inline parks the band for
+/// the whole bound. Measured exactly there (gdb all-thread dump, host-linux
+/// `rtems-pva-ioc`): the single `cbMedium` worker sat in `poll(timeout=39999)`
+/// under `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a name
+/// server that did not answer starved every future on Medium for ~40 s per
+/// attempt (the executor failure class of `doc/qsrv-rtems-design.md` §9.15.1).
+///
+/// So the connect takes a dedicated thread — the CA client's
+/// `dial_blocking` shape (`epics-ca-rs/src/client/transport.rs`) — at the same
+/// band as the two pumps it precedes, and the caller parks on a oneshot
+/// instead: the receiver registers the task's waker, the send from the dial
+/// thread wakes it, and the band worker is released for the whole dial. The
+/// thread is *transient*: its body is one syscall and a channel send, its
+/// lifetime is bounded by `connect_timeout`, and a receiver dropped by an
+/// aborted caller only makes the send fail — the socket it opened closes with
+/// the thread, which is the socket's single finalizer.
+async fn dial_blocking(
     target: SocketAddr,
     connect_timeout: Duration,
     write_deadline: Duration,
 ) -> PvaResult<(DynRead, DynWrite)> {
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
+    use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread};
 
-    // `connect_timeout` rather than `connect`: this is a blocking syscall, and
-    // it is the one place in the blocking path that is NOT on a pump thread. On
-    // RTEMS the caller is a bare thread, so blocking it is correct and is what
-    // the server driver does. On a host taking this path it occupies a runtime
-    // worker for at most `connect_timeout`, which is why the bound is passed
-    // rather than left to the OS.
-    let stream =
-        std::net::TcpStream::connect_timeout(&target, connect_timeout).map_err(|e| {
-            match e.kind() {
+    // `Small`: the thread's whole body is one syscall and a channel send. It
+    // is named for the target so a thread dump during a stuck connect says
+    // which server is not answering.
+    let (dialed_tx, dialed_rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    spawn_dedicated_thread(
+        format!("PVAC-connect {target}"),
+        PVA_CLIENT_PRIORITY,
+        StackSizeClass::Small,
+        move || {
+            // `connect_timeout` rather than `connect`: pvxs bounds the dial
+            // with the client's per-operation deadline, and the bound is also
+            // what caps this thread's lifetime.
+            let _ = dialed_tx.send(std::net::TcpStream::connect_timeout(
+                &target,
+                connect_timeout,
+            ));
+        },
+    )
+    .map_err(PvaError::Io)?;
+    let stream = match dialed_rx.await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(match e.kind() {
                 std::io::ErrorKind::TimedOut => PvaError::Timeout,
                 _ => PvaError::Io(e),
-            }
-        })?;
+            });
+        }
+        // The thread ended without sending: it panicked.
+        Err(_) => {
+            return Err(PvaError::Io(std::io::Error::other(
+                "circuit dial thread ended without a result",
+            )));
+        }
+    };
     // `read_timeout` keeps `PumpConfig`'s effectively-infinite default, and
     // that is load-bearing rather than a default taken for lack of a better
     // value. `reader_pump` ends the connection when its `SO_RCVTIMEO` expires,
@@ -355,7 +400,7 @@ pub(crate) async fn dial_pva(
     }
     #[cfg(any(exec_backend, pva_blocking_client))]
     {
-        dial_blocking(target, connect_timeout, write_deadline)
+        dial_blocking(target, connect_timeout, write_deadline).await
     }
 }
 
@@ -404,7 +449,7 @@ impl ServerConn {
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout)?;
+        let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
         Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
     }
 
@@ -3030,5 +3075,270 @@ mod tests {
             "an idle blocking circuit must outlive op_timeout: the reader pump's \
              receive timeout is not an idle-disconnect bound"
         );
+    }
+
+    /// The dial seam must never occupy a callback-band worker.
+    ///
+    /// Measured (gdb all-thread dump of the host-linux `rtems-pva-ioc`): the
+    /// single `cbMedium` worker sat in `poll(timeout=39999)` under
+    /// `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a
+    /// synchronous dial to a SYN-blackholed name server held the band for
+    /// ~40 s per attempt, starving everything scheduled on Medium (the same
+    /// executor failure class as `doc/qsrv-rtems-design.md` §9.15.1: one
+    /// occupant on a band = broad delivery starvation).
+    ///
+    /// Exec-backend-only: the callback band being pinned is the exec
+    /// executor's. The `--cfg pva_blocking_client` tokio build shares the
+    /// same `dial_blocking` code path, so this coverage carries to it.
+    /// Linux-only for the same reason as `epics-ca-rs`'s
+    /// `connect_deadline_tests`: the blackhole below relies on Linux
+    /// answering an accept-queue-overflowing SYN with silence
+    /// (`tcp_abort_on_overflow = 0`, the default); macOS/BSD answer it with
+    /// an RST and the dial resolves immediately.
+    #[cfg(all(exec_backend, target_os = "linux"))]
+    mod dial_band_tests {
+        use super::*;
+        use std::future::Future;
+
+        /// A local address whose SYNs the kernel drops: a listening socket
+        /// with a full accept queue (the `epics-ca-rs`
+        /// `connect_deadline_tests::syn_blackhole` mechanism). Linux
+        /// (`tcp_abort_on_overflow = 0`, the default) answers an overflowing
+        /// SYN with silence, so the connecting peer sits in SYN-SENT and
+        /// retries — a deterministic unanswered dial with no route off the
+        /// box and no firewall.
+        ///
+        /// Saturation is *verified*, not assumed: a handshake completing
+        /// through the SYN queue lands in the accept queue a beat after the
+        /// filler's `connect()` returns, so a dial racing right behind a
+        /// single unverified filler can still be admitted (observed: the
+        /// late-dial test's connection beat the filler into the queue). The
+        /// probe loop below keeps adding established fillers until a fresh
+        /// nonblocking connect is still unanswered 300 ms in — on loopback a
+        /// queued handshake completes in microseconds and a dropped SYN's
+        /// first retransmit is at ~1 s, so an unanswered probe proves the
+        /// queue is full. Closing the probe in SYN-SENT aborts the attempt
+        /// (no further retransmits), so it cannot steal a slot later.
+        ///
+        /// Returns the blackhole address, the listener, and the fillers
+        /// occupying the queue; the caller keeps them alive (and never
+        /// accepts) for as long as the blackhole must hold.
+        fn syn_blackhole() -> (SocketAddr, socket2::Socket, Vec<std::net::TcpStream>) {
+            use socket2::{Domain, Socket, Type};
+
+            let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+            sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+                .expect("bind");
+            // Backlog 0 → the kernel rounds to a 1-slot accept queue.
+            sock.listen(0).expect("listen");
+            let addr: SocketAddr = sock.local_addr().expect("local_addr").as_socket().unwrap();
+
+            let mut fillers = Vec::new();
+            loop {
+                let probe = Socket::new(Domain::IPV4, Type::STREAM, None).expect("probe");
+                probe.set_nonblocking(true).expect("probe nonblocking");
+                match probe.connect(&addr.into()) {
+                    Ok(()) => {}
+                    Err(e)
+                        if e.raw_os_error() == Some(libc::EINPROGRESS)
+                            || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("probe connect: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                if probe.peer_addr().is_ok() {
+                    // Admitted: the queue had room. Keep it as a filler.
+                    probe.set_nonblocking(false).expect("filler blocking");
+                    fillers.push(probe.into());
+                } else {
+                    // Still SYN-SENT after 300 ms: the queue is full.
+                    return (addr, sock, fillers);
+                }
+            }
+        }
+
+        /// The invariant, pinned where it was measured broken: while a dial
+        /// toward an unanswering server is in flight, other work spawned on
+        /// the same callback band still runs. Pre-fix, `dial_blocking`'s
+        /// synchronous `connect_timeout` parked the band's single worker for
+        /// the whole bound and the canary starved.
+        #[test]
+        fn stalled_dial_releases_the_callback_band() {
+            let (addr, _listener, _fillers) = syn_blackhole();
+
+            // The dial, spawned exactly as `ns_task` is: `runtime::task::spawn`
+            // → the default (Medium) callback band and its single worker.
+            let (dial_tx, _dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = dial_tx.send(
+                    dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            // Let the band worker take the dial task and enter the connect.
+            std::thread::sleep(Duration::from_millis(300));
+
+            // Canary on the same band, behind the stalled dial.
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                "a stalled dial must not occupy the callback band: the canary \
+                 spawned behind it did not run within 2 s, so the band's \
+                 single worker is parked inside the dial"
+            );
+        }
+
+        /// Boundary: a dial that completes only after SYN retransmission is
+        /// still usable. The accept queue is drained ~2 s in, the client's
+        /// next SYN retry (Linux RTO ladder: ~1 s, ~3 s, …) completes the
+        /// handshake, and the returned write half carries bytes.
+        #[test]
+        fn dial_completing_after_syn_retry_is_usable() {
+            let (addr, listener, fillers) = syn_blackhole();
+            let started = std::time::Instant::now();
+
+            let (bytes_tx, bytes_rx) = std::sync::mpsc::channel();
+            let acceptor = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                // Drain the fillers (queued first, FIFO): frees the accept
+                // queue so the dial's retried SYN completes. The next accept
+                // after them is the late dial.
+                for _ in 0..fillers.len() {
+                    let _ = listener.accept().expect("drain a filler");
+                }
+                drop(fillers);
+                let (ours, _) = listener.accept().expect("accept the late dial");
+                let ours: std::net::TcpStream = ours.into();
+                ours.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                use std::io::Read;
+                let mut buf = [0u8; 9];
+                (&ours).read_exact(&mut buf).expect("read the dialed bytes");
+                let _ = bytes_tx.send(buf);
+            });
+
+            // Write through the returned half, then hand BOTH halves to the
+            // test: dropping the reader adapter shuts the socket down, so
+            // the halves must outlive the acceptor's read.
+            let (dial_tx, dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let res =
+                    match dial_pva(addr, Duration::from_secs(15), Duration::from_secs(15)).await {
+                        Ok((reader, mut writer)) => writer
+                            .write_all(b"late-dial")
+                            .await
+                            .map(|()| (reader, writer))
+                            .map_err(PvaError::Io),
+                        Err(e) => Err(e),
+                    };
+                let _ = dial_tx.send(res);
+            });
+
+            let _halves = dial_rx
+                .recv_timeout(Duration::from_secs(12))
+                .expect("dial must resolve before its 15 s bound")
+                .expect("a dial completing after SYN retry must succeed");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1900),
+                "the dial resolved in {:?}, i.e. before the accept queue was \
+                 drained — the blackhole did not hold and the test proved \
+                 nothing about a late-completing dial",
+                started.elapsed()
+            );
+            let got = bytes_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the late-dialed connection must carry bytes");
+            assert_eq!(&got, b"late-dial");
+            acceptor.join().expect("acceptor thread");
+        }
+
+        /// Boundary: a target that answers with RST (nothing listening)
+        /// fails the dial promptly — the off-band hop must not turn a fast
+        /// refusal into a slow one.
+        #[test]
+        fn dial_to_closed_target_fails_fast() {
+            // Bind, take the addr, drop: nothing listens → RST.
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = l.local_addr().expect("addr");
+            drop(l);
+
+            let started = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("an RST-refused dial must resolve promptly");
+            assert!(
+                res.is_err(),
+                "nothing listens at {addr}: the dial must fail"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "the refusal took {:?}; the off-band hop must not delay it",
+                started.elapsed()
+            );
+        }
+
+        /// Boundary: a caller that goes away mid-dial leaks nothing. The
+        /// dial thread is the single finalizer for the socket it opens — it
+        /// is bounded by `connect_timeout`, its send to the dropped receiver
+        /// fails, and the socket closes with the thread.
+        #[test]
+        fn dropped_dial_future_retires_the_dial_thread() {
+            // `comm` is truncated to 15 bytes, so match on the stable prefix.
+            fn dial_threads() -> usize {
+                std::fs::read_dir("/proc/self/task")
+                    .expect("task dir")
+                    .filter(|e| {
+                        let Ok(e) = e else { return false };
+                        std::fs::read_to_string(e.path().join("comm"))
+                            .is_ok_and(|c| c.starts_with("PVAC-connect"))
+                    })
+                    .count()
+            }
+
+            let (addr, _listener, _fillers) = syn_blackhole();
+            let mut fut = Box::pin(dial_pva(
+                addr,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // The first poll spawns the dial thread and parks on the oneshot.
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "a dial toward a blackhole must be pending, not resolved on \
+                 the caller's thread"
+            );
+            assert_eq!(
+                dial_threads(),
+                1,
+                "the first poll must have handed the connect to a dedicated \
+                 dial thread"
+            );
+
+            // The caller goes away mid-dial.
+            drop(fut);
+
+            // The thread finishes on its own within its connect bound (2 s)
+            // plus slack; nothing else has to reap it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while dial_threads() > 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dial thread leaked past its connect_timeout bound"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }

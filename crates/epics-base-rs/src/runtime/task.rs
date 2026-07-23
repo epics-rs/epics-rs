@@ -269,6 +269,105 @@ where
     )
 }
 
+/// A set of spawned tasks, joined as they complete — the seam replacement for
+/// `tokio::task::JoinSet`.
+///
+/// `JoinSet` is a **fourth spelling of `tokio::spawn`**, and the one no seam
+/// guard caught: `JoinSet::spawn` calls `tokio::spawn` internally, so it panics
+/// with *"there is no reactor running"* on any thread that is not inside a
+/// tokio runtime — which on RTEMS is every callback-band worker. Measured on
+/// target: the CA client's transport manager died on `cbMedium` at its first
+/// connect (`doc/calink-rtems-design.md` §11.1). Naming it here means a call
+/// site can express "spawn a set of tasks and reap them as they finish"
+/// without reaching past the seam.
+///
+/// The three properties call sites depend on, all preserved:
+///
+/// * **Concurrency** — every member runs independently; joining one does not
+///   block the others.
+/// * **Pair-by-value** — [`Self::join_next`] yields whichever member finished
+///   first, so a task that returns its own key can be matched to its state.
+/// * **Abort on drop** — dropping the set cancels every member that has not
+///   finished, which is the property that distinguishes a `JoinSet` from a bag
+///   of detached `JoinHandle`s.
+pub struct TaskSet<T> {
+    tasks: Vec<TaskHandle<T>>,
+}
+
+impl<T> Default for TaskSet<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> TaskSet<T> {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self { tasks: Vec::new() }
+    }
+
+    /// Number of members that have not yet been joined.
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// `true` when no member is outstanding.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+}
+
+impl<T: Send + 'static> TaskSet<T> {
+    /// Spawn `future` into the set — through [`spawn`], so the RTEMS build
+    /// lands it on a callback band instead of demanding a tokio runtime.
+    pub fn spawn<F>(&mut self, future: F)
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        self.tasks.push(spawn(future));
+    }
+
+    /// Wait for the next member to finish and return its result, removing it
+    /// from the set. `None` when the set is empty — matching
+    /// `JoinSet::join_next`, so a `select!` arm on it goes quiet rather than
+    /// spinning once every task has been reaped.
+    ///
+    /// Cancel-safe: the returned future holds no state of its own, so a
+    /// `select!` that drops it loses nothing.
+    pub async fn join_next(&mut self) -> Option<Result<T, TaskJoinError>> {
+        if self.tasks.is_empty() {
+            return None;
+        }
+        std::future::poll_fn(|cx| {
+            for i in 0..self.tasks.len() {
+                // Both backends' handles are `Unpin` (tokio's `JoinHandle`,
+                // and `JoinFuture`, whose only field is an `Arc`), so this
+                // needs no pin projection. Polling every pending member
+                // re-registers this waker with each — the shape both handles
+                // document.
+                if let std::task::Poll::Ready(result) =
+                    std::pin::Pin::new(&mut self.tasks[i]).poll(cx)
+                {
+                    self.tasks.swap_remove(i);
+                    return std::task::Poll::Ready(Some(result));
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+impl<T> Drop for TaskSet<T> {
+    /// Cancel every outstanding member — `JoinSet`'s drop behaviour, and the
+    /// reason a call site reaches for a set rather than a `Vec` of handles.
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(tokio_backend)]
 pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
@@ -280,14 +379,34 @@ pub async fn sleep(duration: Duration) {
     crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
 }
 
+/// The instant [`sleep_until`] measures deadlines against — **the backend's own
+/// clock**, which is the whole point of naming it here.
+///
+/// A deadline is only meaningful in the clock the timer that waits on it runs
+/// on. The hosted timer is tokio's, and under `#[tokio::test(start_paused =
+/// true)]` tokio's clock is virtual and advances on `sleep`, not with the wall
+/// — so a `std::time::Instant` deadline handed to a tokio timer is a deadline
+/// in a *different* timeline, and the wait is wrong by however far the two have
+/// diverged. The RTEMS timer runs on `std::time::Instant` (1-second-quantized
+/// on target, `doc/calink-rtems-design.md` §5.5).
+///
+/// Taking the alias rather than a concrete instant type is what keeps a caller
+/// from mixing them: `Instant::now() + timeout` is the deadline `sleep_until`
+/// will actually honour, on both backends.
 #[cfg(tokio_backend)]
-pub async fn sleep_until(deadline: std::time::Instant) {
-    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+pub type Instant = tokio::time::Instant;
+/// See the hosted definition.
+#[cfg(exec_backend)]
+pub type Instant = std::time::Instant;
+
+#[cfg(tokio_backend)]
+pub async fn sleep_until(deadline: Instant) {
+    tokio::time::sleep_until(deadline).await;
 }
 
 /// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
 #[cfg(exec_backend)]
-pub async fn sleep_until(deadline: std::time::Instant) {
+pub async fn sleep_until(deadline: Instant) {
     crate::runtime::background::timer_sleep::sleep_until(&background().timer().handle(), deadline)
         .await;
 }

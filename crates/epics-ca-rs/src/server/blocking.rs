@@ -24,6 +24,20 @@
 //! and work on hosted Unix too — so this whole driver is host-compiled and
 //! host-tested.
 //!
+//! # Two threads a client, borrowed and not created
+//!
+//! "Thread-per-client" describes the I/O model, not the thread lifecycle. A
+//! client runs on two threads — the C `camsgtask` receiver and its `event_task`
+//! sender — but it **borrows** them, as one set, from [`CAS_CLIENT_POOL`]; it
+//! creates neither. Every `std::thread` *creation* leaves 176–179 B behind
+//! permanently on RTEMS 6, so a driver that created two per accept leaked
+//! without a ceiling (`doc/rtems-connection-worker-pool-design.md`). Borrowing
+//! is also the single admission point: the accept loop's one
+//! [`WorkerPool::acquire`] is the only fallible step before a client is served,
+//! and its failure — a full process or a target out of thread resources — is
+//! the one refusal, taken after `accept` with the socket still open, where C
+//! `rsrv` takes its own (`caservertask.c:1240-1250`).
+//!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
 //! the analogue of C's `CAS-UDP` thread (`cast_server`, `cast_server.c:113`):
 //! a blocking `std::net::UdpSocket` `recv_from` loop that drives the shared
@@ -115,7 +129,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -125,6 +139,7 @@ use epics_base_rs::runtime::blocking_io;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
+use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
 
@@ -180,6 +195,99 @@ const CAS_TCP_PRIORITY: ThreadPriority =
 /// monitor send.
 const CAS_UDP_PRIORITY: ThreadPriority =
     ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 4);
+
+/// The most CA clients this **process** can serve at once, and therefore the
+/// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
+///
+/// Not an arbitrary headroom number: it is the target's measured fd wall, and
+/// every term is read out of a source file or a measurement recorded in
+/// `doc/rtems-fd-ceiling-deviation.md` (the ramp that produced them drove this
+/// very driver — raw CA TCP, VERSION handshake, one `CA_PROTO_CREATE_CHAN`).
+///
+/// * **fd wall = 142.** `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150
+///   (`crates/epics-rtems-boot/csrc/rtems_config.c` §F) and the IOC holds 8
+///   descriptors at idle, so 142 client sockets fit and the 143rd `accept`
+///   fails with `ENFILE` — measured, and published as `FD_FREE` = 142 at idle.
+///   A CA client is exactly one descriptor, so 142 is also the most sets that
+///   can be leased simultaneously.
+/// * **stack wall ≥ 142.** A set is `Big` + `Medium` = 1,048,576 + 524,288 =
+///   1,572,864 B of stack on `armv7-rtems-eabihf` (`StackSizeClass::bytes` is
+///   `f × 0x10000 × size_of::<usize>()`, and `usize` is 4 there). All 142 sets
+///   grown is 223,346,688 B against the 241,199,000 B free at idle — the ~17.9
+///   MB left over is the measured `MEM_FREE` at 141 clients held. The memory
+///   wall itself was measured at **151** connections, on an image whose fd cap
+///   was raised to 400 so it could be reached at all.
+/// * **capacity = min(142, 151) = 142.**
+///
+/// That minimum is why §9 of `doc/rtems-connection-worker-pool-design.md`
+/// proposed 256 and why the number is 142 instead: a capacity above the fd
+/// wall can never be reached, so it would bound nothing that `accept` does not
+/// already bound, and the pool's own refusal would be dead code. A capacity
+/// *below* 142 would be the other thing C `rsrv` does not have — a connection
+/// count limit. At exactly the fd wall the pool bounds thread **creations**
+/// (142 × 2 = 284, once) while the refusal a client actually meets stays where
+/// C has it: the resource failure, not a count.
+const CAS_CLIENT_POOL_CAPACITY: usize = 142;
+
+/// The two roles one CA client borrows together, in the order
+/// [`CAS_CLIENT_POOL`] hands them out: `[client, event]`.
+///
+/// Both classes and both bands are C's, and they are declared here — once per
+/// role, at thread creation — rather than taken by each thread's body:
+///
+/// * `client` is the TCP receiver, C `camsgtask`, created with
+///   `epicsThreadGetStackSize(epicsThreadStackBig)` at
+///   `rsrv/caservertask.c:109-111` and at `epicsThreadPriorityCAServerLow`
+///   (`:109`). It runs the full CA command dispatch into the database, so
+///   `Big` is the parity answer, not merely a safe one.
+/// * `event` is the per-client monitor sender, C's `event_task`, created with
+///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
+///   one class below the receiver, because it formats and sends queued events
+///   rather than dispatching commands — and banded one level below it
+///   (`caservertask.c:560`, computed at `:1508`) so a client that stops
+///   reading cannot starve command dispatch.
+fn client_roster() -> [WorkerRole; 2] {
+    [
+        WorkerRole {
+            suffix: "client",
+            stack: StackSizeClass::Big,
+            priority: ThreadPriority::CaServerLow,
+        },
+        WorkerRole {
+            suffix: "event",
+            stack: StackSizeClass::Medium,
+            priority: ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 1),
+        },
+    ]
+}
+
+/// The two threads every CA client runs on, borrowed from a bounded set of
+/// permanent threads instead of created per accept.
+///
+/// Every `std::thread` **creation** leaves 176–179 B behind permanently on
+/// RTEMS 6 (its TLS key is freed before the key's destructor runs), so a driver
+/// that creates two threads per accepted client leaks without a ceiling — a
+/// client that connects and disconnects in a loop drains the target's heap for
+/// as long as the IOC runs. Borrowing bounds the creations at
+/// `CAS_CLIENT_POOL_CAPACITY × 2` for the life of the process
+/// (`doc/rtems-connection-worker-pool-design.md`).
+///
+/// **Process-wide, not per-server**, and that is the same argument
+/// [`refused_clients`] already makes: the resource that runs out — descriptors,
+/// thread stacks, heap — is process-wide, so a per-server capacity would divide
+/// a number whose whole meaning is that it is undivided. Two `BlockingCaServer`s
+/// in one process share the one fd table, and must therefore share the one
+/// bound. It also removes a teardown ordering this driver has no way to get
+/// right: [`WorkerPool`]'s `Drop` joins every worker, and a worker inside a live
+/// client body takes its `Stop` only when that client disconnects, so a
+/// server-owned pool would need a registry of live sockets to shut first (what
+/// the PVA server's `ConnRegistry` is for). A `static` pool is never dropped, so
+/// there is no such ordering to state.
+///
+/// `CAS`: RTEMS truncates thread names at 16 bytes and the pool appends
+/// `-{suffix} {index}`, so the longest name here is `CAS-client 141` — 14.
+static CAS_CLIENT_POOL: LazyLock<WorkerPool<2>> =
+    LazyLock::new(|| WorkerPool::new("CAS", client_roster(), CAS_CLIENT_POOL_CAPACITY));
 
 /// A blocking, thread-per-client CA TCP server.
 ///
@@ -285,10 +393,14 @@ impl BlockingCaServer {
     }
 
     /// Run the accept loop until [`shutdown`](Self::shutdown) is requested.
-    /// Blocks the calling thread; run it on its own `std::thread`. Each
-    /// accepted connection gets a dedicated client thread (C `camsgtask`
-    /// spawn, `caservertask.c:109`); client threads are detached and exit on
-    /// disconnect.
+    /// Blocks the calling thread; run it on its own `std::thread`.
+    ///
+    /// Each accepted connection **borrows** its two threads — the C `camsgtask`
+    /// receiver (`caservertask.c:109`) and its event sender — as one set from
+    /// [`CAS_CLIENT_POOL`]; it creates none. Nobody joins a client, and a client
+    /// returns its set when it disconnects. Borrowing is also the admission
+    /// point: a set that cannot be borrowed is a client that cannot be served,
+    /// and is refused through [`refuse_client`] with the socket still open.
     pub fn serve(&self) {
         // The band belongs to the loop, not to whoever spawned the thread:
         // `serve` is what actually blocks here, on every path that reaches it.
@@ -322,61 +434,62 @@ impl BlockingCaServer {
                     let acf = self.acf.clone();
                     let tcp_port = self.tcp_port;
                     let active = self.active.clone();
-                    // The socket is handed to the thread *after* the thread
-                    // exists, not captured by the closure. `Builder::spawn`
-                    // consumes its closure, so a capture would drop the
-                    // socket on failure and leave nothing to refuse *with*:
-                    // no reply, no peer address, just a close. Thread
-                    // creation is the resource check on this target — it is
-                    // the allocation of a 1 MiB stack — so its failure is
-                    // precisely the moment an admission refusal is owed.
-                    let (handover, take) = std::sync::mpsc::sync_channel::<TcpStream>(1);
-                    let spawned = thread::Builder::new()
-                        .name(format!("CAS-client-blocking {peer}"))
-                        // caservertask.c:109-111 creates this same thread with
-                        // `epicsThreadGetStackSize(epicsThreadStackBig)`. It
-                        // runs the full CA command dispatch into the database,
-                        // so Big is the parity answer, not merely a safe one.
-                        .stack_size(StackSizeClass::Big.bytes())
-                        .spawn(move || {
-                            let Ok(stream) = take.recv() else {
-                                // Unreachable in practice: the sender is used
-                                // on the very next line after a successful
-                                // spawn. Exiting is right either way.
-                                return;
-                            };
-                            // Held for the whole client: its `Drop` returns the
-                            // slot however this thread ends, panic included.
-                            let _slot = ClientSlot::take(active);
-                            // caservertask.c:109 — the TCP receiver is created
-                            // as `epicsThreadCreate("CAS-client",
-                            // epicsThreadPriorityCAServerLow, ...)`. Best
-                            // effort, and only when the RT switch is on
-                            // (`runtime::task::RT_PRIORITY_ENV`).
-                            let _ = enter_ioc_thread(ThreadPriority::CaServerLow);
-                            if let Err(e) = handle_client_blocking(stream, peer, db, acf, tcp_port)
-                            {
-                                tracing::debug!(
-                                    target: "epics_ca_rs::server::blocking",
-                                    %peer, error = %e,
-                                    "blocking CA client ended with error"
-                                );
-                            }
-                        });
-                    match spawned {
-                        Ok(_) => {
-                            // The thread is alive and parked on `take.recv()`.
-                            // Send cannot fail: the receiver is held by that
-                            // thread and dropped only after it has the socket.
-                            let _ = handover.send(stream);
+                    // The single admission point. A client costs two threads,
+                    // and it borrows both *together* — a client that could take
+                    // the receiver and then wait for the event sender would, at
+                    // capacity, wait on one nobody is going to release.
+                    //
+                    // This is also the only fallible step left before the client
+                    // is served, which is what makes it the only place a refusal
+                    // is owed. `WouldBlock` is "this process is full" (§5) and
+                    // any other error is "this target is out of thread
+                    // resources"; both mean this client cannot be served, so
+                    // both go to the one refusal owner, whose console line
+                    // carries the cause verbatim to tell them apart.
+                    //
+                    // Note the socket is still held here, un-moved, precisely so
+                    // there is something to refuse *with*: a refusal after
+                    // `accept` that says nothing is the silent close this
+                    // driver's `refuse_client` exists to remove.
+                    let leased = match CAS_CLIENT_POOL.acquire() {
+                        Ok(set) => set,
+                        Err(e) => {
+                            refuse_client(peer, &e, |frame| {
+                                use std::io::Write;
+                                let _ = stream.write_all(frame);
+                                let _ = stream.flush();
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                            });
+                            continue;
                         }
-                        Err(e) => refuse_client(peer, &e, |frame| {
-                            use std::io::Write;
-                            let _ = stream.write_all(frame);
-                            let _ = stream.flush();
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                        }),
-                    }
+                    };
+                    let (lease, [client_worker, event_worker]) = leased;
+                    // The band and the stack class are the `client` role's, taken
+                    // once when the worker thread was created (`client_roster`),
+                    // not per client — so unlike a fresh `Builder::spawn` there
+                    // is nothing here that can fail and nothing the body has to
+                    // remember to do.
+                    //
+                    // `run_detached`: nobody joins a CA client. The worker itself
+                    // announces a panic through `errlog`, and the event job is
+                    // joined inside `handle_client_blocking` before this body
+                    // returns. `_lease` is declared first so it drops last — the
+                    // set goes back only after the client body has returned.
+                    client_worker.run_detached(format!("CA client {peer}"), move || {
+                        let _lease = lease;
+                        // Held for the whole client: its `Drop` returns the
+                        // slot however this job ends, panic included.
+                        let _slot = ClientSlot::take(active);
+                        if let Err(e) =
+                            handle_client_blocking(event_worker, stream, peer, db, acf, tcp_port)
+                        {
+                            tracing::debug!(
+                                target: "epics_ca_rs::server::blocking",
+                                %peer, error = %e,
+                                "blocking CA client ended with error"
+                            );
+                        }
+                    });
                 }
                 Err(e) => {
                     if self.shutdown.load(Ordering::Acquire) {
@@ -825,7 +938,13 @@ struct BlockingSub {
 
 /// Serve one CA client over a blocking `TcpStream`. C `camsgtask`
 /// (`camsgtask.c:41`).
+///
+/// Runs on the `client` worker of the set the accept loop borrowed for this
+/// client; `event_worker` is the other one, and this function is the only thing
+/// that may dispatch on it. Taken by value, so a caller cannot run the event
+/// task on a worker it did not lease, and cannot serve a client on half a set.
 fn handle_client_blocking(
+    event_worker: Worker,
     stream: TcpStream,
     peer: SocketAddr,
     db: Arc<PvDatabase>,
@@ -883,50 +1002,27 @@ fn handle_client_blocking(
     // `server.h:221`). It has no async runtime either: `run_event_task` is an
     // async fn driven by `park_on`; its readers suspend on the runtime-agnostic
     // `EvQue` wake (a `Notify`) and are woken cross-thread by `db_post_events`.
+    //
+    // It runs on the `event` worker of this client's leased set, whose stack
+    // class and band are the role's (`client_roster`). Pooled, so this dispatch
+    // is infallible: the thread already exists, so there is no per-client
+    // creation left to fail here. That used to be the failure that mattered most
+    // — the receiver was already running and the VERSION frame above had already
+    // gone out, so a client could be accepted, handshake, and then be closed in
+    // silence — and it is gone rather than handled: admission moved up to the
+    // accept loop's one `acquire`, which refuses *before* any of this runs.
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EventTaskControl>();
     let event_send_lock = send_lock.clone();
-    let event_thread = thread::Builder::new()
-        .name(format!("CAS-event-blocking {peer}"))
-        // C's counterpart is the per-client event task, which `db_start_events`
-        // creates with `epicsThreadGetStackSize(epicsThreadStackMedium)`
-        // (`db/dbEvent.c:1117`) — one class below the receiver, because it
-        // formats and sends queued events rather than dispatching commands.
-        .stack_size(StackSizeClass::Medium.bytes())
-        .spawn(move || {
-            // caservertask.c:560 — "TCP sender: epicsThreadPriorityCAServerLow-1",
-            // computed at :1508 as `epicsThreadHighestPriorityLevelBelow(
-            // epicsThreadPriorityCAServerLow)`. What matters is that the
-            // sender sits just below the receiver so a client that stops
-            // reading cannot starve command dispatch. (C's helper subtracts
-            // a further OS-range step at osdThread.c:874, landing on 18 for a
-            // full Linux FIFO range; the EPICS-space ordering is the same.)
-            let _ = enter_ioc_thread(ThreadPriority::Custom(
-                ThreadPriority::CaServerLow.value() - 1,
-            ));
-            let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
-            if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
-                tracing::error!(
-                    target: "epics_ca_rs::server::blocking",
-                    %peer,
-                    "CAS-event thread future not blockable (unexpected on a runtime-less thread)"
-                );
-            }
-        });
-    // This is the second of the two threads a CA client costs, and on target it
-    // is the one that fails first: the receiver already exists and the VERSION
-    // frame above has already gone out, so a bare `?` here is precisely the
-    // measured symptom — accepted, handshake completed, then closed in silence.
-    // A client is not served without its event thread, so this is a refusal and
-    // goes through the same owner as the accept-loop one.
-    let event_thread = match event_thread {
-        Ok(t) => t,
-        Err(e) => {
-            refuse_client(peer, &e, |frame| {
-                let _ = write_frame_locked(&send_lock, frame);
-            });
-            return Err(CaError::Io(e));
+    let event_job = event_worker.run(move || {
+        let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
+        if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
+            tracing::error!(
+                target: "epics_ca_rs::server::blocking",
+                %peer,
+                "CAS-event thread future not blockable (unexpected on a runtime-less thread)"
+            );
         }
-    };
+    });
 
     // The blocking driver's own subscription registry (see [`BlockingSub`]).
     let mut blk_subs: HashMap<u32, BlockingSub> = HashMap::new();
@@ -1281,10 +1377,14 @@ fn handle_client_blocking(
             }
         }
     }
-    // Dropping the control sender ends `run_event_task`; join so the second
-    // thread never leaks (C `db_close_events` + `event_task` exit).
+    // Dropping the control sender ends `run_event_task`; join so the event
+    // worker is finished with this client before its set can be handed to
+    // another (C `db_close_events` + `event_task` exit). The pool would not
+    // re-idle the set until this job returned even if the join were forgotten —
+    // a running job holds the set — but joining here is what makes the C
+    // ordering hold: this client's event task is over before its receiver is.
     drop(ev_tx);
-    let _ = event_thread.join();
+    let _ = event_job.join();
     result
 }
 
@@ -1429,6 +1529,13 @@ mod tests {
     /// `every_thread_in_this_crate_states_a_stack_size` has carried this half
     /// since the classes were introduced; these two files did not.
     ///
+    /// The two per-client threads no longer have a `Builder` of their own to
+    /// carry a class: they are pool workers, created once from
+    /// [`client_roster`], and the pool is what calls `Builder::stack_size` (with
+    /// `role.stack`). So for this file the class is stated in the roster, and
+    /// that is what is checked here — the `Builder` scan below covers the
+    /// entry-point threads, which are still created directly.
+    ///
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn every_ca_server_thread_states_a_stack_size() {
@@ -1466,14 +1573,35 @@ mod tests {
         }
 
         assert!(
-            checked >= 4,
-            "expected the CA server's Builder sites, found {checked} — \
+            checked >= 3,
+            "expected the CA entry point's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
         assert!(
             unclassified.is_empty(),
             "these CA threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
         );
+
+        // The per-client half, which has no `Builder` here to scan: both
+        // classes are stated once, in the roster the pool creates its workers
+        // from. A role added or a class dropped there is two threads per client
+        // at std's 2 MiB RTEMS default, which is the ceiling this guard is about.
+        let prod = production_scope(include_str!("blocking.rs"));
+        let roster = {
+            let at = prod
+                .find("fn client_roster()")
+                .expect("client_roster moved; update this guard");
+            &prod[at..]
+        };
+        let roster = &roster[..roster.find("\n}").expect("client_roster body")];
+        for class in ["StackSizeClass::Big", "StackSizeClass::Medium"] {
+            assert!(
+                roster.contains(class),
+                "the per-client worker roster must state `{class}`: C creates \
+                 the receiver with epicsThreadStackBig (caservertask.c:109-111) \
+                 and the event task with epicsThreadStackMedium (dbEvent.c:1117)"
+            );
+        }
     }
 
     /// The RTEMS IOC installs a console subscriber before it does anything
@@ -1494,33 +1622,53 @@ mod tests {
         );
     }
 
-    /// Every per-client thread this driver creates has a refusal behind it.
+    /// Admission is one fallible step, at one place, with one refusal behind it.
     ///
-    /// A CA client costs two threads, and on target either creation can fail —
-    /// the receiver in the accept loop, the event task after the VERSION frame
-    /// has already gone out. Whichever fails, the client cannot be served, and
-    /// the failure must reach [`refuse_client`] rather than a bare `?` or a
-    /// dropped socket. Counting sites is the check that survives a refactor:
-    /// add a third per-client thread here and this guard demands its refusal.
+    /// A CA client costs two threads. It used to *create* both, and either
+    /// creation could fail — the receiver in the accept loop, the event task
+    /// after the VERSION frame had already gone out — so the guard here counted
+    /// creations and demanded a refusal per creation. Both threads are borrowed
+    /// now, as one set, from a single `acquire` in the accept loop: there is one
+    /// fallible step left, it happens while the socket is still open and
+    /// un-moved, and it is the only place a refusal can be owed.
+    ///
+    /// So the shape being pinned is stronger than the old count: **zero**
+    /// per-client thread creations in this file, **one** admission point, **one**
+    /// refusal owner, and a refusal on that point's only failure path. A second
+    /// `acquire` here would be a client able to hold half a set; a `Builder`
+    /// would be the per-accept creation the pool exists to remove.
     #[test]
-    fn every_per_client_thread_failure_reaches_the_refusal_owner() {
+    fn client_admission_is_one_acquire_with_one_refusal_behind_it() {
         let prod = production_scope(include_str!("blocking.rs"));
 
-        let builders = prod.matches("thread::Builder::new()").count();
+        assert_eq!(
+            prod.matches("thread::Builder::new()").count(),
+            0,
+            "this driver must create no thread per client: both run on workers \
+             borrowed from `CAS_CLIENT_POOL`, which is the per-accept creation \
+             whose RTEMS residue never comes back"
+        );
+        assert_eq!(
+            prod.matches("CAS_CLIENT_POOL.acquire()").count(),
+            1,
+            "there must be exactly one admission point: a second one is a \
+             client that can hold part of a set while it waits for the rest"
+        );
+        assert_eq!(
+            prod.matches("run_detached(").count(),
+            1,
+            "the client body is dispatched onto its `client` worker exactly \
+             once — the pooled replacement for the old per-client spawn"
+        );
+
         // `refuse_client(` also matches its own definition; subtract it.
         let definitions = prod.matches("fn refuse_client(").count();
         let calls = prod.matches("refuse_client(").count() - definitions;
-
         assert_eq!(definitions, 1, "there must be exactly one refusal owner");
         assert_eq!(
-            builders, 2,
-            "the per-client thread count in this file changed — classify the \
-             new site, then update this guard"
-        );
-        assert_eq!(
-            calls, builders,
-            "{calls} refusal(s) for {builders} per-client thread creation(s): \
-             a thread failure here closes the socket in silence"
+            calls, 1,
+            "{calls} refusal(s) for one admission point: a failed `acquire` \
+             that does not reach the owner closes the socket in silence"
         );
     }
 
@@ -1547,10 +1695,13 @@ mod tests {
     ///   band without the name, so it is asserted *absent* rather than merely
     ///   uncounted.
     ///
-    /// Four threads, four calls: the accept loop, the UDP responder, the
-    /// per-client receiver and the per-client event sender. There is no
-    /// unbanded case — a fifth call would mean a thread nobody assigned a
-    /// number to, and a fourth-minus-one an inherited one.
+    /// Four threads, four bands, but now only two of the calls are here: the
+    /// accept loop and the UDP responder take their own, at their own top. The
+    /// per-client receiver and event sender are pool workers, so their bands are
+    /// declared once in [`client_roster`] and applied by the pool's own
+    /// `enter_ioc_thread` when the worker thread is created — which is stricter,
+    /// not looser: a body cannot forget a band it never sets. Both halves are
+    /// checked below, so a per-client role added without a band still fails.
     ///
     /// Source inspection, because the defect is a call that is *absent*.
     /// Fails today, on Linux, with no cross toolchain.
@@ -1560,10 +1711,30 @@ mod tests {
 
         assert_eq!(
             prod.matches("enter_ioc_thread(").count(),
-            4,
-            "the accept loop, the UDP responder, the per-client receiver and \
-             the per-client event sender"
+            2,
+            "the accept loop and the UDP responder take their own band; the \
+             two per-client bands are the roster's"
         );
+        // The per-client half: both bands stated, and C's ordering between them
+        // (the event sender one level below the receiver) visible in the roster
+        // rather than buried in a thread body.
+        let roster = {
+            let at = prod
+                .find("fn client_roster()")
+                .expect("client_roster moved; update this guard");
+            let tail = &prod[at..];
+            &tail[..tail.find("\n}").expect("client_roster body")]
+        };
+        for band in [
+            "priority: ThreadPriority::CaServerLow,",
+            "ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 1)",
+        ] {
+            assert!(
+                roster.contains(band),
+                "the per-client worker roster must state `{band}`: a role with \
+                 no band runs one level above idle on the target"
+            );
+        }
         assert_eq!(
             prod.matches("apply_to_current_thread(").count(),
             0,
@@ -1637,6 +1808,97 @@ mod tests {
         // (epicsThread.h:73-83).
         assert!(receiver.value() <= ThreadPriority::CaServerHigh.value());
         assert!(receiver.value() < ThreadPriority::ScanLow.value());
+    }
+
+    /// A client that comes and goes must cost the same two threads every time.
+    ///
+    /// This is the direct statement of the closed leak: on RTEMS the cost is per
+    /// thread *creation* (176–179 B that never comes back), so the property that
+    /// matters is not "few threads live" but "no new thread created". `K`
+    /// sequential clients through a pool of the driver's own roster must leave
+    /// `worker_count()` at exactly one set's worth — and the assertion is inside
+    /// the loop, not only after it, because the tight spot is the client
+    /// admitted immediately after a release.
+    ///
+    /// A local pool rather than [`CAS_CLIENT_POOL`], so the count means only
+    /// what this test did to it.
+    #[test]
+    fn a_client_reuses_its_two_threads_and_never_creates_more() {
+        let pool: WorkerPool<2> = WorkerPool::new("test-cas", client_roster(), 4);
+        let db = Arc::new(PvDatabase::new());
+
+        for cycle in 1..=5 {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server_sock, peer) = listener.accept().expect("accept");
+
+            let (lease, [client_worker, event_worker]) = pool.acquire().expect("acquire a set");
+            let db = db.clone();
+            let job = client_worker.run(move || {
+                let _lease = lease;
+                let _ =
+                    handle_client_blocking(event_worker, server_sock, peer, db, new_acf(), 5064);
+            });
+            // EOF ends the client body, which drops the control sender and
+            // joins the event job.
+            drop(client);
+            job.join().expect("the client job must not panic");
+
+            // The set re-idles a moment after the job's result is handed to the
+            // joiner (the worker loop's return step runs next), so wait for the
+            // accounting rather than racing it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while pool.set_usage().0 != 0 && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                pool.set_usage().0,
+                0,
+                "cycle {cycle}: the client's set never came back"
+            );
+            assert_eq!(
+                pool.worker_count(),
+                2,
+                "cycle {cycle}: a client created threads instead of borrowing \
+                 them — on RTEMS every creation leaves residue that never returns"
+            );
+        }
+    }
+
+    /// The pool's capacity is the target's measured fd wall, and nothing else.
+    ///
+    /// The number is a decision, so it is pinned here with its derivation rather
+    /// than left as a literal somebody rounds up later
+    /// (`doc/rtems-connection-worker-pool-design.md` §9,
+    /// `doc/rtems-fd-ceiling-deviation.md` §3):
+    ///
+    /// * 150 descriptors configured minus the 8 the IOC holds at idle = **142**
+    ///   client sockets, and the 143rd `accept` fails `ENFILE` — measured.
+    /// * 142 sets × (`Big` + `Medium`) = 223,346,688 B of stack against the
+    ///   241,199,000 B free at idle; the memory wall is 151 connections, and was
+    ///   only reachable at all on an image with the fd cap raised to 400.
+    ///
+    /// Above 142 the capacity can never be reached, so the pool's refusal would
+    /// be dead code and the creation bound unassertable; below 142 it becomes a
+    /// CA connection *count* limit, which C `rsrv` does not have
+    /// (`caservertask.c:110-118`, `:1234-1250` both refuse on a resource
+    /// failure). At exactly the wall the creations are bounded and the refusal a
+    /// client meets is still the resource failure.
+    #[test]
+    fn the_client_pool_capacity_is_the_measured_fd_wall() {
+        const CONFIGURED_DESCRIPTORS: usize = 150;
+        const IOC_HELD_AT_IDLE: usize = 8;
+        const MEMORY_WALL_CONNECTIONS: usize = 151;
+
+        let fd_wall = CONFIGURED_DESCRIPTORS - IOC_HELD_AT_IDLE;
+        assert_eq!(fd_wall, 142, "the fd wall is the cap minus the idle hold");
+        assert_eq!(
+            CAS_CLIENT_POOL_CAPACITY,
+            fd_wall.min(MEMORY_WALL_CONNECTIONS),
+            "the capacity is the lower of the two measured walls; a larger one \
+             is unreachable and a smaller one is a connection limit C has not got"
+        );
     }
 
     /// The RTEMS constraint (S1): the blocking driver must not touch tokio's

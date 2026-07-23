@@ -106,7 +106,15 @@ calls `process_record_with_links` (`scan.rs:166`), which takes L1
    | side | thread | EPICS band | reaches L1 via |
    |---|---|---|---|
    | **high** | `scan-1` | 63 (`scan.rs:48-50`) | `scan.rs:121` `block_on_sync` → `scan.rs:166` → `processing.rs:1295` |
-   | **low** | `CAS-client-blocking <peer>` | 20 (`ThreadPriority::CaServerLow`, `task.rs:430`) | `ca .../blocking.rs:1244` `block_on_sync(serve_write_head)` → `ca .../tcp.rs:3792` → `:4305`/`:4316` → `field_io.rs:1392` |
+   | **low** | `CAS-client <n>` | 20 (`ThreadPriority::CaServerLow`, `task.rs:430`) | `ca .../blocking.rs:1283` `block_on_sync(serve_write_head)` → `ca .../tcp.rs:3792` → `:4305`/`:4316` → `field_io.rs:1392` |
+
+   (`CAS-client <n>` is a **pooled worker**, not a thread created for one
+   client: the CA server borrows each client's two threads from
+   `CAS_CLIENT_POOL` and the name carries the worker's index, not the peer —
+   `epics-ca-rs/src/server/blocking.rs`, `doc/rtems-connection-worker-pool-design.md`
+   §9. The band is unchanged; it is now the `client` role's, applied once at
+   worker creation. Target measurements taken before that conversion name the
+   same thread `CAS-client-blocking <peer>`.)
 
    Both sit in `std::thread::park()` while waiting. Neither is visible to the
    kernel as waiting on an owned resource. This is no longer a hypothetical
@@ -538,16 +546,32 @@ L9.
 threads: `field_io.rs:493`, `:595`, `:790`, `:804`, `:826`, `:851`, `:877`,
 `:2182`; `mod.rs:801`, `:1473`, `:1565`, `:1645`, `:1739`, `:1853`.
 
-* *Who reads concurrently:* one `CAS-client-blocking <peer>` thread per CA TCP
+* *Who reads concurrently:* one `CAS-client <n>` pooled worker per live CA TCP
   connection, one `PVAS-conn` per PVA connection, the UDP search responders via
   `has_name_from` (`mod.rs:1645`), and the scan/callback bands through the put
-  paths. On the RTEMS target that population is bounded in the **single digits**
-  by the 2 MiB-per-thread stack ceiling (~5 CA / ~3 PVA connections), not by the
-  lock.
+  paths. On the RTEMS target that population is bounded at **142** — the
+  measured fd wall, not a stack estimate, and not the lock.
+
+  *(This bullet used to say "single digits … ~5 CA / ~3 PVA connections",
+  derived from a 2 MiB-per-thread stack ceiling. Both halves were wrong.
+  **2 MiB is the 64-bit host's `Big` class**: `StackSizeClass::bytes` is
+  `f × 0x10000 × size_of::<usize>()` (`task.rs:695-703`), so on
+  `armv7-rtems-eabihf`, where `usize` is 4 bytes, the classes are
+  **256 KiB / 512 KiB / 1 MiB** — a CA connection's `Big` + `Medium` and a PVA
+  connection's `Big` + `Small` + `Small` are each 1,572,864 B, not ~4–6 MiB.
+  And the binding ceiling is not stacks at all: 150 configured descriptors
+  minus the 8 the IOC holds at idle gives **142** concurrent connections, with
+  client #143 refused by `accept` with `ENFILE`, while the memory wall sits at
+  151 and was only reachable on an image with the fd cap raised to 400 —
+  measured, `doc/rtems-fd-ceiling-deviation.md` §2–§3, and the derivation the
+  CA worker pool's capacity was set from,
+  `doc/rtems-connection-worker-pool-design.md` §9.)*
 * *Critical section:* one `HashMap::get` plus an `Arc::clone` at 13 of the 14
   sites. The exception is `all_simple_pv_names` (`mod.rs:1853`), which clones
   every key and is reached only from iocsh dumps.
-* *Cost of demotion:* ≤ ~10 threads serialise on an O(1) section. C serialises
+* *Cost of demotion:* ≤ 142 threads serialise on an O(1) section — the
+  corrected bound above, not the ~10 this line carried while it inherited the
+  stack estimate. C serialises
   the same lookup at a **finer** grain (per hash bucket) than our single
   map-wide lock, so the port is already coarser than C here and the demotion
   does not make it coarser still. **Accepted.**

@@ -23,7 +23,7 @@ a thread per accepted connection:
 |---|---|---|---|
 | A | `epics-pva-rs/src/server_native/blocking.rs:807` `PVAS-conn {peer}` | 1 | `Big` |
 | B | `epics-base-rs/src/runtime/blocking_io.rs:257` `spawn_pump` (reader + writer) | 2 | `Small` |
-| C | `epics-ca-rs/src/server/blocking.rs:334` + `:888` (`CAS-client-blocking`, `CAS-event-blocking`) | 2 | `Big` + `Medium` |
+| C | `epics-ca-rs/src/server/blocking.rs:334` + `:888` (`CAS-client-blocking`, `CAS-event-blocking`) — **now converted, §9** | 2 | `Big` + `Medium` |
 
 A + B together are the PVA server's **three threads per connection**. B is
 also reached by the two blocking *clients* through `drive_socket_blocking`
@@ -42,7 +42,7 @@ what decision it needs.
 - **Same defect, fixed in this change:** the first two (and therefore both
   blocking clients, which reach `spawn_pump` through
   `drive_socket_blocking`)
-- **Same defect, sequenced (§9):** the two CA-server sites
+- **Same defect, sequenced (§9), since converted:** the two CA-server sites
 - **Distinct, skip:**
   - `epics-base-rs/src/server/status_pv.rs:291` — one pusher thread for the
     life of the IOC, not per connection.
@@ -247,17 +247,20 @@ loop {
   is. A connection job that panics with nobody joining it is announced by
   the worker loop itself.
 
-## 9. What this change does *not* close
+## 9. The CA server (site C) — RESOLVED: capacity is the fd wall, 142
 
-**The CA server's two per-client threads** (site C) are the same defect and
-are not converted here, because they need a decision this panel should not
-take silently:
+**Status: converted.** This section was written before the CA sites were
+done, and recorded the decision they needed. The decision has been taken and
+the sites are now pooled; what follows is the question as it stood, the
+answer, and the arithmetic behind the number.
+
+### The question
 
 `BlockingCaServer` deliberately has **no** connection limit — C `rsrv` has
 none either, refusing only on a resource failure and never on a count
 (`caservertask.c:110-118`, `:1234-1250`), and `active_connections()` says so
 in its own doc comment. A pool has a capacity, so converting CA means
-choosing one. The two candidates:
+choosing one. The two candidates as originally stated:
 
 1. Capacity well above the measured 142-connection fd/socket-zone ceiling
    (say 256), so the fd layer still refuses first and the count limit is
@@ -266,9 +269,92 @@ choosing one. The two candidates:
 2. Capacity as a new, documented CA connection limit. Honest, but a
    deviation from `rsrv`.
 
-Recommendation is (1) — it keeps the refusal source where C has it while
-still bounding creations at `256 × 2` for the life of the process. Pending
-sign-off, the CA sites remain open and are reported as such.
+### The decision — neither; the capacity **is** the fd wall
+
+**256 is rejected.** It is not merely arbitrary, it is *unreachable*: the
+143rd client cannot be accepted at all, so a 256-set pool could never lease
+its 143rd set. Its `EAGAIN` arm would be dead code, `worker_count()` would
+never approach its bound, and §12's verification ("at capacity, `acquire`
+returns `WouldBlock` and creates no thread") would be unassertable on the
+target. A bound nothing can reach does not bound anything.
+
+Option 2 is rejected for the reason already stated: it is a count limit C
+has not got.
+
+**`CAS_CLIENT_POOL_CAPACITY = 142`**, the measured fd wall itself. Every
+term below is read out of a named source file or out of
+`doc/rtems-fd-ceiling-deviation.md`, whose ramp drove *this* driver (raw CA
+TCP, VERSION handshake, one `CA_PROTO_CREATE_CHAN`).
+
+| term | value | source |
+|---|---|---|
+| descriptors configured | 150 | `crates/epics-rtems-boot/csrc/rtems_config.c` §F |
+| held by the IOC at idle | 8 | measured; published as `FD_CNT` = 8, `FD_FREE` = 142 |
+| **fd wall** | **142** | 150 − 8; client #143 fails `accept` with `ENFILE` |
+| descriptors per CA client | 1 | `FD_CNT + FD_FREE = 150` at every row of the ramp |
+| set stack (`Big` + `Medium`) | 1,572,864 B | 1,048,576 + 524,288; `StackSizeClass::bytes` is `f × 0x10000 × size_of::<usize>()`, `usize` = 4 on `armv7-rtems-eabihf` |
+| 142 sets of stack | 223,346,688 B | 142 × 1,572,864 |
+| free heap at idle | 241,199,000 B | measured, ramp row "held 0" |
+| **memory wall** | **151** | measured on an fd-cap-400 image: `(259,803,736 − 19,880,696) / 1,589,000 = 150.99` |
+
+`capacity = min(fd wall, memory wall) = min(142, 151) = 142`.
+
+The two walls are close because they measure the same connection: at 142
+sets the residual heap is 241,199,000 − 223,346,688 ≈ 17.9 MB, which is the
+17,148,200 B `MEM_FREE` measured with 141 clients held. So 142 sets fit,
+with the same margin the un-pooled driver already ran with at that load.
+
+### What 142 buys and what it does not change
+
+* **Creations are bounded**: 142 × 2 = **284** threads for the life of the
+  process, ≈ 50.5 kB of RTEMS TLS residue *once*, against a per-accept leak
+  with no ceiling. That is the whole point of the conversion.
+* **The refusal a client meets stays where C has it.** At capacity the fd
+  layer refuses first — `accept` fails with `ENFILE` before any of our code
+  sees a socket — exactly as it did before, and `CA_REFUSED_CNT` stays 0 at
+  that wall for the reason `doc/rtems-fd-ceiling-deviation.md` §4 already
+  records. The pool's `WouldBlock` arm is reachable only in the narrow
+  window where a client's descriptor is closed but its set has not yet
+  re-idled; it goes to the same `refuse_client` owner as a thread-resource
+  failure, so that window produces a refusal *with* a `CA_PROTO_ERROR` and a
+  console line rather than a silent close.
+* **It does not raise or lower the connection ceiling** (§2). 142 is what
+  the target already served.
+
+### Deviations this introduces
+
+* **The pool never shrinks.** After a peak of *n* concurrent clients the
+  process keeps *n* sets — *n* × 1,572,864 B of stack — for its whole life,
+  where the per-accept driver returned each client's stacks on disconnect.
+  At the extreme (a peak of 142) that is 223 MB held permanently on a 256 MB
+  guest. This is the price of removing the creation residue and it is
+  bounded by the high-water mark, which is exactly what that peak already
+  cost while it was live; there is no load at which the pooled driver needs
+  more memory than the un-pooled one *needed at its worst moment*.
+* **The pool is process-wide (`static`), not per-server.** The resource it
+  bounds — descriptors, stacks, heap — is process-wide, the same argument
+  `refused_clients()` already makes for its counter, so two servers in one
+  process must share one bound rather than have 142 each. It also removes a
+  teardown ordering CA cannot state: `WorkerPool::drop` joins every worker,
+  and a worker inside a live client takes its `Stop` only on disconnect, so
+  a server-owned pool would need a registry of live sockets to shut first
+  (what the PVA server's `ConnRegistry` is). A `static` pool is never
+  dropped.
+* **Thread names lose the peer**, as §11 records for every pooled role:
+  `CAS-client 3`, not `CAS-client 10.0.0.1:44312`. The measurement records
+  in `doc/rtems-priority-on-target-measurement.md` and
+  `doc/rtems-pi-step7-target-measurement.md` name the old
+  `CAS-client-blocking <peer>` / `CAS-event-blocking <peer>` threads; those
+  are historical measurements and are left as they were taken.
+
+### What is no longer true above
+
+§1's site table lists site C as open, and §1's "Same defect, sequenced (§9)"
+line follows from that. Both are now closed: `blocking.rs` creates **no**
+thread per client, and its second refusal site — the event-thread creation
+failure inside the connection body, which used to fire *after* the VERSION
+frame had gone out — is gone rather than handled, because admission moved up
+to the accept loop's single `acquire`.
 
 **The 176–179 B residue itself** may be removed by a target-spec flip (a
 separate panel). That does not remove the need for this pool: admission

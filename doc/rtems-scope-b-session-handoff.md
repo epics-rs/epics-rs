@@ -622,7 +622,18 @@ into is a census: which threads skip it.
 #### The census — every thread that exists on the target
 
 From the two binaries the gate builds (`rtems-ca-ioc`, `rtems-pva-ioc`), every
-spawn reachable from them:
+spawn reachable from them.
+
+Rows marked **(pooled)** are no longer spawned per connection: both servers
+borrow a connection's threads as one set from a `WorkerPool`, created once per
+worker from the roster cited and reused
+(`doc/rtems-connection-worker-pool-design.md`). Three consequences for reading
+this census: the name carries the **worker index**, not the peer (`CAS-client 3`,
+not `CAS-client-blocking 10.0.0.1:44312` — which is how target measurements taken
+before the conversion spell the same thread); the band is stated in the roster
+and applied by the pool at worker creation rather than by the thread body, so
+the prologue cannot be skipped for these; and the row count is a bound on
+concurrent connections, not on connections ever served.
 
 | thread | site | band |
 |---|---|---|
@@ -633,12 +644,12 @@ spawn reachable from them:
 | `status-pv` | `server/status_pv.rs:291` | `Low`, via `spawn_dedicated_thread` |
 | `CAS-TCP` | `ca .../blocking.rs`, `serve` | `CAS_TCP_PRIORITY` = 18 |
 | `CAS-UDP` | `ca .../blocking.rs`, `serve_udp_search` | `CAS_UDP_PRIORITY` = 16 |
-| `CAS-client-blocking <peer>` | `ca .../blocking.rs`, accept loop | `CaServerLow` = 20 |
-| `CAS-event-blocking <peer>` | `ca .../blocking.rs`, per client | 19 |
+| `CAS-client <n>` | `ca .../blocking.rs:249` `client_roster` (pooled) | `CaServerLow` = 20 |
+| `CAS-event <n>` | `ca .../blocking.rs:249` `client_roster` (pooled) | 19 |
 | `PVAS-TCP` | `pva .../blocking.rs`, `serve` | `PVA_SERVER_PRIORITY` = 18 |
 | `PVAS-UDP` | `pva .../blocking.rs`, `serve_udp_search` | `PVA_UDP_PRIORITY` = 16 |
-| `PVAS-conn <peer>` | `pva .../blocking.rs`, accept loop | 18 |
-| `PVAS-reader` / `PVAS-writer <peer>` | `pva .../blocking.rs`, `spawn_child` | 18 |
+| `PVAS-conn <n>` | `pva .../blocking.rs:645` `connection_roster` (pooled) | 18 |
+| `PVAS-reader` / `PVAS-writer <n>` | `pva .../blocking.rs:645` `connection_roster` (pooled) | 18 |
 
 Not in the closure, and why: `iocsh-startup` / `iocsh-after-ioc-running`
 (`server/ioc_app.rs:696`,`:1040`) — neither RTEMS binary constructs an

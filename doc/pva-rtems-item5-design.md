@@ -318,10 +318,14 @@ reason §7 does not give.
 
 CA has **no third writer thread**: writes are serialised by an
 `Arc<Mutex<TcpStream>>` send lock shared between the dispatch thread and the
-`CAS-event-blocking` thread (CA worktree `blocking.rs:624-628`, `:652-657`,
-`write_frame_locked` `:568`), mirroring C `client->lock` / `SEND_LOCK`
+`CAS-event <n>` thread (CA worktree `blocking.rs:982`, `:1016`,
+`write_frame_locked` `:899`), mirroring C `client->lock` / `SEND_LOCK`
 (`server.h:221`). That works because **both CA writers are threads** — a
-blocking `write` parks a thread that owns nothing else.
+blocking `write` parks a thread that owns nothing else. (Both are pooled
+workers now, borrowed as one set rather than created per client; that changed
+where the threads come from, not that they are threads, so the argument this
+section makes is untouched. Pre-conversion text and target measurements call
+the same thread `CAS-event-blocking <peer>`.)
 
 PVA's producers are the operation thread *and* M monitor subscriber tails on a
 shared band. If a tail wrote the socket directly, a blocking `write_all` would

@@ -30,12 +30,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+// The UDP SEARCH/beacon transport is compiled out on the RTEMS target: newlib
+// has no `recvmsg`/`IP_PKTINFO` original-destination recovery and `local_addr()`
+// cannot be read back to stamp a SEARCH response port, so a UDP search would
+// advertise port 0 and never be answered (doc/pvalink-rtems-design.md §4.2).
+// Everything the target reaches goes over TCP name servers via the
+// `SearchTransport::NameServersOnly` seam; the `AsyncUdpV4`/`UdpSocket` surface
+// below is gated to match, so "no UDP on target" holds by construction.
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::net::AsyncUdpV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_os = "rtems"))]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Interval, interval};
-use tracing::{debug, warn};
+use tracing::debug;
+// `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
+// the RTEMS target — so the import is too, or it is unused there.
+#[cfg(not(target_os = "rtems"))]
+use tracing::warn;
 
 use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
@@ -326,6 +339,7 @@ impl Default for ClientSearchConfig {
 /// cannot be configured independently, and so the per-client
 /// `EPICS_PVA_*` UDP knobs are resolved once at bind time rather than
 /// re-read from the process environment each tick.
+#[cfg(not(target_os = "rtems"))]
 struct UdpTransport {
     /// Ephemeral all-NIC v4 SEARCH socket: sends SEARCH, receives the
     /// unicast SEARCH_RESPONSE.
@@ -377,6 +391,11 @@ struct UdpTransport {
 /// and `local_addr()` cannot be read back to stamp a response port.
 enum SearchTransport {
     /// UDP SEARCH and beacon receive, alongside any TCP name servers.
+    ///
+    /// Compiled out on the RTEMS target — there is no UDP transport to hold,
+    /// so `NameServersOnly` is the only variant and "no UDP socket" is a fact
+    /// about the type rather than a runtime branch (§4.2).
+    #[cfg(not(target_os = "rtems"))]
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`ns_task`), and every UDP arm parks
@@ -393,6 +412,7 @@ impl SearchTransport {
     /// `addr_list` is merged into them here (pva2pva client-config
     /// semantics: address-list entries are UDP SEARCH destinations on
     /// `broadcast_port`, never TCP name servers).
+    #[cfg(not(target_os = "rtems"))]
     fn bind_udp(
         config: &ClientSearchConfig,
         mut extra_targets: Vec<SocketAddr>,
@@ -508,6 +528,7 @@ impl SearchTransport {
     fn has_no_udp_destinations(&self) -> bool {
         match self {
             Self::NameServersOnly => true,
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => u.extra_targets.is_empty() && !u.auto_addr_list,
         }
     }
@@ -549,8 +570,12 @@ impl SearchTransport {
     /// socket already used.
     async fn recv_search(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => u.search_socket.recv_from(buf).await,
-            Self::NameServersOnly => std::future::pending().await,
+            Self::NameServersOnly => {
+                let _ = buf;
+                std::future::pending().await
+            }
         }
     }
 
@@ -558,27 +583,39 @@ impl SearchTransport {
     /// without a UDP transport, and equally when v6 is unavailable.
     async fn recv_search_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => recv_from_v6(u.search_socket_v6.as_ref(), buf).await,
-            Self::NameServersOnly => std::future::pending().await,
+            Self::NameServersOnly => {
+                let _ = buf;
+                std::future::pending().await
+            }
         }
     }
 
     /// `select!` arm: the next v4 BEACON datagram.
     async fn recv_beacon(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => match &u.beacon_socket {
                 Some(s) => s.recv_from(buf).await,
                 None => std::future::pending().await,
             },
-            Self::NameServersOnly => std::future::pending().await,
+            Self::NameServersOnly => {
+                let _ = buf;
+                std::future::pending().await
+            }
         }
     }
 
     /// `select!` arm: the next v6 multicast BEACON datagram.
     async fn recv_beacon_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
+            #[cfg(not(target_os = "rtems"))]
             Self::Udp(u) => recv_from_v6(u.beacon_socket_v6.as_ref(), buf).await,
-            Self::NameServersOnly => std::future::pending().await,
+            Self::NameServersOnly => {
+                let _ = buf;
+                std::future::pending().await
+            }
         }
     }
 
@@ -592,14 +629,24 @@ impl SearchTransport {
         entries: &[(u32, String)],
         send_errs: &mut HashSet<SocketAddr>,
     ) {
-        let Self::Udp(u) = self else { return };
-        // Pack the same entries with each family's response port. The port
-        // field is fixed-width, so the two sets batch identically and pair
-        // 1:1 (see `UdpTransport::broadcast`).
-        let frames_v4 = pack_search_frames(codec, entries, u.response_port, false);
-        let frames_v6 = pack_search_frames(codec, entries, u.response_port_v6, false);
-        for (frame_v4, frame_v6) in frames_v4.iter().zip(&frames_v6) {
-            u.broadcast(frame_v4, frame_v6, send_errs).await;
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                // Pack the same entries with each family's response port. The
+                // port field is fixed-width, so the two sets batch identically
+                // and pair 1:1 (see `UdpTransport::broadcast`).
+                let frames_v4 = pack_search_frames(codec, entries, u.response_port, false);
+                let frames_v6 = pack_search_frames(codec, entries, u.response_port_v6, false);
+                for (frame_v4, frame_v6) in frames_v4.iter().zip(&frames_v6) {
+                    u.broadcast(frame_v4, frame_v6, send_errs).await;
+                }
+            }
+            // No UDP transport (RTEMS target, or a name-servers-only host
+            // engine): nothing is packed or sent — the frames would advertise
+            // response ports that only exist inside `UdpTransport`.
+            Self::NameServersOnly => {
+                let _ = (codec, entries, send_errs);
+            }
         }
     }
 
@@ -608,14 +655,22 @@ impl SearchTransport {
     /// channels, which every reachable PVA server answers. UDP-only by
     /// nature — discovery has no name-server equivalent.
     async fn broadcast_discover(&self, codec: &PvaCodec, send_errs: &mut HashSet<SocketAddr>) {
-        let Self::Udp(u) = self else { return };
-        // Stamp the fixed pvxs `search_seq` ("find") rather than a fresh
-        // randomized id: the discovery-pong receive path gates on this exact
-        // value (client.cpp:889) so an unrelated found=false reply is not
-        // promoted to a fake beacon.
-        let pkt_v4 = codec.build_discover_search(SEARCH_SEQ, u.response_port);
-        let pkt_v6 = codec.build_discover_search(SEARCH_SEQ, u.response_port_v6);
-        u.broadcast(&pkt_v4, &pkt_v6, send_errs).await;
+        match self {
+            #[cfg(not(target_os = "rtems"))]
+            Self::Udp(u) => {
+                // Stamp the fixed pvxs `search_seq` ("find") rather than a fresh
+                // randomized id: the discovery-pong receive path gates on this
+                // exact value (client.cpp:889) so an unrelated found=false reply
+                // is not promoted to a fake beacon.
+                let pkt_v4 = codec.build_discover_search(SEARCH_SEQ, u.response_port);
+                let pkt_v6 = codec.build_discover_search(SEARCH_SEQ, u.response_port_v6);
+                u.broadcast(&pkt_v4, &pkt_v6, send_errs).await;
+            }
+            // UDP-only by nature — discovery has no name-server equivalent.
+            Self::NameServersOnly => {
+                let _ = (codec, send_errs);
+            }
+        }
     }
 }
 
@@ -638,13 +693,29 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
-            SearchTransport::bind_udp(&ClientSearchConfig::from_env(), extra_targets)?,
+            Self::env_transport(extra_targets)?,
             name_servers,
             String::new(),
             String::new(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
+    }
+
+    /// Build the SEARCH transport from the process environment: a bound UDP
+    /// socket bundle on a host, and [`SearchTransport::NameServersOnly`] on the
+    /// RTEMS target, where no UDP socket can be bound (§4.2). The single place
+    /// the target's transport choice is made, so the three UDP-config spawn
+    /// entry points collapse to name-servers-only there rather than each
+    /// naming `bind_udp` (which does not exist on the target).
+    #[cfg(not(target_os = "rtems"))]
+    fn env_transport(extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
+        SearchTransport::bind_udp(&ClientSearchConfig::from_env(), extra_targets)
+    }
+
+    #[cfg(target_os = "rtems")]
+    fn env_transport(_extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
+        Ok(SearchTransport::NameServersOnly)
     }
 
     /// Spawn with an explicit per-client UDP SEARCH config (address list /
@@ -662,13 +733,35 @@ impl SearchEngine {
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
-            SearchTransport::bind_udp(&config, extra_targets)?,
+            Self::config_transport(config, extra_targets)?,
             name_servers,
             ns_user,
             ns_host,
             ns_handshake_timeout,
         )
         .await
+    }
+
+    /// Build the SEARCH transport from an explicit per-client
+    /// [`ClientSearchConfig`]: a bound UDP socket bundle on a host,
+    /// [`SearchTransport::NameServersOnly`] on the RTEMS target (§4.2). The
+    /// config's UDP knobs (address list, ports, auto-addr) have no effect on the
+    /// target, where there is no UDP socket to apply them to; the caller's TCP
+    /// name servers still reach every server.
+    #[cfg(not(target_os = "rtems"))]
+    fn config_transport(
+        config: ClientSearchConfig,
+        extra_targets: Vec<SocketAddr>,
+    ) -> PvaResult<SearchTransport> {
+        SearchTransport::bind_udp(&config, extra_targets)
+    }
+
+    #[cfg(target_os = "rtems")]
+    fn config_transport(
+        _config: ClientSearchConfig,
+        _extra_targets: Vec<SocketAddr>,
+    ) -> PvaResult<SearchTransport> {
+        Ok(SearchTransport::NameServersOnly)
     }
 
     /// Spawn with the client's CA credentials for TCP name-server connections,
@@ -685,7 +778,7 @@ impl SearchEngine {
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
-            SearchTransport::bind_udp(&ClientSearchConfig::from_env(), extra_targets)?,
+            Self::env_transport(extra_targets)?,
             name_servers,
             ns_user,
             ns_host,
@@ -898,6 +991,7 @@ impl SearchEngine {
 
 // ── UDP socket helpers ──────────────────────────────────────────────────
 
+#[cfg(not(target_os = "rtems"))]
 fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
@@ -927,6 +1021,7 @@ fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
 /// Sets `IPV6_V6ONLY=true` explicitly so the v6 socket cannot accept
 /// v4-mapped traffic that would otherwise duplicate what the
 /// `AsyncUdpV4` search socket already handles.
+#[cfg(not(target_os = "rtems"))]
 fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -968,6 +1063,7 @@ fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
 /// `select!`-friendly recv helper: yields the next datagram from the
 /// optional v6 socket, or parks forever when v6 is disabled. Shared by the
 /// v6 search and v6 beacon arms of [`SearchTransport`].
+#[cfg(not(target_os = "rtems"))]
 async fn recv_from_v6(
     sock: Option<&Arc<UdpSocket>>,
     buf: &mut [u8],
@@ -978,6 +1074,7 @@ async fn recv_from_v6(
     }
 }
 
+#[cfg(not(target_os = "rtems"))]
 fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<AsyncUdpV4> {
     // Skip the loopback NIC: any local pva-rs *server* has its UDP
     // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
@@ -1009,6 +1106,7 @@ fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<A
 /// default v6 PVA multicast group `ff0e::400`. Returns `None` when the
 /// host lacks v6 or the bind fails — fast-reconnect via v6 beacons is
 /// best-effort, the v4 beacon socket keeps doing its job.
+#[cfg(not(target_os = "rtems"))]
 fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -1090,6 +1188,7 @@ fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
 /// An unresolvable `@iface` spec is skipped (logged). Pure given IP-literal
 /// `@iface` forms (`resolve_iface_v4` passthrough), so the projection is
 /// testable without real NIC multicast.
+#[cfg(not(target_os = "rtems"))]
 fn addr_list_multicast_targets(
     endpoints: &[crate::config::Endpoint],
 ) -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
@@ -1130,6 +1229,7 @@ fn addr_list_multicast_targets(
 /// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
 /// group — the same `@iface`-dropping defect as the server beacon-join
 /// path, fixed here in the same change.
+#[cfg(not(target_os = "rtems"))]
 pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4, endpoints: &[crate::config::Endpoint]) {
     // The endpoints were resolved once at config-build time through the
     // single address-list parser (`parse_endpoints_with_port`): split on
@@ -2034,12 +2134,14 @@ async fn maybe_poke(
 /// unicast target); `false` for broadcast / multicast.
 /// [`UdpTransport::broadcast`] uses it to pick which pre-built frame variant
 /// to send.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone, Copy, Debug)]
 struct SearchTarget {
     addr: SocketAddr,
     unicast: bool,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl SearchTarget {
     fn broadcast(addr: SocketAddr) -> Self {
         Self {
@@ -2055,6 +2157,7 @@ impl SearchTarget {
     }
 }
 
+#[cfg(not(target_os = "rtems"))]
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
@@ -2160,6 +2263,7 @@ fn search_targets(
 /// the egress of the pre-fix interface-constrained bundle's `fanout_to`,
 /// while leaving explicit unicast to route across the full bundle via
 /// `pick_nic`.
+#[cfg(not(target_os = "rtems"))]
 async fn fanout_on_interfaces(
     socket: &AsyncUdpV4,
     packet: &[u8],
@@ -2189,6 +2293,7 @@ async fn fanout_on_interfaces(
     }
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl UdpTransport {
     async fn broadcast(
         &self,

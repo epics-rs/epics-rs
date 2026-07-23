@@ -23,9 +23,18 @@ pub mod channel;
 pub mod context;
 pub mod operation;
 pub mod ops_v2;
+// The UDP SEARCH modules are compiled out on the RTEMS target: newlib lacks the
+// `recvmsg`/`IP_PKTINFO` receive path and `local_addr()` readback a UDP search
+// needs, so the target resolves PVs over TCP name servers alone through
+// `search_engine`'s `SearchTransport::NameServersOnly` seam
+// (doc/pvalink-rtems-design.md §4.2). `search` is the legacy standalone search
+// path and `udp` is the client UDP manager — both are host-only surface (the
+// latter is used by the host-only `pvxvct-rs` tool and the search-engine tests).
+#[cfg(not(target_os = "rtems"))]
 pub mod search;
 pub mod search_engine;
 pub mod server_conn;
+#[cfg(not(target_os = "rtems"))]
 pub mod udp;
 
 pub use context::{AssertedIdentity, CacheAction, PvGetResult, PvaClient, PvaClientBuilder};

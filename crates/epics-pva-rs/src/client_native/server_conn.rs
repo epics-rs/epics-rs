@@ -234,6 +234,23 @@ pub(crate) type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
     epics_base_rs::runtime::task::ThreadPriority::Custom(18);
 
+/// Every TCP dial this client makes, on a bounded set of permanent threads.
+///
+/// One pool for the process rather than one per `PvaClient`: `pvalink` builds a
+/// client per link (`pvalink/registry.rs` keys on the link, not the IOC), so a
+/// per-client pool would multiply the bound by the link count — the count this
+/// exists to bound. The pool is per *role* instead, which is what the band
+/// requires: workers enter `PVA_CLIENT_PRIORITY`, the band of the pumps they
+/// precede, and the CA client's dials cannot share threads with them.
+///
+/// `"PVAC-dial"` and not `"PVAC-connect {target}"`: a reused worker cannot be
+/// named for one target. A thread dump therefore still says *how many* dials
+/// are stuck but no longer *which server* is not answering — the trade for
+/// bounding the count. The target remains in the caller's own error and in the
+/// `debug!` the connection path emits.
+static PVA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
+    epics_base_rs::runtime::blocking_io::DialPool::new("PVAC-dial", PVA_CLIENT_PRIORITY);
+
 /// Dial `target` and drive it with two blocking pump threads.
 ///
 /// Compiled on every target, not only the ones that select it: the RTEMS build
@@ -258,14 +275,28 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 /// server that did not answer starved every future on Medium for ~40 s per
 /// attempt (the executor failure class of `doc/qsrv-rtems-design.md` §9.15.1).
 ///
-/// So the connect takes a dedicated thread — the CA client's
-/// `dial_blocking` shape (`epics-ca-rs/src/client/transport.rs`) — at the same
-/// band as the two pumps it precedes, and the caller parks on a oneshot
-/// instead: the receiver registers the task's waker, the send from the dial
-/// thread wakes it, and the band worker is released for the whole dial. The
-/// thread is *transient*: its body is one syscall and a channel send, and a
-/// receiver dropped by an aborted caller only makes the send fail — the socket
-/// it opened closes with the thread, which is the socket's single finalizer.
+/// So the connect takes a dial thread — the CA client's `dial_blocking` shape
+/// (`epics-ca-rs/src/client/transport.rs`) — at the same band as the two pumps
+/// it precedes, and the caller parks on a oneshot instead: the receiver
+/// registers the task's waker, the send from the dial thread wakes it, and the
+/// band worker is released for the whole dial.
+///
+/// # Why the thread is borrowed and not created
+///
+/// The dial thread comes from [`PVA_DIAL_POOL`], a permanent set of at most
+/// `MAX_DIAL_WORKERS` workers, and is returned to it when the connect resolves.
+/// It used to be created per attempt and left to exit. That is unbounded in
+/// thread *creations*, and creations are the cost on RTEMS: every
+/// `std::thread` leaks 128 B there permanently (its TLS key is freed before the
+/// key's destructor runs). A search engine whose name server is down redials
+/// roughly every 10 s for as long as the IOC runs, so per-attempt creation
+/// leaked with no ceiling — a leak the bound now removes by construction rather
+/// than caps at runtime. See `runtime::blocking_io::DialPool`.
+///
+/// A worker is still the **single finalizer** for the socket it opens: a
+/// receiver dropped by an aborted caller only makes the send fail, and the
+/// fresh socket is dropped — and closed — right there, before the worker takes
+/// its next request.
 ///
 /// # Why the thread's connect is plain-blocking, and where the bound lives
 ///
@@ -283,10 +314,11 @@ const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
 /// oneshot — the timer mechanism the exec backend already runs everywhere on
 /// target — fails the *dial* at the deadline while the thread keeps blocking
 /// under the OS's own connect ladder (Linux `tcp_syn_retries`, ~130 s). A
-/// timed-out dial's thread lingers until that OS bound, still the socket's
-/// single finalizer: if the connect completes after the caller gave up, the
-/// failed send drops the fresh socket. The lingering is bounded (one thread
-/// per in-flight dial, OS-capped) and only occurs on a blackholed peer — a
+/// timed-out dial's worker stays inside the connect until that OS bound, still
+/// the socket's single finalizer: if the connect completes after the caller
+/// gave up, the failed send drops the fresh socket. The occupancy is bounded
+/// (`MAX_DIAL_WORKERS` for the whole process, and past that dials queue and
+/// still fail at their own bound) and only occurs on a blackholed peer — a
 /// refused or reachable peer resolves the connect promptly.
 async fn dial_blocking(
     target: SocketAddr,
@@ -294,26 +326,13 @@ async fn dial_blocking(
     write_deadline: Duration,
 ) -> PvaResult<(DynRead, DynWrite)> {
     use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
-    use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread};
 
-    // `Small`: the thread's whole body is one syscall and a channel send. It
-    // is named for the target so a thread dump during a stuck connect says
-    // which server is not answering.
-    let (dialed_tx, dialed_rx) = epics_base_rs::runtime::sync::oneshot::channel();
-    spawn_dedicated_thread(
-        format!("PVAC-connect {target}"),
-        PVA_CLIENT_PRIORITY,
-        StackSizeClass::Small,
-        move || {
-            // Plain blocking `connect`; the application bound is applied by
-            // the awaiting side below. See "Why the thread's connect is
-            // plain-blocking" above.
-            let _ = dialed_tx.send(std::net::TcpStream::connect(target));
-        },
-    )
-    .map_err(PvaError::Io)?;
+    // Plain blocking `connect` on a pooled worker; the application bound is
+    // applied by the awaiting side below. See "Why the thread's connect is
+    // plain-blocking" above.
+    let dialed_rx = PVA_DIAL_POOL.dial(target).map_err(PvaError::Io)?;
     let stream = match timeout(connect_timeout, dialed_rx).await {
-        // The pvxs `operationTimeout` bound: the dial fails now; the thread
+        // The pvxs `operationTimeout` bound: the dial fails now; the worker
         // finishes under the OS connect ladder and closes whatever it opens.
         Err(_) => return Err(PvaError::Timeout),
         Ok(Ok(Ok(s))) => s,
@@ -3119,6 +3138,7 @@ mod tests {
     #[cfg(all(exec_backend, target_os = "linux"))]
     mod dial_band_tests {
         use super::*;
+        use epics_base_rs::runtime::blocking_io::MAX_DIAL_WORKERS;
         use std::future::Future;
 
         /// A local address whose SYNs the kernel drops: a listening socket
@@ -3309,25 +3329,97 @@ mod tests {
             );
         }
 
-        /// Boundary: a caller that goes away mid-dial leaks nothing. The
-        /// dial thread is the single finalizer for the socket it opens: when
-        /// the connect finally resolves, its send to the dropped receiver
-        /// fails, the fresh socket closes with the thread, and the thread
-        /// exits — nothing else has to reap either.
+        /// Every thread this client creates for a dial, whatever shape the
+        /// dial seam has.
+        ///
+        /// Both prefixes on purpose: `"PVAC-connect <target>"` is the
+        /// per-attempt thread the pool replaced and `"PVAC-dial <n>"` is a
+        /// pool worker, so a count taken through this function is comparable
+        /// across the change and the bound below is asserted against the old
+        /// shape as well as the new one. (`comm` is truncated to 15 bytes, so
+        /// both are matched on their stable prefix.)
+        fn dial_threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("task dir")
+                .filter(|e| {
+                    let Ok(e) = e else { return false };
+                    std::fs::read_to_string(e.path().join("comm"))
+                        .is_ok_and(|c| c.starts_with("PVAC-connect") || c.starts_with("PVAC-dial"))
+                })
+                .count()
+        }
+
+        /// The bound the dial seam owes the target: **N failed dials must not
+        /// cost N threads.**
+        ///
+        /// Every `std::thread` leaks 128 B permanently on RTEMS — its TLS key
+        /// is freed before the key's destructor runs — so the cost that
+        /// matters is thread *creations*, not threads alive. A search engine
+        /// whose name server is unreachable redials roughly every 10 s for as
+        /// long as the IOC runs, which under a per-attempt dial thread is a
+        /// leak with no ceiling.
+        ///
+        /// The dials here are sequential — each is awaited to its failure
+        /// before the next is issued, exactly the redial loop's shape — and
+        /// they are aimed at a blackhole so that the threads serving them are
+        /// still alive to be counted: a refusal would retire the old
+        /// per-attempt thread before this test could see it and prove nothing.
+        ///
+        /// Fails on the per-attempt shape (12 live `PVAC-connect` threads, one
+        /// per attempt, each pinned under the OS connect ladder); passes on the
+        /// pool (at most `MAX_DIAL_WORKERS`, and past the first four every
+        /// further dial queues and still fails at its own bound).
         #[test]
-        fn dropped_dial_future_retires_the_dial_thread() {
-            // `comm` is truncated to 15 bytes, so match on the stable prefix.
-            fn dial_threads() -> usize {
-                std::fs::read_dir("/proc/self/task")
-                    .expect("task dir")
-                    .filter(|e| {
-                        let Ok(e) = e else { return false };
-                        std::fs::read_to_string(e.path().join("comm"))
-                            .is_ok_and(|c| c.starts_with("PVAC-connect"))
-                    })
-                    .count()
+        fn sequential_failed_dials_do_not_grow_the_dial_thread_count() {
+            // Long enough to outgrow the bound it asserts, whatever the bound
+            // is set to.
+            const DIALS: usize = MAX_DIAL_WORKERS * 3;
+
+            let (addr, _listener, _fillers) = syn_blackhole();
+            let before = dial_threads();
+
+            for i in 0..DIALS {
+                let (tx, rx) = std::sync::mpsc::channel();
+                epics_base_rs::runtime::task::spawn(async move {
+                    let _ = tx.send(
+                        dial_pva(addr, Duration::from_millis(200), Duration::from_secs(10))
+                            .await
+                            .map(|_| ()),
+                    );
+                });
+                let res = rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|e| panic!("dial {i} must resolve at its bound: {e}"));
+                assert!(
+                    matches!(res, Err(PvaError::Timeout)),
+                    "dial {i} toward a blackhole must fail with Timeout, got {res:?}"
+                );
             }
 
+            let after = dial_threads();
+            assert!(
+                after <= before + MAX_DIAL_WORKERS,
+                "{DIALS} sequential failed dials created {} dial threads \
+                 (from {before} to {after}); the dial seam must borrow from a \
+                 bounded set of at most {MAX_DIAL_WORKERS} permanent workers, \
+                 not create one per attempt — on RTEMS each creation leaks \
+                 128 B that is never returned",
+                after - before
+            );
+        }
+
+        /// Boundary: a caller that goes away mid-dial leaks nothing. The
+        /// dial worker is the single finalizer for the socket it opens: when
+        /// the connect finally resolves, its send to the dropped receiver
+        /// fails and the fresh socket is dropped — and closed — before the
+        /// worker takes its next request. Nothing else has to reap either.
+        ///
+        /// The worker itself deliberately does **not** retire; that is the
+        /// bound. So the assertion that used to be "the thread exits" is now
+        /// its stronger replacement: the socket is finalised *and* the same
+        /// worker goes on to serve the next dial.
+        #[test]
+        fn dropped_dial_future_finalizes_its_socket_and_returns_its_worker() {
             let (addr, listener, fillers) = syn_blackhole();
             let mut fut = Box::pin(dial_pva(
                 addr,
@@ -3352,9 +3444,9 @@ mod tests {
             drop(fut);
 
             // Un-blackhole: drain the fillers so the abandoned dial's SYN
-            // retry (~1 s, ~3 s) completes. The thread's blocking connect
-            // resolves, its send fails, and it must close the socket and
-            // exit on its own.
+            // retry (~1 s, ~3 s) completes. The worker's blocking connect
+            // resolves, its send fails, and it must close the socket before
+            // going back for its next request.
             for _ in 0..fillers.len() {
                 let _ = listener.accept().expect("drain a filler");
             }
@@ -3362,27 +3454,41 @@ mod tests {
             let (ours, _) = listener.accept().expect("accept the abandoned dial");
             let ours: std::net::TcpStream = ours.into();
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
-            while dial_threads() > 0 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "dial thread leaked after its connect resolved into a \
-                     dropped receiver"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-
-            // Single finalizer: the thread closed the socket it opened, so
+            // Single finalizer: the worker closed the socket it opened, so
             // the accepted side reads EOF, not a half-open connection.
-            ours.set_read_timeout(Some(Duration::from_secs(5)))
+            ours.set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("read timeout");
             use std::io::Read;
             let mut buf = [0u8; 1];
             let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
             assert_eq!(
                 n, 0,
-                "the dial thread must close the socket whose receiver is gone"
+                "the dial worker must close the socket whose receiver is gone"
             );
+
+            // …and it is back in service rather than retired: the next dial
+            // is served without a second thread being created.
+            let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let live_addr = live.local_addr().expect("addr");
+            let acceptor = std::thread::spawn(move || live.accept().expect("accept").0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(live_addr, Duration::from_secs(5), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            rx.recv_timeout(Duration::from_secs(6))
+                .expect("the next dial must resolve")
+                .expect("a dial to a live listener must succeed");
+            assert_eq!(
+                dial_threads(),
+                1,
+                "the worker that finalised the abandoned socket must serve the \
+                 next dial, not be replaced by a fresh thread"
+            );
+            drop(acceptor.join().expect("acceptor"));
         }
 
         /// Boundary: the application-level bound (pvxs `operationTimeout`)

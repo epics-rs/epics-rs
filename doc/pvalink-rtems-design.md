@@ -1486,6 +1486,95 @@ name, not the client one this stage changed.
 | `cargo clippy -p epics-pva-rs -p epics-base-rs --all-targets -- -D warnings` | clean, in both the default and the forced-on configuration |
 | `./scripts/rtems-check.sh` | exit 0; client probe 28, 2 pre-existing warnings unchanged |
 
+### 9.11 The dial thread is borrowed, not created — `runtime::blocking_io::DialPool`
+
+§9.3 moved the connect off the callback band and onto a dedicated thread,
+and 85224553 then made that thread's connect plain-blocking with the
+application bound on the awaiting side. Both are still true. What was
+wrong in the shape they left is the thread's *lifetime*: `dial_blocking`
+created a fresh `spawn_dedicated_thread("PVAC-connect <target>")` **per
+dial attempt** and let it exit.
+
+That is unbounded in thread *creations*, and creations are the cost on
+this target: every `std::thread` leaks 128 B permanently on RTEMS — its
+TLS key is freed before the key's destructor runs (measured; raw C
+pthreads leak 0). §12.7's own finding is the trigger: a name server that
+is down makes the search engine redial roughly every 10 s for as long as
+the IOC runs. Per-attempt creation turns that into a leak with no
+ceiling — ~11 KiB/day of a target whose whole heap is fixed, and the
+per-attempt thread's own doc comment already named the 128 B as the price
+it was paying.
+
+**The fix is structural, not a cap.** No runtime "too many spawns" guard
+was added — the count cannot grow because there is nothing left to
+create. `runtime::blocking_io::DialPool` is a permanent set of at most
+`MAX_DIAL_WORKERS = 4` threads, fed dial requests over a queue and handing
+the connected `TcpStream` back through a `oneshot`. After the first dial
+at each concurrency level the pool never spawns again, whatever the redial
+cadence. `epics-pva-rs` holds one as a `static PVA_DIAL_POOL`.
+
+Five things about it that are load-bearing and should not be re-derived:
+
+* **Four workers, not one.** A worker is occupied for as long as its
+  `connect` blocks, and a SYN-blackholed peer holds one for the OS connect
+  ladder (~130 s on Linux) long after the awaiting side gave up at its own
+  bound. A single worker would let one unreachable peer
+  head-of-line-block every dial in the process — the §9.3 band-starvation
+  failure, moved rather than fixed. Four keeps distinct in-flight dials
+  independent; the cost is four `Small` stacks (4 × 256 KiB on
+  `armv7-rtems-eabihf`) and only if four dials were ever concurrently in
+  flight.
+* **Past the bound, dials queue — and that needs no handling.** A queued
+  request is still under its caller's own `timeout`, so it fails at that
+  deadline exactly as an in-flight one would. This is the §9.4 two-bound
+  split doing its job unchanged.
+* **The pool is per *role*, not per client.** Workers enter
+  `PVA_CLIENT_PRIORITY`, the band of the pumps they precede, so the CA
+  client cannot share threads with them. Per *client* was the obvious
+  granularity and is wrong: §2.4's defect means `pvalink` builds a client
+  per link, so a per-client pool would multiply the bound by the link
+  count — the count this exists to bound.
+* **A worker is still the socket's single finalizer.** A failed send
+  drops the fresh `TcpStream` right there, before the worker takes its
+  next request. A worker that *reaches* a request whose caller has already
+  gone skips the connect entirely, so a backlog behind a blackholed peer
+  costs no sockets at all.
+* **Busy workers are counted, not parked ones.** A worker between its
+  `connect` and its park is neither busy nor parked; counting parked
+  workers would make it read as unavailable, so a caller woken by that
+  very worker's reply would create a second one it does not need. The busy
+  slot is released *before* the reply is sent.
+
+**Recorded as a deviation.** A pool worker is named `"PVAC-dial <n>"`,
+not `"PVAC-connect <target>"` — a reused thread cannot be named for one
+target. A target-side thread dump therefore still says *how many* dials
+are stuck but no longer *which server* is not answering. The target stays
+visible in the caller's own error. This is the price of the bound and is
+not removable without renaming the thread per request.
+
+`dropped_dial_future_retires_the_dial_thread` was renamed to
+`dropped_dial_future_finalizes_its_socket_and_returns_its_worker`: "the
+thread exits" is no longer the property — it is the opposite of the fix —
+so the assertion became its stronger replacement, that the socket is
+finalised (EOF on the accepted side) *and* the same worker serves the next
+dial.
+
+**The CA client has the same defect and is not fixed here.**
+`epics-ca-rs/src/client/transport.rs:620` is the identical per-attempt
+`"CAC-connect <addr>"` shape, reached repeatedly by the CA search
+engine's re-offer loop. `DialPool` was put in `epics-base-rs` — beside
+`drive_socket_blocking`, for the §9.1 reason — precisely so that fix is a
+short adoption rather than a second copy. Left to a separate change to
+keep this one inside its scope.
+
+| gate | result |
+|---|---|
+| `sequential_failed_dials_do_not_grow_the_dial_thread_count` (new) | pass — verified by mutation: **12 threads for 12 sequential failed dials** on the per-attempt shape, 4 on the pool |
+| `dropped_dial_future_finalizes_its_socket_and_returns_its_worker` | pass — also fails on the per-attempt shape (worker retired: 0 threads where 1 is owed) |
+| `blocking_io::tests::sequential_dials_reuse_one_worker` (new) | pass — 8 sequential dials, `worker_count() == 1` asserted after every one |
+| `cargo nextest run -p epics-pva-rs` | 1389 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1351 passed, 0 failed, 2 skipped |
+
 ## 10. Stage 3 as built — where reality deviated from §5
 
 ### 10.1 The invariant closure landed at the facility loop, not the band loop

@@ -81,22 +81,32 @@
 //! parks; on a multi-thread runtime worker it hands the worker off first. It is
 //! **not** `blocking_send`, which panics inside a runtime context and would
 //! make this module unusable from a hosted worker.
+//!
+//! # Before the pumps: the dial
+//!
+//! A reactor-free driver cannot `await` a connect either, so the blocking
+//! `connect` needs a thread just as the two pumps do — and for the same reason,
+//! at the same band. [`DialPool`] owns those threads. It is here rather than in
+//! a protocol crate for the reason the pumps are: `epics-ca-rs` and
+//! `epics-pva-rs` both dial and neither may depend on the other.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON
-// suite. Each drives an adapter or a real socket pump; the pumps themselves are
-// std threads that reach `block_on_sync` with no runtime entered, which is the
-// exec-backend path, so the tokio runtime here only hosts the assertions.
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON
+// suite. Each drives an adapter, a real socket pump, or a `DialPool` worker;
+// those threads are std threads that reach `block_on_sync`/`connect` with no
+// runtime entered, which is the exec-backend path, so the tokio runtime here
+// only hosts the assertions.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::io::ReadBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread};
@@ -251,6 +261,221 @@ fn spawn_pump(
         body,
     )
     .inspect_err(|e| pump_thread_lost(role, &spec.label, &format!("could not be created ({e})")))
+}
+
+// ---------------------------------------------------------------------------
+// Dial side
+// ---------------------------------------------------------------------------
+
+/// How many dial threads one [`DialPool`] may ever create.
+///
+/// The bound is on *creations for the life of the process*, not on threads
+/// alive at an instant, because that is the resource that was being consumed:
+/// every `std::thread` leaks 128 B on RTEMS permanently (its TLS key is freed
+/// before the key's destructor runs), so a dial that spawns per attempt leaks
+/// per attempt. A pool whose workers never retire creates at most this many,
+/// ever — the leak becomes a one-off 4 × 128 B, whatever the redial cadence.
+///
+/// Four, not one: a worker is occupied for as long as its `connect` blocks, and
+/// a SYN-blackholed peer holds one for the OS connect ladder (Linux
+/// `tcp_syn_retries`, ~130 s) long after the awaiting side gave up at its own
+/// bound. One worker would let a single unreachable peer head-of-line-block
+/// every other dial in the process; four keeps distinct in-flight dials
+/// independent in normal operation. The cost is four `Small` stacks
+/// (4 × 256 KiB on `armv7-rtems-eabihf`), and only if four dials were ever
+/// concurrently in flight — a client that only ever dials one server at a time
+/// creates exactly one worker and reuses it forever.
+///
+/// Past the bound, dials queue. That is not a failure mode that needs its own
+/// handling: a queued request is still under the caller's own timeout, so it
+/// fails at that deadline exactly as an in-flight one would, and a worker that
+/// later reaches a request whose caller has gone opens no socket at all.
+pub const MAX_DIAL_WORKERS: usize = 4;
+
+/// One dial handed to a worker: where to connect, and where the result goes.
+struct DialRequest {
+    target: SocketAddr,
+    reply: oneshot::Sender<io::Result<TcpStream>>,
+}
+
+/// Everything the pool mutates, under one lock.
+///
+/// The three counts answer one question — *is a worker owed?* — and are kept in
+/// the shape that makes the answer exact: `workers - busy` is available, and a
+/// request is covered iff the available ones outnumber the queue.
+struct DialQueue {
+    /// Requests no worker has taken yet.
+    pending: VecDeque<DialRequest>,
+    /// Workers holding a request. Counting the *busy* ones rather than the
+    /// parked ones is load-bearing: a worker between its `connect` and its park
+    /// is neither, and counting parked workers would make it read as
+    /// unavailable — so a caller woken by that very worker's reply would create
+    /// a second one it does not need. The busy count is released *before* the
+    /// reply is sent, so a woken caller always sees its worker as available.
+    busy: usize,
+    /// Workers created. Only ever decremented when a spawn *fails*: a worker
+    /// that exists never exits, which is the whole point.
+    workers: usize,
+}
+
+/// A bounded, permanent set of threads that own this role's blocking TCP
+/// dials.
+///
+/// # Why the dial needs a thread at all
+///
+/// The connect is a blocking syscall and every caller is a task. On the exec
+/// backend a task runs on a cooperative callback-band worker shared with every
+/// other future on its band, so connecting inline parks the band for the whole
+/// attempt — measured exactly there (gdb all-thread dump, host-linux
+/// `rtems-pva-ioc`): one unanswering name server starved every future on Medium
+/// for ~40 s per attempt. So the connect goes to a thread and the caller parks
+/// on a oneshot instead.
+///
+/// # Why the threads are permanent
+///
+/// The obvious shape — one transient thread per dial — is unbounded in thread
+/// *creations*, and creations are what cost on RTEMS (see [`MAX_DIAL_WORKERS`]).
+/// A search engine whose name server is down redials roughly every 10 s for as
+/// long as the IOC runs, so "transient, one per attempt" is a leak with no
+/// ceiling. Making the workers permanent and reusing them removes the family
+/// rather than capping it: after the first dial of each concurrency level there
+/// is nothing left to create.
+///
+/// # What a worker owes the socket it opens
+///
+/// A worker is the **single finalizer** for every socket it opens. If the
+/// caller gave up (timed out, or its future was dropped) the oneshot send fails
+/// and the returned `TcpStream` is dropped right there, closing the fresh
+/// socket. A worker that reaches a request whose caller is already gone skips
+/// the connect entirely, so a backlog built up behind a blackholed peer costs
+/// no sockets at all.
+///
+/// # Where the timeout is *not*
+///
+/// The worker issues a plain blocking [`TcpStream::connect`] — the CA client's
+/// proven on-target dial, C parity with `tcpiiu.cpp`'s blocking `::connect()`,
+/// and a thread that owns its blocking needs no poll machinery. The
+/// application-level bound belongs to the awaiting side, which holds the
+/// [`oneshot::Receiver`] this returns and is free to wrap it in
+/// `runtime::task::timeout`. Do not add a bound here: the two are deliberately
+/// split, and collapsing them puts the application deadline back inside a
+/// syscall that cannot honour it.
+pub struct DialPool {
+    /// OS thread-name stem; workers are `"{name_prefix} {index}"`. Keep it
+    /// short — RTEMS truncates thread names at 16 bytes.
+    name_prefix: &'static str,
+    /// The band every worker enters. Dials belong to the band of the pumps
+    /// they precede, so this is per-role and is why the pool is not global.
+    priority: ThreadPriority,
+    queue: Mutex<DialQueue>,
+    work: Condvar,
+}
+
+impl DialPool {
+    /// Declare a role's dial pool. `const` so it can be a `static`: a pool is
+    /// per-role and lives as long as the process, so a caller needs no `Arc`
+    /// and no lazy initialiser.
+    pub const fn new(name_prefix: &'static str, priority: ThreadPriority) -> Self {
+        Self {
+            name_prefix,
+            priority,
+            queue: Mutex::new(DialQueue {
+                pending: VecDeque::new(),
+                busy: 0,
+                workers: 0,
+            }),
+            work: Condvar::new(),
+        }
+    }
+
+    /// Threads this pool has created — never more than [`MAX_DIAL_WORKERS`].
+    ///
+    /// The bound made observable: this is the number the per-attempt shape grew
+    /// without limit.
+    pub fn worker_count(&self) -> usize {
+        self.lock().workers
+    }
+
+    /// Submit a dial. The returned receiver resolves with whatever the worker's
+    /// `connect` returned.
+    ///
+    /// The error is a thread-creation failure, and only that: it is returned
+    /// *before* the request is queued, so a caller that sees it knows no dial is
+    /// pending on its behalf.
+    pub fn dial(
+        &'static self,
+        target: SocketAddr,
+    ) -> io::Result<oneshot::Receiver<io::Result<TcpStream>>> {
+        let (reply, rx) = oneshot::channel();
+        let req = DialRequest { target, reply };
+
+        let mut q = self.lock();
+        // Each queued request already claims one available worker, so this
+        // request is covered only if the available ones outnumber the queue.
+        if q.pending.len() + q.busy < q.workers || q.workers >= MAX_DIAL_WORKERS {
+            q.pending.push_back(req);
+            drop(q);
+            self.work.notify_one();
+            return Ok(rx);
+        }
+
+        // Create the worker *before* queueing, so a spawn failure leaves the
+        // pool exactly as it found it and the caller keeps its error.
+        let index = q.workers;
+        q.workers += 1;
+        drop(q);
+        if let Err(e) = spawn_dedicated_thread(
+            format!("{} {index}", self.name_prefix),
+            self.priority,
+            StackSizeClass::Small,
+            move || self.worker_loop(),
+        ) {
+            self.lock().workers -= 1;
+            return Err(e);
+        }
+        self.lock().pending.push_back(req);
+        self.work.notify_one();
+        Ok(rx)
+    }
+
+    /// A worker's whole life: take a request, connect, hand the socket back.
+    ///
+    /// Never returns. See the type docs for why that is the fix rather than an
+    /// oversight.
+    fn worker_loop(&self) -> ! {
+        loop {
+            let req = {
+                let mut q = self.lock();
+                loop {
+                    if let Some(req) = q.pending.pop_front() {
+                        q.busy += 1;
+                        break req;
+                    }
+                    // No lost wakeup to worry about: every worker re-reads
+                    // `pending` under this lock before parking, so a request
+                    // queued while this one was still running is seen here.
+                    q = self.work.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            // The caller gave up while this request sat in the queue. Opening a
+            // socket nobody can receive would only make this worker its
+            // finalizer for no reason.
+            let dialed = (!req.reply.is_closed()).then(|| TcpStream::connect(req.target));
+            // Release the slot *before* replying: the caller this reply wakes
+            // may dial again immediately, and it must see this worker as
+            // available rather than create a second one.
+            self.lock().busy -= 1;
+            if let Some(dialed) = dialed {
+                // Single finalizer: a failed send drops the `TcpStream` here,
+                // which closes the socket this worker opened.
+                let _ = req.reply.send(dialed);
+            }
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DialQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,5 +1549,55 @@ mod tests {
         reader.read_exact(&mut got).await.expect("read back");
         assert_eq!(&got, b"pong");
         assert_eq!(peer.join().expect("peer"), b"ping");
+    }
+
+    /// The invariant [`DialPool`] exists for: a dial *borrows* a thread, it does
+    /// not create one.
+    ///
+    /// Sequential dials — the shape a reconnect loop makes — must all be served
+    /// by the same worker, so the count of threads created over the process's
+    /// life is 1 rather than one per attempt. The per-attempt shape this
+    /// replaced would report 8 here (and leak 8 × 128 B of RTEMS TLS key).
+    ///
+    /// The tight spot is the *first* dial after a reply: the caller is woken by
+    /// the very worker that must serve it next, so a pool that counted parked
+    /// workers would see none available and create a second. That is why the
+    /// assertion is inside the loop and not only after it.
+    #[tokio::test]
+    async fn sequential_dials_reuse_one_worker() {
+        static POOL: DialPool = DialPool::new("test-dial", ThreadPriority::Low);
+        const DIALS: usize = 8;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Hold every accepted side open: a peer that closed would let a dial
+        // fail for a reason this test is not about.
+        let acceptor = thread::spawn(move || {
+            (0..DIALS)
+                .map(|_| listener.accept().expect("accept").0)
+                .collect::<Vec<_>>()
+        });
+
+        for i in 0..DIALS {
+            let dialed = POOL.dial(addr).expect("dial submitted");
+            let stream = dialed
+                .await
+                .expect("the worker must reply")
+                .expect("connect to a live listener");
+            assert_eq!(
+                POOL.worker_count(),
+                1,
+                "dial {i} created a new thread instead of reusing the idle \
+                 worker: sequential dials must borrow one thread, not one each"
+            );
+            drop(stream);
+        }
+
+        assert_eq!(
+            POOL.worker_count(),
+            1,
+            "{DIALS} sequential dials must have created exactly one thread"
+        );
+        drop(acceptor.join().expect("acceptor"));
     }
 }

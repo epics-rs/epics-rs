@@ -12,7 +12,13 @@ use crate::server::database::PvDatabase;
 use crate::server::record::ScanType;
 
 /// Scan scheduler that processes records at their configured scan rates.
-pub struct ScanScheduler {
+///
+/// `pub(crate)` by design: scanning is owned by the IOC core, and the
+/// only public way to start it is [`ScanOwner::start`] — a protocol
+/// server (CA, PVA) cannot construct or drive a scheduler of its own,
+/// which is what used to leave server-less targets with every periodic
+/// `SCAN` field dead.
+pub(crate) struct ScanScheduler {
     db: Arc<PvDatabase>,
 }
 
@@ -60,11 +66,11 @@ fn periodic_thread_name(period: Duration) -> String {
 /// Shutdown signal shared by the periodic scan threads.
 ///
 /// The single owner of the stop transition is [`ScanStopGuard`], held
-/// by the `run_with_hooks` future: dropping that future (tokio
-/// cancellation, runtime teardown) trips the flag and wakes every
-/// sleeper, preserving the teardown contract the previous
-/// `JoinSet`-abort implementation provided. No other path may set the
-/// flag.
+/// by the `ScanScheduler::run` future: dropping that future (the
+/// [`ScanOwner`] thread unblocking, tokio cancellation, runtime
+/// teardown) trips the flag and wakes every sleeper, preserving the
+/// teardown contract the previous `JoinSet`-abort implementation
+/// provided. No other path may set the flag.
 struct ScanStop {
     stopped: Mutex<bool>,
     wake: Condvar,
@@ -84,7 +90,7 @@ impl Drop for ScanStopGuard {
 /// processing on its own (banded) thread.
 ///
 /// Hosted: [`tokio::runtime::Handle::block_on`], the handle captured
-/// from the async context that called `run_with_hooks` — record
+/// from the async context that called `run` — record
 /// processing may spawn tasks and start timers, which need a runtime
 /// context a plain `std` thread does not otherwise have. RTEMS:
 /// `block_on_sync` → `park_on`, the same seam every blocking CA/PVA
@@ -101,8 +107,8 @@ struct TickDriver {
 
 impl TickDriver {
     /// Capture from the current async context. Hosted callers reach
-    /// `run_with_hooks` inside a tokio runtime (the previous
-    /// `JoinSet::spawn` implementation already required exactly that).
+    /// `run` inside a tokio runtime (the previous `JoinSet::spawn`
+    /// implementation already required exactly that).
     fn capture() -> Self {
         Self {
             #[cfg(tokio_backend)]
@@ -182,54 +188,21 @@ fn periodic_loop(
 }
 
 impl ScanScheduler {
-    pub fn new(db: Arc<PvDatabase>) -> Self {
+    pub(crate) fn new(db: Arc<PvDatabase>) -> Self {
         Self { db }
     }
 
-    /// Run all scan tasks. Also processes PINI records at startup.
-    /// This function runs indefinitely.
-    pub async fn run(&self) {
-        self.run_with_hooks(Vec::new()).await;
-    }
-
-    /// Run all scan tasks with post-PINI hooks.
+    /// Run the PINI=YES pass (unless the IOC init path already ran it —
+    /// see the exactly-once gate below) and all periodic scan tasks.
+    /// Never returns; dropping the future stops every scan thread (see
+    /// [`ScanStopGuard`]).
     ///
-    /// After PINI records are processed, the hooks are invoked before
-    /// periodic scan tasks begin. This ensures pollers start only after
-    /// the initial record processing burst is complete.
-    ///
-    /// If another `ScanScheduler` has already started for the same DB (e.g.
-    /// CA server already running when PVA server starts in a QSRV setup),
-    /// this call still runs the provided hooks but does NOT spawn duplicate
-    /// scan tasks. It then awaits forever so the caller's `tokio::select!`
-    /// behaves as expected.
-    pub async fn run_with_hooks(&self, hooks: Vec<Box<dyn FnOnce() + Send>>) {
+    /// If another `ScanScheduler` has already started for the same DB
+    /// (e.g. an IOC entry point and an embedded harness both starting a
+    /// [`ScanOwner`]), this call parks as a non-owner and spawns no
+    /// duplicate scan tasks.
+    pub(crate) async fn run(&self) {
         let is_first = self.db.try_claim_scan_start();
-
-        if is_first {
-            // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
-            // Exactly once per database, as in C (initialProcess runs once,
-            // inside iocBuild): when the IOC init path (`IocApplication::run`
-            // Phase 2b.6) already ran it and published completion, skip the
-            // re-run instead of re-processing every PINI record.
-            if !self.db.pini_done() {
-                self.db
-                    .pini_process(crate::server::record::PiniMode::Yes)
-                    .await;
-            }
-            // Release non-owner schedulers so they can run their hooks now.
-            self.db.mark_pini_done();
-        } else {
-            // Non-owner: wait for the owner to finish PINI before running hooks.
-            // This preserves the "PINI before after-init hooks" contract.
-            self.db.wait_for_pini().await;
-        }
-
-        // Run the caller's after-init hooks (protocol-specific, e.g. registering
-        // PVA PVs after the DB is loaded). Always AFTER PINI is done.
-        for hook in hooks {
-            hook();
-        }
 
         if !is_first {
             // Another ScanScheduler already owns the periodic tasks for this DB.
@@ -237,6 +210,20 @@ impl ScanScheduler {
             std::future::pending::<()>().await;
             return;
         }
+
+        // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
+        // Exactly once per database, as in C (initialProcess runs once,
+        // inside iocBuild): when the IOC init path (`IocApplication::run`
+        // Phase 2b.6) already ran it and published completion, skip the
+        // re-run instead of re-processing every PINI record.
+        if !self.db.pini_done() {
+            self.db
+                .pini_process(crate::server::record::PiniMode::Yes)
+                .await;
+        }
+        // Publish completion — `PvDatabase::wait_for_pini` subscribers
+        // (anything ordering itself "after PINI") unblock here.
+        self.db.mark_pini_done();
 
         // C `spawnPeriodic` (`dbScan.c:943-959`): one **dedicated,
         // banded thread per periodic rate**, `scan-%g` at
@@ -438,7 +425,7 @@ mod tests {
         }
     }
 
-    /// Cancelling `run_with_hooks` must tear the scan threads down —
+    /// Cancelling `run` must tear the scan threads down —
     /// the contract the previous `JoinSet` implementation provided via
     /// task abort. Observed through the `Arc<PvDatabase>` strong count:
     /// every scan thread holds a clone, so the count returns to the

@@ -829,7 +829,7 @@ impl PvDatabase {
 
     /// Atomically claim the right to start the scan scheduler for this DB.
     /// Returns `true` on the first call, `false` on subsequent calls.
-    /// Used by `ScanScheduler::run_with_hooks` to prevent duplicate scan tasks
+    /// Used by `ScanScheduler::run` to prevent duplicate scan tasks
     /// when multiple protocol servers (CA + PVA) both try to start scanning.
     pub fn try_claim_scan_start(&self) -> bool {
         self.inner

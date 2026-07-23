@@ -45,7 +45,41 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-TARGET="armv7-rtems-eabihf"
+# The RTEMS target this gate compiles for.
+#
+# ADOPTED DEVIATION: by default this is the custom spec carrying
+# `has-thread-local: true` (measured to take the per-thread heap leak from
+# 136 B to 0 — `doc/rtems-tls-spec-deviation.md`, evidence in
+# `doc/upstream-rtems-bugs/rust-std-rtems-tls-thread-leak.md`). Every RTEMS
+# image this workspace ships is built with the flip, so the gate compiles the
+# same native-TLS codegen the image uses: `has-thread-local` flips
+# `cfg(target_thread_local)`, which selects a *different* std TLS path, and a
+# gate on the builtin triple would type-check the path the image does not take.
+#
+# The spec is GENERATED from the active nightly (`scripts/rtems-tls-spec.sh`
+# adds exactly the one key to the builtin spec print), never frozen, so it
+# tracks whatever toolchain is installed rather than pinning one nightly's
+# data-layout. `cargo check` does not link, so no BSP/linker is needed here.
+#
+# RETIREMENT: when upstream sets `has_thread_local: true` in
+# `armv7_rtems_eabihf.rs`, `rtems-tls-spec.sh` refuses (the key is already
+# present), which fails this gate loudly — the signal to set
+# `RTEMS_USE_STOCK_SPEC=1` permanently, delete the spec wiring, and drop the
+# deviation doc. `RTEMS_USE_STOCK_SPEC=1` also forces the pre-adoption builtin
+# triple for a one-off comparison.
+JSON_SPEC_FLAGS=()
+if [[ "${RTEMS_USE_STOCK_SPEC:-0}" == "1" ]]; then
+    TARGET="armv7-rtems-eabihf"
+else
+    TARGET="$(./scripts/rtems-tls-spec.sh)"
+    JSON_SPEC_FLAGS=(-Zjson-target-spec)
+    # check does not link, but export the linker for the JSON stem anyway so a
+    # future `build` invocation through the same COMMON does not silently pick a
+    # host linker. Stem = basename without .json, upper-cased, non-alnum -> _.
+    _stem="$(basename "$TARGET" .json)"
+    _env="CARGO_TARGET_$(printf '%s' "$_stem" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+    export "$_env=arm-rtems6-gcc"
+fi
 # `-Zbuild-std` is required: there is no prebuilt std for this triple.
 #
 # `--locked` is load-bearing, not hygiene. This gate's whole claim is "the
@@ -64,7 +98,7 @@ TARGET="armv7-rtems-eabihf"
 # still fire, byte for byte, as they do at 0.2.186. No published `libc`
 # satisfies the predicates; the one that does is the unmerged fork, and which
 # fork lands is not this script's decision.
-COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort --target "$TARGET")
+COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
 
 # The crates that must compile for the target.
 CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
@@ -454,7 +488,14 @@ fi
 # The PVA probe above stays, because it is not duplicative: CRATE_FEATURES has
 # no `epics-pva-rs` entry, so `--features client` is built nowhere else.
 
-log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
-log "the portability and the image configuration."
+if [[ "${RTEMS_USE_STOCK_SPEC:-0}" == "1" ]]; then
+    log "RTEMS gate (STOCK builtin spec, RTEMS_USE_STOCK_SPEC=1): every crate and"
+    log "target binary compiles for armv7-rtems-eabihf, in both the portability"
+    log "and the image configuration."
+else
+    log "RTEMS gate (has-thread-local spec, doc/rtems-tls-spec-deviation.md): every"
+    log "crate and target binary compiles for the generated native-TLS spec, in"
+    log "both the portability and the image configuration."
+fi
 log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

@@ -97,6 +97,15 @@ jobs:
     # Tolerating "the two refusals we already know about" and exiting 0 was
     # considered and rejected by measurement: the incident that motivated the
     # refusals fires exactly one of the two, so an allowlist admits it.
+    #
+    # NOTE (has-thread-local spec deviation, 2026-07-24): there is deliberately
+    # NOTHING here that wires the custom `has-thread-local: true` target spec
+    # (`scripts/rtems-tls-spec.sh`). That spec only matters when the RTEMS
+    # *target* is compiled, and no CI job compiles it: the RTEMS coverage in CI
+    # is the `rtems-exec-model` feature built for the host (linux), which is
+    # spec-independent, and the RTEMS-target gate (`rtems-check.sh`) is excluded
+    # for the reason above. The spec gate runs on the bring-up box, not here.
+    # See doc/rtems-tls-spec-deviation.md §3 (the "CI" row) for why this is n/a.
 
   # Commit b7a6b0ab found the no-default-features debt was three masked *build
   # breaks*, not warnings — code that simply does not compile once the default

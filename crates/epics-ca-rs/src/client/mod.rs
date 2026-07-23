@@ -1320,18 +1320,22 @@ impl CaClient {
 /// `ClearChannel`, rather than discovering it via TCP RST + their
 /// own watchdog.
 ///
-/// We approximate the same outcome despite tokio's sync `Drop`:
-///   * If a runtime is reachable, spawn a detached cleanup task that
-///     sends `CoordRequest::Shutdown` (the coordinator's handler at
-///     line ~2160 emits `ClearChannel` for every operational channel
-///     before returning) and awaits the reply with a 2-s ceiling.
-///     Once the reply lands, abort the four top-level tasks. Aborts
-///     cascade through the `connections` HashMap → `ServerConnection`
-///     Drop → per-circuit read/write tasks.
-///   * If no runtime is reachable (Drop on a non-tokio thread, or
-///     after the runtime has begun shutting down), abort the four
-///     handles directly. No graceful drain — same fallback as before
-///     this elaboration.
+/// We approximate the same outcome despite the sync `Drop`, spawning a
+/// detached cleanup task through the `runtime::task` spawn seam that
+/// sends `CoordRequest::Shutdown` (the coordinator's handler at line
+/// ~2160 emits `ClearChannel` for every operational channel before
+/// returning) and awaits the reply with a 2-s ceiling. Once the reply
+/// lands, abort the four top-level tasks. Aborts cascade through the
+/// `connections` HashMap → `ServerConnection` Drop → per-circuit
+/// read/write tasks.
+///
+/// The spawn goes through `epics_base_rs::runtime::task::spawn` like the
+/// client's other 17 production tasks, not a bare `tokio::spawn` behind a
+/// `Handle::try_current()` guard: under the RTEMS exec backend the guard
+/// would return `Err` and silently skip the whole cleanup, so the
+/// bounded coordinator shutdown would never run on target. The seam
+/// dispatches onto the callback-band executor there, so the drain runs on
+/// both backends (design doc §5.1, §6 Stage C3).
 ///
 /// Residual differences from libca that this can't bridge in a sync
 /// `Drop` body:
@@ -1370,27 +1374,22 @@ impl Drop for CaClient {
             fwd.abort();
         }
 
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                let (tx, rx) = oneshot::channel();
-                if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
-                    // Bounded so a wedged coordinator doesn't keep
-                    // the cleanup task alive indefinitely.
-                    let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
-                }
-                coord_abort.abort();
-                transport_abort.abort();
-                search_abort.abort();
-                beacon_abort.abort();
-            });
-        } else {
-            // No runtime to drive the graceful sequence — fall back
-            // to immediate abort to at least guarantee no task leak.
-            self._coordinator.abort();
-            self._transport_task.abort();
-            self._search_task.abort();
-            self._beacon_task.abort();
-        }
+        // Spawn the graceful drain through the `runtime::task` seam so it
+        // runs on the RTEMS exec backend too — a bare `tokio::spawn`
+        // behind a `Handle::try_current()` guard silently skipped it on
+        // target (design doc §5.1).
+        epics_base_rs::runtime::task::spawn(async move {
+            let (tx, rx) = oneshot::channel();
+            if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
+                // Bounded so a wedged coordinator doesn't keep
+                // the cleanup task alive indefinitely.
+                let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+            }
+            coord_abort.abort();
+            transport_abort.abort();
+            search_abort.abort();
+            beacon_abort.abort();
+        });
     }
 }
 

@@ -142,7 +142,7 @@ pub struct CaLink {
 /// (`dbCa.c:459-463`), and the record lands in LINK/INVALID. Without the
 /// dispatch a Passive CP holder is never processed again and keeps serving
 /// its last good value with `SEVR=NO_ALARM` for the whole outage — measured
-/// on target, stage C6 criterion 4 (§11.2).
+/// on target, stage C6 criterion 4 (§11.4).
 ///
 /// **Owner.** This type. The flag is private, so the three sites that used
 /// to `store` into it directly (the connection watcher's two arms and

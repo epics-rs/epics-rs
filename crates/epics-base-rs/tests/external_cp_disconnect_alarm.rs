@@ -13,7 +13,7 @@
 //! The half this file pins is the one a unit test on the resolver cannot
 //! see: that a dispatch on a link which has *stopped serving a value*
 //! actually lands the alarm on the holder. Measured missing on target —
-//! stage C6 criterion 4, `doc/calink-rtems-design.md` §11.2: the guest's
+//! stage C6 criterion 4, `doc/calink-rtems-design.md` §11.4: the guest's
 //! downstream records held their last good value with `SEVR=0 STAT=0` for
 //! the whole 65 s upstream outage.
 

@@ -4835,7 +4835,7 @@ mod runtime_seam_guard {
         ),
         (
             // Every channel operation's round-trip bound. Target finding 2
-            // (`doc/calink-rtems-design.md` §11.1): four `cbMedium` panics
+            // (`doc/calink-rtems-design.md` §11.2): four `cbMedium` panics
             // from `tokio::time::timeout` in the channel read path, which the
             // transport-only guard could not see.
             "client/mod.rs",

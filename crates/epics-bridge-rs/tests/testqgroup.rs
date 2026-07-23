@@ -11,7 +11,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(31): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(32): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 
@@ -2050,4 +2050,122 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
         },
         other => panic!("expected an NTScalar member structure, got {other:?}"),
     }
+}
+
+/// Delivery-keeps-up regression for the doc §9.14 starvation defect
+/// (host-scale stand-in — the measured starvation itself is target-only):
+/// a subscribed 20-member group flooding value posts must not stall an
+/// unrelated single-record monitor's delivery. Pre-fix, the group monitor
+/// spawned ~2 forwarder tasks per member onto the shared callback pool, so
+/// the flood put O(members) task wakes per tick between the scalar
+/// monitor's events (16.9 s stalls on target); with the shared drain the
+/// group costs O(1) wakes per tick, and both channels — created through
+/// the provider, so the group rides the provider's shared pump — keep
+/// delivering with bounded latency while the flood runs.
+#[tokio::test]
+async fn group_flood_does_not_stall_scalar_monitor_delivery() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::AnyChannel;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let db = Arc::new(PvDatabase::new());
+    let mut members = String::new();
+    for i in 0..20 {
+        let rec = format!("TEST:fm{i:02}");
+        db.add_record(&rec, Box::new(AiRecord::new(f64::from(i))))
+            .await
+            .unwrap();
+        if i > 0 {
+            members.push(',');
+        }
+        members.push_str(&format!(
+            r#""f{i:02}": {{"+type": "plain", "+channel": "{rec}.VAL"}}"#
+        ));
+    }
+    db.add_record("TEST:flood_scalar", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(&format!(r#"{{ "TEST:floodgrp": {{ {members} }} }}"#))
+        .expect("20-member group loads");
+
+    // Both monitors through the provider, so the group monitor registers
+    // with the provider's shared GroupPump — the as-deployed wiring.
+    let group_ch = provider
+        .create_channel_for("TEST:floodgrp", "u", "h")
+        .await
+        .expect("group channel");
+    let mut group_mon = group_ch.create_monitor().await.expect("group monitor");
+    group_mon.start().await.expect("group monitor starts");
+
+    let scalar_ch = match provider
+        .create_channel_for("TEST:flood_scalar", "u", "h")
+        .await
+        .expect("scalar channel")
+    {
+        AnyChannel::Single(ch) => ch,
+        other => panic!(
+            "expected a single-record channel, got {:?}",
+            other.channel_name()
+        ),
+    };
+    let mut scalar_mon = scalar_ch.create_monitor().await.expect("scalar monitor");
+    scalar_mon.start().await.expect("scalar monitor starts");
+
+    // Flood every group member from a concurrent task until told to stop,
+    // yielding per round so the current-thread runtime interleaves it with
+    // the drain, the monitors and the assertions below.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let db = db.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut rounds: u32 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..20 {
+                    let rec = db
+                        .get_record(&format!("TEST:fm{i:02}"))
+                        .expect("member record");
+                    rec.write()
+                        .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
+                }
+                rounds += 1;
+                tokio::task::yield_now().await;
+            }
+            rounds
+        })
+    };
+
+    // While the flood runs: every scalar post must be delivered within a
+    // bounded window, five times in a row.
+    for round in 0..5 {
+        {
+            let rec = db.get_record("TEST:flood_scalar").expect("scalar record");
+            rec.write()
+                .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
+        }
+        tokio::time::timeout(Duration::from_secs(2), scalar_mon.poll())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("scalar delivery stalled under the group flood (round {round})")
+            })
+            .expect("scalar update");
+    }
+
+    // The flooded group's own stream flows too (coalesced, not wedged).
+    tokio::time::timeout(Duration::from_secs(2), group_mon.poll())
+        .await
+        .expect("group delivery keeps up under its own flood")
+        .expect("assembled group update");
+
+    stop.store(true, Ordering::Relaxed);
+    let rounds = flood.await.expect("flood task");
+    assert!(rounds > 0, "the flood actually ran");
+
+    group_mon.stop().await;
+    scalar_mon.stop().await;
 }

@@ -336,7 +336,9 @@ pub fn dial_pool_probe() -> (usize, usize) {
 /// therefore moves to the awaiting side: `runtime::task::timeout` around the
 /// oneshot — the timer mechanism the exec backend already runs everywhere on
 /// target — fails the *dial* at the deadline while the thread keeps blocking
-/// under the OS's own connect ladder (Linux `tcp_syn_retries`, ~130 s). A
+/// under the OS's own connect ladder — 75 s on the RTEMS target this dial is
+/// written for (libbsd `TCPTV_KEEP_INIT`, `75 * hz`, measured), ~130 s on a
+/// Linux host (`tcp_syn_retries`). A
 /// timed-out dial's worker stays inside the connect until that OS bound, still
 /// the socket's single finalizer: if the connect completes after the caller
 /// gave up, the failed send drops the fresh socket. The occupancy is bounded

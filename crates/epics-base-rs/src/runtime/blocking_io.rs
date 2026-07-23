@@ -277,9 +277,13 @@ fn spawn_pump(
 /// ever — the leak becomes a one-off 4 × 128 B, whatever the redial cadence.
 ///
 /// Four, not one: a worker is occupied for as long as its `connect` blocks, and
-/// a SYN-blackholed peer holds one for the OS connect ladder (Linux
-/// `tcp_syn_retries`, ~130 s) long after the awaiting side gave up at its own
-/// bound. One worker would let a single unreachable peer head-of-line-block
+/// a SYN-blackholed peer holds one for the whole OS connect ladder long after
+/// the awaiting side gave up at its own bound. The ladder that bounds a worker
+/// is the *target's*, not the host's: on `armv7-rtems-eabihf` libbsd ends an
+/// unanswered handshake at `TCPTV_KEEP_INIT` (`75 * hz`), measured at 75 s,
+/// while a Linux host runs `tcp_syn_retries` out to ~130 s. This pool exists
+/// for the RTEMS target, so 75 s is the figure its sizing is reasoned against.
+/// One worker would let a single unreachable peer head-of-line-block
 /// every other dial in the process; four keeps distinct in-flight dials
 /// independent in normal operation. The cost is four `Small` stacks
 /// (4 × 256 KiB on `armv7-rtems-eabihf`), and only if four dials were ever

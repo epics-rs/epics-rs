@@ -560,10 +560,13 @@ track ACK batching rather than the subscription queue shape.
 
 Rust evidence:
 
-- `crates/epics-pva-rs/src/client_native/decode.rs:311-325` defines
-  `OpDataResponse` with `changed` and `value`, but no `overrun` field.
-- `decode.rs:488-492` decodes the MONITOR DATA overrun bitset into `_overrun`
-  and then drops it.
+- `crates/epics-pva-rs/src/decode.rs:326-338` defines
+  `OpDataResponse` with `changed` and `value`. (`decode.rs` split out of
+  `client_native/` in `24d514e8`; this gap is since closed — `overrun` is now
+  a field on `OpDataResponse`, line 338.)
+- `crates/epics-pva-rs/src/decode.rs:647` decodes the MONITOR DATA overrun
+  bitset — into the real `overrun` field now, not dropped (regression-guarded by
+  `monitor_data_preserves_overrun_bitset`, `decode.rs:1588`).
 - `crates/epics-pva-rs/src/client_native/ops_v2.rs:1152-1169` exposes
   `n_cli_squash`, `n_srv_squash`, `max_queue`, and `limit_queue` in
   `SubscriptionStat`.

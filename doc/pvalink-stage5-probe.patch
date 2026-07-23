@@ -1,0 +1,439 @@
+From a82ee9fefb178e4f5331f2db7ac590b5c4e4b92e Mon Sep 17 00:00:00 2001
+From: Sang Woo Kim <physwkim@postech.ac.kr>
+Date: Thu, 23 Jul 2026 10:10:31 +0900
+Subject: [PATCH] probe(pvalink-stage5): the on-target two-IOC measurement
+ image
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Measurement scaffolding for doc/pvalink-rtems-design.md §5 stage 5,
+topology A. NOT for merge — the same arrangement as
+doc/rtems-priority-probe.patch and the slirp probe: the probe lives in
+its own commit on the branch that produced the measurement document.
+
+Three parts, each forced by something the target does not have:
+
+* `EPICS_PVA_NAME_SERVERS` is compiled in. `rtems_init.c:195` hands
+  `main` a fixed one-element argv and POSIX_Init calls `setenv` zero
+  times, so there is no environment and no command line to configure the
+  guest with. Set before `install_pvalink_resolver` builds the ONE
+  client, whose builder reads the variable once at construction.
+* The two link-bearing records live in DEMO_DB. A `-kernel` boot has no
+  filesystem, so there is no path a `.db` argument could name.
+* A console reporter thread, because criterion 6 asks for `rt top` /
+  `rt stackuse` on an image that configures the shell's commands but
+  starts no shell. The C side calls the same
+  `rtems_stack_checker_report_usage` the shell's `stackuse` calls, and
+  reuses the task census from doc/rtems-priority-probe.patch verbatim.
+
+`PvaLinkResolver::client_report` / `PvaLinkRegistry::client` are the
+guest-side view of "one upstream connection regardless of link count".
+---
+ .../epics-bridge-rs/src/bin/rtems-pva-ioc.rs  | 168 +++++++++++++++++-
+ .../src/pvalink/integration.rs                |   6 +
+ .../epics-bridge-rs/src/pvalink/registry.rs   |   8 +
+ crates/epics-rtems-boot/csrc/rtems_stats.c    | 105 +++++++++++
+ 4 files changed, 284 insertions(+), 3 deletions(-)
+
+diff --git a/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs b/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
+index c91bdf91..eb8056c1 100644
+--- a/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
++++ b/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
+@@ -168,6 +168,36 @@ mod demo_db {
+         "  info(Q:group, {\"RTEMS:PVA:GRP\":",
+         "{\"message\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":2}}})\n",
+         "}\n",
++        // STAGE-5 PROBE (doc/pvalink-rtems-design.md §5 stage 5, topology A).
++        // The records the gate is about: two INP links with `CP` (the monitor
++        // path) and one OUT link (the put path), all naming PVs served by the
++        // host-side upstream IOC. They are in `DEMO_DB` rather than in a `.db`
++        // file because a `-kernel` boot has no filesystem to name one on and
++        // `rtems_init.c:195` hands `main` a fixed one-element argv.
++        //
++        // NOT `@pva://…`, which §5 stage 5 spells: a leading `@` is INST_IO,
++        // and `dbCanSetLink` (`record/link.rs:487`, C `dbStaticLib.c:2400`)
++        // rejects INST_IO on a record whose bound device support declares
++        // CONSTANT — a soft `ai`. Measured on the target: iocInit fails with
++        // *"ai.INP: can't initialize link type CONSTANT with
++        // \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* and the image exits. C
++        // refuses the same `.db`. The two spellings that do load are both
++        // exercised here: pvxs's documented JSON longhand
++        // (`documentation/pvalink.rst:124-135`) and this tree's `pva://`
++        // scheme+suffix form, which parses to `ParsedLink::Pva`.
++        "record(ai, \"RTEMS:PVA:DOWN\") {\n",
++        "  field(INP, \"{pva: { pv: 'UPSTREAM:AI', proc: 'CP' }}\")\n",
++        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
++        "}\n",
++        "record(ai, \"RTEMS:PVA:DOWN2\") {\n",
++        "  field(INP, \"pva://UPSTREAM:AI CP\")\n",
++        "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
++        "}\n",
++        "record(ao, \"RTEMS:PVA:UPLNK\") {\n",
++        "  field(OUT, \"{pva: { pv: 'UPSTREAM:AO' }}\")\n",
++        "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
++        "  field(SCAN, \"Passive\")\n",
++        "}\n",
+     );
+ }
+ 
+@@ -280,6 +310,84 @@ mod ioc {
+         }
+     }
+ 
++    /// STAGE-5 PROBE: the upstream name server the guest's `pva://` links
++    /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
++    /// host-side upstream IOC's TCP port (the guest's own 5075 is taken by
++    /// the inbound `hostfwd`, so the upstream cannot also use it).
++    const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
++
++    /// STAGE-5 PROBE: the C task census and stack-usage report — see
++    /// `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
++    #[cfg(target_os = "rtems")]
++    unsafe extern "C" {
++        fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
++        fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
++    }
++
++    /// STAGE-5 PROBE: `rt top` + `rt stackuse`, from inside the image.
++    fn stage5_task_and_stack_report(tag: &str) {
++        #[cfg(target_os = "rtems")]
++        {
++            let c = std::ffi::CString::new(tag).unwrap_or_default();
++            // SAFETY: both take a NUL-terminated tag and only read it; the
++            // C side does its own bounds-checked iteration.
++            unsafe {
++                epics_rtems_boot_dump_tasks(c.as_ptr());
++                epics_rtems_boot_stack_report(c.as_ptr());
++            }
++        }
++        #[cfg(not(target_os = "rtems"))]
++        let _ = tag;
++    }
++
++    /// STAGE-5 PROBE: one console report — the link registry, the ONE
++    /// client's connection list, and the two link-bearing records.
++    ///
++    /// This is the guest half of pass criteria 1, 3, 4 and 6: with no shell
++    /// on the target the console is the only place the connection count and
++    /// the record's alarm state can be read from *inside* the IOC, next to
++    /// what `pvxget` reads from outside.
++    fn stage5_report(
++        seq: u32,
++        resolver: &epics_bridge_rs::pvalink::PvaLinkResolver,
++        db: &Arc<PvDatabase>,
++    ) {
++        let rep = resolver.client_report();
++        println!(
++            "STAGE5 seq={seq} links={} channels_total={} active={} searching={} \
++             connecting={} name_servers={} connections={}",
++            resolver.link_count(),
++            rep.channels_total,
++            rep.channels_active,
++            rep.channels_searching,
++            rep.channels_connecting,
++            rep.name_servers,
++            rep.connections.len(),
++        );
++        for c in &rep.connections {
++            println!(
++                "STAGE5 seq={seq} conn peer={} alive={} rx={} tx={} channels={:?}",
++                c.peer,
++                c.alive,
++                c.bytes_rx,
++                c.bytes_tx,
++                c.channels.iter().map(|ch| ch.name.as_str()).collect::<Vec<_>>(),
++            );
++        }
++        for d in resolver.channel_diagnostics() {
++            println!(
++                "STAGE5 seq={seq} link pv={} dir={:?} connected={} records={:?}",
++                d.pv_name, d.direction, d.connected, d.records,
++            );
++        }
++        for rec in ["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2", "RTEMS:PVA:UPLNK"] {
++            let val = db.get_pv(rec).map(|v| v.to_string());
++            let sevr = db.get_pv(&format!("{rec}.SEVR")).map(|v| v.to_string());
++            let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
++            println!("STAGE5 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
++        }
++    }
++
+     pub fn main() -> ExitCode {
+         // (0) Pull the RTEMS boot shim into the link. Measured: rustc forwards
+         //     a dependency's `rustc-link-lib` entries only when the binary
+@@ -288,6 +396,21 @@ mod ioc {
+         //     absent from the image. Compiles to nothing on a host build.
+         epics_rtems_boot::link_anchor();
+ 
++        // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
++        // `rtems_init.c:195` hands `main` a fixed one-element argv and
++        // `POSIX_Init` calls `setenv` zero times, so nothing outside the
++        // image can configure it — the value is compiled in here. Set before
++        // `install_pvalink_resolver` builds the ONE client, because
++        // `PvaClientBuilder`'s default reads the variable once at
++        // construction (`client_native/context.rs:171`).
++        //
++        // SAFETY (edition 2024): this runs on the single init thread before
++        // `background_init` starts any other thread, so no concurrent
++        // reader/writer of the environment exists.
++        unsafe {
++            std::env::set_var("EPICS_PVA_NAME_SERVERS", STAGE5_NAME_SERVER);
++        }
++
+         // (0b) Make the IOC audible. Every diagnostic below is a `tracing`
+         //      event, and an event with no subscriber is discarded, not
+         //      buffered — without this line the IOC boots, serves and dies
+@@ -548,6 +671,40 @@ mod ioc {
+             println!("rtems-pva-ioc: {name}");
+         }
+ 
++        // STAGE-5 PROBE: the console reporter. One line group every 10 s, and
++        // the task census + stack-usage report every 6th pass (~1 min), which
++        // is the `rt top` / `rt stackuse` reading criterion 6 asks for on a
++        // target that starts no shell. Its own thread with a stated stack
++        // class, like every other thread this entry point starts.
++        {
++            let probe_db = db.clone();
++            let probe_resolver = resolver.clone();
++            println!(
++                "STAGE5 probe: EPICS_PVA_NAME_SERVERS={} (compiled in), reporting every 10 s",
++                STAGE5_NAME_SERVER,
++            );
++            match thread::Builder::new()
++                .name("stage5-probe".to_string())
++                .stack_size(StackSizeClass::Medium.bytes())
++                .spawn(move || {
++                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
++                        epics_base_rs::runtime::task::ThreadPriority::Low,
++                    );
++                    let mut seq = 0u32;
++                    loop {
++                        thread::sleep(std::time::Duration::from_secs(10));
++                        seq += 1;
++                        stage5_report(seq, &probe_resolver, &probe_db);
++                        if seq % 6 == 0 {
++                            stage5_task_and_stack_report(&format!("s5-{seq}"));
++                        }
++                    }
++                }) {
++                Ok(_) => {}
++                Err(e) => eprintln!("STAGE5 probe: cannot start the reporter thread: {e}"),
++            }
++        }
++
+         // Runs until the board is reset: an IOC has no self-shutdown path on
+         // this target. Joining the accept thread is how the main thread waits;
+         // the accept loop only returns if `shutdown()` is requested, which
+@@ -933,16 +1090,21 @@ mod tests {
+         let recs =
+             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
+                 .expect("the built-in database must parse");
+-        assert_eq!(recs.len(), 3, "the demo database is three records");
++        // STAGE-5 PROBE: three group members plus the three link-bearing
++        // records the stage-5 gate is about (`RTEMS:PVA:DOWN` INP,
++        // `RTEMS:PVA:DOWN2`, `RTEMS:PVA:UPLNK`), which carry no `Q:group` tag.
++        assert_eq!(recs.len(), 6, "three group members plus the three pva:// links");
+ 
+         let mut groups: HashMap<String, epics_bridge_rs::qsrv::GroupPvDef> = HashMap::new();
+         for rec in &recs {
+-            let json = rec
++            let Some(json) = rec
+                 .info_tags
+                 .iter()
+                 .find(|(k, _)| k == "Q:group")
+                 .map(|(_, v)| v.clone())
+-                .unwrap_or_else(|| panic!("record {} carries no Q:group tag", rec.name));
++            else {
++                continue;
++            };
+             let defs = parse_info_group(&rec.name, &json)
+                 .unwrap_or_else(|e| panic!("record {}: {e}", rec.name));
+             merge_group_defs(&mut groups, defs);
+diff --git a/crates/epics-bridge-rs/src/pvalink/integration.rs b/crates/epics-bridge-rs/src/pvalink/integration.rs
+index 2f3c6b5c..48478926 100644
+--- a/crates/epics-bridge-rs/src/pvalink/integration.rs
++++ b/crates/epics-bridge-rs/src/pvalink/integration.rs
+@@ -681,6 +681,12 @@ impl PvaLinkResolver {
+         self.registry.len()
+     }
+ 
++    /// STAGE-5 PROBE: a snapshot of the one IOC-wide client, so a target
++    /// console can report how many upstream TCP connections back N links.
++    pub fn client_report(&self) -> epics_pva_rs::client_native::context::ClientReport {
++        self.registry.client().report_zeroed(false)
++    }
++
+     /// Per-channel pvalink diagnostics, backing the `dbpvar` IOC shell
+     /// command (pvxs `dbpvxr`, `pvxs/ioc/pvalink.cpp:184-316`).
+     pub fn channel_diagnostics(&self) -> Vec<super::registry::ChannelDiag> {
+diff --git a/crates/epics-bridge-rs/src/pvalink/registry.rs b/crates/epics-bridge-rs/src/pvalink/registry.rs
+index 1118d882..ded2d5e7 100644
+--- a/crates/epics-bridge-rs/src/pvalink/registry.rs
++++ b/crates/epics-bridge-rs/src/pvalink/registry.rs
+@@ -163,6 +163,14 @@ impl PvaLinkRegistry {
+         }
+     }
+ 
++    /// STAGE-5 PROBE: the IOC-wide client, so a target image with no shell
++    /// can print `PvaClient::report()` on its console — the only way to
++    /// observe "one upstream connection regardless of link count" from the
++    /// guest side.
++    pub fn client(&self) -> &PvaClient {
++        &self.client
++    }
++
+     /// Record that `record`'s link attached to the channel identified by
+     /// `config`. The channel may not be open yet (or may be shared by
+     /// several records); the back-index keys by the same
+diff --git a/crates/epics-rtems-boot/csrc/rtems_stats.c b/crates/epics-rtems-boot/csrc/rtems_stats.c
+index 747f6b7c..5a41d5f0 100644
+--- a/crates/epics-rtems-boot/csrc/rtems_stats.c
++++ b/crates/epics-rtems-boot/csrc/rtems_stats.c
+@@ -111,3 +111,108 @@ int epics_rtems_boot_mem_usage(uint64_t *free_total, uint64_t *used_total,
+   *free_largest = (uint64_t)info.Free.largest;
+   return 0;
+ }
++
++/*
++ * STAGE-5 PROBE — MEASUREMENT ONLY (doc/pvalink-rtems-design.md §5 stage 5,
++ * pass criterion 6). Not merged; see doc/pvalink-stage5-probe.patch.
++ *
++ * Criterion 6 asks for `rt stackuse` / `rt top` on the guest. This image
++ * configures the shell's commands (CONFIGURE_SHELL_COMMAND_STACKUSE,
++ * rtems_config.c) but never starts a shell task, and the target has no
++ * console input path at all — so the two readings have to be produced from
++ * inside the image:
++ *
++ *   * `epics_rtems_boot_stack_report` calls the exact function the shell's
++ *     `stackuse` command calls (`rtems_stack_checker_report_usage`,
++ *     cpukit/libmisc/stackchk/check.c), which is why the output format below
++ *     is the shell's own, not something this file invents. It needs
++ *     CONFIGURE_STACK_CHECKER_ENABLED, which rtems_config.c:223 already sets.
++ *   * `epics_rtems_boot_dump_tasks` is the task census (the `rt top` half —
++ *     thread count, kernel names, effective priorities). It is verbatim the
++ *     probe doc/rtems-priority-probe.patch used for the priority measurement,
++ *     reused here rather than re-invented so both measurements are reading
++ *     the same listing.
++ *
++ * The visitor only copies ids: `rtems_task_iterate` runs it with the object
++ * allocator mutex held, so every query that could block or take another lock
++ * (`rtems_object_get_name`, `rtems_task_get_priority`) is done afterwards.
++ */
++#include <stdio.h>
++#include <string.h>
++
++#include <rtems/stackchk.h>
++#include <rtems/score/objectdata.h>
++#include <rtems/score/thread.h>
++#include <rtems/score/threadimpl.h>
++
++#define EPICS_RTEMS_DUMP_MAX_TASKS 192
++
++static rtems_id epics_rtems_dump_ids[EPICS_RTEMS_DUMP_MAX_TASKS];
++/* Two names per task, because they are two different facts. `object` is what
++ * `rtems_object_get_name` reports — the classic Objects_Name, which a POSIX
++ * thread never has. `thread` is `tcb->name`, which is what
++ * `pthread_setname_np` writes. */
++static char epics_rtems_dump_object_names[EPICS_RTEMS_DUMP_MAX_TASKS][32];
++static char epics_rtems_dump_thread_names[EPICS_RTEMS_DUMP_MAX_TASKS][32];
++static uint32_t epics_rtems_dump_count;
++
++static bool epics_rtems_dump_collect(rtems_tcb *tcb, void *arg) {
++  (void)arg;
++  if (epics_rtems_dump_count < EPICS_RTEMS_DUMP_MAX_TASKS) {
++    uint32_t i = epics_rtems_dump_count++;
++    epics_rtems_dump_ids[i] = tcb->Object.id;
++    /* A memcpy out of the TCB, no lock taken — safe inside the visitor. */
++    memset(epics_rtems_dump_thread_names[i], 0,
++           sizeof(epics_rtems_dump_thread_names[i]));
++    _Thread_Get_name(tcb, epics_rtems_dump_thread_names[i],
++                     sizeof(epics_rtems_dump_thread_names[i]));
++  }
++  return false; /* false == keep iterating */
++}
++
++void epics_rtems_boot_dump_tasks(const char *tag) {
++  uint32_t i;
++  rtems_id scheduler = 0;
++  rtems_status_code sc;
++
++  epics_rtems_dump_count = 0;
++  rtems_task_iterate(epics_rtems_dump_collect, NULL);
++
++  sc = rtems_task_get_scheduler(RTEMS_SELF, &scheduler);
++  printf("TASKDUMP begin tag=%s count=%lu scheduler_sc=%d\n",
++         tag == NULL ? "?" : tag, (unsigned long)epics_rtems_dump_count,
++         (int)sc);
++
++  for (i = 0; i < epics_rtems_dump_count; i++) {
++    rtems_task_priority prio = 0;
++    rtems_status_code psc;
++    char *obj;
++
++    memset(epics_rtems_dump_object_names[i], 0,
++           sizeof(epics_rtems_dump_object_names[i]));
++    obj = rtems_object_get_name(epics_rtems_dump_ids[i],
++                                sizeof(epics_rtems_dump_object_names[i]),
++                                epics_rtems_dump_object_names[i]);
++    if (obj == NULL) {
++      strcpy(epics_rtems_dump_object_names[i], "-");
++    }
++    psc = rtems_task_get_priority(epics_rtems_dump_ids[i], scheduler, &prio);
++    printf("TASKDUMP id=0x%08lx core=%3lu posix=%4ld sc=%d obj=%-6s thread=%s\n",
++           (unsigned long)epics_rtems_dump_ids[i], (unsigned long)prio,
++           (long)255 - (long)prio, (int)psc, epics_rtems_dump_object_names[i],
++           epics_rtems_dump_thread_names[i][0] == '\0'
++               ? "<empty>"
++               : epics_rtems_dump_thread_names[i]);
++  }
++  printf("TASKDUMP end tag=%s\n", tag == NULL ? "?" : tag);
++  fflush(stdout);
++}
++
++/* `rt stackuse`: the shell command's own implementation, called directly. */
++void epics_rtems_boot_stack_report(const char *tag) {
++  printf("STACKUSE begin tag=%s\n", tag == NULL ? "?" : tag);
++  fflush(stdout);
++  rtems_stack_checker_report_usage();
++  printf("STACKUSE end tag=%s\n", tag == NULL ? "?" : tag);
++  fflush(stdout);
++}
+-- 
+2.43.0
+
+From c9907585ae66243c63554a59c5761b8e31c4d2ac Mon Sep 17 00:00:00 2001
+From: Sang Woo Kim <physwkim@postech.ac.kr>
+Date: Thu, 23 Jul 2026 11:00:37 +0900
+Subject: [PATCH] probe(pvalink-stage5): silence unused_doc_comments on the
+ RTEMS extern block
+
+rustdoc does not document extern blocks, so the `///` on the probe's
+`epics_rtems_boot_dump_tasks`/`_stack_report` declarations warned on
+every target build (`warning: `epics-bridge-rs` (bin "rtems-pva-ioc")
+generated 1 warning`). Plain `//`.
+---
+ crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs b/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
+index 78377146..7c6aca9e 100644
+--- a/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
++++ b/crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs
+@@ -316,8 +316,11 @@ mod ioc {
+     /// the inbound `hostfwd`, so the upstream cannot also use it).
+     const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
+ 
+-    /// STAGE-5 PROBE: the C task census and stack-usage report — see
+-    /// `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
++    // STAGE-5 PROBE: the C task census and stack-usage report — see
++    // `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
++    // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
++    // document extern blocks, and the target build is the only one that
++    // compiles this.)
+     #[cfg(target_os = "rtems")]
+     unsafe extern "C" {
+         fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
+-- 
+2.43.0
+

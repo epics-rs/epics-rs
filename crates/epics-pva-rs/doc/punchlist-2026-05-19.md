@@ -28,32 +28,32 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 ## Items
 
 - [x] **PVA-R2** (MEDIUM, architectural) — `PvaClientBuilder::tcp_timeout()` is stored but not applied. Plumb `tcp_timeout` through `ConnectionPool::get_or_connect` + `ServerConn::connect` + spawned heartbeat task. Multi-layer signature change.
-  - Spec: `doc/critical-review-2026-05-18.md:68-102`
-  - Deferral note: `doc/critical-review-2026-05-18.md:1254-1257`
+  - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:68-102`
+  - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1254-1257`
   - Done: worker A, commit `479f77c0` on `caucus/HJB9ABPH/worker`; regression `pva_r2_tcp_timeout_applied`. Upstream parity: pvxs clientconn.cpp:73-74,163-165; config.cpp:149,211-226,373-391.
 
 - [x] **PVA-R3** (MEDIUM, architectural) — Nested Variant values lose the stream type-cache. Thread `&mut TypeCache` through `decode_pv_field` family + all op-response decoders + reader flattening.
-  - Spec: `doc/critical-review-2026-05-18.md:103-147`
-  - Deferral note: `doc/critical-review-2026-05-18.md:1258-1260`
+  - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:103-147`
+  - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1258-1260`
   - Done: worker A, commit `cf5a0e5d` on `caucus/HJB9ABPH/worker`; regression `pva_r3_nested_variant_uses_typecache`. `decode_pv_field_at_depth` refactored to `&mut TypeCache`; new `decode_pv_field_cached` / `decode_pv_field_with_bitset_cached` entry points; RPC value decode + GET/MONITOR + PUT_GET data decode all switched to cache-aware variant. Surprisingly contained (141/19 lines, 3 files).
 
 - [x] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
-  - Spec: `doc/critical-review-2026-05-18.md:148-183`
-  - Deferral note: `doc/critical-review-2026-05-18.md:1261-1267`
+  - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:148-183`
+  - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1261-1267`
   - Done: worker A, commit `7dfe5de6` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R4`, content is PVA-R4); regression `pva_r4_tcp_nameserver_persistent_peer`. `SearchEngine::spawn` now takes `name_servers: Vec<SocketAddr>`, spawns persistent `ns_task` per entry with full PVA TCP handshake + bidirectional SEARCH relay, reconnects every 10s; `Channel` NS fallback path removed. Upstream parity: pvxs `tcpNSCheckInterval`; client.cpp:828-846 (port-0 fixup).
 
 - [x] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
-  - Spec: `doc/critical-review-2026-05-18.md:259-294`
-  - Deferral note: `doc/critical-review-2026-05-18.md:1268-1271`
+  - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:259-294`
+  - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1268-1271`
   - Done: worker A, commit `c4bb773a` on `caucus/HJB9ABPH/worker`; regression `pva_r6_squash_to_tail`. New `MonitorOutbox`/`MonitorInbox` types with `Mutex<VecDeque>+Notify`; queue default 64 → 4. Upstream parity: pvxs servermon.cpp:66 (default queue limit), :283-286 (squash-to-tail).
 
 - [x] **PVA-R14** (MEDIUM, architectural) — Decouple server source calls from per-connection read loop. Operation-state-machine restructure so source futures don't head-of-line-block the socket parser.
-  - Spec: `doc/critical-review-2026-05-18.md:513-556`
-  - Deferral note: `doc/critical-review-2026-05-18.md:1272-1275`
+  - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:513-556`
+  - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1272-1275`
   - Done: worker A, commit `601a568f` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R14`, content is PVA-R14 — same label error as PVA-R4); regression `pva_r14_source_calls_no_head_of_line_block`. Massive single-file restructure of `server_native/tcp.rs` (660/484 lines): GET/PUT/RPC/PUT_GET/PROCESS/GET_FIELD all spawn source futures; payload decoded inline before spawn; `OpState.data_task_abort: Option<Arc<AbortOnDrop>>` aborts in-flight tasks on DESTROY. 7 test assertions changed from `try_recv()` to `recv().await` for spawned data-phase responses.
 
 - [x] **TLS-NAMESERVER** (MEDIUM, architectural) — TLS via name-server (mixed-mode listener). TCP accept loop peeks the first byte and dispatches to plain handshake or `TlsAcceptor`. Refactor of `server_native/tcp.rs:460-590`.
-  - Spec/Deferral note: `doc/critical-review-2026-05-18.md:1290-1298`
+  - Spec/Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1290-1298`
   - Done: worker A, commit `2d30aebc` on `caucus/HJB9ABPH/worker`; regression `pva_tls_nameserver_mixed_mode_listener` + 3 existing TLS tests + 404/404 full suite. Peek dispatch in `run_tcp_server_on_listener` (100 ms peek window), `PeerEntry.tls` flag determined post-peek.
 
 ---

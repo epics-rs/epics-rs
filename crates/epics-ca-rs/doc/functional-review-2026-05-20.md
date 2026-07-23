@@ -139,7 +139,7 @@ Rust evidence:
   without priority and immediately allocates only a `cid`.
 - `crates/epics-ca-rs/src/client/transport.rs:246-314` queues and connects by
   `server_addr`.
-- `crates/epics-ca-rs/doc/09-libca-parity.md:111-119` records the missing
+- `crates/epics-ca-rs/crates/epics-ca-rs/doc/09-libca-parity.md:111-119` records the missing
   priority, per-priority virtual circuit, OS-thread priority, and attachable
   context behavior.
 

@@ -242,7 +242,7 @@ gate (and no SPC_NOMOD read-only gate). A PVA client sending
 `DISP=1` writes/processes it anyway — a safety-interlock bypass wire-reachable
 via a standard pvRequest option. Family: shared with Q49 (group path). The
 prior review confirmed three-way routing "faithful"
-(`doc/pvxs-functional-security-review-2026-05-18.md:43`) but not that the DISP
+(`crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:43`) but not that the DISP
 precondition applies to all three routes.
 
 ### Q26: Read access-security enforced on GET/MONITOR, which pvxs QSRV2 single-source never applies

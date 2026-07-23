@@ -1080,8 +1080,11 @@ impl CaClient {
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Shutdown { reply: tx });
-        // Wait briefly for the clear commands to be sent
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        // Wait briefly for the clear commands to be sent. Through the
+        // `runtime::task` seam: on the RTEMS target there is no tokio timer
+        // to drive `tokio::time::timeout`, and shutdown would panic instead
+        // of draining.
+        let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
     }
 
     /// Create a persistent channel. Returns immediately (starts searching in background).
@@ -1457,8 +1460,11 @@ impl Drop for CaClient {
             let (tx, rx) = oneshot::channel();
             if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
                 // Bounded so a wedged coordinator doesn't keep
-                // the cleanup task alive indefinitely.
-                let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+                // the cleanup task alive indefinitely. The bound goes
+                // through the same seam as the `spawn` above: this future
+                // is polled on the RTEMS exec backend, where `tokio::time`
+                // has no timer and panics the band worker.
+                let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
             }
             coord_abort.abort();
             transport_abort.abort();

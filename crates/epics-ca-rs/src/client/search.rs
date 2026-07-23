@@ -19,7 +19,10 @@ use std::time::{Duration, Instant};
 use epics_base_rs::net::AsyncUdpV4;
 use epics_base_rs::runtime::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::interval;
+// The `runtime::task` seam, not `tokio::time::interval`: this engine is
+// compiled for the RTEMS target, where the periodic ticker is the delayed
+// callback timer and there is no tokio timer to drive tokio's own.
+use epics_base_rs::runtime::task::interval;
 
 use crate::protocol::*;
 
@@ -1150,7 +1153,7 @@ async fn run_nameserver_connection(
                 nameserver = %addr,
                 "EPICS_CA_NAME_SERVERS connect failed; retrying after EPICS_CA_CONN_TMO"
             );
-            tokio::time::sleep(super::transport::connection_timeout()).await;
+            epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
             continue;
         };
 
@@ -1180,7 +1183,7 @@ async fn run_nameserver_connection(
             &epics_base_rs::runtime::env::hostname(),
         ));
         if writer.write_all(&handshake).await.is_err() {
-            tokio::time::sleep(super::transport::connection_timeout()).await;
+            epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
             continue;
         }
 
@@ -1336,7 +1339,7 @@ async fn run_nameserver_connection(
             // Same cadence as a failed connect: one knob (CONN_TMO), so a
             // nameserver that accepts and immediately drops cannot be
             // hammered any harder than one that refuses outright.
-            tokio::time::sleep(super::transport::connection_timeout()).await;
+            epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
         }
     }
 }

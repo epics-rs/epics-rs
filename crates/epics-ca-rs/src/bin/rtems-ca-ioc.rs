@@ -197,6 +197,44 @@ mod ioc {
         let resolver = block_on_sync(install_calink_resolver(&db))
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
+        // (2c) iocInit's link phases, in `IocApplication::run`'s order
+        //      (`ioc_app.rs:913-925`) and for its reasons. Without them the
+        //      resolver above is mounted and unreachable:
+        //
+        //      * `initialize_link_locality` commits C `dbInitLink`'s locality
+        //        decision (`dbLink.c:117-129` falling through
+        //        `dbDbInitLink`'s `S_db_notFound`, `dbDbLink.c:94-96`) — a
+        //        `Db` link naming a record this IOC does not have becomes a
+        //        `Ca` link. `INP=UPSTREAM:AI CP`, the bare ` CA`-modifier
+        //        spelling C calls `pvlOptCA`, is a `Db` link until this runs,
+        //        so without it that whole spelling reads nothing forever.
+        //      * `setup_cp_links` warms external CP/CPP links. A Passive
+        //        holder of one is never scanned, so its link never opens
+        //        lazily and its monitor is never created — a chicken-and-egg
+        //        a lazy open cannot break.
+        //      * `setup_external_link_opens` stages the rest, as C's
+        //        `dbInitLink` hands every non-local `PV_LINK` to
+        //        `dbCaAddLink` regardless of direction. Without it every
+        //        other external link pays one cold scan cycle to stage its
+        //        own open.
+        //
+        //      AFTER the mount above, not before: the warm path
+        //      (`resolve_external_pv`) routes through the registered link
+        //      set's lazy open and is a documented no-op when no lset is
+        //      installed, so running these first would silently warm nothing.
+        //
+        //      `rtems-pva-ioc` needs no equivalent: `install_pvalink_resolver`
+        //      walks the whole database itself and pre-registers every
+        //      `pva://` link. `install_calink_resolver` registers the link set
+        //      and scans nothing — C's `dbCaLinkInit` does not scan either —
+        //      because for CA the scan IS these three iocInit passes.
+        block_on_sync(async {
+            db.initialize_link_locality().await;
+            db.setup_cp_links().await;
+            db.setup_external_link_opens().await;
+        })
+        .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+
         // (3) The CA front-end. UDP search port and TCP port are the same
         //     value, as under a C IOC (caservertask.c:491-499). No ACF is
         //     configured, so access control is the permissive default.
@@ -485,6 +523,52 @@ mod tests {
             "the banner no longer reports the registered link count, the one number \
              that tells an operator whether the database's ca:// links were seen"
         );
+    }
+
+    /// The mount is not enough on its own: iocInit's three link phases are
+    /// what route the database's links through it.
+    ///
+    /// This binary does not go through `IocApplication::run`, which is the
+    /// only other place these are called, so dropping them here drops them
+    /// entirely — and the failure is silent in exactly the way the target
+    /// cannot survive. Without `initialize_link_locality` the bare
+    /// ` CA`-modifier spelling (`INP=UPSTREAM:AI CP`) stays a local `Db` link
+    /// to a record that does not exist; without `setup_cp_links` a Passive
+    /// holder of an external CP link never opens it; without
+    /// `setup_external_link_opens` every other external link waits for a cold
+    /// scan. The IOC boots and serves in all three cases.
+    #[test]
+    fn iocinit_link_phases_run_after_the_mount() {
+        let src = include_str!("rtems-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // `concat!` so these assertions cannot match their own source text.
+        let mount = concat!("install_calink_", "resolver(&db)");
+        let phases = [
+            concat!("initialize_link_", "locality()"),
+            concat!("setup_cp_", "links()"),
+            concat!("setup_external_link_", "opens()"),
+        ];
+        let mount_at = prod
+            .find(mount)
+            .expect("the mount guard above covers this; if it passed, this cannot fail");
+        for phase in phases {
+            let at = prod.find(phase).unwrap_or_else(|| {
+                panic!(
+                    "this entry point no longer calls `{phase}`; it is not reached by \
+                     `IocApplication::run` either, so the database's ca:// links would \
+                     never be routed through the mounted resolver and the IOC would boot \
+                     and serve with every external link dead"
+                )
+            });
+            assert!(
+                at > mount_at,
+                "`{phase}` must run AFTER the resolver mount: the warm path routes \
+                 through the registered link set and is a no-op with none installed"
+            );
+        }
     }
 
     /// A panic on a per-connection thread kills that thread and leaves the IOC

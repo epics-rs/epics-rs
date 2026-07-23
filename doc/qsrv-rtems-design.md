@@ -946,13 +946,14 @@ Everything here is a claim this document could not settle from source.
    `pvxinfo` against a `Q:group` PV, reached via
    `EPICS_PVA_NAME_SERVERS` (SLIRP forwards TCP; broadcast does not
    cross it).
-2. **Task count against the callback pool.** A 20-member group spawns
-   ~40 forwarder tasks (`group.rs:2496`, `:2532`); C runs one
-   `qsrvGroup` thread (`ioc/groupsource.cpp:96`). How many of those the
-   `BackgroundExecutor`'s pool can hold, and what happens at saturation,
-   is unmeasured. UNVERIFIED whether the cooperative executor's
-   release-on-`Pending` behaviour makes this a non-issue or whether the
-   group monitor needs a single drain loop the way C has one.
+2. ~~**Task count against the callback pool.**~~ **MEASURED — see
+   §9.14.** A 20-member group spawns ~40 forwarder tasks
+   (`group.rs:2496`, `:2532`); C runs one `qsrvGroup` thread
+   (`ioc/groupsource.cpp:96`). On the target this is *not* a non-issue:
+   one group subscriber collapses group delivery to ~0.35 Hz and starves
+   an unrelated scalar monitor on its own TCP connection for up to
+   16.9 s, while scanning itself stays at 10 Hz. The single drain loop
+   C has is the structural candidate.
 3. **Per-connection memory ceiling with a group source mounted.** The
    measured PVA ceiling is ~1.59 MB per connection, bounded before file
    descriptors. A group GET assembles a whole `PvStructure` from N
@@ -970,9 +971,10 @@ Everything here is a claim this document could not settle from source.
    `CAServerLow-1` = 19 (`ioc/groupsource.cpp:96`), i.e. *above* the
    server's own reactor at 18 (`src/server.cpp:388`). The Rust
    forwarders land on the callback pool at
-   `DEFAULT_SPAWN_PRIORITY` (Medium band). UNVERIFIED whether that
-   inversion relative to C matters under load — it is the kind of
-   difference that shows up only as latency, and only on a loaded board.
+   `DEFAULT_SPAWN_PRIORITY` (Medium band). §9.14 measured the *effect*
+   under load (multi-second delivery stalls) but cannot yet attribute it
+   between band priority and delivery-path saturation; the attribution
+   experiment is listed there. Latency-only, load-only, as predicted.
 6. **The 250-site census count.** Stage 4's bill is derived from
    `#[tokio::test]` occurrences. The tool also counts hand-built runtimes
    in test code, which this document did not grep for. The real number is
@@ -1713,3 +1715,63 @@ that runs it.
   on an entry point whose RTEMS arm is byte-identical — so §9.11's
   hardware evidence stands and §8's open items are untouched.
 * Stage 5 (pvalink on RTEMS) remains blocked on a blocking PVA client.
+
+### 9.14 §8 items 2 and 5, measured on the target — one group subscriber starves monitor delivery
+
+**Setup.** Probe commit `8e70b6f8` compiles a 20-member `Q:group`
+`RTEMS:PVA:BIG` into `rtems-pva-ioc`'s demo DB: members `B00..B19` are
+self-driven calcs (`SCAN ".1 second"`, `CALC "VAL+1"`), plus an
+out-of-group victim `RTEMS:PVA:V0` with the same 10 Hz self-drive.
+Scanning on the PVA-only target is alive via `51f60ed0` (the scan-owner
+thread; without it SCAN was dead entirely — see the scan-ownership
+note). Target: QEMU `xilinx_zynq_a9` on the build box, reached over
+SLIRP hostfwd to `127.0.0.1:5075`. Instrument: host-side `pvxmonitor`
+arrival timestamps in microseconds (the guest clock is
+1-second-quantized, so host wire time is the only usable clock), one
+`pvxmonitor` process — and therefore one TCP connection — per PV.
+Phases: 90 s baseline (victim monitored alone), 90 s load (a monitor
+opened on `BIG`; group forwarders only run while a subscription
+exists), 30 s recovery (load monitor closed). Scripts and raw captures:
+box `~/rtems-bringup/qsrv8/` (`q8-measure.sh`, `q8.victim`, `q8.big`,
+`q8.phases`, run 2 — run 1 is invalid, `pvxmonitor` has no `-w` flag).
+
+**Victim `V0` inter-arrival gaps (ms), per phase:**
+
+| phase    | n   | median | mean    | p99     | max      |
+|----------|-----|--------|---------|---------|----------|
+| BASELINE | 900 | 100.01 | 100.00  | 104.51  | 140.62   |
+| LOAD     | 41  | 102.99 | 2198.36 | 5995.12 | 16883.97 |
+| RECOVERY | 301 | 99.99  | 99.90   | 103.44  | 107.73   |
+
+Baseline delivers every 10 Hz tick with no value jumps. Under load the
+victim receives **41 updates where ~900 were posted**; delivery is
+bimodal — bursts at normal cadence, then stalls up to **16.9 s** — and
+8 value jumps (deltas up to 224 ticks) show the rest were coalesced
+away, not delayed. Recovery is complete from the first post-load
+sample.
+
+**Group `BIG` during load:** 31 delivered updates in 89.5 s (~0.35 Hz
+against a 10 Hz posting rate); gap median 3009.64 ms, min 0.50 ms
+(queue-drain bursts), max 5883.04 ms; the `f00` step histogram is 13×
+step-1 (burst drains) plus steps of 57–105 ticks (latest-value
+coalescing through `queueSize` 4).
+
+**What is and is not starved.** `f00` advanced 840 ticks in 89.5 s and
+the victim's counter kept incrementing through every stall: database
+scanning ran at ~10 Hz throughout. The victim sat on its own TCP
+connection, so socket backpressure from the group reply cannot explain
+its stalls. The collapse is server-side, in the monitor delivery path
+shared by both subscriptions.
+
+**Verdict on §8 item 2:** not a non-issue. The cooperative executor
+*holds* the ~40 forwarder tasks (nothing died), but delivery collapses
+~30× under a single group subscriber and takes an unrelated PV down
+with it. C's one-`qsrvGroup`-drain-thread shape
+(`ioc/groupsource.cpp:96`) is the structural candidate; resizing the
+pool or re-banding the forwarders is the patch-shaped alternative.
+
+**On §8 item 5 (forwarder priority vs C):** this run measures the
+combined effect only. Separating band-priority inversion from
+delivery-path saturation needs an attribution experiment — e.g. rerun
+with the forwarders spawned in the High band, or with a single drain
+task — before concluding which lever closes it.

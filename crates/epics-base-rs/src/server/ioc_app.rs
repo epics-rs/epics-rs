@@ -1021,6 +1021,17 @@ impl IocApplication {
         // `initHookAtIocRun` is announced. PINI=RUN records are processed
         // here and NOT in the PINI=YES pass above.
         db.pini_process(crate::server::record::PiniMode::Run).await;
+        // C `scanRun` (iocInit.c, iocRun: after the PINI=RUN hook, before
+        // `initHookAfterDatabaseRunning`): periodic scanning is owned by
+        // the IOC core, not by any protocol server — a PVA-only or
+        // server-less IOC scans all the same. The owner's PINI=YES pass
+        // is skipped (Phase 2b.6 already ran it and published
+        // completion); the `try_claim_scan_start` claim it takes keeps a
+        // protocol runner or embedded harness that starts another owner
+        // parked and harmless. Held across the runner handoff: when
+        // `run` returns (or its future is dropped), the drop stops every
+        // scan-%g thread.
+        let _scan_owner = crate::server::scan::ScanOwner::start(db.clone());
         announce!(InitHookState::AfterDatabaseRunning);
         announce!(InitHookState::AfterCaServerRunning);
 

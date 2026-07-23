@@ -621,6 +621,11 @@ impl Channel for AnyChannel {
 /// and pluggable access control.
 pub struct BridgeProvider {
     db: Arc<PvDatabase>,
+    /// The server-wide QSRV group drain — pvxs's one `qsrvGroup` event pump
+    /// per `GroupSource` (`ioc/groupsource.cpp:96`). Every group channel
+    /// this provider vends shares it, so ALL group subscriptions on the
+    /// served IOC drain through ONE task (doc/qsrv-rtems-design.md §9.15).
+    group_pump: Arc<super::group_pump::GroupPump>,
     /// Group PV registry. Wrapped in [`parking_lot::RwLock`] so iocsh
     /// commands (`dbLoadGroup`, `processGroups`) can mutate the
     /// registry through a shared `Arc<BridgeProvider>` after the
@@ -753,6 +758,7 @@ impl BridgeProvider {
     pub fn new_with_serving(db: Arc<PvDatabase>, enabled: bool) -> Self {
         Self {
             db,
+            group_pump: super::group_pump::GroupPump::new(),
             groups: parking_lot::RwLock::new(HashMap::new()),
             record_cache: parking_lot::RwLock::new(HashMap::new()),
             access_cell: Arc::new(parking_lot::RwLock::new(Arc::new(AllowAllAccess))),
@@ -1407,7 +1413,9 @@ impl BridgeProvider {
         // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
         if let Some(def) = self.servable_group(name).await {
             return Ok(AnyChannel::Group(
-                GroupChannel::new(self.db.clone(), def).with_access(access_ctx),
+                GroupChannel::new(self.db.clone(), def)
+                    .with_access(access_ctx)
+                    .with_pump(self.group_pump.clone()),
             ));
         } else if self.groups.read().contains_key(name) {
             tracing::warn!(

@@ -27,6 +27,7 @@
 pub mod channel;
 pub mod group;
 pub mod group_config;
+pub(crate) mod group_pump;
 pub mod iocsh;
 pub mod monitor;
 pub mod provider;

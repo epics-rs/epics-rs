@@ -727,6 +727,7 @@ fn member_put_action(m: &GroupMember, value: &PvStructure) -> MemberPutAction {
 // ---------------------------------------------------------------------------
 
 /// A PVA channel backed by a group of EPICS database records.
+#[derive(Clone)]
 pub struct GroupChannel {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
@@ -737,6 +738,14 @@ pub struct GroupChannel {
     /// decision — "monitor-stamped" and "has a negotiated limit" are one
     /// state, so neither can be set without the other.
     stamp: OptionsStamp,
+    /// The server-wide group drain this channel's monitors register with —
+    /// pvxs's one `qsrvGroup` pump per `GroupSource`
+    /// (`ioc/groupsource.cpp:96`). `BridgeProvider` injects its shared
+    /// pump via [`Self::with_pump`] so every group subscription on the
+    /// server drains through ONE task; a directly-constructed channel
+    /// (tests) gets a private pump, which behaves identically with one
+    /// group on it.
+    pump: Arc<super::group_pump::GroupPump>,
 }
 
 impl GroupChannel {
@@ -746,12 +755,19 @@ impl GroupChannel {
             def,
             access: super::provider::AccessContext::allow_all(),
             stamp: OptionsStamp::Get,
+            pump: super::group_pump::GroupPump::new(),
         }
     }
 
     /// Inject an access control context (for [`super::provider::BridgeProvider`]).
     pub fn with_access(mut self, access: super::provider::AccessContext) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Share the server-wide group drain (see the `pump` field docs).
+    pub(crate) fn with_pump(mut self, pump: Arc<super::group_pump::GroupPump>) -> Self {
+        self.pump = pump;
         self
     }
 
@@ -2127,7 +2143,9 @@ impl super::provider::Channel for GroupChannel {
             )));
         }
         Ok(AnyMonitor::Group(Box::new(
-            GroupMonitor::new(self.db.clone(), self.def.clone()).with_access(self.access.clone()),
+            GroupMonitor::new(self.db.clone(), self.def.clone())
+                .with_access(self.access.clone())
+                .with_pump(self.pump.clone()),
         )))
     }
 }
@@ -2138,101 +2156,57 @@ impl super::provider::Channel for GroupChannel {
 
 /// The kind of event received from a member subscription.
 #[derive(Debug, Clone, Copy)]
-enum MemberEventKind {
+pub(crate) enum MemberEventKind {
     /// Value or alarm change (DBE_VALUE | DBE_ALARM).
     Value,
     /// Property change — display limits, enum choices, etc. (DBE_PROPERTY).
     Property,
 }
 
-/// Event from a group member subscription, sent through the fan-in channel.
-struct MemberEvent {
-    member_index: usize,
-    kind: MemberEventKind,
-    /// The per-event DBE mask (`MonitorEvent.mask`, C `db_field_log.mask`;
-    /// OR-accumulated when the subscription coalesced). A *value* event
-    /// narrows the SELF-triggered member's marked leaves to the classes
-    /// that actually fired — pvxs `subscriptionValueCallback` uses
-    /// `pDbFieldLog->mask & UpdateType::Everything` for the self-trigger
-    /// and `Value | Alarm` for every other triggered field
-    /// (`groupsource.cpp:331-337`). A *property* event ignores it: pvxs
-    /// passes `UpdateType::Property` unconditionally
-    /// (`groupsource.cpp:378`).
-    mask: DbeMask,
-}
-
 /// A PVA monitor for a group PV that subscribes to all member records.
 ///
 /// Corresponds to C++ QSRV's `PDBGroupMonitor` + `pdb_group_event()`.
-/// Uses a fan-in channel pattern: each member subscription spawns a task
-/// that forwards events to a single receiver, enabling concurrent wait
-/// across all members.
-///
-/// Drop-guarded per-member task handle. Aborts the spawned forwarder
-/// when the GroupMonitor drops so a quiet PV doesn't leak the task.
-///
-/// The handle type is the `runtime::task` seam alias, not tokio's: on the
-/// target this is `background::future_exec::AbortHandle` and the forwarders
-/// it cancels run on the callback pool, where the C group event pump
-/// (`ioc/groupsource.cpp:96`) runs one thread per source. `abort()` means the
-/// same thing on both backends, which is the only property this guard needs.
-pub struct MemberTaskGuard(epics_base_rs::runtime::task::TaskAbortHandle);
-
-impl Drop for MemberTaskGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
+/// [`PvaMonitor::start`] opens the member subscriptions and registers them
+/// with the server-wide [`group_pump::GroupPump`](super::group_pump) — the
+/// port of pvxs's single `qsrvGroup` event pump (`ioc/groupsource.cpp:96`).
+/// The pump is the only consumer of member events: it resolves the marked
+/// leaves, assembles the atomic snapshot and posts the assembled update
+/// into this monitor's bounded update queue, which [`PvaMonitor::poll`]
+/// drains. No per-member task exists anywhere — the task cost of a group
+/// tick is O(1), not O(members) (doc/qsrv-rtems-design.md §9.15).
 pub struct GroupMonitor {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
     running: bool,
-    /// Reusable GroupChannel for read_group/read_partial calls.
-    /// Created once in start() instead of per-event in poll().
-    /// The internal GroupChannel inherits the same `access` context so
-    /// any read enforcement applied at create_monitor time stays in effect.
+    /// Reusable GroupChannel for the monitor-stamped `seed()` read. The
+    /// pump's registration carries a clone, so the seed and every drained
+    /// update share one stamping by construction.
     group_channel: Option<GroupChannel>,
-    /// Fan-in receiver for member events
-    event_rx: Option<tokio::sync::mpsc::Receiver<MemberEvent>>,
-    /// Keepalive fan-in *sender*, retained for the monitor's whole
-    /// lifetime so the event channel stays open even when no member task
-    /// holds a sender (an all-const / channel-less group) or every member
-    /// has gone quiet. Without it, [`start`]'s local `tx` would drop as
-    /// soon as the member loop finishes, [`poll`]'s `rx.recv()` would
-    /// return `None` immediately, and the forward task would read that as
-    /// source-close and emit a MONITOR FINISH — whereas pvxs keeps an
-    /// all-const subscription open until the client cancels
-    /// (`groupsource.cpp:240-300`). This sender is never used to post; it
-    /// only pins the channel open so `poll()` *parks* on a quiet stream.
-    /// `None` from `poll()` therefore means teardown (`stop()` cleared
-    /// `event_rx`) or a read error — never "no member events left to
-    /// forward".
-    event_tx: Option<tokio::sync::mpsc::Sender<MemberEvent>>,
-    /// Handles for spawned per-member tasks. Wrapped in AbortOnDrop
-    /// so a quiet PV (no events between subscribe-then-drop cycles)
-    /// doesn't leak member-subscription tasks. Each task drives a
-    /// DbSubscription and forwards into the fan-in mpsc; without
-    /// the abort guard those tasks survive group-monitor teardown
-    /// until the parent record's broadcast disconnects.
-    _tasks: Vec<MemberTaskGuard>,
+    /// The server-wide drain this monitor registers with on `start()`.
+    /// Injected by `GroupChannel::create_monitor` (the provider's shared
+    /// pump); a directly-constructed monitor gets a private pump.
+    pump: Arc<super::group_pump::GroupPump>,
+    /// This subscription's registration finalizer. `Some` ⟺ the pump is
+    /// draining this monitor's member subscriptions. Dropping it (in
+    /// [`PvaMonitor::stop`] or on monitor drop) is THE teardown path: it
+    /// queues the pump's `Deregister`, which releases the member
+    /// `DbSubscription`s and this monitor's update-queue producer.
+    registration: Option<super::group_pump::RegistrationHandle>,
+    /// Consumer half of the pump→monitor update queue. `poll()` parks on
+    /// it; `None` from its `recv()` ⟺ the registration left the pump ⟺
+    /// teardown. Never "no member events left" — a quiet group parks
+    /// (pvxs keeps an all-const subscription open until the client
+    /// cancels, `groupsource.cpp:240-300`).
+    update_rx: Option<super::group_pump::UpdatePoller>,
     /// Detachable enable/disable handles for every member `DbSubscription`
     /// (value + PROPERTY) opened in [`start`]. Collected before each
-    /// subscription is moved into its member task so the per-op MONITOR
-    /// START/STOP gate can `db_event_disable`/`enable` the
+    /// subscription is moved into the pump's registration so the per-op
+    /// MONITOR START/STOP gate can `db_event_disable`/`enable` the
     /// whole group's upstream on a client STOP/RESUME — pvxs
     /// `groupsource.cpp` `onStart` toggles every member `dbChannel`.
     activation_handles: Vec<SubscriptionActivation>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
-    /// Which NT property leaves each member's channel actually SUPPLIES —
-    /// `member_props[i]` belongs to `def.members[i]`, resolved once in
-    /// [`start`] (the record type's rset slots narrowed to the member's
-    /// field, exactly as `dbChannelGet` narrows `getProperties`'s option
-    /// mask). Resolved there rather than per event because it cannot change
-    /// while the monitor runs: a record's type is fixed at load. Empty until
-    /// `start`, which is the only state in which no event can arrive.
-    member_props: Vec<PropertySupport>,
     /// The NEGOTIATED monitor queue limit the PVA server resolved for this
     /// operation (`MonitorOptions::queue_size` == pvxs `stats.limitQueue`).
     /// Stamped into every monitor value's `record._options.queueSize` via
@@ -2246,7 +2220,7 @@ pub struct GroupMonitor {
 /// how a member subscription event maps onto a group
 /// monitor post — pvxs `groupsource.cpp:283-300` (value) /
 /// `:310-340` (property) / `subscriptionPost` `:207`.
-enum EventMark {
+pub(crate) enum EventMark {
     /// Post the group, marking exactly these group field paths
     /// (the resolved `+trigger` target set, assigned-not-changed).
     Marked(Vec<String>),
@@ -2263,14 +2237,21 @@ impl GroupMonitor {
             def,
             running: false,
             group_channel: None,
-            event_rx: None,
-            event_tx: None,
-            _tasks: Vec::new(),
+            pump: super::group_pump::GroupPump::new(),
+            registration: None,
+            update_rx: None,
             activation_handles: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
-            member_props: Vec::new(),
             queue_limit: epics_pva_rs::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT,
         }
+    }
+
+    /// Share the server-wide group drain. Called by
+    /// `GroupChannel::create_monitor` with the provider's pump; a monitor
+    /// built without it drains through a private pump.
+    pub(crate) fn with_pump(mut self, pump: Arc<super::group_pump::GroupPump>) -> Self {
+        self.pump = pump;
+        self
     }
 
     /// Inject an access control context. Called by `GroupChannel::create_monitor`.
@@ -2353,7 +2334,7 @@ impl GroupMonitor {
     /// unmasked post carries no classification) falls back to
     /// `Value | Alarm`, the same default pvxs uses when no field log is
     /// available (pre-7.0.6 builds).
-    fn value_event_mark(
+    pub(crate) fn value_event_mark(
         def: &GroupPvDef,
         props: &[PropertySupport],
         source_idx: usize,
@@ -2418,7 +2399,7 @@ impl GroupMonitor {
     /// and marking timeStamp/alarm here (as the snapshot diff did) is
     /// exactly the divergence `getTimeAlarm`'s `change & (Value | Alarm)`
     /// gate rules out (`iocsource.cpp:330-332`).
-    fn property_event_mark(
+    pub(crate) fn property_event_mark(
         def: &GroupPvDef,
         props: &[PropertySupport],
         source_idx: usize,
@@ -2501,7 +2482,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // (`dbChannelGet`'s narrowing of `getProperties`'s option mask). Built
         // by mapping over `def.members`, so the index correspondence
         // `member_props[i] <-> def.members[i]` holds by construction.
-        self.member_props = {
+        let member_props = {
             let mut props = Vec::with_capacity(self.def.members.len());
             for member in &self.def.members {
                 props.push(
@@ -2511,20 +2492,19 @@ impl super::provider::PvaMonitor for GroupMonitor {
             props
         };
 
-        // Create fan-in channel for member events. Capacity scales
-        // with member count so a many-record group with simultaneous
-        // updates doesn't backpressure each member's
-        // DbSubscription (which would lose events to broadcast Lag).
-        // 64 was the original constant; 4× members.len() gives slow
-        // groups the same headroom while bounded by member count.
-        let cap = (self.def.members.len() * 4).max(64);
-        let (tx, rx) = tokio::sync::mpsc::channel::<MemberEvent>(cap);
+        // Member subscriptions collect HERE and move into the pump's
+        // registration below — no task is spawned per member. The pump is
+        // the single consumer (pvxs's one `qsrvGroup` event thread,
+        // `ioc/groupsource.cpp:96`); member events queue in each
+        // subscription's own EvQue (C dbEvent ring, replace-in-place under
+        // pressure) until the drain takes them.
+        let mut member_subs: Vec<super::group_pump::MemberSub> = Vec::new();
 
         // Subscribe to ALL members with channels, regardless of trigger
         // setting — pvxs subscribes every field with a dbChannel
         // (groupsource.cpp:375-398). TriggerDef::None only means "don't
         // update the group when this field changes"; its events are
-        // filtered to EventMark::Skip in poll() rather than gating the
+        // filtered to EventMark::Skip in the pump rather than gating the
         // stream.
         for (idx, member) in self.def.members.iter().enumerate() {
             if member.channel.is_empty() {
@@ -2566,33 +2546,22 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     | epics_base_rs::server::recgbl::EventMask::LOG)
                     .bits()
             };
-            if let Some(mut sub) =
+            if let Some(sub) =
                 DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, value_mask).await
             {
                 // Capture the enable/disable handle BEFORE the subscription
-                // moves into its member task, so the per-op gate
+                // moves into the pump's registration, so the per-op gate
                 // can toggle this member's event flow without owning the sub.
+                // The pump drains with `poll_recv_event` (not a snapshot
+                // read) so the per-event DBE mask reaches the mark
+                // resolution — pvxs reads `pDbFieldLog->mask` for the
+                // self-trigger narrowing.
                 self.activation_handles.push(sub.activation_handle());
-                let tx = tx.clone();
-                let handle = epics_base_rs::runtime::task::spawn(async move {
-                    // `recv_event` (not `recv_snapshot`) so the per-event
-                    // DBE mask reaches the mark resolution — pvxs reads
-                    // `pDbFieldLog->mask` for the self-trigger narrowing.
-                    while let Some(event) = sub.recv_event().await {
-                        if tx
-                            .send(MemberEvent {
-                                member_index: idx,
-                                kind: MemberEventKind::Value,
-                                mask: event.mask,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
+                member_subs.push(super::group_pump::MemberSub {
+                    member_index: idx,
+                    kind: MemberEventKind::Value,
+                    sub,
                 });
-                self._tasks.push(MemberTaskGuard(handle.abort_handle()));
             }
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
@@ -2604,54 +2573,55 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // field.
             if member.mapping == FieldMapping::Scalar || member.mapping == FieldMapping::Meta {
                 let prop_mask = epics_base_rs::server::recgbl::EventMask::PROPERTY.bits();
-                if let Some(mut sub) =
+                if let Some(sub) =
                     DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, prop_mask)
                         .await
                 {
                     self.activation_handles.push(sub.activation_handle());
-                    let tx = tx.clone();
-                    let handle = epics_base_rs::runtime::task::spawn(async move {
-                        while let Some(event) = sub.recv_event().await {
-                            if tx
-                                .send(MemberEvent {
-                                    member_index: idx,
-                                    kind: MemberEventKind::Property,
-                                    mask: event.mask,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
+                    member_subs.push(super::group_pump::MemberSub {
+                        member_index: idx,
+                        kind: MemberEventKind::Property,
+                        sub,
                     });
-                    self._tasks.push(MemberTaskGuard(handle.abort_handle()));
                 }
             }
         }
 
-        // Create a reusable GroupChannel once (instead of per-event in poll).
-        // Propagate the same access context so any subsequent reads triggered
-        // by trigger evaluation also honor read enforcement.
+        // Create a reusable GroupChannel once (instead of per-event in the
+        // drain). Propagate the same access context so any subsequent reads
+        // triggered by trigger evaluation also honor read enforcement.
         //
         // The monitor stamp carries the per-operation negotiated queue limit,
         // so every monitor value stamps `record._options.queueSize` with the
         // depth the subscription actually got (pvxs `groupsource.cpp:404`
-        // `stats.limitQueue`).
+        // `stats.limitQueue`). The pump's registration clones this channel,
+        // so the seed and every drained update share one stamping by
+        // construction.
         let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
             .with_access(self.access.clone())
             .with_monitor_stamp(self.queue_limit);
 
-        // Retain the original fan-in sender for the monitor's lifetime so
-        // the event channel never closes just because there are no member
-        // tasks (all-const / channel-less group) or they have all gone
-        // quiet. poll() then *parks* instead of returning None, so the
-        // forward task never reads source-close and never emits a premature
-        // MONITOR FINISH — pvxs keeps an all-const subscription open until
-        // the client cancels (groupsource.cpp:240-300).
-        self.event_tx = Some(tx);
+        // Register with the server-wide drain. The update queue's producer
+        // lives in the pump's registration for this monitor's whole
+        // subscribed life, so `poll()` *parks* on a quiet stream (all-const
+        // group, every member quiet) instead of reading end-of-stream —
+        // pvxs keeps an all-const subscription open until the client
+        // cancels (groupsource.cpp:240-300). Its capacity is the negotiated
+        // queue limit; on overflow the newest update replaces the tail in
+        // place (C monitor latest-value coalescing).
+        let (update_tx, update_rx) =
+            super::group_pump::update_queue(self.queue_limit.max(1) as usize);
+        let registration = self.pump.register(super::group_pump::RegistrationSpec {
+            def: self.def.clone(),
+            member_props,
+            group_channel: group_channel.clone(),
+            subs: member_subs,
+            update_tx,
+        });
+
         self.group_channel = Some(group_channel);
-        self.event_rx = Some(rx);
+        self.update_rx = Some(update_rx);
+        self.registration = Some(registration);
         self.running = true;
         Ok(())
     }
@@ -2660,105 +2630,37 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // Purely event-driven: the wire layer already sent the initial
         // frame via get_value_checked() at MONITOR INIT for every source
         // (server_native/tcp.rs:build_monitor_payload), so this stream
-        // carries only fresh member deltas — never an initial snapshot.
+        // carries only fresh assembled updates — never an initial snapshot.
         //
-        // A channel-less (all-const) group has no member subscriptions, so
-        // `rx.recv()` never wakes — but the retained `event_tx` keepalive
-        // keeps the channel open, so this *parks* rather than returning
-        // `None`. The client sees exactly one DATA frame (the wire initial)
-        // and the subscription stays open until the client cancels, matching
-        // pvxs `groupsource.cpp:240-300` (an all-const subscription is left
-        // open after the initial post). `None` here therefore means teardown
-        // (`stop()` cleared `event_rx`) or a read error — never "no member
-        // events left to forward". A channel-backed group
-        // forwards each member event
-        // as it arrives, with NO gate on other members posting first: pvxs
-        // primes every field from sampled values at start via
-        // db_post_single_event (groupsource.cpp:289-297), so a quiet member
-        // never withholds an active one. The previous per-member priming
-        // gate both withheld every delta until all members changed and
-        // re-emitted a full snapshot the wire layer had already sent — one
-        // structural defect (the priming gate) producing two symptoms.
-        let rx = self.event_rx.as_mut()?;
-
-        loop {
-            let event = rx.recv().await?;
-
-            // resolve which group field paths this event
-            // marks, instead of treating every trigger kind identically.
-            // pvxs iterates `field.triggers` (value) or the source field
-            // alone (property), refreshes those targets, then posts the
-            // full group with only those leaves marked. `read_group()`
-            // still reads every member (the posted Value is complete);
-            // the marked set is what the PVA layer turns into the wire
-            // changed-bitset.
-            let mark = match event.kind {
-                MemberEventKind::Value => Self::value_event_mark(
-                    &self.def,
-                    &self.member_props,
-                    event.member_index,
-                    event.mask,
-                ),
-                MemberEventKind::Property => {
-                    Self::property_event_mark(&self.def, &self.member_props, event.member_index)
-                }
-            };
-            // Every posted group event carries its marked leaves — there is
-            // no shape a group event can take that the leaf paths cannot
-            // address (see `marked_leaves`), so the group source never asks
-            // the server to derive a changed-bitset.
-            let marked = match mark {
-                EventMark::Skip => continue,
-                EventMark::Marked(paths) => paths,
-            };
-
-            let group_channel = self.group_channel.as_ref()?;
-            let value = match group_channel.read_group().await {
-                Ok(v) => v,
-                Err(e) => {
-                    // pvxs wraps each group value/property refresh in a
-                    // try/catch that logs and returns from the callback
-                    // *without posting*, leaving the subscription alive
-                    // (`groupsource.cpp:350-352`). A per-event read or
-                    // conversion failure (a member record gone, a value
-                    // conversion error, a mid-stream ACL revocation on one
-                    // member) must therefore drop a single update — not map
-                    // to `None`, which the forward task reads as source-close
-                    // and turns into a spurious MONITOR FINISH that tears the
-                    // whole group subscription down.
-                    tracing::warn!(
-                        group = %self.def.name,
-                        error = %e,
-                        "qsrv group monitor: member read failed; skipping event, subscription kept open"
-                    );
-                    continue;
-                }
-            };
-            // Resolve value-shape-dependent leaves against the concrete
-            // composed value: an NTEnum member's value/alarm event marks
-            // only `value.index`, never the property-only `value.choices`
-            // the whole-subtree `value` mark would otherwise re-send
-            // (pvxs `iocsource.cpp:107-109,331-351`).
-            let marked = super::pvif::narrow_enum_value_leaves(marked, &value);
-            return Some(super::provider::MonitorPoll {
-                value,
-                marked: Some(marked),
-            });
-        }
+        // Everything per-event — trigger/mark resolution, the atomic
+        // `read_group()` snapshot, enum-leaf narrowing, the skip on a
+        // markless event or a per-event read failure (pvxs
+        // `groupsource.cpp:350-352` parity) — happens in the server-wide
+        // drain (`group_pump::process_event`), which posts assembled
+        // updates into this monitor's bounded update queue. This method
+        // only parks on that queue.
+        //
+        // A quiet group (all-const, every member idle) parks here: the
+        // queue's producer lives in the pump's registration for the whole
+        // subscribed life, so `recv()` cannot read end-of-stream early —
+        // pvxs keeps an all-const subscription open until the client
+        // cancels (groupsource.cpp:240-300). `None` therefore means
+        // teardown (`stop()` cleared `update_rx`, or the registration left
+        // the pump) — never "no member events left to forward".
+        self.update_rx.as_mut()?.recv().await
     }
 
     async fn stop(&mut self) {
-        // Drop the receiver and the keepalive sender so the fan-in channel
-        // fully closes; any still-live member task then observes the send
-        // error and exits even before its AbortOnDrop guard fires. Clearing
-        // the keepalive here is what lets a future poll() report teardown —
-        // while running, the keepalive keeps poll() parking on a quiet
-        // stream.
-        self.event_rx = None;
-        self.event_tx = None;
-
-        // Abort spawned tasks. Drop fires the AbortOnDrop guard.
-        self._tasks.clear();
+        // The ONE teardown path. Dropping `update_rx` marks the consumer
+        // side closed (a drain push after this fails visibly and routes the
+        // registration out through the pump's removal path); dropping
+        // `registration` queues the pump's `Deregister` finalizer, which
+        // releases the member `DbSubscription`s and the update-queue
+        // producer — and terminates the drain task when this was the last
+        // group subscription. A later poll() sees `update_rx == None` and
+        // reports teardown.
+        self.update_rx = None;
+        self.registration = None;
 
         self.running = false;
         self.group_channel = None;
@@ -4982,21 +4884,31 @@ mod tests {
     /// revocation on one member — must drop that single update and leave
     /// the subscription open. pvxs wraps each group value/property refresh
     /// in a try/catch that logs and returns from the callback WITHOUT
-    /// posting (`groupsource.cpp:350-352`). Mapping the error to `None`
+    /// posting (`groupsource.cpp:350-352`). Ending the update stream
     /// instead reads as source-close in the forward task and tears the
     /// whole group monitor down with a spurious MONITOR FINISH.
+    ///
+    /// Two members so the failure is a REAL drain-side one: member `b`'s
+    /// record is removed (its subscription ends; the drain drops just that
+    /// member stream), then a genuine post on member `a` makes the drain
+    /// assemble the group — `read_group()` fails on the missing `b`, the
+    /// drain skips the update, and the subscription stays open.
     #[tokio::test]
     async fn q39_group_monitor_member_read_error_skips_event_keeps_open() {
         use crate::qsrv::provider::PvaMonitor;
         use epics_base_rs::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("Q39:rec", Box::new(AiRecord::new(1.0)))
+        db.add_record("Q39:a", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("Q39:b", Box::new(AiRecord::new(2.0)))
             .await
             .unwrap();
         let cfg = r#"{
             "Q39:GRP": {
-                "v": {"+type": "plain", "+channel": "Q39:rec.VAL"}
+                "va": {"+type": "plain", "+channel": "Q39:a.VAL"},
+                "vb": {"+type": "plain", "+channel": "Q39:b.VAL"}
             }
         }"#;
         let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
@@ -5004,25 +4916,24 @@ mod tests {
         let mut mon = GroupMonitor::new(db.clone(), def);
         mon.start().await.expect("group monitor starts");
 
-        // Retain a keepalive sender so the fan-in channel stays open, then
-        // make the member unreadable: `read_group()` now fails with
-        // `RecordNotFound`.
-        let tx = mon.event_tx.clone().expect("keepalive sender present");
-        assert!(db.remove_record("Q39:rec").await, "member record removed");
+        // Make the group unreadable: `read_group()` now fails with
+        // `RecordNotFound` on `b`.
+        assert!(db.remove_record("Q39:b").await, "member record removed");
 
-        // Inject a value event for the now-unreadable member.
-        tx.send(MemberEvent {
-            member_index: 0,
-            kind: MemberEventKind::Value,
-            mask: DbeMask::VALUE | DbeMask::ALARM,
-        })
-        .await
-        .expect("event queued on keepalive channel");
+        // A real post on the surviving member reaches the drain.
+        {
+            let rec = db.get_record("Q39:a").expect("member a exists");
+            rec.write().notify_field(
+                "VAL",
+                epics_base_rs::server::recgbl::EventMask::VALUE
+                    | epics_base_rs::server::recgbl::EventMask::ALARM,
+            );
+        }
 
-        // poll() must consume the event, hit the read failure, log+skip,
-        // and PARK on the still-open channel — never return `None` (FINISH).
-        // A bounded poll therefore TIMES OUT; pre-fix it returned `None`
-        // (Some(None)) immediately.
+        // The drain must consume the event, hit the read failure, log+skip,
+        // and poll() must PARK on the still-open update queue — never
+        // return `None` (FINISH). A bounded poll therefore TIMES OUT;
+        // pre-fix it returned `None` (Some(None)) immediately.
         let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
         assert!(
             polled.is_err(),

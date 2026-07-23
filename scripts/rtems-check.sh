@@ -89,8 +89,18 @@ CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
 # was `qsrv-core` alone, because `client_native` was 47 errors on this target
 # (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
+#
+# `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
+# `rtems-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
+# `calink` drives a live `CaClient`. `client-core`, not `client`: the split is
+# stated in `crates/epics-ca-rs/Cargo.toml` and it is the circuit, the search
+# engine, subscriptions and the resolver WITHOUT the beacon monitor / repeater
+# / service discovery / reverse-DNS stack a record link never reaches. This is
+# the same selection the CA ratchet below measures, so the probe and the built
+# binary agree by construction rather than by two people remembering.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
+    [epics-ca-rs]="client-core"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.
@@ -384,23 +394,15 @@ if [[ "$client_errors" -ne "$PVA_CLIENT_TARGET_ERRORS" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The CA client probe: the same RATCHET, for the other protocol.
+# The CA client had the same RATCHET, and no longer needs one.
 #
 # `doc/calink-rtems-design.md` §6 stage C5 mounts the `ca://` record-link
 # resolver in `rtems-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
-# the target — `calink` drives a live `CaClient` (§2.1). Same staging problem
-# as the PVA probe above: the remaining errors are work this design stages
-# after the split, and a gate red for unstarted work reports nothing. So the
-# selection is measured rather than built, and the count is the artefact.
+# the target — `calink` drives a live `CaClient` (§2.1). While that was work in
+# progress the selection was MEASURED rather than built, exactly as the PVA one
+# above still is, because a gate red for unstarted work reports nothing:
 #
-# The measured configuration is `--features client-core`, NOT `client`: the
-# split is stated in `crates/epics-ca-rs/Cargo.toml`, and `client-core` is what
-# an image selects — the circuit, the search engine, subscriptions and the link
-# resolver, without the beacon monitor / repeater / service discovery /
-# reverse-DNS stack that a record link never reaches. Probing `client` instead
-# would measure the errors of code this target is never going to build.
-#
-# History, `--no-default-features --features client-core -p epics-ca-rs --lib`:
+# `--no-default-features --features client-core -p epics-ca-rs --lib`:
 #
 #     22  before the split      measured with `client`/`channel`/`calink` merely
 #                               un-gated: 7 of them are the discovery stack's
@@ -428,34 +430,21 @@ fi
 # not a runtime branch, and `CaClient::new_with_config` reaches
 # `name_servers_only_search_engine` by `cfg` rather than by choice.
 #
-# Bidirectional for the same reason the binary census is: MORE is a regression
-# that moved the client further from the target; FEWER means someone did the
-# work and left the bound behind, at which point it stops measuring and becomes
-# decoration. It stays pinned AT ZERO, and it is what keeps `tokio::net`,
-# `socket2` and a raw `FIONREAD` out of the target client: re-introducing any of
-# them raises the count and this comparison names it.
-CA_CLIENT_TARGET_ERRORS=0
-
-log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
-export RUSTFLAGS="$BASE_RUSTFLAGS"
-ca_client_errors=$(cargo "${COMMON[@]}" -p epics-ca-rs --lib --features client-core 2>&1 |
-    grep -oP 'due to \K\d+(?= previous error)' || true)
-ca_client_errors=${ca_client_errors:-0}
-
-if [[ "$ca_client_errors" -ne "$CA_CLIENT_TARGET_ERRORS" ]]; then
-    echo "RTEMS gate FAILED: the CA client's target error count moved." >&2
-    echo "  expected: $CA_CLIENT_TARGET_ERRORS (CA_CLIENT_TARGET_ERRORS in $0)" >&2
-    echo "  measured: $ca_client_errors" >&2
-    if [[ "$ca_client_errors" -gt "$CA_CLIENT_TARGET_ERRORS" ]]; then
-        echo "A change moved epics-ca-rs's client further from $TARGET. Reproduce with:" >&2
-    else
-        echo "Fewer errors than recorded — update the number so it keeps measuring:" >&2
-    fi
-    echo "  cargo ${COMMON[*]} -p epics-ca-rs --lib --features client-core" >&2
-    exit 1
-fi
+# The probe is RETIRED rather than left pinned at zero, and the replacement is
+# STRICTER, not looser: `CRATE_FEATURES[epics-ca-rs]="client-core"` above makes
+# the crate loop build this exact selection as a hard pass/fail — in BOTH the
+# portability and the image configuration, where the probe only ever ran the
+# first — and the binary loop then links `rtems-ca-ioc` on top of it. A count
+# pinned at 0 and a build that must succeed are the same assertion; keeping
+# both would mean a second check that can only ever fail after the first
+# already did, which is the decoration this script's own census comment warns
+# about. `tokio::net`, `socket2` and a raw `FIONREAD` re-entering the target
+# client still fail the gate — one loop earlier, and twice.
+#
+# The PVA probe above stays, because it is not duplicative: CRATE_FEATURES has
+# no `epics-pva-rs` entry, so `--features client` is built nowhere else.
 
 log "RTEMS gate: every crate and target binary compiles for $TARGET, in both"
 log "the portability and the image configuration."
 log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
-log "CA client (--features client-core): $CA_CLIENT_TARGET_ERRORS target errors."
+log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

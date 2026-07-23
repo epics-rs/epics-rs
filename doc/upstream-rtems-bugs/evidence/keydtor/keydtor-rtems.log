@@ -1,0 +1,24 @@
+qemu-system-arm: warning: nic cadence_gem.0 has no peer
+qemu-system-arm: warning: nic cadence_gem.1 has no peer
+
+keydtor: POSIX_Init entered (RTEMS rtems-6.0.0 (ARM/ARMv4/xilinx_zynq_a9_qemu))
+KEYDTOR-BEGIN platform=rtems6-armv7-xilinx_zynq_a9_qemu
+KEYDTOR-VARIANT variant=Afirst created=A,B kA=318832641 kB=318832642 dtor_iterations=4
+KEYDTOR-THREAD variant=Afirst set_A_rc=0 set_B_rc=0 back_A=0xa5a5a5a5 back_B=0xb0b0b0b0
+KEYDTOR-R1-A=0x0 variant=Afirst B_arg=0xb0b0b0b0 A_expected=0xa5a5a5a5 A_live=NO
+KEYDTOR-R1-REARM variant=Afirst rc=0
+KEYDTOR-R2-A=0x0 variant=Afirst B_arg=0xb1b1b1b1 A_expected=0xa5a5a5a5 A_live=NO
+KEYDTOR-VARIANT-END variant=Afirst rounds=2 expected_rounds=2
+KEYDTOR-VARIANT variant=Bfirst created=B,A kA=318832644 kB=318832643 dtor_iterations=4
+KEYDTOR-THREAD variant=Bfirst set_A_rc=0 set_B_rc=0 back_A=0xa5a5a5a5 back_B=0xb0b0b0b0
+KEYDTOR-R1-A=0x0 variant=Bfirst B_arg=0xb0b0b0b0 A_expected=0xa5a5a5a5 A_live=NO
+KEYDTOR-R1-REARM variant=Bfirst rc=0
+KEYDTOR-R2-A=0x0 variant=Bfirst B_arg=0xb1b1b1b1 A_expected=0xa5a5a5a5 A_live=NO
+KEYDTOR-VARIANT-END variant=Bfirst rounds=2 expected_rounds=2
+KEYDTOR-DONE
+
+[ RTEMS shutdown ]
+RTEMS version: 6.0.0.2faafecb7f9df8400fd78a1e6d9b3cf3df0eeccc
+RTEMS tools: 13.3.0 20240521 (RTEMS 6, RSB 5dbc1e0855820578661fa4bf8384abc8dda21357, Newlib 1b3dcfd)
+executing thread ID: 0x0b010001
+executing thread name: 

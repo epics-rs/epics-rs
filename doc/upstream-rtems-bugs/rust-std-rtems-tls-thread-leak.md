@@ -1,8 +1,10 @@
 # rust std on RTEMS: every `std::thread` leaks its `Arc<Thread::Inner>` — the TLS key/value pair is freed before its deferred destructor runs
 
 Evidence package for an upstream report — the sixth in this directory, and
-the only one whose venue is outside the EPICS ecosystem: **rust-lang/rust**
-(with an RTEMS-side conformance discussion as a possible secondary). Report
+the only one whose venue is outside the EPICS ecosystem: **rust-lang/rust**.
+(An RTEMS-side conformance report was considered as a secondary and killed
+by measurement on 2026-07-24 — glibc behaves the same; see the C-primitive
+control section.) Report
 prose is deliberately not written here (standing rule: upstream prose is
 hand-written); this file is the evidence it will be written from.
 
@@ -101,12 +103,16 @@ dropped. Both rounds *did* run — measured `round1=50 round2=50` over 50
 threads — so the "no further round" leak the comment accepts is not what
 happens; the deferred cleanup runs and finds its data already destroyed.
 
-Neither side is individually wrong in an obvious way: RTEMS may free pair
-*storage* when it likes, and POSIX does not clearly specify whether
-destructor-less keys' values remain readable during other keys' destructor
-iterations (glibc keeps them until thread storage is torn down, which is
-what the std protocol was written against). That assessment — unspecified
-ordering relied upon by std — is why the primary venue is rust-lang.
+POSIX does not clearly specify whether destructor-less keys' values remain
+readable during other keys' destructor iterations — and a controlled
+C-primitive experiment (next section, 2026-07-24) shows that **neither
+RTEMS nor glibc keeps them readable**: glibc's exit sweep clears every
+non-NULL slot regardless of destructor (`nptl_deallocate_tsd.c`: "Always
+clear the data"), so by round 2 the value is gone on *both* measured
+implementations. The earlier working assumption that glibc preserves them
+was wrong. This pins the defect on the std protocol itself: it relies on
+behavior that POSIX does not guarantee and that no measured mainstream
+implementation provides — which is why the venue is rust-lang, alone.
 
 ## Measured numbers
 
@@ -140,6 +146,48 @@ thread per accepted connection, `epics-pva-rs/src/server_native/blocking.rs`
 and `epics-base-rs/src/runtime/blocking_io.rs` pumps) — 176–179 B per
 connection cycle until the planned thread pool lands.
 
+## The C-primitive control — RTEMS *and* glibc drain destructor-less values (2026-07-24)
+
+Run to decide whether an RTEMS-side POSIX-conformance report (a would-be
+seventh package) was sustainable. **It is not** — the measurement killed it —
+but it sharpened this package instead. Full write-up with raw logs and
+hashes: [`evidence/keydtor/RESULT.md`](evidence/keydtor/RESULT.md); sources
+in [`repro/keydtor/`](repro/keydtor/).
+
+Minimal C program (`keydtor.c` / `keydtor-setorder.c`, zero Rust): key A
+with **no** destructor, key B **with** one; a thread sets both and exits;
+B's destructor reads `pthread_getspecific(A)` and re-arms itself once to
+force a second round. Both key-creation orders × both `setspecific` orders,
+each image run twice (byte-identical logs):
+
+| `getspecific(A)` from B's destructor | round 1 | round 2 |
+|---|---|---|
+| RTEMS 6.0.0 armv7 (kernel `2faafecb`) | NULL when A was **set** first (RBTree insertion order); creation order irrelevant | **NULL always** |
+| Linux glibc 2.39 | NULL when A's **key id** is lower (slot order); creation order decides | **NULL always** |
+
+- glibc's behavior is deliberate — `nptl/nptl_deallocate_tsd.c` (master,
+  fetched 2026-07-24): `if (data != NULL) { /* Always clear the data. */
+  level2[inner].data = NULL; if (seq match && destr != NULL) destr (data); }`
+  — every non-NULL slot is cleared in the sweep, destructor or not; only the
+  ordering rule differs from RTEMS.
+- The destructor **argument** channel worked correctly on both platforms in
+  both rounds (`B_arg=0xb0b0b0b0` round 1, re-armed `0xb1b1b1b1` round 2) —
+  the value handed to a destructor by the implementation itself is the one
+  POSIX-guaranteed way to receive data across the teardown, which is exactly
+  the std fix candidate below.
+- Conformance reading that motivated the experiment: POSIX specifies the
+  NULL return from `pthread_getspecific` inside a destructor *only for the
+  key being destroyed*, and specifies value-clearing only for keys with
+  destructors. Strictly read, both implementations deviate identically; with
+  glibc as established practice, an RTEMS-only defect report is not
+  sustainable, and RTEMS's extract-before-call loop is a deliberate fix for
+  its 2010 issue #1615 (destructor re-invoked with a stale value).
+- Consequence for this package: the std key-based fallback is broken on
+  *any* key-based-TLS platform that behaves like the two measured ones — a
+  hypothetical glibc target using the fallback would leak identically. No
+  tier-1 target does (they all have native TLS), which is presumably why
+  this never surfaced before a tier-3 target exercised the fallback.
+
 ## No existing upstream report
 
 `gh search issues --repo rust-lang/rust` on 2026-07-23 for
@@ -158,10 +206,15 @@ hits each. (RTEMS target support is recent, tier 3.)
   pairs before invoking destructors — e.g. `CLEANUP`'s round-1 arm could
   capture the `CURRENT` pointer into the key's own value (the destructor
   argument is passed by value and survives the pair teardown) instead of
-  re-reading `CURRENT` via `pthread_getspecific` in round 2.
-- **RTEMS (secondary):** whether `_POSIX_Keys_Run_destructors` should keep
-  destructor-less pairs readable until destructor iteration completes —
-  a POSIX-interpretation discussion, not a clear-cut defect.
+  re-reading `CURRENT` via `pthread_getspecific` in round 2. The keydtor
+  control (above) measured the argument channel delivering the correct
+  value in both rounds on both RTEMS and glibc — it is the only channel
+  either implementation (or POSIX) actually guarantees.
+- ~~**RTEMS (secondary)**~~ **closed by measurement 2026-07-24**: glibc
+  clears destructor-less values in the same sweep (deliberately, "Always
+  clear the data"), so RTEMS's behavior matches mainstream practice and an
+  RTEMS-side conformance report is not sustainable (see the C-primitive
+  control section).
 
 ## The spec-flip experiment — `has_thread_local: true` measured VIABLE (2026-07-23)
 
@@ -225,4 +278,8 @@ not exercised.
 | 128 B/thread, +named block, joined=detached, raw-pthread 0.000, `round1=50 round2=50` | 2026-07-22 attribution run; artefacts on the box: `~/rtems-bringup/rtems-ca-ioc.instrumented*.rs`, `rtems-*-ioc.heapinstr.rs`, `leak.log`, `leak2.log`; recorded in session memory the same day; **not re-run today** |
 | 176.0 ± 5 / 179.1 ± 3 B per creation, differential method | in-repo `doc/calink-rtems-design.md` §13.2–13.3 and `doc/pvalink-rtems-design.md` §9.11 (commits `913f96fc`/`4d366800`), measured 2026-07-23 |
 | no existing rust-lang report | `gh search issues`, three queries, 2026-07-23 |
+| keydtor control: RTEMS+glibc both NULL by round 2, order rules, argument channel intact | raw `KEYDTOR-*` lines re-read from the four logs in `evidence/keydtor/` (sha256 verified against `RESULT.md`'s table after copy off the box, 2026-07-24); run twice per image, logs byte-identical |
+| glibc "Always clear the data" sweep | WebFetch of glibc master `nptl/nptl_deallocate_tsd.c` raw (github mirror), 2026-07-24 |
+| POSIX destructor/getspecific text | pubs.opengroup.org POSIX.1-2017 `pthread_key_create` + `pthread_getspecific` DESCRIPTION, fetched 2026-07-24 |
+| RTEMS #1615 history (extract-before-call is a deliberate fix) | gitlab.rtems.org issue #1615 fetched 2026-07-24; no existing report of the drain behavior (gitlab search `_POSIX_Keys_Run_destructors`: only #1615/#1266, both distinct) |
 | spec-flip: 136.00→0.00 B/thread, TLS segments, dtor 110/110, iso clean | experiment run 2026-07-23 in `~/rtems-bringup/tlsdtor/` (source, both specs, three images, `stock*.log`/`native*.log`/`control.log`, `RESULT.md`); slope and counter lines re-read directly from `stock.log`/`native.log` console output and recomputed by hand — not quoted from the experiment panel's summary alone |

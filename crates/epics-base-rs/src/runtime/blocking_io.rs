@@ -769,11 +769,23 @@ impl Default for PumpConfig {
 /// Both socket timeouts are set here rather than left to the caller, because
 /// getting `SO_SNDTIMEO` wrong silently disarms [`write_frame_deadline`]'s only
 /// way of regaining control.
+///
+/// # Two priorities, not one
+///
+/// The two pumps take separate bands because at least one caller's upstream C
+/// derives two: libca gives a circuit's receive thread
+/// `highestPriorityLevelBelow(initializing thread)` and its send thread
+/// `lowestPriorityLevelAbove(...)` (`tcpiiu.cpp:677-682`), so the sender sits
+/// *above* the receiver and can always drain a queue the receiver's work is
+/// filling. A caller whose upstream uses one band for both (pvxs, one reactor
+/// thread) passes the same value twice, which states that sameness rather than
+/// having the API assume it.
 pub fn drive_socket_blocking(
     stream: TcpStream,
     spec_prefix: &str,
     label: &str,
-    priority: ThreadPriority,
+    reader_priority: ThreadPriority,
+    writer_priority: ThreadPriority,
     config: &PumpConfig,
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
@@ -787,12 +799,12 @@ pub fn drive_socket_blocking(
     let reader_spec = PumpSpec {
         thread_name: format!("{spec_prefix}-reader {label}"),
         label: label.to_string(),
-        priority,
+        priority: reader_priority,
     };
     let writer_spec = PumpSpec {
         thread_name: format!("{spec_prefix}-writer {label}"),
         label: label.to_string(),
-        priority,
+        priority: writer_priority,
     };
 
     // The reader guard is bound first, so a writer-spawn failure below unwinds
@@ -1290,6 +1302,7 @@ mod tests {
             client,
             "TEST",
             "127.0.0.1:0",
+            ThreadPriority::Low,
             ThreadPriority::Low,
             &PumpConfig {
                 read_timeout: Duration::from_secs(5),

@@ -409,12 +409,16 @@ fi
 #     14  FIONREAD single owner  the client's flow-control probe now reaches
 #                               `runtime::blocking_io::pending_bytes`, which
 #                               supplies the constant `libc` omits for RTEMS
+#     11  the `dial_ca` seam     the circuit's dial, its keepalive and its
+#                               receive-queue probe became one compile-time
+#                               transport choice; `tokio::net` and `socket2`
+#                               are named only on the hosted arm
 #
 # Bidirectional for the same reason the binary census is: MORE is a regression
 # that moved the client further from the target; FEWER means someone did the
 # work and left the bound behind, at which point it stops measuring and becomes
 # decoration.
-CA_CLIENT_TARGET_ERRORS=14
+CA_CLIENT_TARGET_ERRORS=11
 
 log "== [probe] epics-ca-rs --lib --features client-core (ratchet)"
 export RUSTFLAGS="$BASE_RUSTFLAGS"

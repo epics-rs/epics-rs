@@ -1094,7 +1094,7 @@ errors without a line of porting, and it must be a **stated** feature split
 (`client-core` vs `client`) rather than an absence — the same argument
 `scripts/rtems-check.sh:70-84` makes for `qsrv-core`.
 
-### Stage C3 — put calink on the spawn seam (small, host-only)
+### Stage C3 — put calink on the spawn seam (small, host-only) — **DONE** (see §9)
 
 Delete `CaLinkResolver::handle` (`resolver.rs:269`, `:288`, `:302`) and its
 three `handle.spawn` calls (`:383`, `:391`, `:568`); spawn through
@@ -1446,3 +1446,89 @@ would have until C2 brings the client into the target build.
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo nextest run --workspace` | 10115 passed, 2 skipped |
 | `./scripts/rtems-check.sh` | exit 0, 2 pre-existing `epics-pva-rs` warnings unchanged |
+
+## 9. Stage C3 as built — where reality deviated from §6
+
+Stage C3 landed on top of `f724ef81` as three commits (calink resolver
+onto the seam; the `CaClient::drop` survivor; the source-text guard),
+with this doc as the fourth. The §6 shape held — the three `handle.spawn`
+calls, the `AbortOnDrop` retype, and the `Handle::current()` drops are
+exactly as written. Four points did not survive contact with the
+compiler untouched.
+
+### 9.1 A nullary `new()` forces a `Default` impl
+
+§6 said "delete `CaLinkResolver::handle`", which drops the
+`tokio::runtime::Handle` argument from `new`, `with_client` and
+`install_calink_resolver`. `CaLinkResolver::new()` thereby becomes
+nullary and public, which `clippy::new_without_default` refuses without a
+`Default`. So an `impl Default for CaLinkResolver { fn default() ->
+Self { Self::new() } }` was added — not in §6's line budget, but the
+resolver's fields (`Arc<OnceCell>`, two `Arc<RwLock<…>>`) all default to
+the same empty state `new()` builds, so it is delegation, not a second
+constructor. The four caller sites the signature change ripples to —
+`calink/mod.rs:75`, `iocsh.rs`'s `dummy_resolver`, and the two test
+files `tests/calink.rs` (7 `with_client`, 2 `install_calink_resolver`)
+and `tests/calink_lset_contexts.rs` (2 `new`) — were updated to compile;
+they are the only workspace callers (`register_link_set_installer(calink_link_set_install)`
+in `ad-plugins-rs` and the bridge is unaffected because
+`calink_link_set_install`'s own signature is unchanged).
+
+### 9.2 The `CaClient::drop` survivor loses its guard *and* its fallback
+
+§6 / §5.1 said "route `client/mod.rs:1374`'s surviving bare
+`tokio::spawn` through the seam and delete its `try_current` guard." The
+guard was one arm of an `if try_current().is_ok() { spawn graceful } else
+{ abort four handles directly }`. Removing the guard makes the graceful
+spawn unconditional, which leaves the `else` immediate-abort branch dead
+— so it was removed too. The observable consequence, stated for the
+record: on the host `tokio_backend`, a `CaClient` dropped on a thread
+with no entered runtime previously fell back to a synchronous abort;
+it now spawns through the seam unconditionally (which on that backend is
+`tokio::spawn`). That path is the same one every one of the client's 17
+already-converted production spawns takes; on the exec backend the seam
+dispatches onto the callback band, which is the whole point — the guard
+had been silently skipping the bounded coordinator shutdown there.
+
+### 9.3 The guard is scoped to the three calink files, not `client/mod.rs`
+
+§6 asked for a guard "in `epics-ca-rs` mirroring
+`epics-pva-rs/src/server_native/tcp.rs`", noting "the client would pass
+this guard today; calink would not." The PVA guard slices production
+scope at the file's *first* column-0 `#[cfg(test)]`. That works for the
+three calink files (`resolver.rs`, `mod.rs`, `iocsh.rs`), whose test
+modules sit at the end — but not for `client/mod.rs`, which interleaves
+production code *after* its first `#[cfg(test)]` at `:1559` (e.g. the
+already-converted `runtime::task::spawn` at `:2951`). A single-slice
+guard over `client/mod.rs` would either miss that production or trip on
+test code. So the guard is scoped to the calink surface — which is
+precisely the asymmetry §6 named it to close — and covers all three
+files, asserting each production slice spawns through
+`runtime::task::spawn` and holds no bare `tokio::spawn(`, no
+`handle.spawn(`, and no `tokio::runtime::Handle` field/call. It is
+mutation-proven (injecting a bare `tokio::spawn` into `mod.rs` fails it).
+The `client/mod.rs:1374` fix is verified by the feature-ON suite, not by
+this guard.
+
+### 9.4 No census marker
+
+The guard is a plain `#[test]` doing source-text inspection with no
+runtime — not a `#[tokio::test]` and not a hand-built runtime — so it is
+not a reactor-dependent site under the `rtems-exec-gate` census, and
+`resolver.rs` carries (and needs) no `RTEMS-EXEC-MODEL-ALLOW(N)` marker.
+The feature-ON `epics-ca-rs` count rose 608 → 609 purely by that one
+extra plain test; the census floor is untouched.
+
+### 9.5 The gate as measured
+
+| gate | result |
+|---|---|
+| `calink_production_spawns_go_through_the_runtime_seam` | pass; mutation-proven (fails on an injected bare `tokio::spawn`) |
+| `cargo fmt --all` | clean |
+| `cargo clippy -p epics-ca-rs -p epics-bridge-rs --all-targets -- -D warnings` | clean |
+| `cargo nextest run -p epics-ca-rs --features rtems-exec-model` | 609 passed, 0 skipped |
+| `cargo nextest run -p epics-ca-rs -p epics-bridge-rs` | 1409 passed, 0 skipped |
+
+Stage C4's `dispatch_external_cp_targets` CP fan-out semantics are
+deliberately untouched — that change awaits sign-off (§6 Stage C4); C3 is
+spawn plumbing only.

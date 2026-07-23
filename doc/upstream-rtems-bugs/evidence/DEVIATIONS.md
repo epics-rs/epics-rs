@@ -106,3 +106,80 @@ base and RTEMS already ship:
 Ports: 5164 only, as this panel owns.  The other panel's qemu (5064/15076,
 pid 2062470) was neither touched nor read.  The qemu this session started was
 `cioc-fd64.exe` as pid 2061756; no process this panel did not start was signalled.
+
+---
+
+## Session 4 additions (2026-07-23, epicsEvent heap-leak measurement)
+
+### Base: still zero source patches.  pvxs: not built, not touched this session.
+### Package installs: still none; `sudo` has still not been used.
+
+The IOC connect/disconnect-cycle measurement was taken on **`cioc-fd64.exe`**,
+byte-identical to the session-3 image
+(`sha256 10a4db99c63159423a4d7bda2d6db5f1d57dcf73f6a7dc59d5aabc8f19e3efa1`),
+with **no addition whatsoever**.  The heap instrument used is stock:
+
+* `rt malloc` -- base's `rt` bridge to the RTEMS shell (`rtems_init.c:500`)
+  running RTEMS 6's own `malloc [walk]` command, which prints the full heap
+  statistics block (free/used block counts, total bytes free/used, lifetime
+  allocation and free counters).  Found via `rt help mem`.  Nothing was added
+  to the target image to read the heap.
+* `epicsThreadShowAll 1` -- base, `libComRegister.c:523`, for the thread census.
+
+### New image: `cioc-evloop-fd64.exe`
+### sha256 `964bcbf64d59ba522d689a2fd7725cd9608dbc171650bcfe2092c01301f24bc0`
+
+*** THIS IMAGE IS NOT STOCK.  It carries one added application source file. ***
+It exists only to isolate the size of the leaked block directly; it does NOT
+carry any of the connect/disconnect-cycle numbers, which come from
+`cioc-fd64.exe`.
+
+* `cioc/ciocApp/src/ciocEvLoop.c` + `.dbd` -- APP code, same shape as the
+  session-2 `ciocSizes.c`.  Registers two iocsh commands:
+    `evloop N` -- N x (`epicsEventCreate` + `epicsEventDestroy`), nothing else,
+                  using only base's public `epicsEvent.h` API.
+    `evsize`   -- prints `sizeof(rtems_binary_semaphore)` from `<rtems/thread.h>`.
+  No EPICS base or RTEMS source is patched, copied-and-edited, or overridden by
+  this file.
+* `cioc/ciocApp/src/Makefile` -- two lines added (`cioc_DBD += ciocEvLoop.dbd`,
+  `cioc_SRCS += ciocEvLoop.c`).
+* `cioc/ciocApp/src/ciocRtemsConfig.c` -- `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`
+  set back to base's stock **64** for this build, so the evloop image differs
+  from `cioc-fd64.exe` by the added command and nothing else.  (The tree had
+  been left at the 150 of deviation item 2 by session 2.)
+
+### Host-side driver added under ~/rtems-cside (not target source)
+
+* `evleak.py` -- sequential CA connect/disconnect driver, concurrency exactly 1,
+  60 warm-up cycles then baseline, then batches of 250 and 600, taking a
+  `rt malloc` + `epicsThreadShowAll 1` reading through the `ciocin` fifo at each
+  boundary.  Connect method is `hold6.py`'s, unchanged.  Nothing in it is
+  compiled into or linked against the target image.
+
+### Raw console logs kept
+* `log/cioc-evleak-2026-07-23.log`  (25844 B) -- the `cioc-fd64.exe` run
+* `log/cioc-evloop-2026-07-23.log`  (12190 B) -- the `cioc-evloop-fd64.exe` run
+
+Ports: 5164 only, as this panel owns.  The other panel's guests (pids 2938228 /
+2938252, ~/rtems-bringup/topoB, ports 4441/8011) were neither touched nor
+signalled; no blanket `pkill` was ever issued.  The qemu processes this session
+started were pid 2939153 (`cioc-fd64.exe`) and pid 2947898
+(`cioc-evloop-fd64.exe`), both started and stopped only through
+`boot-cioc.sh`'s own `qemu.pid` handling.
+
+### Session 4, second boot (same day): repeat + monitor control
+
+* `evmon.py` -- host-side driver, same discipline as `evleak.py`, but each cycle
+  also creates a channel on `CIOC:HB100` and subscribes a monitor, closing with
+  the subscription still live.  Control for the conditional "+1 block per
+  cancelled monitor" path (`dbEvent.c:632`).  Not compiled into the image.
+* `log/cioc-evleak-repeat-evmon-2026-07-23.log` (32415 B) -- one boot of the
+  same stock `cioc-fd64.exe` carrying BOTH the repeat of the `evleak.py` run and
+  the `evmon.py` control.  qemu pid 2952568.
+
+NOTE on a stale label: `evleak.py` prints its first reading as
+`T0-initial-after-20-smoke-cycles`.  That label is accurate for the FIRST boot
+only (a 20-cycle smoke test had preceded it).  In this second boot no smoke test
+was run, so that reading is a genuine pre-first-connection reading despite the
+label.  The label was left unedited so the script in the repo is byte-identical
+to the one that produced both logs.

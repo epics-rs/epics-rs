@@ -1595,6 +1595,59 @@ rather than failing at a bound.
 | `cargo nextest run -p epics-pva-rs` | 1389 passed, 0 failed, 2 skipped |
 | `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1351 passed, 0 failed, 2 skipped |
 
+**Measured on the RTEMS target.** Every row above runs on Linux, so the bound
+was proven there and the 128 B/creation saving was *inferred from the leak
+model*. Both are now read off a QEMU guest's serial console, from the
+`bringup-probes` reporter (`dialpool workers=N attempts=M MEM_FREE=…` every
+10 s; the accessor and its counter compile only under that feature). Rig:
+topology A, one guest, `EPICS_PVA_NAME_SERVERS=10.0.2.2:15076` compiled in
+with **nothing listening** on the host — SLIRP returns RST, so every dial
+fails fast and `ns_task` redials at its shipped `RECONNECT_INTERVAL` (pvxs
+`tcpNSCheckInterval`, 10 s) instead of pinning a worker in the OS ladder.
+1200 s per run, 118 samples.
+
+*The bound* — **119 dial attempts, `worker_count` = 1 in every one of the 118
+samples** (`MAX_DIAL_WORKERS` = 4; the maximum was never approached because
+one name server is one concurrent dial). The pre-`05c7ffed` shape, rebuilt as
+a mutation image and run beside it, creates one thread per attempt: 119
+creations for the same 119 attempts, and its `worker_count` reads 0 because
+the pool is never entered.
+
+*The leak* — read as **`MEM_FREE`**, the RTEMS malloc-heap free total from
+`epics_rtems_boot::stats::mem_usage()` (the source behind the
+`RTEMS:MEM_FREE` status PV; the RTEMS *workspace* is a separate allocator and
+is not in it). Byte-granular — but **quantisation is not the limit, workload
+drift is, and a single-image reading of this PV cannot carry the claim**: the
+*pooled* image's own free heap falls **-190.8 B/attempt** across the full run
+while creating exactly one thread. Anyone reading one image's `MEM_FREE`
+against the 128 B/attempt expectation would have "confirmed" a leak that is
+not there. So the claim is carried by a **differential** — same image, same
+refused name server, same duration, differing only in the dial shape, which
+cancels the drift both share — over a steady window (samples 30-118, attempts
+32 → 119, after warm-up):
+
+| | `MEM_FREE` over 87 attempts | slope |
+|---|---:|---:|
+| pooled (this tip) | **+3344 B** | +38.4 B/attempt |
+| per-attempt (pre-`05c7ffed`, mutation) | **-12240 B** | -140.7 B/attempt |
+| difference — what the pool removes | **-15584 B** | **-179.1 B/attempt** |
+
+Resolution, stated because the number depends on it: the method resolves a
+per-attempt cost to about **±3 B/attempt**, measured by repeating the pooled
+configuration end-to-end — two independent runs gave +35.8 and +38.4
+B/attempt, a spread of 2.7. The 179 B/attempt difference is ~65× that, and
+the pooled arm does not merely fall more slowly, it does not fall at all.
+Sensitivity is separately evidenced in the CA half of the same rig
+(`doc/calink-rtems-design.md` §13.5): a single `Small` stack shows up in this
+readout as a 264,304 B step, so it is not blind to thread cost.
+
+**The measured per-creation residue is 176-179 B, not 128 B** (the CA half
+independently reads 176.0). The 128 B this section cites is the TLS key
+alone, which is the part that was measured in isolation; what the heap
+actually loses per creation is that plus the rest of the per-thread
+bookkeeping. The leak was therefore ~40% larger than the section claimed, and
+the "~11 KiB/day" estimate above scales with it.
+
 ## 10. Stage 3 as built — where reality deviated from §5
 
 ### 10.1 The invariant closure landed at the facility loop, not the band loop

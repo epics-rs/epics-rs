@@ -100,7 +100,13 @@ pub struct CaLink {
     /// the last stale `Snapshot` through the whole outage with no
     /// LINK alarm. `dbCa.c` sets `pca->connected = FALSE` in its
     /// `connectionCallback` for exactly this reason.
-    connected: Arc<AtomicBool>,
+    ///
+    /// Owned by [`LinkConnState`], not a bare flag: C's
+    /// `connectionCallback` does two things on a disconnect — clears the
+    /// flag AND adds `CA_DBPROCESS` for the link's CP holders
+    /// (`dbCa.c:862-873`) — and a bare `AtomicBool` let three call sites
+    /// do the first without the second (stage C6 criterion 4).
+    connected: Arc<LinkConnState>,
     /// Cached remote CTRL attributes (display/control/alarm limits,
     /// precision, units) plus the channel's native DBF type and element
     /// count. `None` until the first attribute fetch completes; the
@@ -123,6 +129,80 @@ pub struct CaLink {
     /// Drains `CaChannel::connection_events()` and keeps `connected`
     /// in sync with the real circuit state.
     _conn_task: AbortOnDrop,
+}
+
+/// The single owner of a `ca://` link's connection-state transition.
+///
+/// **Invariant.** A `ca://` link's servability flag MUST NOT go from
+/// connected to disconnected without dispatching that PV's CP/CPP holders.
+/// C `connectionCallback` (`dbCa.c:861-873`) clears `pca->isConnected` and,
+/// in the same critical section, sets `CA_DBPROCESS` for a `pvlOptCP` link
+/// (or a `pvlOptCPP` link whose holder is Passive), so the holder processes,
+/// its `dbCaGetLink` returns `-1` with `LINK_ALARM`/`INVALID_ALARM`
+/// (`dbCa.c:459-463`), and the record lands in LINK/INVALID. Without the
+/// dispatch a Passive CP holder is never processed again and keeps serving
+/// its last good value with `SEVR=NO_ALARM` for the whole outage — measured
+/// on target, stage C6 criterion 4 (§11.2).
+///
+/// **Owner.** This type. The flag is private, so the three sites that used
+/// to `store` into it directly (the connection watcher's two arms and
+/// `run_monitor`'s subscription-ended tail) now have to go through
+/// [`Self::mark_connected`] / [`Self::mark_disconnected`], and the dispatch
+/// cannot be forgotten at a new fourth site.
+///
+/// Only the true→false EDGE dispatches: `Disconnected` can arrive repeatedly
+/// (the watcher sees it, then the subscription ends), and C reaches
+/// `CA_DBPROCESS` once per `connectionCallback` with a real state change.
+/// The `swap` makes that an atomic test-and-set rather than a load-then-store
+/// race between the watcher task and the monitor task.
+///
+/// Reconnect does NOT dispatch here, matching C: `connectionCallback`'s
+/// connect arm schedules attribute and monitor work, and it is the monitor
+/// event that drives processing — which [`run_monitor`] already does.
+struct LinkConnState {
+    flag: AtomicBool,
+    /// The database whose CP/CPP holders of `pv_name` must be processed on a
+    /// disconnect. Attached after the resolver is mounted, hence the lock and
+    /// the `Option`; a `None` here is a link opened with no database, which
+    /// has no holders to process.
+    db: Arc<RwLock<Option<PvDatabase>>>,
+    pv_name: String,
+}
+
+impl LinkConnState {
+    fn new(db: Arc<RwLock<Option<PvDatabase>>>, pv_name: String) -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            db,
+            pv_name,
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Mark the link live. Returns `true` on the false→true edge.
+    fn mark_connected(&self) -> bool {
+        !self.flag.swap(true, Ordering::AcqRel)
+    }
+
+    /// Mark the link dead and, on the true→false edge, process every local
+    /// CP/CPP holder of this PV so the holder's failed link read commits
+    /// LINK/INVALID. Returns `true` on the edge.
+    fn mark_disconnected(&self) -> bool {
+        if !self.flag.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        // Drop the read guard before dispatching: the dispatch runs record
+        // processing, and holding a lock across it is the deadlock shape
+        // `run_monitor` already avoids on the value path.
+        let db_handle = self.db.read().clone();
+        if let Some(db_handle) = db_handle {
+            db_handle.dispatch_external_cp_targets(&self.pv_name);
+        }
+        true
+    }
 }
 
 /// Abort the wrapped task when dropped. A bare handle detaches on drop
@@ -158,7 +238,7 @@ impl CaLink {
     /// value-intrinsic, so it has no dependence on the ordering between the
     /// connection-event watcher and the monitor task.
     fn with_servable<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> Option<R> {
-        if !self.connected.load(Ordering::Acquire) {
+        if !self.connected.is_set() {
             return None;
         }
         let guard = self.cache.load();
@@ -250,7 +330,7 @@ impl CaLink {
     /// CA link is disconnected, so the owning record keeps its local
     /// default rather than adopting stale remote limits.
     pub fn link_metadata(&self) -> Option<LinkMetadata> {
-        if !self.connected.load(Ordering::Acquire) {
+        if !self.connected.is_set() {
             return None;
         }
         self.meta.load().as_ref().clone()
@@ -381,7 +461,7 @@ impl CaLinkResolver {
                 reason: e.to_string(),
             })?;
         let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
-        let connected = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(LinkConnState::new(self.db.clone(), pv_name.to_string()));
         let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
         // real circuit state so `is_connected()` reflects upstream
@@ -519,7 +599,7 @@ impl CaLinkResolver {
 async fn run_monitor(
     mut monitor: crate::client::MonitorHandle,
     cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
-    connected: Arc<AtomicBool>,
+    connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
     pv_name: String,
     db: Arc<RwLock<Option<PvDatabase>>>,
@@ -531,7 +611,7 @@ async fn run_monitor(
                 // liveness — mark the link connected even if the
                 // `Connected` lifecycle event has not been observed
                 // yet (race-free, mirrors `pvalink`'s callback).
-                connected.store(true, Ordering::Release);
+                connected.mark_connected();
                 // Capture the channel's native element count this event was
                 // produced under, so a later type/count change makes the
                 // cache unservable (the DBR type is intrinsic to the
@@ -576,8 +656,9 @@ async fn run_monitor(
             }
         }
     }
-    // Subscription ended (channel dropped). Reflect the disconnect.
-    connected.store(false, Ordering::Release);
+    // Subscription ended (channel dropped). Reflect the disconnect —
+    // through the owner, so the CP holders are processed here too.
+    connected.mark_disconnected();
 }
 
 /// Connection-event watcher: keep `connected` in sync with the CA
@@ -594,7 +675,7 @@ async fn run_monitor(
 /// gates on `connected` regardless.
 async fn run_connection_watcher(
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
-    connected: Arc<AtomicBool>,
+    connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
     pv_name: String,
@@ -630,15 +711,15 @@ async fn run_connection_watcher(
 /// Factored out of [`run_connection_watcher`] so the flag logic — the
 /// disconnect-tracking regression — is unit-testable without a live CA
 /// channel.
-fn note_conn_event(evt: &crate::client::ConnectionEvent, flag: &AtomicBool) -> bool {
+fn note_conn_event(evt: &crate::client::ConnectionEvent, state: &LinkConnState) -> bool {
     use crate::client::ConnectionEvent;
     match evt {
         ConnectionEvent::Connected => {
-            flag.store(true, Ordering::Release);
+            state.mark_connected();
             true
         }
         ConnectionEvent::Disconnected => {
-            flag.store(false, Ordering::Release);
+            state.mark_disconnected();
             false
         }
         _ => false,
@@ -969,31 +1050,34 @@ mod tests {
     /// CTRL attribute refetch; the clearing/neutral events return `false`.
     #[test]
     fn bug1_connection_event_tracks_disconnect() {
-        let connected = AtomicBool::new(false);
+        // No database attached: `mark_disconnected`'s dispatch is a no-op,
+        // so this test stays about the flag alone. The dispatch itself is
+        // covered by `disconnect_edge_dispatches_cp_holders_once`.
+        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
 
         // Circuit comes up — flag true, and signals an attribute refetch.
         assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
-        assert!(connected.load(Ordering::Acquire));
+        assert!(connected.is_set());
 
         // Upstream IOC restart — circuit drops. Flag MUST go false; no
         // refetch on a disconnect.
         assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
-        assert!(!connected.load(Ordering::Acquire));
+        assert!(!connected.is_set());
 
         // Reconnect — flag true again (CA monitors auto-restore), refetch
         // signalled again.
         assert!(note_conn_event(&ConnectionEvent::Connected, &connected));
-        assert!(connected.load(Ordering::Acquire));
+        assert!(connected.is_set());
 
         // Echo timeout (TCP up, server hung) reaches the watcher as a plain
         // `Disconnected` — C's `unresponsiveCircuitNotify` fires the same
         // `CA_OP_CONN_DOWN` — so it clears the flag with no refetch.
         assert!(!note_conn_event(&ConnectionEvent::Disconnected, &connected));
-        assert!(!connected.load(Ordering::Acquire));
+        assert!(!connected.is_set());
 
         // An access-rights change is neutral: it leaves the flag as-is
         // and signals no refetch.
-        connected.store(true, Ordering::Release);
+        connected.mark_connected();
         assert!(!note_conn_event(
             &ConnectionEvent::AccessRightsChanged {
                 read: true,
@@ -1001,7 +1085,40 @@ mod tests {
             },
             &connected,
         ));
-        assert!(connected.load(Ordering::Acquire));
+        assert!(connected.is_set());
+    }
+
+    /// Stage C6 criterion 4 regression, at the level the invariant is
+    /// stated: only the true→false EDGE is a disconnect, so the CP-holder
+    /// dispatch happens exactly once per outage no matter how many
+    /// `Disconnected` events and subscription-end tails arrive.
+    ///
+    /// The dispatch's own effect (holder processes, link read fails,
+    /// LINK/INVALID commits) is a database behaviour and is covered on the
+    /// `epics-base-rs` side; what can only be checked here is that the
+    /// transition owner is the thing that decides.
+    #[test]
+    fn disconnect_edge_dispatches_cp_holders_once() {
+        let state = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+
+        // Never connected: a disconnect is not an edge and must not
+        // dispatch — otherwise every link would process its holders once
+        // at startup, before any value existed.
+        assert!(!state.mark_disconnected());
+
+        assert!(state.mark_connected());
+        // Already connected: not an edge.
+        assert!(!state.mark_connected());
+
+        // The outage. One edge...
+        assert!(state.mark_disconnected());
+        // ...and every repeat (watcher event, then `run_monitor`'s
+        // subscription-ended tail) is not.
+        assert!(!state.mark_disconnected());
+        assert!(!state.mark_disconnected());
+
+        assert!(state.mark_connected());
+        assert!(state.mark_disconnected());
     }
 
     /// BUG 1 regression: the `is_connected()` / `value()` gating logic

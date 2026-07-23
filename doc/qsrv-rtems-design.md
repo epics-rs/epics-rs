@@ -999,6 +999,13 @@ Everything here is a claim this document could not settle from source.
    target clock is 1-second-quantized, which makes a 50 ms poll
    meaningless there. Whatever the pvalink stage does, it should not
    assume sub-second deadlines are expressible.
+   *Quantization note, now measured rather than claimed:* the 1-second
+   quantum was confirmed on the target in the timespec-ABI round — with
+   the patched libc the clock advances in whole-second steps (`CLOCK_*`
+   reads quantize; it is not frozen), and with the *stock* libc the
+   half-size `timespec` makes every `Instant` read 0 ns, so a deadline
+   loop either spins forever or fires immediately. Both failure shapes
+   land on this loop; the constraint stands for stage 5 as written.
 9. **The bridge's four `#[cfg(unix)]` sites.** RTEMS satisfies
    `cfg(unix)`, so a bare `#[cfg(unix)]` arm silently hands the target a
    Linux-shaped path. Checked for stage 1: all four are in

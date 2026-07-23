@@ -977,12 +977,11 @@ impl IocApplication {
         {
             // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
             db.pini_process(crate::server::record::PiniMode::Yes).await;
-            // Publish completion so any scan scheduler started by the
-            // protocol runner sees PINI as already done and its
-            // non-owner branch does not block. The scheduler's owner
-            // branch still re-runs the PINI burst; that is benign
-            // (PINI records simply recompute) and avoids touching
-            // `scan.rs`, which is outside this change's file scope.
+            // Publish completion: a later-started scan owner (or a
+            // non-owner scheduler) sees PINI as already done — the
+            // owner branch then skips its own PINI pass (exactly-once,
+            // as C's `initialProcess`) and non-owners run their hooks
+            // without blocking.
             db.mark_pini_done();
         }
         announce!(InitHookState::AfterInitialProcess);

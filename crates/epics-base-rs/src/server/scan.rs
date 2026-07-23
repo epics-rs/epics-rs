@@ -208,9 +208,15 @@ impl ScanScheduler {
 
         if is_first {
             // C `initialProcess()` (iocInit.c:653-657) — the PINI=YES pass.
-            self.db
-                .pini_process(crate::server::record::PiniMode::Yes)
-                .await;
+            // Exactly once per database, as in C (initialProcess runs once,
+            // inside iocBuild): when the IOC init path (`IocApplication::run`
+            // Phase 2b.6) already ran it and published completion, skip the
+            // re-run instead of re-processing every PINI record.
+            if !self.db.pini_done() {
+                self.db
+                    .pini_process(crate::server::record::PiniMode::Yes)
+                    .await;
+            }
             // Release non-owner schedulers so they can run their hooks now.
             self.db.mark_pini_done();
         } else {
@@ -498,6 +504,83 @@ mod tests {
             n == 1
         })
         .await;
+    }
+
+    /// PINI exactly-once boundary: when the IOC init path already ran the
+    /// PINI=YES pass and published completion (`mark_pini_done`, as
+    /// `IocApplication::run` Phase 2b.6 does), the scan owner must NOT
+    /// re-run it — C's `initialProcess` (iocInit.c:653) runs once, inside
+    /// iocBuild. Sync point: once every scan thread is up the owner is
+    /// past its PINI stage, so a re-run would already have advanced the
+    /// record's TIME.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_skips_pini_when_the_init_path_already_ran_it() {
+        use crate::server::record::PiniMode;
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PINI:ONCE", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("PINI:ONCE").unwrap();
+            let mut inst = rec.write();
+            inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+                .unwrap();
+            inst.common.udf = 0;
+        }
+
+        // The IOC init path's own pass + publication (Phase 2b.6 shape).
+        db.pini_process(PiniMode::Yes).await;
+        db.mark_pini_done();
+        let t_init = db.get_record("PINI:ONCE").unwrap().read().common.time;
+
+        let owner = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+        let t_owner = db.get_record("PINI:ONCE").unwrap().read().common.time;
+        assert_eq!(
+            t_owner, t_init,
+            "the owner re-ran the PINI=YES pass the init path already ran"
+        );
+        drop(owner);
+    }
+
+    /// The other side of the boundary: with NO init-path pass, the owner
+    /// runs PINI itself — the direct-entry-point contract (`softioc-rs`,
+    /// the rtems binaries, oracle) where nothing pre-runs PINI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_runs_pini_when_nothing_pre_ran_it() {
+        use crate::server::records::ai::AiRecord;
+        use crate::types::EpicsValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PINI:OWNED", Box::new(AiRecord::new(2.5)))
+            .await
+            .unwrap();
+        let t_unprocessed = {
+            let rec = db.get_record("PINI:OWNED").unwrap();
+            let mut inst = rec.write();
+            inst.put_common_field("PINI", EpicsValue::String("YES".into()))
+                .unwrap();
+            inst.common.udf = 0;
+            inst.common.time
+        };
+
+        let owner = ScanOwner::start(Arc::clone(&db));
+        wait_for_count(&db, "scan threads never started", |n| {
+            n >= 2 + PERIODIC_SCANS.len()
+        })
+        .await;
+        let t_owner = db.get_record("PINI:OWNED").unwrap().read().common.time;
+        assert!(
+            t_owner > t_unprocessed,
+            "the owner must run the PINI=YES pass when the init path did not"
+        );
+        drop(owner);
     }
 
     /// Redundant-start boundary: a second `ScanOwner` on the same DB is a

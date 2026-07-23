@@ -852,6 +852,18 @@ impl PvDatabase {
         self.inner.pini_notify.notify_waiters();
     }
 
+    /// True once the PINI=YES pass has completed for this database —
+    /// published by [`Self::mark_pini_done`]. The scan owner reads this
+    /// to keep the pass exactly-once (C `initialProcess`, iocInit.c:653
+    /// runs once, inside iocBuild): when the IOC init path already ran
+    /// PINI, the owner skips its own pass instead of re-processing every
+    /// PINI record.
+    pub fn pini_done(&self) -> bool {
+        self.inner
+            .pini_done
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Wait until the scan owner has completed PINI processing.
     /// Returns immediately if PINI has already completed.
     pub async fn wait_for_pini(&self) {

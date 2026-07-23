@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::CacheAction;
-use epics_pva_rs::client_native::ops_v2::PutLeaf;
+use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask, PutLeaf};
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
@@ -134,6 +134,46 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
     if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
         overrun.mark();
     }
+}
+
+/// Take an INP link from connected to disconnected: stamp the
+/// disconnect time and enqueue the payload-less scan trigger that makes
+/// CP / passive-CPP targets process and expose LINK_ALARM/INVALID.
+///
+/// **The single owner of that transition**, called from the two places
+/// that can observe it — the monitor's `Disconnected`/`Finished` event and
+/// the subscription future returning — so neither can implement half of it.
+/// Idempotent by construction: the `swap` gate means the second observer of
+/// one outage is a no-op, and a subscription that never delivered an event
+/// synthesizes no scan at all (pvxs gates its `Disconnect` handling on the
+/// prior `connected` state, `pvalink_channel.cpp:342`).
+fn inp_disconnect_scan(
+    connected: &AtomicBool,
+    disconnect_time: &Mutex<Option<(i64, i32)>>,
+    tx: &mpsc::Sender<ScanEvent>,
+    overrun: &ScanOverrun,
+) {
+    if !connected.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    // Capture the disconnect-event time so a `time=true` link adopts it
+    // (not the stale last value's time, nor local processing time) while
+    // disconnected — pvxs `snap_time = e.time` in `onDisconnect`
+    // (`pvalink_channel.cpp:372`). We have no client-supplied exception
+    // time, so the observation moment (now) is the closest analogue.
+    if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        *disconnect_time.lock() = Some((dur.as_secs() as i64, dur.subsec_nanos() as i32));
+    }
+    // Notify the scan forwarder of the lifecycle transition so CP /
+    // passive-CPP targets process and expose LINK_ALARM/INVALID even
+    // though no value follows the disconnect. pvxs scans the
+    // atomic/non-atomic target lists after the `catch(client::Disconnect&)`
+    // branch (`pvalink_channel.cpp:359-373` + `:420-432`). Same coalescing
+    // rule as the value path: if the channel is saturated, mark an owed
+    // scan instead of dropping the disconnect trigger. The owed scan is
+    // payload-less, so the forwarder still reads `is_connected() == false`
+    // and raises LINK_ALARM/INVALID on the CP/CPP targets.
+    enqueue_scan_trigger(tx, overrun, ScanEvent::Disconnected);
 }
 
 /// A live PVA link.
@@ -345,86 +385,96 @@ impl PvaLink {
             let request = monitor_request(&config);
             // B-pvalink-restart: the INP monitor is a re-subscribe
             // loop, mirroring `channel_cache.rs::spawn_upstream_monitor`.
-            // `pvmonitor` blocks until the subscription ends (IOC
-            // restart / transient I/O); when it returns we mark the
-            // link disconnected and re-subscribe after an exponential
-            // backoff. Pre-fix this ran `pvmonitor` exactly once, so
-            // a single IOC restart froze the cached value forever and
-            // `is_connected()` stayed true.
+            // The subscription runs on the TYPED EVENT STREAM
+            // (`pvmonitor_events`), not on the value-only `pvmonitor`,
+            // because the disconnect must arrive as an EVENT — see
+            // `inp_disconnect_scan` below.
             let join = task::spawn(async move {
                 let mut backoff = Duration::from_millis(250);
                 let max_backoff = Duration::from_secs(30);
                 loop {
                     let tx_inner = tx.clone();
+                    let tx_disc = tx.clone();
                     let latest_inner = latest_clone.clone();
                     let connected_inner = connected_for_task.clone();
+                    let connected_disc = connected_for_task.clone();
                     let overrun_inner = scan_overrun_task.clone();
-                    // Liveness is proven by a delivered event, not by
-                    // entering `pvmonitor` (which may fail immediately
-                    // against a down IOC). The callback flips the flag
-                    // `true` on the first event of each subscription;
-                    // it is reset `false` when `pvmonitor` returns.
-                    let on_event = move |value: &PvField| {
-                        connected_inner.store(true, Ordering::Release);
-                        *latest_inner.lock() = Some(value.clone());
-                        // The value is now cached in `latest`; enqueue a
-                        // scan trigger, coalescing to the cache + overrun
-                        // marker if the queue is full rather than dropping
-                        // the CP/CPP scan (EPICS `db_queue_event_log`,
-                        // `dbEvent.c:808-826`).
-                        enqueue_scan_trigger(
-                            &tx_inner,
-                            &overrun_inner,
-                            ScanEvent::Value(value.clone()),
-                        );
-                    };
-                    let result = match &request {
-                        Some(req) => {
-                            client_clone
-                                .pvmonitor_with_request(&pv_name, req, on_event)
-                                .await
+                    let overrun_disc = scan_overrun_task.clone();
+                    let disconnect_time_ev = disconnect_time_task.clone();
+                    // pvxs's pvalink channel is driven by the monitor's
+                    // event stream: `Connected` / value updates / the
+                    // `catch(client::Disconnect&)` branch
+                    // (`pvalink_channel.cpp:335-373`). Ours must be too.
+                    //
+                    // `mask_disconnected: false` is the load-bearing half.
+                    // `op_monitor_events` RE-SUBSCRIBES INTERNALLY on
+                    // connection loss (`ops_v2.rs`, `MonitorEnd::ConnectionLost`
+                    // → deliver `Disconnected`, sleep, loop), so the
+                    // subscription future does NOT return when the upstream
+                    // IOC dies. Inferring the disconnect from that future
+                    // returning — what this loop did before — therefore
+                    // never fired: measured on the RTEMS stage-5 target
+                    // (doc/pvalink-rtems-design.md §5), killing the upstream
+                    // left both downstream records at their stale value with
+                    // `SEVR=0 STAT=0` and `is_connected() == true`, while the
+                    // client itself correctly reported the peer gone
+                    // (`conn alive=false channels=[]`, `active=0 searching=2`).
+                    let on_event = move |ev: MonitorEvent| match ev {
+                        MonitorEvent::Connected { .. } => {
+                            connected_inner.store(true, Ordering::Release);
                         }
-                        None => client_clone.pvmonitor(&pv_name, on_event).await,
-                    };
-                    // Subscription ended — reflect the disconnect so
-                    // `is_connected()` goes false until re-subscribed.
-                    // `swap` reports whether the subscription had been
-                    // live (any event delivered): pvxs only runs the
-                    // disconnect scan path for a channel that was
-                    // connected (`pvalink_channel.cpp:342` gates the
-                    // `Disconnect` handling on the prior `connected`
-                    // state), so a never-connected subscription failure
-                    // must not synthesize a spurious disconnect scan.
-                    let was_connected = connected_for_task.swap(false, Ordering::AcqRel);
-                    if was_connected {
-                        // Capture the disconnect-event time so a
-                        // `time=true` link adopts it (not the stale last
-                        // value's time, nor local processing time) while
-                        // disconnected — pvxs `snap_time = e.time` in
-                        // `onDisconnect` (`pvalink_channel.cpp:372`). We
-                        // have no client-supplied exception time, so the
-                        // observation moment (now) is the closest analogue.
-                        if let Ok(dur) =
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                        {
-                            *disconnect_time_task.lock() =
-                                Some((dur.as_secs() as i64, dur.subsec_nanos() as i32));
+                        MonitorEvent::Data { value, .. } => {
+                            connected_inner.store(true, Ordering::Release);
+                            *latest_inner.lock() = Some(value.clone());
+                            // The value is now cached in `latest`; enqueue a
+                            // scan trigger, coalescing to the cache + overrun
+                            // marker if the queue is full rather than dropping
+                            // the CP/CPP scan (EPICS `db_queue_event_log`,
+                            // `dbEvent.c:808-826`).
+                            enqueue_scan_trigger(
+                                &tx_inner,
+                                &overrun_inner,
+                                ScanEvent::Value(value),
+                            );
                         }
-                        // Notify the scan forwarder of the lifecycle
-                        // transition so CP / passive-CPP targets process
-                        // and expose LINK_ALARM/INVALID even though no
-                        // value follows the disconnect. pvxs scans the
-                        // atomic/non-atomic target lists after the
-                        // `catch(client::Disconnect&)` branch
-                        // (`pvalink_channel.cpp:359-373` + `:420-432`).
-                        // Same coalescing rule as the value path: if the
-                        // channel is saturated, mark an owed scan instead
-                        // of dropping the disconnect trigger. The owed scan
-                        // is payload-less, so the forwarder still reads
-                        // `is_connected() == false` and raises
-                        // LINK_ALARM/INVALID on the CP/CPP targets.
-                        enqueue_scan_trigger(&tx, &scan_overrun_task, ScanEvent::Disconnected);
-                    }
+                        // A clean end-of-stream is as much a loss of the
+                        // live value as a dropped circuit: pvxs pushes
+                        // `Finished()` into the same stream the
+                        // `Disconnect` lands in, and `pvaLinkChannel`
+                        // stops being `connected` either way.
+                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
+                            inp_disconnect_scan(
+                                &connected_disc,
+                                &disconnect_time_ev,
+                                &tx_disc,
+                                &overrun_disc,
+                            );
+                        }
+                    };
+                    let result = client_clone
+                        .pvmonitor_events(
+                            &pv_name,
+                            request.as_ref(),
+                            MonitorEventMask {
+                                mask_connected: false,
+                                mask_disconnected: false,
+                            },
+                            on_event,
+                        )
+                        .await;
+                    // The subscription future returned — the stream ended
+                    // for good (`Fatal`/`Remote`, or the channel closed),
+                    // rather than dropping a circuit it re-subscribes to
+                    // itself. Same transition, same owner: idempotent
+                    // because it is gated on the prior `connected` state,
+                    // so a `Disconnected` event already handled above does
+                    // not scan twice here.
+                    inp_disconnect_scan(
+                        &connected_for_task,
+                        &disconnect_time_task,
+                        &tx,
+                        &scan_overrun_task,
+                    );
                     match &result {
                         Ok(()) => tracing::debug!(
                             pv = %pv_name,
@@ -437,7 +487,7 @@ impl PvaLink {
                             "pvalink: INP monitor failed, will retry"
                         ),
                     }
-                    tokio::time::sleep(backoff).await;
+                    task::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
             });
@@ -478,23 +528,37 @@ impl PvaLink {
                 let max_backoff = Duration::from_secs(30);
                 loop {
                     let connected_inner = connected_for_task.clone();
-                    // Liveness is proven by a delivered event (the
-                    // monitor's initial value on connect), not by
-                    // entering `pvmonitor`; the value itself is ignored.
-                    let on_event = move |_value: &PvField| {
-                        connected_inner.store(true, Ordering::Release);
-                    };
-                    let result = match &request {
-                        Some(req) => {
-                            client_clone
-                                .pvmonitor_with_request(&pv_name, req, on_event)
-                                .await
+                    // Same event stream as the INP monitor, for the same
+                    // reason: `op_monitor_events` re-subscribes internally
+                    // on connection loss, so the future returning is NOT
+                    // the disconnect signal. Without the `Disconnected`
+                    // event the OUT-write gate would keep reporting a dead
+                    // upstream as writable and every put would be swallowed
+                    // by the peer's absence instead of deferring/retrying.
+                    // Liveness is proven by a delivered event, never by
+                    // entering the subscription; the value itself is ignored.
+                    let on_event = move |ev: MonitorEvent| match ev {
+                        MonitorEvent::Connected { .. } | MonitorEvent::Data { .. } => {
+                            connected_inner.store(true, Ordering::Release);
                         }
-                        None => client_clone.pvmonitor(&pv_name, on_event).await,
+                        MonitorEvent::Disconnected | MonitorEvent::Finished => {
+                            connected_inner.store(false, Ordering::Release);
+                        }
                     };
-                    // Subscription ended — reflect the disconnect so the
-                    // OUT-write gate sees `is_connected() == false` until
-                    // re-subscribed.
+                    let result = client_clone
+                        .pvmonitor_events(
+                            &pv_name,
+                            request.as_ref(),
+                            MonitorEventMask {
+                                mask_connected: false,
+                                mask_disconnected: false,
+                            },
+                            on_event,
+                        )
+                        .await;
+                    // The subscription future returned — the stream ended
+                    // for good. Reflect the disconnect so the OUT-write gate
+                    // sees `is_connected() == false` until re-subscribed.
                     connected_for_task.store(false, Ordering::Release);
                     match &result {
                         Ok(()) => tracing::debug!(
@@ -508,7 +572,7 @@ impl PvaLink {
                             "pvalink: OUT connection monitor failed, will retry"
                         ),
                     }
-                    tokio::time::sleep(backoff).await;
+                    task::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
             });
@@ -3668,6 +3732,98 @@ mod tests {
                     .expect("deferred write_with_block must enqueue");
             });
         assert_eq!(link.staged_count(), 1, "one entry staged");
+    }
+
+    /// An upstream that dies must disconnect the INP link and drive one
+    /// disconnect scan — even though the client's monitor RE-SUBSCRIBES
+    /// INTERNALLY and its future never returns.
+    ///
+    /// `op_monitor_events` handles `MonitorEnd::ConnectionLost` by pushing
+    /// `MonitorEvent::Disconnected` and looping, so a subscriber that infers
+    /// the disconnect from "the subscription future returned" learns nothing
+    /// when the peer dies. Measured on the RTEMS stage-5 target
+    /// (doc/pvalink-rtems-design.md §5, criterion 4): with the upstream IOC
+    /// killed, the client correctly reported `conn alive=false channels=[]`,
+    /// `active=0 searching=2`, while both downstream records still read
+    /// `SEVR=0 STAT=0` at their stale value and the link still claimed
+    /// `connected=true`.
+    ///
+    /// This is the end-to-end shape of that: a real server, a real
+    /// subscription, the server dropped underneath it.
+    // Reactor-dependent, and unusually so — it is the RE-dial that needs the
+    // reactor, not the first one. Losing the peer makes the client re-dial
+    // from a background-executor thread, and feature-ON that thread has no
+    // tokio reactor while `dial_pva`'s hosted arm is still `tokio::net`
+    // (`TcpStream::connect` → `PollEvented::new` → "no reactor running").
+    // The feature swaps the executor, not the transport; the target does not
+    // have this shape at all, because `target_os = "rtems"` selects the
+    // blocking dial. Gated out feature-ON (stage 3); the on-target boot is
+    // what proves this path there.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upstream_death_disconnects_the_inp_monitor_link() {
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let pv = SharedPV::build_mailbox();
+        pv.open(
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            },
+            PvField::Structure(PvStructure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), PvField::Scalar(ScalarValue::Double(1.0)))],
+            }),
+        )
+        .unwrap();
+        let source = SharedSource::new();
+        source.add("DISC:PV", pv);
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            proc: ProcMode::Cp,
+            scan_on_update: true,
+            ..PvaLinkConfig::defaults_for("DISC:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::open(cfg, client).await.expect("link opens");
+        let mut rx = link
+            .take_notify_rx()
+            .expect("an INP+monitor link has a channel");
+
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the initial monitor update must arrive")
+            .expect("the monitor channel must stay open");
+        assert!(
+            matches!(first, ScanEvent::Value(_)),
+            "the first trigger is the initial value, got {first:?}"
+        );
+        assert!(link.is_connected(), "a live subscription reports connected");
+
+        drop(server);
+
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect(
+                "a dead upstream must enqueue a disconnect scan trigger; the monitor \
+                 future does not return — it re-subscribes internally",
+            )
+            .expect("the monitor channel must stay open");
+        assert!(
+            matches!(ev, ScanEvent::Disconnected),
+            "the trigger after the upstream dies must be Disconnected, got {ev:?}"
+        );
+        assert!(
+            !link.is_connected(),
+            "a dead upstream must not keep reporting connected"
+        );
     }
 
     /// a typed (`PvField`) OUT write to a query-bearing link

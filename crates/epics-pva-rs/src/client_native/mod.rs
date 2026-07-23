@@ -100,4 +100,64 @@ mod spawn_seam_guard {
             );
         }
     }
+
+    /// Every timer the native client arms in production comes from
+    /// `epics_base_rs::runtime::task::{interval, sleep, sleep_until, timeout}`,
+    /// not from `tokio::time` — the timer twin of the spawn guard above.
+    ///
+    /// MEASURED, and this guard exists because the spawn half alone was not
+    /// enough: with every spawn already on the seam, the stage-5 target image
+    /// still died with three
+    /// *"there is no reactor running, must be called from the context of a
+    /// Tokio 1.x runtime"* panics on `cbMedium`
+    /// (`tokio/src/time/interval.rs:138` from `run_engine`'s tick,
+    /// `search_engine.rs`'s NS reconnect sleep, and pvalink's re-subscribe
+    /// backoff). A task moved onto the callback pool takes its timer calls with
+    /// it, so pinning where tasks *start* says nothing about what they wait on.
+    ///
+    /// Scope is the files that compile for `armv7-rtems-eabihf`. `udp.rs` and
+    /// `search.rs` are `#[cfg(not(target_os = "rtems"))]` (see the module list
+    /// above) — they may use `tokio::time` freely, because no target build ever
+    /// contains them.
+    #[test]
+    fn client_scope_timers_go_through_the_runtime_seam() {
+        // (file source, an anchor that must survive in the production slice).
+        // The RTEMS-compiled client files only.
+        let files: &[(&str, &str)] = &[
+            (include_str!("context.rs"), "impl PvaClient"),
+            (
+                include_str!("operation.rs"),
+                "impl<T: Send + 'static> PvaOperation<T>",
+            ),
+            (include_str!("ops_v2.rs"), "impl SubscriptionHandle"),
+            (include_str!("server_conn.rs"), "impl ServerConn"),
+            (include_str!("search_engine.rs"), "async fn run_engine"),
+            (include_str!("channel.rs"), "impl ConnectionPool"),
+        ];
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::time::");
+        for (src, anchor) in files {
+            let prod = match src.find("\n#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => src,
+            };
+            assert!(
+                prod.contains(anchor),
+                "production slice no longer covers `{anchor}` — the guard would pass vacuously"
+            );
+            // The seam's own doc comments may name the type they replace, so
+            // only code lines count: a `//`-prefixed line is prose.
+            let hits = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(literal))
+                .count();
+            assert_eq!(
+                hits, 0,
+                "client production scope must arm timers through \
+                 `runtime::task`; found {hits} bare `{literal}` near `{anchor}` — \
+                 on RTEMS that panics the callback worker at runtime"
+            );
+        }
+    }
 }

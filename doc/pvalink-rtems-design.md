@@ -587,8 +587,17 @@ from source and each confirmed present on a real boot in
 | `scanOnce` | `scan_once.rs:187-191` | Big | 1,048,576 |
 | `PVAS-TCP` | `rtems-pva-ioc.rs:460-464` | Medium | 524,288 |
 | `PVAS-UDP` | `rtems-pva-ioc.rs:476-478` | Medium | 524,288 |
+| `main` (POSIX_Init) † | `rtems_config.c:35` | — | 65,536 |
+| `status-pv` † | `status_pv.rs:291-294` | Small | 262,144 |
 | per inbound conn: `PVAS-conn` | `blocking.rs:1266-1269` | Big | 1,048,576 |
 | per inbound conn: `PVAS-read`, `PVAS-write` | `blocking.rs:501-505` | Small ×2 | 524,288 |
+
+† Both rows were **added by stage 5's census** (§12.6): they were absent
+from this table, so "count the threads and compare against §4.3" was off
+by two before a single `pva://` link existed. `main` is not a
+`StackSizeClass` thread at all — it is `CONFIGURE_POSIX_INIT_THREAD_STACK_SIZE`,
+and it is the deepest user of its own stack of any thread on the box
+(21,912 of 65,520 B used, 33 %).
 
 The per-inbound-connection total (1,572,864 B) matches the on-target
 measurement of **1,589,000 B/connection, 97.4 % of it stack**
@@ -794,7 +803,14 @@ replace the banner that currently says nothing about links.
 
 **Not sufficient.** This stage's real gate is stage 5.
 
-### Stage 5 — two IOCs on the wire, one linking to the other (the actual gate)
+### Stage 5 — two IOCs on the wire, one linking to the other (the actual gate) — **DONE**
+
+*Status: run on the box on 2026-07-23; all six topology-A criteria pass.
+The measurements, the four defects it found, and where reality deviated
+from this section are §12. Two corrections to the text below, both
+recorded there: the `@pva://…` spelling in the topology-A paragraph does
+not load (§12.1), and the §4.3 thread table it points at was missing two
+baseline threads (§12.6).*
 
 Everything above is `cargo check` and host tests. "Type-checks for RTEMS"
 and "runs on RTEMS" are different claims and this workspace has been bitten
@@ -1666,3 +1682,483 @@ Forwarded}` variants. Neither is client-side; neither moved.
 | `cargo nextest run -p epics-bridge-rs --features pvalink,qsrv-core,rtems-exec-model` | 681 passed |
 | four `rtems-pva-ioc` source-text guards (incl. the new pvalink guard) | pass, feature-ON |
 | both crates' `rtems_exec_model_gate` census | pass, feature-ON, no marker bump needed |
+
+---
+
+## 12. Stage 5 as built — the on-target gate, and what it found
+
+Run on the QEMU/BSP box on 2026-07-23. Topology A only (topology B stays
+UNVERIFIED, §6). All six of §5's criteria pass. Getting there took four
+production fixes, three of which no host test and no `cargo check` could
+have produced: the failures are *runtime* failures of the target's
+execution model, which is the whole reason §5 says stage 4 is not the
+gate.
+
+### 12.1 The rig
+
+The probe — the three link records, the compiled-in name server, the
+console reporter thread and the C task/stack census it calls — is
+`doc/pvalink-stage5-probe.patch` (commits `a82ee9fe` + `c9907585`,
+verified to apply to `d28b1c6d`). It is measurement scaffolding, not
+product: it exists because the image configures the RTEMS shell's
+`stackuse`/`top` commands but starts no shell, and because a `-kernel`
+boot has no `.db` to load (§12.3). The four production fixes below are
+separate commits and stand without it.
+
+Guest image — built on the box, not cross-checked and hoped for
+(`~/rtems-bringup/build-stage5.sh`):
+
+```
+cargo +nightly build --release --target armv7-rtems-eabihf \
+    -Zbuild-std=std,panic_abort \
+    --no-default-features --features qsrv-core,pvalink \
+    -p epics-bridge-rs --bin rtems-pva-ioc
+```
+
+Upstream IOC — pvxs `softIocPVX` on the host, PVA on **15076**, because
+5075 belongs to the guest's `hostfwd` (`~/rtems-bringup/stage5/run-upstream.sh`,
+`upstream.db`):
+
+```
+export EPICS_PVAS_SERVER_PORT=15076 EPICS_PVAS_BROADCAST_PORT=15076
+export EPICS_PVA_SERVER_PORT=15076  EPICS_PVA_BROADCAST_PORT=15076
+exec .../softIocPVX -D .../softIocPVX.dbd -d .../stage5/upstream.db
+# record(ai, "UPSTREAM:AI") { VAL 1.0, PREC 3, EGU V, SCAN Passive }
+# record(ao, "UPSTREAM:AO") { VAL 0.0, PREC 3, EGU V, OMSL supervisory }
+```
+
+Guest boot (`~/rtems-bringup/stage5/boot-stage5.sh`) — the measured
+invocation of `doc/rtems-priority-on-target-measurement.md`, plus one
+`hostfwd` whose **host port equals the guest port**:
+
+```
+qemu-system-arm -M xilinx-zynq-a9 -m 256M -no-reboot -nographic \
+  -serial null -serial mon:stdio \
+  -nic user,model=cadence_gem,hostfwd=tcp:127.0.0.1:5075-:5075 \
+  -kernel stage5ioc.exe
+```
+
+Two directions, two mechanisms, and they are not symmetric: the guest
+reaches the upstream **outbound** at `10.0.2.2:15076` with no `hostfwd`
+at all, and the host reaches the guest **inbound** only through the
+`hostfwd` — as `127.0.0.1:5075`, because SLIRP presents the host to the
+guest and the guest to the host as loopback. No UDP is forwarded in
+either direction; both IOCs are found by `EPICS_PVA_NAME_SERVERS` over
+TCP.
+
+### 12.2 §5's `.db` spelling does not load — `@pva://` is INST_IO
+
+§5 stage 5 says the guest record carries `INP=@pva://UPSTREAM:AI CP`. It
+does not load, in this tree or in C. A leading `@` is INST_IO, and
+`dbCanSetLink` (`record/link.rs:487`, C `dbStaticLib.c:2400`) refuses
+INST_IO on a record whose bound device support declares CONSTANT — which
+a soft `ai` does. Measured on the target: `iocInit` fails with
+
+```
+ai.INP: can't initialize link type CONSTANT with "@pva://UPSTREAM:AI CP" (type INST_IO)
+```
+
+and the image exits. The `@` prefix belongs to device-support links
+(`INP=@asyn(...)`), not to soft links. Two spellings do load and both are
+exercised by the probe image, so the gate covers the JSON longhand *and*
+this tree's scheme form:
+
+```
+record(ai, "RTEMS:PVA:DOWN")  { field(INP, "{pva: { pv: 'UPSTREAM:AI', proc: 'CP' }}") }
+record(ai, "RTEMS:PVA:DOWN2") { field(INP, "pva://UPSTREAM:AI CP") }
+record(ao, "RTEMS:PVA:UPLNK") { field(OUT, "{pva: { pv: 'UPSTREAM:AO' }}") }
+```
+
+### 12.3 The topology is compiled in, because the target has neither a filesystem nor argv
+
+§5 assumes "boot `rtems-pva-ioc` with `EPICS_PVA_NAME_SERVERS=...` and a
+`.db`". A `-kernel` boot has no filesystem to name a `.db` on and
+`rtems_init.c:195` hands `main` a fixed one-element argv, so there is no
+`-d` and no environment to inherit. Both are therefore compiled into the
+probe image: the three records above live in `DEMO_DB`, and the address
+is `const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076"`, `set_var`'d
+before the client is built. This is a property of the probe, not of
+pvalink: the resolver reads `EPICS_PVA_NAME_SERVERS` normally.
+
+### 12.4 The six criteria, as measured
+
+All six on one boot of the `f75f1e56` image. Guest booted 02:16;
+`STAGE5 seq=N` lines are the probe reporter thread, every 10 s.
+
+**(1) Banner — resolver installed, link count, not silence. PASS.**
+Console, `~/rtems-bringup/stage5/guest.log`:
+
+```
+rtems-pva-ioc: serving 6 records on PVA TCP port 5075 (UDP search on 5076), GUID 4245e0646d8db428da5936bc, RTEMS execution model, no tokio runtime
+rtems-pva-ioc: QSRV2 ENABLED — sources: qsrvSingle(0), qsrvGroup(1)
+rtems-pva-ioc: pvalink resolver installed — 2 pva:// record links pre-registered; @pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS (TCP name servers; UDP search is compiled out on this target)
+STAGE5 probe: EPICS_PVA_NAME_SERVERS=10.0.2.2:15076 (compiled in), reporting every 10 s
+STAGE5 seq=1 links=2 channels_total=2 active=2 searching=0 connecting=0 name_servers=1 connections=1
+STAGE5 seq=1 link pv=UPSTREAM:AI dir=Inp connected=true records=["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2"]
+STAGE5 seq=1 link pv=UPSTREAM:AO dir=Out connected=true records=["RTEMS:PVA:UPLNK"]
+```
+
+"2 links" for three records is correct and is the §2.4 property on
+target: `UPSTREAM:AI` is shared by both INP records.
+
+**(2) `pvxget` from the host against the guest's record returns the
+upstream value. PASS.** Command and output (host, through the `hostfwd`):
+
+```
+$ EPICS_PVA_NAME_SERVERS=127.0.0.1:15076 pvxget -w 5 UPSTREAM:AI
+UPSTREAM:AI
+    value double = 3.875
+    alarm.severity int32_t = 0
+    alarm.status int32_t = 0
+$ EPICS_PVA_NAME_SERVERS=127.0.0.1:5075 pvxget -w 5 RTEMS:PVA:DOWN RTEMS:PVA:DOWN2
+RTEMS:PVA:DOWN
+    value double = 3.875
+    alarm.severity int32_t = 0
+    alarm.status int32_t = 0
+    ...
+    display.units string = "V"
+    display.precision int32_t = 3
+RTEMS:PVA:DOWN2
+    value double = 3.875
+    alarm.severity int32_t = 0
+```
+
+(`...` elides the unchanged NTScalar metadata fields.) The first run of
+this criterion, before criterion 3 moved the upstream, read `42.125` on
+all three PVs. Both spellings of the link carry the value; the guest's
+own `EGU`/`PREC` are served, i.e. the value is a *record* value produced
+by the link, not a proxied upstream structure.
+
+**(3) A put upstream reaches the guest record — the monitor path. PASS.**
+`~/rtems-bringup/stage5/crit3.sh 3.875`: a `pvxmonitor` on the guest's
+two records, then a `pvxput` to the upstream 6 s later.
+
+```
+---- put side ----
+02:19:23.428 PUT UPSTREAM:AI = 3.875
+02:19:23.459 PUT returned rc=0
+---- monitor side ----
+02:19:17.697 MON     value double = 42.125         <- RTEMS:PVA:DOWN, initial
+02:19:17.741 MON     value double = 42.125         <- RTEMS:PVA:DOWN2, initial
+02:19:23.498 MON RTEMS:PVA:DOWN
+02:19:23.500 MON     value double = 3.875
+02:19:23.509 MON RTEMS:PVA:DOWN2
+02:19:23.511 MON     value double = 3.875
+```
+
+70 ms and 81 ms from the upstream put to the downstream monitor update,
+end to end through SLIRP twice. `SCAN` is `Passive` on both records: the
+update is the `CP` monitor driving `scanOnce`, which is exactly the path
+the criterion is about — nothing polls here.
+
+**(4) Kill the upstream → `LINK`/`INVALID`; restart → recovery with no
+guest reboot. PASS.** Upstream killed 02:17:54:
+
+```
+STAGE5 seq=5 links=2 channels_total=2 active=0 searching=2 connecting=0 name_servers=1 connections=1
+STAGE5 seq=5 conn peer=10.0.2.2:15076 alive=false rx=1393 tx=274 channels=[]
+STAGE5 seq=5 link pv=UPSTREAM:AI dir=Inp connected=false records=["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2"]
+STAGE5 seq=5 link pv=UPSTREAM:AO dir=Out connected=false records=["RTEMS:PVA:UPLNK"]
+STAGE5 seq=5 record RTEMS:PVA:DOWN  VAL=Ok("99.5") SEVR=Ok("3") STAT=Ok("14")
+STAGE5 seq=5 record RTEMS:PVA:DOWN2 VAL=Ok("99.5") SEVR=Ok("3") STAT=Ok("14")
+```
+
+`SEVR=3` is INVALID, `STAT=14` is LINK. Upstream restarted 02:18:26 and
+`pvxput UPSTREAM:AI 42.125`; 40 s later, same boot of the guest, no
+reboot, no restart of anything on the target:
+
+```
+STAGE5 seq=9 links=2 channels_total=2 active=2 searching=0 connecting=0 name_servers=1 connections=1
+STAGE5 seq=9 conn peer=10.0.2.2:15076 alive=true rx=1377 tx=258 channels=["UPSTREAM:AO", "UPSTREAM:AI"]
+STAGE5 seq=9 link pv=UPSTREAM:AI dir=Inp connected=true records=["RTEMS:PVA:DOWN", "RTEMS:PVA:DOWN2"]
+STAGE5 seq=9 record RTEMS:PVA:DOWN  VAL=Ok("42.125") SEVR=Ok("0") STAT=Ok("0")
+STAGE5 seq=9 record RTEMS:PVA:DOWN2 VAL=Ok("42.125") SEVR=Ok("0") STAT=Ok("0")
+```
+
+The re-subscribe loop survives the 1 s clock quantum (§4.4) — but only
+after §12.5 and §12.8; on the pre-fix images this criterion failed twice,
+in two different ways.
+
+**(5) An OUT link writes upstream. PASS.** `~/rtems-bringup/stage5/crit5.sh 6.25`:
+a `pvxmonitor` on the *upstream* `UPSTREAM:AO`, then a `pvxput` to the
+*guest's* `RTEMS:PVA:UPLNK` through the `hostfwd`.
+
+```
+---- put side ----
+02:19:47.595 PUT RTEMS:PVA:UPLNK = 6.25 (guest, via hostfwd 127.0.0.1:5075)
+02:19:47.872 PUT returned rc=0
+02:19:50.876 GET UPSTREAM:AO
+UPSTREAM:AO
+    value double = 6.25
+    alarm.severity int32_t = 0
+    alarm.status int32_t = 0
+    alarm.message string = ""
+---- upstream UPSTREAM:AO monitor ----
+02:19:41.616 MON     value double = 0
+02:19:41.620 MON     alarm.status int32_t = 2
+02:19:41.622 MON     alarm.message string = "UDF"      <- before
+02:19:47.886 MON UPSTREAM:AO
+02:19:47.888 MON     value double = 6.25
+02:19:47.890 MON     alarm.severity int32_t = 0
+02:19:47.894 MON     alarm.message string = ""         <- after
+```
+
+291 ms from the guest-side put to the upstream monitor event, and the
+upstream's UDF alarm clears — the write reached the upstream *record*,
+not just its server. This is `flush_puts` on the link-put-queue owner
+executing on the callback pool.
+
+**(6) Thread census and per-thread peaks vs §4.3; one connection
+regardless of link count. PASS.** `TASKDUMP`/`STACKUSE` from the probe
+(`rtems_task_iterate` + `rtems_stack_checker_report_usage`), tag `s5-18`,
+IOC threads only (`0x0b......`; the `0x0a......` block is libbsd and
+`0x09010001` is IDLE):
+
+```
+TASKDUMP begin tag=s5-18 count=30 scheduler_sc=0
+TASKDUMP id=0x0b010001 core=254 posix=   1 sc=0 obj=       thread=<empty>
+TASKDUMP id=0x0b010002 core=140 posix= 115 sc=0 obj=       thread=cbLow
+TASKDUMP id=0x0b010003 core=135 posix= 120 sc=0 obj=       thread=cbMedium
+TASKDUMP id=0x0b010004 core=128 posix= 127 sc=0 obj=       thread=cbHigh
+TASKDUMP id=0x0b010005 core=129 posix= 126 sc=0 obj=       thread=cbTimer
+TASKDUMP id=0x0b010006 core=132 posix= 123 sc=0 obj=       thread=scanOnce
+TASKDUMP id=0x0b010007 core=189 posix=  66 sc=0 obj=       thread=status-pv
+TASKDUMP id=0x0b010008 core=181 posix=  74 sc=0 obj=       thread=PVAS-TCP
+TASKDUMP id=0x0b010009 core=183 posix=  72 sc=0 obj=       thread=PVAS-UDP
+TASKDUMP id=0x0b01000a core=189 posix=  66 sc=0 obj=       thread=stage5-probe
+TASKDUMP id=0x0b01000f core=181 posix=  74 sc=0 obj=       thread=PVAC-reader 10.
+TASKDUMP id=0x0b010010 core=181 posix=  74 sc=0 obj=       thread=PVAC-writer 10.
+TASKDUMP id=0x0b010011 core=181 posix=  74 sc=0 obj=       thread=PVAC-reader 10.
+TASKDUMP id=0x0b010012 core=181 posix=  74 sc=0 obj=       thread=PVAC-writer 10.
+TASKDUMP end tag=s5-18
+
+STACKUSE begin tag=s5-18
+ID         NAME                  LOW        HIGH       CURRENT     AVAIL   USED
+0x0b010001                       0x00948650 0x0095863f 0x00957c10  65520  21912
+0x0b010002 cbLow                 0x00a2d878 0x00b2d867 0x00b2d6d0 1048560    632
+0x0b010003 cbMedium              0x00b2deb0 0x00c2de9f 0x00c2dd08 1048560  28160
+0x0b010004 cbHigh                0x00c2e4e8 0x00d2e4d7 0x00d2e340 1048560    632
+0x0b010005 cbTimer               0x00d2eb20 0x00daeb0f 0x00dae910 524272    760
+0x0b010006 scanOnce              0x00daf158 0x00eaf147 0x00eaefc0 1048560    616
+0x0b010007 status-pv             0x00eb6e28 0x00ef6e17 0x00ef6bf0 262128   1960
+0x0b010008 PVAS-TCP              0x00ef74a0 0x00f7748f 0x00f76aa8 524272   3144
+0x0b010009 PVAS-UDP              0x00f77bd0 0x00ff7bbf 0x00ff7538 524272   1752
+0x0b01000a stage5-probe          0x00ff8328 0x01078317 0x01077f00 524272   1648
+0x0b01000f PVAC-reader 10.       0x010bcd20 0x010fcd0f 0x010fc860 262128   1288
+0x0b010010 PVAC-writer 10.       0x010fd5a0 0x0113d58f 0x0113d330 262128   2264
+0x0b010011 PVAC-reader 10.       0x01183460 0x011c344f 0x011c2fa0 262128   1320
+0x0b010012 PVAC-writer 10.       0x01140bd0 0x01180bbf 0x01180960 262128   2264
+STACKUSE end tag=s5-18
+```
+
+Against §4.3's arithmetic:
+
+* **pvalink's delta is exactly the predicted 4 threads** — two
+  `PVAC-reader`/`PVAC-writer` pairs, one pair per TCP peer (the data
+  connection and the name-server connection), each `Small` (262,128 B
+  usable of the 262,144 class). Not one thread more: the re-subscribe
+  loops, the search-engine loop and the heartbeat are tasks on the
+  callback bands, exactly as §4.3's zero-thread rows claim.
+* **`connections=1` regardless of link count**, on target, with two links
+  and three records: `STAGE5 seq=18 links=2 channels_total=2 active=2
+  searching=0 connecting=0 name_servers=1 connections=1`. Confirmed
+  independently on the wire, host side:
+
+  ```
+  $ ss -tn state established '( sport = :15076 )'
+  Recv-Q Send-Q      Local Address:Port        Peer Address:Port
+  0      0      [::ffff:127.0.0.1]:15076 [::ffff:127.0.0.1]:40390
+  0      0      [::ffff:127.0.0.1]:15076 [::ffff:127.0.0.1]:40584
+  ```
+
+  Two sockets, and that is the correct number: one data circuit plus one
+  name-server circuit. §2.4's property is *one connection per upstream
+  peer*, and the name server here happens to be the same process.
+* **Baseline threads match §4.3 to zero, not to "within one"**, once
+  §12.9's two missing rows are added to that table. Ten baseline IOC
+  threads are present: `main`, `cbLow`, `cbMedium`, `cbHigh`, `cbTimer`,
+  `scanOnce`, `status-pv`, `PVAS-TCP`, `PVAS-UDP`, and `stage5-probe` —
+  the last of which belongs to the probe, not to an IOC.
+* **No per-inbound-connection triple is in this sample** because the
+  `pvxget`s had already closed; a sample taken while a host client was
+  attached showed the predicted `PVAS-conn` (Big, 25,616 B used) plus
+  `PVAS-read`/`PVAS-write`.
+* **Peak stack use is nowhere near a ceiling.** The deepest IOC thread is
+  `cbMedium` at 28,160 of 1,048,560 B (2.7 %) — that is where every
+  pvalink task, the search engine and the record processing run. The
+  PVAC pump threads peak at 2,264 of 262,128 B (0.9 %). The tightest
+  ratio on the box is `main` at 21,912 of 65,520 B (33 %), and `main` is
+  not a `StackSizeClass` thread — it is
+  `CONFIGURE_POSIX_INIT_THREAD_STACK_SIZE` (`rtems_config.c:35`), which
+  is the one stack size in this system that is *not* generous.
+
+### 12.5 Finding 1 — a task moved to the callback pool takes its timers with it
+
+The first boot of the probe image killed `cbMedium` three times over:
+
+```
+panic on thread `cbMedium` at tokio-1.51.1/src/time/interval.rs:138:
+  there is no reactor running, must be called from the context of a Tokio 1.x runtime
+panic on thread `cbMedium` at pvalink/link.rs:440: (same)
+panic on thread `cbMedium` at client_native/search_engine.rs:3046: (same)
+```
+
+The IOC kept listening, kept answering searches and kept serving its
+local records — it looked healthy from the network — while every
+downstream record sat at `SEVR=3 STAT=17` forever.
+
+Stage 3 put every client **spawn** on the `runtime::task` seam and pinned
+that with a source-text guard. A task moved onto the callback pool takes
+its **timer** calls with it, and nothing pinned those; stage 4 then made
+the search engine target-live, which carried its `tokio::time::interval`
+tick straight onto the pool. Fixed at every site the anchor `rg -n
+'tokio::time'` found in target-compiled production code, and closed
+structurally: the seam guard grew a timer half in both crates
+(`client_scope_timers_go_through_the_runtime_seam`,
+`pvalink_scope_timers_go_through_the_runtime_seam`), both of which fail
+on the pre-fix tree. Commit `b76971ef`.
+
+This is the finding that justifies §5's insistence that stage 4 is not
+the gate: `scripts/rtems-check.sh` was green, all host tests were green,
+and the feature-ON simulation could not see it either, because
+`rtems-exec-model` keeps a tokio *runtime* alive for `tokio::net` — so
+the timer calls that panic on target find a reactor on the host.
+
+### 12.6 Finding 2 — the install scan skipped every option-less link, in both directions
+
+Criterion 5 could not even be attempted: `OUT="{pva: {pv: 'UPSTREAM:AO'}}"`
+produced no link at all, and the banner read `1 pva:// record link`
+instead of 2. A `pv`-only JSON longhand collapses to `ParsedLink::Pva`
+with no option suffix, and the install scan had an early-out —
+`if link_pv_name(s) == s { continue; }` — that dropped exactly those
+links. pvxs has no such branch: `pvaOpenLink` opens every link, and
+options are defaults, not a precondition for opening. Removing the
+early-out is the whole fix; the arm already had both directions.
+Commit `44c4ef3e`.
+
+Its sibling is why this took a scratch test to find rather than a glance
+at the console: the install scan's four open calls were `let _ = ...`, so
+an open that failed said nothing at all — on a target with no iocsh,
+silence is the only symptom you get. Every one now reports through one
+helper, in the shape C uses (`record.FIELD Error: pvalink to 'chan' not
+opened: ...`). Commit `669b4d53`.
+
+### 12.7 Finding 3 — an idle name-server circuit is silent, and the server reaps it
+
+With both links resolved and nothing to search for, `ns_run_once` wrote
+nothing, and a pvxs server closes a client that has been silent for its
+`tcpTimeout`. Host-side `ss -tn state established '( sport = :15076 )'`,
+sampled every 2 s, with the guest idle:
+
+```
+01:51:02  ...:37802  ...:56928      <- NS circuit re-dialled
+01:51:41  ...:37802  ...:56928      <- alive 39 s
+01:51:43             ...:56928      <- server dropped it
+01:51:53  ...:44726  ...:56928      <- next dial, 10 s later
+```
+
+`...:56928` is the data connection, which has a heartbeat and never
+churned. The same churn is visible from the target, in the census: the
+data pair keeps its object ids while the name-server pair gets new ones
+at every sample, and at one sample is missing entirely
+(`guest-prefix-boot3.log`, `PVAC-*` rows: `0x12/0x13` → `0x1a/0x1b` →
+`0x1f/0x20` → *absent* → `0x13/0x14`).
+
+pvxs has no such gap because a name-server connection is not special
+there: `Connection::build()` makes it and `nameserver = true` is flipped
+only afterwards (`client.cpp:674-685`), so it carries `clientconn.cpp`'s
+echo timer and inactivity bound like any data circuit. Ours now does the
+same — application `CMD_ECHO` every `max(1, min(15, tcpTimeout*3/8))` s
+and a `tcpTimeout` idle bound. Commit `94868064`.
+
+On target the cost of the bug was not cosmetic: each cycle re-created two
+blocking pump threads (every RTEMS `std::thread` leaks 128 B of TLS-key
+bookkeeping) and left a ≥10 s window — `tcpNSCheckInterval` — in which no
+PV could be resolved at all. Post-fix, the `f75f1e56` image held both
+circuits open for the whole 46-report (≈8 min) run with no re-dial:
+`seq=46` still reads `alive=true`, and `ss` still shows the same two
+sockets.
+
+### 12.8 Finding 4 — the disconnect that never arrives
+
+Criterion 4's first half failed on the otherwise-good image: the upstream
+was killed and the client saw it immediately and correctly, while every
+link and record kept claiming health.
+
+```
+STAGE5 seq=23 links=2 channels_total=2 active=0 searching=2 connections=1
+STAGE5 seq=23 conn peer=10.0.2.2:15076 alive=false rx=1486 tx=370 channels=[]
+STAGE5 seq=23 link pv=UPSTREAM:AI dir=Inp connected=true records=[...]
+STAGE5 seq=23 record RTEMS:PVA:DOWN  VAL=Ok("12.5") SEVR=Ok("0") STAT=Ok("0")
+STAGE5 seq=23 record RTEMS:PVA:DOWN2 VAL=Ok("12.5") SEVR=Ok("0") STAT=Ok("0")
+```
+
+A stale value served as good, with no LINK/INVALID — the exact failure
+`is_connected()` exists to prevent. Root cause: both monitors inferred
+"the upstream is gone" from the subscription future returning, and it
+never returns. `op_monitor_events` handles `MonitorEnd::ConnectionLost`
+by re-subscribing **internally** (deliver `Disconnected`, sleep 200 ms,
+loop), so the future comes back only for a fatal/remote end.
+
+Both monitors now take the transition from the event stream
+(`pvmonitor_events` with `mask_connected: false, mask_disconnected:
+false`), which is the shape pvxs has — `pvaLinkChannel` is driven by the
+monitor's event stream and its `catch(client::Disconnect&)` branch
+(`pvalink_channel.cpp:335-373`), not by a subscription call returning.
+The INP transition got a single owner, `inp_disconnect_scan`, called from
+both places that can observe it and idempotent by construction (a `swap`
+gate makes the second observer of one outage a no-op, and a subscription
+that never delivered an event synthesizes no scan). Commit `f75f1e56`.
+
+### 12.9 §4.3's thread table was two threads short
+
+Criterion 6 says "match §4.3's arithmetic to within one thread", which
+requires §4.3 to be right. It listed 7 baseline threads; the target runs
+9 before any `pva://` link exists. Missing: `main` (the POSIX_Init
+thread, 65,536 B from `rtems_config.c:35`, and the deepest user of its
+own stack on the box at 33 %) and `status-pv` (`status_pv.rs:291-294`,
+`Small`). Both rows are now in §4.3, marked. Nobody had counted the
+threads on a target before, which is why an omission in the table
+survived four stages.
+
+### 12.10 What stage 5 does **not** prove
+
+* **Topology B** is untouched and stays UNVERIFIED (§6): two SLIRP guests
+  are on separate `10.0.2.0/24` networks and cannot address each other.
+* **Scale.** Two links, one upstream, one name server, three records. The
+  per-peer cost is confirmed; the 20-link figure in §4.3 is still
+  arithmetic.
+* **The gateway's monitor path has the §12.8 defect and is UNFIXED.**
+  The anchor for "disconnect inferred from the subscription future
+  returning" has a third site:
+  `pva_gateway/channel_cache.rs:1162`'s `handle.wait().await`, where
+  `op_monitor_handle` re-subscribes internally on `ConnectionLost` in the
+  same way, so `signal_disconnect_boundary` does not fire on a plain
+  upstream loss. It is not in this image (the gateway is not built into
+  `rtems-pva-ioc`) and the raw-frames monitor path has no connection-state
+  hook to bind to, so closing it is a change to `epics-pva-rs`'s
+  monitor-handle API rather than a call-site edit. Recorded here rather
+  than fixed blind.
+* **Long-run stability** is 8 minutes, not days. What that does establish
+  is that §12.7's churn is gone.
+
+### 12.11 The gate as measured
+
+| gate | result |
+|---|---|
+| §5 criterion 1 — banner reports resolver + link count | **pass** (`pvalink resolver installed — 2 pva:// record links pre-registered`) |
+| §5 criterion 2 — `pvxget` host → guest record returns the upstream value | **pass** (`RTEMS:PVA:DOWN`/`DOWN2` = `3.875` = `UPSTREAM:AI`) |
+| §5 criterion 3 — upstream put reaches the guest record via the monitor | **pass** (70 ms / 81 ms, `SCAN=Passive`) |
+| §5 criterion 4 — kill → LINK/INVALID, restart → recovery, no guest reboot | **pass** (`SEVR=3 STAT=14` → `SEVR=0 STAT=0`, same boot) |
+| §5 criterion 5 — OUT link writes and is observed upstream | **pass** (`UPSTREAM:AO` = `6.25`, UDF cleared, 291 ms) |
+| §5 criterion 6 — census vs §4.3, and one connection per peer | **pass** (+4 threads exactly; `connections=1`, 2 sockets = data + NS) |
+| `./scripts/rtems-check.sh` | exit 0, both configurations |
+| target release build (`armv7-rtems-eabihf`, `-Zbuild-std`) | links; image boots and runs (this is the check `cargo check` cannot make) |
+| `cargo clippy -p epics-bridge-rs -p epics-pva-rs --all-targets -- -D warnings`, default and feature-ON | clean |
+| `cargo nextest run -p epics-pva-rs` | 1384 passed, 2 skipped (was 1382) |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1353 passed, 2 skipped (was 1352) |
+| `cargo nextest run -p epics-bridge-rs` | 687 passed (was 684) |
+| `cargo nextest run -p epics-bridge-rs --features pvalink,qsrv-core,rtems-exec-model` | 683 passed (was 681) |
+| new tests | 5: two seam guards (one per crate), the NS echo, the install scan opening option-less links both ways, and upstream-death → link disconnect |
+| both crates' `rtems_exec_model_gate` census | pass, marker `ALLOW(38)` → `ALLOW(39)` in `pvalink/integration.rs` |
+| the two pre-existing RTEMS-gate warnings (§9.9, §11.7) | unchanged, still `server_native/` |

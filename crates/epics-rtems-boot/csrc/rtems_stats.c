@@ -111,3 +111,108 @@ int epics_rtems_boot_mem_usage(uint64_t *free_total, uint64_t *used_total,
   *free_largest = (uint64_t)info.Free.largest;
   return 0;
 }
+
+/*
+ * STAGE-5 PROBE — MEASUREMENT ONLY (doc/pvalink-rtems-design.md §5 stage 5,
+ * pass criterion 6). Not merged; see doc/pvalink-stage5-probe.patch.
+ *
+ * Criterion 6 asks for `rt stackuse` / `rt top` on the guest. This image
+ * configures the shell's commands (CONFIGURE_SHELL_COMMAND_STACKUSE,
+ * rtems_config.c) but never starts a shell task, and the target has no
+ * console input path at all — so the two readings have to be produced from
+ * inside the image:
+ *
+ *   * `epics_rtems_boot_stack_report` calls the exact function the shell's
+ *     `stackuse` command calls (`rtems_stack_checker_report_usage`,
+ *     cpukit/libmisc/stackchk/check.c), which is why the output format below
+ *     is the shell's own, not something this file invents. It needs
+ *     CONFIGURE_STACK_CHECKER_ENABLED, which rtems_config.c:223 already sets.
+ *   * `epics_rtems_boot_dump_tasks` is the task census (the `rt top` half —
+ *     thread count, kernel names, effective priorities). It is verbatim the
+ *     probe doc/rtems-priority-probe.patch used for the priority measurement,
+ *     reused here rather than re-invented so both measurements are reading
+ *     the same listing.
+ *
+ * The visitor only copies ids: `rtems_task_iterate` runs it with the object
+ * allocator mutex held, so every query that could block or take another lock
+ * (`rtems_object_get_name`, `rtems_task_get_priority`) is done afterwards.
+ */
+#include <stdio.h>
+#include <string.h>
+
+#include <rtems/stackchk.h>
+#include <rtems/score/objectdata.h>
+#include <rtems/score/thread.h>
+#include <rtems/score/threadimpl.h>
+
+#define EPICS_RTEMS_DUMP_MAX_TASKS 192
+
+static rtems_id epics_rtems_dump_ids[EPICS_RTEMS_DUMP_MAX_TASKS];
+/* Two names per task, because they are two different facts. `object` is what
+ * `rtems_object_get_name` reports — the classic Objects_Name, which a POSIX
+ * thread never has. `thread` is `tcb->name`, which is what
+ * `pthread_setname_np` writes. */
+static char epics_rtems_dump_object_names[EPICS_RTEMS_DUMP_MAX_TASKS][32];
+static char epics_rtems_dump_thread_names[EPICS_RTEMS_DUMP_MAX_TASKS][32];
+static uint32_t epics_rtems_dump_count;
+
+static bool epics_rtems_dump_collect(rtems_tcb *tcb, void *arg) {
+  (void)arg;
+  if (epics_rtems_dump_count < EPICS_RTEMS_DUMP_MAX_TASKS) {
+    uint32_t i = epics_rtems_dump_count++;
+    epics_rtems_dump_ids[i] = tcb->Object.id;
+    /* A memcpy out of the TCB, no lock taken — safe inside the visitor. */
+    memset(epics_rtems_dump_thread_names[i], 0,
+           sizeof(epics_rtems_dump_thread_names[i]));
+    _Thread_Get_name(tcb, epics_rtems_dump_thread_names[i],
+                     sizeof(epics_rtems_dump_thread_names[i]));
+  }
+  return false; /* false == keep iterating */
+}
+
+void epics_rtems_boot_dump_tasks(const char *tag) {
+  uint32_t i;
+  rtems_id scheduler = 0;
+  rtems_status_code sc;
+
+  epics_rtems_dump_count = 0;
+  rtems_task_iterate(epics_rtems_dump_collect, NULL);
+
+  sc = rtems_task_get_scheduler(RTEMS_SELF, &scheduler);
+  printf("TASKDUMP begin tag=%s count=%lu scheduler_sc=%d\n",
+         tag == NULL ? "?" : tag, (unsigned long)epics_rtems_dump_count,
+         (int)sc);
+
+  for (i = 0; i < epics_rtems_dump_count; i++) {
+    rtems_task_priority prio = 0;
+    rtems_status_code psc;
+    char *obj;
+
+    memset(epics_rtems_dump_object_names[i], 0,
+           sizeof(epics_rtems_dump_object_names[i]));
+    obj = rtems_object_get_name(epics_rtems_dump_ids[i],
+                                sizeof(epics_rtems_dump_object_names[i]),
+                                epics_rtems_dump_object_names[i]);
+    if (obj == NULL) {
+      strcpy(epics_rtems_dump_object_names[i], "-");
+    }
+    psc = rtems_task_get_priority(epics_rtems_dump_ids[i], scheduler, &prio);
+    printf("TASKDUMP id=0x%08lx core=%3lu posix=%4ld sc=%d obj=%-6s thread=%s\n",
+           (unsigned long)epics_rtems_dump_ids[i], (unsigned long)prio,
+           (long)255 - (long)prio, (int)psc, epics_rtems_dump_object_names[i],
+           epics_rtems_dump_thread_names[i][0] == '\0'
+               ? "<empty>"
+               : epics_rtems_dump_thread_names[i]);
+  }
+  printf("TASKDUMP end tag=%s\n", tag == NULL ? "?" : tag);
+  fflush(stdout);
+}
+
+/* `rt stackuse`: the shell command's own implementation, called directly. */
+void epics_rtems_boot_stack_report(const char *tag) {
+  printf("STACKUSE begin tag=%s\n", tag == NULL ? "?" : tag);
+  fflush(stdout);
+  rtems_stack_checker_report_usage();
+  printf("STACKUSE end tag=%s\n", tag == NULL ? "?" : tag);
+  fflush(stdout);
+}

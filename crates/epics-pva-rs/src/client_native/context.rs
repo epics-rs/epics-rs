@@ -2647,7 +2647,7 @@ impl PvaClient {
             if failed_warm.contains(&wi) {
                 continue;
             }
-            let frame_res = tokio::time::timeout(op_timeout, rx).await;
+            let frame_res = epics_base_rs::runtime::task::timeout(op_timeout, rx).await;
             let value = match frame_res {
                 // Decode with no shared cache. The reader side
                 // (`flatten_type_cache_markers`) has already flattened every

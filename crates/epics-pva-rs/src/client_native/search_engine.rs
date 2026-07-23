@@ -43,7 +43,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(not(target_os = "rtems"))]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Interval, interval};
+// The periodic/one-shot timers come from the `runtime::task` seam, NOT from
+// `tokio::time`: this loop is spawned through `runtime::task::spawn`, which on
+// the RTEMS target lands it on the callback pool where no tokio timer wheel
+// exists. Measured on target: a direct `tokio::time::interval` panics the
+// `cbMedium` worker with *"there is no reactor running"* the moment the engine
+// starts, and the pvalink monitor never connects.
+use epics_base_rs::runtime::task::{Interval, interval, sleep, sleep_until};
 use tracing::debug;
 // `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
 // the RTEMS target — so the import is too, or it is unused there.
@@ -61,7 +67,8 @@ use super::beacon_throttle::{BeaconAction, BeaconTracker};
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
     DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
-    read_handshake_init, select_client_auth, wait_for_validated,
+    heartbeat_interval, heartbeat_timeout, read_handshake_init, select_client_auth,
+    wait_for_validated,
 };
 
 /// Search retry intervals in seconds.
@@ -1559,7 +1566,7 @@ async fn run_engine(
             .min();
         let deadline_arm = async {
             match next_multi_deadline {
-                Some(d) => tokio::time::sleep_until(d.into()).await,
+                Some(d) => sleep_until(d).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -1569,7 +1576,7 @@ async fn run_engine(
         // armed, so this arm parks forever.
         let initial_arm = async {
             match initial_deadline {
-                Some(d) => tokio::time::sleep_until(d.into()).await,
+                Some(d) => sleep_until(d).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -3043,7 +3050,7 @@ async fn ns_task(
                 "NS {ns_addr} disconnected: {e}; reconnecting in {RECONNECT_INTERVAL:?}"
             );
         }
-        tokio::time::sleep(RECONNECT_INTERVAL).await;
+        sleep(RECONNECT_INTERVAL).await;
     }
 }
 
@@ -3124,9 +3131,56 @@ async fn ns_run_once(
     queued_bytes.store(0, Ordering::SeqCst);
     ready.store(true, Ordering::SeqCst);
 
+    // A name-server circuit is an ORDINARY PVA connection and must keep the
+    // same heartbeat as one. pvxs builds it through `Connection::build()` and
+    // only flips `nameserver = true` afterwards (client.cpp:674-685), so it
+    // gets `clientconn.cpp:160-165`'s echo timer — CMD_ECHO every
+    // `max(1, min(15, tcpTimeout*3/8))` s — and `:73-74`'s `tcpTimeout`
+    // socket inactivity bound, exactly like a data connection.
+    //
+    // Without the echo this circuit is SILENT whenever no search is pending,
+    // and a pvxs server closes a silent client at its own `tcpTimeout`.
+    // Measured on the RTEMS stage-5 target against `softIocPVX`
+    // (doc/pvalink-rtems-design.md §5): once both links had resolved, the
+    // name-server connection died every ~40 s and was re-dialled 10 s later
+    // (`ss -tn` on the host, `127.0.0.1:15076` peer port walking
+    // 38346 → 59766 → 37802 → 44726). Each cycle re-creates the two blocking
+    // pump threads — on RTEMS every `std::thread` leaks 128 B of TLS-key
+    // bookkeeping — and leaves a ≥10 s window in which no PV can be resolved
+    // at all. The host never showed it: a tokio-side NS circuit is just as
+    // silent, but the churn only costs a reconnect there.
+    let echo_interval = heartbeat_interval();
+    let ns_idle_timeout = heartbeat_timeout();
+    let mut echo_tick = interval(echo_interval);
+    echo_tick.tick().await; // `interval` fires immediately; skip that one
+    let mut last_rx = Instant::now();
+
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
     loop {
         tokio::select! {
+            _ = echo_tick.tick() => {
+                // Liveness first, on the same rule the data connection uses:
+                // nothing inbound for a whole `tcpTimeout` means the peer is
+                // gone, and `ns_task` re-dials. Without this, adding the echo
+                // would trade a 40 s churn for a circuit that can wedge
+                // forever against a black-holed peer.
+                if last_rx.elapsed() > ns_idle_timeout {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "NS idle",
+                    ));
+                }
+                // Application CMD_ECHO with an empty payload — pvxs
+                // `Header{CMD_ECHO, 0u, 0u}` (clientconn.cpp:496). A *control*
+                // EchoRequest would be drained and ignored by a pvxs peer
+                // (conn.cpp:180-194), so it would not refresh `last_rx`.
+                // `byte_order` is the order latched by the handshake, the same
+                // one every other frame this circuit writes uses.
+                let h = PvaHeader::application(false, byte_order, Command::Echo.code(), 0);
+                let mut bytes = Vec::with_capacity(PvaHeader::SIZE);
+                h.write_into(&mut bytes);
+                writer.write_all(&bytes).await?;
+            }
             pkt = search_rx.recv() => {
                 match pkt {
                     Some(bytes) => {
@@ -3148,6 +3202,10 @@ async fn ns_run_once(
                         "NS closed",
                     ));
                 }
+                // Any inbound byte — a SEARCH_RESPONSE, the echo reply, a
+                // control frame — proves the peer is alive, the same rule
+                // `ServerConn`'s heartbeat applies to `last_rx_nanos`.
+                last_rx = Instant::now();
                 // Fallible growth: this buffer is sized by the name server's
                 // stream, and an infallible `extend_from_slice` would take the
                 // whole process down through `handle_alloc_error`. Losing the
@@ -5351,6 +5409,21 @@ mod tests {
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_mock_name_server_watch(ns_listener, ns_addr, None)
+    }
+
+    /// [`spawn_mock_name_server`] plus a one-shot that fires on the first
+    /// **application** CMD_ECHO the client sends — the heartbeat a pvxs
+    /// `Connection` puts on every circuit, name-server ones included
+    /// (clientconn.cpp:160-165, 496).
+    // Same predicate as its wrapper: every caller is a gated
+    // TCP-name-server test — otherwise dead code feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
+    fn spawn_mock_name_server_watch(
+        ns_listener: tokio::net::TcpListener,
+        ns_addr: SocketAddr,
+        mut echo_tx: Option<oneshot::Sender<()>>,
+    ) -> tokio::task::JoinHandle<()> {
         use std::io::Cursor as IoCursor;
 
         tokio::spawn(async move {
@@ -5459,6 +5532,11 @@ mod tests {
                     if buf.len() < frame_end {
                         break;
                     }
+                    if !hdr.flags.is_control() && hdr.command == Command::Echo.code() {
+                        if let Some(tx) = echo_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
                     if !hdr.flags.is_control()
                         && hdr.command == Command::Search.code()
                         && !responded
@@ -5487,6 +5565,72 @@ mod tests {
                 buf.drain(..pos);
             }
         })
+    }
+
+    /// A name-server circuit must send the same heartbeat as any other
+    /// connection, with no search traffic to carry it.
+    ///
+    /// pvxs builds the NS connection through `Connection::build()` and only
+    /// flips `nameserver = true` afterwards (client.cpp:674-685), so it runs
+    /// `clientconn.cpp:160-165`'s echo timer like a data connection. Ours was
+    /// hand-rolled and silent: with every channel resolved it wrote nothing at
+    /// all, and a pvxs server drops a client that has been silent for its
+    /// `tcpTimeout`.
+    ///
+    /// Measured on the RTEMS stage-5 target against `softIocPVX`: the
+    /// name-server connection died every ~40 s and was re-dialled 10 s later
+    /// (host `ss -tn`, peer port walking 38346 → 59766 → 37802 → 44726), which
+    /// on that target re-creates two blocking pump threads per cycle and
+    /// leaves a ≥10 s hole in which no PV can be resolved.
+    ///
+    /// `EPICS_PVA_CONN_TMO=2` pulls the pvxs-derived echo period
+    /// (`max(1, min(15, tcpTimeout*3/8))`) down to its 1 s floor so the
+    /// assertion does not have to wait out the 15 s default.
+    // Reactor-dependent: `interval`/`sleep` inside `ns_task` land on the
+    // reactor-less callback pool feature-ON. Gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
+    async fn ns_circuit_echoes_like_an_ordinary_connection() {
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+            ("EPICS_PVA_CONN_TMO", "2"),
+        ]);
+
+        let (echo_tx, echo_rx) = oneshot::channel();
+        let ns_handle = spawn_mock_name_server_watch(ns_listener, ns_addr, Some(echo_tx));
+
+        let engine = SearchEngine::spawn_name_servers_only(
+            vec![ns_addr],
+            String::new(),
+            String::new(),
+            NS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .expect("spawn name-servers-only engine");
+
+        // No `find()` — the circuit is deliberately idle, which is exactly the
+        // state the target sat in once both pvalink channels had resolved.
+        let got_echo = tokio::time::timeout(Duration::from_secs(5), echo_rx).await;
+
+        ns_handle.abort();
+        drop(engine);
+
+        got_echo
+            .expect(
+                "an idle name-server circuit must send an application CMD_ECHO \
+                 within the pvxs-derived echo period; a silent one is closed by \
+                 the server at its tcpTimeout",
+            )
+            .expect("mock NS dropped the echo notifier");
     }
 
     /// Regression: TCP name servers must resolve PVs via persistent

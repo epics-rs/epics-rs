@@ -18,7 +18,7 @@
 //! pvxs equivalent: `ioc/pvalink.cpp` + `pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(38): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(39): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 
@@ -681,6 +681,12 @@ impl PvaLinkResolver {
         self.registry.len()
     }
 
+    /// STAGE-5 PROBE: a snapshot of the one IOC-wide client, so a target
+    /// console can report how many upstream TCP connections back N links.
+    pub fn client_report(&self) -> epics_pva_rs::client_native::context::ClientReport {
+        self.registry.client().report_zeroed(false)
+    }
+
     /// Per-channel pvalink diagnostics, backing the `dbpvar` IOC shell
     /// command (pvxs `dbpvxr`, `pvxs/ioc/pvalink.cpp:184-316`).
     pub fn channel_diagnostics(&self) -> Vec<super::registry::ChannelDiag> {
@@ -741,7 +747,7 @@ impl PvaLinkResolver {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            task::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -820,6 +826,37 @@ impl PvaLinkResolver {
     }
 }
 
+/// Report a link that the install scan could not open, on the one channel
+/// an IOC operator actually sees.
+///
+/// The scan used to discard every open result with `let _ =`, so a link
+/// rejected at init (bad options, `local=true` naming a PV this IOC does not
+/// hold) left NO trace: the record simply never linked, and the only visible
+/// difference was a link count one lower than the database implies. That cost
+/// a full cross-build / image-copy / qemu-boot cycle to notice on the RTEMS
+/// target, where the pre-open of `RTEMS:PVA:UPLNK` was believed to be failing
+/// (it was in fact never attempted — `44c4ef3e`).
+///
+/// `eprintln!` rather than `tracing::warn!` deliberately, on two grounds:
+/// pvxs reports the same class of init-time link refusal with
+/// `fprintf(stderr, "%s Error: local:true link to '%s' can't be fulfilled\n")`
+/// (`ioc/pvalink_lset.cpp:70-76`), and the sibling QSRV group loader in this
+/// crate already reports config-load failures the same way
+/// (`qsrv/group_config.rs`, `qsrv/provider.rs:1071`). It is also the only
+/// path that reaches an RTEMS console: the target installs no `tracing`
+/// subscriber, so a `warn!` here would be discarded exactly like the
+/// diagnostic it replaces.
+fn report_open_failure(
+    record: &str,
+    field: &str,
+    channel: &str,
+    result: PvaLinkResult<Arc<PvaLink>>,
+) {
+    if let Err(e) = result {
+        eprintln!("{record}.{field} Error: pvalink to '{channel}' not opened: {e}");
+    }
+}
+
 /// Install a [`PvaLinkResolver`] on `db`. Returns the resolver so the
 /// caller can pre-open links and query stats (`db_pvxr` /
 /// `pvalinkrefdiff` iocsh commands lean on this).
@@ -869,22 +906,33 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // Convenience-URI / legacy-suffix form: the verbatim
                 // channel-name string may carry options in the
                 // `?key=value` query form OR the legacy whitespace suffix
-                // form (`TARGET MS`, `TARGET CPP`). `link_pv_name(s) == s`
-                // is true only for a truly bare PV (no query, no
-                // modifiers), which needs no pre-registration; anything
-                // else is parsed and wired so its `field`/`sevr`/`proc`
-                // and any `CP`/`CPP` scan target are effective before the
-                // first read.
+                // form (`TARGET MS`, `TARGET CPP`).
+                //
+                // A BARE PV (no query, no modifiers) is opened here too.
+                // pvxs `pvaOpenLink` (`pvalink_lset.cpp:64-137`) creates and
+                // opens a `pvaLinkChannel` for EVERY pvalink at link-init —
+                // both directions, options or not; the one early-out is an
+                // empty channel name (`:98`). Skipping bare links because
+                // "there are no options to pre-register" conflated *carrying
+                // options* with *needing a channel*, and the missing channel
+                // is load-bearing on the OUT side: `PvaLink::open` starts the
+                // OUT connection-tracking monitor, and the non-retry write
+                // gate refuses a put while `is_connected()` is false
+                // (pvxs `valid() == connected && root`, `pvalink_link.cpp:69`).
+                // Opening lazily on the first put therefore DROPPED that put.
+                // Measured on the RTEMS target, stage 5:
+                // `record(ao,"RTEMS:PVA:UPLNK"){field(OUT,"{pva:{pv:'UPSTREAM:AO'}}")}`
+                // — a pv-only longhand parses to a plain `Pva`, so it took
+                // this arm — never appeared in `channel_diagnostics()` and the
+                // banner reported 1 link for 3 link-bearing records.
                 ParsedLink::Pva(s) => {
-                    if link_pv_name(s) == s {
-                        continue;
-                    }
                     let link_str = format!("pva://{s}");
-                    if field_name == "OUT" {
-                        let _ = resolver.open_out_link(&link_str, Some(&record_name)).await;
+                    let opened = if field_name == "OUT" {
+                        resolver.open_out_link(&link_str, Some(&record_name)).await
                     } else {
-                        let _ = resolver.open_link_for_record(&link_str, &record_name).await;
-                    }
+                        resolver.open_link_for_record(&link_str, &record_name).await
+                    };
+                    report_open_failure(&record_name, &field_name, &link_str, opened);
                 }
                 // pvxs-parity JSON longhand `{pva:{pv,…}}`: the options
                 // are structured JLink members, read directly without a
@@ -893,15 +941,16 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // precisely to carry options (a pv-only longhand yields a
                 // plain `Pva`), so there is no bare-PV early-out here.
                 ParsedLink::PvaJson(j) => {
-                    if field_name == "OUT" {
-                        let _ = resolver
+                    let opened = if field_name == "OUT" {
+                        resolver
                             .open_json_out_link(&j.pv, &j.options, Some(&record_name))
-                            .await;
+                            .await
                     } else {
-                        let _ = resolver
+                        resolver
                             .open_json_link_for_record(&j.pv, &j.options, &record_name)
-                            .await;
-                    }
+                            .await
+                    };
+                    report_open_failure(&record_name, &field_name, &j.pv, opened);
                 }
                 _ => {}
             }
@@ -3177,6 +3226,60 @@ mod tests {
         // connect, which is fine for this assertion).
         let r = resolver.open_link("pva://SOME:REMOTE:PV").await;
         assert!(r.is_ok(), "non-local link should open");
+    }
+
+    /// The install scan opens a channel for a link that carries NO
+    /// options, in both directions.
+    ///
+    /// pvxs `pvaOpenLink` (`pvalink_lset.cpp:64-137`) creates and opens a
+    /// `pvaLinkChannel` for every pvalink at link-init; the only early-out
+    /// is an empty channel name. This scan used to skip any link whose
+    /// verbatim string equalled its bare PV name, on the reasoning that
+    /// there were no options to pre-register — which left the channel
+    /// unopened. On the OUT side that is a dropped write, not just a
+    /// missing diagnostic: `PvaLink::open` is what starts the
+    /// connection-tracking monitor, and the non-retry write gate refuses a
+    /// put while `is_connected()` is false, so the first put through a
+    /// lazily-opened OUT link was always discarded.
+    ///
+    /// Measured on the RTEMS target (stage 5, `doc/pvalink-rtems-design.md`
+    /// §5): `field(OUT,"{pva:{pv:'UPSTREAM:AO'}}")` — a pv-only longhand
+    /// parses to a plain `Pva` — never appeared in `channel_diagnostics()`.
+    #[tokio::test]
+    async fn install_scan_opens_option_less_links_in_both_directions() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::ao::AoRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("DOWN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("UPLNK", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record("DOWN").unwrap().write().common.inp = "pva://UP:AI".to_string();
+        db.get_record("UPLNK").unwrap().write().common.out = "pva://UP:AO".to_string();
+
+        let resolver = install_pvalink_resolver(&db).await;
+        assert_eq!(
+            resolver.link_count(),
+            2,
+            "both option-less links must be opened at install, got {:?}",
+            resolver.channel_diagnostics()
+        );
+        let diags = resolver.channel_diagnostics();
+        let inp = diags
+            .iter()
+            .find(|d| d.pv_name == "UP:AI")
+            .unwrap_or_else(|| panic!("INP channel missing, got {diags:?}"));
+        assert!(matches!(inp.direction, LinkDirection::Inp));
+        assert_eq!(inp.records, vec!["DOWN".to_string()]);
+        let out = diags
+            .iter()
+            .find(|d| d.pv_name == "UP:AO")
+            .unwrap_or_else(|| panic!("OUT channel missing, got {diags:?}"));
+        assert!(matches!(out.direction, LinkDirection::Out));
+        assert_eq!(out.records, vec!["UPLNK".to_string()]);
     }
 
     /// B4 `local`: a `local`-flagged link to a non-record local PV —

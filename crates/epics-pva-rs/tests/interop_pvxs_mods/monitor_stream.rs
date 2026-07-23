@@ -201,14 +201,18 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     let received = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
     let received_cb = received.clone();
     let handle = client
-        .pvmonitor_handle("W:INT", move |_desc, v| {
-            if let PvField::Structure(s) = v
-                && let Some((_, PvField::Scalar(ScalarValue::Int(i)))) =
-                    s.fields.iter().find(|(n, _)| n == "value")
-            {
-                received_cb.lock().unwrap().push(*i);
-            }
-        })
+        .pvmonitor_handle(
+            "W:INT",
+            move |_desc, v| {
+                if let PvField::Structure(s) = v
+                    && let Some((_, PvField::Scalar(ScalarValue::Int(i)))) =
+                        s.fields.iter().find(|(n, _)| n == "value")
+                {
+                    received_cb.lock().unwrap().push(*i);
+                }
+            },
+            |_| {},
+        )
         .await
         .expect("subscribe");
 

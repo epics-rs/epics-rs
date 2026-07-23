@@ -31,10 +31,10 @@ use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get, op_get_get, op_get_put,
-    op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
-    op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request,
-    op_process_with_request_value, op_put, op_put_get, op_rpc,
+    MonitorConnEvent, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
+    op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
+    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
+    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::{ClientSearchConfig, SearchEngine};
 
@@ -1669,13 +1669,19 @@ impl PvaClient {
     /// `pva_gateway` uses this to forward downstream watermark events
     /// into upstream pipeline-pause control msgs without an
     /// intermediate decode/encode cycle.
-    pub async fn pvmonitor_raw_frames_handle<F>(
+    ///
+    /// `on_conn` carries the subscription's connection-state transitions —
+    /// the only sanctioned source of upstream connect/disconnect for a
+    /// handle monitor (see [`MonitorConnEvent`]).
+    pub async fn pvmonitor_raw_frames_handle<F, C>(
         &self,
         pv_name: &str,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_raw_frames_handle(
@@ -1683,6 +1689,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1697,14 +1704,16 @@ impl PvaClient {
     /// correct). pvxs `p2pApp/channel.cpp:157-193` forwards the
     /// serialized downstream pvRequest; `moncache.cpp:34-37` caches one
     /// upstream monitor per distinct request.
-    pub async fn pvmonitor_raw_frames_handle_with_request<F>(
+    pub async fn pvmonitor_raw_frames_handle_with_request<F, C>(
         &self,
         pv_name: &str,
         pv_request: crate::pvdata::PvField,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_raw_frames_handle_with_request(
@@ -1712,6 +1721,7 @@ impl PvaClient {
             pv_request,
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1779,13 +1789,19 @@ impl PvaClient {
     /// for stats. Mirrors pvxs `Context::monitor(name).exec()` →
     /// `Subscription`. The returned handle owns the inner task; call
     /// `stop()` to terminate or drop after `stop()` returns.
-    pub async fn pvmonitor_handle<F>(
+    ///
+    /// `on_conn` carries the subscription's connection-state transitions —
+    /// the only sanctioned source of upstream connect/disconnect for a
+    /// handle monitor (see [`MonitorConnEvent`]).
+    pub async fn pvmonitor_handle<F, C>(
         &self,
         pv_name: &str,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, &PvField) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_handle(
@@ -1793,6 +1809,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1800,14 +1817,16 @@ impl PvaClient {
     /// pvxs `MonitorBuilder::server(addr).exec()`. The handle owns its
     /// own per-call channel — it does not affect the shared cache for
     /// `pv_name`.
-    pub async fn pvmonitor_handle_from<F>(
+    pub async fn pvmonitor_handle_from<F, C>(
         &self,
         pv_name: &str,
         server: SocketAddr,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, &PvField) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         Ok(op_monitor_handle(
@@ -1815,6 +1834,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 

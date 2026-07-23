@@ -250,13 +250,18 @@ async fn typed_monitor_delivers_the_update_carried_on_the_finish_frame() {
     let sink = seen.clone();
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_handle_from("FINISH:PV", addr, move |_desc, value| {
-            if let PvField::Structure(s) = value
-                && let Some(PvField::Scalar(ScalarValue::Double(v))) = s.get_field("value")
-            {
-                sink.lock().expect("sink").push(*v);
-            }
-        }),
+        client.pvmonitor_handle_from(
+            "FINISH:PV",
+            addr,
+            move |_desc, value| {
+                if let PvField::Structure(s) = value
+                    && let Some(PvField::Scalar(ScalarValue::Double(v))) = s.get_field("value")
+                {
+                    sink.lock().expect("sink").push(*v);
+                }
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("monitor setup timed out")
@@ -299,9 +304,13 @@ async fn raw_monitor_forwards_the_body_carried_on_the_finish_frame() {
     let sink = bodies.clone();
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_raw_frames_handle("FINISH:PV", move |_desc, body, _order| {
-            sink.lock().expect("sink").push(body.to_vec());
-        }),
+        client.pvmonitor_raw_frames_handle(
+            "FINISH:PV",
+            move |_desc, body, _order| {
+                sink.lock().expect("sink").push(body.to_vec());
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("raw monitor setup timed out")

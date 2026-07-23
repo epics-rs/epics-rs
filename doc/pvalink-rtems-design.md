@@ -2128,17 +2128,35 @@ survived four stages.
 * **Scale.** Two links, one upstream, one name server, three records. The
   per-peer cost is confirmed; the 20-link figure in §4.3 is still
   arithmetic.
-* **The gateway's monitor path has the §12.8 defect and is UNFIXED.**
-  The anchor for "disconnect inferred from the subscription future
-  returning" has a third site:
-  `pva_gateway/channel_cache.rs:1162`'s `handle.wait().await`, where
-  `op_monitor_handle` re-subscribes internally on `ConnectionLost` in the
-  same way, so `signal_disconnect_boundary` does not fire on a plain
-  upstream loss. It is not in this image (the gateway is not built into
-  `rtems-pva-ioc`) and the raw-frames monitor path has no connection-state
-  hook to bind to, so closing it is a change to `epics-pva-rs`'s
-  monitor-handle API rather than a call-site edit. Recorded here rather
-  than fixed blind.
+* ~~**The gateway's monitor path has the §12.8 defect and is UNFIXED.**~~
+  **CLOSED at the monitor-handle API.** The anchor for "disconnect
+  inferred from the subscription future returning" had a third site:
+  `pva_gateway/channel_cache.rs`'s `handle.wait().await`, where the
+  raw-frames handle re-subscribes internally on `ConnectionLost` in the
+  same way, so `signal_disconnect_boundary` did not fire on a plain
+  upstream loss. As predicted here, the fix was an `epics-pva-rs`
+  monitor-handle API change rather than a call-site edit, and it closes
+  the family rather than the site:
+
+  * **Invariant.** A monitor consumer MUST learn connection transitions
+    from the monitor's event/state stream and MUST NOT infer them from
+    the subscription handle/future terminating.
+  * **Owner.** `ConnEventOwner` in `client_native/ops_v2.rs` — the one
+    place a `MonitorConnEvent` is emitted, for BOTH handle constructors
+    (`op_monitor_handle` and the raw-frames pair). It emits `Connected`
+    only from the disconnected state and exactly one of `Disconnected` /
+    `Finished` per `Connected`, so the alternation holds by construction.
+  * **Structural closure.** The connection-state callback is a REQUIRED
+    constructor parameter, so no call site can open a handle monitor with
+    no way to observe a disconnect; and `SubscriptionHandle::wait()` is
+    gone, replaced by `wait_terminal() -> MonitorTermination`, a type
+    with no variant that can stand in for a connection state. The old
+    inference does not compile.
+
+  The gateway now takes the transition from `MonitorConnEvent` and keeps
+  the post-termination `signal_disconnect_boundary` call as the second
+  observer of one idempotent owner — the same shape `inp_disconnect_scan`
+  has in pvalink (§12.8, commit f75f1e56).
 * **Long-run stability** is 8 minutes, not days. What that does establish
   is that §12.7's churn is gone.
 

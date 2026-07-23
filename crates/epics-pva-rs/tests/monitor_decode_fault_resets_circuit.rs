@@ -271,7 +271,7 @@ async fn typed_monitor_decode_fault_closes_the_circuit() {
 
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_handle_from("BAD:PV", addr, move |_desc, _value| {}),
+        client.pvmonitor_handle_from("BAD:PV", addr, move |_desc, _value| {}, |_| {}),
     )
     .await
     .expect("monitor setup timed out")
@@ -300,7 +300,7 @@ async fn raw_monitor_invalid_frame_closes_the_circuit() {
 
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_raw_frames_handle("BAD:PV", move |_desc, _body, _order| {}),
+        client.pvmonitor_raw_frames_handle("BAD:PV", move |_desc, _body, _order| {}, |_| {}),
     )
     .await
     .expect("raw monitor setup timed out")

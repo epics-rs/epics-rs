@@ -19,7 +19,7 @@
 
 #![cfg(feature = "pva-gateway")]
 
-// RTEMS-EXEC-MODEL-ALLOW(24): not built feature-ON by default - this file is behind the `pva-gateway` feature.
+// RTEMS-EXEC-MODEL-ALLOW(25): not built feature-ON by default - this file is behind the `pva-gateway` feature.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1267,6 +1267,98 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 
     h_raw.abort();
     h_pipe.abort();
+}
+
+/// §12.10: a PLAIN upstream loss — the IOC dies, nothing is closed
+/// gracefully — must revoke the gateway's cached value with a
+/// monitor-unlisten boundary.
+///
+/// This is the third site of the "disconnect inferred from the subscription
+/// future returning" family (doc/pvalink-rtems-design.md §12.8, §12.10;
+/// commit f75f1e56 closed the two pvalink sites). The gateway's upstream task
+/// learned about the upstream ONLY from `handle.wait()` returning — and the
+/// client's raw-frames handle re-subscribes INTERNALLY on
+/// `MonitorEnd::ConnectionLost` (announce, sleep 200 ms, loop), so on a plain
+/// upstream loss it never returns. `signal_disconnect_boundary` therefore
+/// never fired, and every downstream monitor kept being served the dead IOC's
+/// last value at NoAlarm — the exact failure the boundary exists to prevent.
+///
+/// Distinguishing it from `br_99_...` above matters: THAT test kills the
+/// upstream with `SharedPV::close()`, a clean MONITOR FINISH that DOES end
+/// the handle, so it passes with or without the fix. Only a plain circuit
+/// loss (`drop(server)`) separates the two designs.
+///
+/// Post-fix the transition comes from the monitor handle's
+/// `MonitorConnEvent` stream, so the downstream monitor observes a
+/// subscription boundary while the upstream subscription is still alive and
+/// retrying. Upstream parity: pva2pva surfaces a lost upstream as downstream
+/// *unlisten* (`moncache.cpp:212-235`) rather than fabricating an INVALID
+/// alarm value.
+///
+/// Proven by mutation: with the `conn_cb` wiring in
+/// `channel_cache::spawn_upstream_monitor` removed, this times out at 10 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
+    use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
+    use epics_pva_rs::pv_request::PvRequestExpr;
+
+    let (us_server, us_addr, us_pv) = spawn_upstream("GW:LOSS:PV", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let c = gw.client_config();
+
+    let (boundary_tx, mut boundary_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // `field(value)` is the full mask for this single-field PV and carries no
+    // pipeline option, so the downstream monitor is raw-path eligible and is
+    // served straight off the gateway's raw fanout — the stream
+    // `signal_disconnect_boundary` revokes.
+    let req = PvRequestExpr::parse("field(value)").expect("parse pvRequest");
+    let mon = tokio::spawn(async move {
+        let _ = c
+            .pvmonitor_events(
+                "GW:LOSS:PV",
+                Some(&req),
+                MonitorEventMask::default(),
+                move |ev| {
+                    if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
+                        let _ = boundary_tx.try_send(());
+                    }
+                },
+            )
+            .await;
+    });
+
+    // Let the downstream monitor establish and the gateway's shared upstream
+    // monitor deliver a value: `signal_disconnect_boundary` is idempotent per
+    // outage by no-opping without a cached snapshot, so the cache must be
+    // armed before the loss for the boundary to mean anything.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    us_pv.try_post(nt_double_value(2.0));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // PLAIN upstream loss: the server value is dropped, which aborts its
+    // listeners and interrupts every connection. No MONITOR FINISH, no
+    // descriptor revocation — just a dead circuit. The gateway's upstream
+    // subscription takes `MonitorEnd::ConnectionLost` and RE-SUBSCRIBES; its
+    // handle does not return.
+    drop(us_server);
+
+    tokio::time::timeout(Duration::from_secs(10), boundary_rx.recv())
+        .await
+        .expect(
+            "a plain upstream loss must revoke the cached value with a \
+             monitor-unlisten boundary; pre-fix the gateway inferred the \
+             disconnect from `handle.wait()` returning, which a re-subscribing \
+             monitor never does, so this times out",
+        )
+        .expect("boundary channel must not close empty");
+
+    mon.abort();
 }
 
 /// GW-60 lock (system-level false-positive regression).

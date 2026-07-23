@@ -82,6 +82,28 @@ pub mod replay;
 pub mod server;
 pub mod tls;
 
+// Pins this crate's `exec_backend`/`tokio_backend` decision (`build.rs`) to
+// `epics-base-rs`'s.
+//
+// Both scripts compute the same rule from the same two inputs — the target OS
+// and their own `rtems-exec-model` feature — and cargo features unify per
+// *package*, so a build that turned on `epics-base-rs/rtems-exec-model`
+// without this crate's own `rtems-exec-model` would give `runtime::task::spawn`
+// a reactor-free backend while this crate still compiled the reactor-backed
+// UDP SEARCH transport in and selected it. That is exactly the configuration
+// `doc/calink-rtems-design.md` §10.10 item 2 measured as a boot panic, and it
+// is the one state the two-variant `search::SearchTransport` cannot rule out
+// on its own.
+//
+// So it is ruled out here instead: the two views must agree or the crate does
+// not compile.
+const _: () = assert!(
+    epics_base_rs::runtime::task::HAS_TOKIO_REACTOR == cfg!(tokio_backend),
+    "epics-ca-rs and epics-base-rs disagree about the runtime::task backend: \
+     enable `epics-ca-rs/rtems-exec-model` rather than \
+     `epics-base-rs/rtems-exec-model` alone"
+);
+
 // Re-export commonly used types from epics-base-rs for convenience
 pub use epics_base_rs::error::{CaError, CaResult};
 pub use epics_base_rs::runtime;

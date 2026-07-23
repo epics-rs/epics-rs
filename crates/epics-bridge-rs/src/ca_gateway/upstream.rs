@@ -37,7 +37,10 @@
 //! events arrive). On terminal failure the entry transitions to the
 //! `Disconnect` state, which the cleanup tick eventually evicts.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - `cached_old_for_audit_boundaries` runs and
+// passes in the feature-ON suite (it touches the cache only, never the upstream
+// client). The other twelve take gate (3); see the comment on
+// `manager_construct`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1894,6 +1897,9 @@ mod tests {
     // import carries their predicate — otherwise it is unused feature-ON.
     #[cfg(not(feature = "rtems-exec-model"))]
     use epics_ca_rs::server::CaServer;
+    // Same predicate as the import above: every `#[serial(epics_env)]` test in
+    // this module is one of the gated ones.
+    #[cfg(not(feature = "rtems-exec-model"))]
     use serial_test::serial;
 
     #[test]
@@ -2072,6 +2078,7 @@ mod tests {
     ///
     /// The caller must bind the returned guard for the test duration — the
     /// port is dead only while the socket lives.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn dead_upstream() -> (std::net::UdpSocket, u16) {
         let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("own a dead CA port");
         let port = sock.local_addr().unwrap().port();
@@ -2081,6 +2088,7 @@ mod tests {
     /// Point the ambient `EPICS_CA_*` env at `127.0.0.1:port` so the
     /// `UpstreamManager`'s internal env-driven `CaClient::new()` connects
     /// to the test server. Callers must be `#[serial(epics_env)]`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn pin_env(port: u16) {
         // SAFETY: env-touching tests are serialized via
         // `#[serial(epics_env)]`; no other thread reads/writes these
@@ -2095,6 +2103,7 @@ mod tests {
     /// Build an `UpstreamManager` whose internal `CaClient::new()` reads
     /// the ambient `EPICS_CA_*` env — call [`pin_env`] first so the client
     /// is pinned to the test server.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn pinned_manager(db: Arc<PvDatabase>) -> UpstreamManager {
         pinned_manager_full(db, Arc::new(RwLock::new(PvCache::new())), CacheMode::Cached).await
     }
@@ -2102,6 +2111,7 @@ mod tests {
     /// Like [`pinned_manager`] but with a caller-supplied cache (so a test
     /// can inspect per-PV state) and an explicit cache mode (so a test can
     /// exercise the no-cache GET-forward + lazy-monitor paths).
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn pinned_manager_full(
         db: Arc<PvDatabase>,
         cache: Arc<RwLock<PvCache>>,
@@ -2130,6 +2140,16 @@ mod tests {
         .expect("manager builds")
     }
 
+    // `UpstreamManager::new` constructs the gateway's upstream `CaClient`.
+    // Under this feature that client's search engine is name-servers-only
+    // (`epics-ca-rs` `search::SearchTransport` has no `Udp` variant on the
+    // exec backend, because a future spawned through the `runtime::task`
+    // seam runs on a callback-pool worker with no tokio reactor), and a
+    // name-servers-only engine with an empty `EPICS_CA_NAME_SERVERS` is
+    // refused at construction — it could reach no server at all. The
+    // gateway is a hosted daemon that is never built in the exec model, so
+    // the configuration these tests use is not one it has to satisfy.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn manager_construct() {
         let cache = Arc::new(RwLock::new(PvCache::new()));
@@ -2166,6 +2186,10 @@ mod tests {
     /// `UpstreamManagerConfig` and reaches `CaClient::new_with_config`.
     /// We do not connect to a real IOC here — the assertion is that
     /// the TLS-configured construction path compiles and runs.
+    // Same reason as `manager_construct`: the manager builds a
+    // name-servers-only upstream `CaClient` with no name server under this
+    // feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[cfg(feature = "ca-gateway-tls")]
     #[tokio::test]
     async fn manager_construct_with_upstream_tls() {
@@ -2644,6 +2668,9 @@ ASG(NewGroup) {
     /// pattern. Mirrors C ca-gateway `gatePvData::death →
     /// pverDoesNotExistHere` (gatePv.cc:622): exists-here is reported only
     /// after the upstream connects, not on a bare pattern match.
+    // Same reason as `manager_construct`: the manager builds a name-servers-only
+    // upstream `CaClient` with no name server under this feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_r64_dead_upstream_not_registered() {
@@ -2950,6 +2977,9 @@ ASG(NewGroup) {
     /// the search miss is reported well under the old 1 s constant —
     /// proving the configured value flows into `wait_connected` (one
     /// connect-timeout owner shared with the cache reaper).
+    // Same reason as `manager_construct`: the manager builds a name-servers-only
+    // upstream `CaClient` with no name server under this feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_2026_22_lazy_connect_honors_configured_timeout() {

@@ -1,4 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these two run and pass in the feature-ON
+// suite. The rest of this file's async tests drive the UDP SEARCH transport,
+// which only exists on `tokio_backend`, so they carry that gate and the census
+// no longer vouches for them feature-ON.
 // The sixth tokio::test (stage_c1_name_servers_only_resolves_without_binding_udp)
 // is per-test #[cfg(not(feature = "rtems-exec-model"))] — its TCP name-server
 // resolution cannot run on the exec backend until Stage C2/C3 — so it is not one
@@ -8,14 +11,30 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-// The UDP SEARCH transport is compiled out on the RTEMS target: `AsyncUdpV4`
-// is itself `#[cfg(not(target_os = "rtems"))]` in `epics-base-rs`, because
-// newlib has no `recvmsg`/`IP_PKTINFO` receive path and cannot read a socket's
-// `local_addr()` back. The target resolves every PV over TCP name servers
-// through `SearchTransport::NameServersOnly` (design §4.2, §4.5), and the whole
-// UDP surface below carries this gate so "no UDP on target" holds by
-// construction rather than by a runtime branch.
-#[cfg(not(target_os = "rtems"))]
+// The UDP SEARCH transport is compiled out wherever a spawned future has no
+// tokio reactor — `cfg(exec_backend)`, which is the RTEMS target *and* a host
+// `--features rtems-exec-model` build. Two facts, one gate:
+//
+//   * On the target `AsyncUdpV4` does not exist at all (it is host-only in
+//     `epics-base-rs`): newlib has no `recvmsg`/`IP_PKTINFO` receive path and
+//     cannot read a socket's `local_addr()` back.
+//   * On either backend-free build the engine runs on a callback-pool worker
+//     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
+//     "there is no reactor running" — even when the process has a runtime
+//     somewhere else, because it is not entered on that worker.
+//
+// Gating this on `not(target_os = "rtems")` named the first fact and missed
+// the second, so a hosted `rtems-exec-model` build compiled the UDP transport
+// in, selected it, and panicked at the first search
+// (`doc/calink-rtems-design.md` §10.10 item 2, measured). `tokio_backend` is
+// the predicate that means "a reactor exists" and is the one the whole UDP
+// surface below carries, so "this build binds no UDP socket" holds by
+// construction rather than by a runtime branch. The target's compiled surface
+// is unchanged: `target_os = "rtems"` implies `exec_backend`.
+//
+// Either way the client resolves every PV over TCP name servers through
+// `SearchTransport::NameServersOnly` (design §4.2, §4.5).
+#[cfg(tokio_backend)]
 use epics_base_rs::net::AsyncUdpV4;
 use epics_base_rs::runtime::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,7 +76,7 @@ struct SearchDatagram {
 /// destination is the limited broadcast `255.255.255.255` or an IPv4
 /// multicast group (`224.0.0.0/4`). Per-subnet broadcasts and
 /// unicast destinations route via the NIC chosen by [`AsyncUdpV4`].
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 async fn send_with_fanout(
     socket: &AsyncUdpV4,
     buf: &[u8],
@@ -532,7 +551,7 @@ impl SearchEngineState {
 /// `prev_drops_per_iface` keys the `SO_RXQ_OVFL` transition log by the NIC
 /// of the socket that received the datagram. None of the three survives the
 /// socket's absence.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 struct UdpTransport {
     /// libca-style multi-NIC bundle: one bound socket per IPv4 interface so
     /// `255.255.255.255` and per-subnet broadcasts each leave via the
@@ -569,15 +588,16 @@ struct UdpTransport {
 /// The configuration that needs the second variant is C's documented
 /// TCP-only name resolution mode (`modules/ca/src/client/CAref.html:515-520`):
 /// `EPICS_CA_NAME_SERVERS` set, `EPICS_CA_ADDR_LIST` empty and
-/// `EPICS_CA_AUTO_ADDR_LIST=NO`. On the RTEMS target it is the only mode
-/// available at all, because `AsyncUdpV4` is `#[cfg(not(target_os = "rtems"))]`.
+/// `EPICS_CA_AUTO_ADDR_LIST=NO`. On `exec_backend` it is the only mode
+/// available at all — see the module-head note on why the gate is the
+/// backend and not the target.
 enum SearchTransport {
     /// UDP SEARCH fanout and reply receive, alongside any TCP name servers.
     ///
-    /// Compiled out on the RTEMS target, so there `NameServersOnly` is the
+    /// Compiled out on `exec_backend`, so there `NameServersOnly` is the
     /// *only* variant: "this build binds no UDP socket" is then a property of
     /// the type, which no later edit can reintroduce a branch around.
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(tokio_backend)]
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`run_nameserver_connection`), replies
@@ -609,7 +629,7 @@ impl SearchTransport {
     /// `None` when the bind fails — the caller's only sane response is to
     /// abandon the engine, which is what `run_search_engine` did before this
     /// type existed.
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(tokio_backend)]
     fn bind_udp(addr_list: Vec<super::AddrEntry>) -> Option<Self> {
         // SO_REUSEADDR + (Linux) IP_MULTICAST_ALL=0 are applied to every
         // per-NIC socket inside `AsyncUdpV4::bind`.
@@ -666,7 +686,7 @@ impl SearchTransport {
     /// `addAddrToChannelAccessAddressList` (`iocinf.cpp:45`).
     fn add_address(&mut self, addr: SocketAddr) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 if !u.addr_list.iter().any(|e| e.sock == addr) {
                     let port = match addr {
@@ -689,7 +709,7 @@ impl SearchTransport {
     #[cfg(feature = "client")]
     fn remove_address(&mut self, addr: SocketAddr) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 let before = u.addr_list.len();
                 u.addr_list.retain(|e| e.sock != addr);
@@ -708,7 +728,7 @@ impl SearchTransport {
     /// `configureChannelAccessAddressList` (`iocinf.cpp:166`).
     fn set_address_list(&mut self, list: Vec<SocketAddr>) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
                 u.addr_list = list
@@ -737,7 +757,7 @@ impl SearchTransport {
     /// arm needs no `if` of its own.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(SearchDatagram, u32)> {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => u
                 .socket
                 .recv_with_meta_with_drops(buf)
@@ -764,7 +784,7 @@ impl SearchTransport {
     /// `prev != current && current != 0`.
     fn note_drops(&mut self, iface_ip: Ipv4Addr, drops: u32) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 let prev = u.prev_drops_per_iface.insert(iface_ip, drops).unwrap_or(0);
                 if drops != 0 && drops != prev {
@@ -790,7 +810,7 @@ impl SearchTransport {
     /// rather than a list that must be checked for emptiness.
     async fn fanout(&mut self, frame: &[u8], site: &'static str) {
         match self {
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Split-borrow so the per-destination error-suppression map can
                 // be updated while the socket is borrowed for the send.
@@ -820,7 +840,7 @@ impl SearchTransport {
             // cached IP when it differs. Changes are logged at info so
             // operators can correlate an IOC migration with the client's
             // discovery of the new address.
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 for entry in u.addr_list.iter_mut() {
                     let prev_sock = entry.sock;
@@ -863,18 +883,40 @@ impl SearchTransport {
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => u.socket.local_addrs(),
+        }
+    }
+
+    /// How many UDP SEARCH destinations this transport holds. Zero for
+    /// [`Self::NameServersOnly`] by construction.
+    ///
+    /// Separate from [`Self::addr_list`] because it is nameable on both
+    /// backends: `AddrEntry` is part of the UDP surface and does not exist on
+    /// `exec_backend`, so a test that asserts "this transport holds no UDP
+    /// destinations" — which is exactly the assertion that must still run
+    /// there — cannot go through a slice of it.
+    #[cfg(test)]
+    fn udp_dest_count(&self) -> usize {
+        match self {
+            Self::NameServersOnly => 0,
+            #[cfg(tokio_backend)]
+            Self::Udp(u) => u.addr_list.len(),
         }
     }
 
     /// The current UDP SEARCH destinations. Empty for
     /// [`Self::NameServersOnly`], which has none by construction.
-    #[cfg(test)]
+    ///
+    /// `tokio_backend` as well as `test`: `AddrEntry` is part of the UDP
+    /// surface and does not exist on `exec_backend`. `feature = "client"`
+    /// because its one caller — `add_then_remove_address_round_trip` — is the
+    /// runtime address-list mutation path, which `client-core` does not have.
+    #[cfg(all(test, tokio_backend, feature = "client"))]
     fn addr_list(&self) -> &[super::AddrEntry] {
         match self {
             Self::NameServersOnly => &[],
-            #[cfg(not(target_os = "rtems"))]
+            #[cfg(tokio_backend)]
             Self::Udp(u) => &u.addr_list,
         }
     }
@@ -889,7 +931,7 @@ impl SearchTransport {
 ///
 /// Host-only, because binding that bundle is: the RTEMS target selects
 /// [`name_servers_only_search_engine`] instead (design §4.5).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(tokio_backend)]
 pub(crate) async fn run_search_engine(
     addr_list: Vec<super::AddrEntry>,
     nameserver_addrs: Vec<SocketAddr>,
@@ -938,19 +980,19 @@ pub(crate) async fn run_search_engine(
 /// Returns the engine future rather than running it, so the empty-name-server
 /// refusal is observed by the caller **before** anything is spawned.
 ///
-/// On the RTEMS target this is the *only* engine: `CaClient` selects it there
+/// On `exec_backend` this is the *only* engine: `CaClient` selects it there
 /// (`client/mod.rs`), because `SearchTransport` has no UDP variant compiled in.
-/// On a host it stays capability-only — the client binds UDP — so it is dead
-/// code in every host configuration except the gate test, which is itself
-/// per-test gated off under `rtems-exec-model`. The `expect` covers exactly
-/// those, and is *not* applied on the target, where the call is live.
+/// That is the RTEMS target and a host `--features rtems-exec-model` build
+/// alike. On `tokio_backend` it stays capability-only — the client binds UDP —
+/// so it is dead code there outside the gate test. The `expect` covers exactly
+/// that, and is *not* applied where the call is live.
 #[cfg_attr(
-    all(not(target_os = "rtems"), any(not(test), feature = "rtems-exec-model")),
+    all(tokio_backend, not(test)),
     expect(
         dead_code,
         reason = "\
-    a host client binds UDP; this entry point is what the RTEMS target selects \
-    (doc/calink-rtems-design.md §4.5, §6 stage C5)"
+    a client with a reactor binds UDP; this entry point is what the reactor-free \
+    exec backend selects (doc/calink-rtems-design.md §4.5, §6 stage C5)"
     )
 )]
 pub(crate) fn name_servers_only_search_engine(
@@ -2237,7 +2279,7 @@ mod tests {
     /// whose construction binds the per-NIC socket bundle — the point of the
     /// sum type is that there is no way to hold UDP destinations without the
     /// socket that would transmit to them.
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", tokio_backend))]
     #[tokio::test]
     async fn add_then_remove_address_round_trip() {
         let mut state = SearchEngineState::new();
@@ -2278,8 +2320,9 @@ mod tests {
         );
         #[cfg(feature = "client")]
         handle_request_or_addr(&mut state, &mut transport, SearchRequest::RemoveAddress(a));
-        assert!(
-            transport.addr_list().is_empty(),
+        assert_eq!(
+            transport.udp_dest_count(),
+            0,
             "NameServersOnly must hold no UDP SEARCH destinations"
         );
         assert!(
@@ -2743,6 +2786,7 @@ mod tests {
     /// pins the env var to C's 60 s lower limit so the tick is the
     /// fastest the C-faithful clamp allows — 2 s — and asserts
     /// against that, not the earlier 1 s tick.
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn reconnect_search_broadcasts_within_one_tick() {
@@ -2847,6 +2891,7 @@ mod tests {
     ///
     /// Slack: ±1 s per gap to absorb scheduler / mio jitter on
     /// loaded CI. Total runtime ~8 s.
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn retry_escalation_pvxs_pattern() {

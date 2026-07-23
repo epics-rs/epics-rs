@@ -875,6 +875,7 @@ circuit costs two pump threads rather than three:
 | per **name-server** circuit (reader + writer pumps, `Small`) | 2 | 524,288 | needed only if a name server is configured |
 | `read_loop` / `write_loop` / coordinator / search-engine *tasks* | 0 | 0 | cbMedium band |
 | calink monitor + connection-watcher tasks, per link | 0 | 0 | cbMedium band — and see §5.4 |
+| dial workers (`DialPool`, `Small`), **process-wide, not per peer** | ≤4 | ≤1,048,576 | created lazily, shared by every CA dial, never retired — §13 |
 
 So the cost is **per distinct TCP peer, not per link** — and unlike pvalink,
 calink has that property *today* (§2.4), not after a stage-0 fix. An IOC with
@@ -2669,3 +2670,145 @@ Two warnings in `epics-pva-rs` were outside this change: a deprecated
 `fetch_update` and the never-constructed `Origin::{FromOriginTag, Forwarded}`
 in `server_native/search_engine.rs`. Both were closed in the same integration
 round — §10.11 items 4–5.
+
+## 13. The dial thread is borrowed, not created — `DialPool` on the CA side
+
+The CA twin of `doc/pvalink-rtems-design.md` §9.11, and the second half of one
+defect family. Read that section first; this one records only what is
+CA-specific.
+
+### 13.1 The accounting that was wrong
+
+`transport::dial_blocking` created a fresh
+`spawn_dedicated_thread("CAC-connect <addr>")` per dial attempt and let it
+exit. Its own doc argued that this is *cheaper* than C — C's connect runs on
+the circuit's permanent `CAC-TCP-recv` thread (`tcpiiu.cpp:677`), created
+before the connect rather than after it, so a transient thread costs fewer
+live threads and "one `std::thread` TLS-key allocation (128 B on RTEMS,
+measured) more expensive per connect attempt".
+
+The comparison is right and the conclusion is backwards, because on RTEMS that
+128 B is **never returned** — the TLS key is freed before the key's destructor
+runs. So the cost is per thread *creation*, and the two shapes are:
+
+| | thread creations | RTEMS TLS leak |
+|---|---|---|
+| C, permanent `CAC-TCP-recv` | 1 per **circuit** | one-off |
+| the per-attempt port | 1 per **attempt** | unbounded |
+| the pool | ≤ `MAX_DIAL_WORKERS` **ever** | one-off, 4 × 128 B |
+
+`run_nameserver_connection` (`client/search.rs`) is what makes "per attempt"
+unbounded: on a failed dial it sleeps `EPICS_CA_CONN_TMO` (30 s) and retries
+the same address indefinitely. That cadence is C's own (`tcpiiu.cpp:653-657`)
+and is deliberately not going to change, so the leak had no ceiling for as
+long as the IOC ran. The per-attempt thread was cheaper than C in the one term
+that does not accumulate and more expensive in the one that does.
+
+### 13.2 The adoption is the one the PVA change was shaped for
+
+`static CA_DIAL_POOL = DialPool::new("CAC-dial", CAC_RECV_PRIORITY)`, and the
+`spawn_dedicated_thread` block replaced by `CA_DIAL_POOL.dial(server_addr)`.
+Nothing else moved. The primitive was put in `epics-base-rs` beside
+`drive_socket_blocking` for the §3.3 reason — `epics-ca-rs` does not depend on
+`epics-pva-rs` and must not — and this is that decision paying out: no second
+copy, no shared-crate refactor, one `static` and one call.
+
+`CAC_RECV_PRIORITY` and not a shared pool: the pool is per *band*, and this is
+the band C's own connect runs on and the band of the receive pump the dial
+precedes. The PVA client's dials sit on `PVA_CLIENT_PRIORITY` and therefore
+cannot share threads with these.
+
+### 13.3 The one place CA differs from PVA: there is no awaiting-side bound
+
+PVA's dial has an application deadline (`op_timeout`, pvxs
+`operationTimeout`), so a request that queues past the pool's bound fails at
+that deadline. **CA has none, by rule** — R7-19, pinned by
+`connect_deadline_tests::tcp_connect_has_no_application_level_deadline`: C
+issues a blocking `::connect()` and lets the OS TCP stack bound it, and a
+hardcoded cap here once made every slow-but-live server permanently
+unreachable. The pool does not add one, and that test still passes.
+
+The consequence, stated rather than papered over: a worker pinned against a
+SYN-blackholed server is held for the OS ladder (~130 s), and with every
+worker so pinned a further dial *waits in the queue* instead of connecting at
+once. Three things bound how bad that is, and they are why the uniform
+`MAX_DIAL_WORKERS = 4` was kept rather than special-cased for CA:
+
+* It takes `MAX_DIAL_WORKERS` **distinct** blackholed servers dialed at the
+  same time to reach. A circuit is dialed once per address at a time
+  (`connect_server`'s map lookup), so the 30 s re-offer loop cannot produce it
+  by retrying one address — which is exactly the shape the actual leak had.
+* Waiting is inside the contract. R7-19 already permits a CA dial to take the
+  full OS ladder; a queued dial that connects late is slower, not incorrect.
+  A *deadline* would have been the contract violation.
+* The alternative is the defect. One worker per attempt is what leaks; a
+  per-role cap raised for CA alone would be a boundary special-case of the
+  kind that spawns the next round of edges.
+
+### 13.4 The §5.2 budget gains one line
+
+§5.2 counts threads *per connection* and the dial thread appears in none of
+its rows, because it was transient. It is now permanent and process-wide, so
+it belongs in the total rather than the per-peer column: **up to 4 `Small`
+threads (armv7: 4 × 262,144 = 1,048,576 B), created lazily and shared by every
+CA dial in the process.** An IOC that only ever dials one server at a time
+creates exactly one. This does not change §5.2's per-peer arithmetic; it adds
+a one-off ceiling beside it.
+
+### 13.5 Deviation recorded
+
+A pool worker is named `"CAC-dial <n>"`, not `"CAC-connect <addr>"` — a reused
+thread cannot be named for one circuit. A target thread dump therefore still
+says *how many* dials are stuck but no longer *which server* is not answering.
+The server stays in the `tracing::warn!` on every failure arm of
+`dial_blocking`. Same trade as the PVA pool, recorded in both places.
+
+### 13.6 An abandoned dial has two correct outcomes, and the test had to say so
+
+`abandoned_dial_leaks_no_socket_and_returns_its_worker` first asserted the
+obvious one — the caller goes away mid-dial, so the worker's connect resolves
+into a dropped receiver and the worker closes the socket. It hung under a
+loaded suite in 2 of 4 runs, and the reason is a designed property, not a bug:
+between the test's single `poll` and its `drop` there is a `/proc` scan,
+milliseconds during which the worker may not yet have popped the request. When
+it does pop it, `Sender::is_closed()` is already true and it **skips the
+connect entirely** — so no SYN is ever sent and the test's blocking `accept`
+waited forever for a connection that correctly never existed. Instrumented to
+confirm rather than assumed: the failing runs report `WouldBlock` on a timed
+accept, i.e. no connection ever arrived.
+
+Which branch is taken is a genuine scheduling race, so the assertion
+accommodates it instead of a sleep papering over it. A timed `accept`
+(`SO_RCVTIMEO`, honoured by `accept` on Linux) discriminates, and each branch
+gets the assertion that is true of it: a connection means the worker owned a
+socket and must have closed it; a timeout means no socket was opened at all.
+The reuse assertion — the same worker serves the next dial — is unconditional,
+and is the one that fails on the per-attempt shape. The test is stronger for
+it: the skip path is a documented `DialPool` property that nothing tested
+before.
+
+The same latent race exists in the PVA test this was modelled on and is fixed
+in its own commit; see `doc/pvalink-rtems-design.md` §9.11.
+
+### 13.7 The gate as measured
+
+| gate | result |
+|---|---|
+| `sequential_unanswered_dials_do_not_grow_the_dial_thread_count` (new) | pass — verified by mutation: **12 threads for 12 sequential dial attempts** on the per-attempt shape, 4 on the pool |
+| `abandoned_dial_leaks_no_socket_and_returns_its_worker` (new) | pass, 6/6 loaded runs, both branches observed — also fails on the per-attempt shape (worker retired: 0 threads where 1 is owed) |
+| `connect_deadline_tests::tcp_connect_has_no_application_level_deadline` (R7-19) | pass — unchanged; the pool adds no deadline |
+| `cargo nextest run -p epics-ca-rs` | 990 passed, 0 failed, 2 skipped |
+| `cargo nextest run -p epics-ca-rs --features rtems-exec-model` | 580 passed, 0 failed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo nextest run --workspace` | 10188 passed, 0 failed, 2 skipped |
+| `./scripts/rtems-check.sh` | exit 0 — the pool compiles for `armv7-rtems-eabihf` |
+
+The new tests are `exec_backend`-gated, because `dial_blocking` only exists
+there: the hosted arm of `dial_ca` is `tokio::net::TcpStream::connect` and has
+no thread to bound. Their coverage therefore comes from the feature-ON run,
+not the default one.
+
+Not verified: the bound has not been measured on the real RTEMS target. The
+128 B/creation figure is the one already measured there; its removal is argued
+from the pooling structure plus the host-side thread counts above, not from an
+on-target heap measurement.

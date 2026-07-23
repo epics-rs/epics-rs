@@ -1559,13 +1559,16 @@ so the assertion became its stronger replacement, that the socket is
 finalised (EOF on the accepted side) *and* the same worker serves the next
 dial.
 
-**The CA client has the same defect and is not fixed here.**
-`epics-ca-rs/src/client/transport.rs:620` is the identical per-attempt
+**The CA client had the same defect — closed separately.**
+`epics-ca-rs/src/client/transport.rs` carried the identical per-attempt
 `"CAC-connect <addr>"` shape, reached repeatedly by the CA search
-engine's re-offer loop. `DialPool` was put in `epics-base-rs` — beside
-`drive_socket_blocking`, for the §9.1 reason — precisely so that fix is a
-short adoption rather than a second copy. Left to a separate change to
-keep this one inside its scope.
+engine's 30 s re-offer loop. `DialPool` was put in `epics-base-rs` —
+beside `drive_socket_blocking`, for the §9.1 reason — precisely so that
+fix would be a short adoption rather than a second copy, and it was: one
+`static CA_DIAL_POOL` and one call. As built in
+`doc/calink-rtems-design.md` §13, including the one place CA differs —
+R7-19 gives its dial no awaiting-side deadline, so a queued CA dial waits
+rather than failing at a bound.
 
 | gate | result |
 |---|---|

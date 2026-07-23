@@ -558,7 +558,7 @@ Every stage is independently workspace-green
 |---|---|---|---|---|
 | 1 | `runtime::task::timeout(dur, fut)` in `epics-base-rs` — the one seam gap. `tokio_backend` → `tokio::time::timeout`; `exec_backend` → `select(timer_sleep::sleep(dur), fut)`. Boundary tests: fires, does-not-fire, already-elapsed, cancel-drop. | ✅ | ✅ | 1–2 d |
 | 2 | PVA server-native seam swap: 11 `tokio::spawn` → `runtime::task::spawn`; `AbortOnDrop(TaskAbortHandle)` (`tcp.rs:783`); 3 timer sites (`:3280`, `:3323`, `:5509`) onto the seam. Aliases on hosted ⇒ zero behaviour change. | ✅ | ✅ | 3–4 d |
-| 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. | ✅ | ✅ (additive) | 1–1.5 wk |
+| 3 | `server_native/blocking.rs`: `ChannelReader`/`ChannelWriter` adapters + reader/writer threads + `block_on_sync(handle_connection_io(..))`. Host-compiled and host-tested against a real loopback client, mirroring CA (`blocking.rs` is not cfg'd out), **including** the static `blocking_driver_has_no_async_runtime_symbols` guard (CA worktree `blocking.rs:984`). Tests: adapter cancel-safety under a lost select race; partial-header and partial-body frames; segmented message across a chunk boundary; a `0xFD` define and a `0xFE` reference in **different** frames (the TypeCache invariant, §1.3); writer deadline loop vs a non-reading client. **DONE** (`44681c76`; as built: §10) | ✅ | ✅ (additive) | 1–1.5 wk |
 | 4 | Shutdown: per-connection socket registry + `shutdown(Shutdown::Both)`; the exit sequence and both joins (§4.3); the writer-exit `oneshot` arm. **Sign-off required** — the `oneshot` arm makes hosted teardown immediate instead of ≤15 s. Tests: N connections + server stop ⇒ every thread joined and no fd leak; writer death ⇒ connection retired in ms; client disconnect mid-MONITOR ⇒ `MonitorFinishGuard` fired. | ✅ | ⚠️ timing only, flagged | 3–4 d |
 | 5 | RTEMS gate: `cargo +nightly check --target armv7-rtems-eabihf` green for the blocking driver's module set; record the `--extern` set as phase 5 did (`15f1fc6c`). Feeds item 10. | ✅ | ✅ | 2–3 d |
 
@@ -612,5 +612,75 @@ and reopens the TypeCache question — call it +1 wk of downside risk.
    accept the window on RTEMS too?
 2. **Frame channel depth (§1.4).** `N = 1` for behavioural identity, or a
    larger depth for read-ahead throughput? I recommend 1 and measuring later.
+   **RESOLVED in stage 3 (`44681c76`): depth = 1**, for the reason §1.4 gives —
+   the hosted read is demand-driven, so 1 reproduces it and a deeper queue
+   would be a behaviour change, not an optimisation.
 3. **Writer deadline loop (§3.3)** vs plain SO_SNDTIMEO. I recommend the loop —
    SO_SNDTIMEO alone silently weakens a stated anti-DoS property.
+   **RESOLVED in stage 3 (`44681c76`): the deadline loop**, mutation-proved —
+   deleting the deadline check and leaving only SO_SNDTIMEO left the
+   trickle-client test never returning (killed at 120 s). §3.3's argument,
+   executed. The loop lives at `write_frame_deadline`, since `8024b175` in
+   `epics-base-rs`'s `runtime::blocking_io` (§10.3).
+
+---
+
+## 10. Stage 3 as built — where reality deviated from §1/§3/§7
+
+Stage 3 landed as `44681c76` (`server_native/blocking.rs`, 1,071 lines +
+the `mod.rs` mount) on the integration branch. The load-bearing shape
+held exactly as designed: three threads per connection, the threads hand
+**bytes not frames** (§1.3 — the `0xFD`-define / `0xFE`-reference
+cross-frame test is in the landed test list, end to end), `ChannelReader`
+is a new `SrvRead` implementor rather than a new seam, no `cfg` is
+threaded through the 21,000-line protocol module, and the hosted driver
+is untouched. Both §9 decisions this stage owned were resolved as
+recommended (depth = 1; deadline loop — see §9 for the mutation
+evidence). Four points did not survive contact unchanged:
+
+### 10.1 Teardown determinism is a WeakSender rule, not just a drop order
+
+§3.4 said the writer-side adapter "pushes into a bounded mpsc" and §4.3
+step 2 said "drop every `Sender` clone". As built the rule is stronger
+and structural: **the driver holds the only strong `Sender` of the frame
+channel; `ChannelWriter` holds a `mpsc::WeakSender`.** That is what makes
+dropping the driver end the writer pump deterministically instead of
+whenever the runtime reaps an aborted task. Mutation-proved: giving the
+adapter a strong `Sender` hangs teardown while every end-to-end test
+still passes, which is why the rule has its own test.
+
+### 10.2 The hosted host-runtime boundary is a refusal, not a footnote
+
+§1.4 named `block_on_sync` as the reader-side send primitive and left it
+at that. As built, `serve_connection_blocking` on a *hosted* build must
+run on a multi-thread runtime worker (the connection future still awaits
+tokio-backed seam primitives there), and a current-thread runtime is
+**refused with an error rather than deadlocked** — the boundary has its
+own test. On RTEMS the exec backend supplies both halves and the same
+call runs on a bare thread.
+
+### 10.3 The byte-source primitive did not stay in `epics-pva-rs`
+
+The design put `ChannelReader`/`ChannelWriter` in
+`server_native/blocking.rs` (§1.2). They landed there, and then
+`8024b175` promoted them — both pump bodies, `write_frame_deadline`, and
+both thread-lifecycle guards — into **`epics_base_rs::runtime::blocking_io`**,
+because the PVA client's `connect_blocking` and the coming blocking CA
+client need the identical primitive and `epics-ca-rs` structurally cannot
+depend on `epics-pva-rs` (`doc/calink-rtems-design.md` §3.3 measured
+this and named the destination). `blocking.rs` keeps what is
+server-side: `ConnRegistry`, `serve_connection_blocking`,
+`BlockingPvaServer`. One follow-up the move cost: the file's
+RTEMS-EXEC-MODEL-ALLOW census marker went stale (18 → 16) and the
+feature-ON gate caught it; corrected in `2c5155c6`.
+
+### 10.4 §1.5's one unexecuted claim was executed, and held
+
+The confidence caveat in §8 — `ChannelReader` cancel-safety "reasoned
+about but not executed" — is closed. The landed adapter test covers both
+boundaries (mid-chunk and pending) and is mutation-checked: dropping the
+parked tail instead of keeping it in `cur`/`pos` hangs the named test
+while **every end-to-end test still passes** — exactly the silent,
+intermittent failure mode §1.5 predicted, which is why the adapter has
+its own test rather than relying on the e2e suite. The +1 wk downside
+risk (frame-channel fallback) was not spent.

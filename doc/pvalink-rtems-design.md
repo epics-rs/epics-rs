@@ -777,7 +777,7 @@ stage adds `pvalink`'s 68 `#[tokio::test]` sites to that bill
 `integration.rs` 38, `link.rs` 23, `registry.rs` 5, `iocsh.rs` 2). Land
 that stage first or accept that this one is gated behind it.
 
-### Stage 4 — mount pvalink in `rtems-pva-ioc` (small)
+### Stage 4 — mount pvalink in `rtems-pva-ioc` (small) — **DONE** (see §11)
 
 Select `pvalink` for the target: extend `CRATE_FEATURES[epics-bridge-rs]`
 in `scripts/rtems-check.sh:87-89` from `qsrv-core` to
@@ -1546,3 +1546,123 @@ struct field; `new(handle)` became `new()` with a `Default` impl.
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo nextest run --workspace` | 10116 passed, 0 failed, 2 skipped |
 | `./scripts/rtems-check.sh` | exit 0; client probe **28** (ratchet held), 2 pre-existing `server_native/` warnings unchanged (§9.9) |
+
+## 11. Stage 4 as built — where reality deviated from §5
+
+### 11.1 The "small" stage was the ratchet closure, not the mount
+
+§5 scoped stage 4 as *small*: "extend `CRATE_FEATURES`… which pulls
+`epics-pva-rs/client`… Install the resolver… replace the banner." That
+prose reads as if `epics-pva-rs/client` already compiled for the target
+and only the wiring remained. It did **not**: `required-features =
+["qsrv-core", "pvalink"]` pulls `epics-pva-rs/client`, and the client's
+UDP SEARCH transport was **28 compile errors** on `armv7-rtems-eabihf`
+(the `PVA_CLIENT_TARGET_ERRORS` ratchet stood at 28, all UDP-confined —
+`client_native/udp.rs` 20, `search_engine.rs` 7, `search.rs` 1). Selecting
+the feature without first closing those 28 would make `--bin rtems-pva-ioc`
+fail the target build. So the mount could not land until the client
+compiled for the triple, and the real work of stage 4 was the structural
+closure §5 had folded invisibly into "pulls `epics-pva-rs/client`". It is
+split across two commits: the ratchet closure first, the mount second.
+
+### 11.2 The closure is a cfg-gate on the existing seam, not `#[allow]`
+
+The 28 errors are the UDP transport, and §4.2 already named the seam:
+`SearchTransport` is a sum type whose `NameServersOnly` variant resolves
+over TCP name servers with no socket. Stage 1 built that variant; stage 4
+makes it the *only* variant the target compiles. Every UDP-only item in
+`client_native/search_engine.rs` — the `SearchTransport::Udp(UdpTransport)`
+variant and its `impl`, `bind_udp`, the `recv_search`/`recv_beacon`
+families' `Udp` arms, the ephemeral/beacon socket binders, the multicast
+and interface-fanout helpers, the `SearchTarget` type — is now behind
+`#[cfg(not(target_os = "rtems"))]`, and `client_native/mod.rs` gates the
+two host-only modules (`search`, the legacy standalone path; `udp`, the
+client UDP manager) the same way. This is structural: the illegal
+configuration (a UDP socket on a target with no `recvmsg`/`IP_PKTINFO` and
+no `local_addr()` readback) is **not constructible** on the target, rather
+than constructed-then-suppressed. No `#[allow]`, no `#[cfg]`'d-away panic.
+
+The `NameServersOnly` arms that previously delegated to UDP now discard
+their unused inputs explicitly (`let _ = buf;` in the `recv_*` families,
+`let _ = (codec, entries, send_errs);` in `broadcast_*`) and, where a
+receive loop must never resolve, `std::future::pending().await`. That is
+why the closure produced **zero** new warnings, not ten: the discards are
+part of the structural arm, not an afterthought.
+
+### 11.3 The predicate is `target_os`, not a Cargo feature
+
+The gate key is `cfg(not(target_os = "rtems"))`, a **target-capability**
+predicate, not a feature flag. This is deliberate and load-bearing in two
+directions: the ratchet probe compiles the client for the target triple
+*without* any bespoke feature, so `target_os` is what it keys on; and the
+host's forced-on RTEMS-exec-model test suite runs on Linux, where UDP is
+present and must stay compiled — a feature predicate would risk stripping
+UDP from the host build too. `PVA_CLIENT_TARGET_ERRORS` moved 28 → **0**
+in `scripts/rtems-check.sh`, and the bidirectional ratchet (fail if the
+measured count is either above *or* below the pin) now holds the line at
+fully-closed. The log line reads "0 target errors (UDP transport
+cfg-gated out)".
+
+### 11.4 pvalink itself compiles for the target — §6 item 2, settled
+
+§6 listed as unverified whether pvalink's own surface (over
+`client_native`) would compile for the target once the client did. It
+does: with the 28 client errors closed, `--bin rtems-pva-ioc` with
+`required-features = ["qsrv-core", "pvalink"]` builds for
+`armv7-rtems-eabihf` with **0 errors** in both the portability and the
+image configuration. Stage 3's target-compatibility work (every spawn
+through `runtime::task::spawn`, `PvaLinkResolver` construction with no
+runtime handle) is what makes that true; stage 4 is the first build that
+exercises it end-to-end for the target.
+
+### 11.5 The banner and its guard flipped from absence to presence
+
+The old banner said `pva:// record links do NOT resolve on this target`
+and its guard `the_banner_states_that_pva_links_do_not_resolve` pinned
+that sentence. Both are gone. The banner now reports
+`pvalink resolver installed — {link_count} pva:// record link(s)
+pre-registered`, unconditionally including `link_count == 0` (the target
+has no shell; the console is the only place an operator confirms the
+resolver came up). The guard became
+`the_pvalink_resolver_is_mounted_and_the_banner_reports_it`: it asserts
+the `install_pvalink_resolver(&db)` call, the banner text, and the
+`link_count` report all survive in the production slice — the stage-4
+counterpart of `the_group_source_is_mounted_at_the_pvxs_order`. The other
+three source-text guards (`entry_point_never_starts_a_runtime`,
+`every_thread_here_states_a_stack_size`,
+`the_group_source_is_mounted_at_the_pvxs_order`) already cover the new
+code unchanged.
+
+### 11.6 What stage 4 does **not** prove
+
+Everything here is `cargo check` for the target and host tests. Whether a
+`pva://` link on the guest actually resolves over `EPICS_PVA_NAME_SERVERS`
+and forwards a monitor — the claim an operator cares about — is stage 5's
+gate (two IOCs on the wire, §5), unrun. In particular, no census marker
+needed bumping: the mount adds a `block_on_sync(install_pvalink_resolver)`
+call, which is neither a spawn nor a thread the `rtems_exec_model_gate`
+census counts, and the UDP gating removed no `RTEMS-EXEC-MODEL-ALLOW`
+marker (source-text scans see cfg'd-out code). Both crates' census gates
+pass feature-ON unchanged.
+
+### 11.7 The two pre-existing RTEMS-gate warnings, unchanged
+
+The client probe still surfaces the same two warnings §9.9 recorded, both
+in `server_native/` (outside this change): `tcp.rs:1407` deprecated
+`fetch_update`, and `search_engine.rs:501` dead `Origin::{FromOriginTag,
+Forwarded}` variants. Neither is client-side; neither moved.
+
+### 11.8 The gate as measured
+
+| gate | result |
+|---|---|
+| `./scripts/rtems-check.sh` | exit 0; client probe **0** target errors (was 28; UDP transport cfg-gated out), both configs green |
+| `cargo clippy -p epics-bridge-rs -p epics-pva-rs --all-targets -- -D warnings` (default) | clean |
+| `cargo clippy -p epics-bridge-rs --all-targets --features pvalink,qsrv-core,rtems-exec-model -- -D warnings` | clean |
+| `cargo clippy -p epics-pva-rs --all-targets --features rtems-exec-model -- -D warnings` | clean |
+| `cargo nextest run -p epics-pva-rs` (default) | 1382 passed, 2 skipped |
+| `cargo nextest run -p epics-pva-rs --features rtems-exec-model` | 1352 passed, 2 skipped |
+| `cargo nextest run -p epics-bridge-rs` (default) | 684 passed |
+| `cargo nextest run -p epics-bridge-rs --features pvalink,qsrv-core,rtems-exec-model` | 681 passed |
+| four `rtems-pva-ioc` source-text guards (incl. the new pvalink guard) | pass, feature-ON |
+| both crates' `rtems_exec_model_gate` census | pass, feature-ON, no marker bump needed |

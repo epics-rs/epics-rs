@@ -1151,6 +1151,19 @@ stage C5's on-target measurement shows band latency is not affected, the
 structural change may still be worth having for the invariant, but the urgency
 changes. Measure before committing to the semantic change.
 
+**Sign-off outcome (user, 2026-07-23): DEFERRED pending measurement.** The
+semantic change is NOT approved on the current evidence — with the necessity
+unproven, breaking the event↔processing atomicity (one processing pass per
+event; cache update and record processing in lockstep on the monitor task) is
+not acceptable. The deadlock half is already closed structurally by the shared
+band invariant (pvalink stage 3, `block_on_sync` facility-thread refusal), so
+the residual exposure is latency only. Decision rule: stage C6's on-target
+gate MUST include a band-occupancy measurement (deep CP→FLNK chain on one
+link; observe delay of other callbacks on the same band). Only if that
+measurement shows a real problem do the two closures (enqueue restructure vs
+C-style dedicated thread) come back for a second sign-off, with numbers. Until
+then no code change alters `run_monitor`'s inline `dispatch_external_cp_targets`.
+
 ### Stage C5 — mount calink in `rtems-ca-ioc` (small)
 
 Select the target client feature (stage C2's `client-core`) for

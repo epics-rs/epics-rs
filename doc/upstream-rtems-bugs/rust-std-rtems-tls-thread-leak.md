@@ -250,16 +250,125 @@ and custom-JSON *native* (the one key added). Built with
 
 Caveats: the flag was applied via a custom JSON spec, not an upstream
 `armv7_rtems_eabihf.rs` patch (same codegen path, but the one-line upstream
-change itself was not built); panic-unwind through TLS, `const`-init
-`thread_local!`, TLS from C-created threads, and a full IOC workload were
-not exercised.
+change itself was not built). Four cases the 2026-07-23 rig did **not**
+exercise — panic-unwind through TLS, `const`-init `thread_local!`, TLS from
+C-created threads, and a full IOC workload — were the five owed adoption
+checks, and all are now measured: see the next section.
+
+## The adoption track — the five owed checks, measured (2026-07-24)
+
+A second rig, `repro/tlsflip/` (booted logs in `evidence/tlsflip/`), closes
+the four unexercised cases above plus the build-wiring question. Same
+toolchain (box nightly `87e5904f5`), same one-key spec
+(`repro/tlsflip/armv7-rtems-tls.json`, diff vs the current stock print: the
+single key `has-thread-local: true`). The rig runs **one phase per image**,
+selected at build time (`TLSDTOR_PHASE`), because the stock leak was measured
+to be **contingent on TLS key-creation order** — on one unchanged stock image,
+touching the rig's `SLOT` `thread_local!` before `std::thread::current()`
+measures 136.16 B/thread, and the reverse order measures 0.00 (RTEMS's exit
+sweep pops the root of a per-thread RBTree, so which pair is freed before
+std's deferred `CLEANUP(RUN)` reads `CURRENT` depends on the tree shape). A
+four-phase boot would measure later phases in a key layout the earlier ones
+created; one phase per image removes that variable, leaving the spec flag as
+the only difference in each stock/native pair. Every image was booted twice;
+the measurement lines are byte-identical across the two boots except in the
+two socket-touching phases, noted below. Native leak is **0.00 in every
+phase**.
+
+**Check ONE — TLS destructors on an unwinding panic.** The rig images are
+`panic=unwind` (the spec sets no `panic-strategy`, so it inherits the default;
+`-Zbuild-std=std,panic_abort` names crates to build, it does not select the
+strategy — confirmed by `panic_unwind` linked, `.ARM.exidx` present, and
+`rust_eh_personality` in the image). A thread sets its `thread_local!` slot,
+`catch_unwind`s an inner panic, then panics out of the closure with a live
+frame guard. `stock-unwind`/`native-unwind`: **frame_drops=110/110** (proves
+a real unwind, not an abort — an abort never runs the guard's `Drop`),
+**catch=55/55**, **join_err=55/55**, **slot destructor 55/55**. The TLS
+destructor runs on the unwinding exit on both images; native leaks 0.00.
+
+**Check TWO — Rust TLS from a C-created thread.** `cthread-*`: a thread
+created by raw `pthread_create` (never `std::thread`) runs a Rust
+`extern "C"` body that touches two `thread_local!`s and calls
+`std::thread::current()`. **started=55/55, tls_ok=55/55, tls_bad=0,
+current_distinct=55/55** (std minted a distinct per-thread handle each time),
+destructors 55/55. Stock leaks **136.00 B per C-created thread**; native
+0.00. *Codebase audit:* production Rust creates **no** threads via
+`pthread_create` (`rg 'pthread_create'` over `crates/**/*.rs` non-test: one
+comment, zero calls) — every worker is `std::thread` /
+`spawn_dedicated_thread`. The **only** structural site where Rust TLS is
+touched on a C-created thread is the process entry: RTEMS's initial POSIX task
+`POSIX_Init` (`crates/epics-rtems-boot/csrc/rtems_init.c`) calls Rust `main`
+directly, and `main`'s call graph touches `thread_local!`s (e.g.
+`runtime::task::SCHED_CALLS`). That thread never exits until board reset, so
+its handle cost is one-time, not churn. No Rust callback is registered to run
+on a libbsd/RTEMS-created thread (the I/O model is blocking-thread-per-
+connection on Rust-spawned threads, no reactor, no C callback into Rust TLS).
+
+**Check THREE — `const`-init `thread_local!`.** `constinit-*`: a
+`const { Cell::new(0) }` slot (no destructor) and a `const { ConstMarker … }`
+slot (with `Drop`). **iso_ok=55/55, iso_bad=0**, const-init destructor
+**55/55**; native 0.00.
+
+**Check FOUR — full IOC workload on the flipped image.** The real
+`rtems-ca-ioc` (full dependency graph, not the microrig) was built with the
+flipped spec via
+`--target …/armv7-rtems-tls.json -Zbuild-std=std,panic_abort -Zjson-target-spec`
+(linker supplied by `CARGO_TARGET_ARMV7_RTEMS_TLS_LINKER` so the checkout's
+`.cargo/config.toml` is untouched), alongside a stock-spec control from the
+same source commit.
+
+- **Codegen/link:** the native IOC gains a real Rust TLS segment —
+  `.tdata 0x98` / `.tbss 0x7f8` / `PT_TLS memsz 0x890` vs stock
+  `0x18`/`0x608`/`0x620` — with **zero** unresolved TLS relocations
+  (`evidence/tlsflip/rtems-ca-ioc-tls-segments.txt`).
+- **Boot + serve:** both images boot, bring up libbsd + DHCP (lease
+  `10.0.2.15` BOUND), build the database, install the calink resolver, and
+  register `RTEMS:AO`/`RTEMS:LO`/`RTEMS:MSG`. A 10-minute dial workload
+  (compiled-in refused name server driving the DialPool) ran with **no fault**
+  on the native image (`evidence/tlsflip/measure-native.log`), the stock
+  control likewise (`measure-stock.log`). Host-to-guest `caget` over SLIRP
+  hits the CA server-address-advertisement obstacle (the server advertises its
+  own `10.0.2.15`, unreachable from the host) — an environmental limit
+  independent of the spec, which is why the residue reading below uses the
+  guest-internal console gauge, not a wire read.
+- **Residue.** The prior 176.0 ± 5 / 179.1 ± 3 B *per connection attempt* is
+  128 B thread handle + ~40–51 B unattributed. The flip's effect on the
+  handle is now measured **four ways** (bare unnamed 136→0, bare named
+  160.64→0, C-created 136→0, and a **noise-free dial phase** — `dialattempt-*`,
+  a named thread + `TcpStream::connect` to a refused `127.0.0.1:9` per
+  attempt, the pre-DialPool `CAC-connect` shape — **161.76→0.00 / 1.98→0.00
+  blocks**, run 2 `161.12→1.28`, i.e. native 0 within a ~1 B socket-path
+  noise floor). So the flip removes the **entire** thread-creation-and-dial
+  cost, and a bare thread+socket dial leaves **no** per-attempt residue. The
+  ~40–51 B gap is therefore neither the thread handle (zeroed with no residue)
+  nor a bare socket; it is other per-attempt allocation in the real dial
+  machinery (the `oneshot`/`DialRequest`/address formatting the microrig does
+  not reproduce), which is orthogonal to `has_thread_local` and unaffected by
+  the flip. **Not** independently re-confirmed by a full pooled-vs-perattempt
+  IOC differential under the flipped spec this session: a single-image full-IOC
+  `MEM_USED` slope moves ±~1 KB per C6 tick (record processing) and reached
+  only 10 dial attempts in 10 min, far too coarse to resolve ~40 B — the
+  documented single-image false-confirmation the differential exists to avoid.
+  This does not affect the adoption verdict (the flip's job is the 128 B
+  handle, which is fully closed); the ~40 B remains for the separate
+  server-side thread-pool / allocation work, which is needed regardless of
+  this flip.
+
+**Check FIVE — build wiring.** See `doc/rtems-tls-spec-deviation.md`: the
+committed spec, the paths taught to build through it, and the exact condition
+that retires the deviation (upstream setting `has_thread_local: true` in
+`armv7_rtems_eabihf.rs`).
 
 ## Not measured / open
 
 - The ~48–51 B gap between the attributed `Arc`+header (136 B measured on
   bare threads) and the total per-*connection-attempt* residue (176–179 B)
-  is unattributed — different measurements; the spec-flip experiment does
-  not speak to it.
+  is unattributed. The 2026-07-24 adoption track (above) narrows it: it is
+  **not** the thread handle and **not** a bare thread+socket dial (both go to
+  0.00 under the flip), so it is other per-attempt allocation in the real dial
+  machinery — flip-independent. It was not isolated to the byte, and a full
+  pooled-vs-perattempt IOC differential under the flipped spec was not run
+  (single-image IOC heap noise ≫ 40 B).
 - Current rust master was inspected (target spec), not executed; the
   measured toolchain is nightly `87e5904f5` (2026-07-20).
 - The 2026-07-22 attribution transcript was not re-run on 2026-07-23; its
@@ -283,3 +392,7 @@ not exercised.
 | POSIX destructor/getspecific text | pubs.opengroup.org POSIX.1-2017 `pthread_key_create` + `pthread_getspecific` DESCRIPTION, fetched 2026-07-24 |
 | RTEMS #1615 history (extract-before-call is a deliberate fix) | gitlab.rtems.org issue #1615 fetched 2026-07-24; no existing report of the drain behavior (gitlab search `_POSIX_Keys_Run_destructors`: only #1615/#1266, both distinct) |
 | spec-flip: 136.00→0.00 B/thread, TLS segments, dtor 110/110, iso clean | experiment run 2026-07-23 in `~/rtems-bringup/tlsdtor/` (source, both specs, three images, `stock*.log`/`native*.log`/`control.log`, `RESULT.md`); slope and counter lines re-read directly from `stock.log`/`native.log` console output and recomputed by hand — not quoted from the experiment panel's summary alone |
+| adoption checks 1–3 (unwind dtor 55/55 + frame_drops 110/110; C-thread tls_ok 55/55; const-init iso 55/55), each stock 136/native 0.00 | rig 2 `repro/tlsflip/` on box nightly `87e5904f5` 2026-07-24, 8 images (4 phases × 2 specs), each booted twice byte-identical; `SLOPE`/`TLSDTOR2-*` lines in `evidence/tlsflip/{stock,native}-{plain,unwind,cthread,constinit}.run1.log` |
+| key-creation-order contingency of the stock leak (SLOT-first 136.16 vs CURRENT-first 0.00 on one unchanged image) | measured on the box 2026-07-24 by reordering the main-thread key touches in one stock image and re-booting; the reason one phase per image is required |
+| check 4: real `rtems-ca-ioc` builds+boots+DHCP+serves+10-min dial workload fault-free under the flip; native `.tdata 0x98`/`PT_TLS 0x890` vs stock `0x18`/`0x620`, 0 unresolved TLS relocs | box epics-rs `419b59d5d7c`, both specs from one source; `evidence/tlsflip/measure-{native,stock}.log`, `rtems-ca-ioc-tls-segments.txt`, `caflip-native2.log` (DHCP `10.0.2.15` BOUND); linker via `CARGO_TARGET_ARMV7_RTEMS_TLS_LINKER` |
+| check 4 residue: flip zeroes the dial thread+socket cost (`dialattempt` 161.76→0.00 / 1.98→0.00 blocks, refused=55/55), so ~40–51 B gap is non-handle dial-machinery alloc | rig 2 `dialattempt` phase, `evidence/tlsflip/{stock,native}-dialattempt.run1.log`; run-2 slopes (stock 161.12, native 1.28) noted inline in the doc as the ~1 B socket noise floor; **full IOC differential NOT re-run** |

@@ -897,7 +897,49 @@ Everything here is a claim this document could **not** settle.
    outbound TCP is standard SLIRP behaviour but is **not measured here**.
    Verify it with one `pvxget`-equivalent from the guest before building a
    stage on it.
-5. **Topology B (guest↔guest).** Needs a shared netdev; untried.
+   **MEASURED (topology B bring-up, packet capture on the shared
+   netdev) — the wire works, the client does not.** Guest-initiated
+   outbound TCP flows: the target emits well-formed SYNs (checksums
+   verified correct in the capture) and the stage-5 NS retry dials every
+   ~10 s. But the first on-target dial ever made against a *live*
+   listener exposed a client-side defect: the peer's SYN-ACK arrives
+   ~5 ms later and the guest answers it with a kernel RST — the
+   application has already abandoned the connect, microseconds in.
+   `dial_blocking`'s `std::net::TcpStream::connect_timeout`
+   (`server_conn.rs:261`) does not honor its bound on RTEMS; only
+   instant-outcome dials (fast RST refusal) ever "worked", which is
+   why every standard-topology run — whose compiled-in NS
+   `10.0.2.2:15076` always got an instant refusal — hid this. The
+   contrast that localizes it: `epics-ca-rs`'s calink client uses a
+   plain *blocking* `connect()` with no application deadline
+   (`client/transport.rs`, C parity with `tcpiiu.cpp`) and demonstrably
+   connects outbound on the same target (C6 rounds). Fix owned by the
+   ns-dial round; until it lands, **no PVA outbound dial with real
+   network latency can succeed on the target**, and stage 5 topology A
+   is blocked on the same defect.
+5. ~~**Topology B (guest↔guest).** Needs a shared netdev; untried.~~
+   **TRIED — the netdev is viable; the E2E waits on item 4's client
+   fix.** Mechanics proven on the QEMU/BSP box with two guests and no
+   image change: guest 1 joins its own SLIRP and a
+   `-netdev socket,listen=` to a QEMU hub (modern spelling:
+   `-netdev hubport,id=…,hubid=0,netdev=…` per member, NIC attached
+   with `-nic hubport,hubid=0,model=cadence_gem`, distinct `mac=` per
+   guest — mandatory, both guests otherwise default to the same MAC);
+   guest 2 attaches directly with `-nic socket,connect=`. Both guests
+   lease from guest 1's SLIRP DHCP (10.0.2.15 / 10.0.2.16), both IOCs
+   boot and serve, and the guest↔guest TCP handshake is healthy on the
+   wire (SYN → SYN-ACK captured; the abort after it is item 4's client
+   defect, not the topology). One rig caveat, measured on this QEMU:
+   SLIRP **inbound `hostfwd` does not work behind a hubport** — the
+   host side accepts but SLIRP never opens the guest-side connection
+   (no SYN toward the guest in the capture), with both the legacy
+   `-net` spelling and the explicit-guest-address form. Host-side
+   observation of a hubbed guest therefore has to go through a peer
+   guest or the serial console; keep `-nic user` (no hub) for any run
+   that needs `hostfwd`. Downstream image recipe for the E2E rerun:
+   patch `STAGE5_NAME_SERVER` to `10.0.2.15:5075` and point the three
+   stage-5 links at PVs the upstream guest serves (`RTEMS:PVA:V0` for
+   the two INP CP links, `RTEMS:PVA:B00` for the OUT link).
 6. **Whether the blocking client changes the per-connection memory
    ceiling.** §4.3 computes 512 KiB per client connection from stack
    classes. The server's equivalent arithmetic (1,572,864 B) matched the

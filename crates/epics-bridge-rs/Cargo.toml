@@ -79,7 +79,13 @@ rtems-exec-model = [
 # all. The bring-up box's build scripts add this flag to get exactly the
 # measured stage-5/§8 image back. NOT forwarded to `epics-ca-rs`: each target
 # binary's rig rides its own crate's feature.
-bringup-probes = []
+#
+# It IS forwarded to `epics-pva-rs`, because that is not a second binary's rig
+# but this one's client half: the `PVA_DIAL_POOL` whose `MAX_DIAL_WORKERS`
+# bound §9.11 asks to be measured on target lives there, and its probe
+# accessor has to be compiled by the same flag that compiles the reporter
+# thread which prints it.
+bringup-probes = ["epics-pva-rs?/bringup-probes"]
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is

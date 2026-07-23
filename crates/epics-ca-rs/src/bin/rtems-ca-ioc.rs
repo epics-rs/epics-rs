@@ -280,6 +280,19 @@ mod ioc {
             "C6 seq={seq} links={} circuits={conns:?}",
             resolver.link_count(),
         );
+        // The §13 dial-pool bound, and the heap it was said to stop eating.
+        // Both on one line so a console reader can see the attempt count that
+        // the worker count is bounded *against* — a worker count of 1 proves
+        // nothing next to an attempt count of 1.
+        let (dial_workers, dial_attempts) = epics_ca_rs::client::dial_pool_probe();
+        let (mem_free, mem_used) = match epics_rtems_boot::stats::mem_usage() {
+            Some(m) => (m.free as i64, m.used as i64),
+            None => (-1, -1),
+        };
+        println!(
+            "C6 seq={seq} dialpool workers={dial_workers} attempts={dial_attempts} \
+             MEM_FREE={mem_free} MEM_USED={mem_used}",
+        );
         for (pv, connected) in resolver.link_report() {
             println!("C6 seq={seq} link pv={pv} connected={connected}");
         }

@@ -2510,9 +2510,66 @@ to-mid-teens millisecond latency tax on other links sharing the band.
    link machinery holds zero descriptors while disconnected, because
    the NS retry opens and closes its socket per attempt; §5.3's "+1 per
    circuit, +2 for name server + upstream" is a *connected-state* hold,
-   exactly as its table states. What remains unmeasured is only the
-   live-upstream idle hold on *this* tip, which §5.3 already measured
-   on the C6 image.
+   exactly as its table states.
+
+   **The connected-state hold, measured on this tip (`32f234d4`).** The
+   isolating rig is topology B (`~/rtems-bringup/topoB/run-fd.sh`): two
+   QEMU guests on a qemu hub, DHCP first, then `set_link n1 off` to cut
+   the SLIRP hub port, because SLIRP on a hub forges RSTs into every
+   guest-to-guest TCP flow. `hostfwd` is dead behind a hubport, so every
+   number below was read off a **serial console**, not off `caget` — the
+   two images print `FD_CNT`/`FD_MAX`/`CA_CONN_CNT` from the same two
+   sources the status PVs publish (`stats::fd_usage`,
+   `BlockingCaServer::active_connections`). Upstream guest =
+   `rtems-ca-ioc` built *without* `bringup-probes` (link-free by
+   construction, serving the four `UPSTREAM:*` records the probe database
+   names); downstream guest = the `bringup-probes` image with
+   `EPICS_CA_NAME_SERVERS` pointed at the upstream guest
+   (`10.0.2.15:5064`), 4 `ca://` links:
+
+   | point | downstream `FD_CNT` | downstream circuits | upstream `FD_CNT` | upstream `CA_CONN_CNT` |
+   |---|---:|---:|---:|---:|
+   | 1. both idle, links never connected | 8 | 0 | 8 | 0 |
+   | 2. upstream up, all 4 links connected | **10** | 1 | 10 | 2 |
+   | 3. upstream unreachable (its hub port muted) | 10 → 9 | 0 | 10 | 2 |
+   | 4. upstream back, all 4 links reconnected | **10** | 1 | 12 | 4 |
+
+   So the connected-state hold is **exactly +2** over the link-free
+   floor, and §5.3's "+ 1 name-server circuit + 1 upstream circuit → new
+   idle hold 10" row is measured, not arithmetic. Its two halves read
+   this way on target: the four links share **one** circuit
+   (`C6 seq=N links=4 circuits=Some(1)` — §11.5 criterion 6's circuit
+   sharing, now also measured guest-to-guest), and the client holds
+   **two** descriptors for it. The capture names both: two SYNs from
+   distinct source ports (`10.0.2.16:60090` and `10.0.2.16:49347`) to
+   `10.0.2.15:5064`, 82 ms apart, immediately after the hub cut — the
+   name-server connection and the data circuit, which this topology
+   makes visible as two sockets because name server and upstream are the
+   same `host:port`. The upstream agrees from the other side:
+   `CA_CONN_CNT = 2` for that one downstream, at `FD_CNT` 8 → 10, and
+   8 → 12 at `CA_CONN_CNT = 4` after the reconnect — the **+1 fd per
+   inbound circuit** slope above, reproduced on a second image and a
+   second topology.
+
+   Point 3 is the one entry that is not a plateau, and it is recorded as
+   read rather than as a steady state. Over the 152 s outage the
+   downstream held **10** for the first ~126 s and **9** for the last
+   ~26 s; it never returned to the 8 floor. The link registry was
+   already ahead of the descriptors — all four links reported
+   `connected=false` 30 s after the cut (`EPICS_CA_CONN_TMO`'s echo
+   watchdog) and `circuits=0` at 50 s — while `FD_CNT` stayed at 10 for
+   another ~76 s. The packets account for one of the two held
+   descriptors: a redial from `10.0.2.16:58118` SYN-retransmitting with
+   BSD backoff from 11:12:58 to 11:14:02, giving up at the moment the
+   count fell to 9. **The identity of the descriptor still held at 9 is
+   not settled by this run** (a stale blackholed socket is the reading
+   consistent with the capture, but nothing in it proves that). What is
+   settled is the asymmetry: a link that has *once* connected does not
+   idle back to the link-free floor while its upstream is a blackhole,
+   whereas the never-connected case measured above does (`FD_CNT = 8`).
+   Recovery is clean and the whole delta is reversible: point 4 is back
+   to 10 with `circuits=1` within one report interval of the hub port
+   coming back, with no leak across the outage.
 5. **Stage C4's second sign-off** is now unblocked with numbers (§11.6). The
    two closures (enqueue restructure vs C-style dedicated thread) are
    unchanged and still not picked.

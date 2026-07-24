@@ -71,3 +71,8 @@ Two operational notes:
   and silently drops the flip; unset it for RTEMS builds, or build through
   `scripts/rtems-check.sh`, whose explicit spec path does not depend on the
   wrapper.
+- The wrapper is a bash script, so on Windows cargo cannot execute it and
+  every build fails (os error 193). Building the workspace's *host* targets
+  from Windows needs `RUSTC_WRAPPER` set to the **empty string** (cmd:
+  `set RUSTC_WRAPPER=`), which disables a config-wired wrapper outright;
+  RTEMS cross-builds are not possible from Windows in the first place.

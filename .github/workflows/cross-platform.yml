@@ -35,6 +35,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # This workflow never builds the RTEMS target, so the rustc-wrapper wired
+  # in .cargo/config.toml (the has-thread-local spec rewrite — a pure
+  # passthrough for host builds) has no role in any cell, and on Windows
+  # cargo cannot execute a .sh wrapper at all (os error 193, measured on
+  # this matrix 2026-07-24). An EMPTY RUSTC_WRAPPER disables a config-wired
+  # wrapper outright — cargo treats empty-env as "no wrapper", it does not
+  # fall back to the config value (measured on cargo 1.94 against a broken
+  # config path: hard error without the env, clean build with it). Set for
+  # the whole matrix, not just Windows: uniform, and a no-op on Unix.
+  RUSTC_WRAPPER: ""
 
 jobs:
   build:

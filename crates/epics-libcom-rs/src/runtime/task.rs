@@ -844,9 +844,12 @@ impl StackSizeClass {
     /// what a C IOC asks `pthread_attr_setstacksize` for on that target.
     ///
     /// Read "on a 64-bit target" here before: it was wrong in the direction
-    /// that matters, because the only target this crate is portable *to* is
-    /// 32-bit, and it invited a reader to assume the RTEMS numbers were
-    /// unverified.
+    /// that matters, because it invited a reader to assume the RTEMS numbers
+    /// were unverified. This crate is portable to 64-bit embedded targets
+    /// too — `x86_64-wrs-vxworks` — and pays for it: a 64-bit pointer doubles
+    /// every class in this table, so an `x86_64-wrs-vxworks` CA client thread
+    /// costs exactly 2× what the same thread costs on `armv7-rtems-eabihf`,
+    /// pointer width for pointer width, not a difference in the formula.
     pub fn bytes(self) -> usize {
         // STACK_SIZE(f) = f * 0x10000 * sizeof(void*)
         let unit = 0x10000usize * std::mem::size_of::<usize>();
@@ -930,7 +933,7 @@ pub enum RtPolicy {
 /// later caller can undo or reorder, and a variable one component writes for
 /// another to read is the dual-meaning shape this code keeps removing.
 ///
-/// Why the two targets differ:
+/// Why the embedded targets differ from hosted:
 ///
 ///   - Base's own equivalent switch,
 ///     `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`, defaults to `YES`
@@ -940,15 +943,25 @@ pub enum RtPolicy {
 ///     `CAP_SYS_NICE` or a non-zero `RLIMIT_RTPRIO` (so on a desktop the
 ///     request merely fails), and where a runaway RT band on a box that
 ///     *grants* it can wedge a developer's machine. Neither failure mode
-///     exists on RTEMS: there is no RLIMIT_RTPRIO and no desktop to wedge.
+///     exists on RTEMS or VxWorks: there is no RLIMIT_RTPRIO, no
+///     `CAP_SYS_NICE` gate, and no desktop to wedge on either.
 ///   - The band invariant is now a test rather than a hope —
 ///     `rtems_priority_map_stays_below_the_libbsd_network_band` proves every
 ///     u8 input lands in core 100..199, at or below libbsd's default band and
 ///     strictly less urgent than IRQS(96)/TIME(98).
+///   - **VxWorks is measurement-backed, not assumed.** On the bring-up box
+///     (VxWorks 7, `x86_64-wrs-vxworks`), 11 of 11 measured threads landed
+///     `PriorityApplied::Realtime` via `SCHED_FIFO`, exactly one scheduler
+///     call each, at `posix = 56 + epics` — the same POSIX value RTEMS gets
+///     (see [`map_epics_priority_rtems`]) — which VxWorks's own POSIX layer
+///     then inverts into its native task-priority space at `vx = 199 -
+///     epics`, exact: EPICS base's own vxWorks-port formula
+///     (`vxWorks/osdThread.c:99`), reached by construction rather than by
+///     restating it (see [`map_epics_priority_vxworks`]).
 ///
-/// An explicit value still wins in **both** directions on both targets, so
-/// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS.
-pub const DEFAULT_POLICY: RtPolicy = default_policy(cfg!(target_os = "rtems"));
+/// An explicit value still wins in **both** directions on every target, so
+/// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS or VxWorks.
+pub const DEFAULT_POLICY: RtPolicy = default_policy(cfg!(epics_embedded_target));
 
 /// [`DEFAULT_POLICY`] as a pure function of the one target fact it depends
 /// on, so both arms are reachable from a host test run. A host CI will never
@@ -1330,11 +1343,37 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
+/// Map an EPICS priority onto a VxWorks **POSIX** SCHED_FIFO priority.
+///
+/// **Measurement-backed**, not derived: on the bring-up box (VxWorks 7,
+/// `x86_64-wrs-vxworks`), setting `posix = 56 + epics` — the identical POSIX
+/// value [`map_epics_priority_rtems`] computes for RTEMS — landed 11 of 11
+/// measured threads at `PriorityApplied::Realtime`, one scheduler call each.
+/// VxWorks's own POSIX layer then inverts that POSIX value into its native
+/// task-priority space, and the result observed there was `vx = 199 -
+/// epics`, exact: EPICS base's own vxWorks-port formula
+/// (`vxWorks/osdThread.c:99`, `oss = 199 - osiPriority`) — reached by a
+/// different route (we set the POSIX value; VxWorks inverts it, rather than
+/// us computing the native value directly as C's own port does).
+///
+/// Deliberately **not** implemented by calling [`rtems_core_priority`] /
+/// [`map_epics_priority_rtems`]: those compute an RTEMS **core** priority
+/// through `RTEMS_MAXIMUM_PRIORITY`, an RTEMS kernel constant measured on the
+/// RTEMS bring-up guest — machinery VxWorks has no equivalent of. The two
+/// happen to land on the same POSIX number; this restates the `56 + epics`
+/// arithmetic directly so this function cites no RTEMS-specific fact and a
+/// change to the RTEMS core-priority mechanism cannot silently move the
+/// VxWorks value with it.
+#[cfg(any(target_os = "vxworks", test))]
+fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
+    56 + epics_priority.min(99) as i32
+}
+
 /// Ask the OS for SCHED_FIFO at `oss` on the **calling** thread. The single
 /// place this crate touches the scheduler; returns the raw `pthread_*`
 /// status (0 on success). Counting lives here so the "switch off ⟹ no
 /// scheduler call" guarantee is observable on every target that has one.
-#[cfg(any(target_os = "linux", target_os = "rtems"))]
+#[cfg(any(target_os = "linux", epics_embedded_target))]
 fn set_fifo_priority(oss: i32) -> i32 {
     SCHED_CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -1367,6 +1406,18 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
 /// toolchain has `sizeof(time_t) == 8`. Its `timespec` is therefore half the
 /// real width on this target, so the tail is carried as opaque bytes sized
 /// from the target compiler instead.
+///
+/// **RTEMS-only, deliberately not widened to VxWorks.** VxWorks is not
+/// newlib, and `libc` *does* declare `sched_param`/`SCHED_FIFO`/
+/// `pthread_setschedparam`/`pthread_self` for it — with a different
+/// `sched_param` layout (48 bytes, but `sched_priority: c_int` followed by a
+/// *typed* `sched_ss_low_priority`/two `timespec`s/`sched_ss_max_repl` tail,
+/// not this module's opaque bytes). Reusing this RTEMS-shaped struct for
+/// VxWorks was measured to "work" only because `SCHED_FIFO` never reads past
+/// `sched_priority` at offset 0 — the tail's true shape never mattered for
+/// that policy — which is exactly the kind of coincidence a struct-layout
+/// mismatch should not be allowed to depend on. VxWorks's `set_fifo_priority_raw`
+/// arm below therefore uses `libc::sched_param` directly.
 #[cfg(target_os = "rtems")]
 mod rtems_sched {
     use std::ffi::c_int;
@@ -1439,6 +1490,37 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
             &param,
         )
     }
+}
+
+/// VxWorks: `libc::sched_param` directly, not the RTEMS-shaped struct above.
+///
+/// Unlike RTEMS, `libc` declares this target's own `sched_param` — a
+/// `sched_priority: c_int` followed by a *typed* sporadic-server tail
+/// (`sched_ss_low_priority: c_int`, two `libc::timespec` fields,
+/// `sched_ss_max_repl: c_int`) — so there is nothing to hand-lay: the tail is
+/// zeroed rather than omitted because `SCHED_FIFO` never reads it, matching
+/// the RTEMS arm's own reasoning, but the fields are the platform's real
+/// fields at the platform's real offsets rather than opaque bytes sized by
+/// guesswork.
+#[cfg(target_os = "vxworks")]
+fn set_fifo_priority_raw(oss: i32) -> i32 {
+    let param = libc::sched_param {
+        sched_priority: oss,
+        sched_ss_low_priority: 0,
+        sched_ss_repl_period: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        sched_ss_init_budget: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        sched_ss_max_repl: 0,
+    };
+    // SAFETY: pthread_setschedparam operates on the calling thread with a
+    // stack-local sched_param of libc's own VxWorks width and a valid policy
+    // constant.
+    unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
 }
 
 /// The unprivileged-fallback message. Emitted **once per process**: the
@@ -1525,14 +1607,40 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "rtems")))]
+/// **Measurement-backed** (VxWorks 7, `x86_64-wrs-vxworks` bring-up box): no
+/// range probe here either, and for the same reason as RTEMS —
+/// `pthread_setschedparam` performed no privilege check there, 11 of 11
+/// measured threads landed `PriorityApplied::Realtime`, and
+/// [`map_epics_priority_vxworks`]'s fixed image is inside the settable range
+/// by construction. There is nothing to discover on this target either.
+#[cfg(target_os = "vxworks")]
+fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+    let oss = map_epics_priority_vxworks(epics_priority);
+    let rc = set_fifo_priority(oss);
+    if rc == 0 {
+        PriorityApplied::Realtime
+    } else {
+        tracing::debug!(
+            target: "epics_base_rs::runtime",
+            epics_priority,
+            oss,
+            errno = rc,
+            "SCHED_FIFO priority not applied; thread stays at default policy"
+        );
+        PriorityApplied::BestEffortFailed
+    }
+}
+
+#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
 fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
-    // No OS-scheduler priority API is wired on other targets. The two that
+    // No OS-scheduler priority API is wired on other targets. The three that
     // are wired each needed a *measured* target band before they could be:
-    // Linux probes for its settable ceiling at runtime, and RTEMS's map is
+    // Linux probes for its settable ceiling at runtime, RTEMS's map is
     // pinned against libbsd's network-thread band measured on the bring-up
-    // guest. Neither number is guessable, so a new target gets `Unsupported`
-    // until somebody measures it rather than a plausible-looking range.
+    // guest, and VxWorks's map is the RTEMS one's POSIX value, confirmed by
+    // measurement on its own bring-up box. No number here is guessable, so a
+    // new target gets `Unsupported` until somebody measures it rather than a
+    // plausible-looking range.
     PriorityApplied::Unsupported
 }
 
@@ -1550,7 +1658,7 @@ pub fn sched_calls_made() -> usize {
 
 static SCHED_CALLS_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(all(test, any(target_os = "linux", target_os = "rtems")))]
+#[cfg(all(test, any(target_os = "linux", epics_embedded_target)))]
 thread_local! {
     /// Every scheduler call this crate makes passes through
     /// [`set_fifo_priority`], which bumps this. Tests assert the delta is
@@ -2315,7 +2423,7 @@ mod tests {
         );
 
         // (2) the compiled-in default is wired to the target, not to a guess
-        assert_eq!(DEFAULT_POLICY, default_policy(cfg!(target_os = "rtems")));
+        assert_eq!(DEFAULT_POLICY, default_policy(cfg!(epics_embedded_target)));
         assert_eq!(RtPolicy::from_env_value(None), DEFAULT_POLICY);
 
         // (3) an explicit value wins over EITHER default, in BOTH directions.
@@ -2576,6 +2684,29 @@ mod tests {
                 < RTEMS_MAXIMUM_PRIORITY
                     - map_epics_priority_rtems(ThreadPriority::CaServerHigh.value())
         );
+    }
+
+    /// [`map_epics_priority_vxworks`] must land on the exact same POSIX
+    /// values as [`map_epics_priority_rtems`] — that equality is the
+    /// measured fact [`DEFAULT_POLICY`]'s doc cites, and this function
+    /// deliberately does not call into the RTEMS one (see its own doc), so
+    /// nothing else pins the two together if one of them drifts.
+    #[test]
+    fn vxworks_priority_map_matches_the_rtems_posix_values() {
+        for epics in 0..=u8::MAX {
+            assert_eq!(
+                map_epics_priority_vxworks(epics),
+                map_epics_priority_rtems(epics),
+                "EPICS {epics}: VxWorks and RTEMS must set the identical POSIX \
+                 SCHED_FIFO value"
+            );
+        }
+        // The measured endpoints, restated directly per this function's own
+        // doc rather than only via the equality above.
+        assert_eq!(map_epics_priority_vxworks(0), 56);
+        assert_eq!(map_epics_priority_vxworks(99), 155);
+        assert_eq!(map_epics_priority_vxworks(100), 155);
+        assert_eq!(map_epics_priority_vxworks(u8::MAX), 155);
     }
 
     /// The RTEMS map is not the hosted map with retuned endpoints, and the

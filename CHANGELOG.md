@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### New crate: `epics-libcom-rs`
+
+- **`epics_base_rs::runtime` and `epics_base_rs::net` are now their own
+  crate.** They move to `epics-libcom-rs` — named for C's `libCom`, whose
+  scope is exactly these two halves (`epicsThread`/`epicsTime`/`errlog`/
+  `envDefs` and `osiSock`) — so a consumer that wants the concurrency and
+  socket primitives can take them without the record system. (#55)
+
+  **No downstream source change.** `epics-base-rs` re-exports both modules at
+  their original paths (`pub use epics_libcom_rs::{net, runtime};`), so
+  `epics_base_rs::runtime::…` and `epics_base_rs::net::…` resolve as before,
+  and so does `crate::runtime::…` inside `epics-base-rs` itself. `WallTime`
+  moved with its producer and is re-exported at `epics_base_rs::types::
+  WallTime`. Not one call site in the workspace changed.
+
+  Both feature levers are forwarded, so `--features epics-base-rs/linux-rt`
+  and `--features epics-base-rs/rtems-exec-model` are unchanged for callers.
+
+- **Two seams that used to be intra-crate are now pinned at compile time.**
+  The extraction removed the shared crate that made them implicit, so each is
+  now a `const _: () = assert!(…)` that fails the build rather than a comment
+  that can drift:
+
+  - the scanOnce worker's band against the periodic-rate count —
+    `epics-base-rs`'s `PERIODIC_SCANS.len()` against
+    `epics-libcom-rs`'s `PERIODIC_SCAN_BAND_COUNT`;
+  - the `exec_backend` / `tokio_backend` predicate, derived by both crates'
+    build scripts, against `epics_libcom_rs::EXEC_BACKEND` — so a
+    `rtems-exec-model` forward that stops being wired is a compile error
+    instead of a workspace split across two task backends.
+
 ## v0.24.3 — 2026-07-20
 
 Patch release. Adds the `dbLoadTemplate` iocsh command to `epics-base-rs`,

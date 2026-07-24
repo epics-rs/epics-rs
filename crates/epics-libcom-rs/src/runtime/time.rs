@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::types::WallTime;
+use crate::walltime::WallTime;
 
 /// Current wall-clock time as a [`WallTime`].
 ///

@@ -7,7 +7,7 @@
 //!
 //! This module is the workspace's ONLY declaration of an EPICS environment
 //! default. [`EnvParam`](super::env::EnvParam) cannot be constructed outside
-//! `epics-base-rs`, and none of its accessors take a `default` argument, so a
+//! `epics-libcom-rs`, and none of its accessors take a `default` argument, so a
 //! caller has no way to introduce a second one.
 
 use super::build_info;

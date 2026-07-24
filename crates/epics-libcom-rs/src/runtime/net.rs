@@ -42,8 +42,9 @@ pub fn ca_server_port() -> u16 {
 /// port without disturbing its client routing.
 ///
 /// For the multi-IOC "shared UDP search port, distinct TCP ports"
-/// deployment, callers should use [`crate::server::ioc_app::IocApplication::tcp_port`]
-/// (or the equivalent `CaServerBuilder::tcp_port`) to override the
+/// deployment, callers should use `epics_base_rs::server::ioc_app::
+/// IocApplication::tcp_port` (or the equivalent `CaServerBuilder::tcp_port`,
+/// in `epics-ca-rs`) to override the
 /// TCP port *only*. The env-var path keeps strict C parity so a
 /// startup script that sets `EPICS_CAS_SERVER_PORT=6064` lands UDP
 /// and TCP on the same port, as it would under a C IOC.

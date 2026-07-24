@@ -1,22 +1,22 @@
 //! The real-time scheduling switch is off on a HOSTED target unless someone
 //! asks for it. (On RTEMS the default is the other way — see
-//! `runtime::task::DEFAULT_POLICY` for why the two targets differ. This is an
+//! `task::DEFAULT_POLICY` for why the two targets differ. This is an
 //! integration test binary, so it only ever runs hosted.)
 //!
-//! `runtime::task::apply_to_current_thread` can put an IOC thread into a
+//! `task::apply_to_current_thread` can put an IOC thread into a
 //! SCHED_FIFO band. Doing that without being asked is wrong twice over: on a
 //! desktop the request fails (no `CAP_SYS_NICE`, `RLIMIT_RTPRIO` 0), and on a
 //! box where it *succeeds* an unattended RT band can starve the machine. So
 //! the guarantee is not "the request usually fails" but "the request is never
-//! made" — see `runtime::task::RT_PRIORITY_ENV`.
+//! made" — see `task::RT_PRIORITY_ENV`.
 //!
 //! This lives in its own integration binary on purpose. The claim is about a
 //! whole *process* making zero scheduler calls, and
-//! `runtime::task::sched_calls_made` is a process-global count; a unit test
+//! `task::sched_calls_made` is a process-global count; a unit test
 //! sharing a process with switch-on tests could not assert zero. One test per
 //! file keeps the process pure under every runner.
 
-use epics_base_rs::runtime::task::{
+use epics_libcom_rs::runtime::task::{
     PriorityApplied, RT_PRIORITY_ENV, RtPolicy, ThreadPriority, apply_to_current_thread,
     sched_calls_made,
 };

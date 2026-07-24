@@ -30,7 +30,15 @@
 
 pub mod callback_executor;
 pub mod delayed_timer;
-pub(crate) mod facility;
+// `pub`, not `pub(crate)`: the record system's periodic-scan threads
+// (`epics_base_rs::server::scan`) and the database write gate run under the
+// same poison-recovery and panic-isolation rules as the facilities here, and
+// they call [`facility::recover`] / [`facility::run_isolated`] to get them.
+// Those call sites were inside this crate before the runtime layer was split
+// out; the split moved the callers across a crate boundary, and one shared
+// helper reached through a wider door is what keeps the rule single-sourced
+// rather than restated in the crate above.
+pub mod facility;
 pub mod future_exec;
 pub mod scan_once;
 pub mod timer_sleep;

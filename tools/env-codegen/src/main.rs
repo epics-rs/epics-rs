@@ -1,4 +1,4 @@
-//! `configure/` -> Rust generator for `epics-base-rs`: the `ENV_PARAM` table and
+//! `configure/` -> Rust generator for `epics-libcom-rs`: the `ENV_PARAM` table and
 //! the EPICS Base version.
 //!
 //! C does not hand-write either of them. Both are generated from the same
@@ -32,13 +32,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const ENVCONFIG_DIR: &str = "crates/epics-base-rs/envconfig";
-const OUT_FILE: &str = "crates/epics-base-rs/src/runtime/env_table.rs";
-const OUT_VERSION: &str = "crates/epics-base-rs/src/runtime/version.rs";
+const OUT_FILE: &str = "crates/epics-libcom-rs/src/runtime/env_table.rs";
+const OUT_VERSION: &str = "crates/epics-libcom-rs/src/runtime/version.rs";
 
 /// The three parameters `bldEnvData.pl` does NOT read from the config files:
 /// C's Makefile passes them on the command line (`-c`, `-s`, `-t`) so they
 /// describe the toolchain that built libCom. The generated table references the
-/// hand-written `runtime::build_info` consts, which describe the toolchain that
+/// hand-written `build_info` consts, which describe the toolchain that
 /// built *this* crate.
 const BUILD_SUPPLIED: [(&str, &str); 3] = [
     ("EPICS_BUILD_COMPILER_CLASS", "COMPILER_CLASS"),
@@ -190,7 +190,7 @@ fn read(p: &Path) -> Result<String, String> {
 
 enum Value {
     Literal(String),
-    /// A `runtime::build_info` const name.
+    /// An `epics_libcom_rs::runtime::build_info` const name.
     BuildConst(&'static str),
 }
 
@@ -345,7 +345,7 @@ fn emit(rows: &[(String, Value)]) -> String {
          //!\n\
          //! This module is the workspace's ONLY declaration of an EPICS environment\n\
          //! default. [`EnvParam`](super::env::EnvParam) cannot be constructed outside\n\
-         //! `epics-base-rs`, and none of its accessors take a `default` argument, so a\n\
+         //! `epics-libcom-rs`, and none of its accessors take a `default` argument, so a\n\
          //! caller has no way to introduce a second one.\n\n",
     );
     s.push_str("use super::build_info;\n");
@@ -491,7 +491,7 @@ fn emit_version(v: &BaseVersion) -> String {
          //! DO NOT EDIT — bump the spec and regenerate. `env-codegen --check` fails on\n\
          //! drift and runs as part of `cargo nextest run -p env-codegen`.\n\
          //!\n\
-         //! These are the EPICS Base version, NOT the `epics-base-rs` crate version\n\
+         //! These are the EPICS Base version, NOT the `epics-libcom-rs` crate version\n\
          //! (`CARGO_PKG_VERSION`): the crate version tracks the Rust port's own release\n\
          //! cadence, these name the upstream release being ported.\n\
          \n\

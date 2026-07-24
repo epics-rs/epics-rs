@@ -1666,6 +1666,12 @@ mod tests {
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn every_thread_in_this_crate_states_a_stack_size() {
+        // The list is this crate's files only. `epics-base-rs`'s two
+        // thread-building files (`server/ioc_app.rs`, `server/scan.rs`) are
+        // swept by the same three assertions in that crate's own
+        // `tests/thread_census.rs`: `include_str!` must not cross a crate
+        // boundary — a path outside the package directory does not survive
+        // `cargo publish` — so the guard was split by subject, not weakened.
         // (file label, source) — every production `Builder` site in the crate.
         let files = [
             ("runtime/task.rs", include_str!("task.rs")),
@@ -1682,8 +1688,6 @@ mod tests {
                 include_str!("background/callback_executor.rs"),
             ),
             ("runtime/worker_pool.rs", include_str!("worker_pool.rs")),
-            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
-            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
 
         let mut unclassified = Vec::new();
@@ -1714,7 +1718,7 @@ mod tests {
         }
 
         assert!(
-            checked >= 6,
+            checked >= 7,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
@@ -2525,6 +2529,7 @@ mod tests {
     /// `name_current_thread` for one that deliberately has none.
     #[test]
     fn every_thread_in_this_crate_publishes_its_name() {
+        // This crate's files only — see the note on the sweep above.
         let files = [
             ("runtime/task.rs", include_str!("task.rs")),
             (
@@ -2539,8 +2544,6 @@ mod tests {
                 "runtime/background/callback_executor.rs",
                 include_str!("background/callback_executor.rs"),
             ),
-            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
-            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
         // The one exemption, named rather than pattern-matched: the
         // SCHED_FIFO range probe is `#[cfg(target_os = "linux")]`, exists for
@@ -2590,6 +2593,7 @@ mod tests {
     /// somewhere else in the file.
     #[test]
     fn only_the_prologue_reaches_the_banding_call() {
+        // This crate's files only — see the note on the sweep above.
         let files = [
             ("runtime/task.rs", include_str!("task.rs")),
             (
@@ -2604,8 +2608,6 @@ mod tests {
                 "runtime/background/callback_executor.rs",
                 include_str!("background/callback_executor.rs"),
             ),
-            ("server/ioc_app.rs", include_str!("../server/ioc_app.rs")),
-            ("server/scan.rs", include_str!("../server/scan.rs")),
         ];
         // Only the definition and the prologue's own delegation, both in
         // task.rs. Anywhere else is a thread banded without being named.

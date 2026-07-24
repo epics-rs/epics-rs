@@ -107,15 +107,25 @@ impl Inner {
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "scanOnce worker";
 
+/// How many periodic scan rates the record system defines — C's `nPeriodic`,
+/// sized from menuScan at `scanInit` (`dbScan.c`).
+///
+/// Stated here rather than read from the record system because this crate is
+/// *below* it: `epics-base-rs` owns `server::scan::PERIODIC_SCANS`, and a
+/// dependency edge back up would be a cycle. The two are pinned together in
+/// the direction that has one — `epics-base-rs`'s `server::scan` carries a
+/// `const _: () = assert!(PERIODIC_SCANS.len() == PERIODIC_SCAN_BAND_COUNT)`,
+/// so adding or removing a rate fails to compile rather than silently moving
+/// one side of the band ladder.
+pub const PERIODIC_SCAN_BAND_COUNT: usize = 7;
+
 /// The scanOnce worker's EPICS band — `epicsThreadPriorityScanLow +
 /// nPeriodic` (`dbScan.c:776`), where `nPeriodic` is the number of periodic
-/// scan rates. C sizes it from menuScan at `scanInit`; here the same count is
-/// `server::scan::PERIODIC_SCANS.len()`, so the two cannot drift apart.
+/// scan rates ([`PERIODIC_SCAN_BAND_COUNT`], pinned to
+/// `server::scan::PERIODIC_SCANS.len()` so the two cannot drift apart).
 /// 60 + 7 = 67: scanOnce preempts every periodic scan thread, as in C.
 fn scan_once_priority() -> ThreadPriority {
-    ThreadPriority::Custom(
-        ThreadPriority::ScanLow.value() + crate::server::scan::PERIODIC_SCANS.len() as u8,
-    )
+    ThreadPriority::Custom(ThreadPriority::ScanLow.value() + PERIODIC_SCAN_BAND_COUNT as u8)
 }
 
 /// Port of `onceTask` (`dbScan.c:700-730`): wait on the wake event, drain the
@@ -267,7 +277,7 @@ mod tests {
     fn scan_once_band_is_scanlow_plus_n_periodic() {
         assert_eq!(
             scan_once_priority().value(),
-            ThreadPriority::ScanLow.value() + crate::server::scan::PERIODIC_SCANS.len() as u8
+            ThreadPriority::ScanLow.value() + PERIODIC_SCAN_BAND_COUNT as u8
         );
         assert_eq!(scan_once_priority().value(), 67);
     }

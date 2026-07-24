@@ -43,10 +43,31 @@ pub mod error;
 // socket-bearing submodules rather than on `net` itself, so the wire constants
 // beside them (`ORIGIN_TAG_MCAST_GROUP`) stay reachable from the protocol code
 // that has to embed them on RTEMS too — see the module doc.
-pub mod net;
-pub mod runtime;
+//
+// `net` and `runtime` now live in `epics-libcom-rs` (issue #55) so a consumer
+// can take the socket/concurrency layer without the record system. They are
+// re-exported here under their original names rather than left to callers to
+// depend on directly: `epics_base_rs::net::…` and `epics_base_rs::runtime::…`
+// are the paths every downstream crate and every module below already spells,
+// and the re-export keeps `crate::net::…` / `crate::runtime::…` valid inside
+// this crate too, so the split cost zero call-site edits.
+pub use epics_libcom_rs::{net, runtime};
 pub mod server;
 pub mod types;
+
+// The `exec_backend` / `tokio_backend` cfg is derived twice — once by
+// `epics-libcom-rs`'s build script for the task seam, once by this crate's
+// for `server::scan` above it — because a dependency's cfg is not visible
+// here. This pins the two copies together: if `rtems-exec-model` ever stops
+// forwarding to `epics-libcom-rs/rtems-exec-model`, the workspace would
+// otherwise compile with the record system on one backend and the seam
+// beneath it on the other, which is a runtime symptom (no reactor, or two)
+// rather than a build error. Now it is a build error.
+const _: () = assert!(
+    epics_libcom_rs::EXEC_BACKEND == cfg!(exec_backend),
+    "epics-base-rs and epics-libcom-rs disagree about the task backend — \
+     check that `rtems-exec-model` still forwards to `epics-libcom-rs`"
+);
 
 pub use epics_macros_rs::epics_main;
 pub use epics_macros_rs::epics_test;

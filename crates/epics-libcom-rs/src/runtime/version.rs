@@ -6,7 +6,7 @@
 //! DO NOT EDIT — bump the spec and regenerate. `env-codegen --check` fails on
 //! drift and runs as part of `cargo nextest run -p env-codegen`.
 //!
-//! These are the EPICS Base version, NOT the `epics-base-rs` crate version
+//! These are the EPICS Base version, NOT the `epics-libcom-rs` crate version
 //! (`CARGO_PKG_VERSION`): the crate version tracks the Rust port's own release
 //! cadence, these name the upstream release being ported.
 

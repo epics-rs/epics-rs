@@ -33,10 +33,13 @@ pub(crate) struct ScanScheduler {
 /// rates preempt slower ones. Keep slowest-first or the priority
 /// ladder inverts.
 ///
-/// `pub(crate)`: the scanOnce worker's priority is defined by C as
+/// The scanOnce worker's priority is defined by C as
 /// `epicsThreadPriorityScanLow + nPeriodic` (`dbScan.c:776`), so
-/// `runtime::background::scan_once` needs this slice's length — one
-/// source of truth for "how many periodic rates exist".
+/// `runtime::background::scan_once` needs this slice's length too. It cannot
+/// read it: the runtime layer is a crate *below* this one, and the edge back
+/// up would be a cycle. So it states the count itself and the two are pinned
+/// by the assertion below — one source of truth for "how many periodic rates
+/// exist", enforced at compile time rather than by two comments agreeing.
 pub(crate) const PERIODIC_SCANS: &[ScanType] = &[
     ScanType::Sec10,
     ScanType::Sec5,
@@ -46,6 +49,12 @@ pub(crate) const PERIODIC_SCANS: &[ScanType] = &[
     ScanType::Sec02,
     ScanType::Sec01,
 ];
+
+const _: () = assert!(
+    PERIODIC_SCANS.len() == crate::runtime::background::scan_once::PERIODIC_SCAN_BAND_COUNT,
+    "adding or removing a periodic scan rate moves the scanOnce worker's band \
+     (dbScan.c:776) — update PERIODIC_SCAN_BAND_COUNT in epics-libcom-rs to match"
+);
 
 /// What the periodic scan facility calls itself when reporting.
 const FACILITY: &str = "periodic scan";

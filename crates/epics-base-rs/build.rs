@@ -1,17 +1,22 @@
-//! Selects the `runtime::task` spawn/sleep/interval backend at compile time.
+//! Derives this crate's own copy of the `exec_backend` / `tokio_backend` cfg.
 //!
-//! The task seam (`src/runtime/task.rs`) has two mutually exclusive backends,
-//! chosen here so the ~two dozen seam sites gate on one uniform condition
-//! rather than repeating the target/feature predicate at each:
+//! The seam itself lives in `epics-libcom-rs` (whose `build.rs` is the
+//! original of this one). This crate still needs the predicate because code
+//! *above* the seam gates on it too — `server::scan` sizes its periodic-scan
+//! threads differently on the reactor-free backend — and a cfg set by a
+//! dependency's build script is not visible here. Each crate that declares
+//! `rtems-exec-model` deriving its own cfg from the same two inputs is the
+//! existing pattern in this workspace (`epics-ca-rs`, `epics-pva-rs`).
 //!
-//! * `exec_backend` — the std-thread background executor (callback pool +
-//!   delayed timer + scanOnce worker, `runtime::background`). This is the
-//!   RTEMS target's only option (no tokio reactor there), and — via the
-//!   `rtems-exec-model` cargo feature — the **host-selectable RTEMS execution
-//!   model**: a real product mechanism for a Linux (e.g. PREEMPT_RT)
-//!   blocking-front-end deployment that wants the same runtime-free
-//!   spawn/timer backend the RTEMS build uses, driving async record-processing
-//!   completion on dedicated OS threads instead of a tokio runtime.
+//! Two copies of a predicate is two chances to disagree, so they are pinned:
+//! `lib.rs` carries
+//! `const _: () = assert!(epics_libcom_rs::EXEC_BACKEND == cfg!(exec_backend))`,
+//! which fails to compile if this crate's `rtems-exec-model` ever stops
+//! forwarding to the runtime crate's.
+//!
+//! * `exec_backend` — the std-thread background executor. The RTEMS target's
+//!   only option (no tokio reactor there), and — via the `rtems-exec-model`
+//!   cargo feature — the host-selectable RTEMS execution model.
 //! * `tokio_backend` — the tokio runtime. The hosted default (feature off,
 //!   non-RTEMS target).
 //!

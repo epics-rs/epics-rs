@@ -22,6 +22,12 @@ parking_lot = "0.12"
 arc-swap = "1"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }
+# The libCom layer — `runtime` and `net` — split out under issue #55 and
+# re-exported from `lib.rs` at the original `epics_base_rs::{runtime, net}`
+# paths. Not optional: the record system is built on the task seam, the
+# priority bands and `errlog`, so there is no configuration of this crate that
+# does without it.
+epics-libcom-rs = { workspace = true }
 # `server::status_pv::target_status_pvs` reads descriptor and heap usage out of
 # RTEMS through this crate's `stats` module. A leaf: `epics-rtems-boot` depends
 # on nothing of ours, its build script no-ops off RTEMS, and on a host target
@@ -118,13 +124,22 @@ tracing-subscriber = "0.3"
 # epics-base-rs --features rtems-exec-model` builds the split state the
 # `HAS_TOKIO_REACTOR` const guard exists to refuse (base on the exec
 # backend, the ca dev-dep still on tokio), and the guard fails the build.
-rtems-exec-model = ["epics-ca-rs/rtems-exec-model"]
+# Forwards to `epics-libcom-rs` because that is where the seam itself now
+# lives; this crate's own `build.rs` derives the same cfg for `server::scan`
+# above the seam, and `lib.rs` pins the two together so a dropped forward is a
+# compile error rather than a split backend.
+rtems-exec-model = [
+    "epics-libcom-rs/rtems-exec-model",
+    "epics-ca-rs/rtems-exec-model",
+]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on
 # non-Linux. Off by default — only enable on systems running with
 # SCHED_FIFO / SCHED_RR where unbounded priority inversion is a risk.
-linux-rt = []
+# The mutex lives in `epics-libcom-rs`; this is the forward that keeps
+# `--features epics-base-rs/linux-rt` meaning what it always did.
+linux-rt = ["epics-libcom-rs/linux-rt"]
 # Test-only: enables the `client_server` integration test, whose
 # `run_tcp_listener` call must match `epics-ca-rs`'s TLS/cap-token
 # signature. `run_tcp_listener` has `#[cfg]`-gated `tls` /

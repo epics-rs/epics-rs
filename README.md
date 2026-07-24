@@ -244,14 +244,27 @@ Per-crate design detail lives in each crate's README and on docs.rs.
 ## Testing
 
 ```bash
-cargo nextest run --workspace   # 10,000+ tests (or: cargo test --workspace)
+# without a C EPICS tree (what CI runs)
+cargo nextest run --workspace --exclude epics-oracle-rs
+
+# full suite, 10,000+ tests — includes the differential oracle
+cargo nextest run --workspace
 ```
 
 Coverage includes wire-format golden packets (CA + PVA), pvxs interop
 fixtures, record processing and link chains, 46 golden tests against compiled
 C `tableRecord.c` output, and `examples/regression-ioc` — an end-to-end IOC
-that pins fixed wire behavior across releases. `epics-oracle-rs` additionally
-diffs the running Rust IOC against a C `softIoc` where a C EPICS tree exists.
+that pins fixed wire behavior across releases.
+
+`epics-oracle-rs` is the differential oracle: it boots a C `softIoc` and the
+Rust IOC on the same `.db` and diffs their observable CA/PVA behavior. It
+needs a built C EPICS tree (point `EPICS_BASE_BIN` / `EPICS_ORACLE_DBD` /
+`PVXS_BIN` at it — see
+[`crates/epics-oracle-rs/README.md`](crates/epics-oracle-rs/README.md)) and
+fails loudly rather than skipping when the tree is absent, so CI excludes it.
+**Before contributing** changes that touch record, CA, or PVA behavior, run
+the full suite *including* the oracle against a local C tree — it is the gate
+CI cannot run for you.
 See [`CHANGELOG.md`](./CHANGELOG.md) for the release-by-release audit trail.
 
 ## Requirements

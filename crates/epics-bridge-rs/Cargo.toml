@@ -204,7 +204,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # host-facing feature that pulls this dependency — `qsrv`, `pvalink`,
 # `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
 # `qsrv-core`, the RTEMS selection, gets the reduced set.
-epics-pva-rs = { path = "../epics-pva-rs", version = "0.24.0", optional = true, default-features = false }
+epics-pva-rs = { path = "../epics-pva-rs", version = "0.25.0", optional = true, default-features = false }
 # `epics-ca-rs` stays inherited, but NOT because its defaults are empty — they
 # stopped being empty at `274a734b`, which introduced the `client-core`/`client`
 # split and made `default = ["client"]`. The reason is narrower and is a fact
@@ -215,7 +215,7 @@ epics-pva-rs = { path = "../epics-pva-rs", version = "0.24.0", optional = true, 
 # none of them — measured with `cargo tree -p epics-bridge-rs
 # --no-default-features --features qsrv-core,pvalink`, which does not name it.
 # So `default-features = false` here would change nothing the target compiles,
-# while costing the second hand-written `version = "0.24.0"` that the
+# while costing the second hand-written `version` pin that the
 # `epics-pva-rs` entry above had to accept for a real reason.
 #
 # If a target feature ever does pull it, this entry needs the same treatment

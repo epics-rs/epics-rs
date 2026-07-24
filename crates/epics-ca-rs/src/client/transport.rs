@@ -5391,7 +5391,18 @@ mod circuit_retirement_tests {
     use std::io::Read;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::net::TcpListener;
+
+    /// The fake server's listener, used only by a `std::thread` peer — so it
+    /// is born a `std` listener, blocking from birth. It used to be a tokio
+    /// listener converted with `into_std()` + `set_nonblocking(false)`; on
+    /// Windows that conversion does not return the socket to blocking mode
+    /// (measured, PR #56 CI 2026-07-24: the peer's `accept` failed
+    /// WSAEWOULDBLOCK on a listener this test believed it had made blocking).
+    fn std_listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
 
     fn spawn_manager() -> (
         mpsc::UnboundedSender<TransportCommand>,
@@ -5494,10 +5505,7 @@ mod circuit_retirement_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rst_after_create_chan_retires_the_circuit_without_a_reconnect() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let std_listener = listener.into_std().unwrap();
-        std_listener.set_nonblocking(false).unwrap();
+        let (std_listener, addr) = std_listener();
 
         let (cmd_tx, mut event_rx, sw) = spawn_manager();
 
@@ -5536,10 +5544,7 @@ mod circuit_retirement_tests {
     /// error specifically rather than on "the pump exited".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn clean_peer_close_also_retires_the_circuit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let std_listener = listener.into_std().unwrap();
-        std_listener.set_nonblocking(false).unwrap();
+        let (std_listener, addr) = std_listener();
 
         let (cmd_tx, mut event_rx, sw) = spawn_manager();
 

@@ -13,9 +13,10 @@
 //!
 //! This module is the *funnel* for both: the types, and one entry point per
 //! reading that every consumer calls. The per-OS half lives in a `backend`
-//! module selected below — RTEMS' is the C in `csrc/rtems_stats.c`, ported from
-//! devIocStats' `os/RTEMS/osdFdUsage.c` and `osdMemUsage.c`, and the fallback
-//! reports no reading and prints nothing.
+//! module selected below, and there are three — `rtems.rs`, the C in
+//! `csrc/rtems_stats.c` ported from devIocStats' `os/RTEMS/osdFdUsage.c` and
+//! `osdMemUsage.c`; `vxworks.rs`, POSIX through `libc` for an IOC running as an
+//! RTP; and `unsupported.rs`, which reports no reading and prints nothing.
 //!
 //! # Why the OS fork is a module and not a `#[cfg]` arm
 //!
@@ -36,7 +37,8 @@
 //! So a second OS is a new file plus one `mod` line here. It is not a change to
 //! any consumer, and it cannot become one: value consumers see `Option`, which
 //! already means "this build has no reading", and census consumers see a call
-//! that prints nothing.
+//! whose whole contract is that it prints — a backend with nothing to print
+//! says so on its own line rather than making the caller ask.
 //!
 //! # `None` means unavailable, not zero
 //!
@@ -58,7 +60,10 @@
 #[cfg(all(target_os = "rtems", rtems_boot_linked))]
 #[path = "rtems.rs"]
 mod backend;
-#[cfg(not(all(target_os = "rtems", rtems_boot_linked)))]
+#[cfg(target_os = "vxworks")]
+#[path = "vxworks.rs"]
+mod backend;
+#[cfg(not(any(all(target_os = "rtems", rtems_boot_linked), target_os = "vxworks")))]
 #[path = "unsupported.rs"]
 mod backend;
 
@@ -293,6 +298,7 @@ mod tests {
     /// than trusted.
     const BACKENDS: &[(&str, &str)] = &[
         ("rtems.rs", include_str!("rtems.rs")),
+        ("vxworks.rs", include_str!("vxworks.rs")),
         ("unsupported.rs", include_str!("unsupported.rs")),
     ];
 

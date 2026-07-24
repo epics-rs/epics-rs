@@ -144,9 +144,11 @@ hop, and it is now measured rather than argued.
 12× samples (520 s) the largest chain deviation is **1155.9 µs**, 7.2× smaller
 than §2's reported p99.9, and p99.9 itself is **406.6 µs**, 20× smaller. §2's
 figure is a single sample out of 200 (see the `p99.9`-is-the-max note in §1).
-Rare multi-millisecond stalls of that size do exist — the two no-load arms each
-caught exactly one (6757.9 µs and 5657.1 µs), roughly one per 180 s — but they
-are isolated events at a rate of order 0.5 %, not a routine tail. §2 reports one
+Rare multi-millisecond stalls of that size do exist — counting a paired ±sample
+as one event, the `SCHED_OTHER` no-load arm caught two (6757.9 and 6098.1 µs,
+both scan-blamed) and the FIFO no-load arm one (5657.1 µs, hop-blamed) — but
+across the four FIFO arms (n = 9996, ~1000 s) there are **2** such events, one
+per ~500 s or **0.04 % of samples**, not a routine tail. §2 reports one
 such event as a percentile and thereby overstates the steady-state tail by an
 order of magnitude.
 
@@ -298,11 +300,16 @@ refuted.
 
 ## §7 What this document does not establish
 
-* **The rare multi-millisecond hop stall is unexplained.** Observed 4 times
-  across ~1200 s of arms (6757.9 µs and 5657.1 µs no-load; 1155.9 µs and
-  655.1 µs in the long FIFO arm). Its ~0.5 % rate makes it expensive to
-  bisect, and nothing here distinguishes a tokio scheduling artefact, a loopback
-  TCP interaction, and host-side KVM preemption. It is the open item.
+* **The rare multi-millisecond hop stall is unexplained.** Two events across
+  the four FIFO arms (n = 9996, ~1000 s): **5657.1 µs** in the no-load arm
+  (99.5 % hop) and **1155.9 µs** in the long loaded arm (99.96 % hop) — one per
+  ~500 s, 0.04 % of samples. Counted strictly: `hop`-blamed and ≥ 1 ms. The
+  6757.9 µs and 6098.1 µs no-load events are **scan**-blamed (98.5 % and
+  99.1 % `dA`) and belong to Finding 3's `SCHED_OTHER` half, not here; the
+  655.1 µs event in the long arm is hop-side but sub-millisecond. That rate
+  makes the stall expensive to bisect, and nothing here distinguishes a tokio
+  scheduling artefact, a loopback TCP interaction, and host-side KVM
+  preemption. It is the open item.
 * **The hop is not split below "server side / client side".** §3 apportions by
   scheduling class, not by stage: encode, `write`, socket, `read`, decode and
   the `mpsc` hop are one bucket. Splitting further needs timestamps inside both

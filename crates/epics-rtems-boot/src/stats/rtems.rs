@@ -14,6 +14,9 @@
 //! why this backend is C at all, and why it is the only one that needs a
 //! build-script cfg to say whether its symbols exist.
 
+use core::ffi::c_char;
+use std::ffi::CString;
+
 use super::{FdUsage, MemUsage};
 
 pub(super) fn fd_usage() -> Option<FdUsage> {
@@ -38,8 +41,40 @@ pub(super) fn mem_usage() -> Option<MemUsage> {
     })
 }
 
+pub(super) fn dump_tasks(tag: &str) {
+    // SAFETY: takes a NUL-terminated tag and only reads it; the C side does
+    // its own bounds-checked iteration and copies only ids inside the visitor.
+    unsafe { with_tag(tag, ffi::epics_rtems_boot_dump_tasks) }
+}
+
+pub(super) fn stack_report(tag: &str) {
+    // SAFETY: as above — a read-only NUL-terminated tag, and the report itself
+    // is the shell command's own implementation.
+    unsafe { with_tag(tag, ffi::epics_rtems_boot_stack_report) }
+}
+
+pub(super) fn fd_census(tag: &str) {
+    // SAFETY: as above. The census is read-only on every descriptor it
+    // touches, so it can run while the pumps own their sockets.
+    unsafe { with_tag(tag, ffi::epics_rtems_boot_fd_census) }
+}
+
+/// Hand a Rust tag to a C printer as a NUL-terminated string.
+///
+/// `unwrap_or_default` rather than `expect`: an interior NUL in a caller's tag
+/// is a formatting slip, and a probe that aborts the IOC to complain about its
+/// own label is worse than one that prints an empty tag.
+///
+/// # Safety
+///
+/// `f` must only read the pointer it is given, for the duration of the call.
+unsafe fn with_tag(tag: &str, f: unsafe extern "C" fn(*const c_char)) {
+    let c = CString::new(tag).unwrap_or_default();
+    unsafe { f(c.as_ptr()) }
+}
+
 mod ffi {
-    use core::ffi::c_int;
+    use core::ffi::{c_char, c_int};
 
     unsafe extern "C" {
         pub fn epics_rtems_boot_fd_usage(used: *mut u32, max: *mut u32) -> c_int;
@@ -48,5 +83,8 @@ mod ffi {
             used_total: *mut u64,
             free_largest: *mut u64,
         ) -> c_int;
+        pub fn epics_rtems_boot_dump_tasks(tag: *const c_char);
+        pub fn epics_rtems_boot_stack_report(tag: *const c_char);
+        pub fn epics_rtems_boot_fd_census(tag: *const c_char);
     }
 }

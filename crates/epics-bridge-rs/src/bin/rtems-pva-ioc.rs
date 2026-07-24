@@ -396,32 +396,16 @@ mod ioc {
     #[cfg(feature = "bringup-probes")]
     const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
 
-    // STAGE-5 PROBE: the C task census and stack-usage report — see
-    // `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
-    // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
-    // document extern blocks, and the target build is the only one that
-    // compiles this.)
-    #[cfg(all(target_os = "rtems", feature = "bringup-probes"))]
-    unsafe extern "C" {
-        fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
-        fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
-    }
-
     /// STAGE-5 PROBE: `rt top` + `rt stackuse`, from inside the image.
+    ///
+    /// Both calls go through `epics_rtems_boot::stats`, which owns the per-OS
+    /// backend — see the same function in `rtems-ca-ioc` for why the
+    /// `extern "C"` block and the `#[cfg(target_os = …)]` pair that used to sit
+    /// here are gone.
     #[cfg(feature = "bringup-probes")]
     fn stage5_task_and_stack_report(tag: &str) {
-        #[cfg(target_os = "rtems")]
-        {
-            let c = std::ffi::CString::new(tag).unwrap_or_default();
-            // SAFETY: both take a NUL-terminated tag and only read it; the
-            // C side does its own bounds-checked iteration.
-            unsafe {
-                epics_rtems_boot_dump_tasks(c.as_ptr());
-                epics_rtems_boot_stack_report(c.as_ptr());
-            }
-        }
-        #[cfg(not(target_os = "rtems"))]
-        let _ = tag;
+        epics_rtems_boot::stats::dump_tasks(tag);
+        epics_rtems_boot::stats::stack_report(tag);
     }
 
     /// STAGE-5 PROBE: one console report — the link registry, the ONE

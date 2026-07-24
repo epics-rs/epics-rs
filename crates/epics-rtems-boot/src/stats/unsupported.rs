@@ -20,3 +20,16 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
 pub(super) fn mem_usage() -> Option<MemUsage> {
     None
 }
+
+/// Silence, not a placeholder line.
+///
+/// The console census is read by a log scraper looking for `TASKDUMP` /
+/// `STACKUSE` / `FDCENSUS` blocks. A build with no backend has nothing to put
+/// in one, and printing an empty block would let a scraper count a census that
+/// never happened — the same "sentinel that reads like a measurement" mistake
+/// the `Option` above exists to avoid, one layer up.
+pub(super) fn dump_tasks(_tag: &str) {}
+
+pub(super) fn stack_report(_tag: &str) {}
+
+pub(super) fn fd_census(_tag: &str) {}

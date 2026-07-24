@@ -1,24 +1,42 @@
-//! Descriptor and heap usage, read out of the OS the IOC is running on.
+//! IOC statistics, read out of the OS the IOC is running on.
 //!
-//! These are the two IOC-statistics values a target build cannot get from
-//! `std`, and each OS keeps them somewhere different. This module is the
-//! *funnel*: the types, and one pair of readers that every consumer calls. The
-//! per-OS reading lives in a `backend` module selected below — RTEMS' is the C
-//! in `csrc/rtems_stats.c`, ported from devIocStats' `os/RTEMS/osdFdUsage.c`
-//! and `osdMemUsage.c`, and the fallback reports no reading at all.
+//! Two kinds, and they are two kinds because they answer different questions:
+//!
+//! * **Values** — [`fd_usage`] and [`mem_usage`], the readings the status PVs
+//!   publish. These are the numbers a target build cannot get from `std`, and
+//!   each OS keeps them somewhere different.
+//! * **The console census** — [`dump_tasks`], [`stack_report`] and
+//!   [`fd_census`], which print rather than return. They exist because a target
+//!   has no shell to ask: with no `iocsh` and no console input path, the only
+//!   way to get `rt top`, `rt stackuse` or a descriptor listing off the board
+//!   is for the image to print them itself.
+//!
+//! This module is the *funnel* for both: the types, and one entry point per
+//! reading that every consumer calls. The per-OS half lives in a `backend`
+//! module selected below — RTEMS' is the C in `csrc/rtems_stats.c`, ported from
+//! devIocStats' `os/RTEMS/osdFdUsage.c` and `osdMemUsage.c`, and the fallback
+//! reports no reading and prints nothing.
 //!
 //! # Why the OS fork is a module and not a `#[cfg]` arm
 //!
-//! [`fd_usage`] and [`mem_usage`] carry no `#[cfg]` of their own, and the
+//! Nothing below carries a `#[cfg]` of its own, and the
 //! `the_os_fork_happens_only_at_the_backend_selection` test below keeps it that
-//! way. The alternative — a `#[cfg]` pair inside each reader — costs one new
-//! arm per function per OS, and every consumer that wanted the same value would
-//! reproduce the same fork at its own call site. That is the shape devIocStats
-//! avoids too: one record set, one OSD file per OS.
+//! way. The alternative — a `#[cfg]` set inside each entry point — costs one
+//! new arm per function per OS, and every consumer that wanted the same reading
+//! would reproduce the same fork at its own call site. That is the shape
+//! devIocStats avoids too: one record set, one OSD file per OS.
+//!
+//! The census in particular was reproduced per consumer before this: each of
+//! the two target IOC binaries carried its own `extern "C"` block *and* its own
+//! `#[cfg(target_os = …)]` / `#[cfg(not(…))]` wrapper around every call, so
+//! `rtems-pva-ioc` had drifted to declaring two of the three functions and
+//! calling neither [`fd_census`] nor anything in its place. Two copies of a
+//! per-OS rule is how they come to disagree.
 //!
 //! So a second OS is a new file plus one `mod` line here. It is not a change to
-//! any consumer, and it cannot become one: consumers see `Option`, which
-//! already means "this build has no reading".
+//! any consumer, and it cannot become one: value consumers see `Option`, which
+//! already means "this build has no reading", and census consumers see a call
+//! that prints nothing.
 //!
 //! # `None` means unavailable, not zero
 //!
@@ -121,9 +139,65 @@ pub fn mem_usage() -> Option<MemUsage> {
     backend::mem_usage()
 }
 
+/// Print the task census — thread count, kernel names, effective priorities —
+/// tagged with `tag`. No output on a build whose OS has no backend.
+///
+/// This is the `rt top` half of what a shell would give an operator, produced
+/// from inside the image because the target has no shell task and no console
+/// input path at all. The tag is what pairs a block with the phase of a
+/// measurement that produced it.
+pub fn dump_tasks(tag: &str) {
+    backend::dump_tasks(tag)
+}
+
+/// Print the stack high-water report, tagged with `tag`. No output on a build
+/// whose OS has no backend.
+///
+/// The `rt stackuse` half. On RTEMS this is the shell command's own
+/// implementation called directly, which is why the output format is the
+/// shell's rather than something this crate invents.
+pub fn stack_report(tag: &str) {
+    backend::stack_report(tag)
+}
+
+/// Print one line per open descriptor, classified, tagged with `tag`. No
+/// output on a build whose OS has no backend.
+///
+/// [`fd_usage`] answers *how many* descriptors are open, which is the number
+/// that predicts the connection ceiling. It cannot answer *which*, and an
+/// outage measurement needs exactly that: a client whose circuits are all down
+/// still holds one descriptor more than it held at boot, and "one unexplained
+/// fd" is only a finding once the other seven are named.
+///
+/// The walk is the same one [`fd_usage`] does, so the census cannot disagree
+/// with the count beside it. Read-only on every descriptor it touches: it can
+/// run while the pumps own their sockets.
+pub fn fd_census(tag: &str) {
+    backend::fd_census(tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The funnel's own source lines — this file down to the test module, with
+    /// comments dropped.
+    ///
+    /// Both halves matter. The `#[cfg(test)]` split keeps the tests below out
+    /// of scope, since they legitimately carry the attributes and call the
+    /// paths the guards forbid above them. Dropping comment lines keeps the
+    /// *prose* out too: the module docs explain the backend selection by
+    /// quoting the shapes it replaced, and a guard that reads its own
+    /// explanation as code fails on the sentence describing it. Measured — both
+    /// guards below failed exactly that way on their first run.
+    fn funnel_code() -> impl Iterator<Item = &'static str> {
+        include_str!("mod.rs")
+            .split_once("#[cfg(test)]")
+            .expect("the test module is still here")
+            .0
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+    }
 
     /// The host has no backend, so both readers must say so rather than
     /// inventing a reading. A host build that reported `0` free descriptors
@@ -204,18 +278,64 @@ mod tests {
     /// satisfied by a `#[cfg]` that merely *looks* like a backend selection.
     #[test]
     fn the_os_fork_happens_only_at_the_backend_selection() {
-        let src = include_str!("mod.rs");
-        // Only the funnel is in scope: the tests legitimately sit behind
-        // `#[cfg(test)]`, which is the split point.
-        let funnel = src
-            .split_once("#[cfg(test)]")
-            .expect("the test module is still here")
-            .0;
         assert_eq!(
-            funnel.matches("#[cfg(").count(),
-            funnel.matches("mod backend;").count(),
+            funnel_code()
+                .filter(|l| l.contains("#[cfg("))
+                .collect::<Vec<_>>()
+                .len(),
+            funnel_code().filter(|l| l.contains("mod backend;")).count(),
             "every `#[cfg]` in the funnel must be a backend selection"
         );
+    }
+
+    /// Every backend file, paired with its contents. The census below is only
+    /// as good as this list, so the list is checked against `mod.rs` rather
+    /// than trusted.
+    const BACKENDS: &[(&str, &str)] = &[
+        ("rtems.rs", include_str!("rtems.rs")),
+        ("unsupported.rs", include_str!("unsupported.rs")),
+    ];
+
+    /// A backend file that is `#[cfg]`ed out is not compiled, so nothing about
+    /// it is checked by building — the host build type-checks exactly one of
+    /// them, and a missing function in any other would surface only on that
+    /// OS's own build, which on this workspace means on the bring-up box.
+    ///
+    /// So the surface is a census instead: every entry point the funnel calls
+    /// must exist in every backend file, and every backend file `mod.rs`
+    /// selects must be in the list above. Both directions, because either one
+    /// alone can be satisfied while the other quietly is not.
+    #[test]
+    fn every_backend_implements_the_whole_funnel_surface() {
+        let declared: Vec<&str> = funnel_code()
+            .filter_map(|l| l.trim().strip_prefix("#[path = \""))
+            .map(|r| &r[..r.find('"').expect("the path attribute is terminated")])
+            .collect();
+        let listed: Vec<&str> = BACKENDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            declared, listed,
+            "every backend `mod.rs` selects must be listed in BACKENDS, in order"
+        );
+
+        // Taken from the funnel's own calls, so a new entry point cannot be
+        // added here without every backend growing it.
+        let required: Vec<&str> = funnel_code()
+            .filter_map(|l| l.trim().strip_prefix("backend::"))
+            .map(|r| &r[..r.find('(').expect("a backend call is a call")])
+            .collect();
+        assert!(
+            !required.is_empty(),
+            "the funnel must delegate to the backend"
+        );
+
+        for (name, body) in BACKENDS {
+            for f in &required {
+                assert!(
+                    body.contains(&format!("fn {f}(")),
+                    "backend `{name}` does not implement `{f}`, which the funnel calls"
+                );
+            }
+        }
     }
 
     /// The C is compiled on exactly one configuration, and the backend that

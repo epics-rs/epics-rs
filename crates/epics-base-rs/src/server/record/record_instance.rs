@@ -77,7 +77,11 @@ impl Drop for AmbientWriteOriginScope {
     }
 }
 
-fn ambient_write_origin() -> u64 {
+/// The current thread's ambient write origin (0 outside any scope).
+/// `pub(crate)` so the simple-PV posting funnel
+/// (`ProcessVariable::deliver`) applies the same inheritance rule as the
+/// two record funnels in this file.
+pub(crate) fn ambient_write_origin() -> u64 {
     AMBIENT_WRITE_ORIGIN.with(|c| c.get())
 }
 

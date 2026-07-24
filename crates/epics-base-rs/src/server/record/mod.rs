@@ -34,11 +34,11 @@ pub use menu_choices::{
     shared_menu_choices,
 };
 pub use pini::PiniMode;
-pub(crate) use record_instance::value_as_dbr_string;
 pub use record_instance::{
     AlarmAck, AmbientWriteOriginScope, DeferredNotifyPut, NotifyWaitSet, PactExit,
     ProcessCompletion, RecordInstance, ambient_write_origin_scope,
 };
+pub(crate) use record_instance::{ambient_write_origin, value_as_dbr_string};
 pub use record_trait::{
     ArrayMonitorPost, Asl, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc, FieldMetadataOverride,

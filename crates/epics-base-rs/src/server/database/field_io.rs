@@ -970,14 +970,13 @@ impl PvDatabase {
         // shadow PVs, IOCsh stats PVs) are stored in `simple_pvs`,
         // not `records`. Without this branch the function would
         // silently return `ChannelNotFound` for every gateway-mirrored
-        // PV — `ProcessVariable::set` already does the
-        // notify-subscribers fan-out internally so all we need here is
-        // to delegate. The `origin` tag is a no-op for simple PVs
-        // because they don't yet plumb origin through `set`.
+        // PV — `ProcessVariable::set_with_origin` already does the
+        // notify-subscribers fan-out internally (tagging the event with
+        // `origin`, same self-write contract as the record branch) so
+        // all we need here is to delegate.
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            let _ = origin; // simple PVs don't currently honor origin tagging
-            pv.set(value);
+            pv.set_with_origin(value, origin);
             return Ok(());
         }
 

@@ -315,10 +315,21 @@ compared against the host.
 
 * **The 14 `epics-oracle-rs` failures are env-gated, not RT regressions.**
   `epics-oracle-rs` boots against a C EPICS ground-truth tree at
-  `/home/stevek/work/epics-base/bin/linux-x86_64`, which is absent on the box
-  and present on the host — which is why the host passes all 10182 and the box
-  fails exactly those 14. Excluding the package is the correct isolation, not a
-  workaround for an RT defect.
+  `/home/stevek/work/epics-base/bin/linux-x86_64`, which was absent on the box
+  and present on the host — which is why the host passed all 10182 and the box
+  failed exactly those 14. Excluding the package was the correct isolation, not
+  a workaround for an RT defect.
+
+  **This is no longer the box's state.** The C tree was provisioned on `.129`
+  later the same day — stock base + stock pvxs, 34 record types, recipe and env
+  block in `doc/oracle-ground-truth-provisioning.md`. With it, the exclusion is
+  unnecessary: at tip `ad5d77bc` on the same kernel, `cargo nextest run -p
+  epics-oracle-rs --no-fail-fast` reports **151 tests run: 151 passed, 0
+  skipped** (exit 0, 13.187 s) and `cargo nextest run --workspace
+  --no-fail-fast` reports **10192 tests run: 10192 passed, 2 skipped** (exit 0,
+  60.310 s) — oracle included, no `-E` filter. The table above stays as the
+  measurement taken at its own commit; do not read its `-E 'not
+  package(epics-oracle-rs)'` row as still-required practice on this box.
 * **The one feature-ON base failure is a load-induced ordering flake.**
   `runtime::background::future_exec::tests::a_yielding_task_releases_the_worker_to_a_queued_task`
   failed only inside the concurrent full-workspace run (load avg ~20), in

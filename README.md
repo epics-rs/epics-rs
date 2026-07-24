@@ -27,7 +27,7 @@ records with the full areaDetector plugin chain from a single `cargo build`.
 
 - **Channel Access** — client & server (UDP name resolution + TCP circuit, beacons, repeater)
 - **pvAccess** — client & server (search engine, monitor/get/put/RPC, ORIGIN_TAG forwarding)
-- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible)
+- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `pva://` / `ca://` database links (pvalink/calink)
 - **IOC runtime** — 35 base record types, .db loader, link chains, scan scheduling, ACF access security, iocsh, autosave, calc engine
 - **asyn** — actor-based async port driver framework
 - **motor** — 9-phase state machine, coordinate transforms, backlash compensation
@@ -43,7 +43,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.24", features = ["ad"] }
+epics-rs = { version = "0.25", features = ["ad"] }
 ```
 
 ```rust
@@ -74,8 +74,8 @@ through the umbrella crate — depend on them directly when needed.
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.24"  # just the IOC runtime
-epics-ca-rs   = "0.24"  # just Channel Access
+epics-base-rs = "0.25"  # just the IOC runtime
+epics-ca-rs   = "0.25"  # just Channel Access
 ```
 
 ## Workspace
@@ -255,6 +255,10 @@ Coverage includes wire-format golden packets (CA + PVA), pvxs interop
 fixtures, record processing and link chains, 46 golden tests against compiled
 C `tableRecord.c` output, and `examples/regression-ioc` — an end-to-end IOC
 that pins fixed wire behavior across releases.
+
+Async tests use `#[epics_test]`, whose driver follows the build's backend:
+re-running a crate's suite with `--features rtems-exec-model` exercises the
+same test bodies on the reactor-free exec backend that RTEMS uses.
 
 `epics-oracle-rs` is the differential oracle: it boots a C `softIoc` and the
 Rust IOC on the same `.db` and diffs their observable CA/PVA behavior. It

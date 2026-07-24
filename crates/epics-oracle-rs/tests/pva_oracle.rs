@@ -31,7 +31,6 @@
 //! oracle is exactly the false-clean this project exists to escape.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
@@ -59,7 +58,7 @@ fn tools() -> PvxTools {
 /// denominator under test is still the `.dbd`'s — that is the claim being
 /// pinned — just narrowed to the one type these tests can afford to boot.
 fn surface_of(record_type: &str) -> Surface {
-    let dbd = Dbd::parse_file(Path::new(CTools::DEFAULT_DBD)).unwrap_or_else(|e| {
+    let dbd = Dbd::parse_file(&CTools::dbd_path()).unwrap_or_else(|e| {
         panic!("the fat dbd must be readable for the denominator to exist: {e}")
     });
     let supported: BTreeSet<String> = [record_type.to_string()].into_iter().collect();
@@ -80,7 +79,12 @@ fn sweep(record_type: &str) -> (Surface, PvaReport) {
         &[record_type.to_string()],
         &mut allowlist,
     );
-    let report = pvaread::report(CTools::DEFAULT_DBD, &surface, cases, &allowlist);
+    let report = pvaread::report(
+        &CTools::dbd_path().display().to_string(),
+        &surface,
+        cases,
+        &allowlist,
+    );
     (surface, report)
 }
 

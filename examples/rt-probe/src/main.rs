@@ -6,6 +6,15 @@
 //!   * `scan-jitter` — boots an in-process IOC with a `.1 second` periodic
 //!     calc record, CA-monitors it, and reports the deviation of the
 //!     record's own timestamps from the nominal scan period.
+//!   * `scan-decomp` / `serve` + `watch` — the same measurement split into
+//!     its legs. Every CA monitor update carries the record's own
+//!     `DBR_TIME_*` timestamp, stamped inside record processing on the
+//!     `scan-0.1` thread; the client stamps arrival off the same
+//!     `CLOCK_REALTIME`. Two timestamps per sample give three series and an
+//!     exact identity between them, so the scan leg and the CA hop are
+//!     apportioned rather than argued. `scan-decomp` keeps the single
+//!     process of `scan-jitter`; `serve`/`watch` splits IOC and client into
+//!     two processes so each side's scheduling class can be set alone.
 //!   * `ca-latency` / `pva-latency` — a counter is driven into a record and
 //!     the elapsed time until the matching monitor update is delivered is
 //!     collected, optionally against a background CPU-hog load.
@@ -53,6 +62,30 @@ enum Cmd {
     ScanJitter {
         /// Number of scan-period samples to collect.
         #[arg(long, default_value_t = 300)]
+        samples: usize,
+    },
+    /// Per-leg decomposition of `scan-jitter`, single process — the same
+    /// topology `scan-jitter` measures, reported as scan leg / CA hop /
+    /// full chain instead of the chain total alone.
+    ScanDecomp {
+        #[arg(long, default_value_t = 2000)]
+        samples: usize,
+    },
+    /// IOC half of the split rig: boot the IOC on a fixed CA port and hold.
+    /// Run under its own `chrt` so the server side's scheduling class is
+    /// independent of the client's.
+    Serve {
+        /// CA UDP/TCP port to bind. Never 5064 — this is a measurement rig,
+        /// not an IOC, and must not answer for the site's CA namespace.
+        #[arg(long, default_value_t = 5164)]
+        ca_port: u16,
+    },
+    /// Client half of the split rig: CA-monitor `RT:SCAN` on an already
+    /// running `serve` and emit the same decomposition as `scan-decomp`.
+    Watch {
+        #[arg(long, default_value_t = 5164)]
+        ca_port: u16,
+        #[arg(long, default_value_t = 2000)]
         samples: usize,
     },
     /// CA monitor delivery latency (put → monitor round-ish trip).
@@ -145,6 +178,10 @@ record(ao, "RT:AO") {
 "#;
 
 async fn boot_ioc() -> Result<Ioc, Box<dyn std::error::Error>> {
+    boot_ioc_on(0).await
+}
+
+async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1");
         std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
@@ -155,7 +192,7 @@ async fn boot_ioc() -> Result<Ioc, Box<dyn std::error::Error>> {
         .build()
         .await?;
     let scan = ScanOwner::start(db.clone());
-    let ca_server = CaServer::from_parts(db.clone(), 0, None, None, None, None).await?;
+    let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await?;
     let ca_port = ca_server.udp_port();
     let _ca_task = tokio::spawn(async move { ca_server.run().await });
     let source = Arc::new(PvDatabaseSource::new(db.clone()));
@@ -246,6 +283,160 @@ async fn scan_jitter(samples: usize) -> Result<(), Box<dyn std::error::Error>> {
     // Report absolute jitter magnitude.
     let mag: Vec<f64> = devs.iter().map(|d| d.abs()).collect();
     report("scan-jitter |dev from 100ms|", mag);
+    Ok(())
+}
+
+// ────────────────────── per-leg scan decomposition ──────────────────────
+
+/// One monitor delivery, timestamped at both ends of the CA hop.
+///
+/// `t_rec` is the record's own `TIME`, resolved by `recGblGetTimeStamp`
+/// (`TSE = 0` → `general_time::get_current()`) *inside* record processing on
+/// the `scan-0.1` thread, and carried to the client in the `DBR_TIME_*`
+/// payload. `t_arr` is `SystemTime::now()` on the client the instant
+/// `MonitorHandle::recv` hands the snapshot over. Both are `CLOCK_REALTIME`
+/// seconds since the UNIX epoch, so their difference is a real transit and
+/// not a clock-domain artefact — the whole rig is one host.
+struct LegSample {
+    t_rec: f64,
+    t_arr: f64,
+}
+
+fn unix_f64(t: std::time::SystemTime) -> f64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Collect `samples` monitor deliveries of `RT:SCAN` with both timestamps.
+async fn collect_legs(
+    ca: &CaClient,
+    samples: usize,
+) -> Result<Vec<LegSample>, Box<dyn std::error::Error>> {
+    let ch = ca.create_channel("RT:SCAN");
+    let mut mon = ch.subscribe().await?;
+    let mut out = Vec::with_capacity(samples);
+    let mut warm = 5i32;
+    while out.len() < samples {
+        match tokio::time::timeout(Duration::from_secs(5), mon.recv()).await {
+            Ok(Some(Ok(snap))) => {
+                let t_arr = unix_f64(std::time::SystemTime::now());
+                if warm > 0 {
+                    warm -= 1;
+                    continue;
+                }
+                let t_rec = unix_f64(std::time::SystemTime::from(snap.timestamp));
+                out.push(LegSample { t_rec, t_arr });
+            }
+            _ => {
+                eprintln!("collect_legs: monitor stalled, collected {}", out.len());
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Split the chain total into its legs and print all four series plus the
+/// worst-sample attribution table.
+///
+/// With `dA = Δt_rec − T`, `dB = Δt_arr − T` and `C = t_arr − t_rec`, the
+/// identity `dB[i] = dA[i] + (C[i] − C[i−1])` holds by construction — every
+/// microsecond of chain deviation is either scan-side (`dA`) or a change in
+/// CA hop transit (`dC`). The attribution is therefore arithmetic, not
+/// inference.
+fn report_decomp(label: &str, s: &[LegSample], period_s: f64) {
+    if s.len() < 2 {
+        println!("{label}: NO SAMPLES");
+        return;
+    }
+    let n = s.len();
+    let mut d_a = Vec::with_capacity(n - 1);
+    let mut d_b = Vec::with_capacity(n - 1);
+    let mut d_c = Vec::with_capacity(n - 1);
+    let transit: Vec<f64> = s.iter().map(|x| (x.t_arr - x.t_rec) * 1e6).collect();
+    for i in 1..n {
+        d_a.push(((s[i].t_rec - s[i - 1].t_rec) - period_s) * 1e6);
+        d_b.push(((s[i].t_arr - s[i - 1].t_arr) - period_s) * 1e6);
+        d_c.push(transit[i] - transit[i - 1]);
+    }
+    // Identity check — if this is ever non-zero the two clocks are not the
+    // same clock and every number below is meaningless.
+    let worst_resid = d_b
+        .iter()
+        .zip(d_a.iter().zip(d_c.iter()))
+        .map(|(b, (a, c))| (b - (a + c)).abs())
+        .fold(0.0f64, f64::max);
+    println!("{label}: identity max residual = {worst_resid:.6} us (dB == dA + dC)");
+    report(
+        &format!("{label} | A scan leg |dev|"),
+        d_a.iter().map(|x| x.abs()).collect(),
+    );
+    report(
+        &format!("{label} | B full chain |dev|"),
+        d_b.iter().map(|x| x.abs()).collect(),
+    );
+    report(
+        &format!("{label} | C CA hop transit"),
+        transit[1..].to_vec(),
+    );
+    report(
+        &format!("{label} | dC CA hop |delta|"),
+        d_c.iter().map(|x| x.abs()).collect(),
+    );
+
+    // Attribute the worst chain samples: which leg produced each one.
+    let mut idx: Vec<usize> = (0..d_b.len()).collect();
+    idx.sort_by(|&i, &j| d_b[j].abs().partial_cmp(&d_b[i].abs()).unwrap());
+    println!("{label} | worst 10 chain samples (us): i  dB(chain)  dA(scan)  dC(hop)  blame");
+    for &i in idx.iter().take(10) {
+        let blame = if d_a[i].abs() >= d_c[i].abs() {
+            "scan"
+        } else {
+            "hop"
+        };
+        println!(
+            "{label} |   {i:5}  {:10.1}  {:9.1}  {:9.1}  {blame}",
+            d_b[i], d_a[i], d_c[i]
+        );
+    }
+    // How much of the chain tail each leg owns, counted over the worst 1 %.
+    let cut = (d_b.len() as f64 * 0.01).ceil() as usize;
+    let cut = cut.max(1).min(d_b.len());
+    let scan_blamed = idx[..cut]
+        .iter()
+        .filter(|&&i| d_a[i].abs() >= d_c[i].abs())
+        .count();
+    println!(
+        "{label} | worst-1% blame split (n={cut}): scan={scan_blamed} hop={}",
+        cut - scan_blamed
+    );
+}
+
+async fn scan_decomp(samples: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let ioc = boot_ioc().await?;
+    point_ca_at(ioc.ca_port);
+    let ca = CaClient::new().await?;
+    let s = collect_legs(&ca, samples).await?;
+    report_decomp("scan-decomp", &s, 0.1);
+    Ok(())
+}
+
+async fn serve(ca_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let ioc = boot_ioc_on(ca_port).await?;
+    println!("serve: CA udp={} pva={}", ioc.ca_port, ioc.pva_addr);
+    println!("serve: ready");
+    // Hold the IOC (and its `ScanOwner`) alive until killed.
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+async fn watch(ca_port: u16, samples: usize) -> Result<(), Box<dyn std::error::Error>> {
+    point_ca_at(ca_port);
+    let ca = CaClient::new().await?;
+    let s = collect_legs(&ca, samples).await?;
+    report_decomp("watch", &s, 0.1);
     Ok(())
 }
 
@@ -597,6 +788,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::ScanJitter { samples } => scan_jitter(samples).await,
+        Cmd::ScanDecomp { samples } => scan_decomp(samples).await,
+        Cmd::Serve { ca_port } => serve(ca_port).await,
+        Cmd::Watch { ca_port, samples } => watch(ca_port, samples).await,
         Cmd::CaLatency { samples, hogs } => ca_latency(samples, hogs).await,
         Cmd::PvaLatency { samples, hogs } => pva_latency(samples, hogs).await,
         Cmd::RtPolicy => {

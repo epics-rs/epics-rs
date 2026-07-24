@@ -484,17 +484,26 @@ pub(super) fn serve_connection_blocking(
         writer: writer_worker,
     } = pumps;
     let _ = stream.set_nodelay(true);
-    // Portable SO_RCVTIMEO / SO_SNDTIMEO (both valid on RTEMS), the same move
-    // CA's blocking driver makes. Note the receive timeout is NOT a shutdown
-    // mechanism here: `op_timeout` defaults to ~64,000 s, so it is effectively
-    // infinite (§1.6). What ends a parked reader is the `shutdown` below.
+    // SO_RCVTIMEO (the same move CA's blocking driver makes), fatal: every
+    // target that runs this accepts it, RTEMS included. Note the receive
+    // timeout is NOT a shutdown mechanism here: `op_timeout` defaults to
+    // ~64,000 s, so it is effectively infinite (§1.6). What ends a parked
+    // reader is the `shutdown` below.
     stream
         .set_read_timeout(Some(config.op_timeout))
         .map_err(PvaError::Io)?;
     let send_timeout = config.send_timeout;
-    stream
-        .set_write_timeout(Some(send_tick_for(send_timeout)))
-        .map_err(PvaError::Io)?;
+    // SO_SNDTIMEO, unlike SO_RCVTIMEO above, is NOT portable: VxWorks'
+    // libbsd socket stack does not implement it and returns ENOPROTOOPT
+    // (errno 42) on an otherwise-good accepted socket. Propagating that
+    // fatally closed every VxWorks PVA connection before the first byte
+    // (SET_BYTE_ORDER) went out (measured on target). Best-effort like
+    // `set_nodelay` above: applied on RTEMS, silently absent on VxWorks,
+    // where `handle_connection_io`'s `runtime::task::timeout(send_timeout)`
+    // wrapper around every `write_all` is the portable send-stall guard —
+    // this socket-level timeout is a redundant backstop here, not the only
+    // one.
+    let _ = stream.set_write_timeout(Some(send_tick_for(send_timeout)));
 
     // One socket, several handles: the SAME descriptor shared through an
     // `Arc` by both pump threads and the registry, which owns it from here

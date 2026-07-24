@@ -101,11 +101,18 @@ fi
 COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
 
 # The crates that must compile for the target.
-CRATES=(epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
+#
+# `epics-libcom-rs` is the runtime/socket layer `epics-base-rs` re-exports
+# (issue #55). It is listed in its own right rather than left to arrive as a
+# dependency: a `-p epics-base-rs --lib` build compiles only the parts of it
+# base names, so a target break in a module base does not reach — the whole
+# `net` socket half is gated off RTEMS, for instance — would be invisible here
+# exactly as `src/bin` was before this script existed.
+CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
 
 # Per-crate feature selection, on top of COMMON's `--no-default-features`.
 #
-# For the first four crates the empty selection IS the target's configuration,
+# For the first five crates the empty selection IS the target's configuration,
 # so they are absent here. `epics-bridge-rs` is the first crate for which that
 # is false, and silently, in the direction that reports green: with no features
 # at all it compiles `error`, `convert` and `lib.rs` and nothing else — the

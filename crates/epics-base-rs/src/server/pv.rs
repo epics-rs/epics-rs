@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -193,11 +193,16 @@ pub struct MonitorEvent {
     /// `ignore_origin` can filter out self-triggered events.
     /// Used to prevent sequencer write-back loops.
     ///
-    /// **Scope**: Currently tagged on `put_pv_and_post_with_origin` events only.
-    /// Events from `process_record_with_links` (process path) always have
-    /// origin=0. If a future sequencer needs to filter process-path events
-    /// too, origin tagging can be extended to the process path by passing
-    /// origin through `ProcessOutcome` or `process_record_with_links`.
+    /// **Scope**: tagged explicitly by the `put_*_post` tier
+    /// (`put_pv_and_post_with_origin`, records and simple PVs alike), and
+    /// inherited by every post inside the `put_*_process` tier's
+    /// synchronous put+process cascade through the thread-local ambient
+    /// write origin (`AmbientWriteOriginScope`) — both record funnels
+    /// (`notify_field_with_origin`, `notify_from_snapshot`) and the
+    /// simple-PV funnel (`ProcessVariable::deliver`) apply the same
+    /// inheritance rule. Posts from work a cascade merely spawned (async
+    /// record completions, driver pollers) run outside any scope and stay
+    /// origin 0.
     pub origin: u64,
     /// The `DBE_*` event class(es) this post carries — C attaches the
     /// posting mask to each event's field log (`db_field_log.mask`,
@@ -604,6 +609,15 @@ impl ProcessVariable {
 
     /// Set a new value and notify all subscribers.
     pub fn set(&self, new_value: EpicsValue) {
+        self.set_with_origin(new_value, 0);
+    }
+
+    /// [`Self::set`] tagged with the writer's origin: the value post carries
+    /// `origin` so an origin-aware consumer can recognise (and skip) the
+    /// writer's own event — the simple-PV side of the
+    /// `put_pv_and_post_with_origin` self-write contract. Origin 0 is the
+    /// untagged default (never filtered).
+    pub fn set_with_origin(&self, new_value: EpicsValue, origin: u64) {
         {
             let mut val = self.value.write();
             *val = new_value.clone();
@@ -612,7 +626,7 @@ impl ProcessVariable {
         // the bare-PV default so a stale full-snapshot's metadata does
         // not linger on a value the client never stamped.
         *self.posted_meta.write() = None;
-        self.notify_subscribers(new_value);
+        self.notify_subscribers(new_value, origin);
     }
 
     /// Set value from a full snapshot (value + alarm + timestamp) and notify
@@ -647,8 +661,19 @@ impl ProcessVariable {
     /// class differs per caller, nothing else. The snapshot is built once
     /// by the caller (one timestamp per logical event) and cloned per
     /// subscriber.
-    fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
+    fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot, origin: u64) {
         use crate::server::database::filters::FilteredMonitorEvent;
+        // Same ambient-origin inheritance as the record funnels
+        // (`notify_field_with_origin` / `notify_from_snapshot`): a post
+        // carrying no origin of its own inherits the current thread's
+        // ambient write origin, so a simple PV written from inside an
+        // in-process writer's synchronous put cascade tags its event
+        // with the writer's origin too. 0 outside any scope.
+        let origin = if origin != 0 {
+            origin
+        } else {
+            crate::server::record::ambient_write_origin()
+        };
         let mut subs = self.subscribers.lock();
         // Remove subscribers whose consumer has been dropped.
         subs.retain(|sub| !sub.is_closed());
@@ -666,7 +691,7 @@ impl ProcessVariable {
             }
             let event = MonitorEvent {
                 snapshot: snapshot.clone(),
-                origin: 0,
+                origin,
                 mask: post,
             };
             // The channel-filter chain may suppress this event (e.g.
@@ -703,7 +728,7 @@ impl ProcessVariable {
         let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
-        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot);
+        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot, 0);
     }
 
     /// Post a `DBE_PROPERTY` monitor event carrying the decoded upstream
@@ -728,16 +753,17 @@ impl ProcessVariable {
     pub async fn post_property(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
         self.apply_metadata(&mut snapshot);
-        self.deliver(EventMask::PROPERTY, snapshot);
+        self.deliver(EventMask::PROPERTY, snapshot, 0);
     }
 
-    /// Notify all subscribers of a new value.
-    fn notify_subscribers(&self, value: EpicsValue) {
+    /// Notify all subscribers of a new value, tagged with the writer's
+    /// `origin` (0 = untagged).
+    fn notify_subscribers(&self, value: EpicsValue, origin: u64) {
         use crate::server::recgbl::EventMask;
         let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
-        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot);
+        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot, origin);
     }
 
     /// Notify all subscribers using a pre-built Snapshot (value + alarm +
@@ -754,6 +780,7 @@ impl ProcessVariable {
         self.deliver(
             EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
             snapshot,
+            0,
         );
     }
 
@@ -1287,6 +1314,35 @@ mod metadata_tests {
 
     fn pv() -> ProcessVariable {
         ProcessVariable::new("m:pv".into(), EpicsValue::Double(1.0))
+    }
+
+    /// `set_with_origin` tags the value event with the writer's origin,
+    /// plain `set` stays untagged, and a plain `set` inside an
+    /// `AmbientWriteOriginScope` inherits the scope's origin — the
+    /// simple-PV side of the record funnels' inheritance rule.
+    #[tokio::test]
+    async fn set_with_origin_tags_the_value_event() {
+        const DBE_VALUE: u16 = 1;
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .expect("subscriber added");
+
+        pv.set(EpicsValue::Double(2.0));
+        assert_eq!(rx.try_recv().expect("plain set posts").origin, 0);
+
+        pv.set_with_origin(EpicsValue::Double(3.0), 77);
+        assert_eq!(rx.try_recv().expect("tagged set posts").origin, 77);
+
+        {
+            let _scope = crate::server::record::ambient_write_origin_scope(88);
+            pv.set(EpicsValue::Double(4.0));
+        }
+        assert_eq!(
+            rx.try_recv().expect("ambient-scoped set posts").origin,
+            88,
+            "an originless simple-PV post inside an ambient scope must inherit it"
+        );
     }
 
     /// A bare PV serves no metadata until a proxy installs it; after

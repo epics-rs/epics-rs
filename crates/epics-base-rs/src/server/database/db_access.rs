@@ -158,10 +158,21 @@ impl DbChannel {
     /// Use for motor VAL, busy records, etc. where processing drives hardware.
     /// Fire-and-forget — C `dbPutField` semantics; no put-notify is
     /// parked, so concurrent `ca_put_callback`s on the record stay legal.
+    ///
+    /// Carries the channel's `origin` (when set): every event the put's
+    /// synchronous process cascade posts is tagged with it, so a
+    /// `DbSubscription`/`DbMultiMonitor` filtering on the same origin does
+    /// not hear the writer's own put — same self-write contract as the
+    /// `put_*_post` tier.
     pub async fn put_f64_process(&self, v: f64) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
         self.db
-            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Double(v))
+            .put_record_field_from_ca_no_notify_with_origin(
+                record_name,
+                field,
+                EpicsValue::Double(v),
+                self.origin,
+            )
             .await
     }
 
@@ -169,7 +180,12 @@ impl DbChannel {
     pub async fn put_i16_process(&self, v: i16) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
         self.db
-            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Short(v))
+            .put_record_field_from_ca_no_notify_with_origin(
+                record_name,
+                field,
+                EpicsValue::Short(v),
+                self.origin,
+            )
             .await
     }
 
@@ -177,7 +193,12 @@ impl DbChannel {
     pub async fn put_i32_process(&self, v: i32) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
         self.db
-            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Long(v))
+            .put_record_field_from_ca_no_notify_with_origin(
+                record_name,
+                field,
+                EpicsValue::Long(v),
+                self.origin,
+            )
             .await
     }
 
@@ -185,10 +206,11 @@ impl DbChannel {
     pub async fn put_string_process(&self, v: &str) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
         self.db
-            .put_record_field_from_ca_no_notify(
+            .put_record_field_from_ca_no_notify_with_origin(
                 record_name,
                 field,
                 EpicsValue::String(v.to_string().into()),
+                self.origin,
             )
             .await
     }

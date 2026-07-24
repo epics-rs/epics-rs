@@ -970,14 +970,13 @@ impl PvDatabase {
         // shadow PVs, IOCsh stats PVs) are stored in `simple_pvs`,
         // not `records`. Without this branch the function would
         // silently return `ChannelNotFound` for every gateway-mirrored
-        // PV — `ProcessVariable::set` already does the
-        // notify-subscribers fan-out internally so all we need here is
-        // to delegate. The `origin` tag is a no-op for simple PVs
-        // because they don't yet plumb origin through `set`.
+        // PV — `ProcessVariable::set_with_origin` already does the
+        // notify-subscribers fan-out internally (tagging the event with
+        // `origin`, same self-write contract as the record branch) so
+        // all we need here is to delegate.
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
-            let _ = origin; // simple PVs don't currently honor origin tagging
-            pv.set(value);
+            pv.set_with_origin(value, origin);
             return Ok(());
         }
 
@@ -1242,7 +1241,26 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
+        self.put_record_field_from_ca_no_notify_with_origin(record_name, field, value, 0)
+            .await
+    }
+
+    /// [`Self::put_record_field_from_ca_no_notify`] for an in-process writer
+    /// with a self-write-filtering origin (a ported SNL state machine's
+    /// `DbChannel`): every event the put's synchronous process cascade posts
+    /// is tagged with `origin`, so the writer's own filtered subscriptions
+    /// skip them. The ambient scope is sound here because the body below is
+    /// fully synchronous — there is no await between entering the scope and
+    /// the cascade's last post.
+    pub async fn put_record_field_from_ca_no_notify_with_origin(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+        origin: u64,
+    ) -> CaResult<()> {
         let _record_gate = self.acquire_put_gate(record_name);
+        let _origin_scope = crate::server::record::ambient_write_origin_scope(origin);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
     }

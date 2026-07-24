@@ -441,18 +441,18 @@ pub async fn run(
     let n = config.num_filters;
 
     // Connect global PVs
-    let ch_status = DbChannel::new(&db, &format!("{pr}Status"));
-    let ch_trans = DbChannel::new(&db, &format!("{pr}Transmission"));
-    let ch_trans_up = DbChannel::new(&db, &format!("{pr}TransmissionUp"));
-    let ch_trans_down = DbChannel::new(&db, &format!("{pr}TransmissionDown"));
-    let ch_mask = DbChannel::new(&db, &format!("{pr}FilterMask"));
-    let ch_energy = DbChannel::new(&db, &format!("{pr}Energy"));
-    let ch_msg = DbChannel::new(&db, &format!("{pr}Message"));
-    let _ch_setpt = DbChannel::new(&db, &format!("{pr}TransmissionSetpoint"));
-    let ch_step_up = DbChannel::new(&db, &format!("{pr}TransmissionStepUp"));
-    let ch_step_down = DbChannel::new(&db, &format!("{pr}TransmissionStepDown"));
-    let _ch_mask_setpt = DbChannel::new(&db, &format!("{pr}FilterMaskSetpoint"));
-    let ch_wait_time = DbChannel::new(&db, &format!("{pr}WaitTime"));
+    let ch_status = DbChannel::with_origin(&db, &format!("{pr}Status"), my_origin);
+    let ch_trans = DbChannel::with_origin(&db, &format!("{pr}Transmission"), my_origin);
+    let ch_trans_up = DbChannel::with_origin(&db, &format!("{pr}TransmissionUp"), my_origin);
+    let ch_trans_down = DbChannel::with_origin(&db, &format!("{pr}TransmissionDown"), my_origin);
+    let ch_mask = DbChannel::with_origin(&db, &format!("{pr}FilterMask"), my_origin);
+    let ch_energy = DbChannel::with_origin(&db, &format!("{pr}Energy"), my_origin);
+    let ch_msg = DbChannel::with_origin(&db, &format!("{pr}Message"), my_origin);
+    let _ch_setpt = DbChannel::with_origin(&db, &format!("{pr}TransmissionSetpoint"), my_origin);
+    let ch_step_up = DbChannel::with_origin(&db, &format!("{pr}TransmissionStepUp"), my_origin);
+    let ch_step_down = DbChannel::with_origin(&db, &format!("{pr}TransmissionStepDown"), my_origin);
+    let _ch_mask_setpt = DbChannel::with_origin(&db, &format!("{pr}FilterMaskSetpoint"), my_origin);
+    let ch_wait_time = DbChannel::with_origin(&db, &format!("{pr}WaitTime"), my_origin);
 
     // Per-blade channels
     let mut ch_thick: Vec<DbChannel> = Vec::new();
@@ -464,13 +464,41 @@ pub async fn run(
     let mut ch_enbl: Vec<DbChannel> = Vec::new();
 
     for i in 1..=n {
-        ch_thick.push(DbChannel::new(&db, &config.blade_pv(i, "Thickness")));
-        ch_mater.push(DbChannel::new(&db, &config.blade_pv(i, "Material")));
-        ch_blade_trans.push(DbChannel::new(&db, &config.blade_pv(i, "Transmission")));
-        ch_set.push(DbChannel::new(&db, &config.blade_pv(i, "Set")));
-        ch_outget.push(DbChannel::new(&db, &config.blade_pv(i, "OutGet")));
-        ch_lock.push(DbChannel::new(&db, &config.blade_pv(i, "Lock")));
-        ch_enbl.push(DbChannel::new(&db, &config.blade_pv(i, "Enable")));
+        ch_thick.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Thickness"),
+            my_origin,
+        ));
+        ch_mater.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Material"),
+            my_origin,
+        ));
+        ch_blade_trans.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Transmission"),
+            my_origin,
+        ));
+        ch_set.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Set"),
+            my_origin,
+        ));
+        ch_outget.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "OutGet"),
+            my_origin,
+        ));
+        ch_lock.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Lock"),
+            my_origin,
+        ));
+        ch_enbl.push(DbChannel::with_origin(
+            &db,
+            &config.blade_pv(i, "Enable"),
+            my_origin,
+        ));
     }
 
     // Build multi-monitor
@@ -503,15 +531,17 @@ pub async fn run(
     ctrl.recalculate();
 
     // Publish initial values
-    let _ = ch_trans.put_f64(ctrl.transmission).await;
-    let _ = ch_trans_up.put_f64(ctrl.transmission_up).await;
-    let _ = ch_trans_down.put_f64(ctrl.transmission_down).await;
-    let _ = ch_mask.put_i16(ctrl.filter_mask as i32 as i16).await;
+    let _ = ch_trans.put_f64_process(ctrl.transmission).await;
+    let _ = ch_trans_up.put_f64_process(ctrl.transmission_up).await;
+    let _ = ch_trans_down.put_f64_process(ctrl.transmission_down).await;
+    let _ = ch_mask
+        .put_i16_process(ctrl.filter_mask as i32 as i16)
+        .await;
     for (ch_bt, blade) in ch_blade_trans.iter().zip(ctrl.blades.iter()).take(n) {
-        let _ = ch_bt.put_f64(blade.transmission).await;
+        let _ = ch_bt.put_f64_process(blade.transmission).await;
     }
-    let _ = ch_msg.put_string("Initialised").await;
-    let _ = ch_status.put_i16(0_i16).await;
+    let _ = ch_msg.put_string_process("Initialised").await;
+    let _ = ch_status.put_i16_process(0_i16).await;
 
     tracing::info!("filter_drive state machine running for {pr}");
 
@@ -562,7 +592,7 @@ pub async fn run(
                 }
 
                 FilterDriveEvent::TransmissionSetpoint(setpt) => {
-                    let _ = ch_status.put_i16(1_i16).await;
+                    let _ = ch_status.put_i16_process(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::SetTransmission, setpt, 0);
                     let wait_time = {
                         let v = ch_wait_time.get_f64().await;
@@ -570,12 +600,12 @@ pub async fn run(
                     };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
-                    let _ = ch_status.put_i16(0_i16).await;
+                    let _ = ch_status.put_i16_process(0_i16).await;
                 }
 
                 FilterDriveEvent::StepUp => {
-                    let _ = ch_step_up.put_i16(0_i16).await;
-                    let _ = ch_status.put_i16(1_i16).await;
+                    let _ = ch_step_up.put_i16_process(0_i16).await;
+                    let _ = ch_status.put_i16_process(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::StepUp, 0.0, 0);
                     let wait_time = {
                         let v = ch_wait_time.get_f64().await;
@@ -583,12 +613,12 @@ pub async fn run(
                     };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
-                    let _ = ch_status.put_i16(0_i16).await;
+                    let _ = ch_status.put_i16_process(0_i16).await;
                 }
 
                 FilterDriveEvent::StepDown => {
-                    let _ = ch_step_down.put_i16(0_i16).await;
-                    let _ = ch_status.put_i16(1_i16).await;
+                    let _ = ch_step_down.put_i16_process(0_i16).await;
+                    let _ = ch_status.put_i16_process(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::StepDown, 0.0, 0);
                     let wait_time = {
                         let v = ch_wait_time.get_f64().await;
@@ -596,11 +626,11 @@ pub async fn run(
                     };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
-                    let _ = ch_status.put_i16(0_i16).await;
+                    let _ = ch_status.put_i16_process(0_i16).await;
                 }
 
                 FilterDriveEvent::FilterMaskSetpoint(mask) => {
-                    let _ = ch_status.put_i16(1_i16).await;
+                    let _ = ch_status.put_i16_process(1_i16).await;
                     let changes = ctrl.execute_action(FilterAction::SetFilterMask, 0.0, mask);
                     let wait_time = {
                         let v = ch_wait_time.get_f64().await;
@@ -608,18 +638,20 @@ pub async fn run(
                     };
                     apply_filter_changes(&ch_set, &changes, wait_time).await;
                     ctrl.recalculate();
-                    let _ = ch_status.put_i16(0_i16).await;
+                    let _ = ch_status.put_i16_process(0_i16).await;
                 }
             }
 
             // Publish updated values
-            let _ = ch_trans.put_f64(ctrl.transmission).await;
-            let _ = ch_trans_up.put_f64(ctrl.transmission_up).await;
-            let _ = ch_trans_down.put_f64(ctrl.transmission_down).await;
-            let _ = ch_mask.put_i16(ctrl.filter_mask as i32 as i16).await;
-            let _ = ch_msg.put_string(ctrl.message.as_str()).await;
+            let _ = ch_trans.put_f64_process(ctrl.transmission).await;
+            let _ = ch_trans_up.put_f64_process(ctrl.transmission_up).await;
+            let _ = ch_trans_down.put_f64_process(ctrl.transmission_down).await;
+            let _ = ch_mask
+                .put_i16_process(ctrl.filter_mask as i32 as i16)
+                .await;
+            let _ = ch_msg.put_string_process(ctrl.message.as_str()).await;
             for (ch_bt, blade) in ch_blade_trans.iter().zip(ctrl.blades.iter()).take(n) {
-                let _ = ch_bt.put_f64(blade.transmission).await;
+                let _ = ch_bt.put_f64_process(blade.transmission).await;
             }
         }
     }
@@ -633,7 +665,7 @@ async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], w
     let mut any_insert = false;
     for &(idx, inserted) in changes {
         if inserted {
-            let _ = ch_set[idx].put_i16(1).await;
+            let _ = ch_set[idx].put_i16_process(1).await;
             any_insert = true;
         }
     }
@@ -645,7 +677,7 @@ async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], w
     let mut any_remove = false;
     for &(idx, inserted) in changes {
         if !inserted {
-            let _ = ch_set[idx].put_i16(0).await;
+            let _ = ch_set[idx].put_i16_process(0).await;
             any_remove = true;
         }
     }

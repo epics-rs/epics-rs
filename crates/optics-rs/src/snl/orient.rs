@@ -798,42 +798,42 @@ pub async fn run(
     let p = &config.prefix;
 
     // Connect motor channels
-    let ch_mot_tth = DbChannel::new(&db, &config.motor_tth);
-    let ch_mot_th = DbChannel::new(&db, &config.motor_th);
-    let ch_mot_chi = DbChannel::new(&db, &config.motor_chi);
-    let ch_mot_phi = DbChannel::new(&db, &config.motor_phi);
+    let ch_mot_tth = DbChannel::with_origin(&db, &config.motor_tth, my_origin);
+    let ch_mot_th = DbChannel::with_origin(&db, &config.motor_th, my_origin);
+    let ch_mot_chi = DbChannel::with_origin(&db, &config.motor_chi, my_origin);
+    let ch_mot_phi = DbChannel::with_origin(&db, &config.motor_phi, my_origin);
 
     // Motor readback channels
-    let ch_mot_tth_rbv = DbChannel::new(&db, &config.motor_tth_rbv());
-    let ch_mot_th_rbv = DbChannel::new(&db, &config.motor_th_rbv());
-    let ch_mot_chi_rbv = DbChannel::new(&db, &config.motor_chi_rbv());
-    let ch_mot_phi_rbv = DbChannel::new(&db, &config.motor_phi_rbv());
+    let ch_mot_tth_rbv = DbChannel::with_origin(&db, &config.motor_tth_rbv(), my_origin);
+    let ch_mot_th_rbv = DbChannel::with_origin(&db, &config.motor_th_rbv(), my_origin);
+    let ch_mot_chi_rbv = DbChannel::with_origin(&db, &config.motor_chi_rbv(), my_origin);
+    let ch_mot_phi_rbv = DbChannel::with_origin(&db, &config.motor_phi_rbv(), my_origin);
 
     // HKL channels
-    let ch_h = DbChannel::new(&db, &format!("{p}H"));
-    let ch_k = DbChannel::new(&db, &format!("{p}K"));
-    let ch_l = DbChannel::new(&db, &format!("{p}L"));
-    let ch_h_rbv = DbChannel::new(&db, &format!("{p}H_RBV"));
-    let ch_k_rbv = DbChannel::new(&db, &format!("{p}K_RBV"));
-    let ch_l_rbv = DbChannel::new(&db, &format!("{p}L_RBV"));
+    let ch_h = DbChannel::with_origin(&db, &format!("{p}H"), my_origin);
+    let ch_k = DbChannel::with_origin(&db, &format!("{p}K"), my_origin);
+    let ch_l = DbChannel::with_origin(&db, &format!("{p}L"), my_origin);
+    let ch_h_rbv = DbChannel::with_origin(&db, &format!("{p}H_RBV"), my_origin);
+    let ch_k_rbv = DbChannel::with_origin(&db, &format!("{p}K_RBV"), my_origin);
+    let ch_l_rbv = DbChannel::with_origin(&db, &format!("{p}L_RBV"), my_origin);
 
     // Trial angle channels
-    let ch_tth = DbChannel::new(&db, &format!("{p}TTH"));
-    let ch_th = DbChannel::new(&db, &format!("{p}TH"));
-    let ch_chi = DbChannel::new(&db, &format!("{p}CHI"));
-    let ch_phi = DbChannel::new(&db, &format!("{p}PHI"));
+    let ch_tth = DbChannel::with_origin(&db, &format!("{p}TTH"), my_origin);
+    let ch_th = DbChannel::with_origin(&db, &format!("{p}TH"), my_origin);
+    let ch_chi = DbChannel::with_origin(&db, &format!("{p}CHI"), my_origin);
+    let ch_phi = DbChannel::with_origin(&db, &format!("{p}PHI"), my_origin);
 
     // Energy / lambda
-    let ch_energy = DbChannel::new(&db, &format!("{p}energy"));
-    let _ch_lambda = DbChannel::new(&db, &format!("{p}lambda"));
+    let ch_energy = DbChannel::with_origin(&db, &format!("{p}energy"), my_origin);
+    let _ch_lambda = DbChannel::with_origin(&db, &format!("{p}lambda"), my_origin);
 
     // Crystal params
-    let ch_a = DbChannel::new(&db, &format!("{p}a"));
-    let ch_b = DbChannel::new(&db, &format!("{p}b"));
-    let ch_c = DbChannel::new(&db, &format!("{p}c"));
-    let ch_alpha = DbChannel::new(&db, &format!("{p}alpha"));
-    let ch_beta = DbChannel::new(&db, &format!("{p}beta"));
-    let ch_gamma = DbChannel::new(&db, &format!("{p}gamma"));
+    let ch_a = DbChannel::with_origin(&db, &format!("{p}a"), my_origin);
+    let ch_b = DbChannel::with_origin(&db, &format!("{p}b"), my_origin);
+    let ch_c = DbChannel::with_origin(&db, &format!("{p}c"), my_origin);
+    let ch_alpha = DbChannel::with_origin(&db, &format!("{p}alpha"), my_origin);
+    let ch_beta = DbChannel::with_origin(&db, &format!("{p}beta"), my_origin);
+    let ch_gamma = DbChannel::with_origin(&db, &format!("{p}gamma"), my_origin);
 
     // Computed-matrix element display PVs. C copies the A0 / OMTX arrays into
     // the per-element PVs {P}A0_11..A0_33 / {P}OMTX_11..OMTX_33 and pvPut's each
@@ -841,20 +841,24 @@ pub async fn run(
     // display readouts, so a posting put (value + monitor, no process) is the
     // C-faithful call.
     let ch_a0: [[DbChannel; 3]; 3] = std::array::from_fn(|i| {
-        std::array::from_fn(|j| DbChannel::new(&db, &format!("{p}A0_{}{}", i + 1, j + 1)))
+        std::array::from_fn(|j| {
+            DbChannel::with_origin(&db, &format!("{p}A0_{}{}", i + 1, j + 1), my_origin)
+        })
     });
     let ch_omtx: [[DbChannel; 3]; 3] = std::array::from_fn(|i| {
-        std::array::from_fn(|j| DbChannel::new(&db, &format!("{p}OMTX_{}{}", i + 1, j + 1)))
+        std::array::from_fn(|j| {
+            DbChannel::with_origin(&db, &format!("{p}OMTX_{}{}", i + 1, j + 1), my_origin)
+        })
     });
 
     // Mode, busy, message
-    let _ch_mode = DbChannel::new(&db, &format!("{p}Mode"));
-    let ch_busy = DbChannel::new(&db, &format!("{p}Busy"));
-    let ch_msg = DbChannel::new(&db, &format!("{p}Msg"));
-    let _ch_mot_put = DbChannel::new(&db, &format!("{p}motPut"));
-    let _ch_mot_get = DbChannel::new(&db, &format!("{p}motGet"));
-    let ch_mot_put_auto = DbChannel::new(&db, &format!("{p}motPut_Auto"));
-    let ch_mot_get_auto = DbChannel::new(&db, &format!("{p}motGet_Auto"));
+    let _ch_mode = DbChannel::with_origin(&db, &format!("{p}Mode"), my_origin);
+    let ch_busy = DbChannel::with_origin(&db, &format!("{p}Busy"), my_origin);
+    let ch_msg = DbChannel::with_origin(&db, &format!("{p}Msg"), my_origin);
+    let _ch_mot_put = DbChannel::with_origin(&db, &format!("{p}motPut"), my_origin);
+    let _ch_mot_get = DbChannel::with_origin(&db, &format!("{p}motGet"), my_origin);
+    let ch_mot_put_auto = DbChannel::with_origin(&db, &format!("{p}motPut_Auto"), my_origin);
+    let ch_mot_get_auto = DbChannel::with_origin(&db, &format!("{p}motGet_Auto"), my_origin);
 
     // Build multi-monitor
     let monitored_pvs: Vec<String> = vec![
@@ -924,7 +928,7 @@ pub async fn run(
     ctrl.recalc_a0();
     ctrl.recalc_omtx();
 
-    let _ = ch_msg.put_string("Orient initialized").await;
+    let _ = ch_msg.put_string_process("Orient initialized").await;
     tracing::info!("orient state machine running for {p}");
 
     // PV name constants
@@ -1031,14 +1035,14 @@ pub async fn run(
 
             // Apply actions
             if let Some(msg) = &actions.message {
-                let _ = ch_msg.put_string(msg.as_str()).await;
+                let _ = ch_msg.put_string_process(msg.as_str()).await;
             }
             if let Some(a0) = actions.write_a0 {
                 // C: A0[i][j] -> {P}A0_ij, pvPut each (orient_st.st:497-503,
                 // 671-679). NOT into {P}a, which is a user lattice-param input.
                 for (i, row) in ch_a0.iter().enumerate() {
                     for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_post(a0[i][j]).await;
+                        let _ = ch.put_f64_process(a0[i][j]).await;
                     }
                 }
             }
@@ -1046,20 +1050,20 @@ pub async fn run(
                 // C: OMTX[i][j] -> {P}OMTX_ij, pvPut each (orient_st.st:534-539).
                 for (i, row) in ch_omtx.iter().enumerate() {
                     for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_post(omtx[i][j]).await;
+                        let _ = ch.put_f64_process(omtx[i][j]).await;
                     }
                 }
             }
             if let Some(hkl) = actions.write_hkl {
-                let _ = ch_h.put_f64(hkl[0]).await;
-                let _ = ch_k.put_f64(hkl[1]).await;
-                let _ = ch_l.put_f64(hkl[2]).await;
+                let _ = ch_h.put_f64_process(hkl[0]).await;
+                let _ = ch_k.put_f64_process(hkl[1]).await;
+                let _ = ch_l.put_f64_process(hkl[2]).await;
             }
             if let Some(ang) = actions.write_angles {
-                let _ = ch_tth.put_f64(ang[0]).await;
-                let _ = ch_th.put_f64(ang[1]).await;
-                let _ = ch_chi.put_f64(ang[2]).await;
-                let _ = ch_phi.put_f64(ang[3]).await;
+                let _ = ch_tth.put_f64_process(ang[0]).await;
+                let _ = ch_th.put_f64_process(ang[1]).await;
+                let _ = ch_chi.put_f64_process(ang[2]).await;
+                let _ = ch_phi.put_f64_process(ang[3]).await;
             }
             if let Some(motors) = actions.drive_motors {
                 let _ = ch_mot_tth.put_f64_process(motors[0]).await;
@@ -1069,12 +1073,12 @@ pub async fn run(
                 ctrl.waiting_for_motors = true;
             }
             if let Some(b) = actions.busy_changed {
-                let _ = ch_busy.put_i16(if b { 1 } else { 0 }).await;
+                let _ = ch_busy.put_i16_process(if b { 1 } else { 0 }).await;
             }
             if let Some(rbv) = actions.write_hkl_rbv {
-                let _ = ch_h_rbv.put_f64(rbv[0]).await;
-                let _ = ch_k_rbv.put_f64(rbv[1]).await;
-                let _ = ch_l_rbv.put_f64(rbv[2]).await;
+                let _ = ch_h_rbv.put_f64_process(rbv[0]).await;
+                let _ = ch_k_rbv.put_f64_process(rbv[1]).await;
+                let _ = ch_l_rbv.put_f64_process(rbv[2]).await;
             }
         }
     }

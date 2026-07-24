@@ -9,6 +9,24 @@ non-RTEMS target it is empty and costs a host build nothing.
 This README is the build manual for the RTEMS target. The crate-level rustdoc
 (`src/lib.rs`) documents the boot/link contract itself.
 
+## Why an RTEMS-named crate has a VxWorks file in it
+
+`src/stats/` is the IOC statistics funnel — descriptor and heap usage for the
+status PVs, plus the console census (`rt top` / `rt stackuse` / a descriptor
+listing) that a target with no shell has no other way to produce. It is *not*
+RTEMS-specific: it has one backend per OS (`rtems.rs`, `vxworks.rs`,
+`unsupported.rs`) behind a single set of entry points, so `status_pv` and both
+IOC binaries have one uncfg'd call site each.
+
+It lives here rather than in `epics-libcom-rs`, the workspace's os-portability
+crate, for one reason that is not a preference: the RTEMS backend's symbols
+exist only when *this* package's build script compiled `csrc/rtems_stats.c`,
+and it says so by emitting `rtems_boot_linked` — a cfg only the crate it is
+emitted for can see. Any other home would have to re-derive "was the C
+compiled" from a second copy of the BSP-prefix resolution, which is how the
+link contract stops having one source of truth. The boot glue itself stays
+RTEMS-only; nothing in `csrc/` is compiled for any other target.
+
 ## Prerequisites
 
 | what | needed for | notes |

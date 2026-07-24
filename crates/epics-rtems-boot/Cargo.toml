@@ -2,7 +2,7 @@
 name = "epics-rtems-boot"
 version.workspace = true
 edition.workspace = true
-description = "RTEMS boot shim (POSIX_Init + kernel configuration) and link contract for epics-rs IOCs"
+description = "RTEMS boot shim (POSIX_Init + kernel configuration), link contract, and the per-OS IOC statistics funnel for epics-rs IOCs"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true

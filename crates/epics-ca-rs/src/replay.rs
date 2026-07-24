@@ -26,8 +26,6 @@
 //! {"ts":1714200002.000,"ev":"client_disconnect","peer":"10.0.0.6:54311"}
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -308,7 +306,7 @@ mod tests {
         assert!(RecordedEvent::from_json(line).is_none());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn record_then_replay_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rec.jsonl");

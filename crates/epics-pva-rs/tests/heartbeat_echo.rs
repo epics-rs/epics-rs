@@ -20,7 +20,6 @@
 //! nextest profile rather than the gated `interop` suites.
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::io::{Cursor, Read};
 use std::net::TcpStream;
 use std::sync::Arc;

@@ -24,8 +24,9 @@
 //!   paths (`cac::defaultExcep` → `tcpiiu::getHostName`) print exactly that:
 //!   the dotted IP until the engine has answered, the name afterwards.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): the flavored test asserts resolution inside a
+// multi-thread tokio runtime. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
@@ -252,7 +253,7 @@ mod tests {
 
     /// The non-blocking half answers immediately on a cold cache — with the
     /// dotted IP, as libca does before its engine replies.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn the_cache_answers_without_blocking_on_a_miss() {
         let a: SocketAddr = "192.0.2.2:5064".parse().unwrap();
         assert_eq!(cached_name(a), "192.0.2.2:5064");

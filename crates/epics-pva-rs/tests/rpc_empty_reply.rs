@@ -17,9 +17,8 @@
 //! unconditionally decoded a descriptor, so a pvxs server replying with the
 //! no-value form failed the decode. `RpcReply` now models both overloads.
 
-#![cfg(test)]
-
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(test)]
 
 use std::sync::Arc;
 use std::time::Duration;

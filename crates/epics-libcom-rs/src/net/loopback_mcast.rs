@@ -19,8 +19,9 @@
 //! `udp_collector.cpp:561-567` (forward send), `evhelper.cpp:519-585`
 //! (mcast option setters).
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(3): every test binds tokio::net UDP sockets, which
+// need a reactor the exec backend does not start; under the feature these
+// still run on the tokio driver `#[tokio::test]` builds, and pass.
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 

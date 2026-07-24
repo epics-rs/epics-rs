@@ -3,8 +3,6 @@
 //! Uses our own [`crate::pvdata`] types, so only native types appear in the
 //! public surface.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -2751,7 +2749,7 @@ mod tests {
     /// (capacity 1024, one message per name) silently dropped names past the
     /// ring on a large flush; this unbounded per-connection queue cannot. Far
     /// exceed the old 1024 cap before draining, then assert nothing was lost.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidator_never_drops_under_backlog() {
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
@@ -2774,7 +2772,7 @@ mod tests {
     /// One removal command publishes its whole removed set as a single batch,
     /// regardless of how many entries it cleared — the per-name → snapshot
     /// shape change that lets a full-cache `:flush` ride in one message.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidator_delivers_one_batch_per_command() {
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
@@ -2789,7 +2787,7 @@ mod tests {
 
     /// Fan-out reaches every live subscriber, and an empty batch is a no-op
     /// (a `:flush` of an empty cache publishes nothing).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidator_fans_out_and_skips_empty() {
         let inv = ChannelInvalidator::new();
         let mut a = inv.subscribe();
@@ -2813,7 +2811,7 @@ mod tests {
     /// A subscriber whose receiver was dropped is pruned on the next publish,
     /// so a high connection-churn workload does not grow the registry. The
     /// surviving subscriber keeps receiving.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidator_prunes_dropped_subscribers() {
         let inv = ChannelInvalidator::new();
         let dead = inv.subscribe();

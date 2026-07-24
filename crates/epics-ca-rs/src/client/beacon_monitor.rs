@@ -1,5 +1,6 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(4): the four flavored tests drive tokio::net
+// UDP beacon traffic, which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};

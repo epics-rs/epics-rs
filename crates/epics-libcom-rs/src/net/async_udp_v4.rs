@@ -37,8 +37,9 @@
 //! socket-per-NIC mapping (e.g. for diagnostics or NS-driven response
 //! correlation).
 
-// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(14): every test binds tokio::net UDP sockets, which
+// need a reactor the exec backend does not start; under the feature these
+// still run on the tokio driver `#[tokio::test]` builds, and pass.
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;

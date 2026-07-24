@@ -3,7 +3,6 @@
 //! Built on top of the native runtime in [`crate::server_native`].
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -11,7 +11,6 @@
 //! tests guard against.
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::time::Duration;
 

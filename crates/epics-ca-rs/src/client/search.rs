@@ -1,11 +1,8 @@
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these two run and pass in the feature-ON
-// suite. The rest of this file's async tests drive the UDP SEARCH transport,
-// which only exists on `tokio_backend`, so they carry that gate and the census
-// no longer vouches for them feature-ON.
-// The sixth tokio::test (stage_c1_name_servers_only_resolves_without_binding_udp)
-// is per-test #[cfg(not(feature = "rtems-exec-model"))] — its TCP name-server
-// resolution cannot run on the exec backend until Stage C2/C3 — so it is not one
-// of the five ungated sites this count covers.
+// The remaining #[tokio::test]s here are mod-gated to `tokio_backend`: they
+// drive the UDP SEARCH transport, which only exists there. The one per-test
+// #[cfg(not(feature = "rtems-exec-model"))] site
+// (stage_c1_name_servers_only_resolves_without_binding_udp) cannot run on the
+// exec backend until Stage C2/C3.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -2211,7 +2208,7 @@ mod tests {
     /// `ns_try_send` drops the frame instead of blocking or queuing.
     /// This test exercises the helper directly: with a 2-slot channel
     /// and no consumer, the third send must drop.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn nameserver_queue_drops_when_full_no_leak() {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
         ns_try_send(&tx, vec![1, 2, 3]);
@@ -2228,7 +2225,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn nameserver_queue_handles_closed_receiver() {
         // Receiver dropped — ns_try_send must not panic.
         let (tx, rx) = mpsc::channel::<Vec<u8>>(2);
@@ -2283,7 +2280,7 @@ mod tests {
     /// sum type is that there is no way to hold UDP destinations without the
     /// socket that would transmit to them.
     #[cfg(all(feature = "client", tokio_backend))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn add_then_remove_address_round_trip() {
         let mut state = SearchEngineState::new();
         let mut transport = SearchTransport::bind_udp(Vec::new()).expect("bind UDP transport");

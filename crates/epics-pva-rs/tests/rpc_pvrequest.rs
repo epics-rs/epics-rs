@@ -13,9 +13,8 @@
 //! the INIT was answered with `Status::Error "invalid pvRequest mask: …"` —
 //! the RPC never ran.
 
-#![cfg(test)]
-
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(test)]
 
 use std::sync::Arc;
 use std::time::Duration;

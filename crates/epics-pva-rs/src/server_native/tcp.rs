@@ -20,8 +20,7 @@
 //! No socket type is named anywhere in this file's production scope, and
 //! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
-// RTEMS-EXEC-MODEL-ALLOW(94): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9895,7 +9894,7 @@ mod tests {
     /// per-op Status and returned `Ok(())`, leaving a malformed-INIT peer
     /// free to keep reusing the connection. Verified for both GET and
     /// MONITOR via a present-but-truncated pvRequest value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn init_malformed_pvrequest_value_is_connection_fatal() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -9990,7 +9989,7 @@ mod tests {
     /// no op reply, no IOID registration. The prior cursor-exhausted
     /// short-circuit to `Ok(None)` accepted the frame and could register
     /// the op while silently dropping the create-time options.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn init_descriptor_only_pvrequest_value_is_connection_fatal() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -10084,7 +10083,7 @@ mod tests {
     /// descriptor needs NO bytes is NOT fatal — it registers the op and
     /// replies, exactly as before. Guards the `decode_init_pv_request_value`
     /// fix against over-firing on the common default GET/MONITOR INIT.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn init_empty_selector_descriptor_only_registers_op() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -10177,7 +10176,7 @@ mod tests {
     /// Rust rejected it as a decode error, which the read loop treats as
     /// connection-fatal — tearing down every other channel and operation
     /// multiplexed on that circuit.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn init_null_pvrequest_descriptor_is_wildcard_not_fatal() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -11044,7 +11043,7 @@ mod tests {
     /// receive a reply subcmd of exactly `0x08` — pvxs never sets `0x80` on
     /// a server→client monitor frame. (GET/PUT/RPC replies echo their inbound
     /// INIT subcmd, which is already `0x08`, so the strip is monitor-only.)
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_pipeline_init_reply_subcmd_strips_pipeline_bit() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -11169,7 +11168,7 @@ mod tests {
 
     /// Owner path: `MonitorPipelineCredit::take` consumes exactly one window
     /// slot per call, and `available()` reports the gate the emit arm reads.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_pipeline_credit_take_decrements_window() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(2));
@@ -11258,7 +11257,7 @@ mod tests {
 
     /// Owner path: a non-pipeline monitor (no window) is always emit-eligible,
     /// never waits, and touches no counter.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_pipeline_credit_no_window_is_no_op() {
         use std::sync::atomic::AtomicU64;
         let wm_seq = Arc::new(AtomicU64::new(1));
@@ -13163,7 +13162,7 @@ mod tests {
     /// is `!M.good()` → `bev.reset()` (connection-fatal). The previous
     /// `unwrap_or(4)` fabricated 4 credits from a malformed ACK on a live
     /// monitor, silently corrupting the flow-control window.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_ack_truncated_payload_is_fatal() {
         use std::sync::atomic::AtomicU32;
         let order = ByteOrder::Little;
@@ -13215,7 +13214,7 @@ mod tests {
 
     /// A well-formed MONITOR ACK refills the pipeline window by exactly
     /// the decoded count — no fabricated default.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_ack_well_formed_refills_window_by_count() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let order = ByteOrder::Little;
@@ -13267,7 +13266,7 @@ mod tests {
     /// `fetch_add` would wrap to a tiny value, leaving `acquire`'s view
     /// of the credit far below what the watermark logic computed in
     /// `usize` — the divergence pvxs avoids with a `size_t` window.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_ack_refill_saturates_instead_of_wrapping() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let order = ByteOrder::Little;
@@ -13440,7 +13439,7 @@ mod tests {
     /// (servermon.cpp:599-608) reads/validates the ACK count before any op
     /// lookup or `onStart`. Pre-fix the START block ran first, clearing the
     /// pause and firing `notify_monitor_start(true)` before the decode error.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_combined_ack_start_truncated_no_side_effect() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         let order = ByteOrder::Little;
@@ -13516,7 +13515,7 @@ mod tests {
     /// stays cleared and `notify_monitor_start(false)` never fires. Pre-fix the
     /// STOP block stored `monitor_paused=true` and fired the stop edge before
     /// the decode error.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_combined_ack_stop_truncated_no_side_effect() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         let order = ByteOrder::Little;
@@ -13591,7 +13590,7 @@ mod tests {
     /// pvxs (servermon.cpp:643-689) applies ACK refill THEN START, so the
     /// `onHighMark` (Resume watermark) precedes `onStart`. Pre-fix the START
     /// block ran first, reversing the order to [start, watermark].
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_combined_ack_start_wellformed_acks_before_start() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         let order = ByteOrder::Little;
@@ -13717,7 +13716,7 @@ mod tests {
     /// Both sub-cases are asserted: without `MustReply` the response still
     /// carries the found CID (because the match is real, not a forced
     /// probe-reply), and with `MustReply` it likewise carries the CID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn tcp_search_does_not_gate_on_advertised_protocol() {
         use crate::decode::{decode_search_response, try_parse_frame};
         use crate::server_native::{SharedPV, SharedSource};
@@ -13785,7 +13784,7 @@ mod tests {
     /// into a reply-to-everything path — a genuine name miss is still
     /// silent (pvxs serverchan.cpp:240-249 only replies on a match or
     /// MustReply).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn tcp_search_unknown_name_without_mustreply_is_silent() {
         use crate::server_native::{SharedPV, SharedSource};
 
@@ -14056,7 +14055,7 @@ mod tests {
     // sites it stands in for (`finish_exec_data_task`, `monitor_abort`) take
     // their handle from the seam and do compile on both backends.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_request_pauses_monitor_without_aborting() {
         // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
         // transitions Executing→Idle and fires onCancel, but the
@@ -14186,7 +14185,7 @@ mod tests {
     // `JoinError::is_cancelled` readout, neither of which exists on the
     // executor backend.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task() {
         let order = ByteOrder::Little;
         let sid: u32 = 5;
@@ -14864,7 +14863,7 @@ mod tests {
     /// `OK` echo back even for SIDs we never created, which both
     /// amplifies (1:1) and confuses correctness diagnostics in the
     /// client.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn destroy_channel_on_unknown_sid_emits_no_reply() {
         let order = ByteOrder::Little;
         let unknown_sid: u32 = 4242;
@@ -14903,7 +14902,7 @@ mod tests {
     /// (`serverchan.cpp:399-411`). The unknown-SID guard above must
     /// not regress this path: when the SID exists, the reply still
     /// fires.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn destroy_channel_on_known_sid_emits_echo() {
         let order = ByteOrder::Little;
         let sid: u32 = 11;
@@ -14960,7 +14959,7 @@ mod tests {
     /// the handler decoded the payload with the little-endian config order,
     /// byte-swapping the SID into a value no channel owned — silently
     /// dropping the request.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn handle_destroy_channel_decodes_with_frame_header_order_not_config() {
         let config_order = ByteOrder::Little;
         let inbound_order = ByteOrder::Big;
@@ -15017,7 +15016,7 @@ mod tests {
     /// decode its SID/IOID/ack-count from the frame header order. Before
     /// the fix the SID/IOID byte-swapped, the ACK matched no live op, and
     /// the credit window was never refilled.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_ack_decodes_with_frame_header_order_not_config() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let config_order = ByteOrder::Little;
@@ -15074,7 +15073,7 @@ mod tests {
     /// source could never observe a channel closing: per-channel leases,
     /// upstream identities, and credential-scoped caches leaked for the
     /// life of the process.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn destroy_channel_notifies_bound_source_once() {
         struct RecordingCloseSource {
             closed: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -15269,7 +15268,7 @@ mod tests {
     /// snapshots the dispatch-time credential into
     /// `CreateChannelCompletion::open_cred`, and the read loop fires the open
     /// callback from the channel's stored `open_cred`, never the current `cred`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn reauth_channel_open_callback_pinned_to_create_credential() {
         let order = ByteOrder::Little;
         let opened = empty_cred_log();
@@ -15361,7 +15360,7 @@ mod tests {
     /// DESTROY_CHANNEL after the connection re-authed to `bob/ca` must deliver
     /// `notify_channel_close` under Alice — the close identity comes from the
     /// channel's stored `open_cred`, not the connection's current credential.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn reauth_client_destroy_close_pinned_to_create_credential() {
         let order = ByteOrder::Little;
         let sid: u32 = 7;
@@ -15424,7 +15423,7 @@ mod tests {
     /// DESTROY_CHANNEL). It must also deliver `notify_channel_close` under the
     /// channel's CREATE-time identity, not whatever the connection last
     /// re-authed to.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn reauth_server_teardown_close_pinned_to_create_credential() {
         let order = ByteOrder::Little;
         let sid: u32 = 3;
@@ -15485,7 +15484,7 @@ mod tests {
     /// from `conn->cred`). A GET on a channel opened under `alice/ca`, executed
     /// after the connection re-authed to `bob/ca`, must run its ACF check as
     /// Bob — proving the fix did not over-pin operations to `open_cred`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn reauth_get_op_uses_current_connection_credential() {
         let order = ByteOrder::Little;
         let sid: u32 = 11;
@@ -15573,7 +15572,7 @@ mod tests {
     /// lingered and silently rebound to a re-created cache entry on the next
     /// event. Asserts the single-owner teardown removed only the match, sent
     /// a DESTROY_CHANNEL addressing it, and released only its report count.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidate_named_channels_force_disconnects_only_matching_name() {
         let order = ByteOrder::Little;
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
@@ -15650,7 +15649,7 @@ mod tests {
     /// no-op — no teardown, no frame. The invalidation broadcast is
     /// server-wide, so most connections hold no channel under a given
     /// dropped name and must not be disturbed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn invalidate_named_channels_unknown_name_is_noop() {
         let order = ByteOrder::Little;
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
@@ -15703,7 +15702,7 @@ mod tests {
     /// 0x00 makes the client decode the wrong shape: the bitset + value
     /// bytes carried in the frame are misread as trailing garbage and
     /// the PUT_GET readback is silently lost.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_get_response_echoes_request_subcmd() {
         use crate::pvdata::FieldDesc;
         use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
@@ -15839,7 +15838,7 @@ mod tests {
     /// still emit `subcmd=0x00` in the response. Confirms the echo
     /// behaviour is symmetric — neither leaking 0x40 when not requested
     /// nor regressing the common case.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_exec_response_echoes_zero_subcmd() {
         use crate::pvdata::FieldDesc;
         use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
@@ -15970,7 +15969,7 @@ mod tests {
     /// IOID at spawn time would let a re-INIT racing a slow source collide
     /// with the still-in-flight reply on one IOID. A plain GET EXEC (no
     /// `0x10`) returns the op to `Idle` on completion.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_exec_last_request_defers_op_removal_until_response_sent() {
         use crate::pvdata::FieldDesc;
         use crate::pvdata::{PvField, PvStructure, ScalarType, ScalarValue};
@@ -16153,7 +16152,7 @@ mod tests {
     /// reference made by a later operation. The negative control proves the
     /// shared cache is what closes the gap: a *fresh* cache (the pre-fix
     /// per-call behaviour) rejects the reference with a typecache miss.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn init_pv_request_descriptor_resolves_cached_reference_across_ops() {
         use crate::pvdata::FieldDesc;
         use crate::pvdata::encode::{decode_type_desc_cached, encode_type_desc};
@@ -16525,7 +16524,7 @@ mod tests {
     /// marking only `b` must produce `(10,99,30)`. Before the fix the
     /// default read the prior through `get_value`, so `a`/`c`
     /// collapsed to `0` (the wrong-context value).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r3_put_delta_default_merges_under_credentialed_read() {
         use crate::proto::BitSet;
         use crate::server_native::source::{
@@ -16646,7 +16645,7 @@ mod tests {
     /// Before the fix this test fails: a full-structure decode of a
     /// single-field-wide payload either errors (short read) or
     /// misreads `b`'s bytes as `a` and clobbers `b`/`c` with garbage.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_delta_multi_field_applies_only_changed_field() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -16777,7 +16776,7 @@ mod tests {
     /// cmd 12). A 3-field structure PUT_GET where only field `c`
     /// (bit 3) changed must apply exactly `c` and leave `a`/`b`
     /// intact, and the readback must reflect the merged value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_get_delta_multi_field_applies_only_changed_field() {
         use crate::server_native::SharedSource;
         use crate::server_native::runtime::PvaServerConfig;
@@ -17480,7 +17479,7 @@ mod tests {
     /// `""` as the authority to `AccessGate::check`, so the
     /// matching-CA peer failed `authority_match` and was wrongly
     /// denied — its `process` hook never ran.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_honors_authority_scoped_write_rule() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -17540,7 +17539,7 @@ mod tests {
     /// does NOT match the `AUTHORITY("MyCA")` rule gets PROCESS
     /// denied and the `process` hook never runs. Confirms the fix
     /// forwards the real authority rather than blanket-granting.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_denied_for_wrong_authority() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -17631,7 +17630,7 @@ mod tests {
     /// triggering record processing on an op that never negotiated
     /// PROCESS. pvxs `serverget.cpp:421-436` resets the connection on
     /// a wrong-kind IOID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r5_process_data_rejects_get_initialised_ioid() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -17677,7 +17676,7 @@ mod tests {
 
     /// Regression: `handle_process` must also reject a PROCESS
     /// data frame against a MONITOR-initialised IOID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r5_process_data_rejects_monitor_initialised_ioid() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -17808,7 +17807,7 @@ mod tests {
     /// op reply and registering no IOID. The previous
     /// `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..).ok())`
     /// swallowed the value error and registered the op with `Status::ok()`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr8_process_init_truncated_value_rejected_and_unregistered() {
         let order = ByteOrder::Little;
         // Valid Int descriptor, then a truncated (2-byte) i32 value.
@@ -17833,7 +17832,7 @@ mod tests {
     /// (empty body after subcmd) is a peer wire-decode fault —
     /// connection-fatal, not registered, no reply (pvxs faults the buffer
     /// and `bev.reset()`s).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr8_process_init_missing_descriptor_rejected_and_unregistered() {
         let order = ByteOrder::Little;
         let (fatal, registered, reply) = run_process_init(1, 701, &[], order).await;
@@ -17852,7 +17851,7 @@ mod tests {
     /// client's shape — descriptor + value) is accepted, registers the
     /// IOID, and replies `Status::ok()`. Guards against the rejection
     /// path over-firing on valid input.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr8_process_init_valid_pvrequest_registers_op() {
         let order = ByteOrder::Little;
         let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
@@ -17881,7 +17880,7 @@ mod tests {
     /// (`dataencode.cpp:747-752`, `serverget.cpp:371-375`): connection-fatal,
     /// not registered, no reply. The prior cursor-exhausted short-circuit to
     /// `Ok(None)` accepted it and registered the op with `Status::ok()`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_init_descriptor_only_value_rejected_and_unregistered() {
         let order = ByteOrder::Little;
         // Scalar Int descriptor, no value bytes.
@@ -17954,7 +17953,7 @@ mod tests {
     /// `from_wire_type_value` wire fault — connection-fatal, not registered,
     /// no reply. The decode runs before `channel_array_init`, so the fault
     /// fires at the wire boundary exactly as pvxs `bev.reset()` does.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn array_init_descriptor_only_value_rejected_and_unregistered() {
         let order = ByteOrder::Little;
         // Scalar Int descriptor, no value bytes.
@@ -17979,7 +17978,7 @@ mod tests {
     /// operation class (here a GET). Before the fix it extracted
     /// `(intro, mask)` from whatever op existed and performed a
     /// write/readback the operation never negotiated as a PUT_GET.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r5_put_get_data_rejects_get_initialised_ioid() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -18033,7 +18032,7 @@ mod tests {
 
     /// Regression: `handle_put_get` must also reject a PUT_GET
     /// data frame against a PUT-initialised IOID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r5_put_get_data_rejects_put_initialised_ioid() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -18093,7 +18092,7 @@ mod tests {
     /// the peer with the matching CA gets BOTH a successful PUT leg
     /// and a non-empty readback — exercising the fixed GET-leg
     /// `&ctx.authority` forwarding.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_get_readback_honors_authority() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -18201,7 +18200,7 @@ mod tests {
     /// it as a pure destroy and returned before `process_checked` ran, so the
     /// client received no processDone reply. The op must execute, reply, and
     /// only then release its IOID via the deferred completion owner.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_process_last_request_executes_then_defers_destroy() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 700u32);
@@ -18282,7 +18281,7 @@ mod tests {
     /// Pre-fix the handler treated the bit as a pure destroy, so the client
     /// got no write, no readback, and no status reply. The op must execute,
     /// reply, and only then release its IOID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_put_get_last_request_executes_then_defers_destroy() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 701u32);
@@ -18392,7 +18391,7 @@ mod tests {
     /// GET/PUT/MONITOR/RPC in the same channel still fired back a
     /// fabricated introspection reply, polluting the wire conversation
     /// on the busy IOID.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_field_ioid_collision_with_active_op_drops_reply() {
         use crate::pvdata::FieldDesc;
         use crate::server_native::SharedSource;
@@ -18481,7 +18480,7 @@ mod tests {
     /// Companion: GET_FIELD on a CLEAN IOID (not in the channel's ops
     /// map) still emits the introspection reply. Confirms the
     /// collision guard doesn't regress the happy path.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_field_clean_ioid_emits_reply() {
         use crate::pvdata::FieldDesc;
         use crate::server_native::SharedSource;
@@ -18544,7 +18543,7 @@ mod tests {
     /// real handler and reads back the SHARED `ChannelStat` Arc the report
     /// would observe, so a future send site that bypasses `chan_tx` (or an
     /// rx charge that drops the 8-byte header) regresses this test.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_field_attributes_tx_rx_to_channel_stat() {
         use crate::pvdata::FieldDesc;
         use crate::server_native::SharedSource;
@@ -18654,7 +18653,7 @@ mod tests {
     /// report entry. One case per `DestroyCause` boundary; before the fix a
     /// single finalizer charged the channel reply unconditionally, so the
     /// client case over-counted.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn destroy_channel_tx_attribution_splits_by_cause() {
         use std::sync::atomic::Ordering;
         let order = ByteOrder::Little;
@@ -18728,7 +18727,7 @@ mod tests {
     /// Error)` (`serverintrospect.cpp:83-87`) and the `if(type)` guard at
     /// `:41-42`. The old `unwrap_or(FieldDesc::Variant)` reported success
     /// and fabricated a Variant type tree.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_field_none_introspection_replies_error_no_descriptor() {
         use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::server_native::SharedSource;
@@ -18799,7 +18798,7 @@ mod tests {
     /// Companion: a successful GET_FIELD slow path still returns the
     /// exact descriptor the source provided (no regression from the
     /// error-path fix).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_field_slow_path_returns_source_descriptor() {
         use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -18882,7 +18881,7 @@ mod tests {
     /// spawns a second task — only one reply reaches the client. Mirrors
     /// pvxs `opByIOID.find(ioid)!=end()` rejection (serverintrospect.cpp:157)
     /// once the introspect op is inserted Executing (:164-178).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn slow_get_field_reserves_ioid_against_duplicate() {
         use crate::pvdata::FieldDesc;
         use crate::server_native::source::ChannelSource;
@@ -19934,7 +19933,7 @@ mod tests {
     /// a GET whose source read fails during the data phase
     /// replies with the request's data subcmd `0x00` and an error
     /// status — not an INIT `0x08` frame.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr13_get_data_phase_error_echoes_data_subcmd() {
         use crate::server_native::runtime::PvaServerConfig;
         use crate::server_native::tcp::ClientCredentials;
@@ -20037,7 +20036,7 @@ mod tests {
     /// An IOID already live on one channel makes an INIT reusing it on a
     /// *different* channel connection-fatal — pvxs scopes IOIDs to
     /// `ServerConn::opByIOID`, not per channel (serverget.cpp:378-384).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_conn_wide_ioid_init_duplicate_across_channels_is_fatal() {
         use crate::server_native::runtime::PvaServerConfig;
         use crate::server_native::tcp::ClientCredentials;
@@ -20096,7 +20095,7 @@ mod tests {
     /// SID does not match the op's channel still destroys the op (pvxs
     /// serverconn.cpp:295-319 erases by IOID even when the channel-local erase
     /// fails). The pre-fix per-channel lookup would have leaked the op.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_conn_wide_destroy_request_routes_by_ioid_ignoring_sid() {
         let order = ByteOrder::Little;
         let ioid = 9u32;
@@ -20128,7 +20127,7 @@ mod tests {
     /// a PUT readback (`subcmd & 0x40`) whose readback GET
     /// fails replies with the request's `0x40` subcmd and an error
     /// status — not INIT `0x08`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr13_put_readback_error_echoes_0x40_subcmd() {
         use crate::server_native::runtime::PvaServerConfig;
         use crate::server_native::tcp::ClientCredentials;
@@ -20211,7 +20210,7 @@ mod tests {
     /// fix makes error replies echo the *request* subcmd uniformly, so
     /// an INIT request stays `0x08` while a data request becomes
     /// `0x00`/`0x40` — it does not flip every error to `0x00`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr13_init_phase_error_still_echoes_0x08() {
         use crate::server_native::runtime::PvaServerConfig;
         use crate::server_native::tcp::ClientCredentials;
@@ -20337,7 +20336,7 @@ mod tests {
     /// handshake must: emit a SECOND CONNECTION_VALIDATED, replace the
     /// connection credential, update the per-peer credential record, and
     /// re-fire the auth_complete hook with the new identity.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_connection_validation_reauth_replaces_identity() {
         use std::sync::Mutex as StdMutex;
 
@@ -20474,7 +20473,7 @@ mod tests {
     /// so a rejected re-auth is a rejected credential *update*, not a logout.
     /// Pre-fix Rust committed the claim and then forced `*cred` to anonymous,
     /// stripping a live `alice/ca` connection's ACF identity.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_connection_validation_unadvertised_reauth_keeps_previous_credential() {
         use std::io::Cursor;
         use std::sync::Mutex as StdMutex;
@@ -20758,7 +20757,7 @@ mod autoexec_tests {
 
     /// `record._options.autoExec=false` must NOT suppress the write: pvxs
     /// never reads the option server-side, so the EXEC commits.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn autoexec_false_still_commits_the_put() {
         let after = put_through(request_with_autoexec(Some("false"))).await;
         assert_eq!(
@@ -20771,7 +20770,7 @@ mod autoexec_tests {
     /// Negative control: with the option absent the EXEC commits too — so
     /// the assertion above is pinning "the option is inert", not merely
     /// "PUT works".
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_without_autoexec_commits_identically() {
         let after = put_through(request_with_autoexec(None)).await;
         assert_eq!(value_of(after), 2.5);
@@ -20781,7 +20780,7 @@ mod autoexec_tests {
     /// deleted parser treated as false (`"no"`, `"0"`) and the ones it
     /// rejected outright (`"maybe"`). No server-side branch may depend on
     /// this text.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn every_autoexec_spelling_is_inert() {
         for v in ["false", "FALSE", "no", "0", "true", "maybe"] {
             let after = put_through(request_with_autoexec(Some(v))).await;
@@ -20842,7 +20841,7 @@ mod r14_tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_r14_source_calls_no_head_of_line_block() {
         let order = ByteOrder::Little;
         let sid: u32 = 1;
@@ -21145,7 +21144,7 @@ mod bfr15_tests {
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 100u32);
@@ -21235,7 +21234,7 @@ mod bfr15_tests {
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 200u32);
@@ -21326,7 +21325,7 @@ mod bfr15_tests {
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 300u32);
@@ -21383,7 +21382,7 @@ mod bfr15_tests {
     /// (d) A completed EXEC returns the op to `Idle` (through the read-loop
     /// owner via `ExecFinished`/`apply_exec_finish`), so a later explicit
     /// re-EXEC is accepted as a fresh exec and runs a second source read.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr15_completed_exec_returns_op_to_idle_and_allows_reexec() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 400u32);
@@ -21462,7 +21461,7 @@ mod bfr15_tests {
     /// (e) ABA boundary: a stale completion signal (op-instance id mismatch,
     /// e.g. the ioid was removed and re-INIT'd) must NOT flip the fresh op
     /// back to `Idle`. Only an exact `monitor_op_id` match applies.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr15_apply_exec_finish_ignores_stale_op_id() {
         let (sid, ioid) = (1u32, 500u32);
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
@@ -21660,7 +21659,7 @@ mod inbound_message_cap_tests {
         out
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn the_default_ceiling_refuses_an_oversized_header_without_reading_a_body() {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
@@ -21686,7 +21685,7 @@ mod inbound_message_cap_tests {
 
     /// The comparison is `>`, not `>=`: a message exactly at the ceiling is
     /// admitted. An off-by-one here would refuse the largest legal message.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_message_exactly_at_the_ceiling_is_admitted() {
         let cap = 16usize;
         let mut wire = header_announcing(cap as u32);
@@ -21699,7 +21698,7 @@ mod inbound_message_cap_tests {
         assert_eq!(frame.payload.len(), cap);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn one_byte_over_the_ceiling_is_refused() {
         let cap = 16usize;
         let wire = header_announcing(cap as u32 + 1);
@@ -21714,7 +21713,7 @@ mod inbound_message_cap_tests {
     /// `None` is still expressible and still means unbounded — the same
     /// header the default ceiling refuses is accepted for buffering when the
     /// deployment opted out.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn an_explicit_none_still_means_unbounded() {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);

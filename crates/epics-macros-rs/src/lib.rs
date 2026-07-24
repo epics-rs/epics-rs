@@ -27,6 +27,20 @@ fn epics_base_path() -> proc_macro2::TokenStream {
                 quote!(::#ident::base)
             }
         }
+    } else if let Ok(found) = crate_name("epics-libcom-rs") {
+        // `epics_base_rs::runtime` is a re-export of `epics_libcom_rs::runtime`,
+        // so for a consumer that only has the libcom layer — including
+        // `epics-libcom-rs`'s own test suite, which cannot depend on
+        // `epics-base-rs` without a cycle — the same expansions resolve
+        // through the libcom path. Probed last so a crate with both deps
+        // keeps the canonical `epics_base_rs` spelling.
+        match found {
+            FoundCrate::Itself => quote!(::epics_libcom_rs),
+            FoundCrate::Name(name) => {
+                let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+                quote!(::#ident)
+            }
+        }
     } else {
         quote!(::epics_base_rs)
     }

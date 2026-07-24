@@ -18,8 +18,7 @@
 //! the full window let the server window drain to 0 and stalled ~1 RTT
 //! every `pipeline_size` updates.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -7642,7 +7641,7 @@ mod tests {
     /// `teardown()` is the shared owner for `stop()`, `stop_sync()`, and
     /// `Drop`; calling it more than once (e.g. `stop_sync` then `Drop`)
     /// must be a harmless no-op.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_is_idempotent() {
         let state = idle_sub_state();
         state.teardown();
@@ -7692,7 +7691,7 @@ mod tests {
     /// A teardown that races just ahead of the INIT receive sets `stop`
     /// before the loop reaches the await; the pre-check must short-circuit
     /// to `Cancelled` WITHOUT consuming a reply that may already be queued.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_cancels_when_stop_preset() {
         let state = idle_sub_state();
         state.stop.store(true, Ordering::Relaxed);
@@ -7710,7 +7709,7 @@ mod tests {
     }
 
     /// The happy path: a queued INIT reply is delivered as `Reply`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_returns_reply_when_frame_arrives() {
         let state = Some(idle_sub_state());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -7724,7 +7723,7 @@ mod tests {
     /// A frame stream closed before any reply is `Lost` (connection lost),
     /// distinct from a cancel — the caller maps it to ConnectionLost and
     /// lets the reconnect loop retry.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_lost_when_stream_closed() {
         let state = Some(idle_sub_state());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -7737,7 +7736,7 @@ mod tests {
 
     /// The no-handle path (plain `op_monitor`, `state == None`) cannot be
     /// cancelled, so it still simply awaits and delivers the reply.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_no_handle_awaits_reply() {
         let state: Option<Arc<SubscriptionState>> = None;
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();

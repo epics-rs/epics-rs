@@ -1,7 +1,6 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -1210,7 +1209,7 @@ mod tcp_fallback_tests {
     /// rather than aborting the process. Binding to an address that is
     /// not assigned to any local interface yields `AddrNotAvailable`,
     /// which is outside the fallback set, so `start` returns `Err`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn start_returns_err_on_unbindable_address() {
         let source = Arc::new(SharedSource::new());
         let config = PvaServerConfig {

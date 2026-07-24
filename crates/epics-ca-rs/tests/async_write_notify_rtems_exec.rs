@@ -48,9 +48,11 @@
 //!
 //! The whole file is `#[cfg(feature = "rtems-exec-model")]`: with the feature
 //! off it compiles to nothing, so the hosted default test set is unchanged.
+// RTEMS-EXEC-MODEL-ALLOW(1): the flavored e2e drives a live
+// client/server pair over tokio::net; the exec-model behavior it proves is in
+// the server task it spawns. These run and pass in the
+// feature-ON suite on the tokio driver.
 #![cfg(feature = "rtems-exec-model")]
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - this file IS the feature-ON e2e; it runs and passes there.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

@@ -1,4 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): the two multi-thread-flavored tests prove a
+// dedicated thread carries the ambient tokio runtime / requested stack; the
+// tokio flavor is the property under test. Both run and pass in the
+// feature-ON suite.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -1880,13 +1883,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_spawn() {
         let handle = spawn(async { 42 });
         assert_eq!(handle.await.unwrap(), 42);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_spawn_blocking() {
         let handle = spawn_blocking(|| 123);
         assert_eq!(handle.await.unwrap(), 123);
@@ -1944,7 +1947,7 @@ mod tests {
     /// The assertion is on `block_on_sync` succeeding, not on the absence of a
     /// handle, because being able to block is the property the thread is spawned
     /// for; how that is arranged is this function's business.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_dedicated_thread_can_block_under_a_current_thread_ambient() {
         let (tx, rx) = std::sync::mpsc::channel();
         let joined = spawn_dedicated_thread(
@@ -2107,7 +2110,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_sleep() {
         let start = std::time::Instant::now();
         sleep(Duration::from_millis(10)).await;
@@ -2118,13 +2121,13 @@ mod tests {
     // tokio delegation, and that is the point: they are what a later backend
     // swap has to keep true, on a seam whose whole purpose is to be
     // reimplemented.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_yields_the_value_when_the_future_finishes_first() {
         let r = timeout(Duration::from_secs(30), async { 42 }).await;
         assert_eq!(r.unwrap(), 42);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_elapses_on_a_future_that_never_finishes() {
         let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
         assert!(r.is_err());
@@ -2789,7 +2792,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn spawn_blocking_with_priority_runs_closure() {
         let handle = spawn_blocking_with_priority(ThreadPriority::CaServerHigh, || 7);
         assert_eq!(handle.await.unwrap(), 7);

@@ -28,8 +28,6 @@
 //! [`super::source::ChannelContext`] and drained by the connection into
 //! IOID-tagged `CMD_MESSAGE` frames before the operation's reply.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -337,7 +335,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn exec_op_reply_delivers_value() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let logger = RemoteLogger::log_only("TEST:PV");
@@ -357,7 +355,7 @@ mod tests {
         assert!(!op.is_open());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn exec_op_error_closes_and_delivers_message() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let logger = RemoteLogger::log_only("TEST:PV");
@@ -371,7 +369,7 @@ mod tests {
         assert!(!op.is_open());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn exec_op_drop_without_reply_emits_err() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let logger = RemoteLogger::log_only("TEST:PV");
@@ -384,7 +382,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn remote_logger_with_sender_delivers_to_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<OpMessage>(8);
         let logger = RemoteLogger::new(tx, 77, "TEST:PV");
@@ -404,7 +402,7 @@ mod tests {
         assert_eq!(m3.ioid, 77);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn exec_op_error_does_not_emit_side_channel_message() {
         // ExecOp::error resolves the op via its reply (Status), and must
         // NOT also push a CMD_MESSAGE — pvxs sends only the op-error
@@ -422,7 +420,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn remote_logger_log_only_drops_silently() {
         // Should not panic. Tracing output is implementation detail.
         let logger = RemoteLogger::log_only("TEST:PV");

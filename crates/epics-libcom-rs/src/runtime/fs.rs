@@ -35,8 +35,6 @@
 //! interleave between the steps; the same sequence in one closure makes one
 //! hop and keeps the durability ordering where a reader can see it.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -96,7 +94,7 @@ pub async fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_round_trip_goes_through_the_seam() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seam.txt");
@@ -107,14 +105,14 @@ mod tests {
     /// The error must be the filesystem's, not a wrapper's: callers switch on
     /// `ErrorKind::NotFound` (autosave treats a missing `.sav` as "no saved
     /// state" and anything else as corruption), so flattening must not lose it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_missing_file_keeps_its_error_kind() {
         let dir = tempfile::tempdir().unwrap();
         let e = read_to_string(dir.path().join("absent")).await.unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rename_and_copy_move_the_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
@@ -127,7 +125,7 @@ mod tests {
         assert_eq!(read_to_string(&c).await.unwrap(), "payload");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn canonicalize_resolves_to_an_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("real");
@@ -137,7 +135,7 @@ mod tests {
 
     /// A composite sequence is one hop, and its `io::Error` reaches the caller
     /// unchanged — this is the shape `write_save_file` uses.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_composite_closure_returns_its_own_error() {
         let e = blocking(|| std::fs::read_to_string("/definitely/not/here"))
             .await

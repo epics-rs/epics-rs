@@ -4,8 +4,9 @@
 //! [`epics_base_rs::server::ioc_builder::IocBuilder`] and adds only
 //! CA-specific configuration (port, access security).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(2): both tests bind the server's tokio::net TCP
+// listener, which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};

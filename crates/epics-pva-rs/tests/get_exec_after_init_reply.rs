@@ -27,9 +27,8 @@
 //! Pre-fix the client wrote INIT+EXEC as one buffer and the GET died on a
 //! closed circuit; post-fix the EXEC is sent only after the INIT reply lands.
 
-#![cfg(test)]
-
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+#![cfg(test)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

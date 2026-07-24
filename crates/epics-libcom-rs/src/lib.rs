@@ -56,6 +56,12 @@ compile_error!(
      backend on Windows instead"
 );
 
+// Lets `#[epics_macros_rs::epics_test]` expansions — which name the runtime
+// crate by its external path — resolve inside this crate's own unit tests,
+// where proc-macro-crate reports `FoundCrate::Itself`. Same device as
+// `epics-base-rs`'s alias for the same macro.
+extern crate self as epics_libcom_rs;
+
 pub mod net;
 pub mod runtime;
 pub mod walltime;

@@ -18,14 +18,11 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these four run and pass in the feature-ON
-// suite. The other two drive the UDP SEARCH transport, which only exists on
-// `tokio_backend`, so they carry that gate and the census no longer vouches for
-// them feature-ON.
 // (11 tests that spin the live UDP search engine gated out feature-ON below;
 // §4.2 defers UDP search, so their spawned timers/socket cannot run on the
 // reactor-less callback pool — stage 3.)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -6062,7 +6059,7 @@ mod tests {
     /// bundle, so `pick_nic` forced an explicit non-loopback target onto the
     /// loopback socket (last-resort) where it could never reach the IOC.
     #[cfg(tokio_backend)]
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_socket_bundle_not_reduced_by_intf_addr_list() {
         // The defect can only manifest where the host actually has a
         // non-loopback IPv4 NIC; on a loopback-only host the bundle is

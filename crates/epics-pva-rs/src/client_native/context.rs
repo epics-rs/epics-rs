@@ -15,9 +15,9 @@
 //! Public API stays compatible with the previous shape so existing callers
 //! (pvget-rs, pvput-rs, pvmonitor-rs, pvinfo-rs) keep working.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
 // (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -3375,7 +3375,7 @@ mod tests {
     // observable soundly here. `search_engine()`'s early return makes the
     // two paths mutually exclusive by construction, so the routing decision
     // plus this client's engine cell fully pin the behavior.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r9_share_udp_with_name_servers_uses_per_client_engine() {
         let ns: SocketAddr = "127.0.0.1:5099".parse().unwrap();
         let client = PvaClient::builder()
@@ -3399,7 +3399,7 @@ mod tests {
 
     // Control: `share_udp(true)` with no name servers still shares the
     // process-wide engine — share_udp continues to save the UDP socket.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r9_share_udp_without_name_servers_uses_shared_engine() {
         let client = PvaClient::builder().share_udp(true).build();
         assert!(

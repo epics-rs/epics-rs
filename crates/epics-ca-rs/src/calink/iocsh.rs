@@ -5,8 +5,9 @@
 //! record-link resolver reads cached monitor values without a blocking
 //! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): the flavored test drives the CA client stack,
+// which needs a multi-thread tokio runtime. These run and pass in the
+// feature-ON suite on the tokio driver.
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,

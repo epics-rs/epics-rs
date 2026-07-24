@@ -28,8 +28,6 @@
 //! (`dbAccess.c:1263-1264`) processes only when `dbPut` returned 0, so the
 //! fire-and-forget path does NOT process a rejected put. The port mirrors both.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -122,7 +120,7 @@ async fn read_proc(db: &PvDatabase) -> EpicsValue {
 /// C refuses the put (`ECA_PUTFAIL`) but `putCallback` still returns `didPut=1`,
 /// so the record STILL processes (UDF cleared → NO_ALARM). Refuse the put AND
 /// force-process, matching C.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_overflow_via_notify_is_refused_but_still_processes() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -144,7 +142,7 @@ async fn proc_overflow_via_notify_is_refused_but_still_processes() {
 }
 
 /// Same for non-numeric text (`S_stdlib_noConversion`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_non_numeric_via_notify_is_refused_but_still_processes() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -164,7 +162,7 @@ async fn proc_non_numeric_via_notify_is_refused_but_still_processes() {
 /// The fire-and-forget path differs: plain `dbPutField` returns before
 /// `dbProcess` on a non-zero conversion status, so a rejected PROC put drives NO
 /// cycle. Measured: `caput REC.PROC 256` leaves STAT=UDF.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_overflow_fire_and_forget_is_refused_and_does_not_process() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -183,7 +181,7 @@ async fn proc_overflow_fire_and_forget_is_refused_and_does_not_process() {
 
 /// A VALID PROC put still does BOTH on either path: stores the byte AND
 /// force-processes.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_valid_stores_the_byte_and_processes() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -208,7 +206,7 @@ async fn proc_valid_stores_the_byte_and_processes() {
 /// `caput REC.PROC -1`: `epicsParseUInt8` accepts a negative and truncates it to
 /// 255 (`strtoul("-1") == ULONG_MAX`, outside the reject band). It is NOT a naive
 /// `[0, 255]` rejection.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_negative_wraps_to_255_and_is_accepted() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -227,7 +225,7 @@ async fn proc_negative_wraps_to_255_and_is_accepted() {
 /// The whole in-range band lands: 255 is the last accepted value, and 128 —
 /// which a *signed* Char parse would wrongly refuse — is accepted because the
 /// field is C-declared DBF_UCHAR.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn proc_full_uchar_band_is_accepted() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -248,7 +246,7 @@ async fn proc_full_uchar_band_is_accepted() {
 /// The gate is shared: `caput REC.DISP notanumber` / `256` are refused too — DISP
 /// takes the same DBF_UCHAR conversion as PROC. (DISP is not pp(TRUE), so it
 /// drives no process; the assertion is the refusal and that a valid put lands.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn disp_non_numeric_and_overflow_are_refused() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;

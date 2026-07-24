@@ -15,8 +15,6 @@
 //! (link path), On-Change hash across successive scalar updates, and the OUT
 //! target's received type.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -88,7 +86,7 @@ fn onchange_hash_moves_across_scalar_updates() {
 /// End-to-end: `DOL="SETPOINT"` on a closed-loop aao (a scalar ao feeding an
 /// array output). VAL must become a one-element DoubleArray in the NELM
 /// buffer, and the OUT target must receive an ARRAY.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn closed_loop_scalar_dol_feeds_an_array_out_target() {
     const DB: &str = r#"
 record(ao, "SETPOINT") {

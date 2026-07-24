@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(20): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -3192,7 +3190,7 @@ mod out_link_put_fail_tests {
     /// processed. The PP OUT link below carries a write that fails, so the
     /// code returns before `processTarget` and `VAL` stays `0.0`; processing
     /// the target unconditionally would make it `7.0`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pp_out_link_failed_write_does_not_process_target() {
         let db = PvDatabase::new();
         db.add_record("TGT", Box::new(CalcRecord::new("7")))
@@ -3249,7 +3247,7 @@ mod out_link_put_fail_tests {
     ///
     /// The port used to reject the put, which suppressed both the destination's
     /// alarm and its `PP` processing.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pp_out_link_empty_array_alarms_target_and_still_processes_it() {
         use crate::server::recgbl::alarm_status;
 
@@ -3354,7 +3352,7 @@ mod nonlocal_db_link_write_tests {
     /// pre-fix code called `put_pv_already_locked` on a name that does
     /// not exist locally; the write was silently dropped. The recording
     /// lset must now capture the value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn nonlocal_db_out_link_writes_through_external_put() {
         let db = PvDatabase::new();
         let puts = Arc::new(Mutex::new(Vec::new()));
@@ -3395,7 +3393,7 @@ mod nonlocal_db_link_write_tests {
     /// A local OUT-link write must NOT divert to the external put path —
     /// the locality dispatch only reroutes non-local targets. The local
     /// record receives the value; the lset records nothing.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn local_db_out_link_writes_local_not_external() {
         let db = PvDatabase::new();
         let puts = Arc::new(Mutex::new(Vec::new()));
@@ -3465,7 +3463,7 @@ mod nonlocal_db_link_write_tests {
     /// the registered lset's `scan_forward` — the FWD-link twin of
     /// `write_external_pv` for OUT writes (C `dbScanFwdLink` →
     /// `lset->scanForward`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn external_forward_link_dispatches_through_scan_forward() {
         let db = PvDatabase::new();
         let forwards = Arc::new(Mutex::new(Vec::new()));
@@ -3491,7 +3489,7 @@ mod nonlocal_db_link_write_tests {
     /// non-DB FLNK dispatch the DB-only `flnk_name` filter previously
     /// dropped. C `recGblFwdLink` runs `dbScanFwdLink` for every FLNK
     /// regardless of link kind.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn record_processing_fires_external_forward_link() {
         let db = PvDatabase::new();
         let forwards = Arc::new(Mutex::new(Vec::new()));
@@ -3532,7 +3530,7 @@ mod nonlocal_db_link_write_tests {
     /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")`, which
     /// writes `nsta`/`nsev`/`namsg` (promoted by the next
     /// `recGblResetAlarms`, matching the C late-set inside `recGblFwdLink`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn disconnected_external_forward_link_raises_pending_link_invalid() {
         let db = PvDatabase::new();
         let forwards = Arc::new(Mutex::new(Vec::new()));
@@ -3597,7 +3595,7 @@ mod cp_link_locality_tests {
     /// EVERY link, CP or not; `setup_cp_links` only registers the trigger.
     /// The rewrite used to live inside `setup_cp_links`, which is why it
     /// reached CP/CPP links alone.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cp_link_to_nonlocal_target_forced_external() {
         let db = PvDatabase::new();
         db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
@@ -3631,7 +3629,7 @@ mod cp_link_locality_tests {
     /// neither `initialize_link_locality` nor `setup_cp_links` may rewrite
     /// its `parsed_inp` to `Ca`, and it must NOT be registered as an external
     /// CP link.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cp_link_to_local_target_stays_db() {
         let db = PvDatabase::new();
         db.add_record("SRC", Box::new(AiRecord::new(1.0)))
@@ -3677,7 +3675,7 @@ mod external_link_pv_name_tests {
     /// link. iocInit's own console counts are per link FIELD and therefore
     /// disagree by construction — `rtems-ca-ioc`'s banner used to compare a
     /// registry count against nothing at all and print `0`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn declared_external_pvs_are_deduped_direction_agnostic_and_sorted() {
         let db = PvDatabase::new();
         for (name, rec) in [
@@ -3714,7 +3712,7 @@ mod external_link_pv_name_tests {
     /// A database with no external link declares the empty set — the case
     /// the banner reports as `0/0`, which is a healthy boot, not a failure
     /// to connect.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_database_with_no_external_link_declares_none() {
         let db = PvDatabase::new();
         db.add_record("PLAIN", Box::new(AiRecord::new(0.0)))
@@ -3740,7 +3738,7 @@ mod nonlocal_db_link_read_tests {
     /// to a non-local target must read the remote value, not return
     /// `None`. Pre-fix the `Db` read arm read only the local DB (`get_pv`)
     /// and dropped the non-local target.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn plain_nonlocal_db_link_reads_via_external_resolver() {
         let db = PvDatabase::new();
         // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
@@ -3769,7 +3767,7 @@ mod nonlocal_db_link_read_tests {
     /// `read_link_with_alarm`; the same locality rule must hold there, so
     /// a non-local target reads the remote value and surfaces no
     /// local-record alarm.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn nonlocal_db_link_value_and_alarm_via_external() {
         let db = PvDatabase::new();
         db.set_external_resolver(Arc::new(|name: &str| {
@@ -3795,7 +3793,7 @@ mod nonlocal_db_link_read_tests {
 
     /// Owner path: a Db link whose target IS a local record still reads
     /// the local database and never consults the external resolver.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn local_db_link_reads_local_not_external() {
         let db = PvDatabase::new();
         db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
@@ -3838,7 +3836,7 @@ mod link_metadata_tests {
     /// This is the case that decides the oracle's `field(INPA,"5")` records:
     /// C's answer is neither a propagated limit nor a DBF-type-range default.
     /// The caller keeps its pre-filled buffer.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn constant_link_reports_no_metadata() {
         let db = PvDatabase::new();
         let mut visited = HashSet::new();
@@ -3859,7 +3857,7 @@ mod link_metadata_tests {
     /// `ai` supplies every numeric slot, and `aiRecord.c::get_graphic_double`
     /// serves VAL from `prec->hopr`/`prec->lopr`. `dbDbGetGraphicLimits`
     /// returns those verbatim (`dbDbLink.c:280-295`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_link_to_supported_field_propagates_target_limits() {
         let db = PvDatabase::new();
         let mut src = AiRecord::new(1.0);
@@ -3889,7 +3887,7 @@ mod link_metadata_tests {
     /// `get_graphics`/`get_control` `memset` to zero (`dbAccess.c:241-242`,
     /// `:281-283`) while `get_alarm` seeds `{epicsNAN×4}` and assigns
     /// unconditionally (`dbAccess.c:290,317-330`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_link_to_unsupported_field_yields_c_defaults_not_none() {
         let db = PvDatabase::new();
         db.add_record("STR", Box::new(StringoutRecord::new("hello")))
@@ -3931,7 +3929,7 @@ mod link_metadata_tests {
     /// Pins that the no-support default is decided per slot, not per record:
     /// the graphic limits still come from the target's own support while the
     /// alarm limits fall back to NaN.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_link_alarm_default_is_per_slot_not_per_record() {
         let db = PvDatabase::new();
         db.add_record("WF", Box::new(WaveformRecord::new(8, DbFieldType::Double)))
@@ -3960,7 +3958,7 @@ mod link_metadata_tests {
     /// its `S_dbLib_badLink` initialiser and writes nothing
     /// (`dbDbLink.c:239-261`) — without it, a record that sources its own
     /// metadata from an input link pointing back at itself recurses forever.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn revisited_db_link_target_is_refused() {
         let db = PvDatabase::new();
         db.add_record("SRC", Box::new(AiRecord::new(1.0)))
@@ -3991,7 +3989,7 @@ mod link_metadata_tests {
     /// A db link naming a field the target record does not have has no
     /// `dbAddr` in C — `dbNameToAddr` fails at link-init time, so no lset is
     /// installed and `dbGetGraphicLimits` returns `S_db_noLSET`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_link_to_missing_field_reports_no_metadata() {
         let db = PvDatabase::new();
         db.add_record("SRC", Box::new(AiRecord::new(1.0)))

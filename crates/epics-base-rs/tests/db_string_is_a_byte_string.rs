@@ -20,8 +20,6 @@
 //!     dbgf X1.VAL -> "h\xffz"     stored: h, 0xFF, z   (3 bytes)
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -37,7 +35,7 @@ async fn val_bytes(db: &epics_base_rs::server::database::PvDatabase, rec: &str) 
 }
 
 /// The record softIoc was measured on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_high_hex_escape_in_a_db_value_is_one_byte() {
     let (db, _) = IocBuilder::new()
         .db_string(
@@ -57,7 +55,7 @@ async fn a_high_hex_escape_in_a_db_value_is_one_byte() {
 }
 
 /// The boundary: below 0x80 the two models agree, at and above it they did not.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_escape_boundary_at_0x80() {
     let (db, _) = IocBuilder::new()
         .db_string(
@@ -84,7 +82,7 @@ async fn the_escape_boundary_at_0x80() {
 }
 
 /// A common (dbCommon) DBF_STRING carries bytes too — DESC has the same budget.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_common_string_field_carries_bytes() {
     let (db, _) = IocBuilder::new()
         .db_string(

@@ -14,8 +14,6 @@
 //! because the OUT write and its event are both suppressed (C execOutput
 //! `nsev >= INVALID` → `break`, no `postEvent`).
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,10 +78,10 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
 async fn settle(cond: impl Fn() -> bool) {
     for _ in 0..400 {
         if cond() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("OEVT event did not fire within timeout");
 }
@@ -91,7 +89,7 @@ async fn settle(cond: impl Fn() -> bool) {
 /// `calcout`: OOPT=Every_Time + OEVT="e1" wakes a `SCAN="Event"`/`EVNT="e1"`
 /// sibling exactly once — with NO OUT link, proving the event posts on the
 /// output cycle independent of OUT connection (C posts after `writeValue`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_oevt_posts_string_event_on_output() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -121,7 +119,7 @@ async fn calcout_oevt_posts_string_event_on_output() {
 /// `calcout`: an INVALID cycle (CALC="0/0" → NaN → UDF) with IVOA=Don't_drive
 /// must NOT post OEVT — the OUT write and its event are both suppressed
 /// (C execOutput `nsev >= INVALID` → `break`, no `postEvent`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -158,7 +156,7 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     }
 
     // Give any erroneous spawned post time to land, then assert none did.
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(60)).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         0,
@@ -168,7 +166,7 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
 }
 
 /// `scalcout`: numeric OEVT=5 wakes a `SCAN="Event"`/`EVNT="5"` sibling once.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -195,7 +193,7 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
 }
 
 /// `acalcout`: numeric OEVT=7 wakes a `SCAN="Event"`/`EVNT="7"` sibling once.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -225,7 +223,7 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
 /// swait has no IVOA field, so OEVT posts whenever output fires — C
 /// swaitRecord.c:797 posts unconditionally after the OUT write / forward
 /// link, the 4th member of the OEVT-output family.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));

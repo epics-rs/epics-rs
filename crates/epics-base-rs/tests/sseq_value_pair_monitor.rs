@@ -25,8 +25,6 @@
 //! with `DBE_VALUE|DBE_LOG`, unconditionally — an archiver on `STR1` logged a
 //! sample on every `caput DO1` that changed nothing.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -60,7 +58,7 @@ async fn sseq_with_prec2() -> PvDatabase {
 
 /// `caput VP.DO1 3.7` (PREC=2): the put path posts DO1 (C `dbPut`), and
 /// `special()` posts the re-rendered STR1="3.70" with a bare `DBE_VALUE`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
     let db = sseq_with_prec2().await;
     let inst = db.get_record("VP").unwrap();
@@ -105,7 +103,7 @@ async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
 
 /// The change test C makes and a static field list cannot: re-putting the SAME
 /// DO1 leaves `strcmp(str, plinkGroup->s) == 0`, so STR1 posts NOTHING.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
     let db = sseq_with_prec2().await;
     let inst = db.get_record("VP").unwrap();
@@ -139,7 +137,7 @@ async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
 
 /// The mirror site: a `STRn` put derives `DOn = atof(s)` and posts it with a
 /// bare `DBE_VALUE`, only when it moved (sseqRecord.c:1136-1140).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
     let db = sseq_with_prec2().await;
     let inst = db.get_record("VP").unwrap();
@@ -174,7 +172,7 @@ async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
 /// The process path (`processCallback`, numeric DOL arm): NO put posts the
 /// field, so the record owes BOTH events — the view READ carries
 /// `DBE_VALUE|DBE_LOG`, the view DERIVED from it a bare `DBE_VALUE`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_without() {
     let db = PvDatabase::new();
     db.add_record("VPP_SRC", Box::new(AoRecord::new(7.25)))
@@ -220,7 +218,7 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
 
     let e = do_rx.try_recv().expect("the DOL read moved DO1 0 -> 7.25");

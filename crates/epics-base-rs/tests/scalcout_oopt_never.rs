@@ -13,8 +13,6 @@
 //! Boundaries: Never vs Every Time (the OUT target moves / does not move), and
 //! the unnamed-index catch-all.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -60,7 +58,7 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 /// `OOPT="Never"`, `CALC="7"`: C writes nothing to OUT. The port wrote 7.0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_never_writes_nothing_to_out() {
     let db = build().await;
 
@@ -82,7 +80,7 @@ async fn scalcout_never_writes_nothing_to_out() {
 
 /// The owner path: `Every Time` still drives OUT, so the fix is a polarity
 /// correction on index 6, not a disabled output stage.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_every_time_still_drives_out() {
     let db = build().await;
 
@@ -96,7 +94,7 @@ async fn scalcout_every_time_still_drives_out() {
 }
 
 /// acalcout's `Never` (same menu index, same C rule).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_never_writes_nothing_to_out() {
     let db = build().await;
 
@@ -114,7 +112,7 @@ async fn acalcout_never_writes_nothing_to_out() {
 /// The catch-all: an OOPT index the switch does not name is C's untouched
 /// `doOutput = 0` — no output. Driven through the record's own field put, which
 /// is the only way an out-of-menu index can arise.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_unnamed_oopt_index_drives_no_output() {
     let db = build().await;
 

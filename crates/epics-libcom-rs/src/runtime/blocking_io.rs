@@ -98,11 +98,11 @@
 //! a protocol crate for the reason the pumps are: `epics-ca-rs` and
 //! `epics-pva-rs` both dial and neither may depend on the other.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON
-// suite. Each drives an adapter, a real socket pump, or a `DialPool` worker;
-// those threads are std threads that reach `block_on_sync`/`connect` with no
-// runtime entered, which is the exec-backend path, so the tokio runtime here
-// only hosts the assertions.
+// RTEMS-EXEC-MODEL-ALLOW(1): `one_descriptor_serves_both_pumps` asserts both
+// pump directions concurrently from the async side, which needs the
+// multi-thread tokio flavor; it runs and passes in the feature-ON suite (the
+// pumps themselves are std threads, the tokio runtime only hosts the
+// assertions).
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -1182,7 +1182,7 @@ mod tests {
     ///   parked in `cur`/`pos`;
     /// * **pending** — no chunk has arrived at all, so the poll registered a
     ///   waker and returned `Pending`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn channel_reader_loses_no_bytes_when_a_select_race_is_lost() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
         let mut reader = ChannelReader::new(rx);
@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     /// A zero-length `poll_read` buffer must not eat a chunk.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_zero_length_read_consumes_nothing() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
         let mut reader = ChannelReader::new(rx);
@@ -1260,7 +1260,7 @@ mod tests {
 
     /// The adapter must not be what keeps the frame channel open, or a pump
     /// would outlive the guard that is supposed to end it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn channel_writer_does_not_keep_the_frame_channel_open() {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
         let room = Arc::new(WriteRoom::default());
@@ -1616,7 +1616,7 @@ mod tests {
     /// the very worker that must serve it next, so a pool that counted parked
     /// workers would see none available and create a second. That is why the
     /// assertion is inside the loop and not only after it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn sequential_dials_reuse_one_worker() {
         static POOL: DialPool = DialPool::new("test-dial", ThreadPriority::Low);
         const DIALS: usize = 8;

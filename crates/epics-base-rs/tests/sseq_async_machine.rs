@@ -26,8 +26,6 @@
 //! drains the in-flight set before finishing.
 #![allow(clippy::all)]
 
-// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -226,7 +224,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
                 return;
             }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: {pv} did not reach Short({want}) before timeout (last {:?})",
@@ -245,7 +243,7 @@ async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
                 return;
             }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
@@ -270,7 +268,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
                 return;
             }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
@@ -291,7 +289,7 @@ fn read_short(db_value: Option<EpicsValue>) -> i16 {
 /// While blocked: `BUSY == 1`, `WTG1 == 1`, and the next step has not
 /// fired. When the downstream completes, the sequence advances, runs the
 /// last step, and clears `BUSY` (C `asyncFinish`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_waitn_blocks_until_downstream_completes() {
     let db = PvDatabase::new();
     // Step-1 target: a CA link whose put-callback the lset holds open until
@@ -332,7 +330,7 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
     );
 
     // Settle: confirm the block is stable, not just not-yet-arrived.
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(60)).await;
     assert_eq!(
         db.get_pv("SSEQ_W_TGT2").unwrap(),
         EpicsValue::Double(0.0),
@@ -372,7 +370,7 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
 /// favour of the per-step machine; this proves the retirement neither
 /// dropped a step nor left a duplicate dispatch. Also pins last-step
 /// `BUSY` clearing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
     let db = PvDatabase::new();
     let c1 = Arc::new(AtomicU32::new(0));
@@ -422,7 +420,7 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
     // Wait for the last step's target, then settle so any erroneous extra
     // dispatch (a leftover all-at-once path) would also have landed.
     poll_short(&db, "SSEQ_ONCE.BUSY", 0, "sequence finishes").await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
 
     assert_eq!(
         c1.load(Ordering::SeqCst),
@@ -452,7 +450,7 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
 /// never fires, `BUSY`/`ABORT`/`ABORTING` reset, and the superseded delay
 /// re-entry is a structural no-op (the `AsyncToken` generation gate) — no
 /// stale double-dispatch.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_abort_during_delay_finishes_without_dispatch() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -503,7 +501,7 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
         "ABORTING cleared by asyncFinish"
     );
     // Settle: the aborted step's write must never land.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         0,
@@ -517,7 +515,7 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
 /// re-entry from phase `Wait`); the second abort clears the `waiting`
 /// flags, drops the remaining steps, and forces the finish
 /// (C `sseqRecord.c` second-abort branch).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_second_abort_escapes_hung_wait_callback() {
     let db = PvDatabase::new();
     // CA target whose put-callback is never completed — the WAIT step parks
@@ -541,7 +539,7 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
         .await
         .unwrap();
     poll_short(&db, "SSEQ_HUNG.ABORTING", 1, "first abort sets ABORTING").await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_HUNG.BUSY").ok()),
         1,
@@ -578,7 +576,7 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
 /// raise the same alarm AND dispatch no `LNKn` — the regression the old
 /// `MultiOut::Sseq` dispatch covered via `apply_selm_alarm` and the
 /// per-step machine dropped (it finished silently).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -618,7 +616,7 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     drop(inst);
 
     // Settle so any erroneous step dispatch would also have landed.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         count.load(Ordering::SeqCst),
         0,
@@ -636,7 +634,7 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
 /// `init_record` 202-250). A LOCAL DB link → `LOC` (2) + the resolved
 /// target field type; an empty (constant) link → `CON` (3) + the unknown
 /// (-1) field type. The refresh runs at record init (`set_async_context`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_link_status_loc_vs_con() {
     let db = PvDatabase::new();
     // A local target (ao VAL is DBF_DOUBLE = 10 in C dbStatic numbering,
@@ -699,7 +697,7 @@ async fn sseq_link_status_loc_vs_con() {
 /// the runtime re-point refresh (local link → `LOC`). The monotonic
 /// generation gate makes the later classification win regardless of which
 /// spawned task posts last, so `DOL1V` settles at `LOC` and stays there.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_link_status_reclassifies_on_special() {
     let db = PvDatabase::new();
     db.add_record("SSEQ_SP_TGT", Box::new(AoRecord::new(0.0)))
@@ -722,7 +720,7 @@ async fn sseq_link_status_reclassifies_on_special() {
 
     // And it must stay LOC — a stale CON post arriving late cannot clobber it.
     for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
         assert_eq!(
             read_i16(&db, "SSEQ_SP.DOL1V").await,
             2,
@@ -740,7 +738,7 @@ async fn sseq_link_status_reclassifies_on_special() {
 ///
 /// The pre-fix port had this inverted: it raised `WERRn` on the constant and
 /// never on the local DB link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
     let db = PvDatabase::new();
     let _hold = ca_hold(&db).await;
@@ -799,7 +797,7 @@ async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
 /// hung forever on `WTG1`. Under C's rule the step takes the plain put, does
 /// not wait, and the sequence runs straight to the end — while `WERR1` tells
 /// the user the wait they asked for was dropped.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_waitn_on_local_db_link_does_not_wait() {
     let db = PvDatabase::new();
     // Local target that never finishes its own processing.
@@ -856,7 +854,7 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
 /// `usePutCallback == sseqWAIT_Wait` returns immediately, blocking every
 /// later step until that callback completes. Both steps are `Wait` into
 /// async holds; only `WTG1` is high until `HOLD1` completes, then `WTG2`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_wait_full_barrier_serialises_steps() {
     let db = PvDatabase::new();
     let hold = ca_hold(&db).await;
@@ -879,7 +877,7 @@ async fn sseq_wait_full_barrier_serialises_steps() {
 
     // Step 1 in flight; step 2 blocked by the full barrier → NOT dispatched.
     poll_short(&db, "SSEQ_FB.WTG1", 1, "step 1 Wait parks").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_FB.WTG2").ok()),
         0,
@@ -921,7 +919,7 @@ async fn sseq_wait_full_barrier_serialises_steps() {
 /// arithmetic — `After3` gates index `>= 3` — so the overlap+barrier shape
 /// it describes is pinned with `After2`, the value that actually gates
 /// index 2.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_after_n_overlaps_then_barriers() {
     let db = PvDatabase::new();
     let hold = ca_hold(&db).await;
@@ -953,7 +951,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
         1,
         "step 1 is still in flight while step 2 is also in flight (overlap)"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_OV.WTG3").ok()),
         0,
@@ -963,7 +961,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
     // Complete only step 1 → step 3 STILL blocked (step 2's After2 holds it).
     hold.release("SSEQ_OV_HOLD1");
     poll_short(&db, "SSEQ_OV.WTG1", 0, "step 1 cleared").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_OV.WTG3").ok()),
         0,
@@ -998,7 +996,7 @@ async fn sseq_after_n_overlaps_then_barriers() {
 /// only when none remain. Two `After2` steps (no later step, so no barrier
 /// between them) both dispatch and the sequence drains: completing one keeps
 /// `BUSY` high; completing the second finishes.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_end_drain_waits_for_all_in_flight() {
     let db = PvDatabase::new();
     let hold = ca_hold(&db).await;
@@ -1031,7 +1029,7 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     // Complete ONE → drain is not done; BUSY must stay high.
     hold.release("SSEQ_DR_HOLD1");
     poll_short(&db, "SSEQ_DR.WTG1", 0, "step 1 drained").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_DR.BUSY").ok()),
         1,
@@ -1056,7 +1054,7 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
 /// (`asyncFinish` runs once they return). Two overlapping `After2` steps are
 /// in flight; the abort holds `ABORTING`/`BUSY` high until BOTH complete,
 /// then finishes cleanly.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_abort_drains_in_flight_before_finish() {
     let db = PvDatabase::new();
     let hold = ca_hold(&db).await;
@@ -1082,7 +1080,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
         .await
         .unwrap();
     poll_short(&db, "SSEQ_ABD.ABORTING", 1, "abort accepted, draining").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_ABD.BUSY").ok()),
         1,
@@ -1098,7 +1096,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
         "first in-flight drained under abort",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_short(db.get_pv("SSEQ_ABD.BUSY").ok()),
         1,
@@ -1135,7 +1133,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
 /// gates index `>= 2`) into an async hold that stays in flight; step 2
 /// (index 1, `< 2`) is `NoWait` into a sync target and must fire immediately,
 /// landing its value while step 1's callback is still outstanding.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_after_n_does_not_block_lower_index_step() {
     let db = PvDatabase::new();
     let hold = ca_hold(&db).await;

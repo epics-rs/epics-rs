@@ -15,8 +15,6 @@
 //! `c_parse::put_string` Long row, which stores the value and range-checks it
 //! exactly as C's `epicsParseInt32` does.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -80,13 +78,13 @@ async fn assert_val_put_stores(db: &PvDatabase) {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn fanout_val_long_put_stores() {
     let db = db_with(Box::new(FanoutRecord::new())).await;
     assert_val_put_stores(&db).await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn seq_val_long_put_stores() {
     let db = db_with(Box::new(SeqRecord::new())).await;
     assert_val_put_stores(&db).await;

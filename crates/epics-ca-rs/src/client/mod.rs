@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
-
 // The beacon monitor is a UDP listener on the CA beacon port, fed by the
 // repeater. `client-core` has no UDP client socket at all (the target's
 // search reaches servers over `EPICS_CA_NAME_SERVERS`, §4.1), so there are
@@ -18,6 +16,9 @@
 // `--features rtems-exec-model` build had `feature = "client"` on and panicked
 // on both of those sockets at `rtems-ca-ioc` boot, measured — two of the three
 // panics in `doc/calink-rtems-design.md` §10.10 item 2.
+// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the full CA client over
+// tokio::net or pin a specific tokio runtime flavor. These run and pass in the
+// feature-ON suite on the tokio driver.
 #[cfg(ca_beacon_monitor)]
 mod beacon_monitor;
 mod circuit_breaker;
@@ -6090,7 +6091,7 @@ mod monitor_pause_tests {
     /// 1. pre-pause channel backlog is delivered even while paused (3a);
     /// 2. a value arriving during pause is held — `recv` blocks (2a);
     /// 3. `resume` releases the held latest, in order after the backlog.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pause_holds_value_resume_releases_after_backlog() {
         let (callback_tx, callback_rx) = mpsc::channel::<CaResult<Snapshot>>(4);
         let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
@@ -6116,7 +6117,7 @@ mod monitor_pause_tests {
         ));
 
         // (3a) The pre-pause backlog is still delivered while paused.
-        let v1 = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+        let v1 = epics_base_rs::runtime::task::timeout(Duration::from_millis(200), handle.recv())
             .await
             .expect("backlog should deliver promptly")
             .expect("Some")
@@ -6125,7 +6126,8 @@ mod monitor_pause_tests {
 
         // (2a) The held value (2) must NOT be delivered while paused —
         // recv blocks.
-        let blocked = tokio::time::timeout(Duration::from_millis(150), handle.recv()).await;
+        let blocked =
+            epics_base_rs::runtime::task::timeout(Duration::from_millis(150), handle.recv()).await;
         assert!(
             blocked.is_err(),
             "held value must stay withheld while paused (recv-side gate)"
@@ -6133,7 +6135,7 @@ mod monitor_pause_tests {
 
         // resume → the held latest is released.
         handle.resume();
-        let v2 = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+        let v2 = epics_base_rs::runtime::task::timeout(Duration::from_millis(200), handle.recv())
             .await
             .expect("held value should deliver after resume")
             .expect("Some")
@@ -6163,7 +6165,7 @@ mod monitor_pause_tests {
     /// A′ error policy end-to-end: an error arriving during pause is
     /// delivered immediately (bypasses the gate), without waiting for
     /// resume.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pause_does_not_hide_errors() {
         let (callback_tx, callback_rx) = mpsc::channel::<CaResult<Snapshot>>(4);
         let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
@@ -6184,7 +6186,7 @@ mod monitor_pause_tests {
             .try_send(Err(CaError::ServerError(192))) // ECA_DISCONN
             .expect("enqueue error");
 
-        let got = tokio::time::timeout(Duration::from_millis(200), handle.recv())
+        let got = epics_base_rs::runtime::task::timeout(Duration::from_millis(200), handle.recv())
             .await
             .expect("error must deliver while paused")
             .expect("Some");

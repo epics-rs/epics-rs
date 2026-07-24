@@ -36,8 +36,6 @@
 //! INP="SRC" : SEVR=NO_ALARM STAT=NO_ALARM  NUSE=2  VAL=7 7   (two processes)
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -81,7 +79,7 @@ async fn nuse(db: &PvDatabase, rec: &str) -> f64 {
 }
 
 /// An unset INP is not a connected link: LINK/INVALID, nothing ingested.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unset_inp_raises_link_invalid_and_ingests_nothing() {
     let db = build().await;
 
@@ -96,7 +94,7 @@ async fn unset_inp_raises_link_invalid_and_ingests_nothing() {
 /// The fabricated-data half: a CONSTANT INP has no lset, so C never samples it.
 /// The port ingested the literal on every process — NUSE climbed and the
 /// buffer filled with a repeated constant that no source ever produced.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_inp_is_not_connected_and_is_never_ingested() {
     let db = build().await;
     process(&db, "C:CONST").await;
@@ -123,7 +121,7 @@ async fn constant_inp_is_not_connected_and_is_never_ingested() {
 }
 
 /// The gate must not fire on a real link — that is the whole record's job.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_connected_db_link_ingests_and_stays_no_alarm() {
     let db = build().await;
 
@@ -148,7 +146,7 @@ async fn a_connected_db_link_ingests_and_stays_no_alarm() {
 /// the link text softIoc reads: `dbgf C:LINK.INP` → `"SRC"`. The record used to
 /// carry a private `inp` field that the loader never wrote and that shadowed
 /// the common one — the port answered `""`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn inp_reads_back_the_link_text() {
     let db = build().await;
 
@@ -166,7 +164,7 @@ async fn inp_reads_back_the_link_text() {
 /// clears it on the next process (C re-derives it every `process()` from
 /// `nsta`/`nsev`, which `recGblResetAlarms` clears each cycle), and a record
 /// whose link goes away raises it again.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_link_alarm_is_re_derived_every_cycle() {
     let db = build().await;
 

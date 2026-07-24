@@ -36,9 +36,9 @@
 //! destination, which is all the fan-out predicate needs. This keeps the
 //! receive core independent of the wire codec.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 // (1 live-UDP recv_loop test gated out feature-ON below; §4.2 UDP search, stage 3.)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

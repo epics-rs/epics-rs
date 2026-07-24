@@ -16,9 +16,9 @@
 //! - **P8 channel coalescing** — multiple concurrent pvget on the same PV
 //!   share a single channel/connection.
 
+// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the feature-ON suite.
 #![allow(clippy::manual_async_fn)]
 
-// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the feature-ON suite.
 // (5 live client↔server monitor tests gated out feature-ON above; stage 3.)
 
 use epics_pva_rs::server_native::MonitorStream;

@@ -22,8 +22,6 @@
 //! pipeline window. We don't yet wire them into the wire-level
 //! ackCount but the API is in place for callers to set them.
 
-// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -1875,7 +1873,7 @@ mod tests {
             .expect("re-add after remove succeeds");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_pv_subscribe_sees_initial_then_updates() {
         let pv = SharedPV::new();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
@@ -2052,7 +2050,7 @@ mod tests {
     /// named `SharedPV`'s attach/detach so a lazy PV opens for a
     /// GET-only client (no monitor) on first channel and closes on last,
     /// matching pvxs lazy GET/PUT/RPC/GET_FIELD coverage.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_source_channel_open_close_drives_lazy_lifecycle() {
         use crate::server_native::source::{ChannelContext, ChannelSource};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2189,7 +2187,7 @@ mod tests {
     /// `SharedPV::current()` / `introspection()`. A closed PV must report
     /// `None` on both, matching pvxs withdrawing `impl->current` so a
     /// post-close fetch throws `"open() first"` (`sharedpv.cpp:443-469`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_source_get_paths_withdraw_after_close() {
         use crate::server_native::source::ChannelSource;
 
@@ -2238,7 +2236,7 @@ mod tests {
     ///
     /// Before fix: try_send returned TrySendError::Full for posts 3 and 4, so
     /// consumer saw [1, 2] and the assertion v2 == 4 failed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_r6_squash_to_tail() {
         let pv = SharedPV::new();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
@@ -2265,7 +2263,9 @@ mod tests {
         );
 
         // Queue is now empty — no more posts were made.
-        let empty = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        let empty =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await;
         assert!(empty.is_err(), "queue must be empty after squash drain");
     }
 
@@ -2400,7 +2400,7 @@ mod tests {
     /// levels to the monitor loop (which fires the callbacks off the
     /// pipeline window), and `set_*_watermark` retunes them. An unknown
     /// PV / level-less source returns `None`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_source_exposes_per_pv_watermark_levels() {
         use super::super::source::ChannelSource;
         let pv = SharedPV::new();
@@ -2419,7 +2419,7 @@ mod tests {
     /// mailbox handler posts through `try_post_checked`, which retains
     /// the canonical subscriber set under the lock, so a subscriber
     /// survives back-to-back delta PUTs and receives every value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r2_put_delta_clone_drop_keeps_subscriber_alive() {
         use crate::proto::BitSet;
 
@@ -2466,7 +2466,7 @@ mod tests {
     /// `onPut` (`sharedpv.cpp:113-121`). The PV opened with a zero
     /// timestamp; after the value-only PUT the stored timeStamp must hold
     /// the current wall-clock time, not the stale zero.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_mailbox_put_value_only_stamps_timestamp() {
         use crate::proto::BitSet;
         let pv = SharedPV::build_mailbox();
@@ -2491,7 +2491,7 @@ mod tests {
     /// A client that marks `timeStamp.secondsPastEpoch` keeps its own
     /// timestamp — pvxs only stamps when `!isMarked(true, true)`, so a
     /// marked child suppresses the server fill.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_mailbox_put_marked_timestamp_is_preserved() {
         use crate::proto::BitSet;
         let pv = SharedPV::build_mailbox();
@@ -2514,7 +2514,7 @@ mod tests {
 
     /// A value type with no `timeStamp` field is unaffected: the PUT
     /// stores the value and the server fabricates no timeStamp.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_mailbox_put_no_timestamp_field_unchanged() {
         use crate::proto::BitSet;
         let pv = SharedPV::build_mailbox();
@@ -2540,7 +2540,7 @@ mod tests {
     /// `put_delta` are rejected, and the stored value is unchanged
     /// (pvxs `sharedpv.cpp:209-227`). `build_mailbox` makes it writable;
     /// `build_readonly` rejects with the pvxs `"Read-only PV"` message.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn plain_shared_pv_rejects_put_mailbox_accepts_readonly_refuses() {
         use crate::proto::BitSet;
 
@@ -2591,7 +2591,7 @@ mod tests {
     /// explicit `close()` must still terminate the subscriber
     /// inbox — closure is an owner action, and the invariant only
     /// forbids *internal clone drops* from closing the queue.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r2_close_still_terminates_subscriber() {
         let pv = SharedPV::new();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
@@ -2616,7 +2616,7 @@ mod tests {
     /// that committed value; once `close()` runs, the inbox terminates
     /// and a later PUT is rejected with no surviving clone to deliver a
     /// post-close value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_put_delta_store_and_delivery_serialize_with_close() {
         use crate::proto::BitSet;
         let pv = SharedPV::build_mailbox();
@@ -2701,7 +2701,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_source_serves_named_pv() {
         use super::super::source::ChannelSource;
         let pv = SharedPV::new();
@@ -2727,7 +2727,7 @@ mod tests {
     /// hash fallback cannot detect — remove + re-add of the SAME name
     /// within one beacon interval, so `list_pvs()` is identical
     /// before/after — must still advance the counter.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn shared_source_beacon_change_advances_on_pv_registry_mutations() {
         use super::super::source::ChannelSource;
 

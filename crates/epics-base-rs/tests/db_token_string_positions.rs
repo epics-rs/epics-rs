@@ -28,8 +28,6 @@
 //! C's two forms and rejected the other with a hard `DbParseError`. Tier 1: a
 //! `.db` C loads must load.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::db_loader::parse_db;
@@ -43,7 +41,7 @@ record(ai, QT2) { field(VAL, "6") alias(QT2ALIAS) }
 alias("QT2", QT2B)
 "#;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_file_softioc_loads_loads() {
     let (db, _) = IocBuilder::new()
         .db_string(C_MEASURED_DB, &HashMap::new())

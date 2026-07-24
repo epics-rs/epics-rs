@@ -19,8 +19,6 @@
 //! tests in `records::scalcout`. This file proves the framework owner feeds it
 //! the real target metadata end to end.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -50,7 +48,7 @@ fn scalcout_with_out(out: &str) -> ScalcoutRecord {
     sc
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_61_string_target_receives_osv_not_oval() {
     let db = PvDatabase::new();
     db.add_record("SO_TGT", Box::new(StringoutRecord::new("seed")))
@@ -72,7 +70,7 @@ async fn r14_61_string_target_receives_osv_not_oval() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_61_char_array_target_receives_sval_bytes() {
     let db = PvDatabase::new();
     db.add_record(
@@ -101,7 +99,7 @@ async fn r14_61_char_array_target_receives_sval_bytes() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_61_numeric_target_still_receives_oval() {
     let db = PvDatabase::new();
     db.add_record("AI_TGT", Box::new(AiRecord::new(0.0)))

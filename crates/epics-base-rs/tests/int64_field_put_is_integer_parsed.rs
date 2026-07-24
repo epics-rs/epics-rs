@@ -15,8 +15,6 @@
 //! same trailing-text tolerance the dbCommon parse gate keeps. Only an
 //! out-of-integer-range magnitude is refused.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::int64in::Int64inRecord;
@@ -49,7 +47,7 @@ async fn db_with(record: Box<dyn epics_base_rs::server::record::Record>) -> PvDa
 /// `9223372036854775808` is `2^63`, one past `i64::MAX`. A `DBF_DOUBLE` parse
 /// accepts it (`9.22e18`); `epicsParseInt64` refuses it — so the put must be
 /// REFUSED and the field must keep its prior value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn int64out_hopr_over_i64_max_is_refused() {
     let db = db_with(Box::new(Int64outRecord::new(0))).await;
     assert!(
@@ -65,7 +63,7 @@ async fn int64out_hopr_over_i64_max_is_refused() {
 
 /// The same magnitude a double would silently accept is fine once it fits: the
 /// top of the i64 band lands, stored as `Int64`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn int64out_drive_and_display_fields_accept_the_i64_band() {
     let db = db_with(Box::new(Int64outRecord::new(0))).await;
     for field in [
@@ -88,7 +86,7 @@ async fn int64out_drive_and_display_fields_accept_the_i64_band() {
 /// Trailing-text tolerance is preserved (C `strtol`): `5volts` -> `5`, and a
 /// fractional string truncates rather than being rejected — RANGE is the gate,
 /// not fractionality.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn int64out_trailing_text_and_fraction_truncate_not_reject() {
     let db = db_with(Box::new(Int64outRecord::new(0))).await;
     caput(&db, "HOPR", "5volts").await.unwrap();
@@ -99,7 +97,7 @@ async fn int64out_trailing_text_and_fraction_truncate_not_reject() {
 
 // --- int64in: DBF_INT64 fields via the derive macro ---------------------------
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn int64in_over_i64_max_is_refused_in_range_accepted() {
     let db = db_with(Box::new(Int64inRecord::new(0))).await;
     for field in ["HOPR", "LOPR", "HYST", "ADEL", "MDEL"] {
@@ -120,7 +118,7 @@ async fn int64in_over_i64_max_is_refused_in_range_accepted() {
 
 /// aSub `VAL` is `DBF_LONG`, i.e. `epicsInt32`. `2147483648` is `2^31`, one past
 /// `i32::MAX`; a double parse accepts it, `epicsParseLong` refuses it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_val_over_i32_max_is_refused() {
     let db = db_with(Box::new(ASubRecord::default())).await;
     assert!(
@@ -135,7 +133,7 @@ async fn asub_val_over_i32_max_is_refused() {
     assert_eq!(stored(&db, "VAL").await, EpicsValue::Long(0));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_val_in_range_accepted_as_i32() {
     let db = db_with(Box::new(ASubRecord::default())).await;
     caput(&db, "VAL", "42").await.unwrap();
@@ -152,7 +150,7 @@ async fn asub_val_in_range_accepted_as_i32() {
 /// The stored variant now integer, the CA wire type is unchanged: `Int64`
 /// promotes to `DBR_DOUBLE` (the record serves int64 as double, as C does),
 /// `Long` stays `DBR_LONG`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn integer_fields_keep_their_ca_wire_type() {
     assert_eq!(
         EpicsValue::Int64(1).dbr_type(),

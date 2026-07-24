@@ -30,8 +30,6 @@
 //! (the in-process subscribe seam emits no connect snapshot, so every event
 //! here would be an over-post) while VAL still stores the last put.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -93,7 +91,7 @@ async fn db_with(record: Box<dyn Record>) -> PvDatabase {
     db
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn fanout_val_posts_no_per_put_monitor() {
     let db = db_with(Box::new(FanoutRecord::new())).await;
     assert_eq!(
@@ -103,7 +101,7 @@ async fn fanout_val_posts_no_per_put_monitor() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn seq_val_posts_no_per_put_monitor() {
     let db = db_with(Box::new(SeqRecord::new())).await;
     assert_eq!(

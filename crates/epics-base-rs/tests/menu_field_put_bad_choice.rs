@@ -20,8 +20,6 @@
 //! string became `to_f64().unwrap_or(0.0) as u16`, i.e. **menu index 0**. So
 //! `caput FAN.SELM Bogus` silently selected `All`.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -46,7 +44,7 @@ async fn selm(db: &PvDatabase) -> i16 {
 }
 
 /// `menu(fanoutSELM)` = All(0) / Specified(1) / Mask(2) — `nChoice` is 3.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn out_of_menu_index_is_bad_choice_and_stores_nothing() {
     let db = fanout_db().await;
     db.put_record_field_from_ca("FAN", "SELM", EpicsValue::String("Mask".into()))
@@ -69,7 +67,7 @@ async fn out_of_menu_index_is_bad_choice_and_stores_nothing() {
 /// The pre-fix fallback's real damage: an unrecognised string was coerced by
 /// the field-blind `convert_to`, landing as index 0 (`All`) with a SUCCESS
 /// status. C stores nothing and fails the put.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unknown_label_fails_instead_of_collapsing_to_index_zero() {
     let db = fanout_db().await;
     db.put_record_field_from_ca("FAN", "SELM", EpicsValue::String("Mask".into()))
@@ -85,7 +83,7 @@ async fn unknown_label_fails_instead_of_collapsing_to_index_zero() {
 }
 
 /// C matches with `strcmp`: no trimming, no case folding.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn label_match_is_exact_strcmp() {
     let db = fanout_db().await;
 
@@ -110,7 +108,7 @@ async fn label_match_is_exact_strcmp() {
 /// `epicsParseUInt16(pbuffer, &val, dbConvertBase, NULL)` — `dbConvertBase` is
 /// 0 (`epicsConvert.c:37`), so `strtoul` base 0 applies: whitespace around the
 /// digits is fine, `0x`/leading-`0` change the radix.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn in_range_index_is_parsed_the_way_epics_parse_uint16_parses_it() {
     let db = fanout_db().await;
 
@@ -133,7 +131,7 @@ async fn in_range_index_is_parsed_the_way_epics_parse_uint16_parses_it() {
 /// `menu(menuPriority)` (LOW/MEDIUM/HIGH), reached through
 /// `RecordInstance::put_common_field`, which used to hand a miss to
 /// `EpicsValue::parse` and drop it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn shared_menu_common_field_uses_the_same_converter() {
     let db = fanout_db().await;
 

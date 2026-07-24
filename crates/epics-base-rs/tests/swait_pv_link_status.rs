@@ -15,8 +15,6 @@
 //! on DOLV; see `r9_76_dol_fetch_does_not_wait_for_the_classification_task` for
 //! why gating on it would be wrong.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -77,7 +75,7 @@ async fn settle_until(db: &PvDatabase, rec: &str, f: &str, want: u16) {
 
 /// A resolvable name is PV_OK, an unresolvable one is PV_NC, a blank one is
 /// NO_PV — C's three states, one per link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_76_pv_status_classifies_each_link() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
@@ -124,7 +122,7 @@ async fn r9_76_pv_status_classifies_each_link() {
 /// A runtime re-point re-runs the search: C `special()` (swaitRecord.c:507-553)
 /// re-issues `recDynLinkAddInput` for the new name and clears to NO_PV when the
 /// name is emptied.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_76_put_to_a_pv_name_reclassifies_it() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
@@ -170,7 +168,7 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
 /// and that stale DOLD is what C writes to OUT. The port reaches the same
 /// observable state through the failed read (the framework writes DOLD only on
 /// a successful fetch), so DOLV reports the bad status without gating on it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
     let db = PvDatabase::new();
     db.add_record("SINK", Box::new(AiRecord::new(0.0)))
@@ -214,7 +212,7 @@ async fn r9_76_unresolvable_dol_keeps_dold_and_still_writes_it() {
 
 /// The other side: a DOL that DOES connect is fetched, and the fetched value is
 /// what reaches OUT.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_76_connected_dol_is_fetched_at_output_time() {
     let db = PvDatabase::new();
     db.add_record("DOLSRC", Box::new(AiRecord::new(5.0)))
@@ -263,7 +261,7 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
 /// are not a gate: a cycle that runs BEFORE that task lands (no `settle()`
 /// here, DOLV still reads NO_PV) must still fetch a DOL that resolves. Gating
 /// the fetch on `DOLV == PV_OK` made this cycle skip a get C performs.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_76_dol_fetch_does_not_wait_for_the_classification_task() {
     let db = PvDatabase::new();
     db.add_record("DOLSRC", Box::new(AiRecord::new(7.0)))

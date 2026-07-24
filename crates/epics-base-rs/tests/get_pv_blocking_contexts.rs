@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(3): blocking-context tests that hand-build specific tokio runtimes on purpose; run and pass in the feature-ON suite.
 //! `PvDatabase::get_pv_blocking` across caller contexts.
 //!
 //! It USED to be a sync bridge over an async `get_pv`, and whether blocking was
@@ -11,8 +12,6 @@
 //! context-dependent soundness question either — every context below must
 //! simply return the value. The three cases are kept as BOUNDARIES: if a future
 //! change re-introduces a blocking bridge, the current-thread case fails again.
-
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
 
 use std::time::Duration;
 
@@ -79,10 +78,11 @@ fn get_pv_blocking_from_multi_thread_runtime_succeeds() {
     let db = rt.block_on(db_with_pv());
 
     rt.block_on(async move {
-        let value = tokio::task::spawn_blocking(move || db.get_pv_blocking("BLOCKING:PV"))
-            .await
-            .unwrap()
-            .expect("multi-thread runtime must keep working");
+        let value =
+            epics_base_rs::runtime::task::spawn_blocking(move || db.get_pv_blocking("BLOCKING:PV"))
+                .await
+                .unwrap()
+                .expect("multi-thread runtime must keep working");
         assert_eq!(value, EpicsValue::Long(7));
     });
 }

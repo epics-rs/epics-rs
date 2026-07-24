@@ -14,8 +14,6 @@
 //! `rec_gbl_check_udf` tested `udf != 0` (truthy) for every record. Verified
 //! against the C source (not the running oracle) per the panel's constraints.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::bo::BoRecord;
@@ -43,7 +41,7 @@ async fn state(db: &PvDatabase) -> (AlarmSeverity, u16, u8) {
     (g.common.sevr, g.common.stat, g.common.udf)
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_udf_put_type_max_raises_no_alarm() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     caput(&db, "UDF", "255").await;
@@ -56,7 +54,7 @@ async fn bo_udf_put_type_max_raises_no_alarm() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_udf_put_negative_raises_no_alarm() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     // `-1` into the signed-served DBF_UCHAR reaches the field as 255.
@@ -66,7 +64,7 @@ async fn bo_udf_put_negative_raises_no_alarm() {
     assert_eq!((sevr, stat), (AlarmSeverity::NoAlarm, NO_ALARM));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stringout_udf_put_type_max_raises_no_alarm() {
     let db = db_with(Box::new(StringoutRecord::default())).await;
     caput(&db, "UDF", "255").await;
@@ -79,7 +77,7 @@ async fn stringout_udf_put_type_max_raises_no_alarm() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stringout_udf_put_negative_raises_no_alarm() {
     let db = db_with(Box::new(StringoutRecord::default())).await;
     caput(&db, "UDF", "-1").await;
@@ -90,7 +88,7 @@ async fn stringout_udf_put_negative_raises_no_alarm() {
 
 /// The exact-one gate must NOT suppress the ordinary undefined alarm: a fresh
 /// record with `udf == 1` still raises UDF_ALARM/INVALID (C `1 == TRUE`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_udf_one_still_raises() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     // A UDF put of exactly 1 keeps the record undefined and must alarm.

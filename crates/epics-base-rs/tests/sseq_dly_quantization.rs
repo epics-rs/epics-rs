@@ -25,8 +25,6 @@
 //! `epicsThreadSleepQuantum()` is `1/sysconf(_SC_CLK_TCK)` = 0.01 s on Linux
 //! and macOS, and `NINT(f) = (long)(f > 0 ? f+0.5 : f-0.5)` (sseqRecord.c:67).
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::runtime::time::thread_sleep_quantum;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -45,7 +43,7 @@ fn expect_quantized(seconds: f64) -> f64 {
     q * (ticks + 0.5).trunc()
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_init_rounds_every_dly_to_a_clock_tick() {
     let mut rec = SseqRecord::default();
     // Raw db-file values: put_field alone stores them verbatim (C `dbPut` at
@@ -95,7 +93,7 @@ async fn r9_70_init_rounds_every_dly_to_a_clock_tick() {
 
 /// A put to DLY1 quantizes DLY1 — the one index where C's `special` quirk and
 /// the obvious reading agree.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_put_to_dly1_quantizes_dly1() {
     let mut rec = SseqRecord::default();
     rec.put_field("DLY1", EpicsValue::Double(0.037)).unwrap();
@@ -109,7 +107,7 @@ async fn r9_70_put_to_dly1_quantizes_dly1() {
 }
 
 /// C's `special` quirk, pinned: a put to DLYA rounds DLY1 and leaves DLYA raw.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
     let mut rec = SseqRecord::default();
     // DLY1 left unrounded on purpose, so the quirk is observable.
@@ -136,7 +134,7 @@ async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
 /// casts `0.0` to the integer `0`, so every served/monitored `DLYn` is `+0.0`
 /// — it renders `"0"`. An `f64::trunc` port produced `-0.0` (`(-0.0 -
 /// 0.5).trunc()` = `-0.0`), which renders `"-0"`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_default_dly_serves_positive_zero_not_negative_zero() {
     let mut rec = SseqRecord::default();
     rec.init_record(0).unwrap();
@@ -154,7 +152,7 @@ async fn r9_70_default_dly_serves_positive_zero_not_negative_zero() {
 /// Oracle symptom (put): a huge `caput DLY1` overflows C's `(long)` cast to
 /// i64::MIN, so the served value is `quantum * i64::MIN` ≈ -9.22e16 — finite
 /// and negative. An `f64::trunc` port kept `inf`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
     let q = thread_sleep_quantum();
     let expect_overflow = q * (i64::MIN as f64);
@@ -183,7 +181,7 @@ async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
 
 /// The framework put path (`special` after the store) must show the same
 /// thing end to end: DLYA raw, DLY1 rounded.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_70_framework_put_path_matches_c() {
     use epics_base_rs::server::database::PvDatabase;
 

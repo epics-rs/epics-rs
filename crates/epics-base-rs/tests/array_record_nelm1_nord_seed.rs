@@ -26,8 +26,6 @@
 //! The full link-shape table is `tests/array_nord_at_init.rs`; this file keeps
 //! the NELM boundary (NELM==1 vs NELM>1) per kind, with no record processed.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -80,7 +78,7 @@ async fn nord(db: &PvDatabase, rec: &str) -> f64 {
 
 /// `aai` is the one kind whose dset leaves the seed alone: its single element IS
 /// the value, and a client reads it before the first process.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nelm1_seeds_nord1_on_aai_and_serves_one_element() {
     let db = build().await;
     assert_eq!(nord(&db, "N1:AAI").await, 1.0, "devAaiSoft keeps the seed");
@@ -94,7 +92,7 @@ async fn nelm1_seeds_nord1_on_aai_and_serves_one_element() {
 /// waveform and aao: the seed does not survive their dsets, so a NELM=1 record
 /// serves a zero-length array until something loads elements into it — exactly
 /// what C serves.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nelm1_keeps_nord_zero_on_waveform_and_aao() {
     let db = build().await;
     for rec in ["N1:WF", "N1:AAO"] {
@@ -111,7 +109,7 @@ async fn nelm1_keeps_nord_zero_on_waveform_and_aao() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nelm_above_one_keeps_nord_zero() {
     let db = build().await;
     for rec in ["N8:WF", "N8:AAI", "N8:AAO"] {
@@ -126,7 +124,7 @@ async fn nelm_above_one_keeps_nord_zero() {
 
 /// subArray has no NELM==1 seed in C (`subArrayRecord.c:101` sets NORD=0
 /// unconditionally) — its NORD comes from the INP slice.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn subarray_nelm1_keeps_nord_zero() {
     let db = build().await;
     assert_eq!(

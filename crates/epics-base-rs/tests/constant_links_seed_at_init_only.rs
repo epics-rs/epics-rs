@@ -20,8 +20,6 @@
 //! Pre-fix the port re-applied the constant on every process, so the caput was
 //! destroyed on the next scan and A read 0 before the first process.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::printf::PrintfRecord;
@@ -45,7 +43,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 /// The whole rule on one record: seeded at init, never re-delivered, and a
 /// client's put stands.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_input_is_seeded_at_init_and_never_re_applied() {
     let db = PvDatabase::new();
     let mut calc = CalcRecord::new("A+B");
@@ -82,7 +80,7 @@ async fn constant_input_is_seeded_at_init_and_never_re_applied() {
 /// (`AbortOnFirstFailure`), so if a constant read were classified as a failure
 /// the record body would never run. Boundary: constant (success) vs a link to a
 /// missing record (failure).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_constant_input_does_not_gate_the_record_body() {
     let db = PvDatabase::new();
     let mut sel = SelRecord::default();
@@ -110,7 +108,7 @@ async fn a_constant_input_does_not_gate_the_record_body() {
 
 /// seq: constant SELL → SELN and constant DOLn → DOn, both init-only
 /// (`seqRecord.c:121-126`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn seq_seeds_constant_sell_and_doln_at_init() {
     let db = PvDatabase::new();
     let seq = SeqRecord {
@@ -136,7 +134,7 @@ async fn seq_seeds_constant_sell_and_doln_at_init() {
 /// printf is the declared exception: `GET_PRINT` (`printfRecord.c:49-52`)
 /// re-runs `recGblInitConstantLink` on every `doPrintf`, so ITS constants keep
 /// delivering each cycle and its formatted VAL is stable.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn printf_constants_still_deliver_every_cycle() {
     let db = PvDatabase::new();
     let mut p = PrintfRecord::default();

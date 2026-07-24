@@ -32,8 +32,6 @@
 //! record(ai,"A1"){}   (a type that DOES clear)               UDF 0  NO_ALARM NO_ALARM
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -61,7 +59,7 @@ async fn state(db: &PvDatabase, name: &str) -> (bool, AlarmSeverity, u16) {
 
 /// A dfanout with no DOL is undefined FOREVER: it publishes INVALID/UDF on
 /// every process, and processing never clears the flag.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dfanout_without_dol_stays_undefined_and_invalid() {
     let db = PvDatabase::new();
     db.add_record("DFN", Box::new(DfanoutRecord::new(0.0)))
@@ -81,7 +79,7 @@ async fn dfanout_without_dol_stays_undefined_and_invalid() {
 
 /// The closed-loop DOL branch is the ONE place dfanout writes UDF
 /// (`udf = isnan(val)`), so a dfanout fed by a DOL comes up defined.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dfanout_with_closed_loop_dol_is_defined() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))
@@ -121,7 +119,7 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
 /// blanket UDF *alarm* invents an alarm C does not raise. (Histogram's limits are
 /// valid here, so its CBUG-F12 invalid-limits alarm stays silent — that alarm is
 /// about `LLIM >= ULIM`, not about UDF.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn histogram_and_event_keep_udf_without_alarming() {
     let db = PvDatabase::new();
     db.add_record("H1", Box::new(HistogramRecord::new(16, 0.0, 10.0)))
@@ -148,7 +146,7 @@ async fn histogram_and_event_keep_udf_without_alarming() {
 
 /// A record type that DOES clear UDF in its own `process()` is untouched by
 /// the opt-out.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ai_and_ao_still_clear_udf_on_process() {
     let db = PvDatabase::new();
     db.add_record("A1", Box::new(AiRecord::new(1.0)))

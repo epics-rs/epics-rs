@@ -14,8 +14,6 @@
 //! `rpc`, `is_writable`, `get_introspection`). `list_pvs()` is the
 //! union of every source's PV list.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1126,7 +1124,7 @@ mod tests {
     /// must go through the matched inner source's gate via
     /// `ChannelSource::revalidate_read`, not the composite's own
     /// permissive `access()` gate.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn aggregator_gate_observes_inner_bumps() {
         use epics_base_rs::server::access_security::AccessGate;
         struct VersionedSrc {
@@ -1221,7 +1219,7 @@ mod tests {
     /// lookup fails for names no upstream serves); `blanket` makes it
     /// report `levels` for EVERY name (the gateway's name-independent
     /// `monitor_watermarks`) versus only for the name it owns.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn composite_watermarks_come_from_the_owning_source() {
         struct WmSrc {
             serves: &'static str,
@@ -1324,7 +1322,7 @@ mod tests {
     /// version than inner B, then bumps B (which the old `max`
     /// aggregator would miss) and asserts the composite version
     /// changes.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn aggregator_detects_inner_bump_below_max() {
         use epics_base_rs::server::access_security::AccessGate;
         struct VersionedSrc {
@@ -1416,7 +1414,7 @@ mod tests {
     /// detect: replacing a source with another serving the SAME
     /// `list_pvs()` output, and changing a source's priority for the
     /// same PV name. Mirrors pvxs `beaconChange` (server.cpp:90-115).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn beacon_change_advances_on_registry_mutations() {
         let comp = CompositeSource::new();
         let v0 = comp.beacon_change();
@@ -1496,7 +1494,7 @@ mod tests {
     /// keeps a single `beaconChange` bumped by both
     /// `addSource`/`removeSource` AND `addPV`/`removePV`
     /// (server.cpp:95,113,180,189).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn beacon_change_aggregates_inner_shared_source_mutations() {
         use crate::server_native::{SharedPV, SharedSource};
 
@@ -1536,7 +1534,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn priority_order_dispatch() {
         let comp = CompositeSource::new();
         let lo: DynSource = Arc::new(PvSrc {
@@ -1559,7 +1557,7 @@ mod tests {
         assert_eq!(*n, 2);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn list_pvs_unions_sources() {
         let comp = CompositeSource::new();
         comp.add_source(
@@ -1595,7 +1593,7 @@ mod tests {
     /// `has_pv` is reached and records the account seen by
     /// `has_pv_checked`; routing `get_value_checked` through the
     /// composite must hit the credentialed path only.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn fr8_checked_ops_select_via_has_pv_checked() {
         use crate::server_native::source::ChannelContext;
         use epics_base_rs::server::access_security::AccessGate;
@@ -1714,7 +1712,7 @@ mod tests {
     /// name is removed and re-registered to a different source. A fresh
     /// resolve sees the new registry — proving the binding, not the
     /// registry, is what a live channel dispatches through.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn resolve_owner_binds_accepting_source_across_registry_change() {
         use crate::server_native::source::ChannelContext;
         let ctx = ChannelContext {
@@ -1795,7 +1793,7 @@ mod tests {
     /// never suppresses a user PV named `server`. Mirrors the built-in
     /// `__server` (order -1, non-searchable) sitting in front of a
     /// default-order user `server` PV.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_ors_claims_across_sources_non_searchable_host_does_not_veto() {
         /// Hosts `name` but is never search-advertised — the
         /// `ServerInfoSource`/pvxs `ServerSource` shape.
@@ -1920,7 +1918,7 @@ mod tests {
     /// refusal would have degraded to a search timeout. Sources that do not
     /// distinguish the two are unaffected — `searchable` defaults to `has_pv`,
     /// which the sibling test above still pins.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_advertises_a_name_the_source_refuses_at_create() {
         /// Advertised at SEARCH, refused at CREATE — the `SingleSource`
         /// `DBF_NOACCESS` shape.

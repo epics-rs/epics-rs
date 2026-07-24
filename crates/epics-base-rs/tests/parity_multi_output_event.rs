@@ -3,8 +3,6 @@
 //! event-record routing, and UDF-on-NaN.
 #![allow(clippy::all)]
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -38,7 +36,7 @@ fn fanout_has_lnk0_field() {
 
 /// `SELM=All` fans out through `LNK0`; the primary first
 /// slot is no longer silently dropped.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn fanout_selm_all_processes_lnk0_target() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("DOWNSTREAM", Box::new(AiRecord::new(0.0)))
@@ -65,7 +63,7 @@ async fn fanout_selm_all_processes_lnk0_target() {
 
 /// dfanout `SELM=Specified` is 1-based: `SELN=1`
 /// drives OUTA, `SELN=0` drives nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dfanout_specified_is_one_based() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("OUT_A", Box::new(AiRecord::new(0.0)))
@@ -108,7 +106,7 @@ async fn dfanout_specified_is_one_based() {
 
 /// An out-of-range `SELN` on a dfanout raises
 /// SOFT_ALARM / INVALID_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dfanout_specified_out_of_range_raises_invalid() {
     use epics_base_rs::server::record::AlarmSeverity;
     let db = Arc::new(PvDatabase::new());
@@ -153,7 +151,7 @@ fn event_record_val_is_string() {
 
 /// `post_event_named` routes by event number:
 /// a record with `EVNT=5` fires only on event 5, not event 7.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn event_scan_routes_by_event_number() {
     use epics_base_rs::server::record::ScanType;
 
@@ -199,7 +197,7 @@ async fn event_scan_routes_by_event_number() {
 
 /// UDF stays true when the processed value is NaN, so the
 /// record raises UDF_ALARM instead of reporting a garbage value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn udf_stays_true_on_nan_value() {
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -227,7 +225,7 @@ async fn udf_stays_true_on_nan_value() {
 
 /// UDF IS cleared when the processed value is a defined
 /// (non-NaN) number — the fix must not over-suppress UDF clearing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn udf_cleared_on_defined_value() {
     let db = Arc::new(PvDatabase::new());
     db.add_record("OK_REC", Box::new(AiRecord::new(3.14)))
@@ -247,7 +245,7 @@ async fn udf_cleared_on_defined_value() {
 /// `dbScanFwdLink` → `dbScanPassive` (`dbDbLink.c:425-432`), which
 /// returns early when `pto->scan != 0`. The Rust fanout path
 /// previously called `process_record_with_links` unconditionally.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn fanout_lnk_skips_non_passive_target() {
     use epics_base_rs::server::record::ScanType;
 
@@ -316,10 +314,10 @@ async fn poll_until(label: &str, cond: impl Fn() -> bool) {
     for _ in 0..400 {
         if cond() {
             // settle window — a spurious second dispatch would land here.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(30)).await;
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("{label}: sseq sequence did not complete within timeout");
 }
@@ -365,7 +363,7 @@ impl Record for CountingTarget {
 /// One `process` of an sseq record writes each selected `LNKn` value
 /// exactly once — never twice. Regression for the two-owner
 /// double-dispatch defect.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_lnkn_dispatched_exactly_once_per_cycle() {
     let db = PvDatabase::new();
 
@@ -439,7 +437,7 @@ async fn sseq_lnkn_dispatched_exactly_once_per_cycle() {
 
 /// `SELM=Specified` selects a single sseq step — only that step's
 /// `LNKn` is dispatched (and only once), the others are not written.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_selm_specified_writes_only_selected_step_once() {
     let db = PvDatabase::new();
 

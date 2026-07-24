@@ -18,8 +18,6 @@
 //! severity is NOT lost, and neutralizing the gate drives the target to OVAL,
 //! proving the suppression is the gate's doing.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -28,7 +26,7 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     let db = PvDatabase::new();
 

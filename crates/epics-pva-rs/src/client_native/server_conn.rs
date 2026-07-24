@@ -19,8 +19,7 @@
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -2073,7 +2072,7 @@ mod tests {
     /// frame disconnects. The pre-fix port hard-failed, so a Rust client
     /// could not reach a refuse-cred-serve-anon server (reconnect loop).
     /// `wait_for_validated` must return `Ok` on a non-success status.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_for_validated_proceeds_on_auth_refused() {
         let order = ByteOrder::Little;
         let mut payload = Vec::new();

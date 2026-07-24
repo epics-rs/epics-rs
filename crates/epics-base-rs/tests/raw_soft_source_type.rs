@@ -22,8 +22,6 @@
 //! source x {signed, unsigned} RVAL, plus the in-range control that cannot tell
 //! the two rules apart.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -71,7 +69,7 @@ async fn rval(db: &PvDatabase, rec: &str) -> EpicsValue {
 /// `epicsInt32`; C's integer conversion keeps the bits, so RVAL is the negative
 /// word with the same pattern. The float rule would have saturated it to
 /// `INT32_MAX` and thrown the bits away.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_integer_source_wraps_into_a_signed_rval() {
     let db = ioc().await;
     assert_eq!(rval(&db, "AI:INT").await, EpicsValue::Long(-559038737));
@@ -82,7 +80,7 @@ async fn an_integer_source_wraps_into_a_signed_rval() {
 /// (6.3.1.3p2). This is the case the old float rule destroyed outright: `-1.0`
 /// through a saturating `f64 -> u32` is `0`, i.e. every bit of an all-ones source
 /// lost, and mbbiDirect's whole bit field with it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_integer_source_wraps_into_an_unsigned_rval() {
     let db = ioc().await;
     for rec in ["BI:INT", "MBI:INT", "MBD:INT"] {
@@ -98,7 +96,7 @@ async fn an_integer_source_wraps_into_an_unsigned_rval() {
 /// range and which this port saturates (CBUG-E2) rather than reproducing x86-64's
 /// `INT32_MIN`. The two rules must not be collapsed into one — this is why the
 /// conversion is the coercion owner's to make and not a `to_f64()` away.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_float_source_saturates_into_a_signed_rval() {
     let db = ioc().await;
     assert_eq!(rval(&db, "AI:DBL").await, EpicsValue::Long(i32::MAX));
@@ -106,7 +104,7 @@ async fn a_float_source_saturates_into_a_signed_rval() {
 
 /// The control: in range, both rules agree, so no test above proves anything
 /// unless this one passes too.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_in_range_source_is_unaffected_by_which_rule_runs() {
     let db = ioc().await;
     db.put_pv("SRC:BIG", EpicsValue::Long(37)).await.unwrap();

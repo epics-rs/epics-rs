@@ -24,8 +24,11 @@ use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext, CommandDe
 
 fn make_ctx() -> CommandContext {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let handle = rt.handle().clone();
-    let ctx = CommandContext::new(Arc::new(PvDatabase::new()), handle);
+    let bridge = {
+        let _guard = rt.enter();
+        epics_base_rs::runtime::task::BlockingBridge::capture()
+    };
+    let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
     // The context borrows the runtime for the life of the command; the test
     // process exits before the leak matters.
     std::mem::forget(rt);

@@ -3,8 +3,6 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
-// RTEMS-EXEC-MODEL-ALLOW(28): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -2128,7 +2126,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_nt_enum_dereferences_value_index() {
         // pvxs `ioc/iocsource.cpp:589-593`: an NTEnum PUT is dereferenced
         // through `value.index`. A round trip through the native source
@@ -2187,7 +2185,7 @@ mod tests {
     /// `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e. the search
     /// WAS answered (a refusal can only follow a CREATE_CHANNEL, which only
     /// follows a successful search) and the create was refused.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_claims_every_dbd_name_but_create_gates_on_a_servable_field() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2253,7 +2251,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn simple_pv_monitor_observes_later_puts() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("SIMPLE:MON", EpicsValue::Double(1.0))
@@ -2279,10 +2277,11 @@ mod tests {
         .await
         .expect("PUT must succeed");
 
-        let updated = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("monitor must receive the PUT update within 2s")
-            .expect("monitor stream still open");
+        let updated =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("monitor must receive the PUT update within 2s")
+                .expect("monitor stream still open");
         assert_eq!(
             monitor_double(&updated),
             Some(2.0),
@@ -2295,7 +2294,7 @@ mod tests {
     /// server stored ACF only as `#[allow(dead_code)]` and never
     /// called `check_access*` — every client could PUT regardless
     /// of UAG/HAG/RULE configuration.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_value_ctx_denies_when_acf_writeable_rule_unmet() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2353,7 +2352,7 @@ ASG(SECURE) {
     /// NoAccess on the record's ASG must observe the same shape as
     /// "PV not found" (None) — the wire layer surfaces this as
     /// ECA_NORDACCESS-equivalent.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_value_ctx_denies_when_acf_no_access() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2395,7 +2394,7 @@ ASG(LOCKED) {
 
     /// subscribe_ctx must also deny when peer has
     /// NoAccess.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn subscribe_ctx_denies_when_acf_no_access() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2435,7 +2434,7 @@ ASG(LOCKED) {
     /// policy. Proves the RwLock-backed reload path actually
     /// influences the source's behaviour (the reload path plumbs
     /// `PvaServer::reload_acf_from` to write into this cell).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn acf_swap_takes_effect_on_next_put() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2497,7 +2496,7 @@ ASG(SECURE) {
 
     /// When the source is built without ACF, behaviour
     /// matches the old `put_value` path — every PUT succeeds.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_value_ctx_allows_when_no_acf() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -2522,7 +2521,7 @@ ASG(SECURE) {
     /// then sees `NoAccess` in the token level and returns `None`.
     /// Previously every GET handler had to *remember* to call the
     /// ACF check by hand — now the trait method signature forces it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_value_checked_denies_when_no_access() {
         use crate::server_native::source::ChannelSource;
         use epics_base_rs::server::records::ai::AiRecord;
@@ -2576,7 +2575,7 @@ ASG(LOCKED) {
     /// range. Pre-fix `scalar_to_epics` collapsed `ScalarValue::ULong`
     /// to `EpicsValue::Long(x as i32)`, discarding the upper 32 bits
     /// before `PvDatabase::put_pv` coerced to the target field.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r21_scalar_ulong_put_preserves_full_u64() {
         let db = Arc::new(PvDatabase::new());
         // A simple PV stores the value verbatim (`pv.set`), with no
@@ -2612,7 +2611,7 @@ ASG(LOCKED) {
     /// `pv_field_to_epics` had no `ScalarValue::ULong` array arm, so
     /// the PUT fell through to `None` and was rejected as
     /// "PUT value not representable as EpicsValue".
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn mr_r24_ulong_array_put_preserves_full_u64() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -2651,7 +2650,7 @@ ASG(LOCKED) {
     /// `pv_field_to_epics` had only a `ScalarArray` arm, so the
     /// wire-decoded form fell through to `None` and the PUT was
     /// rejected as "PUT value not representable as EpicsValue".
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pf_r2_wire_typed_ulong_array_put_preserves_full_u64() {
         use crate::pvdata::TypedScalarArray;
         use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -2689,7 +2688,7 @@ ASG(LOCKED) {
     /// `ScalarValue::UInt(x)` to `EpicsValue::Long(x as i32)`, so
     /// `0x8000_0000..=0xffff_ffff` was stored as a negative value.
     /// `Int64` is the lossless `epicsUInt32` carrier.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_03_scalar_uint_put_preserves_full_u32() {
         let db = Arc::new(PvDatabase::new());
         // A simple PV stores the value verbatim, isolating the
@@ -2722,7 +2721,7 @@ ASG(LOCKED) {
     /// `scalar_array_to_epics` had no `ScalarValue::UInt` arm, so the
     /// PUT fell through to `None` ("PUT value not representable as
     /// EpicsValue"). `Int64Array` carries every `epicsUInt32` element.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_03_uint_array_put_preserves_full_u32() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -2757,7 +2756,7 @@ ASG(LOCKED) {
     /// a real PVA wire `uint[]` PUT decodes to
     /// `PvField::ScalarArrayTyped`; it must reach the same `Int64Array`
     /// conversion as the untyped form rather than being rejected.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_03_wire_typed_uint_array_put_preserves_full_u32() {
         use crate::pvdata::TypedScalarArray;
         use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -2794,7 +2793,7 @@ ASG(LOCKED) {
     /// `testdata.cpp:596`), not saturate. The `uint` carrier is `Int64`;
     /// pre-fix `convert_to(DBF_LONG)` round-tripped through f64 and clamped
     /// `4294967295.0` to `i32::MAX` (2147483647) instead of yielding -1.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_uint_scalar_put_truncates_into_signed_longout() {
         use epics_base_rs::server::records::longout::LongoutRecord;
 
@@ -2827,7 +2826,7 @@ ASG(LOCKED) {
     /// element (pvxs `convertCast` `Dest(S[i])`, `sharedarray.cpp:160-166`).
     /// `{1, 2, 0xffffffff}` lands as `{1, 2, -1}`; pre-fix the last element
     /// saturated to `i32::MAX` through the f64 round-trip.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r0604_uint_array_put_truncates_into_signed_long_waveform() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -2865,7 +2864,7 @@ ASG(LOCKED) {
     /// element type now comes from the `TypedScalarArray` tag, which is
     /// present at length zero. Covers `double[]`, `string[]`, and an
     /// integer array per the finding.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_04_empty_typed_double_array_put_clears_waveform() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -2894,7 +2893,7 @@ ASG(LOCKED) {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_04_empty_typed_string_array_put_accepted() {
         // `WaveformRecord` has no DBF_STRING storage, so a string array
         // lives on a simple PV, which stores the value verbatim and thus
@@ -2924,7 +2923,7 @@ ASG(LOCKED) {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_04_empty_typed_int_array_put_clears_waveform() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -2960,7 +2959,7 @@ ASG(LOCKED) {
     /// alarm/timeStamp, so a later GET rebuilt them from local defaults
     /// (NO_ALARM + wall-clock-now). pvxs mailbox SharedPV assigns the
     /// whole posted value (`sharedpv.cpp:417-432`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_60_simple_pv_put_persists_alarm_and_timestamp() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("MB:PV", EpicsValue::Double(0.0)).await.unwrap();
@@ -3022,7 +3021,7 @@ ASG(LOCKED) {
     /// rule.level=1`. The fix doesn't change the equality bound;
     /// it threads the real ASL so `RULE(N, …)` with `record_asl > N`
     /// now skips the rule.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn asl_gate_skips_rules_above_record_asl() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -3091,7 +3090,7 @@ ASG(DEFAULT) {
     /// record evaluates the expression into VAL on process, so VAL flips
     /// from its unprocessed default (0) to 5 — proof the chain ran, which
     /// the old no-op `Ok(())` could never produce.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_runs_record_processing_not_noop() {
         use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -3143,7 +3142,7 @@ ASG(DEFAULT) {
     ///
     /// UDF is the witness that discriminates the two routes: `dbPut` writes
     /// the field and stops, so only a real process cycle clears it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn external_put_on_a_passive_record_processes_it() {
         use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -3192,7 +3191,7 @@ ASG(DEFAULT) {
     /// `DBE_PROPERTY` subscription (`singlesource.cpp:162-166`), so putting
     /// display/control/valueAlarm on every value update is a strict superset
     /// of C — the whole `--phase pva-monitor` `update_events` pattern.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_process_update_marks_value_alarm_time_not_the_metadata_leaves() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -3220,10 +3219,11 @@ ASG(DEFAULT) {
             .await
             .expect("put");
 
-        let update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("an update must post within 2s")
-            .expect("stream open");
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open");
         let marked = update.marked.expect("a record update declares its marks");
 
         assert!(
@@ -3307,7 +3307,7 @@ ASG(DEFAULT) {
     /// and, unlike the task, without the consumer awaiting anything: this
     /// is the property that lets an RTEMS operation thread drain a monitor
     /// without a reactor.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn the_upstream_seed_is_the_first_item_and_needs_no_await() {
         use tokio::sync::mpsc::error::TryRecvError;
 
@@ -3369,7 +3369,7 @@ ASG(DEFAULT) {
     /// only reports `Disconnected` when the producer is really gone. Getting
     /// this backwards would make an RTEMS drain loop tear down every idle
     /// monitor, which is why the mapping is spelled once in `from_queue_err`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn an_idle_record_monitor_is_empty_not_disconnected() {
         use epics_base_rs::server::records::ai::AiRecord;
         use tokio::sync::mpsc::error::TryRecvError;
@@ -3398,7 +3398,7 @@ ASG(DEFAULT) {
         db.put_record_field_from_ca_no_notify("AI:IDLE", "VAL", EpicsValue::Double(1.0))
             .await
             .expect("put");
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("an update must post within 2s")
             .expect("stream open");
@@ -3406,7 +3406,7 @@ ASG(DEFAULT) {
 
     /// A simple/mailbox PV has no record body; PROCESS reports unsupported
     /// rather than silently succeeding.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_simple_pv_is_unsupported() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("MAILBOX:PV", EpicsValue::Double(1.0))

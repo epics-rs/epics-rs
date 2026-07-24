@@ -26,8 +26,6 @@
 //!     cleared it on the first cycle merely because VAL (still its initial 0)
 //!     was not NaN.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -53,7 +51,7 @@ async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
 
 /// A NaN result is a calcPerform SUCCESS in base C — UDF is cleared and no
 /// alarm is raised. The port used to report UDF_ALARM/INVALID here.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c13_a_nan_result_clears_udf_and_raises_no_alarm() {
     let db = PvDatabase::new();
     let mut w = SwaitRecord::default();
@@ -82,7 +80,7 @@ async fn r11_c13_a_nan_result_clears_udf_and_raises_no_alarm() {
 
 /// A calc that FAILS never clears UDF: C only clears it in the `else` arm.
 /// The port cleared it anyway (VAL, still 0.0, is not NaN).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c13_a_failing_calc_leaves_udf_set() {
     let db = PvDatabase::new();
     let mut w = SwaitRecord::default();
@@ -114,7 +112,7 @@ async fn r11_c13_a_failing_calc_leaves_udf_set() {
 /// The fetch gate: C runs no calcPerform, so UDF freezes at whatever it was
 /// (here: still set — no calc has ever succeeded), and READ_ALARM is the only
 /// alarm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c13_a_gated_cycle_does_not_touch_udf() {
     const READ_ALARM: u16 = 1;
     let db = PvDatabase::new();

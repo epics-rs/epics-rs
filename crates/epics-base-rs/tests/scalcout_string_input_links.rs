@@ -10,8 +10,6 @@
 //! The port had no INAA..INLL fields and never ran that loop, so AA..LL could
 //! only ever hold what a client put into them.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -45,7 +43,7 @@ fn scalcout(calc: &str) -> ScalcoutRecord {
 
 /// The base case the record could not do at all: INAA points at a string PV,
 /// and the CALC reads it as AA.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_string_input_link_is_fetched_into_aa() {
     let db = PvDatabase::new();
     db.add_record("SSRC", Box::new(StringinRecord::new("hello")))
@@ -75,7 +73,7 @@ async fn r10_65_string_input_link_is_fetched_into_aa() {
 /// link that does not resolve leaves the record computing (C returns 0 from the
 /// string loop) and replaces the value field with the diagnostic text
 /// (sCalcoutRecord.c:939-940).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_failed_string_link_writes_the_diagnostic_and_does_not_gate_the_calc() {
     let db = PvDatabase::new();
     db.add_record("NSRC", Box::new(AiRecord::new(7.0)))
@@ -109,7 +107,7 @@ async fn r10_65_failed_string_link_writes_the_diagnostic_and_does_not_gate_the_c
 /// Negative control for the gate: the SAME failure on a NUMERIC link does gate
 /// the calc (`InputFetchPolicy::AbortOnFirstFailure`), so VAL freezes. The two
 /// loops must not share a policy.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_failed_numeric_link_still_gates_the_calc() {
     let db = PvDatabase::new();
 
@@ -130,7 +128,7 @@ async fn r10_65_failed_numeric_link_still_gates_the_calc() {
 
 /// An unset INAA link is neither CA_LINK nor DB_LINK in C, so neither
 /// `dbGetLink` branch runs, status stays 0, and AA keeps what was put to it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_unset_string_link_leaves_the_field_alone() {
     let db = PvDatabase::new();
 
@@ -152,7 +150,7 @@ async fn r10_65_unset_string_link_leaves_the_field_alone() {
 /// element is the one type NOT read as DBR_STRING — C reads the array as text
 /// and escapes it (`epicsStrSnPrintEscaped`). A DBR_STRING read of a char
 /// waveform would have rendered element 0 as a number instead.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_char_waveform_source_is_read_as_escaped_text() {
     let db = PvDatabase::new();
     let mut wf = WaveformRecord::new(64, DbFieldType::Char);
@@ -180,7 +178,7 @@ async fn r10_65_char_waveform_source_is_read_as_escaped_text() {
 
 /// C caps the string fields at STRING_SIZE-1 = 39 bytes (the `epicsSnprintf` /
 /// `epicsStrSnPrintEscaped` size argument, and the DBR_STRING buffer itself).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_65_fetched_string_is_capped_at_the_c_field_width() {
     let db = PvDatabase::new();
     let long = "x".repeat(50);

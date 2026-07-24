@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): block_on_sync's current-thread-runtime refusal needs an ambient tokio runtime; runs and passes in the feature-ON suite.
 //! Status PVs — the few numbers an operator can read off a target that has no
 //! shell.
 //!
@@ -84,8 +85,6 @@
 //!   computed as free + used (`osdMemUsage.c:73`); here it is
 //!   [`MemUsage::total`](epics_rtems_boot::stats::MemUsage::total), arithmetic
 //!   on the two numbers the kernel actually reported.
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -555,6 +554,10 @@ mod tests {
 
     /// A pusher that cannot publish says so and stops, rather than spinning
     /// through ticks that all fail the same way.
+    ///
+    /// `#[tokio::test]`, not `#[epics_test]`: the point of this test is the
+    /// ambient current-thread tokio runtime — the exact context
+    /// `block_on_sync` refuses. The census marker accounts for it.
     #[tokio::test]
     async fn a_pusher_that_cannot_publish_retires() {
         // A current-thread runtime is exactly the context `block_on_sync`

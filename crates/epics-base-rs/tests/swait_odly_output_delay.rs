@@ -19,8 +19,6 @@
 //! scalcout ODLY test does) so the assertion is deterministic and does not race
 //! the real timer (ODLY=100s makes the timer unfireable here).
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,7 +72,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
 
 /// ODLY>0: the delaying cycle defers, the continuation drives OUT to OVAL and
 /// posts OEVT exactly once.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -109,7 +107,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
         .await
         .unwrap();
     // Give any erroneous spawned OEVT post time to land before asserting none.
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(60)).await;
     assert_eq!(
         db.get_pv("W_TGT").unwrap().to_f64(),
         Some(0.0),
@@ -131,9 +129,9 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         db.get_pv("W_TGT").unwrap().to_f64(),
         Some(42.0),
@@ -153,7 +151,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
 /// `output_wait` continuation and firing the deferred OUT / OEVT early. Without
 /// the PACT hold the foreign process drives the target to OVAL before the delay
 /// elapses.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -194,7 +192,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     db.process_record_with_links("W3_ODLY", &mut v2, 0)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(40)).await;
     assert_eq!(
         db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(0.0),
@@ -216,9 +214,9 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(42.0),
@@ -240,7 +238,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
 /// `monitor()` and so post VAL at delay-end.) This is the regression guard for
 /// the gross divergence the bare-`AsyncPending` port had: VAL arriving ODLY
 /// seconds late.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     use epics_base_rs::server::database::db_access::DbSubscription;
 
@@ -280,9 +278,12 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     // Decisive: VAL=42 must reach the monitor on the delaying cycle. The buggy
     // bare-`AsyncPending` port posted nothing here (VAL only at the continuation),
     // so this recv would time out.
-    let posted = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv_f64())
-        .await
-        .expect("VAL must be posted at delay-START (not deferred to the watchdog)");
+    let posted = epics_base_rs::runtime::task::timeout(
+        std::time::Duration::from_millis(500),
+        sub.recv_f64(),
+    )
+    .await
+    .expect("VAL must be posted at delay-START (not deferred to the watchdog)");
     assert_eq!(
         posted,
         Some(42.0),
@@ -308,7 +309,11 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the delay"
     );
-    let re_post = tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv_f64()).await;
+    let re_post = epics_base_rs::runtime::task::timeout(
+        std::time::Duration::from_millis(150),
+        sub.recv_f64(),
+    )
+    .await;
     assert!(
         re_post.is_err(),
         "continuation must NOT re-post VAL — it was already posted at delay-start \
@@ -325,7 +330,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
 /// alongside the OUT write and OEVT. (Regression guard for the
 /// `run_forward_link_tail` skip in the defer branch: without it the new
 /// Complete-epilogue path would fire FLNK at delay-start.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_odly_defers_forward_link_to_continuation() {
     let db = PvDatabase::new();
     let fcount = Arc::new(AtomicUsize::new(0));
@@ -359,7 +364,7 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     db.process_record_with_links("W5_ODLY", &mut v1, 0)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(40)).await;
     assert_eq!(
         fcount.load(Ordering::SeqCst),
         0,
@@ -372,7 +377,7 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     db.process_record_continuation("W5_ODLY", &mut v2, 0)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(40)).await;
     assert_eq!(
         fcount.load(Ordering::SeqCst),
         1,
@@ -382,7 +387,7 @@ async fn swait_odly_defers_forward_link_to_continuation() {
 
 /// ODLY=0: OUT write and OEVT both fire synchronously on the single cycle —
 /// the regression guard that the defer is gated strictly on `odly > 0`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicUsize::new(0));
@@ -414,9 +419,9 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         db.get_pv("W2_TGT").unwrap().to_f64(),
         Some(7.0),

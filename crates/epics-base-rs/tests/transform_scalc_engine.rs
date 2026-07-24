@@ -24,8 +24,6 @@
 //! post fires on any class, and the alarm bits alone are a class, so a
 //! transform that went INVALID was firing a `.VAL` monitor C never sends.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -57,7 +55,7 @@ async fn transform_db() -> PvDatabase {
 /// never assigns `*pval` — the channel keeps its previous value. (The other -1,
 /// the non-finite tail at `:2056`, writes the cell first; R16-4 and
 /// `transform_non_finite_result_is_kept.rs` cover that half.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c14_divide_by_zero_is_a_calc_failure() {
     let db = transform_db().await;
 
@@ -94,7 +92,7 @@ async fn r11_c14_divide_by_zero_is_a_calc_failure() {
 }
 
 /// The control: a finite result is not a failure. Same engine, no alarm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c14_a_finite_result_raises_no_alarm() {
     let db = transform_db().await;
 
@@ -112,7 +110,7 @@ async fn r11_c14_a_finite_result_raises_no_alarm() {
 /// Second half: no process cycle of a transform posts `.VAL` — not the first
 /// one (which the deadband's never-posted sentinel would otherwise fire), and
 /// not the alarm cycle (whose alarm bits alone would otherwise fire it).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c14_no_process_cycle_posts_val() {
     let db = transform_db().await;
     let rec = db.get_record("T").unwrap();
@@ -164,7 +162,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
 
 /// VAL is still a plain writable dummy: a client put stores it and posts it
 /// (C `dbPut`, dbAccess.c:1414). The closed set gates PROCESS posts, not puts.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c14_a_put_to_the_val_dummy_still_posts() {
     let db = transform_db().await;
     let rec = db.get_record("T").unwrap();

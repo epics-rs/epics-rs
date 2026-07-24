@@ -44,8 +44,6 @@
 //! receiver is not owned by this type, so the external consumer must
 //! call [`MonitorControlOp::note_consumed`] to decrement `pending`.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -292,7 +290,7 @@ impl<T> MonitorReceiver<T> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn try_post_succeeds_below_high_watermark() {
         let (op, mut rx) = MonitorControlOp::<i32>::channel(8);
         op.set_high_watermark(4);
@@ -305,7 +303,7 @@ mod tests {
         let _ = rx.recv().await;
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn try_post_refuses_at_high_watermark() {
         let (op, _rx) = MonitorControlOp::<i32>::channel(8);
         op.set_high_watermark(2);
@@ -317,7 +315,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn force_post_bypasses_watermark() {
         let (op, _rx) = MonitorControlOp::<i32>::channel(8);
         op.set_high_watermark(1);
@@ -326,7 +324,7 @@ mod tests {
         assert_eq!(op.pending(), 2);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn note_consumed_drops_pending_on_from_sender_path() {
         // from_sender owns no MonitorReceiver, so the external consumer
         // decrements via note_consumed.
@@ -343,7 +341,7 @@ mod tests {
         op.try_post(3).expect("after consumed");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_decrements_pending_and_reopens_gate_without_manual_note() {
         // Boundary: the high-watermark gate must reopen as the consumer
         // drains, with no note_consumed call. (Regression: the receiver
@@ -370,7 +368,7 @@ mod tests {
         assert_eq!(op.pending(), 2);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn try_recv_also_decrements_pending() {
         let (op, mut rx) = MonitorControlOp::<i32>::channel(8);
         op.try_post(10).expect("post");
@@ -381,7 +379,7 @@ mod tests {
         assert_eq!(op.pending(), 0, "empty try_recv must not underflow");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn paused_flag_observable_independently() {
         let (op, _rx) = MonitorControlOp::<i32>::channel(8);
         assert!(!op.is_paused());
@@ -391,7 +389,7 @@ mod tests {
         assert!(!op.is_paused());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn closed_receiver_returns_receiver_gone() {
         let (op, rx) = MonitorControlOp::<i32>::channel(8);
         drop(rx);

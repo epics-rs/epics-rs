@@ -22,8 +22,6 @@
 //! Pre-fix the port enforced `read_only` only on the CA route, so the OUT link
 //! truncated NELM (and the data with it) and the writer stayed NO_ALARM.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;
@@ -55,7 +53,7 @@ async fn build() -> PvDatabase {
 /// The OUT link is the route C gates in `dbPut` and the port did not: a record
 /// writing `WF.NELM` must be refused, the waveform must keep its NELM *and its
 /// data*, and the WRITER must go LINK/INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
     let db = build().await;
 
@@ -90,7 +88,7 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
 
 /// The gate is in the shared `dbPut` owner, so the internal `put_pv` /
 /// `put_pv_and_post` routes are refused too — not only the CA route.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn every_put_route_is_refused_on_a_nomod_field() {
     let db = build().await;
 
@@ -122,7 +120,7 @@ async fn every_put_route_is_refused_on_a_nomod_field() {
 /// The gate is a *runtime* gate: `dbLoadRecords` sets NELM through
 /// `dbStaticLib`'s `dbPutString`, which never crosses `dbPut`. The load path
 /// (`Record::put_field`) must therefore still size the array.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_load_path_still_sets_nelm() {
     let db = PvDatabase::new();
     let mut wf = WaveformRecord::new(1, DbFieldType::Double);
@@ -153,7 +151,7 @@ async fn the_load_path_still_sets_nelm() {
 /// dbpf N1.NAMSG hi-> ""           dbpf N1.LCNT 3   -> 0
 /// caput N1.SEVR 2 -> ERROR from put operation: Write access denied
 /// ```
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
     let db = PvDatabase::new();
     db.add_record("AO2", Box::new(AoRecord::new(0.0)))
@@ -227,7 +225,7 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
 /// caget N1.SEVR                 -> MAJOR         (the alarm itself stays)
 /// caput N1.ACKS 2               -> ERROR: Write access denied
 /// ```
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn alarm_acknowledge_travels_the_dbr_type_route_not_the_field() {
     use epics_base_rs::server::record::AlarmAck;
 

@@ -527,7 +527,7 @@ impl HscHolder {
                 let poll_loop =
                     HscPollLoop::new(cmd_rx, driver.clone(), Duration::from_millis(poll_ms));
 
-                ctx.runtime_handle().spawn(poll_loop.run());
+                ctx.bridge().spawn(poll_loop.run());
 
                 holder.poll_senders.lock().unwrap().push(cmd_tx);
                 holder.drivers.lock().unwrap().insert(port.clone(), driver);

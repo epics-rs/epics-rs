@@ -14,8 +14,6 @@
 //! `can_device_write()`, so a "not INVALID" assertion alone would pass even
 //! when nothing is printed.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -55,7 +53,7 @@ impl<'a> MakeWriter<'a> for CaptureBuf {
 }
 
 /// Install a thread-local subscriber capturing the `errlog` `tracing` sink for
-/// the lifetime of the returned guard. `#[tokio::test]` runs the body and every
+/// the lifetime of the returned guard. `#[epics_macros_rs::epics_test]` runs the body and every
 /// `.await` on a single (current-thread) runtime, so the thread-local default
 /// stays active across `process_record_with_links`, where the `stdio` device's
 /// `errlog_printf` is emitted inline.
@@ -93,7 +91,7 @@ async fn build_and_process(db_content: &str, record: &str) -> AlarmSeverity {
 
 /// `stringout` carries a String VAL; processing must route it to the stdio
 /// device and print VAL to the `errlog` stream, leaving the record un-alarmed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stdio_stringout_prints_val_to_errlog() {
     let (_guard, buf) = capture_errlog();
     let sevr = build_and_process(
@@ -121,7 +119,7 @@ async fn stdio_stringout_prints_val_to_errlog() {
 /// `lso` carries a `CharArray` VAL (not a String). A String-only `write()`
 /// would print nothing for it; this test fails on that regression because the
 /// VAL never reaches the `errlog` sink.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stdio_lso_prints_char_array_val_to_errlog() {
     let (_guard, buf) = capture_errlog();
     let (db, _) = IocBuilder::new()
@@ -170,7 +168,7 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
 /// output mechanism (`printfRecord.c:388` calls `write_string` unconditionally).
 /// This fails on the regression where `printf` is absent from
 /// `can_device_write()` and so never reaches `dev.write()`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stdio_printf_routes_to_dev_write_and_prints_to_errlog() {
     let (_guard, buf) = capture_errlog();
     let sevr = build_and_process(
@@ -200,7 +198,7 @@ async fn stdio_printf_routes_to_dev_write_and_prints_to_errlog() {
 /// gate Errs in `init()`, so `wire_device_to_record` flags the record INVALID
 /// at build time — proving the stdio device attached and gated, rather than
 /// being silently accepted as a soft channel.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stdio_wrong_record_type_is_invalid() {
     let db_content = r#"
 record(stringin, "SI_STDIO") {

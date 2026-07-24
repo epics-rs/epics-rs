@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! IOC Application — st.cmd-style startup for Rust IOCs.
 //!
 //! Provides a 2-phase IOC lifecycle matching the C++ EPICS pattern:
@@ -21,8 +22,6 @@
 //!     .run(my_protocol_runner)
 //!     .await
 //! ```
-
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -639,7 +638,7 @@ impl IocApplication {
         #[cfg(target_os = "rtems")]
         crate::runtime::task::background_init();
 
-        let handle = tokio::runtime::Handle::current();
+        let bridge = crate::runtime::task::BlockingBridge::capture();
 
         let Self {
             port,
@@ -690,7 +689,7 @@ impl IocApplication {
         // use Handle::block_on() which panics inside the tokio runtime context.
         if let Some(script) = startup_script {
             let db1 = db.clone();
-            let h1 = handle.clone();
+            let b1 = bridge.clone();
 
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
@@ -705,7 +704,7 @@ impl IocApplication {
                     let _ = crate::runtime::task::enter_ioc_thread(
                         crate::runtime::task::ThreadPriority::Iocsh,
                     );
-                    let shell = iocsh::IocShell::new(db1, h1);
+                    let shell = iocsh::IocShell::new(db1, b1);
                     for cmd in startup_commands {
                         shell.register(cmd);
                     }
@@ -1065,7 +1064,7 @@ impl IocApplication {
         let pending = db.take_after_ioc_running();
         if !pending.is_empty() {
             let db1 = db.clone();
-            let h1 = handle.clone();
+            let b1 = bridge.clone();
             let shell_cmds_clone = shell_commands.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
@@ -1077,7 +1076,7 @@ impl IocApplication {
                     let _ = crate::runtime::task::enter_ioc_thread(
                         crate::runtime::task::ThreadPriority::Iocsh,
                     );
-                    let shell = iocsh::IocShell::new(db1, h1);
+                    let shell = iocsh::IocShell::new(db1, b1);
                     for cmd in shell_cmds_clone {
                         shell.register(cmd);
                     }
@@ -1434,7 +1433,7 @@ mod io_intr_scan_add_tests {
     /// `recGblRecordError` and **demoted to `menuScanPassive`**. It must not be
     /// left claiming I/O Intr, and must not stay in the I/O Intr scan bucket
     /// that `scanpiol` reports from.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn io_intr_without_device_support_is_demoted_to_passive() {
         let db = Arc::new(PvDatabase::new());
         db.add_record("NODEV", Box::new(AiRecord::new(0.0)))
@@ -1473,7 +1472,7 @@ mod io_intr_scan_add_tests {
     /// yields a NULL scan list) is the same failure exit — log and demote. The
     /// port collapses those three C cases into "the device offers no
     /// `io_intr_receiver`", so this covers all of them.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn io_intr_with_device_but_no_interrupt_source_is_demoted_to_passive() {
         use crate::error::CaResult;
         use crate::server::device_support::DeviceSupport;
@@ -1523,7 +1522,7 @@ mod io_intr_scan_add_tests {
 
     /// The demotion is scoped to the failure exits: a record that was never on
     /// I/O Intr is untouched by the pass.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_passive_record_is_not_touched_by_the_io_intr_pass() {
         let db = Arc::new(PvDatabase::new());
         db.add_record("PASV", Box::new(AiRecord::new(0.0)))
@@ -1633,7 +1632,11 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let shell = iocsh::IocShell::new(db, rt.handle().clone());
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let shell = iocsh::IocShell::new(db, bridge);
         shell.register(db_load_group_startup_command());
 
         // Two distinct group files (the command probes existence early).
@@ -1766,7 +1769,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_ioc_application_empty() {
         // An empty IocApplication with no script or records should start and stop cleanly
         // We can't easily test run() because it blocks on REPL, so test the wiring functions
@@ -1776,7 +1779,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_wire_device_support_no_dtyp() {
         use crate::server::records::ai::AiRecord;
 
@@ -1796,7 +1799,7 @@ mod tests {
     /// only patched the IocBuilder path; without this fix, IOCs
     /// loaded entirely through iocsh `dbLoadRecords` lose every
     /// `info()` tag the driver depends on (e.g. asyn `asyn:READBACK`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wire_device_support_forwards_info_tags_to_driver() {
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
@@ -1874,7 +1877,7 @@ mod tests {
     /// first. This walked `all_record_names()` when that returned `HashMap`
     /// keys, so binding ran in hash order — not load order, and not even
     /// stable across runs of the same binary.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wire_device_support_binds_in_database_load_order() {
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::records::ai::AiRecord;
@@ -1950,7 +1953,7 @@ mod tests {
     /// `newOutputCallbackValue` readback branch and never calls
     /// `processCallbackOutput`'s `write()` on a callback cycle; a
     /// put/FLNK/scan cycle still writes the setpoint.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn readback_output_cycle_reads_back_and_skips_device_write() {
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;

@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -229,7 +227,7 @@ mod tests {
     /// following message. A true abort-race is non-deterministic to
     /// schedule, so this asserts the structural property that makes the
     /// race impossible: exactly one queued frame, equal to the full frame.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn send_event_pushes_frame_in_single_push() {
         use epics_base_rs::server::pv::MonitorEvent;
         use epics_base_rs::server::snapshot::Snapshot;
@@ -333,9 +331,9 @@ mod tests {
         /// single-threaded test runtime so the spawned monitor task can
         /// run. Fails the test if it does not arrive within the timeout.
         async fn wait_for(counter: &std::sync::atomic::AtomicU64, want: u64) {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            epics_base_rs::runtime::task::timeout(Duration::from_secs(5), async {
                 while counter.load(Ordering::Relaxed) < want {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_millis(1)).await;
                 }
             })
             .await
@@ -352,7 +350,7 @@ mod tests {
         /// granted and the writer always succeeding — processed. Each
         /// post is drained before the next so coalescing never collapses
         /// two updates into one cycle, giving a deterministic count.
-        #[tokio::test]
+        #[epics_macros_rs::epics_test]
         async fn successful_delivery_advances_posted_and_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv
@@ -398,7 +396,7 @@ mod tests {
         /// dropped before the wire — so PROCESSED never advances. This
         /// is the `serverPostRate` > `serverEventRate` divergence the
         /// gateway surfaces; both counters reading equal would hide it.
-        #[tokio::test]
+        #[epics_macros_rs::epics_test]
         async fn denied_delivery_counts_posted_not_processed() {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv

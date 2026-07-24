@@ -17,8 +17,6 @@
 //! The handle is constructed from any future that returns
 //! `PvaResult<T>`.
 
-// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -396,7 +394,7 @@ async fn wait_for_cancel(flag: Arc<std::sync::atomic::AtomicBool>) {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_returns_value() {
         let mut op = PvaOperation::spawn(async { Ok::<i32, _>(42) });
         let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
@@ -404,7 +402,7 @@ mod tests {
         assert!(op.is_done());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_times_out() {
         let mut op = PvaOperation::<()>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
@@ -414,14 +412,14 @@ mod tests {
         assert!(matches!(r, Err(PvaError::Timeout)));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn interrupt_wakes_waiter_op_continues() {
         let mut op = PvaOperation::<i32>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(7)
         });
         let interrupter = op.interrupt.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
@@ -442,7 +440,7 @@ mod tests {
     /// a real deadline expiry and an explicit interrupt must
     /// surface as distinct variants so timeout-specific caller logic
     /// does not match an interrupt.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_and_interrupt_are_distinct_variants() {
         // Real deadline: op never completes within the window.
         let mut slow = PvaOperation::<()>::spawn(async {
@@ -459,7 +457,7 @@ mod tests {
             Ok(1)
         });
         let interrupter = op.interrupt.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
@@ -468,7 +466,7 @@ mod tests {
         assert!(!matches!(interrupted, Err(PvaError::Timeout)));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_aborts_op() {
         let mut op = PvaOperation::<i32>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
@@ -492,7 +490,7 @@ mod tests {
     /// pvxs `Operation::cancel()` returns `false` once the operation has
     /// already completed (clientget.cpp:173-184 reports the prior active
     /// state). A second cancel is also `false` (idempotent).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_after_completion_reports_not_active() {
         let mut op = PvaOperation::spawn(async { Ok::<i32, _>(11) });
         assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 11);
@@ -517,7 +515,7 @@ mod tests {
     /// `cancel_after_completion_reports_not_active` fail intermittently
     /// feature-ON. The state is built by hand so the window is held open for
     /// as long as the assertions need, rather than raced for.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_published_result_is_terminal_while_the_guard_is_still_open() {
         use std::sync::atomic::AtomicBool;
 
@@ -575,7 +573,7 @@ mod tests {
     /// cancel() is a synchronization point: a resource held by the
     /// operation future must be observably released by the time cancel()
     /// returns (pvxs "blocks until any in-progress callback has finished").
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_is_a_sync_point_resource_released() {
         use std::sync::Arc as StdArc;
         let held = StdArc::new(());
@@ -677,7 +675,7 @@ mod tests {
     /// Dropping an in-flight handle aborts the spawned task (pvxs RAII
     /// `~Operation`). The captured resource is released after the task is
     /// scheduled off — assert the abort actually happens.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn drop_aborts_in_flight_op() {
         use std::sync::Arc as StdArc;
         let held = StdArc::new(());
@@ -706,7 +704,7 @@ mod tests {
     /// Regression: a `wait` that times out while the op is
     /// still in-progress must leave the result recoverable by a later
     /// `wait` (pvxs `Operation::wait` is retriable after a timeout).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_then_wait_again_recovers_result() {
         let mut op = PvaOperation::<i32>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
@@ -722,7 +720,7 @@ mod tests {
 
     /// Repeated short timeouts (polling pattern) must not consume the
     /// result; only actual completion does.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn repeated_timeouts_do_not_consume() {
         let mut op = PvaOperation::<i32>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
@@ -741,7 +739,7 @@ mod tests {
     /// `cancel()` used as idempotent cleanup after an operation has already
     /// completed (but before its result is consumed) must report not-active
     /// and must NOT poison the buffered `Ok` result for a later `wait()`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_after_complete_preserves_ok_result() {
         let mut op = PvaOperation::spawn(async { Ok::<i32, _>(42) });
         // Let the task fully terminate without consuming the result: once
@@ -763,7 +761,7 @@ mod tests {
 
     /// The same precedence holds for an operation that completed with an
     /// `Err`: the real error survives a post-completion `cancel()`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn cancel_after_complete_preserves_err_result() {
         let mut op = PvaOperation::<i32>::spawn(async { Err(PvaError::Protocol("boom".into())) });
         while !op.is_done() {
@@ -779,7 +777,7 @@ mod tests {
 
     /// After one successful result read the single-consumer policy
     /// holds: a second `wait` reports the result already consumed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn second_wait_after_success_is_already_consumed() {
         let mut op = PvaOperation::spawn(async { Ok::<i32, _>(1) });
         assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 1);

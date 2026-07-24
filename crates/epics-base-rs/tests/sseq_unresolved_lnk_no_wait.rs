@@ -28,8 +28,6 @@
 //! any path where that completion is not delivered, a step waiting forever on a
 //! put that was never made.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -54,7 +52,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
         {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: {pv} did not reach Short({want}) (last {:?})",
@@ -66,7 +64,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
 /// set is registered, so the target has no DBF class — C's disconnected
 /// `CA_LINK`). C's `default:` arm makes no put and raises no `waiting`, so no
 /// `WTG1` event is ever emitted and the sequence runs straight through step 2.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
     let db = PvDatabase::new();
     db.add_record("SS_NR_TGT2", Box::new(AoRecord::new(0.0)))
@@ -124,7 +122,7 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
 /// a `WAITn` on a link that DOES resolve still parks the sequence. (The full
 /// wait/complete cycle is `sseq_async_machine.rs`; this pins that the put-class
 /// gate did not swallow the waiting path.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r17_3_a_wait_step_with_a_resolvable_local_lnk_still_puts() {
     let db = PvDatabase::new();
     db.add_record("SS_NR2_TGT", Box::new(AoRecord::new(0.0)))

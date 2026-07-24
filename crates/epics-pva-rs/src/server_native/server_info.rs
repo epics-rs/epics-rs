@@ -40,8 +40,6 @@
 //! a user that wants to own `server` must register at an explicit order
 //! `< -1`.
 
-// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use epics_base_rs::types::PvString;
@@ -460,20 +458,20 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn has_pv_only_matches_server() {
         let src = source_with(vec![]);
         assert!(src.has_pv("server").await);
         assert!(!src.has_pv("anything:else").await);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn list_pvs_is_empty_so_server_never_self_lists() {
         let src = source_with(vec!["user:pv".into()]);
         assert!(src.list_pvs().await.is_empty());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_channels_returns_sorted_deduped_names() {
         let src = source_with(vec![
             "z:pv".into(),
@@ -530,7 +528,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_info_returns_only_impllang_and_version() {
         // pvxs `op=info` is a bare struct with exactly implLang+version
         // (serversource.cpp:19-22). No guid/peerCount/channelCount.
@@ -571,7 +569,7 @@ mod tests {
         assert_eq!(names, vec!["implLang", "version"]);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_help_returns_ntscalar_string() {
         // pvxs answers a help-bearing request with an NTScalar<string>
         // BEFORE reading `op` (serversource.cpp:46-51) — so a request
@@ -636,7 +634,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_unknown_op_errors() {
         let src = source_with(vec![]);
         let (desc, value) = nturi_op("frobnicate");
@@ -649,7 +647,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_missing_op_errors() {
         let src = source_with(vec![]);
         // NTURI with an empty query — no `op`.
@@ -668,7 +666,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_flat_struct_request_op_at_top_level() {
         // pvxs custom services may send `op` at the top level rather
         // than inside `query`. `extract_op` handles both.
@@ -695,7 +693,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_query_op_wins_over_root_help() {
         // pvxs selects `args = query` then reads BOTH help and op from
         // that single view (serversource.cpp:41-53) — a root-level `help`
@@ -734,7 +732,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn rpc_present_query_does_not_fall_back_to_root_op() {
         // With a present (here empty) `query`, pvxs reads `op` ONLY from
         // the query view; a root-level `op` is not a fallback. So this
@@ -758,7 +756,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_has_no_surface_on_server() {
         // pvxs installs no `onOp` for `server`, so it has no GET surface
         // (serversource.cpp:30-94). Both the introspection prototype and
@@ -769,7 +767,7 @@ mod tests {
         assert!(src.get_value("server").await.is_none());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_is_rejected_read_only() {
         let src = source_with(vec![]);
         let err = src.put_value("server", PvField::Null).await.unwrap_err();

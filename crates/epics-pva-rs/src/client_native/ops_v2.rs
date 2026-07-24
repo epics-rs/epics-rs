@@ -18,8 +18,6 @@
 //! the full window let the server window drain to 0 and stalled ~1 RTT
 //! every `pipeline_size` updates.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -7606,17 +7604,17 @@ mod tests {
     /// teardown owner must wake it. Model the loop's wait with a task
     /// that only awaits `cancel.notified()`; `teardown()` must make it
     /// return promptly instead of hanging forever.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_wakes_a_parked_monitor_loop() {
         let state = idle_sub_state();
         let task_state = state.clone();
-        let task = tokio::spawn(async move {
+        let task = epics_base_rs::runtime::task::spawn(async move {
             task_state.cancel.notified().await;
         });
         // Give the task a chance to reach `.notified().await`.
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
         state.teardown();
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), task)
             .await
             .expect("parked loop must wake on teardown, not hang")
             .expect("loop task panicked");
@@ -7630,19 +7628,22 @@ mod tests {
     /// the loop reaching its `select!` is not lost: a later `notified()`
     /// completes immediately. Without this guarantee `stop_sync()` issued
     /// on a not-yet-parked loop could still hang.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_before_park_is_not_lost() {
         let state = idle_sub_state();
         state.teardown(); // notify_one() with no waiter -> stored permit.
-        tokio::time::timeout(std::time::Duration::from_secs(1), state.cancel.notified())
-            .await
-            .expect("stored cancel permit must satisfy a later notified()");
+        epics_base_rs::runtime::task::timeout(
+            std::time::Duration::from_secs(1),
+            state.cancel.notified(),
+        )
+        .await
+        .expect("stored cancel permit must satisfy a later notified()");
     }
 
     /// `teardown()` is the shared owner for `stop()`, `stop_sync()`, and
     /// `Drop`; calling it more than once (e.g. `stop_sync` then `Drop`)
     /// must be a harmless no-op.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_is_idempotent() {
         let state = idle_sub_state();
         state.teardown();
@@ -7667,16 +7668,18 @@ mod tests {
     /// server withholds the INIT reply must complete the cancel promptly
     /// (return `Cancelled`) rather than hang the spawned monitor task
     /// forever — the regression this fix closes.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_cancels_on_teardown_during_wait() {
         let state = idle_sub_state();
         let task_state = Some(state.clone());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        let task = tokio::spawn(async move { recv_monitor_init(&task_state, &mut rx).await });
+        let task = epics_base_rs::runtime::task::spawn(async move {
+            recv_monitor_init(&task_state, &mut rx).await
+        });
         // Let the task reach its `select!` (silent-but-open server).
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
         state.teardown();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        let out = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), task)
             .await
             .expect("INIT recv must wake on teardown, not hang on a silent server")
             .expect("task panicked");
@@ -7692,7 +7695,7 @@ mod tests {
     /// A teardown that races just ahead of the INIT receive sets `stop`
     /// before the loop reaches the await; the pre-check must short-circuit
     /// to `Cancelled` WITHOUT consuming a reply that may already be queued.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_cancels_when_stop_preset() {
         let state = idle_sub_state();
         state.stop.store(true, Ordering::Relaxed);
@@ -7710,7 +7713,7 @@ mod tests {
     }
 
     /// The happy path: a queued INIT reply is delivered as `Reply`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_returns_reply_when_frame_arrives() {
         let state = Some(idle_sub_state());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -7724,7 +7727,7 @@ mod tests {
     /// A frame stream closed before any reply is `Lost` (connection lost),
     /// distinct from a cancel — the caller maps it to ConnectionLost and
     /// lets the reconnect loop retry.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_lost_when_stream_closed() {
         let state = Some(idle_sub_state());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
@@ -7737,7 +7740,7 @@ mod tests {
 
     /// The no-handle path (plain `op_monitor`, `state == None`) cannot be
     /// cancelled, so it still simply awaits and delivers the reply.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_no_handle_awaits_reply() {
         let state: Option<Arc<SubscriptionState>> = None;
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();

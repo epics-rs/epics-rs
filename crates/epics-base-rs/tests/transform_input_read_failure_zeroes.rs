@@ -14,8 +14,6 @@
 //! disconnected INPx source re-drove its OUTx with the last good value where C
 //! drives 0.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -24,7 +22,7 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     let db = PvDatabase::new();
     // OUT target seeded 111 — must be driven to 0 by the zeroed channel.

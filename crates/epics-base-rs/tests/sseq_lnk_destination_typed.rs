@@ -18,8 +18,6 @@
 //!
 //! One test per boundary of that switch.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -129,21 +127,21 @@ async fn poll_put(cell: &Arc<Mutex<Option<EpicsValue>>>, label: &str) -> EpicsVa
         if let Some(v) = cell.lock().unwrap().clone() {
             return v;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!("{label}: LNK1 was never written");
 }
 
 /// Settle long enough that a write, had one been issued, would have landed.
 async fn settle() {
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
 }
 
 /// Boundary — NUMERIC source, STRING-class destination: C puts `DBR_STRING`
 /// from `s`, which the numeric arm rendered with `cvtDoubleToString(dov,
 /// s, pR->prec)`. With PREC=2 the wire value is "1.23", NOT the full-
 /// precision double the source delivered.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -181,7 +179,7 @@ async fn numeric_source_string_destination_puts_the_prec_rendered_string() {
 /// Boundary — STRING source, NUMERIC destination: C puts `DBR_DOUBLE` from
 /// `dov`, which the string arm set to `atof(s)`. A non-numeric string is
 /// 0.0 on the wire — the put still happens (and processes the target).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn string_source_numeric_destination_puts_atof_of_the_string() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -217,7 +215,7 @@ async fn string_source_numeric_destination_puts_atof_of_the_string() {
 /// Boundary — CHAR destination with `n_elements > 1` (the long-string
 /// idiom): C puts `min(n_elements, 40)` bytes of the 40-byte `s` as a char
 /// array, NUL-padded — not the double.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn char_array_destination_puts_the_string_bytes() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -256,7 +254,7 @@ async fn char_array_destination_puts_the_string_bytes() {
 
 /// Boundary — a CHAR destination with `n_elements == 1` is a scalar, and C's
 /// CHAR arm falls back to `DBR_DOUBLE` from `dov` (sseqRecord.c:786-789).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalar_char_destination_puts_the_double() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -293,7 +291,7 @@ async fn scalar_char_destination_puts_the_double() {
 /// Boundary — an UNRESOLVABLE destination (C `dbGetLinkDBFtype` → -1, i.e.
 /// a disconnected CA link) hits `default: break`: NO put is issued at all.
 /// The port previously wrote the source-typed value regardless.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unresolved_destination_is_not_written_at_all() {
     let db = PvDatabase::new();
     let last_put = Arc::new(Mutex::new(None));
@@ -341,7 +339,7 @@ async fn unresolved_destination_is_not_written_at_all() {
 /// Boundary — a RESOLVED external destination is written, typed by the
 /// remote field's class (C `dbCaGetLinkDBFtype`): a remote string channel
 /// takes the STRn view.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn resolved_external_string_destination_takes_the_string_view() {
     let db = PvDatabase::new();
     let last_put = Arc::new(Mutex::new(None));

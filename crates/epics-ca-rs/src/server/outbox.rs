@@ -38,8 +38,6 @@
 //! contiguous `Vec<u8>` per message for the pre-existing abort-safety
 //! invariant, so this is the shape they already produce.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::runtime::sync::mpsc;
 
 /// Cloneable producer handle. Handed to every emit site (in-loop handlers
@@ -107,7 +105,7 @@ impl OutboxDrain {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn push_then_drain_preserves_frame_order() {
         let (outbox, mut drain) = channel();
         outbox.push(vec![1, 2, 3]);
@@ -121,7 +119,7 @@ mod tests {
         assert_eq!(drain.try_next(), None);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn push_after_drain_dropped_is_silently_discarded() {
         let (outbox, drain) = channel();
         drop(drain);

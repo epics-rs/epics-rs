@@ -27,8 +27,6 @@
 //! epoch. ao/bo/longout stamp UNCONDITIONALLY in their `if (!pact)` block, so
 //! they are NOT in this family and must keep stamping while undefined.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::runtime::general_time::epics_epoch;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -55,7 +53,7 @@ async fn udf_of(db: &PvDatabase, name: &str) -> u8 {
 /// A soft UDF mbbo, processed synchronously, keeps TIME at the epoch — C's
 /// `goto CONTINUE` skips the pre-output stamp and the only other stamp is
 /// `if (pact)`-guarded (never taken on a soft record).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sync_udf_mbbo_keeps_epoch_time() {
     let db = PvDatabase::new();
     add(&db, "M", Box::new(MbboRecord::new(0))).await;
@@ -79,7 +77,7 @@ async fn sync_udf_mbbo_keeps_epoch_time() {
 
 /// Same for mbboDirect: bit-derived VAL, but it shares the `goto CONTINUE`
 /// timestamp-skip while undefined.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sync_udf_mbbo_direct_keeps_epoch_time() {
     let db = PvDatabase::new();
     add(&db, "MD", Box::new(MbboDirectRecord::default())).await;
@@ -104,7 +102,7 @@ async fn sync_udf_mbbo_direct_keeps_epoch_time() {
 /// the skip is gated on UDF exactly as C's `goto CONTINUE` is, so defined
 /// updates keep stamping. Guards the fix against becoming an unconditional
 /// skip.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn defined_mbbo_stamps_wall_clock_time() {
     let db = PvDatabase::new();
     add(&db, "M2", Box::new(MbboRecord::new(0))).await;
@@ -122,7 +120,7 @@ async fn defined_mbbo_stamps_wall_clock_time() {
 }
 
 /// mbboDirect too: a VAL put clears UDF and the sync process stamps.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn defined_mbbo_direct_stamps_wall_clock_time() {
     let db = PvDatabase::new();
     add(&db, "MD2", Box::new(MbboDirectRecord::default())).await;

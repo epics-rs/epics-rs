@@ -31,8 +31,6 @@
 //! Boundaries: dead DOL vs live DOL; OUT target written / not written; FLNK
 //! fired / not fired; pending alarm vs committed alarm.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -101,7 +99,7 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 }
 
 /// The whole cycle is abandoned: no OUT write, no forward link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dead_dol_writes_nothing_out_and_does_not_fire_flnk() {
     let db = build().await;
     // A value a client left in the aao — the stale VAL C refuses to write out.
@@ -130,7 +128,7 @@ async fn dead_dol_writes_nothing_out_and_does_not_fire_flnk() {
 /// `dbGetLink` raised LINK/INVALID, but the abort skipped `monitor` — so
 /// `recGblResetAlarms` never ran and the alarm is still PENDING (nsta/nsev),
 /// not committed to STAT/SEVR.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn dead_dol_raises_a_pending_link_alarm() {
     let db = build().await;
     process(&db, "AAO:DEAD").await;
@@ -163,7 +161,7 @@ async fn dead_dol_raises_a_pending_link_alarm() {
 
 /// The contrast case: a live DOL fetch runs the full cycle — VAL from DOL, OUT
 /// written, FLNK fired.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn live_dol_completes_the_cycle() {
     let db = build().await;
     db.put_pv("FLNK:SRC", EpicsValue::DoubleArray(vec![42.0]))
@@ -191,7 +189,7 @@ async fn live_dol_completes_the_cycle() {
 
 /// The abort is per-cycle state, not sticky: once the DOL source exists, the
 /// next cycle completes normally.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn cycle_resumes_when_the_dol_source_returns() {
     let db = build().await;
     process(&db, "AAO:DEAD").await;

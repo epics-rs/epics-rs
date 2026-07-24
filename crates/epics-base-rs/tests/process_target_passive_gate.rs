@@ -26,8 +26,6 @@
 //! epics> dbgf ASY.PUTF      DBF_UCHAR: 0
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -70,7 +68,7 @@ async fn flags(db: &PvDatabase, rec: &str) -> (bool, bool) {
 /// R18-93: an FLNK to a BUSY, non-Passive target must not be touched at all.
 /// `dbScanPassive` returns above `processTarget`, so no PUTF, no RPRO — and so
 /// no extra unscheduled cycle when the target's async completes.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn flnk_to_busy_non_passive_target_sets_no_rpro() {
     let db = build("1 second").await;
 
@@ -90,7 +88,7 @@ async fn flnk_to_busy_non_passive_target_sets_no_rpro() {
 
 /// The Passive half of the same gate still works: a busy PASSIVE target does
 /// get `RPRO = 1` (C `processTarget`'s `else if (psrc->putf && claim_dst)`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn flnk_to_busy_passive_target_still_sets_rpro() {
     let db = build("Passive").await;
 
@@ -116,7 +114,7 @@ async fn flnk_to_busy_passive_target_still_sets_rpro() {
 /// epics> dbpf SRCO.PROC 1
 /// epics> dbgf TGT.VAL      DBF_DOUBLE: 2
 /// ```
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn db_link_to_proc_field_processes_a_non_passive_target() {
     const DB: &str = r#"
 record(calcout, "SRCO") {
@@ -162,7 +160,7 @@ record(calc, "TGT") {
 /// The `.PROC` gate is the only one that ignores SCAN: an ordinary `PP` OUT
 /// link to the same non-Passive target still does NOT process it
 /// (dbDbLink.c:388 — `pvlOptPP && pdest->scan == 0`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pp_link_to_a_non_passive_target_still_does_not_process_it() {
     const DB: &str = r#"
 record(calcout, "SRCV") {

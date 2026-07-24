@@ -22,8 +22,6 @@
 //! a field posts that field `DBE_VALUE | DBE_LOG` on its own, which is a
 //! different post from `monitor()`'s.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -84,7 +82,7 @@ async fn prime_then_move(db: &PvDatabase, rec: &str, rx: &mut EventReader, to: f
 /// VAL's ADEL is wide enough that the archive deadband does not cross, so
 /// `monitor_mask` carries no `DBE_LOG` and the changed input A posts
 /// `DBE_VALUE` alone.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_72_changed_input_posts_dbe_value_without_dbe_log() {
     let db = swait_db(0.0, 1000.0).await;
     let mut rx = subscribe_a(&db, "W").await;
@@ -106,7 +104,7 @@ async fn r9_72_changed_input_posts_dbe_value_without_dbe_log() {
 /// ADEL=0: VAL's archive deadband crosses, so `monitor_mask` itself carries
 /// `DBE_LOG` and C's `monitor_mask | DBE_VALUE` includes it. The LOG bit is not
 /// forbidden — it is derived from VAL's mask.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_72_input_post_carries_log_when_vals_adel_crossed() {
     let db = swait_db(0.0, 0.0).await;
     let mut rx = subscribe_a(&db, "W").await;
@@ -126,7 +124,7 @@ async fn r9_72_input_post_carries_log_when_vals_adel_crossed() {
 
 /// The other side of the same rule: `calcRecord.c:420` DOES force
 /// `DBE_VALUE | DBE_LOG` on a changed input, so calc's mask must not move.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_72_calc_input_post_still_forces_dbe_log() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(7.0)))

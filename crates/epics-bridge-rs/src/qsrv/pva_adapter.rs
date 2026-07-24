@@ -3119,10 +3119,10 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         {
             let db_t = db.clone();
-            let handle = tokio::runtime::Handle::current();
+            let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
             let line = format!("dbLoadGroup(\"{}\")", path.display());
             std::thread::spawn(move || {
-                let shell = IocShell::new(db_t, handle);
+                let shell = IocShell::new(db_t, bridge);
                 shell.register(db_load_group_startup_command());
                 shell.execute_line(&line).expect("dbLoadGroup must queue");
             })

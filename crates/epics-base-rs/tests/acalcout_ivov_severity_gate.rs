@@ -17,8 +17,6 @@
 //! IVOA=Set_output_to_IVOV. Severity is the framework's — the record may not
 //! re-derive it from a private flag.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,7 +65,7 @@ impl Record for OutProbe {
 
 /// A LIMIT alarm at INVALID severity — no calc failure anywhere — must still
 /// take C's IVOA=Set_output_to_IVOV arm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     let db = PvDatabase::new();
 
@@ -129,7 +127,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
 /// The output decision remains the record's: OOPT=Never means C never reaches
 /// `execOutput`, so the IVOV substitution must not run either (VAL/AVAL keep the
 /// calculated value and nothing is written to OUT).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
     let db = PvDatabase::new();
 

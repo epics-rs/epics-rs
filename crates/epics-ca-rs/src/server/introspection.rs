@@ -20,8 +20,9 @@
 //! you've cleared the network policy explicitly. There is no auth —
 //! treat this like `/proc`.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): end_to_end_healthz binds a tokio::net TCP
+// listener for a real GET, which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -462,7 +463,7 @@ mod tests {
         assert!(body.contains("\"version\":"));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn render_clients_handles_empty() {
         let s = IntrospectionState::new(5064);
         assert_eq!(render_clients(&s).await, "{\"clients\":[]}");

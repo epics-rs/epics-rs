@@ -26,8 +26,6 @@
 //! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving the same
 //! record definitions over CA.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -88,7 +86,7 @@ async fn udf(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> boo
 /// C: `dbLoadLinkArray` + `subset` in `devSASoft.c::init_record` (58-73) — the
 /// INDX window of the constant is in VAL before any process. softIoc:
 /// `SA:CONST` reads `1 2 3`, NORD=3, UDF=0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_inp_slice_is_loaded_at_init() {
     let db = build().await;
 
@@ -106,7 +104,7 @@ async fn constant_inp_slice_is_loaded_at_init() {
 ///
 /// This is the R15-78 rule INVERTED for this one record type, so the aai/wf
 /// half of that rule is pinned alongside it (they must still NOT re-load).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_inp_is_re_loaded_and_re_sliced_at_process() {
     let db = build().await;
 
@@ -129,7 +127,7 @@ async fn constant_inp_is_re_loaded_and_re_sliced_at_process() {
 /// C: the INDX window moves with INDX because the constant is re-loaded whole
 /// (`nRequest = min(INDX+NELM, MALM)`) before the shift. softIoc: `caput
 /// SA:CONST.INDX 1` → VAL `2 3 4`, NORD=3.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_inp_indx_selects_the_window() {
     let db = build().await;
 
@@ -167,7 +165,7 @@ async fn constant_inp_indx_selects_the_window() {
 /// | +1    | `30 40`    | 2    |
 /// | +2    | `40`       | 1    |
 /// | +3    | (empty)    | 0    | → UDF/INVALID
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn empty_inp_re_slices_the_client_written_val() {
     let db = build().await;
 
@@ -214,7 +212,7 @@ async fn empty_inp_re_slices_the_client_written_val() {
 /// The DB-link path is unchanged: `read_sa`'s `else` arm reads INDX+NELM
 /// elements from the source and subsets them, and the source is re-read every
 /// cycle (so no in-place eating).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn db_link_inp_re_reads_the_source_every_cycle() {
     let db = build().await;
 

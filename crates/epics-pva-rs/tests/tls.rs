@@ -10,10 +10,9 @@
 //! Compiled only with the `tls` feature (ON by default) — without it the
 //! crate links no rustls, so there is nothing here to exercise.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
 #![cfg(feature = "tls")]
 #![allow(clippy::manual_async_fn)]
-
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;

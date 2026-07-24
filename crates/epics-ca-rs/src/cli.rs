@@ -1,8 +1,9 @@
 //! Helpers shared across the `caget` / `caput` / `cainfo` / `camonitor`
 //! command-line binaries.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): the test's subject is arming a *tokio* timer with
+// INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run and pass in the
+// feature-ON suite on the tokio driver.
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 

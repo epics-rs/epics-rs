@@ -11,8 +11,6 @@
 //! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving these exact
 //! records over CA.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -52,7 +50,7 @@ async fn field(
 
 /// C, `caput SA:CONST.NELM 2` on `INP="[1,2,3,4]" MALM=8 INDX=0`:
 /// `VAL = 1 2`, `NORD = 2`. The port emptied VAL (`NORD = 0`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nelm_put_narrows_the_slice_it_does_not_empty_val() {
     let db = build().await;
 
@@ -78,7 +76,7 @@ async fn nelm_put_narrows_the_slice_it_does_not_empty_val() {
 /// C `readValue` (310-311) clamps NELM to MALM at process, so a NELM put above
 /// MALM lands as MALM. softIoc: `caput SA:CONST.NELM 9` → `NELM = 8`, and the
 /// slice is the whole 4-element constant (`NORD = 4`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nelm_put_above_malm_clamps_at_process() {
     let db = build().await;
 
@@ -102,7 +100,7 @@ async fn nelm_put_above_malm_clamps_at_process() {
 
 /// C: `caput SA:CONST.INDX 1` → the window moves to `2 3 4` (the constant is
 /// re-loaded whole, then shifted). The port stored INDX and left a stale window.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn indx_put_moves_the_window() {
     let db = build().await;
 
@@ -124,7 +122,7 @@ async fn indx_put_moves_the_window() {
 /// `NORD = 0`, and `readValue`'s `nord <= 0 → status = -1` makes the record UDF
 /// (softIoc: `SEVR INVALID`). MALM=8 keeps INDX=5 un-clamped, so this is the
 /// genuine "past the source" path, not the MALM clamp.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn indx_put_past_the_data_empties_the_slice_and_alarms() {
     let db = build().await;
 
@@ -146,7 +144,7 @@ async fn indx_put_past_the_data_empties_the_slice_and_alarms() {
 /// back already sliced. softIoc, `SA:EMPTY` (INDX=1 NELM=3 MALM=8) after
 /// `caput -a SA:EMPTY 5 10 20 30 40 50`: `VAL = 20 30 40`, `NORD = 3`. A
 /// following `caput SA:EMPTY.NELM 2` re-subsets the buffer in place: `30 40`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn empty_inp_val_put_processes_and_nelm_put_re_subsets() {
     let db = build().await;
 

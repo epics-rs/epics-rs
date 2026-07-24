@@ -8,8 +8,6 @@
 //!
 //! Mirrors the data carried by pvxs `IfaceMap::Current` (src/iface.cpp).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -409,12 +407,12 @@ mod tests {
     /// the snapshot's `last_refresh` advances at least once in the
     /// poll window. Mirrors pvxs `IfMapDaemon` 15 s behaviour at a
     /// short test cadence (50 ms × ~3 ticks ≈ 150 ms total).
-    #[tokio::test(flavor = "current_thread")]
+    #[epics_macros_rs::epics_test]
     async fn spawn_refresh_advances_last_refresh() {
         let map = IfaceMap::new();
         let initial = map.inner.lock().last_refresh;
         let handle = map.spawn_refresh(Duration::from_millis(50));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::runtime::task::sleep(Duration::from_millis(200)).await;
         let after = map.inner.lock().last_refresh;
         assert!(
             after > initial,

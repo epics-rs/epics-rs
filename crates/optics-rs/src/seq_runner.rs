@@ -69,12 +69,13 @@ fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> Strin
 ///
 /// Returns `Ok(())` if the program was found and spawned, or `Err` with a message.
 ///
-/// Must be called with a tokio runtime handle (use `CommandContext::runtime_handle()`
-/// from st.cmd startup commands, since st.cmd runs on a non-tokio thread).
+/// Must be called with the runtime access captured for the shell thread (use
+/// `CommandContext::bridge()` from st.cmd startup commands, since st.cmd runs
+/// on a blocking thread the runtime is otherwise unreachable from).
 pub fn seq_start(
     program: &str,
     macro_str: &str,
-    handle: &tokio::runtime::Handle,
+    bridge: &epics_base_rs::runtime::task::BlockingBridge,
     db: &PvDatabase,
 ) -> Result<(), String> {
     let macros = parse_macros(macro_str);
@@ -89,7 +90,7 @@ pub fn seq_start(
                 macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::kohzu_ctl::run(config, db).await {
                     eprintln!("kohzuCtl error: {e}");
                 }
@@ -105,7 +106,7 @@ pub fn seq_start(
                 macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::kohzu_ctl_soft::run(config, db).await {
                     eprintln!("kohzuCtl_soft error: {e}");
                 }
@@ -119,7 +120,7 @@ pub fn seq_start(
                 &require_macro(&macros, "M_PHI2", program)?,
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::hr_ctl::run(config, db).await {
                     eprintln!("hrCtl error: {e}");
                 }
@@ -138,7 +139,7 @@ pub fn seq_start(
                 macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::ml_mono_ctl::run(config, db).await {
                     eprintln!("ml_monoCtl error: {e}");
                 }
@@ -154,7 +155,7 @@ pub fn seq_start(
                 &require_macro(&macros, "mPHI", program)?,
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::orient::run(config, db).await {
                     eprintln!("orient error: {e}");
                 }
@@ -167,7 +168,7 @@ pub fn seq_start(
                 macro_or(&macros, "N", "8").parse::<usize>().unwrap_or(8),
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::filter_drive::run(config, db).await {
                     eprintln!("filterDrive error: {e}");
                 }
@@ -180,7 +181,7 @@ pub fn seq_start(
                 &require_macro(&macros, "B", program)?,
             );
             let db = db.clone();
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::pf4::run(config, db).await {
                     eprintln!("pf4 error: {e}");
                 }
@@ -192,7 +193,7 @@ pub fn seq_start(
                 &macro_or(&macros, "MONO", ""),
                 &macro_or(&macros, "VSC", ""),
             );
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::io::run(config).await {
                     eprintln!("Io error: {e}");
                 }
@@ -206,7 +207,7 @@ pub fn seq_start(
                 &require_macro(&macros, "FM", program)?,
                 &require_macro(&macros, "CM", program)?,
             );
-            handle.spawn(async move {
+            bridge.spawn(async move {
                 if let Err(e) = crate::snl::flex_combined_motion::run(config).await {
                     eprintln!("flexCombinedMotion error: {e}");
                 }
@@ -244,8 +245,12 @@ mod tests {
     #[test]
     fn test_unknown_program() {
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let bridge = {
+            let _guard = rt.enter();
+            epics_base_rs::runtime::task::BlockingBridge::capture()
+        };
         let db = PvDatabase::new();
-        let result = seq_start("nonexistent", "P=x:", rt.handle(), &db);
+        let result = seq_start("nonexistent", "P=x:", &bridge, &db);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown program"));
     }

@@ -25,8 +25,6 @@
 //! (`RecordInstance::run_init_passes`) off the record's `init_record_parks_pact`,
 //! not by a record reaching into common state.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::sub_record::SubRecord;
@@ -38,7 +36,7 @@ async fn pact_of(db: &PvDatabase, name: &str) -> EpicsValue {
     inst.client_field_value("PACT").expect("PACT resolves")
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r21_a_sub_with_no_snam_is_parked_active() {
     let db = PvDatabase::new();
     db.add_record("SUB_BARE", Box::new(SubRecord::default()))
@@ -51,7 +49,7 @@ async fn r21_a_sub_with_no_snam_is_parked_active() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r21_a_sub_with_an_snam_is_not_parked() {
     let db = PvDatabase::new();
     let mut rec = SubRecord::default();
@@ -67,7 +65,7 @@ async fn r21_a_sub_with_an_snam_is_not_parked() {
 
 /// The park is not a one-shot flag a later process clears: C never releases it,
 /// so every scan from then on hits the PACT-active branch and VAL never moves.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r21_a_parked_sub_never_runs_record_support() {
     let db = PvDatabase::new();
     db.add_record("SUB_DEAD", Box::new(SubRecord::default()))

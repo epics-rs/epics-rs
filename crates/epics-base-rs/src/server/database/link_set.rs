@@ -46,8 +46,6 @@
 //! db.register_link_set("pva", Arc::new(MyLset { ... })).await;
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use crate::types::EpicsValue;
@@ -539,7 +537,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn register_and_lookup() {
         let mut reg = LinkSetRegistry::new();
         assert!(reg.is_empty());

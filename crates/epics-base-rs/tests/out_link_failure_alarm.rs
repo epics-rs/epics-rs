@@ -16,8 +16,6 @@
 //! boundary of the put owner: local DB target, external `ca://` target, SIOL
 //! simulated output, and the recovery cycle.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -90,7 +88,7 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 
 /// Boundary 1 — the OUT link names no local record and no external link set is
 /// registered, so the put fails. One process must leave LINK/INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     let db = PvDatabase::new();
     add_ao_with_out(&db, "AO_BADOUT", "NO_SUCH_TARGET").await;
@@ -111,7 +109,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
 /// Boundary 2 — an external `ca://` OUT link whose put fails takes the same
 /// raise: C routes DB and CA links through the identical `dbPutLink` gate, the
 /// alarm comes from `dbPutLink` itself, not from the lset.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_62_failing_external_out_put_raises_link_invalid() {
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
@@ -135,7 +133,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
 /// 384-406) puts the simulated value through `dbPutLink(&prec->siol, …)`, the
 /// same gate, so a failing SIOL raises LINK/INVALID exactly as a failing OUT
 /// does. The port's `write_sim_siol_value` used to drop its error entirely.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     let db = PvDatabase::new();
     db.add_record("SIM_ON", Box::new(AoRecord::new(1.0)))
@@ -163,7 +161,7 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
 /// the put that fails; once the put succeeds, the next `recGblResetAlarms`
 /// commits NO_ALARM (recGbl.c:186-220: `nsta`/`nsev` are re-initialised to 0
 /// at the end of every commit). A latched alarm would stay INVALID forever.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
@@ -215,7 +213,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
 
 /// Companion gate — a working OUT link must NOT raise any alarm. Pins that the
 /// raise fires on a real put failure only.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r14_62_successful_local_out_put_raises_no_alarm() {
     let db = PvDatabase::new();
     db.add_record("AO_GOOD_DEST", Box::new(AoRecord::new(0.0)))

@@ -19,8 +19,6 @@
 //! backoff is a different policy with different semantics. This
 //! module is exclusively for the sliding-window pattern.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::time::{Duration, Instant};
 
 /// Policy: at most `max_restarts` attempts inside `window`,
@@ -257,7 +255,7 @@ mod tests {
         assert!(t.try_record(&policy).is_ok());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn supervise_immediate_success() {
         let policy = RestartPolicy {
             max_restarts: 3,
@@ -269,7 +267,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn supervise_eventual_success() {
         let count = Arc::new(AtomicU32::new(0));
         let policy = RestartPolicy {
@@ -294,7 +292,7 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn supervise_too_many_restarts() {
         let policy = RestartPolicy {
             max_restarts: 2,
@@ -323,7 +321,7 @@ mod tests {
     /// check sits at the launch boundary, not after a failed launch. The
     /// pre-fix loop recorded on failure and admitted `max_restarts + 1`
     /// launches (one extra full gateway start vs C NRESTARTS).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn supervise_launch_count_equals_max_restarts() {
         for max in [1u32, 2, 3, 10] {
             let launches = Arc::new(AtomicU32::new(0));
@@ -358,7 +356,7 @@ mod tests {
     /// supervisor's contract is to run the task at least once, so it must
     /// launch exactly once and then honor the cap — never panic on the
     /// missing root-cause error.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn supervise_zero_max_runs_task_once() {
         let launches = Arc::new(AtomicU32::new(0));
         let policy = RestartPolicy {

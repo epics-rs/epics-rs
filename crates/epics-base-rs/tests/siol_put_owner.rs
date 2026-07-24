@@ -13,8 +13,6 @@
 //! `write_out_link_value`'s single-raise invariant. SIOL now goes through the
 //! put owner like every other OUT link.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -54,7 +52,7 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
 /// `dbDbPutValue` (dbDbLink.c:387-389) processes the target. The old bare
 /// field write never did, so a simulated ao driving a `PP` SIOL left the
 /// downstream record unprocessed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_63_siol_pp_processes_the_passive_target() {
     let db = PvDatabase::new();
     // Target: an ai whose own OUT-less process copies VAL through; the FLNK
@@ -92,7 +90,7 @@ async fn r15_63_siol_pp_processes_the_passive_target() {
 /// Boundary 2 — `SIOL` with `MS`: the writing record's severity folds into the
 /// target, exactly as an MS OUT link's does (`recGblInheritSevrMsg`,
 /// dbDbLink.c:382-383). The bare field write propagated nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_63_siol_ms_inherits_the_writers_severity() {
     let db = PvDatabase::new();
     db.add_record("SIOL_TGT", Box::new(AiRecord::new(0.0)))
@@ -127,7 +125,7 @@ async fn r15_63_siol_ms_inherits_the_writers_severity() {
 
 /// Boundary 3 — the failure path still alarms, and now the OWNER raises it
 /// (R14-62 must keep passing with the caller's raise removed).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_63_failed_siol_put_is_alarmed_by_the_put_owner() {
     let db = PvDatabase::new();
     add_simulated_ao(&db, "AO_SIM", "NO_SUCH_SIOL", 5.0).await;

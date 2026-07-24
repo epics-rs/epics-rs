@@ -8,8 +8,6 @@
 //! put_accepted C=true, port=false, 6 put classes). The fix makes the declared
 //! `DBF_STRING` type win over the name-based menu.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -17,7 +15,7 @@ const DB: &str = r#"record(scalcout, "S") {}"#;
 
 /// Every put class the oracle exercised on `OSV` is accepted and the string is
 /// stored — the field is a plain `DBF_STRING`, never resolved against a menu.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_osv_accepts_string_and_numeric_puts() {
     let db = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())

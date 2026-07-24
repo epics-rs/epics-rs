@@ -5,8 +5,9 @@
 //! record-link resolver reads cached monitor values without a blocking
 //! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): the flavored test drives the CA client stack,
+// which needs a multi-thread tokio runtime. These run and pass in the
+// feature-ON suite on the tokio driver.
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -33,9 +34,9 @@ pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
                 _ => return Err("caxr: missing pv_name".into()),
             };
             let resolver = resolver.clone();
-            let handle = ctx.runtime_handle().clone();
+            let bridge = ctx.bridge().clone();
             let result = std::thread::spawn(move || {
-                handle.block_on(async move { resolver.open(&name).await })
+                bridge.block_on(async move { resolver.open(&name).await })
             })
             .join();
             match result {
@@ -100,12 +101,12 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                             // for the one remaining blocking call.
                             let r = resolver.clone();
                             let n = name.clone();
-                            let h = ctx.runtime_handle().clone();
+                            let b = ctx.bridge().clone();
                             let connected = <CaLinkResolver as LinkSet>::is_connected(&r, &n);
                             let alarm = <CaLinkResolver as LinkSet>::alarm_severity(&r, &n);
                             let ts = <CaLinkResolver as LinkSet>::time_stamp(&r, &n);
                             let value = std::thread::spawn(move || {
-                                h.block_on(async move {
+                                b.block_on(async move {
                                     <CaLinkResolver as LinkSet>::get_value(&r, &n).await
                                 })
                             })

@@ -24,8 +24,6 @@
 //! unconditionally and clobbered RVAL to 0; opting mbbo into the framework's
 //! undefined-skip mirrors C's `goto CONTINUE`.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::mbbo::MbboRecord;
@@ -54,7 +52,7 @@ async fn db_with(record: Box<dyn Record>) -> PvDatabase {
 
 /// On a bare mbbo (UDF=1) a `caput RVAL v` stores `v`. `4294967295` is
 /// `u32::MAX`; `-1` reaches the unsigned field as `u32::MAX` too (C `strtoul`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_rval_put_stores_on_undefined_record() {
     let db = db_with(Box::new(MbboRecord::new(0))).await;
     caput(&db, "RVAL", "1").await.unwrap();
@@ -74,7 +72,7 @@ async fn mbbo_rval_put_stores_on_undefined_record() {
 /// The convert-skip is gated on UDF, exactly as C's `goto CONTINUE` is: once a
 /// VAL put clears UDF, the next process cycle DOES run `convert()` and RVAL is
 /// recomputed from VAL. Guards the fix against becoming an unconditional skip.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_rval_is_overwritten_by_convert_once_val_is_defined() {
     let db = db_with(Box::new(MbboRecord::new(0))).await;
     // Define VAL (clears UDF). VAL=0 on a bare mbbo -> convert() sets RVAL=0.

@@ -15,8 +15,6 @@
 //! generalization of the swait PACT fix; motor's notify carries no
 //! `ReprocessAfter` and so is untouched.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -25,7 +23,7 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     let db = PvDatabase::new();
 

@@ -146,7 +146,6 @@
 //! exist is not, yet.
 
 // RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::io;
 use std::net::{

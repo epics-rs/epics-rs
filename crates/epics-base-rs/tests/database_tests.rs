@@ -1,6 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(4): three multi-thread-flavored tokio tests plus one hand-built runtime; run and pass in the feature-ON suite.
 #![allow(unused_imports, clippy::all)]
-// RTEMS-EXEC-MODEL-ALLOW(215): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,7 +25,7 @@ fn sub_with_snam(snam: &str) -> epics_base_rs::server::records::sub_record::SubR
     rec
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_write_notify_follows_flnk() {
     let db = PvDatabase::new();
     db.add_record("REC_A", Box::new(AoRecord::new(0.0)))
@@ -50,7 +49,7 @@ async fn test_write_notify_follows_flnk() {
     assert!(visited.contains("REC_B"));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_inp_link_processing() {
     let db = PvDatabase::new();
     db.add_record("SOURCE", Box::new(AoRecord::new(42.0)))
@@ -84,7 +83,7 @@ async fn test_inp_link_processing() {
 /// pre-fix path called `read_link_value_soft → get_pv → Err` then
 /// folded the error to `None` and let process() succeed — leaving
 /// downstream alarm consumers blind to the broken link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_soft_inp_read_failure_sets_link_alarm() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -136,7 +135,7 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
 ///             sevr, no amsg propagation.
 /// * **MSS** — DEST gets source stat + sevr + amsg.
 /// * **MSI** — same as MS, but only when source.sevr == INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -191,7 +190,7 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
 }
 
 /// MSS propagates source stat + sevr + amsg (PR d0cf47c).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_single_inp_mss_propagates_stat_and_amsg() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -248,7 +247,7 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
 /// are exercised by the INP tests above; both sides share the
 /// `inherit_sevr_msg` helper, so these OUT tests pin the wiring: the OUT
 /// path captures the source's committed alarm and applies it to the DEST.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_out_link_ms_propagates_link_alarm_to_dest() {
     use epics_base_rs::server::recgbl::alarm_status;
 
@@ -312,7 +311,7 @@ async fn test_out_link_ms_propagates_link_alarm_to_dest() {
 /// NMS contrast for the OUT-link inheritance above: a bare `OUT = DST PP`
 /// carries the default NoMaximize switch, so a MAJOR source must NOT
 /// raise the dest's severity.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(99.0)))
@@ -356,7 +355,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
 /// `(None, None)` for any non-Db link, so a connected pva link
 /// carrying a remote MAJOR severity left the owning record at
 /// NO_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     use epics_base_rs::server::database::LinkSet;
     use epics_base_rs::server::recgbl::alarm_status;
@@ -424,7 +423,7 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
 /// B2: when the lset reports no alarm severity (`alarm_severity` →
 /// None — e.g. NMS, or remote NO_ALARM), a connected pva link must
 /// NOT raise any alarm on the owning record.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pva_link_no_alarm_when_lset_reports_none() {
     use epics_base_rs::server::database::LinkSet;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -525,7 +524,7 @@ impl epics_base_rs::server::database::LinkSet for CapturingLset {
 /// through the registered lset, matching C `dbLink.c::dbPutLink`
 /// (dbLink.c:434-448), which routes every link write through
 /// `plink->lset->putValue` regardless of DB vs CA link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pva_out_link_writes_value_through_link_set() {
     use std::sync::Mutex;
 
@@ -593,7 +592,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
 /// A record with a `pva://` OUT link and NO registered link set must
 /// fail gracefully — process() completes without panic, the value is
 /// simply not delivered (C `dbPutLink` returns `S_db_noLSET`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pva_out_link_no_link_set_fails_gracefully() {
     let db = PvDatabase::new();
     // No register_link_set call — the "pva" scheme is unregistered.
@@ -633,7 +632,7 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
 /// twin asserts the `Plain` boundary; this asserts `Async`, so the
 /// notify→op mapping (`PvDatabase::external_put_op`) is pinned on both
 /// sides of its single branch.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     use std::sync::Mutex;
 
@@ -709,7 +708,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
 /// reset_alarms sees sevr Major→Major (alarm_changed=false) but
 /// amsg "msg1"→"msg2" (amsg_changed=true). The fix posts AMSG for
 /// this case so the subscriber sees the new message.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     use epics_base_rs::server::recgbl::{EventMask, alarm_status};
     use epics_base_rs::server::record::AlarmSeverity;
@@ -795,7 +794,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
 ///   * an amsg-only pass posts VAL with `DBE_ALARM` alone (the value
 ///     deadband did not fire; `recGbl.c:212` `val_mask = DBE_ALARM`)
 ///     and AMSG with `stat_mask = DBE_ALARM` (`recGbl.c:194/210-211`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_record_posts_carry_per_event_dbe_mask() {
     use epics_base_rs::server::recgbl::{EventMask, alarm_status};
     use epics_base_rs::server::record::AlarmSeverity;
@@ -901,7 +900,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
 // change detection and a mask made from the union of the cycle's other posts.
 // A `.UDF` subscriber must see an event only where C's generic `dbPut` posts
 // the field it wrote (dbAccess.c) — i.e. a caput to `.UDF` itself.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_process_cycle_posts_no_udf_event() {
     use epics_base_rs::server::recgbl::{EventMask, alarm_status};
     use epics_base_rs::server::record::AlarmSeverity;
@@ -963,7 +962,7 @@ async fn test_process_cycle_posts_no_udf_event() {
 /// The other side of the R14-63 boundary: a client caput to `.UDF` DOES post,
 /// because C's generic `dbPut` posts the field it wrote. Removing the
 /// synthesized processing-cycle posts must not take this one with it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_caput_to_udf_field_posts_udf_event() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
@@ -1019,7 +1018,7 @@ async fn test_caput_to_udf_field_posts_udf_event() {
 /// so any consumer reading PUTF during the process cycle (TPRO
 /// trace, monitor on .PUTF, async-completion path's
 /// "put-driven vs scan-driven" classifier) always saw PUTF=0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_clears_after_synchronous_put_completion() {
     // AoRecord is synchronous Soft Channel (process() returns
     // Complete immediately). The synchronous-completion clear
@@ -1051,7 +1050,7 @@ async fn test_putf_clears_after_synchronous_put_completion() {
 /// `dbAccess.c::dbPutField:1276` sets putf=TRUE; the async device's
 /// completion eventually calls `dbProcess` again, which runs through
 /// `recGblFwdLink` (clears putf).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
     let db = PvDatabase::new();
     db.add_record("ASYNC_PUTF", Box::new(AsyncRecord { val: 0.0 }))
@@ -1104,7 +1103,7 @@ async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
 /// `complete_async_record` runs its own clear. This test pins the
 /// C-parity invariant: post-put, pre-process, UDF must already be
 /// false on a primary-field write.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
     let db = PvDatabase::new();
     db.add_record("UDF_ASYNC", Box::new(AsyncRecord { val: 0.0 }))
@@ -1145,7 +1144,7 @@ async fn test_put_record_field_from_ca_clears_udf_on_primary_field_write() {
 /// receiving a dbPut should carry PUTF=1 during chain processing.
 /// Pre-fix the CP-target dispatch set PUTF=true on every chained
 /// record, smearing put attribution across the entire chain.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_stays_off_for_cp_chained_targets() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(0.0)))
@@ -1184,7 +1183,7 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
 /// attribution and device-support `put-driven vs scan-driven`
 /// classifiers downstream of the OUT link silently observed
 /// scan-driven processing instead of put-driven.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_propagates_through_db_out_link_to_passive_target() {
     let db = PvDatabase::new();
     db.add_record("PUTF_OUT_TGT", Box::new(AoRecord::new(0.0)))
@@ -1243,7 +1242,7 @@ async fn test_putf_propagates_through_db_out_link_to_passive_target() {
 /// and dispatched process — never touched `target.putf`. So even
 /// when the source had `putf=1` from a CA put, the async target
 /// stayed at `putf=0` for the duration of the in-flight cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_propagates_mid_cycle_via_async_target_out_link() {
     let db = PvDatabase::new();
     // Async target: stays pact between process and complete_async.
@@ -1286,7 +1285,7 @@ async fn test_putf_propagates_mid_cycle_via_async_target_out_link() {
 /// Pre-fix the simulation path called both put_field("RVAL", v) AND
 /// set_val(v), so VAL ended up holding raw counts and the operator's
 /// configured EGU conversion was silently bypassed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_simm_raw_input_runs_conversion_chain() {
     let db = PvDatabase::new();
     // Source PV that the ai's SIOL link reads from — provides the
@@ -1345,7 +1344,7 @@ async fn test_simm_raw_input_runs_conversion_chain() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cycle_detection() {
     let db = PvDatabase::new();
     db.add_record("CYCLE_A", Box::new(AoRecord::new(0.0)))
@@ -1375,7 +1374,7 @@ async fn test_cycle_detection() {
     assert_eq!(visited.len(), 2);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_drvh_drvl_clamp() {
     let mut rec = AoRecord::new(0.0);
     rec.drvh = 100.0;
@@ -1389,7 +1388,7 @@ async fn test_ao_drvh_drvl_clamp() {
     assert!((rec.val - (-50.0)).abs() < 1e-10);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_oroc_rate_limit() {
     let mut rec = AoRecord::new(0.0);
     rec.oroc = 5.0;
@@ -1406,7 +1405,7 @@ async fn test_ao_oroc_rate_limit() {
     assert!((rec.oval - 10.0).abs() < 1e-10, "Second: oval={}", rec.oval);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_omsl_dol() {
     let db = PvDatabase::new();
     db.add_record("SOURCE", Box::new(AoRecord::new(42.0)))
@@ -1430,7 +1429,7 @@ async fn test_ao_omsl_dol() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_oif_incremental() {
     let db = PvDatabase::new();
     db.add_record("DELTA", Box::new(AoRecord::new(10.0)))
@@ -1461,7 +1460,7 @@ async fn test_ao_oif_incremental() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_ivoa_dont_drive() {
     let db = PvDatabase::new();
     db.add_record("TARGET", Box::new(AoRecord::new(0.0)))
@@ -1504,7 +1503,7 @@ async fn test_ao_ivoa_dont_drive() {
 /// land in `common.asl`. `db_loader::apply_fields` feeds every common
 /// field as `EpicsValue::String`; the ASL handler must parse string
 /// numerics or the directive is silently dropped at IOC load.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_db_load_records_asl_field() {
     use epics_base_rs::server::db_loader;
     use epics_base_rs::server::records::ai::AiRecord;
@@ -1546,7 +1545,7 @@ record(ai, "ASLT:LOW") {
     assert_eq!(low.read().common.asl, 0, "absent ASL defaults to 0");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_ivoa_set_to_ivov_writes_oval() {
     use epics_base_rs::server::records::ao::AoRecord;
 
@@ -1589,7 +1588,7 @@ async fn test_ao_ivoa_set_to_ivov_writes_oval() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_bo_ivoa_set_to_ivov_writes_rval() {
     use epics_base_rs::server::records::bo::BoRecord;
 
@@ -1618,7 +1617,7 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     use epics_base_rs::server::records::calcout::CalcoutRecord;
 
@@ -1666,7 +1665,7 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_mode_input() {
     let db = PvDatabase::new();
     db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
@@ -1704,7 +1703,7 @@ async fn test_sim_mode_input() {
 /// VAL of 99 trips HIHI, and because HHSV (MAJOR) outranks SIMM (MINOR)
 /// the limit alarm must WIN — the pre-fix direct-commit clobbered it
 /// (and never even evaluated the limit), reporting only MINOR/SIMM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
     use epics_base_rs::server::recgbl::alarm_status;
 
@@ -1753,7 +1752,7 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
 /// `DBE_VALUE|DBE_ALARM` mask and bypassed the MDEL deadband, so a
 /// steady simulated record re-sent its unchanged alarm fields and VAL on
 /// every cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
@@ -1829,7 +1828,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
 /// `DBE_ALARM`-only `.SEVR` subscriber must NOT be notified — while
 /// STAT's mask carries `DBE_ALARM` when the severity moved. The pre-fix
 /// SIMM tail collapsed both onto a shared `DBE_VALUE|DBE_ALARM` mask.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_alarm_transition_posts_per_field_masks() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
@@ -1889,7 +1888,7 @@ async fn test_sim_alarm_transition_posts_per_field_masks() {
 /// deadband throttles simulated values exactly like real reads
 /// (`aiRecord.c` `monitor()`: `delta > mdel`). The pre-fix SIMM tail
 /// posted VAL on every cycle regardless of MDEL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_val_respects_mdel_deadband() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
@@ -1948,7 +1947,7 @@ async fn test_sim_val_respects_mdel_deadband() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_mode_toggle() {
     let db = PvDatabase::new();
     db.add_record("SIM_SW", Box::new(AoRecord::new(0.0)))
@@ -1994,7 +1993,7 @@ async fn test_sim_mode_toggle() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_mode_output() {
     let db = PvDatabase::new();
     db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
@@ -2029,7 +2028,7 @@ async fn test_sim_mode_output() {
 /// local `ParsedLink::Db` SIOL, so a non-local SIOL read nothing yet
 /// still returned `Simulated` — the record froze with no value. This is
 /// the INPUT twin of the OUT-link locality fallback.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_mode_input_nonlocal_db_siol() {
     use epics_base_rs::server::database::LinkSet;
     struct ValueCaLset(f64);
@@ -2080,7 +2079,7 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
 /// `dbPut`. OUTPUT twin of `test_sim_mode_input_nonlocal_db_siol`; the
 /// pre-fix port special-cased only a local `ParsedLink::Db` SIOL, so a
 /// non-local SIOL write went nowhere.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sim_mode_output_nonlocal_db_siol() {
     use std::sync::Mutex;
 
@@ -2137,7 +2136,7 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sdis_disable_skips_process() {
     let db = PvDatabase::new();
     db.add_record("DISABLE_SW", Box::new(AoRecord::new(1.0)))
@@ -2201,7 +2200,7 @@ async fn test_sdis_disable_skips_process() {
 /// The port used to hand the constant's text back as if the link had delivered
 /// it, which disabled the record permanently. A DB SDIS still refreshes DISA
 /// every cycle — that is the other half of the boundary, asserted below.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
     let db = PvDatabase::new();
     db.add_record("TARGET", Box::new(AoRecord::new(0.0)))
@@ -2258,7 +2257,7 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_phas_scan_order() {
     let db = PvDatabase::new();
 
@@ -2352,7 +2351,7 @@ fn test_depth_limit() {
     });
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disp_blocks_ca_put() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2370,7 +2369,7 @@ async fn test_disp_blocks_ca_put() {
     assert!(matches!(result, Err(CaError::PutDisabled(_))));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disp_allows_disp_write() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2392,7 +2391,7 @@ async fn test_disp_allows_disp_write() {
     assert!(inst.common.disp == 0);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disp_bypassed_by_internal_put() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2408,7 +2407,7 @@ async fn test_disp_bypassed_by_internal_put() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_proc_triggers_processing() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2424,7 +2423,7 @@ async fn test_proc_triggers_processing() {
     assert!(inst.common.udf == 0);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_proc_works_any_scan() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2449,7 +2448,7 @@ async fn test_proc_works_any_scan() {
 /// AND before the PROC-driven `dbProcess` (`:1265-1277`). `PROC`'s pfield is
 /// not `&precord->disp`, so `caput REC.PROC 1` on a disabled record is
 /// refused and the record does NOT process.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disp_blocks_proc_and_suppresses_processing() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2481,7 +2480,7 @@ async fn test_disp_blocks_proc_and_suppresses_processing() {
 /// `S_db_noMod` inside `dbPut` (`dbAccess.c:123`), which `dbPutField` only
 /// reaches AFTER the DISP gate — so on a `DISP=1` record the error a client
 /// sees for `caput REC.PACT` is `S_db_putDisabled`, not `S_db_noMod`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disp_gate_precedes_nomod_rejection() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2500,7 +2499,7 @@ async fn test_disp_gate_precedes_nomod_rejection() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_proc_while_pact() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2515,7 +2514,7 @@ async fn test_proc_while_pact() {
     assert!(inst.common.udf == 0);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_lcnt_ca_write_rejected() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2527,7 +2526,7 @@ async fn test_lcnt_ca_write_rejected() {
     assert!(matches!(result, Err(CaError::ReadOnlyField(_))));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ca_put_scan_index_update() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2589,7 +2588,7 @@ impl epics_base_rs::server::device_support::DeviceSupport for MockDeviceSupport 
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ca_put_no_double_device_write() {
     let db = PvDatabase::new();
     db.add_record("AO_REC", Box::new(AoRecord::new(0.0)))
@@ -2615,7 +2614,7 @@ async fn test_ca_put_no_double_device_write() {
 /// the live case — the motor record emits its retry / backlash-leg /
 /// NTM-stop commands on exactly these passes, and suppressing the write
 /// strands them in the command mailbox (DMOV stuck 0, MIP=RETRY|MOVE).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_readback_cycle_runs_device_write_without_callback_contract() {
     let db = PvDatabase::new();
     db.add_record("AO_CB1", Box::new(AoRecord::new(0.0)))
@@ -2645,7 +2644,7 @@ async fn test_readback_cycle_runs_device_write_without_callback_contract() {
 /// the callback cycle reads the driver value back and must NOT re-write the
 /// setpoint — re-asserting it would re-trigger the driver (AD `Acquire`
 /// loop).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
     let db = PvDatabase::new();
     db.add_record("AO_CB2", Box::new(AoRecord::new(0.0)))
@@ -2680,7 +2679,7 @@ async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
 // `DTYP="Raw Soft Channel"`, MASK set, and a soft INP link must mask
 // the link value into RVAL before the RVAL→VAL convert. The framework
 // must route the INP value to `raw_soft_input` (not `set_val`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_bi_raw_soft_channel_inp_applies_mask() {
     let db = PvDatabase::new();
     db.add_record("SRC_LI", Box::new(LonginRecord::new(0)))
@@ -2723,7 +2722,7 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_input_record_no_device_write() {
     let db = PvDatabase::new();
     db.add_record("AI_REC", Box::new(AiRecord::new(0.0)))
@@ -2773,7 +2772,7 @@ impl epics_base_rs::server::device_support::DeviceSupport for UtagDeviceSupport 
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_device_support_utag_adopted_into_common() {
     // A device that reports a userTag via `last_utag()` must have it
     // adopted into `common.utag` when the record is processed, mirroring
@@ -2802,7 +2801,7 @@ async fn test_device_support_utag_adopted_into_common() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     // C `dbAccess.c::dbPutField:1263-1266` only processes a record on a
     // put when `precord->scan == 0` (Passive). A CA put to a non-Passive
@@ -2842,7 +2841,7 @@ async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_proc_triggers_device_write() {
     let db = PvDatabase::new();
     db.add_record("AO_PROC", Box::new(AoRecord::new(0.0)))
@@ -2864,7 +2863,7 @@ async fn test_proc_triggers_device_write() {
 
 // --- Scan Index Fix tests ---
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_phas_change_updates_scan_index() {
     let db = PvDatabase::new();
     db.add_record("REC_A", Box::new(AoRecord::new(0.0)))
@@ -2912,7 +2911,7 @@ async fn test_phas_change_updates_scan_index() {
     assert_eq!(names, vec!["REC_A", "REC_B"]);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_scan_change_preserves_phas() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -2931,7 +2930,7 @@ async fn test_scan_change_preserves_phas() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_phas_change_passive_no_index() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -3041,7 +3040,7 @@ impl Record for AsyncOutRecord {
 /// dbProcess's own PACT guard (bumping LCNT, and after MAX_LOCK raising a
 /// SCAN_ALARM C never raises for a client put) and never set RPRO — the
 /// second value landed in VAL and was never written out.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     let db = PvDatabase::new();
     let writes: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3096,7 +3095,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
         if writes.lock().unwrap().len() >= 2 {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     assert_eq!(
@@ -3112,7 +3111,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_async_pending_skips_post_process() {
     let db = PvDatabase::new();
     db.add_record("ASYNC", Box::new(AsyncRecord { val: 0.0 }))
@@ -3137,7 +3136,7 @@ async fn test_async_pending_skips_post_process() {
     assert!(inst.common.udf != 0);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_complete_async_record() {
     let db = PvDatabase::new();
     db.add_record("ASYNC", Box::new(AsyncRecord { val: 42.0 }))
@@ -3214,7 +3213,7 @@ impl Record for AsyncAlarmingRecord {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_complete_async_posts_sevr_with_per_field_mask() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -3283,7 +3282,7 @@ async fn test_complete_async_posts_sevr_with_per_field_mask() {
 // (lcnt counting up); after MAX_LOCK=10 consecutive bails, SCAN_ALARM /
 // INVALID must be raised with "Async in progress" amsg and VAL must be
 // posted with DBE_VALUE|DBE_LOG|DBE_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -3364,7 +3363,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
 // TPRO=true does not interfere with the bail decision (lcnt still
 // increments) and (b) RPRO state is preserved through the guard so
 // the diagnostic value is meaningful.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     let db = PvDatabase::new();
     db.add_record("ASYNC_TPRO", Box::new(AsyncRecord { val: 0.0 }))
@@ -3415,7 +3414,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
 
 // After PACT clears via complete_async_record, the next process must
 // reset lcnt to 0 (mirrors C `else { precord->lcnt = 0; }`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pact_entry_guard_resets_lcnt_after_completion() {
     let db = PvDatabase::new();
     db.add_record("ASYNC_RESET", Box::new(AsyncRecord { val: 0.0 }))
@@ -3460,7 +3459,7 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
 // The foreign-caller guard (FLNK / scan / CA put) is still in
 // effect — `test_pact_entry_guard_silent_bail_until_max_lock` above
 // covers that case.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     use epics_base_rs::server::record::{ProcessAction, ProcessOutcome, RecordProcessResult};
     use std::sync::Arc;
@@ -3546,7 +3545,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     );
 
     // Wait for the ReprocessAfter timer to fire.
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(80)).await;
 
     // Continuation fired: process() ran a second time despite
     // pact=true.
@@ -3596,7 +3595,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
 /// while letting through deltas that cross the threshold. Mirrors
 /// the per-subscription filter chain semantics that the JSON-name
 /// parser (future commit) will wire in for real CA channels.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dbnd_filter_drops_subthreshold_changes() {
     use epics_base_rs::server::database::filters::DeadbandFilter;
     use epics_base_rs::server::recgbl::EventMask;
@@ -3662,7 +3661,7 @@ async fn test_dbnd_filter_drops_subthreshold_changes() {
 /// through regardless of the deadband state. Otherwise an alarm
 /// triggered mid-deadband-window would be silenced and clients
 /// would miss the state change.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dbnd_filter_passes_alarm_events() {
     use epics_base_rs::server::database::filters::DeadbandFilter;
     use epics_base_rs::server::recgbl::EventMask;
@@ -3716,7 +3715,7 @@ async fn test_dbnd_filter_passes_alarm_events() {
     rx.try_recv().expect("alarm event passes the filter");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_notify_field_respects_mask() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(42.0)))
@@ -3756,7 +3755,7 @@ async fn test_notify_field_respects_mask() {
 /// check whenever SDIS evaluates to DISV. Pre-fix Rust only
 /// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
 /// next cycle and pending dbNotify completion callbacks stalled.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sdis_disable_clears_rpro_and_putf() {
     let db = PvDatabase::new();
     db.add_record("DIS_SW", Box::new(AoRecord::new(1.0)))
@@ -3798,7 +3797,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
 /// disabled record must release its caller. Pre-fix the
 /// put_notify_tx was never fired, stranding the call until socket
 /// disconnect.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sdis_disable_fires_put_notify_completion() {
     let db = PvDatabase::new();
     db.add_record("DIS_NOT_SW", Box::new(AoRecord::new(1.0)))
@@ -3854,7 +3853,7 @@ async fn test_sdis_disable_fires_put_notify_completion() {
 /// Boundary: a fully synchronous chain (originating record + a sync FLNK
 /// target) drains the wait-set within the put call, so the put reports
 /// immediate completion (`Ok(None)`) — no receiver is handed back.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_notify_sync_chain_completes_immediately() {
     let db = PvDatabase::new();
     db.add_record("PN_SYNC_SRC", Box::new(AoRecord::new(0.0)))
@@ -3886,7 +3885,7 @@ async fn test_put_notify_sync_chain_completes_immediately() {
 /// WRITE_NOTIFY done while the async FLNK target was still in flight. Now
 /// the put returns a receiver that fires only when the async target's
 /// `complete_async_record` runs.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_notify_defers_for_async_flnk_target() {
     let db = PvDatabase::new();
     db.add_record("PN_FLNK_SRC", Box::new(AoRecord::new(0.0)))
@@ -3929,7 +3928,7 @@ async fn test_put_notify_defers_for_async_flnk_target() {
 
 /// Boundary: same deferral, reached through an OUT `PP` link instead of
 /// FLNK — the other dispatch edge that calls `processTarget`/`dbNotifyAdd`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_notify_defers_for_async_out_pp_target() {
     let db = PvDatabase::new();
     db.add_record("PN_OUT_SRC", Box::new(AoRecord::new(0.0)))
@@ -3972,7 +3971,7 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
 /// Silently overwriting the wait-set would drop the prior `Sender`, waking
 /// the prior caller's receiver with a `RecvError` the CA dispatcher treats
 /// as success.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_notify_refuses_second_in_flight() {
     let db = PvDatabase::new();
     db.add_record("PN_DBL", Box::new(AsyncRecord { val: 0.0 }))
@@ -4009,7 +4008,7 @@ async fn test_put_notify_refuses_second_in_flight() {
 /// notify slot occupied for the whole async round trip (a motor's
 /// whole motion), refusing every legitimate WRITE_NOTIFY on the record
 /// with PutCallbackInProgress in the meantime.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
     let db = PvDatabase::new();
     db.add_record("PN_FF", Box::new(AsyncRecord { val: 0.0 }))
@@ -4059,7 +4058,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
             break;
         }
         drop(inst);
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
     {
         let rec = db.get_record("PN_FF").unwrap();
@@ -4084,7 +4083,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
 /// a WRITE_NOTIFY already parked is accepted (C `dbPutField` carries no
 /// notify state to conflict) and leaves the parked wait-set undisturbed
 /// — it neither steals nor fires the prior caller's completion.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fire_and_forget_put_does_not_disturb_parked_notify() {
     let db = PvDatabase::new();
     db.add_record("PN_FF2", Box::new(AsyncRecord { val: 0.0 }))
@@ -4155,7 +4154,7 @@ impl Record for ScanOnceEmitter {
 /// so `dbNotifyCompletion` does not wait on it. The RTEMS CA driver must
 /// therefore see `ProcessCompletion::Sync` here and reply inline — waiting on
 /// the scanOnce would hang the reply on an unrelated cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scan_once_is_not_joined_to_put_notify_completion() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -4192,9 +4191,9 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // returned: the record is re-processed a second time, off the put's
     // completion path.
     for _ in 0..50 {
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         count.load(Ordering::SeqCst) >= 2,
         "the scanOnce must run as its own cycle after the put completed, got \
@@ -4207,7 +4206,7 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
 /// mode. `originating_pending` keys on the instance's parked notify;
 /// a fire-and-forget put parks nothing, so it must fall through to the
 /// guarded clear rather than mistaking an empty slot for "pending".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fire_and_forget_put_clears_putf_on_sync_completion() {
     let db = PvDatabase::new();
     db.add_record("PN_FF_SYNC", Box::new(AoRecord::new(0.0)))
@@ -4232,7 +4231,7 @@ async fn test_fire_and_forget_put_clears_putf_on_sync_completion() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sdis_disable_notifies_alarm() {
     // C `dbAccess.c:587-592` — the disable branch of `dbProcess` posts:
     //   db_post_events(&precord->stat, DBE_VALUE);            // STAT
@@ -4278,7 +4277,7 @@ async fn test_sdis_disable_notifies_alarm() {
 
 // --- UDF in database context ---
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_udf_cleared_by_process_with_links() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -4303,7 +4302,7 @@ async fn test_udf_cleared_by_process_with_links() {
 ///
 /// UDF is the "did it process" probe — `process_record_with_links` clears it
 /// (see `test_udf_cleared_by_process_with_links`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pini_passes_select_disjoint_menu_choices() {
     use epics_base_rs::server::record::PiniMode;
 
@@ -4374,7 +4373,7 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
 /// record; `status` stays 0, so `dbPut` returns success. The port rejected the
 /// put with an error, so the client saw a write failure and the record's alarm
 /// state was never touched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -4418,7 +4417,7 @@ async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
 /// no-op success: C takes the `no_elements > 1` branch (`dbAccess.c:1345`),
 /// clamps `nRequest` to 0 and converts nothing — no alarm. Only the *scalar*
 /// destination alarms. This is the boundary the fix turns on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_empty_array_into_array_field_is_a_silent_no_op() {
     use epics_base_rs::server::record::AlarmSeverity;
 
@@ -4458,7 +4457,7 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
 /// is written and the put SUCCEEDS. The port passed the array straight to the
 /// record's typed `put_field` arm, which rejected it with `TypeMismatch`, so
 /// the client saw a write failure.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
     let db = PvDatabase::new();
     db.add_record("ARRPUT", Box::new(AoRecord::new(5.0)))
@@ -4489,7 +4488,7 @@ async fn r6_10_multi_element_array_into_scalar_writes_element_zero() {
 /// the same multi-element array into an **array** field writes every element
 /// (C: `no_elements >= nRequest`, nothing is clamped away). Only a one-element
 /// destination reduces to element 0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
     let db = PvDatabase::new();
     let wf = epics_base_rs::server::records::waveform::WaveformRecord::new(
@@ -4512,7 +4511,7 @@ async fn r6_10_multi_element_array_into_array_field_writes_all_elements() {
 /// (`caput -a REC.VAL 1 7`); C's clamp leaves `nRequest = 1` and writes it.
 /// Between this and the zero-element case (R6-7, LINK/INVALID alarm, nothing
 /// written) sit the two edges of C's `nRequest` branch.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_10_single_element_array_into_scalar_writes_that_element() {
     let db = PvDatabase::new();
     db.add_record("ONEPUT", Box::new(AoRecord::new(5.0)))
@@ -4535,7 +4534,7 @@ async fn r6_10_single_element_array_into_scalar_writes_that_element() {
 /// coercion path that could not reduce the array, so the value was silently
 /// dropped and VAL kept its stale content. `set_val` now routes through
 /// `put_field_internal`, the single owner of internal-delivery coercion.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
     let db = PvDatabase::new();
     let wf = epics_base_rs::server::records::waveform::WaveformRecord::new(
@@ -4579,7 +4578,7 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
 /// the failure (`dbpf` prints "PV '%s' not found" and returns -1,
 /// `dbTest.c:787-795`). The port's `put_common_field` fell through to
 /// `Ok(NoChange)`, so a misspelled field was a silent success.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
     let db = PvDatabase::new();
     db.add_record("BADFLD", Box::new(AoRecord::new(1.0)))
@@ -4630,7 +4629,7 @@ async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
 /// carries `special == SPC_ATTRIBUTE` → `dbPutField` returns the same
 /// `S_db_noMod` (`dbAccess.c:1252-1253`). Neither may silently succeed, and
 /// neither may be reported as "field not found".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
     let db = PvDatabase::new();
     db.add_record("ATTRFLD", Box::new(AoRecord::new(1.0)))
@@ -4655,7 +4654,7 @@ async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
 /// there). On any other record type C has no such field, so the put is an
 /// `S_dbLib_fieldNotFound` like any other unknown name; the port's `OUTN` arm
 /// used to swallow it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r6_9_outn_is_swait_only() {
     use epics_base_rs::server::records::swait::SwaitRecord;
 
@@ -4692,7 +4691,7 @@ async fn r6_9_outn_is_swait_only() {
 /// which under ascending-PHAS order is the highest-PHAS one. The records are
 /// added in descending phase order so that load order alone gives the wrong
 /// answer.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pini_records_process_in_ascending_phas_order() {
     use epics_base_rs::server::record::PiniMode;
 
@@ -4735,7 +4734,7 @@ async fn test_pini_records_process_in_ascending_phas_order() {
 /// to look for the lowest value of PHAS each time" (`iocInit.c:614-619`). A
 /// record moved out of the phase currently being processed must still be picked
 /// up by the pass for its new phase, not dropped.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pini_sweep_covers_every_phase_present() {
     use epics_base_rs::server::record::PiniMode;
 
@@ -4772,7 +4771,7 @@ async fn test_pini_sweep_covers_every_phase_present() {
 /// be rejected rather than silently landing on NO. The pre-fix bool accepted
 /// only `"YES"`/`"1"`/`"true"` and mapped everything else — including the four
 /// real menu choices — to `false`, so `caput REC.PINI RUN` *disabled* PINI.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
     use epics_base_rs::server::record::PiniMode;
 
@@ -4825,7 +4824,7 @@ async fn test_pini_put_accepts_every_menu_choice_and_rejects_junk() {
 /// does not own UDF. Regression guard for the int32-ao udf-on-readback path
 /// (the recurring "int32-ao udf-on-NaN" residual is framework-handled, not
 /// a divergence).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_asyn_readback_clears_udf_via_framework() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -4855,7 +4854,7 @@ async fn test_ao_asyn_readback_clears_udf_via_framework() {
     assert_eq!(g.record.get_field("VAL"), Some(EpicsValue::Double(150.0)));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_udf_not_cleared_by_clears_udf_false() {
     struct NoClearRecord {
         val: f64,
@@ -4918,7 +4917,7 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
 /// at all) + a runtime `put_common_field("INP", ...)`, then assert the value
 /// appeared after `process` — which only passed because the process-time read
 /// re-delivered the constant every cycle, the R15-78 defect.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_constant_inp_link() {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     let (db, _) = IocBuilder::new()
@@ -4962,7 +4961,7 @@ async fn test_constant_inp_link() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_multi_input_db_links() {
     use epics_base_rs::server::records::calc::CalcRecord;
     let db = PvDatabase::new();
@@ -4994,7 +4993,7 @@ async fn test_calc_multi_input_db_links() {
 /// (bare `get_pv`, no PP processing), so a PP input link read a stale
 /// source value. The single-INP path already did this via
 /// `read_link_value_soft`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_multi_input_pp_processes_passive_source() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5040,7 +5039,7 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
 /// the engine path. It used to call the reduced `process_local`, which fetched
 /// no INPx, so a direct process of a calc/sub read stale A..U inputs; it now
 /// delegates to the canonical link-fetching engine path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn process_record_fetches_input_links() {
     use epics_base_rs::server::records::ao::AoRecord;
     use epics_base_rs::server::records::calc::CalcRecord;
@@ -5073,7 +5072,7 @@ async fn process_record_fetches_input_links() {
 /// Defect 3 control: an `NPP` (no-process-passive) multi-input link
 /// must NOT process its passive source — it reads whatever stale
 /// value the source currently holds.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_multi_input_npp_does_not_process_source() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5111,7 +5110,7 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
 /// `'0'` failed the guard and `INP="DIRECT.B0"` parsed as a link to a *record*
 /// literally named `"DIRECT.B0"`: it never resolved locally and was re-routed
 /// as an external CA channel, losing lock-set atomicity and PP/MS semantics.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     use epics_base_rs::server::record::{DbLink, LinkProcessPolicy, MonitorSwitch, ParsedLink};
     use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
@@ -5203,7 +5202,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
 /// defaulted a bare link to `ProcessPassive`, so `BARE_DST` would have
 /// spuriously processed `BARE_SRC` and read 42; after the fix it reads
 /// the stale 0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_multi_input_bare_does_not_process_source() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5259,7 +5258,7 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
 ///
 /// This test passing at all proves the fix: a regression re-aborts
 /// the whole test process with a stack overflow.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_pp_link_cycle_terminates() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5301,7 +5300,7 @@ async fn test_calc_pp_link_cycle_terminates() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_constant_inputs() {
     use epics_base_rs::server::records::calc::CalcRecord;
     let db = PvDatabase::new();
@@ -5325,7 +5324,7 @@ async fn test_calc_constant_inputs() {
 // ai/ao/longin/longout. The Rust port omitted them — put_field for
 // HIHI silently no-op'd because `common.analog_alarm` was None for
 // rtype="calc".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_record_has_analog_alarm_limits() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5373,7 +5372,7 @@ async fn test_calc_record_has_analog_alarm_limits() {
 // alarm-range integer is exponentially smoothed, so a brief excursion
 // above HIHI does NOT immediately raise the severity until the filter
 // converges.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_calc_record_aftc_filter_delays_alarm() {
     use epics_base_rs::server::records::calc::CalcRecord;
 
@@ -5419,7 +5418,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
     assert!(afvl != 0.0, "AFVL must be updated when AFTC > 0");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fanout_all() {
     use epics_base_rs::server::records::fanout::FanoutRecord;
     let db = PvDatabase::new();
@@ -5443,7 +5442,7 @@ async fn test_fanout_all() {
     assert!(visited.contains("TARGET_2"));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fanout_specified() {
     // C parity (fanoutRecord.c:114): SELM=Specified selects the link
     // at index `SELN + OFFS`, 0-based over LNK0..LNKF. With SELN=1,
@@ -5480,7 +5479,7 @@ async fn test_fanout_specified() {
     assert!(!visited.contains("T2"));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dfanout_value_write() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
     let db = PvDatabase::new();
@@ -5517,7 +5516,7 @@ async fn test_dfanout_value_write() {
 /// `processing.rs::process_record_with_links_inner`, so a dfanout
 /// configured with OMSL=closed_loop never sourced VAL from DOL —
 /// every cycle silently kept the previously-cached VAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
 
@@ -5567,7 +5566,7 @@ async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
 /// (default), DOL must NOT be evaluated even if a DOL link is set —
 /// VAL remains under operator control. This pins the gating so a
 /// future refactor cannot silently widen the closed-loop scope.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dfanout_omsl_supervisory_ignores_dol() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
 
@@ -5624,7 +5623,7 @@ async fn define_val(db: &PvDatabase, name: &str) {
 /// cycle's committed SEVR and the VAL monitor post. After ONE process, a
 /// broken OUT link must leave SEVR=INVALID / STAT=LINK — proving the
 /// same-cycle fold (a one-cycle-late latch would read NO_ALARM here).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
@@ -5674,7 +5673,7 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
 /// Companion gate: a dfanout whose OUT links all write successfully must
 /// NOT raise a LINK alarm — SEVR stays NO_ALARM. Pins that the
 /// write-failure fold above only fires on a real `dbPutLink` failure.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dfanout_out_link_write_success_no_link_alarm() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
 
@@ -5711,7 +5710,7 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_dol_lnk_dispatch() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
@@ -5755,7 +5754,7 @@ async fn test_seq_dol_lnk_dispatch() {
 // then posts DOn on change. The Rust seq dispatch used DOLn only
 // transiently for the LNKn write and never wrote it back into DOn, so a
 // client reading/monitoring DOn saw a stale value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_writes_dol_readback_into_don() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
@@ -5797,7 +5796,7 @@ async fn test_seq_writes_dol_readback_into_don() {
 // real link. A DOL-only group (real DOLn, empty LNKn) still reads back
 // DOn and posts it, even though nothing is driven. The Rust dispatch
 // skipped any group with an empty LNKn, so DOn never updated.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
@@ -5869,7 +5868,7 @@ impl Record for CountingTarget {
 // `parse_link_v2`/`parse_output_link_v2` default a modifier-less link
 // to NPP (`NoProcess`) like C `dbParseLink`, so the `MultiOut::Seq` arm
 // needs no per-call downgrade.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_bare_lnk_does_not_process_passive_target() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
@@ -5953,7 +5952,7 @@ impl Record for WriteThenFlnkProducer {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
     let db = PvDatabase::new();
     // Target the producer writes 42.0 into.
@@ -6002,10 +6001,10 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
 async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
     for _ in 0..400 {
         if counter.load(Ordering::SeqCst) >= want {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(30)).await;
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: counter reached {} (< {want}) before timeout",
@@ -6022,7 +6021,7 @@ async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
                 return;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!(
         "{pv}: did not reach {want} before timeout (last {:?})",
@@ -6033,7 +6032,7 @@ async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
 // BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
 // → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
 // not process its target; an explicit-PP LNKn must.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     use epics_base_rs::server::records::sseq::SseqRecord;
     let db = PvDatabase::new();
@@ -6094,7 +6093,7 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
 // (`callbackRequestDelayed`), exactly as the base `seqRecord` does for
 // DLY0..DLYF. The async machine ports this with a per-step
 // `ReprocessAfter(DLYn)`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sseq_per_step_dly_delays_step_write() {
     use epics_base_rs::server::records::sseq::SseqRecord;
     let db = PvDatabase::new();
@@ -6133,7 +6132,7 @@ async fn test_sseq_per_step_dly_delays_step_write() {
 
     // Before DLY1 (0.3 s) elapses, step 1's value must NOT be written yet,
     // and step 2 must not fire before step 1.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         db.get_pv("SSEQ_DLY_TGT1").unwrap(),
         EpicsValue::Double(0.0),
@@ -6150,7 +6149,7 @@ async fn test_sseq_per_step_dly_delays_step_write() {
     poll_pv_double(&db, "SSEQ_DLY_TGT2", 22.0).await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sel_nvl_link() {
     use epics_base_rs::server::records::sel::SelRecord;
     let db = PvDatabase::new();
@@ -6183,7 +6182,7 @@ async fn test_sel_nvl_link() {
 // SELN is DBF_USHORT (selRecord.dbd.pod:295): an NVL link value in the
 // upper unsigned half (32768..65535) must reach SELN intact. The former
 // f64->i16 carrier saturated such a value to 32767, losing the high half.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sel_nvl_link_high_index_unsigned() {
     use epics_base_rs::server::records::sel::SelRecord;
     let db = PvDatabase::new();
@@ -6205,7 +6204,7 @@ async fn test_sel_nvl_link_high_index_unsigned() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dol_cp_link_registration() {
     let db = PvDatabase::new();
     db.add_record("MTR", Box::new(AoRecord::new(0.0)))
@@ -6222,7 +6221,7 @@ async fn test_dol_cp_link_registration() {
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dol_cp_link_triggers_processing() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
@@ -6252,7 +6251,7 @@ async fn test_dol_cp_link_triggers_processing() {
 /// which — since the holder *writes* that target — is a processing loop that
 /// does not exist on a C IOC. The same text on an `INP` (`DBF_INLINK`) does
 /// register, which is the boundary this pins.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     let db = PvDatabase::new();
     db.add_record("CPOUT_TGT", Box::new(AoRecord::new(0.0)))
@@ -6302,7 +6301,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
 
 /// A CPP link registers as `passive_only` (distinct from CP). Collapsing
 /// CPP into CP loses C's `precord->scan == 0` gate (`dbCa.c:994`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cpp_link_registration_is_passive_only() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(0.0)))
@@ -6326,7 +6325,7 @@ async fn test_cpp_link_registration_is_passive_only() {
 /// processes the link-holder only when its SCAN is Passive. A non-Passive
 /// CPP target must NOT be processed by the dispatch — its own periodic scan
 /// owns it. Boundary: target SCAN != Passive.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cpp_link_skips_nonpassive_target() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
@@ -6356,7 +6355,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
 
 /// CPP gate, complementary boundary: a CPP link DOES process the link-holder
 /// when its SCAN is Passive (the default). Boundary: target SCAN == Passive.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cpp_link_processes_passive_target() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
@@ -6385,7 +6384,7 @@ async fn test_cpp_link_processes_passive_target() {
 /// CP (not CPP) processes the link-holder regardless of its SCAN
 /// (`dbCa.c:993` adds CA_DBPROCESS unconditionally). A non-Passive CP target
 /// IS processed — the boundary that distinguishes CP from CPP.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cp_link_processes_nonpassive_target() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
@@ -6416,7 +6415,7 @@ async fn test_cp_link_processes_nonpassive_target() {
 /// When the same source→target edge is registered from both a CP and a CPP
 /// link, CP dominates: the merged edge is NOT passive_only — an
 /// unconditional CP CA_DBPROCESS overrides the CPP scan gate (`dbCa.c:993`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_cp_overrides_cpp_for_same_edge() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(0.0)))
@@ -6444,7 +6443,7 @@ async fn test_cp_overrides_cpp_for_same_edge() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_dol_cp_link_registration() {
     use epics_base_rs::server::records::seq::SeqRecord;
     let db = PvDatabase::new();
@@ -6461,7 +6460,7 @@ async fn test_seq_dol_cp_link_registration() {
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sel_nvl_cp_link_registration() {
     use epics_base_rs::server::records::sel::SelRecord;
     let db = PvDatabase::new();
@@ -6478,7 +6477,7 @@ async fn test_sel_nvl_cp_link_registration() {
     assert!(!targets[0].passive_only, "CP link must not be passive_only");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sdis_cp_link_registration() {
     let db = PvDatabase::new();
     db.add_record("DISABLE_SRC", Box::new(AoRecord::new(0.0)))
@@ -6508,7 +6507,7 @@ async fn test_sdis_cp_link_registration() {
 /// "device-provided with BestTime fallback" and gated the call on
 /// UNIX_EPOCH. A stale device write of any non-epoch SystemTime
 /// suppressed every subsequent BestTime refresh.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tse_minus1_always_overwrites_via_best_time() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -6535,7 +6534,7 @@ async fn test_tse_minus1_always_overwrites_via_best_time() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tse_minus2_keeps_time_unchanged() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -6556,7 +6555,7 @@ async fn test_tse_minus2_keeps_time_unchanged() {
     assert_eq!(inst.common.time, fixed_time);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_putf_read_only_from_ca() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -6568,7 +6567,7 @@ async fn test_putf_read_only_from_ca() {
     assert!(result.is_err());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_rpro_causes_reprocessing() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AoRecord::new(10.0)))
@@ -6607,7 +6606,7 @@ async fn test_rpro_causes_reprocessing() {
     assert!(inst.common.rpro == 0);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tsel_cp_link_registration() {
     let db = PvDatabase::new();
     db.add_record("TSE_SRC", Box::new(AoRecord::new(0.0)))
@@ -6634,7 +6633,7 @@ async fn test_tsel_cp_link_registration() {
 /// both through `dbGetTimeStampTag(plink, &prec->time, &prec->utag)`.
 /// Pre-fix only `common.time` was copied and the source's `utag` was
 /// dropped.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tsel_time_link_copies_source_time_and_utag() {
     let db = PvDatabase::new();
     db.add_record("TSE_SRC", Box::new(AoRecord::new(0.0)))
@@ -6685,7 +6684,7 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tsel_ca_time_link_copies_source_time() {
     // C `TSEL_modified` (dbLink.c:80-86) sets DBLINK_FLAG_TSELisTIME for
     // ANY PV_LINK TSEL whose pvname contains `.TIME`, set before the
@@ -6753,7 +6752,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     // A bare TSEL `.TIME` link (no `ca://`, no CP/CPP/CA modifier) whose
     // target record is NOT local. C `dbInitLink` (dbLink.c:115-130) sets
@@ -6825,7 +6824,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_new_common_fields_get_put() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -6913,7 +6912,7 @@ async fn test_new_common_fields_get_put() {
 /// answers `10`; the recGbl simulation helpers bail on `*psscn == USHRT_MAX`
 /// (recGbl.c) and on nothing else, so 12 is an ordinary illegal index, not
 /// "unset".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_sscn_serves_menu_index_and_65535_sentinel() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))
@@ -6975,7 +6974,7 @@ async fn test_sscn_serves_menu_index_and_65535_sentinel() {
 /// `notify_from_snapshot`. This test pins that contract for all four
 /// `ArrayKind` variants by subscribing to NORD, processing once, and
 /// verifying the delivered MonitorEvent timestamp is fresh.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
@@ -7075,7 +7074,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
 ///
 /// This test pins the post-fix behaviour for both halves of the gate:
 /// (a) unchanged → no event; (b) changed → event flows through.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_complete_async_record_gates_subscribed_field_on_change() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
@@ -7165,7 +7164,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
 /// This test pins the behaviour for waveform; the same code path
 /// applies to aai/aao/subArray since they share the WaveformRecord
 /// implementation.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
@@ -7261,7 +7260,7 @@ async fn test_put_pv_and_post_propagates_nord_side_effect_on_waveform() {
 /// downstream subscriber path (DST is an ai whose process()
 /// recomputes VAL from RVAL, washing out the put_pv side-effect)
 /// — the timestamp invariant is the load-bearing assertion here.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_output_link_cascade_uses_post_process_source_timestamp() {
     use std::time::SystemTime;
 
@@ -7348,7 +7347,7 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
 /// carry a timestamp ≥ the post-sleep wall-clock instant — proving
 /// the snapshot was timestamped at completion, not at process
 /// start.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_complete_async_record_updates_timestamp_at_completion() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::{DbFieldType, WallTime};
@@ -7379,7 +7378,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 
     // Sleep a measurable interval so the completion timestamp is
     // distinguishable from the process-start timestamp.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     let post_sleep = WallTime::now();
 
     // Second half: completion fires snapshot/notify with a fresh
@@ -7413,7 +7412,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 /// OOPT=1 must drive write_db_link_value (observed via the target
 /// record's `common.time` advancing past baseline), and a second
 /// no-op process cycle must not.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     use std::time::SystemTime;
@@ -7471,7 +7470,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     // off. Capture DST's time before to detect any unwanted
     // re-process.
     let dst_time_before_second = dst_time_after_first;
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     let mut visited = HashSet::new();
     db.process_record_with_links("LO_SRC", &mut visited, 0)
         .await
@@ -7509,7 +7508,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
 /// process exactly once per `process_record_with_links` call and the
 /// call must complete promptly (we use a 1s timeout to fail fast on
 /// infinite recursion regressions).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_self_link_out_does_not_loop() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     use std::time::Duration;
@@ -7532,7 +7531,7 @@ async fn test_self_link_out_does_not_loop() {
     // process call would never return (infinite recursion via
     // write_db_link_value → process_record_with_links → ...).
     let mut visited = HashSet::new();
-    let result = tokio::time::timeout(
+    let result = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
         db.process_record_with_links("SELF_LO", &mut visited, 0),
     )
@@ -7553,7 +7552,7 @@ async fn test_self_link_out_does_not_loop() {
     // been left set on the record, otherwise the record would
     // reprocess in a loop after every external put.
     let mut visited2 = HashSet::new();
-    let result2 = tokio::time::timeout(
+    let result2 = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
         db.process_record_with_links("SELF_LO", &mut visited2, 0),
     )
@@ -7590,7 +7589,7 @@ async fn test_self_link_out_does_not_loop() {
 /// `process_record_with_links_inner`, whose snapshot path includes
 /// VAL via the always-on `include_val` branch for non-deadband
 /// records, so the VAL subscriber sees the post-reset empty array.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_compress_res_write_posts_val_monitor() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::compress::CompressRecord;
@@ -7674,7 +7673,7 @@ async fn test_compress_res_write_posts_val_monitor() {
 ///
 /// Pre-fix the port reset only on RES, so a BALG FIFO→LIFO switch re-read the
 /// stale ring in the new order and an N put corrupted the next emitted sample.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_compress_every_spc_reset_field_resets_the_buffer() {
     use epics_base_rs::server::records::compress::CompressRecord;
 
@@ -7747,7 +7746,7 @@ async fn test_compress_every_spc_reset_field_resets_the_buffer() {
 /// while the same put under BALG=FIFO succeeds. The port expressed NOMOD only
 /// as the static `FieldDesc::read_only`, which cannot depend on record state,
 /// so a LIFO compress accepted VAL puts.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_compress_val_no_mod_under_lifo_balg() {
     use epics_base_rs::server::records::compress::CompressRecord;
 
@@ -7806,7 +7805,7 @@ async fn test_compress_val_no_mod_under_lifo_balg() {
 ///
 /// Pre-fix the port accepted the put on every route, so a caput silently
 /// stopped a live acquisition.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_histogram_csta_is_no_mod() {
     use epics_base_rs::server::records::histogram::HistogramRecord;
 
@@ -7866,7 +7865,7 @@ async fn test_histogram_csta_is_no_mod() {
 /// dbpf LO2.VAL 70000.9 -> 70000     dbpf LO2.VAL -3.9 -> -3   (port agrees:
 ///                                   in range, no policy in play)
 /// ```
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -7943,7 +7942,7 @@ async fn test_double_to_int_narrowing_saturates_per_cbug_e2() {
 /// MDEL can hold every process-time post back indefinitely (`monitor()` posts
 /// only when `mcnt > mdel`), so without the watchdog a slow accumulation never
 /// reaches a display. Pre-fix an SDEL put stored the number and nothing else.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_histogram_sdel_watchdog_posts_val() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::histogram::HistogramRecord;
@@ -7974,10 +7973,11 @@ async fn test_histogram_sdel_watchdog_posts_val() {
         .unwrap();
 
     // The tick must post VAL and zero MCNT.
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-        .await
-        .expect("SDEL watchdog must post VAL within one period")
-        .expect("subscription alive");
+    let event =
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+            .await
+            .expect("SDEL watchdog must post VAL within one period")
+            .expect("subscription alive");
     match &event.snapshot.value {
         EpicsValue::ULongArray(v) => assert_eq!(
             v,
@@ -7996,10 +7996,11 @@ async fn test_histogram_sdel_watchdog_posts_val() {
     db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(6.0))
         .await
         .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-        .await
-        .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
-        .expect("subscription alive");
+    let event =
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
+            .await
+            .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
+            .expect("subscription alive");
     match &event.snapshot.value {
         EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
         other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
@@ -8024,7 +8025,7 @@ async fn test_histogram_sdel_watchdog_posts_val() {
 /// ```
 ///
 /// Both fields were absent from the port, so a caget on either failed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_compress_ouse_and_inpn_fields() {
     use epics_base_rs::server::records::compress::CompressRecord;
 
@@ -8111,7 +8112,7 @@ async fn test_compress_ouse_and_inpn_fields() {
 /// `common.udf`. We exercise the bits-set / undefined branch
 /// directly via the trait method since the full IocBuilder pipeline
 /// pulls in many unrelated pieces.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     use epics_base_rs::server::record::Record;
     use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
@@ -8155,7 +8156,7 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
 /// fetching each input PV and binding A..L slots, and timestamp
 /// passthrough from the chosen input is available via
 /// `evaluate_calc_link_with_time`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
     use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
     use epics_base_rs::server::records::ai::AiRecord;
@@ -8239,7 +8240,7 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
 /// whole evaluation return `None` and the time fell back to the
 /// consumer's own. Sibling of the non-local Db read / OUT-write / TSEL
 /// `.TIME` fixes — same `dbInitLink` locality cause, the lnkCalc inputs.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     use epics_base_rs::server::database::LinkSet;
     use epics_base_rs::server::record::CalcLink;
@@ -8316,7 +8317,7 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
 ///
 /// With `shft = 4` and no state table, `convert()` yields
 /// `RVAL = VAL << 4`. A CA put of VAL=3 must produce RVAL=ORAW=48.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ca_put_mbbo_val_recomputes_rval() {
     use epics_base_rs::server::records::mbbo::MbboRecord;
 
@@ -8360,7 +8361,7 @@ async fn test_ca_put_mbbo_val_recomputes_rval() {
 /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
 /// unconditionally. With `shft = 4`, `convert()` yields
 /// `RVAL = VAL << 4`. A CA put of VAL=5 must produce RVAL=ORAW=80.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
     use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
 
@@ -8394,7 +8395,7 @@ async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
 /// (`aiRecord.c:168`). The pre-fix Rust port returned early from
 /// `check_simulation_mode`, so FLNK / CP / RPRO were skipped — every
 /// link chain downstream of a SIMM-mode record silently broke.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_simulation_mode_still_fires_forward_link() {
     let db = PvDatabase::new();
     db.add_record("SIM:SRC", Box::new(AoRecord::new(11.0)))
@@ -8437,7 +8438,7 @@ async fn test_simulation_mode_still_fires_forward_link() {
 /// `dbGetLink(&prec->siol, DBR_ULONG, &prec->sval)`. Pre-fix the Rust
 /// `is_input` set omitted `mbbi`, so a simulated mbbi fell into the
 /// OUTPUT branch and wrote its own VAL out to the SIOL target.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_simulated_mbbi_reads_siol_not_writes_it() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
 
@@ -8484,7 +8485,7 @@ async fn test_simulated_mbbi_reads_siol_not_writes_it() {
 /// synchronous `process_record_with_links_inner`). An FLNK chain that
 /// loops back (A -> FLNK -> B -> FLNK -> A) must terminate, not
 /// re-enter A unbounded.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_async_completion_flnk_cycle_terminates() {
     let db = PvDatabase::new();
     db.add_record("ACYC:A", Box::new(AoRecord::new(0.0)))
@@ -8518,7 +8519,7 @@ async fn test_async_completion_flnk_cycle_terminates() {
 /// of every `process()`. Pre-fix `dispatch_multi_output` read SELN
 /// directly from the field and never followed SELL, so a SELL link
 /// pointing at another record never updated the selection.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fanout_resolves_sell_link_into_seln() {
     use epics_base_rs::server::records::fanout::FanoutRecord;
 
@@ -8578,7 +8579,7 @@ async fn test_fanout_resolves_sell_link_into_seln() {
 /// for all three unconditionally, so an All-mode seq spuriously updated SELN
 /// (and would post a SELN monitor) from a live SELL link. Boundary test: All
 /// freezes SELN, Specified refreshes it, with the same live SELL link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
     use epics_base_rs::server::records::seq::SeqRecord;
 
@@ -8644,7 +8645,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
 /// hand-coded 0. Observable in SELM=Specified/Mask when the .db omits SELN
 /// (All ignores SELN). dfanout's Specified output is `seln - 1`, so 0 would
 /// drive nothing where C drives OUTA.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_fanout_dfanout_seq_seln_default_is_one() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
     use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -8679,7 +8680,7 @@ async fn test_fanout_dfanout_seq_seln_default_is_one() {
 /// fields — softIoc refuses `caput N1.ACKS 2` with "Write access denied".
 /// The handlers moved to `RecordInstance::put_acks` / `put_ackt`; the
 /// semantics asserted here are unchanged.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
     // putAcks: acks must be cleared when the written severity is >=
     // the STORED acks, even after sevr has dropped below it.
@@ -8738,7 +8739,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
 /// value is written to the target but the target is NOT processed.
 /// C `dbDbPutValue` (dbDbLink.c:386-389) calls `processTarget` only
 /// when the link carries an explicit `PP` flag (or writes `.PROC`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_bare_out_link_does_not_process_target() {
     let db = PvDatabase::new();
     db.add_record("SRC_OUT", Box::new(AoRecord::new(33.0)))
@@ -8777,7 +8778,7 @@ async fn test_bare_out_link_does_not_process_target() {
 /// BUG 2 regression (positive case) — an OUT link with an explicit
 /// `PP` token DOES process a Passive target, mirroring C
 /// `dbDbPutValue` `pvlOptPP` branch.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_pp_out_link_processes_passive_target() {
     let db = PvDatabase::new();
     db.add_record("SRC_PP", Box::new(AoRecord::new(44.0)))
@@ -8824,7 +8825,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
     let db2 = db.clone();
     let processed = Arc::new(AtomicU32::new(0));
     let processed2 = processed.clone();
-    let h = tokio::spawn(async move {
+    let h = epics_base_rs::runtime::task::spawn(async move {
         // Foreign full-processing entry — must block on the gate the
         // epoch holds.
         let mut visited = HashSet::new();
@@ -8835,7 +8836,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
     });
 
     // Give the spawned task time to reach (and block on) the gate.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         processed.load(Ordering::SeqCst),
         0,
@@ -8896,7 +8897,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
 /// in between. Verified to fail when the tail is deferred out of the window
 /// (`tokio::spawn`ing the `update_scan_index` call makes this and the PHAS
 /// test below fail while the epoch test still passes).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scan_move_is_committed_when_put_pv_returns() {
     let db = PvDatabase::new();
     db.add_record("SIW_SCAN", Box::new(AoRecord::new(0.0)))
@@ -8932,7 +8933,7 @@ async fn scan_move_is_committed_when_put_pv_returns() {
 /// Boundary: `CommonFieldPutResult::PhasChanged`. A PHAS put reorders the
 /// bucket rather than moving the record between buckets, and that reorder
 /// is likewise complete when `put_pv` returns.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn phas_reorder_is_committed_when_put_pv_returns() {
     let db = PvDatabase::new();
     for name in ["SIW_PHAS_A", "SIW_PHAS_B"] {
@@ -8987,14 +8988,14 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
     let db2 = db.clone();
     let done = Arc::new(AtomicU32::new(0));
     let done2 = done.clone();
-    let h = tokio::spawn(async move {
+    let h = epics_base_rs::runtime::task::spawn(async move {
         db2.put_pv("SIW_EPOCH.SCAN", EpicsValue::String("1 second".into()))
             .await
             .unwrap();
         done2.store(1, Ordering::SeqCst);
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         done.load(Ordering::SeqCst),
         0,
@@ -9026,7 +9027,7 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
 /// * MS   → max severity, STAT = LINK_ALARM (remote stat NOT preserved)
 /// * MSI  → propagate only when remote sevr == INVALID
 /// * MSS  → max severity AND remote STAT preserved (the cited gap)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     use epics_base_rs::server::database::LinkSet;
     use epics_base_rs::server::recgbl::alarm_status;
@@ -9149,7 +9150,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
 // (lsiRecord.c:217-220). This test drives an unchanged cycle through
 // the link-processing path and asserts the VALUE event fires only when
 // MPST is Always.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::lsi::LsiRecord;
@@ -9208,7 +9209,7 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
 /// every `process()`. Before the fix the main engine called
 /// `record.process()` (a no-op for `sub`) without invoking the framework's
 /// `SubroutineFn`, so VAL never updated when the record was scanned.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sub_record_subroutine_runs_on_main_engine_path() {
     use epics_base_rs::server::records::sub_record::SubRecord;
 
@@ -9260,7 +9261,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
 /// is the standard analog limit check; the Rust port previously gave `sub`
 /// no limit fields and skipped the analog-alarm owner entirely, so a `sub`
 /// whose subroutine drove VAL past HIHI never alarmed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sub_record_hihi_alarm_fires_via_shared_owner() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::sub_record::SubRecord;
@@ -9340,7 +9341,7 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
 /// previously carried no MDEL/MLST, so the deadband owner saw
 /// `mdel=0` and posted on every change. MLST tracks the last posted value,
 /// so it is the observable witness of the deadband decision.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sub_record_mdel_gates_val_monitor() {
     use epics_base_rs::server::records::sub_record::SubRecord;
 
@@ -9391,7 +9392,7 @@ async fn sub_record_mdel_gates_val_monitor() {
 /// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The earlier `SubroutineFn`
 /// returned `CaResult<()>`, so a subroutine could not signal an error and
 /// no SOFT_ALARM was ever raised.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::sub_record::SubRecord;
@@ -9452,7 +9453,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
 /// An `aSub` publishes the subroutine's return status as VAL (C
 /// `aSubRecord.c:223` `prec->val = status`), overwriting whatever the
 /// closure wrote to VAL, and a negative status raises SOFT_ALARM at BRSV.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::asub_record::ASubRecord;
@@ -9529,7 +9530,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
 /// `aSubRecord.c::monitor`): NEVER suppresses it, ON CHANGE (default) posts on
 /// change, ALWAYS posts every process even when unchanged. Exercised through
 /// the real foreign-process monitor path (`process_record` -> `process_local`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_eflg_gates_valx_output_monitor_posting() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::asub_record::ASubRecord;
@@ -9606,7 +9607,7 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
 /// process and re-resolves the function from the registry when it changed
 /// (C `aSubRecord.c::fetch_values`). A name not in the registry is C
 /// `S_db_BadSub`: the subroutine is not run (VAL frozen), ONAM kept for retry.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
     use epics_base_rs::server::records::asub_record::ASubRecord;
     use epics_base_rs::server::records::stringout::StringoutRecord;
@@ -9721,7 +9722,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
 /// aSub `LFLG=IGNORE` (the default) resolves its subroutine from SNAM once at
 /// init via the function registry (C `aSubRecord.c::init_record` ->
 /// `registryFunctionFind`), wired by `wire_subroutines` on the `.db` path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_lflg_ignore_subroutine_wired_by_snam_at_init() {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use std::collections::HashMap;
@@ -9757,7 +9758,7 @@ record(aSub, "ASUB_S") {
 /// `sub` and `aSub` INAM init routine: resolved through the function registry
 /// and invoked exactly once at init, before SNAM resolution, return discarded
 /// (C `subRecord.c` / `aSubRecord.c::init_record`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn inam_init_routine_runs_once_at_init_for_sub_and_asub() {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use std::collections::HashMap;
@@ -9838,7 +9839,7 @@ record(aSub, "ASUB_INIT") {
 /// The public direct-process API `process_record` re-resolves aSub LFLG=READ:
 /// it delegates to the canonical engine path, so a direct process re-reads the
 /// SUBL link, swaps the subroutine, and skips a bad sub like any other process.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     use epics_base_rs::server::records::asub_record::ASubRecord;
     use epics_base_rs::server::records::stringout::StringoutRecord;
@@ -9915,7 +9916,7 @@ async fn asub_lflg_read_reresolves_on_foreign_process_path() {
 /// `*pvalue += prec->val`, discarding any client caput to VAL during a
 /// DOL-driven cycle. The Rust port previously incremented from the current
 /// VAL, so a caput between cycles shifted every subsequent increment.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     let db = PvDatabase::new();
 
@@ -9979,7 +9980,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
 /// re-applied every cycle. Before the fix, both the framework
 /// (`read_link_value` resolving a constant) and `ao::process` re-stamped the
 /// constant each cycle, clobbering the caput. Record-level-removal path (ao).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     let db = PvDatabase::new();
     let mut ao = AoRecord::new(0.0);
@@ -10031,7 +10032,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
 /// `else { value = prec->val; }` branch, so the OIF mode is irrelevant. The
 /// value tracks VAL (init constant, or a later caput) and never accumulates
 /// the constant each cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ao_constant_dol_incremental_does_not_increment() {
     let db = PvDatabase::new();
     let mut ao = AoRecord::new(0.0);
@@ -10061,7 +10062,7 @@ async fn ao_constant_dol_incremental_does_not_increment() {
 /// `longout::init_record` seeds the constant once; the gate keeps it out of
 /// process. Before the fix, the framework re-applied the constant every
 /// cycle, clobbering a caput.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     let db = PvDatabase::new();
@@ -10104,7 +10105,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
 /// (`dbParseLink`, dbStaticLib.c:2346-2349). A quoted `"hi"` is not: softIoc
 /// makes `field(DOL,"\"hi\"")` a `CA_LINK "hi" NPP NMS` and leaves VAL empty /
 /// UDF=1, so this test used to encode a link type C does not have.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
     use epics_base_rs::server::records::stringout::StringoutRecord;
     let db = PvDatabase::new();
@@ -10142,7 +10143,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
 /// gained an `init_record`/`post_init` seed. One assertion per record's
 /// value-type boundary (f64 / i64 / long-string / state-index→RVAL /
 /// bit-field decomposition).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn init_applies_constant_dol_across_record_types() {
     use epics_base_rs::server::records::dfanout::DfanoutRecord;
     use epics_base_rs::server::records::int64out::Int64outRecord;
@@ -10262,7 +10263,7 @@ async fn init_applies_constant_dol_across_record_types() {
 /// NOT process on the delaying cycle; it processes exactly once on the
 /// delayed cycle. Before the fix the delaying cycle ran the full Complete
 /// snapshot + FLNK tail, firing the forward link twice (delaying + delayed).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     use epics_base_rs::server::records::calc::CalcRecord;
     use epics_base_rs::server::records::calcout::CalcoutRecord;
@@ -10330,7 +10331,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
 // only INP[SELN] is read; the other input links are never fetched, so
 // their PP sources are never processed. A non-selected PP source that
 // computes 42-on-process must therefore stay at its default 0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sel_specified_mode_fetches_only_the_selected_input() {
     use epics_base_rs::server::records::calc::CalcRecord;
     use epics_base_rs::server::records::sel::SelRecord;
@@ -10392,7 +10393,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
 
 // Control for the above: in High mode (SELM==1) C fetch_values reads
 // EVERY input to compare them, so all PP sources are processed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sel_high_mode_fetches_all_inputs() {
     use epics_base_rs::server::records::calc::CalcRecord;
     use epics_base_rs::server::records::sel::SelRecord;
@@ -10452,7 +10453,7 @@ async fn sel_high_mode_fetches_all_inputs() {
 // failure, so do_sel is skipped and VAL — set to 5.0 on a prior cycle —
 // freezes. Pre-fix do_sel ran over the NaN-initialised A field and VAL
 // became NaN.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
     use epics_base_rs::server::records::sel::SelRecord;
 
@@ -10484,7 +10485,7 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
 // skipped. Here NVL points at a non-existent record while INPA holds a
 // valid source (3.0). Pre-fix Rust fell back to the stale SELN, fetched
 // INPA, and recomputed VAL=3.0; post-fix VAL freezes at 7.0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     use epics_base_rs::server::records::sel::SelRecord;
 
@@ -10521,7 +10522,7 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
 // and reads the NaN-initialised A field → VAL=NaN. This must NOT freeze
 // (contrast the broken-link case), proving the gate keys on
 // configured-but-unresolved, not merely unresolved.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
     use epics_base_rs::server::records::sel::SelRecord;
 
@@ -10559,7 +10560,7 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
 ///   - `compress.NSAM`   — `promptgroup special(SPC_NOMOD)`: load resizes buffer.
 ///   - `subArray.MALM`   — `special(SPC_NOMOD)`: load sets, runtime rejects.
 ///   - `subArray.INDX`   — `pp(TRUE)`: load AND runtime set.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     use epics_base_rs::server::db_loader::{apply_fields, create_record};
 
@@ -10658,7 +10659,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
 ///   - subArray NELM: `pp(TRUE)` -> runtime-writable; subArray FTVL: SPC_NOMOD.
 /// Load (apply_fields) stays settable for all of them (SPC_NOMOD blocks only
 /// runtime dbPutField).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
     use epics_base_rs::server::db_loader::{apply_fields, create_record};
 
@@ -10757,7 +10758,7 @@ fn asub_ftype_menu_fields_load_by_label() {
 /// subscriber must therefore receive no change update even though
 /// `process()` updates both trackers every cycle — while VAL and WFLG must
 /// still post on change.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_permissive_oval_oflg_not_monitor_posted() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::permissive::PermissiveRecord;
@@ -10822,7 +10823,7 @@ async fn test_permissive_oval_oflg_not_monitor_posted() {
 /// from the generic subscribed-field change loop via `event_posted_fields()`,
 /// so a `.OVAL` subscriber receives no change update even though `process()`
 /// copies VAL into OVAL on change — while VAL must still post on change.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_state_oval_not_monitor_posted() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::state::StateRecord;
@@ -10878,7 +10879,7 @@ async fn test_state_oval_not_monitor_posted() {
 /// value against the pre-put one, found it "changed", and published a SECOND
 /// event that C never sends. `SVAL` (ai simulation value) is the sample: a
 /// plain, non-`pp(TRUE)`, non-metadata auxiliary field.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_put_time_post_is_the_only_post_for_that_put() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;

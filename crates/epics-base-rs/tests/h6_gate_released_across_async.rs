@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(4): multi-thread-flavored tokio tests (the gate contention needs real parallel workers); run and pass in the feature-ON suite.
 //! H6 boundaries: the L1 record gate is NOT held across an asynchronous wait.
 //!
 //! C `dbProcess` never blocks under `dbScanLock`. On async device support it
@@ -18,8 +19,6 @@
 //!    the gate is free while the delay runs;
 //! 3. the completion re-entry RE-TAKES the gate, so it serialises against a
 //!    concurrent holder rather than racing it.
-
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -114,9 +113,9 @@ async fn async_pending_record_does_not_hold_the_gate() {
 /// owned, which is the assertion these tests make.
 async fn probe_gate_is_free(db: &PvDatabase, record: &'static str) -> Result<(), &'static str> {
     let db = db.clone();
-    tokio::time::timeout(
+    epics_base_rs::runtime::task::timeout(
         Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || drop(db.lock_record(record))),
+        epics_base_rs::runtime::task::spawn_blocking(move || drop(db.lock_record(record))),
     )
     .await
     .map_err(|_| "gate still held")?
@@ -142,7 +141,7 @@ async fn a_put_during_the_async_window_is_not_gate_blocked() {
 
     // The plain `dbPutField` analogue (no put-notify wait-set — C builds one
     // only in `dbPutNotify`).
-    tokio::time::timeout(
+    epics_base_rs::runtime::task::timeout(
         Duration::from_secs(5),
         db.put_record_field_from_ca_no_notify("H6:ASYNC2", "VAL", EpicsValue::Double(3.0)),
     )
@@ -238,7 +237,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
         db.get_record("H6:SEQTGT")
@@ -254,7 +253,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         if !db.get_record("H6:SEQ").unwrap().read().is_processing() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         !db.get_record("H6:SEQ").unwrap().read().is_processing(),
@@ -299,12 +298,12 @@ async fn the_async_completion_waits_for_the_gate() {
     let db2 = db.clone();
     let completed = Arc::new(AtomicU32::new(0));
     let completed2 = completed.clone();
-    let h = tokio::spawn(async move {
+    let h = epics_base_rs::runtime::task::spawn(async move {
         db2.complete_async_record("H6:CMPL").await.unwrap();
         completed2.store(1, Ordering::SeqCst);
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         completed.load(Ordering::SeqCst),
         0,
@@ -313,7 +312,7 @@ async fn the_async_completion_waits_for_the_gate() {
 
     drop(release_tx);
     holder.join().expect("epoch holder thread");
-    tokio::time::timeout(Duration::from_secs(5), h)
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(5), h)
         .await
         .expect("the completion must run once the gate is released")
         .unwrap();

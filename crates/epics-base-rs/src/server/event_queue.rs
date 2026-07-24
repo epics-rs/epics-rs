@@ -77,8 +77,6 @@
 //!   its last delivery (pre-existing deliberate deviation, 446e0d4a); the
 //!   surviving *value* is C's.
 
-// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -745,7 +743,7 @@ mod tests {
     /// Boundary `npend == 0`: C appends (`dbEvent.c:832-852`) — there is no last
     /// log to replace — even under flow control, and flags the ring's
     /// empty→non-empty transition (C `firstEventFlag`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn npend_zero_appends_even_under_flow_control() {
         let user = EventUser::new();
         user.flow_ctrl_on();
@@ -765,7 +763,7 @@ mod tests {
     /// Boundary `npend > 0` with flow control ON: C replaces `*pLastLog` in
     /// place (`dbEvent.c:812-820`). The queue does not grow and no duplicate is
     /// created — which is exactly why the reader stays suspended.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn npend_positive_under_flow_control_replaces_in_place() {
         let user = EventUser::new();
         user.flow_ctrl_on();
@@ -788,7 +786,7 @@ mod tests {
     /// Boundary `npend > 0`, flow control OFF, ring space ABOVE the threshold:
     /// C appends (`dbEvent.c:832-852`), so distinct updates each get their own
     /// entry and each is delivered.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ring_space_above_threshold_appends_distinct_entries() {
         let user = EventUser::new();
         let (sink, mut reader) = attach(&user, 1);
@@ -808,7 +806,7 @@ mod tests {
     /// {earlier distinct backlog…, coalesced tail}. The old primitive parked the
     /// newest event in a side slot and the consumer then discarded the whole
     /// backlog, delivering only the newest.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ring_space_at_threshold_replaces_only_the_last_entry() {
         let user = EventUser::new();
         let (sink, mut reader) = attach(&user, 1);
@@ -843,7 +841,7 @@ mod tests {
     /// reader: a subscription torn down with entries still queued (C
     /// `event_remove` per entry, `dbEvent.c:542-558`). Teardown drains through
     /// the same accounting the reader uses, so the counters cannot drift.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn detach_with_queued_entries_keeps_the_duplicate_count_symmetric() {
         let user = EventUser::new();
         let (sink, reader) = attach(&user, 1);
@@ -864,7 +862,7 @@ mod tests {
     /// Producer gone with entries still queued: the reader drains them and only
     /// then sees end-of-stream — the `mpsc` contract every consumer was written
     /// against.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn producer_drop_drains_then_ends_the_stream() {
         let user = EventUser::new();
         let (sink, mut reader) = attach(&user, 1);
@@ -880,7 +878,7 @@ mod tests {
     /// A reader suspended by EVENTS_OFF wakes on EVENTS_ON without needing a
     /// further post (C signals `ppendsem` from `db_event_flow_ctrl_mode_off`).
     /// A lost wake here would strand the monitor for good.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn flow_ctrl_off_wakes_a_suspended_reader() {
         let user = Arc::new(EventUser::new());
         user.flow_ctrl_on();
@@ -888,11 +886,11 @@ mod tests {
         sink.post(ev(1));
         sink.post(ev(2)); // replaces in place: still one entry, no duplicate
         let u2 = user.clone();
-        let waker = tokio::spawn(async move {
-            tokio::task::yield_now().await;
+        let waker = crate::runtime::task::spawn(async move {
+            crate::runtime::task::yield_now().await;
             u2.flow_ctrl_off();
         });
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(2), reader.recv())
             .await
             .expect("EVENTS_ON must wake the suspended reader")
             .expect("the held entry is delivered");
@@ -908,7 +906,7 @@ mod tests {
     ///
     /// The per-subscription queues this replaced evaluated the gate per monitor,
     /// so A stayed suspended until EVENTS_ON.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn duplicate_on_a_sibling_subscription_releases_the_events_off_drain() {
         let user = EventUser::new();
         let (sink_a, mut reader_a) = attach(&user, 1);
@@ -924,7 +922,7 @@ mod tests {
         assert_eq!(reader_a.queue().n_duplicates(), 1);
 
         user.flow_ctrl_on();
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), reader_a.recv())
+        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(2), reader_a.recv())
             .await
             .expect("a duplicate anywhere on the queue must release the drain")
             .expect("A's entry is delivered");
@@ -934,7 +932,7 @@ mod tests {
     /// The complement of the boundary above — EVENTS_OFF with the queue holding
     /// NO duplicate on any subscription: every reader on it suspends, and
     /// EVENTS_ON releases them all.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn flow_control_without_duplicates_suspends_every_reader_on_the_queue() {
         let user = EventUser::new();
         user.flow_ctrl_on();
@@ -953,7 +951,7 @@ mod tests {
     /// Boundary `quota == size - EVENT_ENTRIES`: C chains a new queue rather than
     /// overbooking the ring (`dbEvent.c:446-469`), so a circuit's monitors past
     /// the cap share a *different* `nDuplicates`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn quota_exhaustion_chains_a_second_queue() {
         let user = EventUser::new();
         let cap = event_que_size() / EVENT_ENTRIES - 1;
@@ -978,7 +976,7 @@ mod tests {
     /// C releases the cancelled monitor's quota (`dbEvent.c:999-1002`), so the
     /// freed slot is reusable — the next attach lands back on the first queue
     /// instead of chaining forever.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn detaching_a_monitor_releases_its_quota() {
         let user = EventUser::new();
         let cap = event_que_size() / EVENT_ENTRIES - 1;
@@ -996,7 +994,7 @@ mod tests {
 
     /// Teardown symmetry on a SHARED queue: cancelling one monitor removes only
     /// its own duplicates from the queue-level count; its sibling's stay.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn detaching_one_monitor_leaves_a_siblings_duplicates_counted() {
         let user = EventUser::new();
         let (sink_a, reader_a) = attach(&user, 1);

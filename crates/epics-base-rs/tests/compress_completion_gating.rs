@@ -12,8 +12,6 @@
 //! compress with N=4, fed one sample per cycle, must fire its FLNK exactly
 //! once over four cycles — on the 4th, when the average is emitted.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -23,7 +21,7 @@ use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::compress::CompressRecord;
 use epics_base_rs::types::EpicsValue;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
     let db = Arc::new(PvDatabase::new());
 

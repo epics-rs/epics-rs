@@ -22,8 +22,6 @@
 //! `caput`, `acf_deny`, `subscribe`, `unsubscribe`. Keep additions
 //! strictly additive — downstream log shippers parse the JSON.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -412,7 +410,7 @@ mod tests {
     /// Boundary sweep over the fields, and over both renderers, because the
     /// framing is applied at the sink and must therefore hold for whichever
     /// one is configured.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn no_wire_field_can_forge_a_second_audit_record() {
         const FORGE: &str = "x\n04/09/2026 09:00:00 ASUSER W root@localhost caput: SAFETY:ILK=0 ok";
 

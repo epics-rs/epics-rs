@@ -1,11 +1,12 @@
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 // The bound-socket UDP responder stack (`socket2` shared-port setup, the
 // `tokio::net::UdpSocket` recv loops, the `epics_base_rs::net` RX-overflow
 // helpers) is the async host-only front-end. The RTEMS build answers SEARCH
 // through `server::blocking`'s `std::net` responder, reusing only the shared
 // decode/shape logic (`SearchReplyBatch`, `parse_search_datagram`,
 // `shape_search_reply_dg`) below. Those imports are gated out for RTEMS.
+// RTEMS-EXEC-MODEL-ALLOW(2): both sites hand-build a tokio runtime to drive the
+// tokio::net UDP name-server socket. These run and pass in the
+// feature-ON suite on the tokio driver.
 #[cfg(not(target_os = "rtems"))]
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;

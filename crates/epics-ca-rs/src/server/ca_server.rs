@@ -4,8 +4,9 @@
 //! [`epics_base_rs::server::ioc_builder::IocBuilder`] and adds only
 //! CA-specific configuration (port, access security).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(2): both tests bind the server's tokio::net TCP
+// listener, which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -786,7 +787,7 @@ impl CaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
-        let handle = tokio::runtime::Handle::current();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
             .autosave_manager
@@ -801,7 +802,7 @@ impl CaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, handle);
+            let shell = iocsh::IocShell::new(db, bridge);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {

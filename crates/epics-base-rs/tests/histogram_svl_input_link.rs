@@ -25,8 +25,6 @@
 //! records over CA. Its loader rejects the INP form with
 //! `ERROR: histogram record 'H:INP' doesn't have a field 'INP'`.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;
@@ -80,7 +78,7 @@ async fn bins(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Ve
 /// SVL seeds SGNL at init and clears UDF — and does NOT bin anything (add_count
 /// runs only from `process()` / the SGNL `special()`). softIoc: `SGNL = 2.5`,
 /// `UDF = 0`, `VAL = 0 0 0 0`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_svl_seeds_sgnl_at_init_without_counting() {
     let db = build().await;
 
@@ -99,7 +97,7 @@ async fn constant_svl_seeds_sgnl_at_init_without_counting() {
 /// Each process bins the seeded SGNL once. softIoc, NELM=4 LLIM=0 ULIM=4
 /// (WDTH=1), SGNL=2.5 → bucket 2: `0 0 1 0` after one process, `0 0 2 0` after
 /// two.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_svl_bins_once_per_process() {
     let db = build().await;
 
@@ -117,7 +115,7 @@ async fn constant_svl_bins_once_per_process() {
 /// directly and never runs `special()`, so the SPC_MOD `add_count` that a SGNL
 /// *caput* triggers must not fire on the link delivery — otherwise every linked
 /// sample would be counted twice.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn real_svl_link_is_read_into_sgnl_and_binned_once_per_process() {
     let db = build().await;
 
@@ -140,7 +138,7 @@ async fn real_svl_link_is_read_into_sgnl_and_binned_once_per_process() {
 /// itself (`histogramRecord.c:334`, SPC_MOD → `add_count`) and SGNL is not
 /// `pp(TRUE)`, so no process runs and the sample is counted exactly once.
 /// softIoc: `caput H:LINK.SGNL 0.5` → `VAL` bucket 0 += 1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sgnl_caput_still_counts_through_special() {
     let db = build().await;
 
@@ -154,7 +152,7 @@ async fn sgnl_caput_still_counts_through_special() {
 /// `ERROR: histogram record 'H:INP' doesn't have a field 'INP'` and the record
 /// is inert. The port must refuse it at the same gate rather than driving the
 /// record from a field the C record type does not have.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn field_inp_is_refused_on_a_histogram() {
     let db = IocBuilder::new()
         .db_string(
@@ -202,7 +200,7 @@ record(histogram, "H:INP") {
 /// The port refused `field(INP,...)` at load and at `dbPut`, but `.INP` still
 /// resolved as a readable (empty) channel. Both routes now consult the same
 /// `declares_inp_link()` declaration.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn histogram_inp_does_not_resolve_as_a_channel() {
     let db = IocBuilder::new()
         .db_string(

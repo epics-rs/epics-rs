@@ -19,8 +19,6 @@
 //!     holds its `CON` default until the first process re-points it through
 //!     `check_alarms`.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -44,7 +42,7 @@ async fn poll_status(db: &PvDatabase, pv: &str, want: i16, label: &str) {
         {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
@@ -60,7 +58,7 @@ async fn read_status(db: &PvDatabase, pv: &str) -> i16 {
         .unwrap_or_else(|| panic!("{pv} not readable as a number"))
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_input_link_status_loc_vs_con() {
     let db = PvDatabase::new();
     // A local target so a DB input link to it resolves to LOC.
@@ -89,7 +87,7 @@ async fn calcout_input_link_status_loc_vs_con() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_input_status_reclassifies_on_special() {
     let db = PvDatabase::new();
     db.add_record("CALC_SP_TGT", Box::new(AoRecord::new(0.0)))
@@ -109,7 +107,7 @@ async fn calcout_input_status_reclassifies_on_special() {
     poll_status(&db, "CALC_SP.INCV", LOC, "INPC repointed to local → LOC").await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_outv_classifies_via_process() {
     let db = PvDatabase::new();
     db.add_record("CALC_OUT_TGT", Box::new(AoRecord::new(0.0)))
@@ -149,7 +147,7 @@ async fn calcout_outv_classifies_via_process() {
 /// common-field/init_record passes on the `.db` load path. A passive,
 /// never-processed calcout loaded with a local OUT link must therefore already
 /// report `OUTV = LOC`; one with an empty OUT link keeps its `CON` default.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_outv_classifies_at_init_via_loader() {
     let db_content = r#"
 record(ao, "INIT_OUT_TGT") {

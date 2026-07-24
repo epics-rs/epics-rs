@@ -14,8 +14,6 @@
 //! carries a `ReprocessAfter`) — so a foreign `dbProcess` during the delay
 //! bails at the PACT entry guard instead of firing the deferred OUT early.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,7 +62,7 @@ impl Record for OutProbe {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     let db = PvDatabase::new();
 
@@ -148,7 +146,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
 /// (C `aCalcoutRecord.c` execOutput line 924, reached on the continuation at
 /// line 428), NOT on the delaying cycle. A direct get of VAL during the ODLY
 /// window must still show the calc-fail value, not IVOV.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
     let db = PvDatabase::new();
 
@@ -234,7 +232,7 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
 /// the OUT write. So with Don't_drive + OOPT-fires + ODLY>0 the record still
 /// pulses DLYA and holds PACT across the delay; the OUT write simply never
 /// fires (delaying cycle or continuation).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_odly_dont_drive_still_defers() {
     let db = PvDatabase::new();
 

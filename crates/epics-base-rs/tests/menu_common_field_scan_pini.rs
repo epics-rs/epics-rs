@@ -20,8 +20,6 @@
 //! `field(SSCN,"65535")` — menuScan's out-of-range "use SCAN" sentinel — load
 //! from a `.db` while `caput REC.SSCN 65535` is refused at runtime.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{RecordInstance, ScanType, SimModeScan};
@@ -44,7 +42,7 @@ async fn scan_of(db: &PvDatabase) -> ScanType {
 
 /// menuScan's periodic choices are spelled `".5 second"` — with no leading
 /// zero. The `"0.5 second"` alias is not a menuScan choice in any C release.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn invented_scan_aliases_are_rejected() {
     let db = ai_db().await;
 
@@ -61,7 +59,7 @@ async fn invented_scan_aliases_are_rejected() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn canonical_scan_labels_and_indices_still_resolve() {
     let db = ai_db().await;
 
@@ -88,7 +86,7 @@ async fn canonical_scan_labels_and_indices_still_resolve() {
 
 /// The case that used to end in `Passive` instead of an error: `from_u16`
 /// clamps, so every out-of-menu index silently became a Passive record.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn out_of_menu_scan_index_is_bad_choice_not_passive() {
     let db = ai_db().await;
     db.put_record_field_from_ca("REC", "SCAN", EpicsValue::String("1 second".into()))
@@ -110,7 +108,7 @@ async fn out_of_menu_scan_index_is_bad_choice_not_passive() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pini_uses_the_menu_converter() {
     let db = ai_db().await;
     let rec = db.get_record("REC").unwrap();
@@ -136,7 +134,7 @@ async fn pini_uses_the_menu_converter() {
 /// The two C converters differ at exactly one place that matters in practice:
 /// SSCN's `65535` sentinel. The loader (`dbPutStringNum`) takes it; a runtime
 /// `dbPut` (`putStringMenu`, bound `val < nChoice`) does not.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sscn_sentinel_loads_from_db_but_is_refused_at_runtime() {
     let mut inst = RecordInstance::new("SIM".to_string(), AiRecord::default());
     inst.put_common_field_db_load("SSCN", EpicsValue::String("65535".into()))

@@ -44,8 +44,6 @@
 //! runs the IOC anyway, leaving the record with a link that never reads or
 //! writes. The port refuses the load — the dead link is the illegal state.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -68,7 +66,7 @@ async fn loads(body: &str) -> Result<(), String> {
 /// `.db` text parses to). One case per cell C rejects — the four ways to give an
 /// `INST_IO` device something that is not `@…`, and the one way to give a
 /// `CONSTANT` device an `@…`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_link_the_bound_device_cannot_take_is_refused_exactly_where_c_refuses_it() {
     // "Soft Timestamp" is `device(ai, INST_IO, ...)`; "Soft Channel" is
     // `device(ai, CONSTANT, ...)` — aiRecord's own `.dbd`, not a guess.
@@ -94,7 +92,7 @@ async fn a_link_the_bound_device_cannot_take_is_refused_exactly_where_c_refuses_
 /// The accepting side of the same boundary: an exact match, and the
 /// `{CONSTANT, PV_LINK, JSON_LINK}` set C treats as interchangeable
 /// (`dbStaticLib.c:2408-2416`) — a soft device takes any of the three.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_links_c_accepts_still_load() {
     let accepted = [
         ("Soft Timestamp", "@instio parm"), // INST_IO on INST_IO
@@ -115,7 +113,7 @@ async fn the_links_c_accepts_still_load() {
 /// and so is expected to be `CONSTANT`, whatever the record's DTYP is. C refuses
 /// `field(SDIS,"@instio parm")` and `field(FLNK,"@instio parm")` for that reason
 /// — measured, not reasoned.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_non_device_link_field_is_held_to_constant_whatever_the_dtyp_is() {
     for field in ["SDIS", "FLNK"] {
         let body =
@@ -134,7 +132,7 @@ async fn a_non_device_link_field_is_held_to_constant_whatever_the_dtyp_is() {
 /// never spells DTYP is still bound to the FIRST device its `.dbd` declares
 /// (`ai` → "Soft Channel", CONSTANT). C rejects a hardware `INP` there, and so
 /// must the port: "no DTYP" is not "no device".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_unspelled_dtyp_still_binds_the_first_declared_device() {
     let err = loads("    field(INP, \"@instio parm\")")
         .await
@@ -146,7 +144,7 @@ async fn an_unspelled_dtyp_still_binds_the_first_declared_device() {
 /// checked (`if (!plink->text) continue;`, `dbStaticLib.c:2213`). An `INST_IO`
 /// DTYP with no `INP` line at all loads, in C and here — the check is on the
 /// text the `.db` supplied, not on the record's declaration.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_link_the_db_never_assigns_is_not_checked() {
     loads("    field(DTYP, \"Soft Timestamp\")")
         .await
@@ -164,7 +162,7 @@ async fn a_link_the_db_never_assigns_is_not_checked() {
 /// dbpf T:RT.INP "5"
 /// DBF_STRING:  "@instio parm"     <- the put is refused, the link is unchanged
 /// ```
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
     use epics_base_rs::types::EpicsValue;
 
@@ -197,7 +195,7 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
 /// verdict depend on the order the `.db` happened to use. MEASURED: C loads
 /// `record(ai,"T:ORD"){ field(INP,"@instio parm") field(DTYP,"Soft Timestamp") }`
 /// with no error.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_verdict_does_not_depend_on_the_order_the_db_spells_the_fields() {
     loads("    field(INP, \"@instio parm\")\n    field(DTYP, \"Soft Timestamp\")")
         .await
@@ -213,7 +211,7 @@ async fn the_verdict_does_not_depend_on_the_order_the_db_spells_the_fields() {
 /// (`asynInt32` on an `ai`) appears in no vendored `device()` line, so the port
 /// has no `link_type` for it and invents none — it must not reject the `.db` on
 /// a rule it cannot state.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_dtyp_no_vendored_dbd_declares_carries_no_rule() {
     loads("    field(DTYP, \"asynInt32\")\n    field(INP, \"@asyn(PORT,0)VALUE\")")
         .await

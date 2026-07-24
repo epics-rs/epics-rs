@@ -16,8 +16,6 @@
 //! `dbGetLink` reports failure for, and the framework's link read returns no
 //! value for it.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -52,7 +50,7 @@ async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
 /// calc: INPA resolves (A=2), INPB does not. C's fetch reads BOTH (so A still
 /// refreshes) but returns INPB's failure, and `process` skips calcPerform.
 /// CALC="A+1" therefore holds VAL at its previous value instead of computing 3.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_calc_freezes_val_when_an_input_link_fails() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(2.0)))
@@ -89,7 +87,7 @@ async fn r9_73_calc_freezes_val_when_an_input_link_fails() {
 
 /// calcout: same gate (calcoutRecord.c:237). The OOPT switch is OUTSIDE the
 /// gate in C, so OOPT=Every_Time still drives OUT — with the FROZEN VAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_calcout_freezes_val_and_outputs_the_frozen_value() {
     let db = PvDatabase::new();
     db.add_record("SINK", Box::new(AiRecord::new(0.0)))
@@ -128,7 +126,7 @@ async fn r9_73_calcout_freezes_val_and_outputs_the_frozen_value() {
 
 /// sCalcout: fetch returns at the first failing numeric link
 /// (sCalcoutRecord.c:885-887), and `process` (356) skips sCalcPerform.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_scalcout_freezes_val_when_an_input_link_fails() {
     let db = PvDatabase::new();
 
@@ -153,7 +151,7 @@ async fn r9_73_scalcout_freezes_val_when_an_input_link_fails() {
 
 /// aCalcout: the gate covers doCalc AND afterCalc (aCalcoutRecord.c:399-414),
 /// so on a failed fetch the OOPT decision never happens and OUT is not written.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_acalcout_freezes_val_and_writes_no_output() {
     let db = PvDatabase::new();
     db.add_record("SINK", Box::new(AiRecord::new(0.0)))
@@ -192,7 +190,7 @@ async fn r9_73_acalcout_freezes_val_and_writes_no_output() {
 
 /// swait: same gate, plus the `else` arm — READ_ALARM at INVALID severity
 /// (swaitRecord.c:413). The calc family raises nothing on the same failure.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_swait_freezes_val_and_raises_read_alarm() {
     let db = PvDatabase::new();
 
@@ -221,7 +219,7 @@ async fn r9_73_swait_freezes_val_and_raises_read_alarm() {
 
 /// The other side of every gate: with all links resolvable the calc runs and
 /// VAL updates. Without this, a fix that simply never calculates would pass.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_73_calc_still_computes_when_every_link_resolves() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(2.0)))

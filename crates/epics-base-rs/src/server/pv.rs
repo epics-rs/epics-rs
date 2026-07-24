@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -1012,7 +1010,7 @@ mod mask_gate_tests {
     /// a later `snapshot()` (the GET path) reflects them — not just the
     /// live monitor fan-out. A subsequent value-only `set()` carries no
     /// explicit metadata and must revert the snapshot to NO_ALARM.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn set_snapshot_metadata_persists_then_value_set_clears() {
         let pv = pv();
 
@@ -1046,7 +1044,7 @@ mod mask_gate_tests {
 
     /// a `DBE_ALARM`-only subscriber must not receive a plain
     /// value set, but must receive an alarm post.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alarm_only_subscriber_skips_value_post() {
         let pv = pv();
         let mut rx = pv
@@ -1066,7 +1064,7 @@ mod mask_gate_tests {
 
     /// a `DBE_VALUE`-only subscriber must not receive a
     /// `post_alarm`, but must receive value sets.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn value_only_subscriber_skips_alarm_post() {
         let pv = pv();
         let mut rx = pv
@@ -1096,7 +1094,7 @@ mod mask_gate_tests {
     }
 
     /// A DBE_LOG (archiver) subscriber must receive a set_snapshot post.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn log_subscriber_receives_snapshot_post() {
         let pv = pv();
         let mut rx = pv
@@ -1110,7 +1108,7 @@ mod mask_gate_tests {
     }
 
     /// A DBE_ALARM-only subscriber must receive a set_snapshot post.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alarm_only_subscriber_receives_snapshot_post() {
         let pv = pv();
         let mut rx = pv
@@ -1124,7 +1122,7 @@ mod mask_gate_tests {
     }
 
     /// A DBE_VALUE subscriber must still receive a set_snapshot post.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn value_subscriber_receives_snapshot_post() {
         let pv = pv();
         let mut rx = pv
@@ -1138,7 +1136,7 @@ mod mask_gate_tests {
     }
 
     /// A `DBE_VALUE | DBE_ALARM` subscriber receives both event classes.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn both_classes_receive_both_posts() {
         let pv = pv();
         let mut rx = pv
@@ -1153,7 +1151,7 @@ mod mask_gate_tests {
     /// A DBE_LOG-only subscriber (archiver) must receive both value
     /// events and alarm events.  Pre-fix: VALUE-only / ALARM-only post masks
     /// never intersected DBE_LOG(2), so archivers received silence.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn br_r52_log_subscriber_receives_value_and_alarm_events() {
         const DBE_LOG: u16 = 2;
         let pv = pv();
@@ -1175,7 +1173,7 @@ mod mask_gate_tests {
     /// Every delivered event carries its post's `DBE_*` class — the
     /// per-event mask C attaches to the field log (`db_field_log.mask`)
     /// and pvxs narrows monitor decoding with (`groupsource.cpp:331-337`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_event_carries_post_class_mask() {
         use crate::server::recgbl::EventMask;
         let pv = pv();
@@ -1201,7 +1199,7 @@ mod mask_gate_tests {
     /// displaced event's class and its own: the displaced *value* is gone (C
     /// frees the field log), but a narrow consumer must still learn that an
     /// ALARM-class change happened inside the coalesced tail.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn in_place_replacement_accumulates_event_class_masks() {
         use crate::server::event_queue::{event_que_size, events_per_que};
         use crate::server::recgbl::EventMask;
@@ -1252,7 +1250,7 @@ mod mask_gate_tests {
     /// the consumer, finding it set, discarded the ENTIRE queued backlog and
     /// delivered only that newest value — so a 200-post burst came out as a
     /// single event instead of {1..107, 200}.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r8_22_pv_burst_keeps_earlier_distinct_updates() {
         use crate::server::event_queue::{event_que_size, events_per_que};
         use std::time::Duration;
@@ -1272,7 +1270,7 @@ mod mask_gate_tests {
         }
         let mut seq = Vec::new();
         while let Ok(Some(snap)) =
-            tokio::time::timeout(Duration::from_millis(200), sub.recv_snapshot()).await
+            crate::runtime::task::timeout(Duration::from_millis(200), sub.recv_snapshot()).await
         {
             seq.push(snap.value.to_f64().expect("double value"));
         }
@@ -1320,7 +1318,7 @@ mod metadata_tests {
     /// plain `set` stays untagged, and a plain `set` inside an
     /// `AmbientWriteOriginScope` inherits the scope's origin — the
     /// simple-PV side of the record funnels' inheritance rule.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn set_with_origin_tags_the_value_event() {
         const DBE_VALUE: u16 = 1;
         let pv = pv();
@@ -1347,7 +1345,7 @@ mod metadata_tests {
 
     /// A bare PV serves no metadata until a proxy installs it; after
     /// `set_metadata`, the GET snapshot carries the shadow DBR_GR/DBR_CTRL.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn set_metadata_serves_on_get_snapshot() {
         let pv = pv();
         assert!(
@@ -1367,7 +1365,7 @@ mod metadata_tests {
 
     /// A CTRL-type monitor must see the installed limits on every value
     /// event, not only the initial GET — value posts carry the metadata.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn installed_metadata_rides_value_posts() {
         const DBE_VALUE: u16 = 1;
         let pv = pv();
@@ -1385,7 +1383,7 @@ mod metadata_tests {
 
     /// `apply_metadata` only supplies fields the caller left absent: a
     /// gateway snapshot that already carries its own display wins.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn apply_metadata_does_not_clobber_caller_metadata() {
         const DBE_VALUE: u16 = 1;
         let pv = pv();
@@ -1413,7 +1411,7 @@ mod metadata_tests {
 
     /// `post_property` reaches DBE_PROPERTY subscribers (carrying the
     /// metadata) and not DBE_VALUE-only subscribers.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn post_property_reaches_only_property_subscribers() {
         const DBE_VALUE: u16 = 1;
         const DBE_PROPERTY: u16 = 8;
@@ -1455,7 +1453,7 @@ mod metadata_tests {
     /// (`gatePv.cc:2413-2438`); a downstream `DBE_PROPERTY` monitor must
     /// see `severity=MAJOR` and the upstream timestamp, even though only
     /// metadata changed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn post_property_preserves_upstream_alarm_and_timestamp() {
         const DBE_PROPERTY: u16 = 8;
         const MAJOR: u16 = 2; // epicsSevMajor
@@ -1507,7 +1505,7 @@ mod read_hook_tests {
     /// No hook installed (the default for every record-backed and cached
     /// PV): `read_snapshot` is exactly `snapshot` wrapped in `Ok` — the
     /// stored value, byte-for-byte unchanged.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_snapshot_without_hook_equals_snapshot() {
         let pv = pv();
         let read = pv.read_snapshot().await.expect("no-hook read never errors");
@@ -1519,7 +1517,7 @@ mod read_hook_tests {
     /// With a hook installed (no-cache mode), the GET value comes fresh
     /// from the hook, NOT from the stored shadow value — the stored value
     /// stays a stale sentinel that the hook overrides.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_snapshot_fires_hook_for_fresh_value() {
         let pv = pv();
         // Stored shadow value is a sentinel the hook must override.
@@ -1544,7 +1542,7 @@ mod read_hook_tests {
 
     /// A hook failure propagates so the server can answer `ECA_GETFAIL`,
     /// matching C ca-gateway forwarding each read to the IOC.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_snapshot_propagates_hook_error() {
         let pv = pv();
         pv.set_read_hook(Arc::new(|| Box::pin(async { Err(CaError::Disconnected) })));
@@ -1591,7 +1589,7 @@ mod read_hook_tests {
     /// The read hook is GET-path only: `snapshot` (monitor fan-out, the
     /// initial monitor event, access-rights re-posts) keeps serving the
     /// stored value even when a hook is installed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn snapshot_ignores_read_hook() {
         let pv = pv();
         pv.set(EpicsValue::Double(7.0));
@@ -1616,7 +1614,7 @@ mod read_hook_tests {
     /// Fresh value + upstream alarm/time ride from the hook; the shadow's
     /// installed *property* metadata (display/control/enum) — which a
     /// `DBR_TIME_*` event does not carry — is overlaid for those fields.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_snapshot_carries_shadow_metadata() {
         let pv = pv();
         pv.set_metadata(PvMetadata {
@@ -1658,7 +1656,7 @@ mod read_hook_tests {
     /// a bare value and `read_snapshot` grafted it onto the stored
     /// snapshot, so the GET reported the new value with a stale or default
     /// status/severity/timestamp.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_snapshot_carries_upstream_alarm_not_shadow() {
         use std::time::{Duration, UNIX_EPOCH};
         let pv = pv();

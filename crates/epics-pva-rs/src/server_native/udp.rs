@@ -4,8 +4,7 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1469,7 +1468,7 @@ mod tests {
     /// The reply bytes must be exactly what the wire builder produces, so
     /// a driver that sends them over `std::net::UdpSocket` is byte-identical
     /// to this one.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn the_search_decoder_produces_replies_without_a_socket() {
         use crate::server_native::source::ChannelSource;
         use std::sync::Arc;
@@ -2224,7 +2223,7 @@ mod tests {
     /// for some requesters (pvxs `Search::source()`). Because the v4
     /// UDP, v6 UDP, and TCP-circuit responders all call this one rule,
     /// the endpoint scope governs every search path.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_matched_cids_honors_requester_endpoint() {
         use crate::pvdata::{FieldDesc, PvField};
         use crate::server_native::source::ChannelSource;
@@ -2317,7 +2316,7 @@ mod tests {
     /// v4 UDP, v6 UDP, and TCP-circuit responders all call — the v6 path
     /// previously skipped it and would answer a TLS-only client off a
     /// tcp-only server.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn search_matched_cids_gates_on_protocol() {
         use crate::pvdata::{FieldDesc, PvField, ScalarType};
         use crate::server_native::source::ChannelSource;

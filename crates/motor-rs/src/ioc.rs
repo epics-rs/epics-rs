@@ -114,7 +114,7 @@ impl SimMotorHolder {
                 let device_support = device_support.with_dtyp_name(dtyp_key.clone());
 
                 // Spawn poll loop on the tokio runtime (starts idle)
-                ctx.runtime_handle().spawn(poll_loop.run());
+                ctx.bridge().spawn(poll_loop.run());
 
                 holder
                     .poll_senders

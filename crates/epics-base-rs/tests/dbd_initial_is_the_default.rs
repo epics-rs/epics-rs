@@ -31,8 +31,6 @@
 //! non-calc initial, to show the rule is the loader's and not a calc special
 //! case.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -78,7 +76,7 @@ const NO_ALARM: i64 = 0;
 const INVALID: i64 = 3;
 
 /// The finding, at the record: a plain `record(calc)` must compute, not alarm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_default_calc_record_computes_instead_of_alarming() {
     let db = build(r#"record(calc, "D:CALC") {}"#).await;
 
@@ -101,7 +99,7 @@ async fn a_default_calc_record_computes_instead_of_alarming() {
 /// calcout carries the initial on BOTH of its expressions
 /// (`calcoutRecord.dbd:62` CALC, `:382` OCAL) — an empty OCAL alarms exactly
 /// like an empty CALC, so missing either one is the same defect.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_default_calcout_record_has_both_expressions() {
     let db = build(r#"record(calcout, "D:OUT") {}"#).await;
 
@@ -115,7 +113,7 @@ async fn a_default_calcout_record_has_both_expressions() {
 /// swait is the synApps record that DOES declare the initial
 /// (`swaitRecord.dbd:424`) — and it compiles with base's `postfix()`, so the
 /// empty expression was fatal there too.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_default_swait_record_computes_instead_of_alarming() {
     let db = build(r#"record(swait, "D:WAIT") {}"#).await;
 
@@ -130,7 +128,7 @@ async fn a_default_swait_record_computes_instead_of_alarming() {
 /// `sCalcPostfix("")`/`aCalcPostfix("")` accept it (status 0) and the perform
 /// then fails every cycle (measured: `perform=-1`). The fix must not invent an
 /// initial C does not have.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_and_acalcout_keep_the_empty_calc_their_dbd_declares() {
     let db = build(
         r#"
@@ -154,7 +152,7 @@ record(acalcout, "D:ACALC") {}
 
 /// The prototype is what the `.db` OVERWRITES — the initial must not win over an
 /// explicit field line, and must not be re-applied after it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_db_field_line_overrides_the_dbd_initial() {
     let db = build(
         r#"
@@ -175,7 +173,7 @@ record(calc, "D:EXPL") {
 /// initial gets it. `ai` declares `ASLO initial("1")` and `SDLY initial("-1.0")`
 /// (`aiRecord.dbd`), and a slope of 0 would zero every raw-to-engineering
 /// conversion.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_initial_is_applied_to_every_record_type_not_just_the_calc_family() {
     let db = build(r#"record(ai, "D:AI") {}"#).await;
 

@@ -18,8 +18,6 @@
 //! and `DTYP` fell through to the numeric arm and received OVAL. The class is
 //! now settled at target resolution (`OutTarget::puts_as_string`).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -55,7 +53,7 @@ async fn process(db: &PvDatabase, name: &str) {
 /// Boundary 1 — `DBF_MENU` target: `TGT.PRIO` is `menu(menuPriority)`
 /// (LOW/MEDIUM/HIGH). C puts the OSV string, so the label resolves to index 2.
 /// The pre-fix port took the numeric arm and sent OVAL — 0.0 here, i.e. `LOW`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_64_menu_target_receives_the_osv_label() {
     let db = PvDatabase::new();
     db.add_record("TGT", Box::new(AiRecord::new(0.0)))
@@ -75,7 +73,7 @@ async fn r15_64_menu_target_receives_the_osv_label() {
 
 /// Boundary 2 — the numeric target is unchanged: C's `default:` arm puts
 /// `DBR_DOUBLE` from OVAL (`devsCalcoutSoft.c:140`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_64_numeric_target_still_receives_oval() {
     let db = PvDatabase::new();
     db.add_record("TGT", Box::new(AiRecord::new(0.0)))

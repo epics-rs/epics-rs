@@ -15,8 +15,6 @@
 //! arms, behaviourally identical to C's never-firing callback), so the store
 //! itself is accepted across the whole double range.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::histogram::HistogramRecord;
@@ -45,7 +43,7 @@ async fn db_with(record: Box<dyn Record>) -> PvDatabase {
 
 /// `1e308` (near double max), `1e39` (over float max), `inf` — all SUCCEED. The
 /// store must be accepted and arming the watchdog must not panic.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn histogram_sdel_accepts_large_and_infinite_double() {
     let db = db_with(Box::new(HistogramRecord::default())).await;
     for text in ["1e308", "1e39", "inf"] {
@@ -62,7 +60,7 @@ async fn histogram_sdel_accepts_large_and_infinite_double() {
 
 /// A finite value that fits still arms a real watchdog interval — the fix must
 /// not have turned every SDEL into a no-arm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn histogram_sdel_finite_positive_still_stored() {
     let db = db_with(Box::new(HistogramRecord::default())).await;
     caput(&db, "SDEL", "2.5").await.unwrap();

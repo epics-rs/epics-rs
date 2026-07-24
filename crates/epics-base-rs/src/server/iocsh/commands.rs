@@ -1,5 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 use std::collections::HashMap;
 
 use super::registry::*;
@@ -1911,8 +1910,11 @@ mod tests {
     fn make_ctx() -> (Arc<PvDatabase>, CommandContext) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let handle = rt.handle().clone();
-        let ctx = CommandContext::new(db.clone(), handle);
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(db.clone(), bridge);
         // Leak the runtime so it stays alive for the test
         std::mem::forget(rt);
         (db, ctx)

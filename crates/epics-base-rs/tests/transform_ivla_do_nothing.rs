@@ -21,8 +21,6 @@
 //! Before the fix the port used IVLA only as a per-channel calc-error policy,
 //! so this cycle recomputed CLCB and drove OUTB.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -72,7 +70,7 @@ async fn tr_field(db: &PvDatabase, field: &str) -> Option<EpicsValue> {
     db.get_record("TR").unwrap().read().record.get_field(field)
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
     let db = PvDatabase::new();
     invalid_source(&db).await;
@@ -116,7 +114,7 @@ async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
 /// Same wiring, IVLA="Ignore error" (0): the identical INVALID input must NOT
 /// freeze the record — proving the freeze above is IVLA's doing and not a
 /// side effect of the INVALID severity itself.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_61_ivla_ignore_error_still_calcs_and_drives_outputs() {
     let db = PvDatabase::new();
     invalid_source(&db).await;

@@ -27,8 +27,6 @@
 //! catch-all `_ => clear_histogram(); cmd = 0`, so an over-max CMD read back as
 //! 0/"Read" — the divergence this test pins.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::types::EpicsValue;
@@ -59,7 +57,7 @@ async fn db_with(record: HistogramRecord) -> PvDatabase {
 /// The reported case: a bare `record(histogram,"X"){}` then `caput X.CMD 4`. The
 /// over-max ordinal is stored verbatim; the command switch has no matching case,
 /// so counting state and buckets are untouched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn cmd_over_max_ordinal_stores_raw() {
     let db = db_with(HistogramRecord::default()).await;
     caput_cmd(&db, 4).await.unwrap();
@@ -79,7 +77,7 @@ async fn cmd_over_max_ordinal_stores_raw() {
 
 /// The in-range commands are NOT regressed: each valid ordinal executes its arm
 /// and C resets `cmd` back to 0 afterwards.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn cmd_in_range_commands_execute_and_reset_to_zero() {
     let db = db_with(HistogramRecord::new(2, 0.0, 10.0)).await;
 

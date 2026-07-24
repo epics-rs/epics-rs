@@ -41,8 +41,6 @@
 //! `TSEL`/`SDIS`/`FLNK` — while a real DB link and an empty link still
 //! round-trip verbatim.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -92,7 +90,7 @@ const INP_FIELDS: &[&str] = &[
 /// The finding's own probe on every link field of a parked `sub`: the constant
 /// string "0" is written and read back, with the callback completing
 /// synchronously (not parked on the never-firing PACT exit).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_string_lands_on_every_parked_sub_link_field() {
     let db = build().await;
     assert!(
@@ -124,7 +122,7 @@ async fn constant_string_lands_on_every_parked_sub_link_field() {
 /// Preservation: a real DB link string on a parked `sub` link field still
 /// round-trips verbatim — the fix only removes the erroneous PACT-park, it does
 /// not touch the write itself.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn real_db_link_string_round_trips_on_parked_sub() {
     let db = build().await;
     assert!(is_parked(&db, "W:SUB").await);
@@ -138,7 +136,7 @@ async fn real_db_link_string_round_trips_on_parked_sub() {
 
 /// Preservation: an empty link string still round-trips as empty (a cleared
 /// link), not spuriously kept from a prior value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn empty_link_string_round_trips_on_parked_sub() {
     let db = build().await;
     assert!(is_parked(&db, "W:SUB").await);

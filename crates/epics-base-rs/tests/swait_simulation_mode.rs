@@ -31,8 +31,6 @@
 //! redirect. The port omitted the fields there too, so `check_simulation_mode`
 //! saw an unconfigured record and a simulated busy drove its real output.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -114,7 +112,7 @@ async fn amsg(db: &PvDatabase) -> String {
 
 /// SIMM = YES: VAL comes from SIOL through SVAL, the calc does not run, and the
 /// cycle carries SIMM_ALARM at SIMS.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_simm_yes_reads_siol_into_sval_and_val() {
     let db = sim_db("", 1, 2 /* MAJOR */, "SIM").await;
 
@@ -146,7 +144,7 @@ async fn r11_62_simm_yes_reads_siol_into_sval_and_val() {
 /// switch and `execOutput` still run, so the simulated VAL is written out
 /// through OUT. (A whole-cycle `readValue` simulation — ai/bi — would have
 /// skipped the body and left DEST alone.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_a_simulated_cycle_still_drives_the_output_link() {
     let db = sim_db("", 1, 0, "SIM").await;
 
@@ -162,7 +160,7 @@ async fn r11_62_a_simulated_cycle_still_drives_the_output_link() {
 
 /// SIML resolves SIMM on every process (C `:402`), so the mode can be driven
 /// from another PV — and driving it back to NO restores the real calc.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_siml_refreshes_simm_every_cycle() {
     let db = sim_db("MODE", 0, 0, "SIM").await;
 
@@ -210,7 +208,7 @@ async fn r11_62_siml_refreshes_simm_every_cycle() {
 /// ```
 ///
 /// The port used to raise ONLY the SIMM_ALARM here, publishing MINOR/SIMM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_e4_a_failed_siol_read_raises_link_alarm() {
     let db = sim_db("MODE", 0, 1 /* MINOR */, "NOSUCHREC").await;
 
@@ -247,7 +245,7 @@ async fn w10_e4_a_failed_siol_read_raises_link_alarm() {
 /// strict-greater `recGblSetSevr` leaves LINK in place. (A base record reverses
 /// this: `longinRecord.c:414` raises SIMM BEFORE its read, so SIMM wins there.
 /// Same two alarms, opposite winner, decided purely by C's call order.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_e4_swait_link_alarm_wins_the_tie_at_sims_invalid() {
     let db = sim_db("MODE", 0, 3 /* INVALID */, "NOSUCHREC").await;
 
@@ -266,7 +264,7 @@ async fn w10_e4_swait_link_alarm_wins_the_tie_at_sims_invalid() {
 /// Negative control: with SIMM = NO the record is untouched — the inputs are
 /// fetched, the calc runs, and no SIMM alarm is raised. The failing-input gate
 /// (READ_ALARM, C `:413`) belongs to the real branch...
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_simm_no_runs_the_real_calc_and_its_read_gate() {
     let db = sim_db("MODE", 0, 1, "SIM").await;
 
@@ -300,7 +298,7 @@ async fn r11_62_simm_no_runs_the_real_calc_and_its_read_gate() {
 /// omission; its shape is the OUTPUT redirect the framework already owns, so
 /// declaring the fields is the whole fix: SIMM=YES sends VAL to SIOL instead of
 /// OUT, and the cycle carries SIMM_ALARM at SIMS.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
     let db = PvDatabase::new();
     db.add_record("B_OUT", Box::new(AiRecord::new(0.0)))
@@ -352,7 +350,7 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
 
 /// Negative control for the widened site: SIMM = NO drives the real OUT link and
 /// raises no SIMM alarm.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_62_busy_simm_no_drives_the_real_output() {
     let db = PvDatabase::new();
     db.add_record("B2_OUT", Box::new(AiRecord::new(0.0)))

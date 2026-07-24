@@ -13,8 +13,6 @@
 //! Every expectation below is the output of a driver compiled from
 //! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -51,7 +49,7 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
 
 /// Compiled C, arraySize 4, AA=[9,9,9,9], BB=[1,2,3,4], `AA:=BB*2;SUM(AA)`:
 ///   status=0 amask=0x1 dresult=20 AA=[2,4,6,8]
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_array_store_writes_the_record_field_and_sets_amask() {
     let db = PvDatabase::new();
     acalcout(&db, "S1", "AA:=BB*2;SUM(AA)").await;
@@ -75,7 +73,7 @@ async fn r11_9_array_store_writes_the_record_field_and_sets_amask() {
 /// (`aCalcPerform.c:485`, `pd[j] = ps->d`) — it is not `toArray`'d and it does not
 /// go to the scalar variable of the same letter. Compiled C, `AA:=5;SUM(AA)`:
 /// AA=[5,5,5,5], dresult=20, amask=0x1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_a_scalar_stored_into_an_array_variable_is_broadcast() {
     let db = PvDatabase::new();
     acalcout(&db, "S2", "AA:=5;SUM(AA)").await;
@@ -96,7 +94,7 @@ async fn r11_9_a_scalar_stored_into_an_array_variable_is_broadcast() {
 }
 
 /// Two array stores set two bits. Compiled C, `CC:=AA;DD:=BB;0`: amask=0xc.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_amask_carries_one_bit_per_stored_array() {
     let db = PvDatabase::new();
     acalcout(&db, "S3", "CC:=AA;DD:=BB;0").await;
@@ -122,7 +120,7 @@ async fn r11_9_amask_carries_one_bit_per_stored_array() {
 /// C zeroes `*amask` at the top of every aCalcPerform (`:326`), and the pointer it
 /// is handed IS the record's field. So an expression that stores nothing leaves
 /// AMASK 0 — even right after a process that set it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_amask_is_reset_each_process_not_accumulated() {
     let db = PvDatabase::new();
     acalcout(&db, "S4", "AA:=BB*2;SUM(AA)").await;
@@ -151,7 +149,7 @@ async fn r11_9_amask_is_reset_each_process_not_accumulated() {
 /// A scalar store writes A..L and does NOT touch AMASK — the mask is about ARRAY
 /// fields only (C sets it in `STORE_AA..LL` and `A_ASTORE`, never in `STORE_A..P`).
 /// Compiled C, `A:=SUM(BB);A`: dresult=10, A=10, amask=0x0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_scalar_store_writes_the_field_but_not_amask() {
     let db = PvDatabase::new();
     acalcout(&db, "S5", "A:=SUM(BB);A").await;
@@ -173,7 +171,7 @@ async fn r11_9_scalar_store_writes_the_field_but_not_amask() {
 ///
 /// `AA:=BB*2;SQRT(CC-1)` — CC is all zeros, so every element of `CC-1` is negative
 /// and the ARRAY SQRT domain guard sets status -1 (`:775-812`), after AA is written.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_9_stores_survive_a_failing_expression() {
     let db = PvDatabase::new();
     acalcout(&db, "S6", "AA:=BB*2;SQRT(CC-1)").await;

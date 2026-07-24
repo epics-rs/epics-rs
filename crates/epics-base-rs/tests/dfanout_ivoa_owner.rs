@@ -31,8 +31,6 @@
 //! single owner in `process_record_with_links_inner`, and every output path
 //! (OUT, SIOL, the generic multi-output pairs, dfanout's push) consumes it.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -75,7 +73,7 @@ async fn add_dfanout(db: &PvDatabase, ivoa: i16, invalid: bool, outa: &str) {
 
 /// Boundary 1 — INVALID cycle, IVOA=Set_output_to_IVOV: the targets get IVOV,
 /// the record's own VAL becomes IVOV, and the VAL monitor fires with it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
     let db = PvDatabase::new();
     db.add_record("DF_TGT", Box::new(AiRecord::new(0.0)))
@@ -120,7 +118,7 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
 /// alarm of its own; the only INVALID in the cycle is the one the FAILED OUTA
 /// put raises from inside the push. C evaluated the IVOA switch before that put
 /// and never returns to it, so VAL keeps its computed value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_65_a_failed_push_does_not_retro_trigger_the_ivov_arm() {
     let db = PvDatabase::new();
     add_dfanout(&db, 2, false, "NO_SUCH_TARGET").await;
@@ -143,7 +141,7 @@ async fn r15_65_a_failed_push_does_not_retro_trigger_the_ivov_arm() {
 
 /// Boundary 3 — IVOA=Continue_normally on an INVALID cycle: VAL is untouched
 /// and pushed as-is (dfanoutRecord.c:132-134).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_65_ivoa_continue_pushes_val_unchanged() {
     let db = PvDatabase::new();
     db.add_record("DF_TGT", Box::new(AiRecord::new(0.0)))
@@ -167,7 +165,7 @@ async fn r15_65_ivoa_continue_pushes_val_unchanged() {
 
 /// Boundary 4 — IVOA=Don't_drive_outputs on an INVALID cycle: no push at all
 /// (dfanoutRecord.c:139), VAL untouched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_65_ivoa_dont_drive_suppresses_the_push() {
     let db = PvDatabase::new();
     db.add_record("DF_TGT", Box::new(AiRecord::new(0.0)))

@@ -7,8 +7,6 @@
 //! wrote VAL OUT to SIOL (direction inverted, simulation defeated). These tests
 //! pin the corrected input direction.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -22,7 +20,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// `dbGetLink(&siol, ftvl, bptr)`), and leaves the SIOL source untouched. Under
 /// the pre-fix output misclassification the record instead ran its body and
 /// wrote VAL OUT to the SIOL target — so VAL would NOT carry the source array.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_waveform_reads_siol_array_into_val() {
     let db = PvDatabase::new();
     db.add_record("WFIN_SW", Box::new(AoRecord::new(1.0)))
@@ -66,7 +64,7 @@ async fn sim_waveform_reads_siol_array_into_val() {
 /// SIOL = 42.0 with LLIM=0, ULIM=100, NELM=4 → WDTH=25, and C's
 /// `for (i = 1; i <= nelm; i++) if (temp <= i*wdth) break;` picks i=2, so
 /// `bptr[1]` is incremented: VAL = [0, 1, 0, 0].
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
     let db = PvDatabase::new();
     db.add_record("HGIN_SW", Box::new(AoRecord::new(1.0)))
@@ -112,7 +110,7 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
 /// A FAILED SIOL read leaves C's `status != 0`, so `readValue` never runs
 /// `prec->sgnl = prec->sval` (`:385`, gated on `status == 0`) and `process`
 /// never runs `add_count` (`:218-219`, the same gate). No bin moves.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
     let db = PvDatabase::new();
     db.add_record("HGF_SW", Box::new(AoRecord::new(1.0)))

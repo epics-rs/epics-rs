@@ -39,8 +39,6 @@
 //! field's own `dbPut` post and the next scan is ten seconds away. NORD is the
 //! only thing the subscriber hears — which is exactly why losing it matters.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -83,7 +81,7 @@ fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
 
 /// The finding's own probe: a `caput -a` of three elements onto an
 /// unprocessed waveform must post NORD = 3 to a NORD subscriber.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_ca_array_put_posts_nord() {
     let db = build().await;
 
@@ -104,7 +102,7 @@ async fn a_ca_array_put_posts_nord() {
 
 /// subArray's NORD is DBF_LONG, and its VAL put is the INP-driven slice, so it
 /// gets its own case rather than riding the loop above.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_ca_array_put_posts_nord_on_subarray() {
     let db = build().await;
     let mut rx = nord_sub(&db, "SS").await;
@@ -119,7 +117,7 @@ async fn a_ca_array_put_posts_nord_on_subarray() {
 /// The other silent route: `put_pv` is the `dbPutLink` `dbPut`. An OUT link
 /// that lands an array on a waveform posts NORD in C even when the link is NPP
 /// and the target never processes.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_db_link_write_posts_nord() {
     let db = build().await;
     let mut rx = nord_sub(&db, "WL").await;
@@ -138,7 +136,7 @@ async fn a_db_link_write_posts_nord() {
 /// The `if (nord != prec->nord)` half of the C source: an array put that does
 /// not move NORD posts nothing. Without this the fix would turn every put into
 /// a NORD event and flood the subscriber it is meant to serve.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_that_does_not_move_nord_posts_nothing() {
     let db = build().await;
 

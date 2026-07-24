@@ -220,6 +220,9 @@ epics-rtems-boot = { workspace = true }
 # crate that declares the feature has the same hole, and three copies of a
 # 300-line audit is how three copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+# Dev-only: `#[epics_test]` — the backend-selected test driver — for this
+# crate's own suite.
+epics-macros-rs = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tempfile = "3"
 proptest = "1"

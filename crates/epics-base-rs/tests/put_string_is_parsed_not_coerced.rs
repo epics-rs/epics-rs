@@ -46,8 +46,6 @@
 //! The cases are the invariant BOUNDARIES of the row — at-limit, just-over,
 //! just-under, unparseable, empty — not a narrative.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -104,7 +102,7 @@ async fn stored(db: &PvDatabase, rec: &str, field: &str, text: &str, want: Epics
     assert_eq!(read(db, &pv).await, want, "{pv} = {text:?}");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn short_field_at_limit_stores_and_one_past_it_is_refused() {
     let db = build().await;
     stored(&db, "C", "PREC", "32767", EpicsValue::Short(32767)).await;
@@ -113,7 +111,7 @@ async fn short_field_at_limit_stores_and_one_past_it_is_refused() {
     refused(&db, "C", "PREC", "-32769", EpicsValue::Short(-32768)).await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn long_field_at_limit_stores_and_one_past_it_is_refused() {
     let db = build().await;
     stored(
@@ -136,7 +134,7 @@ async fn long_field_at_limit_stores_and_one_past_it_is_refused() {
     stored(&db, "LO", "DRVH", "-1", EpicsValue::Long(-1)).await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unparseable_text_is_refused_not_stored_as_zero() {
     let db = build().await;
     refused(&db, "C", "PREC", "notanumber", EpicsValue::Short(3)).await;
@@ -145,7 +143,7 @@ async fn unparseable_text_is_refused_not_stored_as_zero() {
     refused(&db, "C", "VAL", "", EpicsValue::Double(7.0)).await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn double_overflow_is_refused_but_nan_and_infinity_are_values() {
     let db = build().await;
     refused(&db, "C", "VAL", "1e400", EpicsValue::Double(7.0)).await;
@@ -173,7 +171,7 @@ async fn double_overflow_is_refused_but_nan_and_infinity_are_values() {
 
 /// `strtol` with `dbConvertBase == 0` stops at the first character it cannot
 /// use, and the trailing text is the field's `units` — never an error.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_numeric_prefix_is_taken_and_the_rest_is_units() {
     let db = build().await;
     stored(&db, "C", "PREC", "1.7", EpicsValue::Short(1)).await;
@@ -184,7 +182,7 @@ async fn the_numeric_prefix_is_taken_and_the_rest_is_units() {
 
 /// Base 0: `0x` is hex, a leading `0` is octal. The range check then applies to
 /// the parsed VALUE, so `0x8000` overflows a short even though the text is short.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn integers_parse_base_zero() {
     let db = build().await;
     stored(&db, "C", "PREC", "0x10", EpicsValue::Short(16)).await;
@@ -197,7 +195,7 @@ async fn integers_parse_base_zero() {
 /// a string as its bytes. Guards the exemption in `coerce_put_value` — without
 /// it, the parse would reject `"hi"` as unparseable text and the char-waveform
 /// carry would be dead.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_string_into_a_char_array_is_still_its_bytes() {
     let db = build().await;
     db.put_pv("W.VAL", EpicsValue::String("hi".into()))

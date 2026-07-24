@@ -15,8 +15,6 @@
 //! `stage_external_link_open_by_name`, i.e. the same `LinkPutQueue` owner
 //! that consumes `connect_link`. Nothing here opens a channel inline.
 
-// RTEMS-EXEC-MODEL-ALLOW(15): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,7 +120,7 @@ async fn val_of(db: &PvDatabase, name: &str) -> Option<f64> {
 /// link is opened at init like any other. The port must therefore stage it
 /// in the iocInit pass, NOT on the first scan's cache miss: the observable
 /// consequence is that scan 1 already reads a warm cache.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -161,7 +159,7 @@ async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
 /// `dbInitLink` above the `dbfType` switch (`dbLink.c:118-130`), so C opens
 /// `DBF_OUTLINK` channels at init too; only the `pvlOptInpNative` /
 /// `pvlOptFWD` flags below it are direction-specific.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn out_only_external_link_is_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -184,7 +182,7 @@ async fn out_only_external_link_is_opened_at_init() {
 /// same `record_link_fields` enumeration, so an external `INPA` is opened
 /// at init exactly like `INP`. This is the property that would break if the
 /// pass grew its own field list instead of reusing the CP pass's owner.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn record_specific_input_link_fields_are_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -218,7 +216,7 @@ async fn record_specific_input_link_fields_are_opened_at_init() {
 /// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:118-124`);
 /// a `CONSTANT` link returns even earlier (`dbLink.c:101-104`). Neither may
 /// consume the link queue's one-shot open.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn local_and_constant_links_stage_nothing() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -249,7 +247,7 @@ async fn local_and_constant_links_stage_nothing() {
 /// `dbCaAddLinkCallbackOpt` (`dbLink.c:129`) and the link IS a CA link from
 /// then on. So both halves must hold: the holder's parse cache is rewritten to
 /// `Ca`, and the channel is opened at init like any other external link.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn plain_non_local_db_link_converts_and_opens_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -295,7 +293,7 @@ async fn plain_non_local_db_link_converts_and_opens_at_init() {
 /// `plink->value.pv_link.pvname` verbatim (`dbLink.c:129`), i.e. the same
 /// `record.FIELD` string `dbChannelCreate` just failed on — not the bare
 /// record name.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn plain_non_local_db_link_keeps_its_field_in_the_channel_name() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -314,7 +312,7 @@ async fn plain_non_local_db_link_keeps_its_field_in_the_channel_name() {
 /// `dbInitLink` the moment `dbDbInitLink` succeeds (`dbLink.c:118-120`), never
 /// reaching `dbCaAddLink`: the link keeps `dbDb_lset`, its lock-set merge, its
 /// `PP` target processing and its `MS` severity inheritance.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn local_db_link_is_not_converted() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -351,7 +349,7 @@ async fn local_db_link_is_not_converted() {
 /// external CP trigger; moving the rewrite to the `dbInitLink` pass must keep
 /// BOTH halves, because C reaches the identical `dbCaAddLink` call for a
 /// CP link — it just skips `dbDbInitLink` on the way (`dbLink.c:117`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -386,7 +384,7 @@ async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
 /// that appears in the IOC *after* iocInit does NOT pull an already-converted
 /// link back to a local DB link. Our commit into the parse cache has the same
 /// shape: nothing re-derives it from locality afterwards.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_record_added_after_init_does_not_un_convert_the_link() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -415,7 +413,7 @@ async fn a_record_added_after_init_does_not_un_convert_the_link() {
 /// locality test: `dbInitLink` returns at `dbConstInitLink`
 /// (`dbLink.c:101-104`). A numeric `INP` must not be turned into a CA channel
 /// named `3.5`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_link_is_not_converted() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -438,7 +436,7 @@ async fn constant_link_is_not_converted() {
 /// (`processing.rs::dispatch_external_forward_link`), so the channel must be
 /// connecting before the first forward trigger rather than being staged by
 /// that trigger's own refusal.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn external_forward_link_is_opened_at_init() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -470,7 +468,7 @@ async fn external_forward_link_is_opened_at_init() {
 /// forward trigger is the local `dbScanPassive` path, not a link set. Widening
 /// `record_link_fields` to carry `FLNK` must not turn every fanout chain in a
 /// database into an external open attempt.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn local_forward_link_stages_nothing() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -505,7 +503,7 @@ async fn local_forward_link_stages_nothing() {
 /// set to `pvlOptCA` alone (`dbStaticLib.c:2390`), which is what
 /// `LinkFieldType::Fwd` reproduces: `FLNK="OTHER CP"` parses as a plain NPP
 /// forward link, never a CP holder edge.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn forward_link_never_registers_a_cp_holder() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -538,7 +536,7 @@ async fn forward_link_never_registers_a_cp_holder() {
 /// is once-per-key and terminal (`link_put_queue.rs:346-369`), so the link
 /// is connected exactly once: C stages one `CA_CONNECT` per link and libca
 /// owns every retry from then on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn external_cp_link_already_warmed_is_not_staged_again() {
     let reads = Arc::new(AtomicUsize::new(0));
     let lset = CountingLset::new(&reads);
@@ -574,7 +572,7 @@ async fn external_cp_link_already_warmed_is_not_staged_again() {
 /// installers run before this pass, but a test or a late installer may not
 /// have) would then never be asked to open it. The gate keeps the link
 /// stageable.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn no_link_set_registered_stages_nothing_and_leaves_the_link_openable() {
     let db = PvDatabase::new();
     add_ai(&db, "AI_NOLSET", "ca://REMOTE:IN").await;

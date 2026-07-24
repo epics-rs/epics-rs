@@ -30,8 +30,6 @@
 //! process — storing nothing into AA, fetching nothing into it — emitted a post
 //! C never makes.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -50,7 +48,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// CC is written by nobody: no expression stores into it (AMASK bit clear) and
 /// no INCC link feeds it (NEWM bit clear). A caput moves it; the next process
 /// must stay silent on CC.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_a6_a_caput_array_is_not_reposted_by_the_next_process() {
     let db = PvDatabase::new();
     let mut a = AcalcoutRecord::new();

@@ -1,10 +1,12 @@
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
 // Was 18: the nine that left are the three virtual-time watchdog modules
 // (read_loop_tests, recv_watchdog_tests, write_loop_timeout_tests), now gated
 // off under the feature because the circuit path's deadlines moved onto the
 // runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
 // DOWN, never up, without running the survivors under the feature.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): the flavored tests drive the TCP transport
+// over tokio::net, which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]
@@ -3365,7 +3367,7 @@ mod server_connection_drop_tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn drop_aborts_read_and_write_tasks() {
         // Long-running dummy tasks that never complete on their own.
         let read_task = tokio::spawn(async {

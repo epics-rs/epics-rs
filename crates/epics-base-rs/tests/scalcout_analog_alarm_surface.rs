@@ -15,8 +15,6 @@
 //! hysteresis band on the way back down (which is what LALM is for); and the
 //! IVOA gate the C ordering exists to feed.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -76,7 +74,7 @@ async fn severity_at(db: &PvDatabase, a: f64) -> (AlarmSeverity, u16) {
 
 /// The ten fields exist and take a put — the surface itself. `caput
 /// scalc.HIHI 5` used to be `FieldNotFound`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_alarm_fields_exist_and_are_writable() {
     let db = build().await;
 
@@ -95,7 +93,7 @@ async fn the_alarm_fields_exist_and_are_writable() {
 
 /// The C ladder, level by level (`sCalcoutRecord.c:727-748`): HIHI/LOLO are
 /// checked before HIGH/LOW, and a zero severity disables its level.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_ladder_raises_each_level() {
     let db = build().await;
     use epics_base_rs::server::recgbl::alarm_status;
@@ -131,7 +129,7 @@ async fn the_ladder_raises_each_level() {
 /// `(lalm == hihi) && (val >= hihi - hyst)`. Coming down from 12 to 9, the HIHI
 /// alarm HOLDS (9 >= 10 - 2) because LALM latched at 10; at 7.5 it releases to
 /// the HIGH level.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn hysteresis_holds_the_level_through_lalm() {
     let db = build().await;
     use epics_base_rs::server::recgbl::alarm_status;
@@ -164,7 +162,7 @@ async fn hysteresis_holds_the_level_through_lalm() {
 /// otherwise takes the IVOA branch — so an INVALID limit excursion must reach
 /// the gate and leave the OUT target untouched. A record with no alarm surface
 /// at all can never raise that severity, which is what made this unreachable.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_invalid_limit_excursion_reaches_the_ivoa_gate() {
     let db = build().await;
 

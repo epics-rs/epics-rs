@@ -11,8 +11,6 @@
 //! chain went async. A fully synchronous chain drains the wait-set inside
 //! processing and returns `Ok(None)`.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -23,7 +21,7 @@ use epics_base_rs::types::EpicsValue;
 /// processing call: the wait-set drains before `process_record_with_notify`
 /// returns, so it yields `Ok(None)` (no receiver to await) — and it processed
 /// UNCONDITIONALLY (Force = C `dbProcess`), driving the OUT link synchronously.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn force_block_sync_record_returns_none_and_processes() {
     let db = PvDatabase::new();
     db.add_record("TGT0", Box::new(AiRecord::new(0.0)))
@@ -69,7 +67,7 @@ async fn force_block_sync_record_returns_none_and_processes() {
 /// a bug that ignored block would have returned before the async work, either
 /// `Ok(None)` or with the OUT already fired. The 100 s timer cannot fire in the
 /// test, so the OUT stays deferred (DLYA=1, TGT unchanged).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn force_block_async_record_withholds_completion_until_processing_done() {
     let db = PvDatabase::new();
     db.add_record("TGT1", Box::new(AiRecord::new(0.0)))

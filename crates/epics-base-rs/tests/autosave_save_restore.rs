@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::PvString;
 
@@ -8,7 +6,7 @@ use epics_base_rs::server::autosave::save_file::{
     write_save_file,
 };
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_write_read_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.sav");
@@ -52,7 +50,7 @@ async fn test_write_read_roundtrip() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_end_marker_validation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("valid.sav");
@@ -66,26 +64,30 @@ async fn test_end_marker_validation() {
     assert!(validate_save_file(&path).await.unwrap());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_missing_end_marker_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("corrupt.sav");
 
     // Write a file without <END>
-    tokio::fs::write(&path, "PV1 1.0\nPV2 2.0\n").await.unwrap();
+    epics_base_rs::runtime::fs::write(&path, "PV1 1.0\nPV2 2.0\n")
+        .await
+        .unwrap();
 
     assert!(!validate_save_file(&path).await.unwrap());
     let result = read_save_file(&path).await.unwrap();
     assert!(result.is_none()); // None = corrupt
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_c_autosave_array_format() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c_array.sav");
 
     let content = "ARRAY_PV @array@ { \"1.0\" \"2.0\" \"3.0\" }\n<END>\n";
-    tokio::fs::write(&path, content).await.unwrap();
+    epics_base_rs::runtime::fs::write(&path, content)
+        .await
+        .unwrap();
 
     let entries = read_save_file(&path).await.unwrap().unwrap();
     assert_eq!(entries.len(), 1);
@@ -93,7 +95,7 @@ async fn test_c_autosave_array_format() {
     assert_eq!(entries[0].value, "[1.0,2.0,3.0]");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_string_with_special_chars() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("special.sav");
@@ -116,14 +118,16 @@ async fn test_string_with_special_chars() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_windows_line_endings() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("windows.sav");
 
     // Write with \r\n
     let content = "# header\r\nPV1 42\r\nPV2 3.14\r\n<END>\r\n";
-    tokio::fs::write(&path, content).await.unwrap();
+    epics_base_rs::runtime::fs::write(&path, content)
+        .await
+        .unwrap();
 
     let entries = read_save_file(&path).await.unwrap().unwrap();
     assert_eq!(entries.len(), 2);
@@ -131,20 +135,22 @@ async fn test_windows_line_endings() {
     assert_eq!(entries[0].value, "42");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_multiple_header_lines() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multi_header.sav");
 
     let content = "# autosave V1\n# extra header\n# another\nPV1 1.0\n<END>\n";
-    tokio::fs::write(&path, content).await.unwrap();
+    epics_base_rs::runtime::fs::write(&path, content)
+        .await
+        .unwrap();
 
     let entries = read_save_file(&path).await.unwrap().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pv_name, "PV1");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_disconnected_pv_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("disconnected.sav");

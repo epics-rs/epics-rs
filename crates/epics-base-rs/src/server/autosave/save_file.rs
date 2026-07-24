@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::path::Path;
 
 use crate::types::EpicsValue;
@@ -539,7 +537,7 @@ mod tests {
     /// `save/restore` banner (the banner a C IOC expects) and is
     /// still readable by the Rust reader — the array form
     /// round-trips through `parse_c_array_line`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn c_compat_save_file_has_c_banner_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.sav");
@@ -577,7 +575,7 @@ mod tests {
     }
 
     /// M6: native mode still writes the autosave-rs banner.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn native_save_file_keeps_native_banner() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("native.sav");

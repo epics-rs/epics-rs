@@ -9,8 +9,6 @@
 //! merely that processing leaves the records un-alarmed — a no-alarm-only test
 //! would pass even if the device never ran.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -19,7 +17,7 @@ use epics_base_rs::types::EpicsValue;
 
 /// bo sets the named bit, bi reads it back — both set (1) and clear (0)
 /// round-trip through the shared `dbState` registry.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn db_state_bo_write_propagates_to_bi_read() {
     let (db, _) = IocBuilder::new()
         .db_string(
@@ -97,7 +95,7 @@ record(bi, "DBST_BI") {
 /// gate Errs in `init()`, so `wire_device_to_record` flags the record INVALID
 /// at build time — proving the device attached and gated rather than being
 /// silently accepted as a soft channel.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn db_state_wrong_record_type_is_invalid() {
     let (db, _) = IocBuilder::new()
         .db_string(

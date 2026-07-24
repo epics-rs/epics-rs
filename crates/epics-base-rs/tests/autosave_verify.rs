@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ao::AoRecord;
 
@@ -20,7 +18,7 @@ async fn setup_db() -> PvDatabase {
     db
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_verify_all_match() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("match.sav");
@@ -50,7 +48,7 @@ async fn test_verify_all_match() {
     assert!(matches!(results[1].result, MatchResult::Match));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_verify_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mismatch.sav");
@@ -72,7 +70,7 @@ async fn test_verify_mismatch() {
     assert!(matches!(results[0].result, MatchResult::Mismatch { .. }));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_verify_pv_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("notfound.sav");
@@ -94,7 +92,7 @@ async fn test_verify_pv_not_found() {
     assert!(matches!(results[0].result, MatchResult::PvNotFound));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_verify_report_format() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("report.sav");

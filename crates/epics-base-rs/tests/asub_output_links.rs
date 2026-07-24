@@ -20,8 +20,6 @@
 //! The port stored OUTA..OUTU and never wrote them: a subroutine's results
 //! reached VALA..VALU (and their CA monitors) but no downstream record.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -95,7 +93,7 @@ async fn asub_db(status: i64) -> PvDatabase {
 }
 
 /// do_sub returns 0 — every configured OUT link is pushed, first to last.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_78_successful_do_sub_pushes_every_output_link() {
     let db = asub_db(0).await;
 
@@ -120,7 +118,7 @@ async fn r9_78_successful_do_sub_pushes_every_output_link() {
 
 /// do_sub returned non-zero — C's `if (!status)` skips the whole push loop, so
 /// no OUT link is written even though VALA..VALU hold fresh values.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_78_failed_do_sub_pushes_nothing() {
     let db = asub_db(3).await;
 
@@ -145,7 +143,7 @@ async fn r9_78_failed_do_sub_pushes_nothing() {
 
 /// A failed INPUT link aborts fetch_values, C's `status` stays non-zero, do_sub
 /// never runs — and the push loop is skipped with it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_78_failed_input_fetch_pushes_nothing() {
     let db = asub_db(0).await;
     {
@@ -172,7 +170,7 @@ async fn r9_78_failed_input_fetch_pushes_nothing() {
 /// link: a subroutine-less aSub with a preset VALA and a wired OUTA drives its
 /// sink. (The real `S_db_BadSub` case is a NON-empty, unregistered SNAM; that
 /// non-zero-status suppression is covered by `r9_78_failed_do_sub_pushes_nothing`.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_78_empty_snam_pushes_output_links() {
     let db = PvDatabase::new();
     db.add_record("SINK_A", Box::new(AiRecord::new(0.0)))

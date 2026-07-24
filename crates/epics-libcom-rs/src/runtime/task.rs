@@ -1,4 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): the two multi-thread-flavored tests prove a
+// dedicated thread carries the ambient tokio runtime / requested stack; the
+// tokio flavor is the property under test. Both run and pass in the
+// feature-ON suite.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -153,6 +156,128 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
+/// A capability, captured where the backend's executor is reachable, to run
+/// async work from a plain blocking thread (iocsh, a REPL, a script thread).
+///
+/// [`block_on_sync`] answers "may I block *here*, now?" per call and can only
+/// use whatever runtime is visible on the calling thread. This type answers
+/// the reachability question once, at [`capture`](Self::capture) time, and
+/// carries the answer to a thread the runtime is otherwise invisible from: a
+/// tokio handle is thread-local state, so a blocking thread spawned *before*
+/// it exists has no way to find it. The exec backend's executor is
+/// process-global, so there is nothing to carry and the bridge is a ZST —
+/// which is what makes an API taking a `BlockingBridge` compile and work on
+/// both backends, where one taking `tokio::runtime::Handle` pinned every
+/// caller to tokio.
+#[cfg(tokio_backend)]
+#[derive(Clone)]
+pub struct BlockingBridge {
+    handle: tokio::runtime::Handle,
+}
+
+/// See the `tokio_backend` definition. The executor here is the
+/// process-global background executor, reachable from any thread, so there is
+/// no state to capture.
+#[cfg(exec_backend)]
+#[derive(Clone)]
+pub struct BlockingBridge;
+
+#[cfg(tokio_backend)]
+impl BlockingBridge {
+    /// Capture the current tokio runtime.
+    ///
+    /// # Panics
+    /// Panics when no runtime is entered on this thread — call it on the
+    /// async setup path (where the runtime is known), not on the blocking
+    /// thread the bridge is being made for.
+    pub fn capture() -> Self {
+        Self {
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    /// Drive `fut` to completion on this thread, with the captured runtime
+    /// entered so the future may spawn and use the reactor.
+    ///
+    /// # Panics
+    /// Panics on a runtime worker thread: blocking one parks tasks that may
+    /// include the future's own wakers (the same refusal `block_on_sync`
+    /// reports as a value).
+    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        assert!(
+            RuntimeHandle::try_current().is_err(),
+            "BlockingBridge::block_on must not be called from a runtime thread"
+        );
+        self.handle.block_on(fut)
+    }
+
+    /// Spawn `future` onto the captured runtime — [`spawn`] for a thread the
+    /// runtime is not entered on.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+}
+
+#[cfg(exec_backend)]
+impl BlockingBridge {
+    /// The exec backend's executor is process-global; capturing is a no-op
+    /// and never panics.
+    pub fn capture() -> Self {
+        Self
+    }
+
+    /// Drive `fut` on this thread via [`park_on`]; whatever it spawns or
+    /// sleeps on lands on the background executor.
+    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        park_on(fut)
+    }
+
+    /// [`spawn`] — the global executor needs no captured state.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn(future)
+    }
+}
+
+/// Drive an async test body to completion — the driver behind
+/// `#[epics_test]` (`epics-macros-rs`).
+///
+/// The point of the indirection is that the *backend* picks the driver, not
+/// the test. On `tokio_backend` this builds exactly what `#[tokio::test]`
+/// builds: a fresh current-thread runtime with IO and time enabled. On
+/// `exec_backend` (the RTEMS target, or a host run with
+/// `--features rtems-exec-model`) no tokio runtime exists to build, so the
+/// test thread itself drives the future via [`park_on`], and everything the
+/// body spawns or sleeps on lands on the process-global background executor
+/// (lazily initialised on first use) — the same seam the RTEMS boot path
+/// exercises. A test written with `#[epics_test]` therefore needs no
+/// per-backend gating and no `RTEMS-EXEC-MODEL-ALLOW` census entry.
+#[cfg(tokio_backend)]
+pub fn test_block_on<F: Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio test runtime")
+        .block_on(fut)
+}
+
+/// `exec_backend` twin of [`test_block_on`]: see the `tokio_backend` copy for
+/// the contract. The body's awaits must reach only runtime-agnostic
+/// primitives (`park_on`'s rule) — a body that touches `tokio::net` or
+/// `tokio::time` directly belongs under `#[tokio::test]` with a backend gate
+/// instead.
+#[cfg(exec_backend)]
+pub fn test_block_on<F: Future>(fut: F) -> F::Output {
+    park_on(fut)
+}
+
 // ---------------------------------------------------------------------------
 // Platform-selected task handle types (decision A2 / B)
 //
@@ -265,6 +390,36 @@ where
         DEFAULT_SPAWN_PRIORITY,
         future,
     )
+}
+
+/// Yield the current task once — the seam replacement for
+/// `tokio::task::yield_now`, so no call site names `tokio::task` directly.
+#[cfg(tokio_backend)]
+pub async fn yield_now() {
+    tokio::task::yield_now().await;
+}
+
+/// Exec-backend yield: return `Pending` once with the waker already woken.
+/// On the cooperative background executor that re-enqueues the task behind
+/// whatever else is runnable; under a `park_on` driver the wake sets the
+/// park token, so the driver re-polls immediately — both give one fair
+/// scheduling point, which is all `yield_now` promises.
+#[cfg(exec_backend)]
+pub async fn yield_now() {
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    YieldNow(false).await;
 }
 
 #[cfg(tokio_backend)]
@@ -1728,13 +1883,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_spawn() {
         let handle = spawn(async { 42 });
         assert_eq!(handle.await.unwrap(), 42);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_spawn_blocking() {
         let handle = spawn_blocking(|| 123);
         assert_eq!(handle.await.unwrap(), 123);
@@ -1792,7 +1947,7 @@ mod tests {
     /// The assertion is on `block_on_sync` succeeding, not on the absence of a
     /// handle, because being able to block is the property the thread is spawned
     /// for; how that is arranged is this function's business.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_dedicated_thread_can_block_under_a_current_thread_ambient() {
         let (tx, rx) = std::sync::mpsc::channel();
         let joined = spawn_dedicated_thread(
@@ -1955,7 +2110,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn test_sleep() {
         let start = std::time::Instant::now();
         sleep(Duration::from_millis(10)).await;
@@ -1966,13 +2121,13 @@ mod tests {
     // tokio delegation, and that is the point: they are what a later backend
     // swap has to keep true, on a seam whose whole purpose is to be
     // reimplemented.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_yields_the_value_when_the_future_finishes_first() {
         let r = timeout(Duration::from_secs(30), async { 42 }).await;
         assert_eq!(r.unwrap(), 42);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_elapses_on_a_future_that_never_finishes() {
         let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
         assert!(r.is_err());
@@ -2637,7 +2792,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn spawn_blocking_with_priority_runs_closure() {
         let handle = spawn_blocking_with_priority(ThreadPriority::CaServerHigh, || 7);
         assert_eq!(handle.await.unwrap(), 7);

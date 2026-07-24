@@ -41,9 +41,9 @@ pub fn db_pvxr_command(resolver: PvaLinkResolver) -> CommandDef {
                 _ => return Err("pvxr: missing pv_name".into()),
             };
             let resolver = resolver.clone();
-            let handle = ctx.runtime_handle().clone();
+            let bridge = ctx.bridge().clone();
             let result = std::thread::spawn(move || {
-                handle.block_on(async move { resolver.open(&name).await })
+                bridge.block_on(async move { resolver.open(&name).await })
             })
             .join();
             match result {

@@ -1060,6 +1060,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "epics-base-rs",
+ "epics-macros-rs",
  "epics-rtems-boot",
  "futures-util",
  "hickory-client",
@@ -1101,6 +1102,7 @@ name = "epics-libcom-rs"
 version = "0.24.3"
 dependencies = [
  "chrono",
+ "epics-macros-rs",
  "hostname",
  "if-addrs",
  "libc",

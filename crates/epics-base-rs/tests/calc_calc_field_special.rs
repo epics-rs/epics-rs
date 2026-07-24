@@ -10,8 +10,6 @@
 //! return `Ok(())` — the client saw a successful write and the record silently
 //! kept an uncompilable expression.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;
@@ -19,7 +17,7 @@ use epics_base_rs::types::EpicsValue;
 
 const ECA_PUTFAIL: u32 = 160; // (20 << 3) | CA_K_WARNING
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bad_calc_put_is_rejected_but_the_string_is_stored() {
     let db = PvDatabase::new();
     db.add_record("CALCREC", Box::new(CalcRecord::new("A+1")))
@@ -45,7 +43,7 @@ async fn bad_calc_put_is_rejected_but_the_string_is_stored() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn empty_calc_put_is_rejected_like_c_postfix_null_arg() {
     let db = PvDatabase::new();
     db.add_record("CALCEMPTY", Box::new(CalcRecord::new("A+1")))
@@ -61,7 +59,7 @@ async fn empty_calc_put_is_rejected_like_c_postfix_null_arg() {
     assert!(matches!(err, CaError::BadField(_)), "got {err:?}");
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn good_calc_put_still_succeeds_and_recompiles() {
     let db = PvDatabase::new();
     db.add_record("CALCOK", Box::new(CalcRecord::new("A+1")))

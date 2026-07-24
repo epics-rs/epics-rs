@@ -72,6 +72,10 @@ libc = "0.2"
 # crate that declares the feature has the same hole, and copies of a 300-line
 # audit is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+# Dev-only: `#[epics_test]` for this crate's own suite. The macro resolves the
+# runtime path through `epics-libcom-rs` itself (its last fallback), so the
+# tests use the backend-selected driver without a cycle through epics-base-rs.
+epics-macros-rs = { workspace = true }
 tempfile = "3"
 serial_test = "3"
 # Test-only: `runtime::log`'s tests install a bare `tracing` registry to prove

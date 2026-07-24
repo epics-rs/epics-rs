@@ -16,8 +16,6 @@
 //! model the field at all, so a caget fell through to that same `.dbd` initial),
 //! and neither refused the seed. This drives the whole path through the loader.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -40,7 +38,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 
 /// Every link-status field of a default (all-constant-link) record reads
 /// `Constant`(3) through the full DB-load path — NOT the `.dbd` `initial("1")`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn link_status_reads_derived_constant_after_load() {
     let db = build().await;
     let cases: &[(&str, &[&str])] = &[
@@ -62,7 +60,7 @@ async fn link_status_reads_derived_constant_after_load() {
 
 /// A direct client put to a link-status field is refused (C `S_db_noMod`), and
 /// the derived value is unchanged.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn link_status_put_is_refused_and_value_stands() {
     let db = build().await;
     for (rec, f) in [("A", "INAV"), ("S", "IAAV"), ("X", "OAV"), ("X", "IAV")] {

@@ -24,8 +24,6 @@
 //! - external target, metadata count > 1    → array buffer
 //! - external target, no metadata (C failed dbCaGetNelements) → scalar
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -172,7 +170,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 /// Scalar local target, DOPT=Use OCAL: effective nelm 1 → `&pcalc->oval`
 /// (devaCalcoutSoft.c:87) → the target receives IVOV, not the stale OAV[0].
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ivov_reaches_a_scalar_target_under_use_ocal() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -194,7 +192,7 @@ async fn ivov_reaches_a_scalar_target_under_use_ocal() {
 
 /// Array local target, DOPT=Use OCAL: effective nelm > 1 → `pcalc->oav`
 /// — IVOV touched only OVAL, so the target receives the STALE OAV.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ivov_bypasses_an_array_target_under_use_ocal() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -216,7 +214,7 @@ async fn ivov_bypasses_an_array_target_under_use_ocal() {
 
 /// DOPT=Use VAL: the buffer is `&val`/`aval`, which IVOV never touches —
 /// C's substitution is a no-op and the computed value is driven.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ivov_is_a_no_op_under_use_val() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -239,7 +237,7 @@ async fn ivov_is_a_no_op_under_use_val() {
 /// 1-element SOURCE (NELM=1), array target: C's clamp
 /// `i = (nuse>0 ? nuse : nelm) = 1` forces nelm to 1 ⇒ `&oval` ⇒ the
 /// array target still receives the scalar buffer, i.e. IVOV.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_single_element_source_picks_the_scalar_buffer() {
     let db = PvDatabase::new();
     let last = Arc::new(Mutex::new(None));
@@ -261,7 +259,7 @@ async fn a_single_element_source_picks_the_scalar_buffer() {
 
 /// External target reporting element_count=3 (`dbCaGetNelements`
 /// succeeded): array buffer — the stale OAV reaches the lset put.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_external_array_target_gets_the_array_buffer() {
     let db = PvDatabase::new();
     let last_put = Arc::new(Mutex::new(None));
@@ -288,7 +286,7 @@ async fn an_external_array_target_gets_the_array_buffer() {
 
 /// External target with NO metadata — C's `dbCaGetNelements` fails and
 /// `nelm` keeps its initializer 1 (devaCalcoutSoft.c:68) ⇒ scalar buffer.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
     let db = PvDatabase::new();
     let last_put = Arc::new(Mutex::new(None));

@@ -1,5 +1,6 @@
-// RTEMS-EXEC-MODEL-ALLOW(45): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(35): the flavored tests drive the async CA TCP server
+// (tokio::net, tokio::spawn AbortHandle machinery), which needs the reactor. These run and pass in the
+// feature-ON suite on the tokio driver.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7296,7 +7297,7 @@ mod pre_v49_peer_tests {
     /// extended form only when `CA_V49(minor)`. For a pre-V49 peer the
     /// echo is the plain 16-byte header — a 24-byte echo would de-sync a
     /// client with no annex parser.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pre_v49_error_echo_is_sixteen_bytes() {
         let (outbox, mut drain) = live_outbox();
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
@@ -7332,7 +7333,7 @@ mod pre_v49_peer_tests {
     }
 
     /// The same error to a V49 peer keeps the 24-byte extended echo.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn v49_error_echo_is_twenty_four_bytes() {
         let (outbox, mut drain) = live_outbox();
         let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
@@ -7364,7 +7365,7 @@ mod pre_v49_peer_tests {
     /// pre-V49 peer. C `read_reply` / `read_action` answer with
     /// `send_err(ECA_16KARRAYCLIENT)` (`camessage.c:~700`) rather than
     /// emitting an extended header the peer cannot parse.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn oversize_reply_to_pre_v49_peer_is_eca_16karrayclient() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
@@ -8988,7 +8989,7 @@ mod single_write_all_framing_tests {
 
     /// `send_ca_error` builds response-header + echoed-request-header +
     /// diagnostic string. All three must leave in a single `write_all`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn send_ca_error_writes_single_frame() {
         let (outbox, mut drain) = live_outbox();
         let original = CaHeader::new(CA_PROTO_READ_NOTIFY);
@@ -9029,7 +9030,7 @@ mod single_write_all_framing_tests {
     /// ZEROED body. The pre-fix `send_cmd_error` shipped `count=0` + an
     /// empty body; this locks the corrected `send_no_read_access_event`
     /// shape the get-failure and no-snapshot paths now use.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn read_notify_get_failure_frame_keeps_count_and_zero_body() {
         let (outbox, mut drain) = live_outbox();
         let requested_count = 3u32;
@@ -9097,7 +9098,7 @@ mod single_write_all_framing_tests {
     /// Regression: when the original request used an extended
     /// 24-byte header, the outer CA_PROTO_ERROR reply must declare
     /// `m_postsize = 24 + diag_len`, not `16 + diag_len`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn send_ca_error_extended_original_declares_correct_payload_size() {
         let (outbox, mut drain) = live_outbox();
         // Build an extended original header: set_payload_size triggers
@@ -9145,7 +9146,7 @@ mod single_write_all_framing_tests {
 
     /// `send_monitor_snapshot` (the introspection EVENT_ADD reply) must
     /// emit header + padded payload as a single `write_all`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn send_monitor_snapshot_writes_single_frame() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
@@ -9188,7 +9189,7 @@ mod single_write_all_framing_tests {
     /// shape the READ path and later monitor updates use. Pre-fix the
     /// initial frame was framed at `snapshot.value.count()`, so a
     /// client saw a count/size discontinuity inside one subscription.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r9_initial_snapshot_pads_over_requested_count() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, DbFieldType, EpicsValue};
@@ -9253,7 +9254,7 @@ mod single_write_all_framing_tests {
     /// a request count SMALLER than the live element count
     /// still truncates — `send_monitor_snapshot` must own both
     /// directions of the count contract.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r9_initial_snapshot_truncates_under_requested_count() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
@@ -9286,7 +9287,7 @@ mod single_write_all_framing_tests {
 
     /// `requested_count == 0` is autosize — the frame keeps the
     /// live element count, unchanged behaviour.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ex_r9_autosize_keeps_live_count() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};

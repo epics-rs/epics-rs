@@ -17,8 +17,6 @@
 //! downstream records held their last good value with `SEVR=0 STAT=0` for
 //! the whole 65 s upstream outage.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{LinkSet, PvDatabase};
@@ -96,7 +94,7 @@ async fn holder_db(lset: Arc<SwitchableLset>) -> PvDatabase {
 /// The gate itself: with the circuit up, a dispatch pulls the upstream
 /// value in with no alarm; with the circuit down, the very same dispatch
 /// commits LINK/INVALID and leaves VAL where it was.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
     use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
 
@@ -138,7 +136,7 @@ async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
 
 /// Recovery, the other half of criterion 4: the alarm must clear on the
 /// next event after the circuit comes back, with no restart of the IOC.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_link_alarm_clears_on_the_next_event_after_recovery() {
     let lset = SwitchableLset::new(7.25);
     let db = holder_db(lset.clone()).await;

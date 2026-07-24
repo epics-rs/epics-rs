@@ -22,8 +22,6 @@
 //! per-cycle fact cannot outlive its cycle: a gated or simulated cycle, which
 //! runs no `calcPerform`, raises nothing.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -59,7 +57,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
 /// CLCV carries `postfix()`'s status: 0 for a CALC that compiled, -1 for one
 /// that did not. Base `postfix("")` is `CALC_ERR_NULL_ARG` → -1, so swait's
 /// empty CALC is INVALID (unlike sCalcPostfix/aCalcPostfix, which accept it).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_clcv_carries_the_postfix_status() {
     for (calc, want) in [("A+1", 0), ("", -1), ("1+", -1), ("@#$", -1)] {
         let mut w = SwaitRecord::default();
@@ -72,7 +70,7 @@ async fn r10_67_clcv_carries_the_postfix_status() {
 
 /// The put SUCCEEDS and CLCV reports the verdict — C's `special(SPC_CALC)`
 /// returns 0 (`swaitRecord.c:560-567`), unlike calcRecord's `S_db_badField`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_a_broken_calc_put_succeeds_and_lands_in_clcv() {
     let db = PvDatabase::new();
     let mut w = SwaitRecord::default();
@@ -95,7 +93,7 @@ async fn r10_67_a_broken_calc_put_succeeds_and_lands_in_clcv() {
 
 /// C posts CLCV `DBE_VALUE` from `special()` (`swaitRecord.c:566`) — CLCV is not
 /// `pp(TRUE)`, so nothing else would post it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_a_calc_put_posts_clcv() {
     let db = PvDatabase::new();
     let mut w = SwaitRecord::default();
@@ -119,7 +117,7 @@ async fn r10_67_a_calc_put_posts_clcv() {
 
 /// The alarm. A broken CALC fails `calcPerform` every cycle, and C raises
 /// CALC_ALARM/INVALID every cycle. Pre-fix the port reported NO_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_a_broken_calc_raises_calc_alarm_every_cycle() {
     let db = PvDatabase::new();
     let mut w = SwaitRecord::default();
@@ -157,7 +155,7 @@ async fn r10_67_a_broken_calc_raises_calc_alarm_every_cycle() {
 /// fact. A cycle that runs no `calcPerform` — here because the input fetch
 /// failed (C `swaitRecord.c:407`) — must not re-raise the previous cycle's
 /// failure. C raises READ_ALARM instead, and nothing else.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
     let db = PvDatabase::new();
     db.add_record("SRC", Box::new(AiRecord::new(1.0)))
@@ -191,7 +189,7 @@ async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
 /// the sticky flag. C `calcRecord.c:120` runs no `calcPerform` on a failed fetch
 /// and — unlike swait — raises nothing at all, so the record must report
 /// NO_ALARM. Pre-fix the stale flag re-raised CALC_ALARM on every gated cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
     let db = PvDatabase::new();
     db.add_record("CSRC", Box::new(AiRecord::new(1.0)))
@@ -224,7 +222,7 @@ async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
 /// first one wins the tie. The framework used to raise CALC_ALARM after
 /// `rec_gbl_check_udf`, reporting UDF_ALARM for a broken CALC on an undefined
 /// record.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_67_calc_alarm_wins_the_stat_over_udf_alarm() {
     let db = PvDatabase::new();
 

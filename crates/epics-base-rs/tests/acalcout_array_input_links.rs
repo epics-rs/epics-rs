@@ -15,8 +15,6 @@
 //!     destination: `dbGetLink(..., DBR_DOUBLE, pvalue, 0, 0)`)
 //!   * scalar source -> scalar field, unchanged (negative control)
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -47,7 +45,7 @@ async fn wf_source(db: &PvDatabase, name: &str, data: Vec<f64>) {
 
 /// INAA -> a 5-element waveform, CALC="SUM(AA)". Compiled C (aCalcPerform,
 /// arraySize 5, AA=[1..5]): dresult=15.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_61_array_input_link_populates_aa() {
     let db = PvDatabase::new();
     wf_source(&db, "WF", vec![1.0, 2.0, 3.0, 4.0, 5.0]).await;
@@ -73,7 +71,7 @@ async fn r11_61_array_input_link_populates_aa() {
 
 /// A source shorter than the record's element count zero-fills the tail
 /// (C: `for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_61_short_array_source_zero_fills_the_tail() {
     let db = PvDatabase::new();
     wf_source(&db, "WF2", vec![7.0, 8.0]).await;
@@ -98,7 +96,7 @@ async fn r11_61_short_array_source_zero_fills_the_tail() {
 
 /// An array source feeding a SCALAR value field is a one-element destination in
 /// C — it takes element 0, not nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_61_array_source_into_scalar_field_takes_element_zero() {
     let db = PvDatabase::new();
     wf_source(&db, "WF3", vec![4.0, 99.0, 99.0]).await;
@@ -115,7 +113,7 @@ async fn r11_61_array_source_into_scalar_field_takes_element_zero() {
 }
 
 /// Negative control: a scalar source still lands as a scalar Double.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_61_scalar_source_unchanged() {
     let db = PvDatabase::new();
     db.add_record(

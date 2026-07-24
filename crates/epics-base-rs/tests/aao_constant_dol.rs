@@ -20,8 +20,6 @@
 //! Boundaries: constant array DOL vs constant scalar DOL vs real link DOL; and
 //! closed_loop vs supervisory (C returns before the load in supervisory).
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -64,7 +62,7 @@ async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> 
 }
 
 /// The constant array is in VAL before any process, NORD = 3, UDF clear.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_array_dol_is_loaded_at_init() {
     let db = build().await;
 
@@ -82,7 +80,7 @@ async fn constant_array_dol_is_loaded_at_init() {
 
 /// A constant SCALAR DOL is a one-element load (`dbPutConvertJSON` on "7.5"
 /// yields nRequest = 1), landing in element 0 — the same rule as R15-79.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_scalar_dol_is_one_element() {
     let db = build().await;
 
@@ -95,7 +93,7 @@ async fn constant_scalar_dol_is_one_element() {
 
 /// Supervisory mode does not source VAL from DOL at all — C `fetchValue`
 /// returns on its first line (`if (prec->omsl != menuOmslclosed_loop) return 0`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn supervisory_mode_ignores_the_constant_dol() {
     let db = build().await;
 
@@ -112,7 +110,7 @@ async fn supervisory_mode_ignores_the_constant_dol() {
 
 /// The loaded constant reaches the OUT target on process, and the process
 /// cycle does not re-fetch the constant over a client caput to VAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn loaded_constant_writes_out_and_is_not_re_fetched() {
     let db = build().await;
 

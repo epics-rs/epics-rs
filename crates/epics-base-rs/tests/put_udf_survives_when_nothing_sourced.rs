@@ -20,8 +20,6 @@
 //! record type, so a UDF-put-driven cycle on stringin/lsi/aSub clobbered the
 //! client's `UDF=1` back to 0.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -42,7 +40,7 @@ async fn udf(db: &PvDatabase, name: &str) -> bool {
 
 /// A UDF put drives processing; because the cycle sources nothing, the put
 /// value survives — both `UDF=1` and `UDF=0` stand.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn stringin_udf_put_survives_both_directions() {
     let db = PvDatabase::new();
     db.add_record("SI", Box::new(StringinRecord::new("hi")))
@@ -68,7 +66,7 @@ async fn stringin_udf_put_survives_both_directions() {
 
 /// lsi: same shape — a constant/empty INP sources nothing at process, so the
 /// UDF put is not clobbered.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn lsi_udf_put_survives() {
     let db = PvDatabase::new();
     db.add_record("LSI", Box::new(LsiRecord::new("hi")))
@@ -86,7 +84,7 @@ async fn lsi_udf_put_survives() {
 
 /// aSub with NO subroutine runs no `do_sub`, so it sources nothing and the UDF
 /// put stands.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_udf_put_survives_without_subroutine() {
     let db = PvDatabase::new();
     db.add_record("ASUB", Box::new(ASubRecord::default()))
@@ -105,7 +103,7 @@ async fn asub_udf_put_survives_without_subroutine() {
 /// aSub WITH a subroutine that runs and returns `>= 0` DOES clear UDF — C
 /// `aSubRecord.c::do_sub` (`else prec->udf = FALSE`). This is aSub's own UDF
 /// clear, the compensating source-clear for opting out of the blanket re-derive.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn asub_clears_udf_when_subroutine_runs() {
     let db = PvDatabase::new();
 
@@ -156,7 +154,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
 /// Control: a record whose C `process()` re-derives UDF UNCONDITIONALLY
 /// (`longinRecord.c:148` `if(status==0) prec->udf = FALSE`) is UNTOUCHED by the
 /// opt-out — a UDF-put-driven cycle re-derives to 0, matching C.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn longin_still_re_derives_udf_on_process() {
     let db = PvDatabase::new();
     db.add_record("LI", Box::new(LonginRecord::new(3)))

@@ -21,8 +21,6 @@
 //! accumulates across cycles; it is visible to the second pass of the same
 //! cycle (calcout CALC → OCAL, transform channel → channel).
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -74,7 +72,7 @@ async fn f64_of(db: &PvDatabase, pv: &str) -> f64 {
 
 /// Compiled softIoc, `record(calc)` with `CALC="A:=A+1;A"`, 3 × PROC:
 /// `VAL=1 A=1 / VAL=2 A=2 / VAL=3 A=3`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calc_store_lands_in_a_and_accumulates() {
     let db = build().await;
 
@@ -99,7 +97,7 @@ async fn calc_store_lands_in_a_and_accumulates() {
 /// OCAL reads the A that CALC just stored. First cycle: CALC stores A=1, VAL=1;
 /// OCAL then computes OVAL = A*10 = 10 (not 0, which is what a fresh copy of
 /// the pre-CALC args would give).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_ocal_sees_the_calc_pass_store() {
     let db = build().await;
 
@@ -123,7 +121,7 @@ async fn calcout_ocal_sees_the_calc_pass_store() {
 
 /// sCalc stores both families: `A:=` through `parg` and `AA:=` through `psarg`
 /// (`sCalcPerform.c:888-894`, `strncpy(psarg[op - STORE_AA], ps->s, …)`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_stores_both_the_numeric_and_the_string_arg() {
     let db = build().await;
 
@@ -140,7 +138,7 @@ async fn scalcout_stores_both_the_numeric_and_the_string_arg() {
 }
 
 /// swait: C `swaitRecord.c:409` — `calcPerform(&pwait->a, &pwait->val, rpcl)`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_store_lands_in_a() {
     let db = build().await;
 
@@ -153,7 +151,7 @@ async fn swait_store_lands_in_a() {
 /// transform evaluates its channels in order against ONE arg set
 /// (`transformRecord.c:593`, `sCalcPerform(&ptran->a, 16, …)` per channel), so
 /// channel B's `A:=5` is what channel C's `A+1` fetches in the SAME cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn transform_channel_store_is_visible_to_the_next_channel() {
     let db = build().await;
 

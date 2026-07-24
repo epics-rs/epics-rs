@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! Access-security iocsh commands — the `as*` family.
 //!
 //! C registers the whole `as*` command family in
@@ -10,8 +11,6 @@
 //! `asSetSubstitutions`, and the parsed [`AccessSecurityConfig`]
 //! activated by `asInit`. The C flow is identical: `asSetFilename`
 //! has "no immediate effect", `asInit` does the (re)load.
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Mutex;
 
@@ -539,8 +538,11 @@ mod tests {
     fn make_ctx() -> (Arc<PvDatabase>, CommandContext) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let handle = rt.handle().clone();
-        let ctx = CommandContext::new(db.clone(), handle);
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(db.clone(), bridge);
         std::mem::forget(rt);
         (db, ctx)
     }

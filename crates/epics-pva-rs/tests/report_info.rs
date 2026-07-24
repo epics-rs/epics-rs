@@ -12,9 +12,8 @@
 //! info, a real in-process server+client opening a channel, and an
 //! assertion that the info reaches the server report.
 
-#![cfg(test)]
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+#![cfg(test)]
 // `ChannelSource` trait methods return `impl Future` (RPITIT); test impls
 // mirror that shape rather than `async fn`, as in the sibling test files.
 #![allow(clippy::manual_async_fn)]

@@ -1,7 +1,8 @@
 //! The `ca://` lset must answer link reads on any runtime flavor.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(2): both flavored tests run a live
+// CaServer over tokio::net. These run and pass in the
+// feature-ON suite on the tokio driver.
 use epics_base_rs::server::database::LinkSet;
 use epics_ca_rs::calink::CaLinkResolver;
 

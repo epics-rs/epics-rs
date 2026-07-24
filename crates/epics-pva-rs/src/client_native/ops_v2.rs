@@ -18,7 +18,6 @@
 //! the full window let the server window drain to 0 and stalled ~1 RTT
 //! every `pipeline_size` updates.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -7605,17 +7604,17 @@ mod tests {
     /// teardown owner must wake it. Model the loop's wait with a task
     /// that only awaits `cancel.notified()`; `teardown()` must make it
     /// return promptly instead of hanging forever.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_wakes_a_parked_monitor_loop() {
         let state = idle_sub_state();
         let task_state = state.clone();
-        let task = tokio::spawn(async move {
+        let task = epics_base_rs::runtime::task::spawn(async move {
             task_state.cancel.notified().await;
         });
         // Give the task a chance to reach `.notified().await`.
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
         state.teardown();
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), task)
             .await
             .expect("parked loop must wake on teardown, not hang")
             .expect("loop task panicked");
@@ -7629,13 +7628,16 @@ mod tests {
     /// the loop reaching its `select!` is not lost: a later `notified()`
     /// completes immediately. Without this guarantee `stop_sync()` issued
     /// on a not-yet-parked loop could still hang.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn teardown_before_park_is_not_lost() {
         let state = idle_sub_state();
         state.teardown(); // notify_one() with no waiter -> stored permit.
-        tokio::time::timeout(std::time::Duration::from_secs(1), state.cancel.notified())
-            .await
-            .expect("stored cancel permit must satisfy a later notified()");
+        epics_base_rs::runtime::task::timeout(
+            std::time::Duration::from_secs(1),
+            state.cancel.notified(),
+        )
+        .await
+        .expect("stored cancel permit must satisfy a later notified()");
     }
 
     /// `teardown()` is the shared owner for `stop()`, `stop_sync()`, and
@@ -7666,16 +7668,18 @@ mod tests {
     /// server withholds the INIT reply must complete the cancel promptly
     /// (return `Cancelled`) rather than hang the spawned monitor task
     /// forever — the regression this fix closes.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_cancels_on_teardown_during_wait() {
         let state = idle_sub_state();
         let task_state = Some(state.clone());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        let task = tokio::spawn(async move { recv_monitor_init(&task_state, &mut rx).await });
+        let task = epics_base_rs::runtime::task::spawn(async move {
+            recv_monitor_init(&task_state, &mut rx).await
+        });
         // Let the task reach its `select!` (silent-but-open server).
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
         state.teardown();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        let out = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), task)
             .await
             .expect("INIT recv must wake on teardown, not hang on a silent server")
             .expect("task panicked");

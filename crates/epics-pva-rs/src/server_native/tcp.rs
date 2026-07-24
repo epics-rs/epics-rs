@@ -20,7 +20,7 @@
 //! No socket type is named anywhere in this file's production scope, and
 //! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
-// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11209,7 +11209,7 @@ mod tests {
     /// Also pins the arm-before-read ordering: the ACK path adds credit and
     /// calls `notify_waiters()`, which stores no permit, so a waiter armed
     /// AFTER the window read would miss the refill and park forever.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn monitor_pipeline_credit_refill_wakes_the_armed_waiter() {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let window = Arc::new(AtomicU32::new(0));
@@ -11232,9 +11232,12 @@ mod tests {
         let refill = credit.arm_refill();
         assert!(!credit.available(), "no credit → the emit gate is shut");
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), wait_credit_refill(refill))
-                .await
-                .is_err(),
+            epics_base_rs::runtime::task::timeout(
+                Duration::from_millis(50),
+                wait_credit_refill(refill)
+            )
+            .await
+            .is_err(),
             "with no ACK the refill waiter must park"
         );
 
@@ -11245,9 +11248,12 @@ mod tests {
         window.fetch_add(1, Ordering::Relaxed);
         notify.notify_waiters();
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), wait_credit_refill(refill))
-                .await
-                .is_ok(),
+            epics_base_rs::runtime::task::timeout(
+                Duration::from_millis(500),
+                wait_credit_refill(refill)
+            )
+            .await
+            .is_ok(),
             "an ACK refill must wake the armed waiter"
         );
         assert!(credit.available(), "the refilled window re-opens the gate");
@@ -11590,7 +11596,7 @@ mod tests {
     /// INIT->START window are delivered in order (A(seed), B, C, D) at the
     /// first START. Pre-fix the subscriber spawned only at START, so the
     /// window posts were lost and only the latest seed survived.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_init_window_posts_accrue_in_order() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 700u32);
@@ -11621,13 +11627,13 @@ mod tests {
 
         // Let the subscriber task subscribe and capture the seed (0,0,0)
         // BEFORE any post arrives.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
         // Posts arrive while the monitor is Idle (INIT->START window).
         for i in 1..=3 {
             pusher.try_post(three_field_value(i, 0, 0));
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         // Invariant: an Idle monitor emits nothing before START.
         assert!(
             rx.try_recv().is_err(),
@@ -11648,7 +11654,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -11663,7 +11669,7 @@ mod tests {
     /// five posts in the INIT->START window squash to the seed + the
     /// latest, so START delivers exactly 2 frames (bounded FIFO, newest
     /// tail wins).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_backlog_bounds_to_queue_size() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (2u32, 701u32);
@@ -11689,15 +11695,15 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // Five posts while Idle — the FIFO (seed + queueSize-1 tail) must
         // bound them to 2 total.
         for i in 1..=5 {
             pusher.try_post(three_field_value(i, 0, 0));
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(15)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         pvx61_drive(
             &pvx61_ctrl_frame(sid, ioid, 0x44, order),
@@ -11712,7 +11718,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -11731,7 +11737,7 @@ mod tests {
 
     /// Backlog == 0: a START with no window posts delivers the seed
     /// only.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_seed_only_no_backlog() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (3u32, 702u32);
@@ -11757,7 +11763,7 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         pvx61_drive(
             &pvx61_ctrl_frame(sid, ioid, 0x44, order),
@@ -11772,7 +11778,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -11784,7 +11790,7 @@ mod tests {
 
     /// Backlog == 1: a single window post delivers the seed + that
     /// one post.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_single_backlog() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (4u32, 703u32);
@@ -11810,10 +11816,10 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         pusher.try_post(three_field_value(1, 0, 0));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
         pvx61_drive(
             &pvx61_ctrl_frame(sid, ioid, 0x44, order),
@@ -11828,7 +11834,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -11842,7 +11848,7 @@ mod tests {
     /// same Idle-accruing state as INIT->START: posts during the pause
     /// accrue up to queueSize and flush at the next START. Pre-fix the
     /// single `held` cell delivered only the latest pause-window value.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_stop_start_delivers_backlog_depth() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (5u32, 704u32);
@@ -11868,7 +11874,7 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // First START drains the seed.
         pvx61_drive(
@@ -11884,7 +11890,7 @@ mod tests {
         )
         .await
         .expect("first MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
         let seed = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(seed, vec![0], "first START delivers the seed; got {seed:?}");
 
@@ -11902,12 +11908,12 @@ mod tests {
         )
         .await
         .expect("MONITOR STOP ok");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         for i in 1..=3 {
             pusher.try_post(three_field_value(i, 0, 0));
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         // Still Idle — nothing emitted during the pause.
         assert!(
             rx.try_recv().is_err(),
@@ -11928,7 +11934,7 @@ mod tests {
         )
         .await
         .expect("second MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -11943,7 +11949,7 @@ mod tests {
     /// task is spawned at INIT with its abort guard installed in the same
     /// synchronous step, so a DESTROY arriving before any START removes
     /// the op, drops the abort, and fires the terminal `MonitorFinished`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_destroy_before_start_tears_down() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (6u32, 705u32);
@@ -11971,7 +11977,7 @@ mod tests {
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
         // Let the task subscribe and install its `MonitorFinishGuard`.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
         assert!(
             mon_fin_rx.try_recv().is_err(),
             "the subscriber is alive (Idle) before DESTROY — no finish yet"
@@ -11992,7 +11998,7 @@ mod tests {
         .await
         .expect("MONITOR DESTROY ok");
 
-        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+        let fin = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), mon_fin_rx.recv())
             .await
             .expect("teardown fires within 2s")
             .expect("MonitorFinished");
@@ -12007,7 +12013,7 @@ mod tests {
     /// subscriber; dropping the channels map (connection teardown) before
     /// any START drops the op's abort guard, aborting the task and firing
     /// the terminal `MonitorFinished`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_never_start_tears_down_on_drop() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (7u32, 706u32);
@@ -12035,12 +12041,12 @@ mod tests {
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
         // Let the task subscribe and install its guard before teardown.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // Connection torn down before any START.
         drop(channels);
 
-        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+        let fin = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), mon_fin_rx.recv())
             .await
             .expect("teardown fires within 2s")
             .expect("MonitorFinished");
@@ -12054,7 +12060,7 @@ mod tests {
     /// Pre-fix the terminal FINISH was ungated on Executing, so an Idle-close
     /// emitted FINISH immediately and abandoned the accrued backlog. Newly
     /// reachable because the subscriber now runs from INIT.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_source_close_while_idle_holds_backlog_until_start() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (11u32, 710u32);
@@ -12080,19 +12086,19 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // Posts arrive while the monitor is Idle (INIT->START window).
         for i in 1..=3 {
             pusher.try_post(three_field_value(i, 0, 0));
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
 
         // The PV closes while the monitor is STILL Idle (never STARTed): the
         // subscriber's source channel ends but no START has arrived.
         pusher.close();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // Invariant: an Idle monitor emits NOTHING on source-close — no
         // FINISH, no DATA. The backlog and the finish are held for a START.
@@ -12117,7 +12123,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         // Classify every drained frame in order: DATA field-`a` values, and
         // whether the terminal FINISH followed the whole backlog.
@@ -12254,7 +12260,7 @@ mod tests {
     /// counterpart of T1). The raw subscriber accrues events from INIT and
     /// flushes them after START in order, ahead of the cooked seed's
     /// backlog.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_raw_path_accrues_in_order() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (8u32, 707u32);
@@ -12280,16 +12286,16 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         for i in 1..=3 {
             raw_tx
                 .send(pvx61_raw_event(i, order))
                 .await
                 .expect("raw event queued");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         assert!(
             rx.try_recv().is_err(),
             "an Idle (pre-START) raw monitor must not emit any DATA frame"
@@ -12308,7 +12314,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -12322,7 +12328,7 @@ mod tests {
     /// raw counterpart of T2). Five events with queueSize 2 flush to
     /// exactly 2 frames (seed + latest), the same total the decoded path
     /// yields — the cooked seed counts against queueSize on both paths.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_raw_path_bounds_to_queue_size() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (9u32, 708u32);
@@ -12348,16 +12354,16 @@ mod tests {
         .await
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         for i in 1..=5 {
             raw_tx
                 .send(pvx61_raw_event(i, order))
                 .await
                 .expect("raw event queued");
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(15)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         pvx61_drive(
             &pvx61_ctrl_frame(sid, ioid, 0x44, order),
@@ -12372,7 +12378,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(250)).await;
 
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert_eq!(
@@ -12440,7 +12446,7 @@ mod tests {
     /// the seed is pending[0] and is rechecked on pop. Pre-fix the raw seed
     /// was emitted via `seed_cooked.take()` without the recheck, so a client
     /// that lost read access still received it.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_raw_seed_rechecks_acl_on_reload() {
         use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
         let order = ByteOrder::Little;
@@ -12497,7 +12503,7 @@ mod tests {
         .expect("MONITOR INIT ok");
         let _ = rx.recv().await.expect("INIT introspection reply");
         // Let the raw subscriber capture the seed under the permissive gate.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
 
         // ACL reload during the idle window: READ is revoked, version bumped.
         let deny = parse_acf(
@@ -12509,7 +12515,7 @@ mod tests {
         .expect("acf");
         cell.store(Some(std::sync::Arc::new(deny)));
         version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
 
         // START: the raw seed emit rechecks ACL, sees the deny, and emits
         // FINISH instead of the seed DATA frame.
@@ -12526,7 +12532,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
 
         let mut data = Vec::new();
         let mut saw_finish = false;
@@ -12623,7 +12629,7 @@ mod tests {
     /// `tests/parity/test_monitor_reload_deny_composite.rs`; this change
     /// preserved that per-event recheck arm unchanged, so that test
     /// remains its coverage.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pvx61_acl_deny_surfaces_at_init() {
         let order = ByteOrder::Little;
         let (sid, ioid) = (10u32, 709u32);
@@ -12667,7 +12673,7 @@ mod tests {
 
         // The subscribe is denied AT INIT: the subscriber task returns
         // immediately, firing its terminal MonitorFinished.
-        let fin = tokio::time::timeout(Duration::from_secs(2), mon_fin_rx.recv())
+        let fin = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), mon_fin_rx.recv())
             .await
             .expect("ACL deny tears the subscriber down at INIT within 2s")
             .expect("MonitorFinished");
@@ -12688,7 +12694,7 @@ mod tests {
         )
         .await
         .expect("MONITOR START ok");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
         let seq = pvx61_drain_data_a(&mut rx, &intro, order);
         assert!(
             seq.is_empty(),
@@ -19380,7 +19386,7 @@ mod tests {
     /// them (coalescing is correct for the production net-state, but a
     /// per-edge assertion needs them separated). The source-level
     /// `notify_monitor_start` edges stay in lockstep.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bridge118_gate_driver_follows_executing_edges() {
         use crate::server_native::source::MonitorGate;
 
@@ -19411,7 +19417,7 @@ mod tests {
         // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
         // covers the same path end to end through a real MONITOR.
         let mut gate_driver = MonitorGateDriver::new(Some(gate));
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             loop {
                 let executing = *exec_rx.borrow_and_update();
                 gate_driver.apply(executing).await;
@@ -19427,7 +19433,7 @@ mod tests {
                 if log.lock().len() >= n {
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
             }
             panic!("gate log never reached {n} entries: {:?}", log.lock());
         }
@@ -19521,7 +19527,7 @@ mod tests {
     /// Revert-verify: drop the per-iteration `gate_driver.apply(executing)`
     /// (keeping only the pre-loop application) and the log stalls at
     /// `[false]`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn bfr12_gate_reaches_a_parked_monitor() {
         let intro = three_field_intro();
         let gate_log = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
@@ -19565,7 +19571,7 @@ mod tests {
                 if log.lock().len() >= n {
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
             }
             panic!("gate log never reached {n} entries: {:?}", log.lock());
         }

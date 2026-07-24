@@ -22,7 +22,6 @@
 //! pipeline window. We don't yet wire them into the wire-level
 //! ackCount but the API is in place for callers to set them.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -2237,7 +2236,7 @@ mod tests {
     ///
     /// Before fix: try_send returned TrySendError::Full for posts 3 and 4, so
     /// consumer saw [1, 2] and the assertion v2 == 4 failed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_r6_squash_to_tail() {
         let pv = SharedPV::new();
         pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
@@ -2264,7 +2263,9 @@ mod tests {
         );
 
         // Queue is now empty — no more posts were made.
-        let empty = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        let empty =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await;
         assert!(empty.is_err(), "queue must be empty after squash drain");
     }
 

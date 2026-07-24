@@ -17,7 +17,6 @@
 
 // (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -3280,7 +3279,7 @@ mod tests {
         assert_eq!(removed.len(), 2);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn periodic_cache_cleaner_sweeps_only_unreferenced_channels() {
         // Drive the same loop the client arms on its first cached channel.
         // `tokio`'s "full" feature excludes "test-util", so paused time is
@@ -3288,7 +3287,10 @@ mod tests {
         // test deterministic without depending on one sleep landing on a tick.
         let client = PvaClient::builder().build();
         let period = Duration::from_millis(25);
-        tokio::spawn(cache_clean_loop(Arc::downgrade(&client.inner), period));
+        epics_base_rs::runtime::task::spawn(cache_clean_loop(
+            Arc::downgrade(&client.inner),
+            period,
+        ));
 
         // (a) a cached channel with no external Arc is swept within a few ticks.
         client
@@ -3302,7 +3304,7 @@ mod tests {
                 swept = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             swept,
@@ -3316,7 +3318,7 @@ mod tests {
             .channels
             .write()
             .insert("held".into(), Arc::clone(&held));
-        tokio::time::sleep(period * 5).await;
+        epics_base_rs::runtime::task::sleep(period * 5).await;
         assert!(
             client.inner.channels.read().contains_key("held"),
             "cleaner preserves a channel that still has a live external reference"
@@ -3330,7 +3332,7 @@ mod tests {
                 swept = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             swept,
@@ -3338,11 +3340,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn periodic_cache_cleaner_exits_when_client_dropped() {
         let client = PvaClient::builder().build();
         let weak = Arc::downgrade(&client.inner);
-        let handle = tokio::spawn(cache_clean_loop(weak.clone(), Duration::from_millis(25)));
+        let handle = epics_base_rs::runtime::task::spawn(cache_clean_loop(
+            weak.clone(),
+            Duration::from_millis(25),
+        ));
 
         // Dropping the only PvaClient clone releases the last strong ref; the
         // cleaner's next `Weak::upgrade` fails and the task returns.
@@ -3354,7 +3359,7 @@ mod tests {
                 finished = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             finished,
@@ -3507,7 +3512,7 @@ mod tests {
     /// channel Idle, so no `on_connect` can race in — the only callback
     /// expected is the initial `on_disconnect`, and it must arrive with
     /// no other operation issued on the client.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_rs_48_connect_fires_initial_on_disconnect_without_other_op() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -3531,12 +3536,12 @@ mod tests {
 
         // No pvget/pvput/monitor is issued. The initial on_disconnect
         // must still fire promptly. Pre-fix `fired` stayed 0 forever.
-        tokio::time::timeout(Duration::from_secs(2), async {
+        epics_base_rs::runtime::task::timeout(Duration::from_secs(2), async {
             loop {
                 if fired.load(Ordering::SeqCst) >= 1 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -3550,7 +3555,7 @@ mod tests {
     /// server: async mode detaches (the task observes the cancel token and
     /// runs to completion), sync mode aborts (the task is cancelled before
     /// its pending work finishes).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_rs_49_drop_async_detaches_sync_aborts() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio_util::sync::CancellationToken;
@@ -3566,7 +3571,7 @@ mod tests {
                 let c = cancel.clone();
                 async move {
                     c.cancelled().await;
-                    tokio::task::yield_now().await;
+                    epics_base_rs::runtime::task::yield_now().await;
                     flag.store(true, Ordering::SeqCst);
                 }
             })),
@@ -3579,7 +3584,7 @@ mod tests {
                 detached_finished = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
         }
         assert!(
             detached_finished,
@@ -3595,14 +3600,14 @@ mod tests {
             task: Some(epics_base_rs::runtime::task::spawn({
                 let flag = did_complete.clone();
                 async move {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    epics_base_rs::runtime::task::sleep(Duration::from_secs(5)).await;
                     flag.store(true, Ordering::SeqCst);
                 }
             })),
             sync_cancel: true,
         };
         drop(handle2);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         assert!(
             !did_complete.load(Ordering::SeqCst),
             "sync sync_cancel(true) Drop must abort the task before its pending work completes"
@@ -3615,7 +3620,7 @@ mod tests {
     /// with the watcher parked mid-work, dropping a default
     /// (`sync_cancel(true)`) handle returns WITHOUT the parked work having
     /// finished, while `wait()` awaits full task termination.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn connect_handle_only_wait_bounds_callback_completion() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio_util::sync::CancellationToken;
@@ -3647,7 +3652,7 @@ mod tests {
             if started.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
         }
         assert!(
             started.load(Ordering::SeqCst),
@@ -3675,7 +3680,7 @@ mod tests {
             })),
             sync_cancel: false,
         };
-        tokio::time::timeout(Duration::from_secs(2), handle2.wait())
+        epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle2.wait())
             .await
             .expect("wait() must terminate synchronously, not hang");
         assert!(
@@ -3688,7 +3693,7 @@ mod tests {
     /// builder flag: after it returns the watcher task has stopped and no
     /// further callbacks fire. Exercised against an unreachable forced
     /// server so the watcher only fires its initial `on_disconnect`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn pva_rs_49_wait_is_synchronous_teardown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3710,12 +3715,12 @@ mod tests {
             .await
             .expect("exec");
 
-        tokio::time::timeout(Duration::from_secs(2), handle.wait())
+        epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle.wait())
             .await
             .expect("wait() must terminate synchronously, not hang");
 
         let after = calls.load(Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             calls.load(Ordering::Relaxed),
             after,

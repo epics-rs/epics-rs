@@ -17,7 +17,6 @@
 //! The handle is constructed from any future that returns
 //! `PvaResult<T>`.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -413,14 +412,14 @@ mod tests {
         assert!(matches!(r, Err(PvaError::Timeout)));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn interrupt_wakes_waiter_op_continues() {
         let mut op = PvaOperation::<i32>::spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(7)
         });
         let interrupter = op.interrupt.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
@@ -441,7 +440,7 @@ mod tests {
     /// a real deadline expiry and an explicit interrupt must
     /// surface as distinct variants so timeout-specific caller logic
     /// does not match an interrupt.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn timeout_and_interrupt_are_distinct_variants() {
         // Real deadline: op never completes within the window.
         let mut slow = PvaOperation::<()>::spawn(async {
@@ -458,7 +457,7 @@ mod tests {
             Ok(1)
         });
         let interrupter = op.interrupt.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });

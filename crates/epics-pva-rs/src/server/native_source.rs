@@ -3,7 +3,6 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -2252,7 +2251,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn simple_pv_monitor_observes_later_puts() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("SIMPLE:MON", EpicsValue::Double(1.0))
@@ -2278,10 +2277,11 @@ mod tests {
         .await
         .expect("PUT must succeed");
 
-        let updated = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("monitor must receive the PUT update within 2s")
-            .expect("monitor stream still open");
+        let updated =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("monitor must receive the PUT update within 2s")
+                .expect("monitor stream still open");
         assert_eq!(
             monitor_double(&updated),
             Some(2.0),
@@ -3191,7 +3191,7 @@ ASG(DEFAULT) {
     /// `DBE_PROPERTY` subscription (`singlesource.cpp:162-166`), so putting
     /// display/control/valueAlarm on every value update is a strict superset
     /// of C — the whole `--phase pva-monitor` `update_events` pattern.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_process_update_marks_value_alarm_time_not_the_metadata_leaves() {
         use epics_base_rs::server::records::ai::AiRecord;
 
@@ -3219,10 +3219,11 @@ ASG(DEFAULT) {
             .await
             .expect("put");
 
-        let update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("an update must post within 2s")
-            .expect("stream open");
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an update must post within 2s")
+                .expect("stream open");
         let marked = update.marked.expect("a record update declares its marks");
 
         assert!(
@@ -3368,7 +3369,7 @@ ASG(DEFAULT) {
     /// only reports `Disconnected` when the producer is really gone. Getting
     /// this backwards would make an RTEMS drain loop tear down every idle
     /// monitor, which is why the mapping is spelled once in `from_queue_err`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn an_idle_record_monitor_is_empty_not_disconnected() {
         use epics_base_rs::server::records::ai::AiRecord;
         use tokio::sync::mpsc::error::TryRecvError;
@@ -3397,7 +3398,7 @@ ASG(DEFAULT) {
         db.put_record_field_from_ca_no_notify("AI:IDLE", "VAL", EpicsValue::Double(1.0))
             .await
             .expect("put");
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
             .expect("an update must post within 2s")
             .expect("stream open");

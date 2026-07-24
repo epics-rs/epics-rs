@@ -40,19 +40,22 @@ use super::{FdUsage, MemUsage};
 
 /// Descriptors this RTP holds, and the ceiling it holds them against.
 ///
-/// `max` is `sysconf(_SC_OPEN_MAX)`, the RTP's own descriptor limit, and the
-/// walk asks `fcntl(fd, F_GETFD)` — which succeeds on exactly the open ones.
-/// That is the POSIX spelling of what the RTEMS backend does by testing
-/// `LIBIO_FLAGS_OPEN` over `rtems_libio_iops`, and it is available to an RTP,
-/// which `iosFdEntry` is not.
+/// `max` is `rtpIoTableSizeGet(getpid())` — the size of *this* RTP's
+/// descriptor table, which is the table the walk below reads and the wall this
+/// IOC actually hits. `sysconf(_SC_OPEN_MAX)` is the POSIX limit rather than
+/// the table, so it can disagree with the thing being counted; the RTEMS
+/// backend reports `rtems_libio_number_iops`, the real table size, and this is
+/// its counterpart rather than a nearby number.
 ///
-/// `None` when `sysconf` reports no limit: a walk needs a bound, and reporting
-/// "unknown" is the answer the funnel's `Option` exists to carry.
+/// The walk asks `fcntl(fd, F_GETFD)`, which succeeds on exactly the open
+/// descriptors — the POSIX spelling of testing `LIBIO_FLAGS_OPEN` over
+/// `rtems_libio_iops`, and available to an RTP, which `iosFdEntry` is not.
+///
+/// `None` when the table size does not read as a positive count: a walk needs
+/// a bound, and reporting "unknown" is the answer the funnel's `Option` exists
+/// to carry.
 pub(super) fn fd_usage() -> Option<FdUsage> {
-    // SAFETY: `sysconf` reads no memory of ours.
-    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    let max = u32::try_from(max).ok().filter(|m| *m > 0)?;
-
+    let max = io_table_size()?;
     let mut used = 0u32;
     for fd in 0..max {
         // SAFETY: `F_GETFD` takes no variadic argument and returns the
@@ -63,6 +66,19 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
         }
     }
     Some(FdUsage { used, max })
+}
+
+/// This RTP's descriptor-table size, or [`None`] if it does not read as a
+/// positive count.
+///
+/// Both `fd_usage` and `fd_census` bound their walk with this, so the count and
+/// the listing cannot cover different ranges — the same property the RTEMS
+/// backend gets from both reading `rtems_libio_number_iops`.
+fn io_table_size() -> Option<u32> {
+    // SAFETY: `getpid` takes nothing and `rtpIoTableSizeGet` reads only the id
+    // it is given; neither touches memory of ours.
+    let size = unsafe { ffi::rtpIoTableSizeGet(libc::getpid()) };
+    u32::try_from(size).ok().filter(|s| *s > 0)
 }
 
 /// Not bound yet — always [`None`].
@@ -129,9 +145,7 @@ pub(super) fn stack_report(tag: &str) {
 /// socket. `fstat` first, on every descriptor, is the discriminator that does
 /// not lie; the raw `SO_TYPE` is printed beside it rather than trusted.
 pub(super) fn fd_census(tag: &str) {
-    // SAFETY: `sysconf` reads no memory of ours.
-    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    let max = u32::try_from(max).ok().filter(|m| *m > 0).unwrap_or(0);
+    let max = io_table_size().unwrap_or(0);
 
     println!("FDCENSUS begin tag={tag}");
     let mut open_count = 0u32;
@@ -261,4 +275,32 @@ fn sock_name(
 /// The last OS error number, in the C's `errno=%d` shape.
 fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+}
+
+/// Declarations the `libc` crate's vxworks module does not carry.
+///
+/// Every symbol here was measured DEFINED — a real `[T]` text symbol with an
+/// address in an SDK RTP library, not a `U` reference. That check is the whole
+/// admission requirement on this target: `killpg` linked clean in an earlier
+/// bring-up purely because nothing called it, so "the image built" is not
+/// evidence that a declared symbol exists.
+mod ffi {
+    use libc::c_int;
+
+    unsafe extern "C" {
+        /// Size of an RTP's file-descriptor table.
+        ///
+        /// DEFINED in `common/libc.a:ioLib.o` @0x9f0 (nm, defined-only scan
+        /// over the SDK sysroot RTP libraries).
+        ///
+        /// The declared shape is robust to the two ways the SDK header could
+        /// differ from it, which is why it is safe to write without the header
+        /// in front of us. The parameter is `RTP_ID` if not `pid_t`, and both
+        /// are `_Vx_OBJ_HANDLE` — `c_int` — so the argument register is the
+        /// same either way. A `size_t` return rather than `int` would be read
+        /// here as its low 32 bits, which is exact for any table size an RTP
+        /// can have. UNCONFIRMED against the header text itself: no SDK on the
+        /// build host.
+        pub fn rtpIoTableSizeGet(rtp_id: c_int) -> c_int;
+    }
 }

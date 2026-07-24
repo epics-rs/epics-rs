@@ -668,29 +668,29 @@ pub async fn run(
     let b = &config.bank;
 
     // Connect PVs
-    let ch_b1 = DbChannel::new(&db, &format!("{ph}displayBit1{b}"));
-    let ch_b2 = DbChannel::new(&db, &format!("{ph}displayBit2{b}"));
-    let ch_b3 = DbChannel::new(&db, &format!("{ph}displayBit3{b}"));
-    let ch_b4 = DbChannel::new(&db, &format!("{ph}displayBit4{b}"));
-    let ch_trans = DbChannel::new(&db, &format!("{ph}trans{b}"));
-    let ch_inv_trans = DbChannel::new(&db, &format!("{ph}invTrans{b}"));
-    let ch_bankctl = DbChannel::new(&db, &format!("{ph}bank{b}"));
-    let _ch_filpos = DbChannel::new(&db, &format!("{ph}fPos{b}"));
-    let ch_select_energy = DbChannel::new(&db, &format!("{ph}useMono"));
-    let ch_local_energy = DbChannel::new(&db, &format!("{ph}E:local"));
-    let ch_filter_al = DbChannel::new(&db, &format!("{ph}filterAl"));
-    let ch_filter_ti = DbChannel::new(&db, &format!("{ph}filterTi"));
-    let ch_filter_glass = DbChannel::new(&db, &format!("{ph}filterGlass"));
+    let ch_b1 = DbChannel::with_origin(&db, &format!("{ph}displayBit1{b}"), my_origin);
+    let ch_b2 = DbChannel::with_origin(&db, &format!("{ph}displayBit2{b}"), my_origin);
+    let ch_b3 = DbChannel::with_origin(&db, &format!("{ph}displayBit3{b}"), my_origin);
+    let ch_b4 = DbChannel::with_origin(&db, &format!("{ph}displayBit4{b}"), my_origin);
+    let ch_trans = DbChannel::with_origin(&db, &format!("{ph}trans{b}"), my_origin);
+    let ch_inv_trans = DbChannel::with_origin(&db, &format!("{ph}invTrans{b}"), my_origin);
+    let ch_bankctl = DbChannel::with_origin(&db, &format!("{ph}bank{b}"), my_origin);
+    let _ch_filpos = DbChannel::with_origin(&db, &format!("{ph}fPos{b}"), my_origin);
+    let ch_select_energy = DbChannel::with_origin(&db, &format!("{ph}useMono"), my_origin);
+    let ch_local_energy = DbChannel::with_origin(&db, &format!("{ph}E:local"), my_origin);
+    let ch_filter_al = DbChannel::with_origin(&db, &format!("{ph}filterAl"), my_origin);
+    let ch_filter_ti = DbChannel::with_origin(&db, &format!("{ph}filterTi"), my_origin);
+    let ch_filter_glass = DbChannel::with_origin(&db, &format!("{ph}filterGlass"), my_origin);
 
-    let ch_f1 = DbChannel::new(&db, &format!("{ph}f1{b}"));
-    let ch_f2 = DbChannel::new(&db, &format!("{ph}f2{b}"));
-    let ch_f3 = DbChannel::new(&db, &format!("{ph}f3{b}"));
-    let ch_f4 = DbChannel::new(&db, &format!("{ph}f4{b}"));
+    let ch_f1 = DbChannel::with_origin(&db, &format!("{ph}f1{b}"), my_origin);
+    let ch_f2 = DbChannel::with_origin(&db, &format!("{ph}f2{b}"), my_origin);
+    let ch_f3 = DbChannel::with_origin(&db, &format!("{ph}f3{b}"), my_origin);
+    let ch_f4 = DbChannel::with_origin(&db, &format!("{ph}f4{b}"), my_origin);
 
-    let ch_z1 = DbChannel::new(&db, &format!("{ph}Z1{b}"));
-    let ch_z2 = DbChannel::new(&db, &format!("{ph}Z2{b}"));
-    let ch_z3 = DbChannel::new(&db, &format!("{ph}Z3{b}"));
-    let ch_z4 = DbChannel::new(&db, &format!("{ph}Z4{b}"));
+    let ch_z1 = DbChannel::with_origin(&db, &format!("{ph}Z1{b}"), my_origin);
+    let ch_z2 = DbChannel::with_origin(&db, &format!("{ph}Z2{b}"), my_origin);
+    let ch_z3 = DbChannel::with_origin(&db, &format!("{ph}Z3{b}"), my_origin);
+    let ch_z4 = DbChannel::with_origin(&db, &format!("{ph}Z4{b}"), my_origin);
 
     // Build multi-monitor
     let monitored_pvs: Vec<String> = vec![
@@ -808,29 +808,29 @@ pub async fn run(
             if let Some(bits) = actions.set_bits {
                 // Insert first, then remove (as per original SNL)
                 if bits[0] {
-                    let _ = ch_b1.put_i16(1_i16).await;
+                    let _ = ch_b1.put_i16_process(1_i16).await;
                 }
                 if bits[1] {
-                    let _ = ch_b2.put_i16(1_i16).await;
+                    let _ = ch_b2.put_i16_process(1_i16).await;
                 }
                 if bits[2] {
-                    let _ = ch_b3.put_i16(1_i16).await;
+                    let _ = ch_b3.put_i16_process(1_i16).await;
                 }
                 if bits[3] {
-                    let _ = ch_b4.put_i16(1_i16).await;
+                    let _ = ch_b4.put_i16_process(1_i16).await;
                 }
                 sleep(Duration::from_millis(200)).await;
                 if !bits[0] {
-                    let _ = ch_b1.put_i16(0_i16).await;
+                    let _ = ch_b1.put_i16_process(0_i16).await;
                 }
                 if !bits[1] {
-                    let _ = ch_b2.put_i16(0_i16).await;
+                    let _ = ch_b2.put_i16_process(0_i16).await;
                 }
                 if !bits[2] {
-                    let _ = ch_b3.put_i16(0_i16).await;
+                    let _ = ch_b3.put_i16_process(0_i16).await;
                 }
                 if !bits[3] {
-                    let _ = ch_b4.put_i16(0_i16).await;
+                    let _ = ch_b4.put_i16_process(0_i16).await;
                 }
             }
         }

@@ -1242,7 +1242,26 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<()> {
+        self.put_record_field_from_ca_no_notify_with_origin(record_name, field, value, 0)
+            .await
+    }
+
+    /// [`Self::put_record_field_from_ca_no_notify`] for an in-process writer
+    /// with a self-write-filtering origin (a ported SNL state machine's
+    /// `DbChannel`): every event the put's synchronous process cascade posts
+    /// is tagged with `origin`, so the writer's own filtered subscriptions
+    /// skip them. The ambient scope is sound here because the body below is
+    /// fully synchronous — there is no await between entering the scope and
+    /// the cascade's last post.
+    pub async fn put_record_field_from_ca_no_notify_with_origin(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+        origin: u64,
+    ) -> CaResult<()> {
         let _record_gate = self.acquire_put_gate(record_name);
+        let _origin_scope = crate::server::record::ambient_write_origin_scope(origin);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
     }

@@ -268,112 +268,136 @@ pub async fn run(
     let my_origin = alloc_origin();
 
     // -- Create channels --
-    let _ch_debug = DbChannel::new(&db, &config.pv("CtlDebug"));
-    let ch_msg1 = DbChannel::new(&db, &config.pv("SeqMsg1"));
-    let ch_msg2 = DbChannel::new(&db, &config.pv("SeqMsg2"));
-    let ch_alert = DbChannel::new(&db, &config.pv("Alert"));
-    let ch_oper_ack = DbChannel::new(&db, &config.pv("OperAck"));
-    let ch_put_vals = DbChannel::new(&db, &config.pv("Put"));
-    let ch_auto_mode = DbChannel::new(&db, &config.pv("Mode"));
-    let ch_cc_mode = DbChannel::new(&db, &config.pv("Mode2"));
-    let ch_moving = DbChannel::new(&db, &config.pv("Moving"));
+    let _ch_debug = DbChannel::with_origin(&db, &config.pv("CtlDebug"), my_origin);
+    let ch_msg1 = DbChannel::with_origin(&db, &config.pv("SeqMsg1"), my_origin);
+    let ch_msg2 = DbChannel::with_origin(&db, &config.pv("SeqMsg2"), my_origin);
+    let ch_alert = DbChannel::with_origin(&db, &config.pv("Alert"), my_origin);
+    let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAck"), my_origin);
+    let ch_put_vals = DbChannel::with_origin(&db, &config.pv("Put"), my_origin);
+    let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("Mode"), my_origin);
+    let ch_cc_mode = DbChannel::with_origin(&db, &config.pv("Mode2"), my_origin);
+    let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
 
     // D-spacing parameters
-    let ch_order = DbChannel::new(&db, &config.pv("Order"));
-    let ch_d = DbChannel::new(&db, &config.pv("D"));
+    let ch_order = DbChannel::with_origin(&db, &config.pv("Order"), my_origin);
+    let ch_d = DbChannel::with_origin(&db, &config.pv("D"), my_origin);
 
     // Energy / lambda / theta
-    let ch_e = DbChannel::new(&db, &config.pv("E"));
-    let ch_e_hi = DbChannel::new(&db, &config.pv("E.DRVH"));
-    let ch_e_lo = DbChannel::new(&db, &config.pv("E.DRVL"));
-    let ch_e_rdbk = DbChannel::new(&db, &config.pv("ERdbk"));
+    let ch_e = DbChannel::with_origin(&db, &config.pv("E"), my_origin);
+    let ch_e_hi = DbChannel::with_origin(&db, &config.pv("E.DRVH"), my_origin);
+    let ch_e_lo = DbChannel::with_origin(&db, &config.pv("E.DRVL"), my_origin);
+    let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbk"), my_origin);
 
-    let ch_lambda = DbChannel::new(&db, &config.pv("Lambda"));
-    let ch_lambda_hi = DbChannel::new(&db, &config.pv("Lambda.DRVH"));
-    let ch_lambda_lo = DbChannel::new(&db, &config.pv("Lambda.DRVL"));
-    let ch_lambda_rdbk = DbChannel::new(&db, &config.pv("LambdaRdbk"));
+    let ch_lambda = DbChannel::with_origin(&db, &config.pv("Lambda"), my_origin);
+    let ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("Lambda.DRVH"), my_origin);
+    let ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("Lambda.DRVL"), my_origin);
+    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbk"), my_origin);
 
-    let ch_theta = DbChannel::new(&db, &config.pv("Theta"));
-    let ch_theta_hi = DbChannel::new(&db, &config.pv("Theta.DRVH"));
-    let ch_theta_lo = DbChannel::new(&db, &config.pv("Theta.DRVL"));
-    let ch_theta_rdbk = DbChannel::new(&db, &config.pv("ThetaRdbk"));
+    let ch_theta = DbChannel::with_origin(&db, &config.pv("Theta"), my_origin);
+    let ch_theta_hi = DbChannel::with_origin(&db, &config.pv("Theta.DRVH"), my_origin);
+    let ch_theta_lo = DbChannel::with_origin(&db, &config.pv("Theta.DRVL"), my_origin);
+    let ch_theta_rdbk = DbChannel::with_origin(&db, &config.pv("ThetaRdbk"), my_origin);
 
     // Echo PVs
-    let ch_theta_mot_name = DbChannel::new(&db, &config.pv("ThetaPv"));
-    let ch_theta2_mot_name = DbChannel::new(&db, &config.pv("Theta2Pv"));
-    let ch_z_mot_name = DbChannel::new(&db, &config.pv("ZPv"));
-    let ch_y_mot_name = DbChannel::new(&db, &config.pv("YPv"));
+    let ch_theta_mot_name = DbChannel::with_origin(&db, &config.pv("ThetaPv"), my_origin);
+    let ch_theta2_mot_name = DbChannel::with_origin(&db, &config.pv("Theta2Pv"), my_origin);
+    let ch_z_mot_name = DbChannel::with_origin(&db, &config.pv("ZPv"), my_origin);
+    let ch_y_mot_name = DbChannel::with_origin(&db, &config.pv("YPv"), my_origin);
 
-    let _ch_theta_cmd_echo = DbChannel::new(&db, &config.pv("ThetaCmd"));
-    let _ch_theta2_cmd_echo = DbChannel::new(&db, &config.pv("Theta2Cmd"));
-    let _ch_z_cmd_echo = DbChannel::new(&db, &config.pv("ZCmd"));
-    let ch_theta_rdbk_echo = DbChannel::new(&db, &config.pv("ThetaRdbkEcho"));
-    let ch_theta2_rdbk_echo = DbChannel::new(&db, &config.pv("Theta2RdbkEcho"));
-    let ch_z_rdbk_echo = DbChannel::new(&db, &config.pv("ZRdbk"));
-    let ch_theta_vel_echo = DbChannel::new(&db, &config.pv("ThetaVel"));
-    let ch_theta2_vel_echo = DbChannel::new(&db, &config.pv("Theta2Vel"));
-    let ch_z_vel_echo = DbChannel::new(&db, &config.pv("ZVel"));
-    let ch_theta_dmov_echo = DbChannel::new(&db, &config.pv("ThetaDmov"));
-    let ch_theta2_dmov_echo = DbChannel::new(&db, &config.pv("Theta2Dmov"));
-    let ch_z_dmov_echo = DbChannel::new(&db, &config.pv("ZDmov"));
+    let _ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.pv("ThetaCmd"), my_origin);
+    let _ch_theta2_cmd_echo = DbChannel::with_origin(&db, &config.pv("Theta2Cmd"), my_origin);
+    let _ch_z_cmd_echo = DbChannel::with_origin(&db, &config.pv("ZCmd"), my_origin);
+    let ch_theta_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ThetaRdbkEcho"), my_origin);
+    let ch_theta2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("Theta2RdbkEcho"), my_origin);
+    let ch_z_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ZRdbk"), my_origin);
+    let ch_theta_vel_echo = DbChannel::with_origin(&db, &config.pv("ThetaVel"), my_origin);
+    let ch_theta2_vel_echo = DbChannel::with_origin(&db, &config.pv("Theta2Vel"), my_origin);
+    let ch_z_vel_echo = DbChannel::with_origin(&db, &config.pv("ZVel"), my_origin);
+    let ch_theta_dmov_echo = DbChannel::with_origin(&db, &config.pv("ThetaDmov"), my_origin);
+    let ch_theta2_dmov_echo = DbChannel::with_origin(&db, &config.pv("Theta2Dmov"), my_origin);
+    let ch_z_dmov_echo = DbChannel::with_origin(&db, &config.pv("ZDmov"), my_origin);
 
     // Motor records
-    let ch_theta_mot_stop = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".STOP"));
-    let ch_theta2_mot_stop = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".STOP"));
-    let ch_z_stop = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".STOP"));
+    let ch_theta_mot_stop =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".STOP"), my_origin);
+    let ch_theta2_mot_stop =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".STOP"), my_origin);
+    let ch_z_stop = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".STOP"), my_origin);
 
-    let ch_theta_dmov = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".DMOV"));
-    let ch_theta2_dmov = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".DMOV"));
-    let ch_z_dmov = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".DMOV"));
+    let ch_theta_dmov =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
+    let ch_theta2_dmov =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".DMOV"), my_origin);
+    let ch_z_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".DMOV"), my_origin);
 
-    let ch_theta_hls = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".HLS"));
-    let ch_theta_lls = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".LLS"));
-    let ch_theta2_hls = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".HLS"));
-    let ch_theta2_lls = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".LLS"));
-    let ch_z_hls = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".HLS"));
-    let ch_z_lls = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".LLS"));
+    let ch_theta_hls =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLS"), my_origin);
+    let ch_theta_lls =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLS"), my_origin);
+    let ch_theta2_hls =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".HLS"), my_origin);
+    let ch_theta2_lls =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".LLS"), my_origin);
+    let ch_z_hls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLS"), my_origin);
+    let ch_z_lls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLS"), my_origin);
 
-    let ch_theta_set = DbChannel::new(&db, &config.pv("ThetaSet"));
-    let ch_theta2_set = DbChannel::new(&db, &config.pv("Theta2Set"));
-    let ch_z_set = DbChannel::new(&db, &config.pv("ZSet"));
+    let ch_theta_set = DbChannel::with_origin(&db, &config.pv("ThetaSet"), my_origin);
+    let ch_theta2_set = DbChannel::with_origin(&db, &config.pv("Theta2Set"), my_origin);
+    let ch_z_set = DbChannel::with_origin(&db, &config.pv("ZSet"), my_origin);
 
-    let ch_theta_mot_hilim = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".HLM"));
-    let ch_theta_mot_lolim = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".LLM"));
-    let ch_z_mot_hilim = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".HLM"));
-    let ch_z_mot_lolim = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".LLM"));
+    let ch_theta_mot_hilim =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLM"), my_origin);
+    let ch_theta_mot_lolim =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLM"), my_origin);
+    let ch_z_mot_hilim =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLM"), my_origin);
+    let ch_z_mot_lolim =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLM"), my_origin);
 
-    let ch_theta_mot_cmd = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ""));
-    let ch_theta2_mot_cmd = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ""));
-    let ch_z_mot_cmd = DbChannel::new(&db, &config.motor_pv(&config.m_z, ""));
+    let ch_theta_mot_cmd =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ""), my_origin);
+    let ch_theta2_mot_cmd =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ""), my_origin);
+    let ch_z_mot_cmd = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ""), my_origin);
 
-    let ch_theta_mot_velo = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".VELO"));
-    let ch_theta2_mot_velo = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".VELO"));
-    let ch_z_mot_velo = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".VELO"));
+    let ch_theta_mot_velo =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".VELO"), my_origin);
+    let ch_theta2_mot_velo =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".VELO"), my_origin);
+    let ch_z_mot_velo =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".VELO"), my_origin);
 
-    let ch_theta_mot_rbv = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".RBV"));
-    let ch_theta2_mot_rbv = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".RBV"));
-    let ch_z_mot_rbv = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".RBV"));
-    let ch_y_mot_rbv = DbChannel::new(&db, &config.motor_pv(&config.m_y, ".RBV"));
+    let ch_theta_mot_rbv =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".RBV"), my_origin);
+    let ch_theta2_mot_rbv =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".RBV"), my_origin);
+    let ch_z_mot_rbv =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".RBV"), my_origin);
+    let ch_y_mot_rbv =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".RBV"), my_origin);
 
-    let _ch_use_set = DbChannel::new(&db, &config.pv("UseSet"));
-    let ch_theta_mot_set_flag = DbChannel::new(&db, &config.motor_pv(&config.m_theta, ".SET"));
-    let ch_theta2_mot_set_flag = DbChannel::new(&db, &config.motor_pv(&config.m_theta2, ".SET"));
-    let ch_z_mot_set_flag = DbChannel::new(&db, &config.motor_pv(&config.m_z, ".SET"));
+    let _ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSet"), my_origin);
+    let ch_theta_mot_set_flag =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".SET"), my_origin);
+    let ch_theta2_mot_set_flag =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".SET"), my_origin);
+    let ch_z_mot_set_flag =
+        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".SET"), my_origin);
 
-    let ch_y_offset = DbChannel::new(&db, &config.pv("_yOffset"));
+    let ch_y_offset = DbChannel::with_origin(&db, &config.pv("_yOffset"), my_origin);
 
     // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
     // C ml_monoCtl.st:710-773 (state tweak): each button adds ± the matching
     // step value, limit-checks, and resets the pressed BO to 0.
-    let ch_e_tweak_val = DbChannel::new(&db, &config.pv("ETweak"));
-    let ch_e_inc = DbChannel::new(&db, &config.pv("EInc"));
-    let ch_e_dec = DbChannel::new(&db, &config.pv("EDec"));
-    let ch_lambda_tweak_val = DbChannel::new(&db, &config.pv("LambdaTweak"));
-    let ch_lambda_inc = DbChannel::new(&db, &config.pv("LambdaInc"));
-    let ch_lambda_dec = DbChannel::new(&db, &config.pv("LambdaDec"));
-    let ch_theta_tweak_val = DbChannel::new(&db, &config.pv("ThetaTweak"));
-    let ch_theta_inc = DbChannel::new(&db, &config.pv("ThetaInc"));
-    let ch_theta_dec = DbChannel::new(&db, &config.pv("ThetaDec"));
+    let ch_e_tweak_val = DbChannel::with_origin(&db, &config.pv("ETweak"), my_origin);
+    let ch_e_inc = DbChannel::with_origin(&db, &config.pv("EInc"), my_origin);
+    let ch_e_dec = DbChannel::with_origin(&db, &config.pv("EDec"), my_origin);
+    let ch_lambda_tweak_val = DbChannel::with_origin(&db, &config.pv("LambdaTweak"), my_origin);
+    let ch_lambda_inc = DbChannel::with_origin(&db, &config.pv("LambdaInc"), my_origin);
+    let ch_lambda_dec = DbChannel::with_origin(&db, &config.pv("LambdaDec"), my_origin);
+    let ch_theta_tweak_val = DbChannel::with_origin(&db, &config.pv("ThetaTweak"), my_origin);
+    let ch_theta_inc = DbChannel::with_origin(&db, &config.pv("ThetaInc"), my_origin);
+    let ch_theta_dec = DbChannel::with_origin(&db, &config.pv("ThetaDec"), my_origin);
 
     // Wait for key channels
 
@@ -414,51 +438,51 @@ pub async fn run(
     let theta2_name = format!("{}{}", config.prefix, config.m_theta2);
     let z_name = format!("{}{}", config.prefix, config.m_z);
     let y_name = format!("{}{}", config.prefix, config.m_y);
-    let _ = ch_theta_mot_name.put_string(&theta_name).await;
-    let _ = ch_theta2_mot_name.put_string(&theta2_name).await;
-    let _ = ch_z_mot_name.put_string(&z_name).await;
-    let _ = ch_y_mot_name.put_string(&y_name).await;
+    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
+    let _ = ch_theta2_mot_name.put_string_process(&theta2_name).await;
+    let _ = ch_z_mot_name.put_string_process(&z_name).await;
+    let _ = ch_y_mot_name.put_string_process(&y_name).await;
 
-    let _ = ch_y_offset.put_f64(config.y_offset).await;
-    let _ = ch_put_vals.put_i16(0).await;
-    let _ = ch_auto_mode.put_i16(0).await;
-    let _ = ch_oper_ack.put_i16(0).await;
+    let _ = ch_y_offset.put_f64_process(config.y_offset).await;
+    let _ = ch_put_vals.put_i16_process(0).await;
+    let _ = ch_auto_mode.put_i16_process(0).await;
+    let _ = ch_oper_ack.put_i16_process(0).await;
 
     // D-spacing
     let mut order_val = ch_order.get_f64().await;
     let mut d_val = ch_d.get_f64().await;
     let (mut two_d, err, msg) = calc_2d_spacing(d_val, order_val);
-    let _ = ch_msg1.put_string(msg).await;
+    let _ = ch_msg1.put_string_process(msg).await;
     // C calc2dSpacing sets opAlert from the Order<1 check (1/0).
-    let _ = ch_alert.put_i16(err as i16).await;
+    let _ = ch_alert.put_i16_process(err as i16).await;
 
     // Theta limits
     let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
     let mut theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
     let (mut theta_hi, mut theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-    let _ = ch_theta_hi.put_f64(theta_hi).await;
-    let _ = ch_theta_lo.put_f64(theta_lo).await;
+    let _ = ch_theta_hi.put_f64_process(theta_hi).await;
+    let _ = ch_theta_lo.put_f64_process(theta_lo).await;
     let (e_hi, e_lo, l_hi, l_lo) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-    let _ = ch_e_hi.put_f64(e_hi).await;
-    let _ = ch_e_lo.put_f64(e_lo).await;
-    let _ = ch_lambda_hi.put_f64(l_hi).await;
-    let _ = ch_lambda_lo.put_f64(l_lo).await;
+    let _ = ch_e_hi.put_f64_process(e_hi).await;
+    let _ = ch_e_lo.put_f64_process(e_lo).await;
+    let _ = ch_lambda_hi.put_f64_process(l_hi).await;
+    let _ = ch_lambda_lo.put_f64_process(l_lo).await;
 
     // Initial readback
     let theta_mot_rdbk = ch_theta_mot_rbv.get_f64().await;
     let mut theta_rdbk_val = theta_mot_rdbk;
     let mut lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
     let mut e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-    let _ = ch_theta_rdbk.put_f64(theta_rdbk_val).await;
-    let _ = ch_lambda_rdbk.put_f64(lambda_rdbk_val).await;
-    let _ = ch_e_rdbk.put_f64(e_rdbk_val).await;
+    let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
+    let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
+    let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
 
     let mut theta_val = theta_mot_rdbk;
-    let _ = ch_theta.put_f64(theta_val).await;
+    let _ = ch_theta.put_f64_process(theta_val).await;
     let mut lambda_val = theta_to_lambda(theta_val, two_d);
-    let _ = ch_lambda.put_f64(lambda_val).await;
+    let _ = ch_lambda.put_f64_process(lambda_val).await;
     let mut e_val = lambda_to_energy(lambda_val);
-    let _ = ch_e.put_f64(e_val).await;
+    let _ = ch_e.put_f64_process(e_val).await;
 
     let mut auto_mode = false;
     let mut use_set_mode = false;
@@ -466,8 +490,8 @@ pub async fn run(
     let mut y_offset_val = config.y_offset;
     let mut _caused_move = false;
 
-    let _ = ch_msg1.put_string("ml_mono Control Ready").await;
-    let _ = ch_msg2.put_string(" ").await;
+    let _ = ch_msg1.put_string_process("ml_mono Control Ready").await;
+    let _ = ch_msg2.put_string_process(" ").await;
 
     info!("ML mono controller initialized for {}", config.prefix);
 
@@ -518,13 +542,13 @@ pub async fn run(
             if (new_e - e_val).abs() > 1e-12 {
                 e_val = new_e;
                 lambda_val = energy_to_lambda(e_val);
-                let _ = ch_lambda.put_f64(lambda_val).await;
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
                 if lambda_val > two_d {
-                    let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                    let _ = ch_alert.put_i16_process(1).await;
                 } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
                     theta_val = th;
-                    let _ = ch_theta.put_f64(theta_val).await;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
                 }
                 proceed_to_theta_changed = true;
             }
@@ -533,11 +557,11 @@ pub async fn run(
             if (new_l - lambda_val).abs() > 1e-12 {
                 lambda_val = new_l;
                 if lambda_val > two_d {
-                    let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                    let _ = ch_alert.put_i16_process(1).await;
                 } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
                     theta_val = th;
-                    let _ = ch_theta.put_f64(theta_val).await;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
                 }
                 proceed_to_theta_changed = true;
             }
@@ -558,23 +582,23 @@ pub async fn run(
                 let e_lo = ch_e_lo.get_f64().await;
                 if temp >= e_lo && temp <= e_hi {
                     e_val = temp;
-                    let _ = ch_e.put_f64(e_val).await;
+                    let _ = ch_e.put_f64_process(e_val).await;
                     lambda_val = energy_to_lambda(e_val);
-                    let _ = ch_lambda.put_f64(lambda_val).await;
+                    let _ = ch_lambda.put_f64_process(lambda_val).await;
                     if lambda_val > two_d {
-                        let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16(1).await;
+                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                        let _ = ch_alert.put_i16_process(1).await;
                     } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
                         theta_val = th;
-                        let _ = ch_theta.put_f64(theta_val).await;
+                        let _ = ch_theta.put_f64_process(theta_val).await;
                     }
                     proceed_to_theta_changed = true;
                 } else {
-                    let _ = ch_msg1.put_string("E tweak exceeds limit").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1.put_string_process("E tweak exceeds limit").await;
+                    let _ = ch_alert.put_i16_process(1).await;
                 }
                 let reset = if inc { &ch_e_inc } else { &ch_e_dec };
-                let _ = reset.put_i16(0).await;
+                let _ = reset.put_i16_process(0).await;
             }
         } else if changed_pv == pv_lambda_inc || changed_pv == pv_lambda_dec {
             // C ml_monoCtl.st:732-751 — lambda tweak by ± LTweakVal, limit-checked.
@@ -586,21 +610,23 @@ pub async fn run(
                 let l_lo = ch_lambda_lo.get_f64().await;
                 if temp >= l_lo && temp <= l_hi {
                     lambda_val = temp;
-                    let _ = ch_lambda.put_f64(lambda_val).await;
+                    let _ = ch_lambda.put_f64_process(lambda_val).await;
                     if lambda_val > two_d {
-                        let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16(1).await;
+                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                        let _ = ch_alert.put_i16_process(1).await;
                     } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
                         theta_val = th;
-                        let _ = ch_theta.put_f64(theta_val).await;
+                        let _ = ch_theta.put_f64_process(theta_val).await;
                     }
                     proceed_to_theta_changed = true;
                 } else {
-                    let _ = ch_msg1.put_string("Lambda tweak exceeds limit").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1
+                        .put_string_process("Lambda tweak exceeds limit")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
                 }
                 let reset = if inc { &ch_lambda_inc } else { &ch_lambda_dec };
-                let _ = reset.put_i16(0).await;
+                let _ = reset.put_i16_process(0).await;
             }
         } else if changed_pv == pv_theta_inc || changed_pv == pv_theta_dec {
             // C ml_monoCtl.st:753-772 — theta tweak by ± thTweakVal, limit-checked.
@@ -610,49 +636,51 @@ pub async fn run(
                 let temp = theta_val + step * if inc { 1.0 } else { -1.0 };
                 if temp >= theta_lo && temp <= theta_hi {
                     theta_val = temp;
-                    let _ = ch_theta.put_f64(theta_val).await;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
                     proceed_to_theta_changed = true;
                 } else {
-                    let _ = ch_msg1.put_string("Theta tweak exceeds limit").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1
+                        .put_string_process("Theta tweak exceeds limit")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
                 }
                 let reset = if inc { &ch_theta_inc } else { &ch_theta_dec };
-                let _ = reset.put_i16(0).await;
+                let _ = reset.put_i16_process(0).await;
             }
         } else if changed_pv == pv_order {
             order_val = ch_order.get_f64().await;
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
-            let _ = ch_msg1.put_string(msg).await;
+            let _ = ch_msg1.put_string_process(msg).await;
             // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
             // from the Order<1 check and dInputChanged pvPuts it
             // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16(err as i16).await;
+            let _ = ch_alert.put_i16_process(err as i16).await;
             auto_mode = false;
-            let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            let _ = ch_auto_mode.put_i16_process(0).await;
+            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await;
-            let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await;
-            let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64_process(eh).await;
+            let _ = ch_e_lo.put_f64_process(el).await;
+            let _ = ch_lambda_hi.put_f64_process(lh).await;
+            let _ = ch_lambda_lo.put_f64_process(ll).await;
         } else if changed_pv == pv_d {
             d_val = ch_d.get_f64().await;
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
-            let _ = ch_msg1.put_string(msg).await;
+            let _ = ch_msg1.put_string_process(msg).await;
             // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
             // from the Order<1 check and dInputChanged pvPuts it
             // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16(err as i16).await;
+            let _ = ch_alert.put_i16_process(err as i16).await;
             auto_mode = false;
-            let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            let _ = ch_auto_mode.put_i16_process(0).await;
+            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await;
-            let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await;
-            let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64_process(eh).await;
+            let _ = ch_e_lo.put_f64_process(el).await;
+            let _ = ch_lambda_hi.put_f64_process(lh).await;
+            let _ = ch_lambda_lo.put_f64_process(ll).await;
         } else if changed_pv == pv_put_vals {
             if new_val as i16 != 0 {
                 proceed_to_theta_changed = true;
@@ -663,14 +691,14 @@ pub async fn run(
             cc_mode = MlMonoMode::from_i16(new_val as i16);
         } else if changed_pv == pv_oper_ack {
             if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16(0).await;
-                let _ = ch_msg1.put_string(" ").await;
-                let _ = ch_msg2.put_string(" ").await;
-                let _ = ch_oper_ack.put_i16(0).await;
+                let _ = ch_alert.put_i16_process(0).await;
+                let _ = ch_msg1.put_string_process(" ").await;
+                let _ = ch_msg2.put_string_process(" ").await;
+                let _ = ch_oper_ack.put_i16_process(0).await;
             }
         } else if changed_pv == pv_theta_mot_rbv {
             let rbv = new_val;
-            let _ = ch_theta_rdbk_echo.put_f64(rbv).await;
+            let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
             theta_rdbk_val = rbv;
             lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
             e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
@@ -678,39 +706,39 @@ pub async fn run(
             let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
             let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
         } else if changed_pv == pv_theta2_mot_rbv {
-            let _ = ch_theta2_rdbk_echo.put_f64(new_val).await;
+            let _ = ch_theta2_rdbk_echo.put_f64_process(new_val).await;
         } else if changed_pv == pv_theta_hilim {
             theta_mot_hi = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
             theta_hi = hi;
             theta_lo = lo;
-            let _ = ch_theta_hi.put_f64(theta_hi).await;
-            let _ = ch_theta_lo.put_f64(theta_lo).await;
+            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
+            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await;
-            let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await;
-            let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64_process(eh).await;
+            let _ = ch_e_lo.put_f64_process(el).await;
+            let _ = ch_lambda_hi.put_f64_process(lh).await;
+            let _ = ch_lambda_lo.put_f64_process(ll).await;
         } else if changed_pv == pv_theta_lolim {
             theta_mot_lo = new_val;
             let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
             theta_hi = hi;
             theta_lo = lo;
-            let _ = ch_theta_hi.put_f64(theta_hi).await;
-            let _ = ch_theta_lo.put_f64(theta_lo).await;
+            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
+            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64(eh).await;
-            let _ = ch_e_lo.put_f64(el).await;
-            let _ = ch_lambda_hi.put_f64(lh).await;
-            let _ = ch_lambda_lo.put_f64(ll).await;
+            let _ = ch_e_hi.put_f64_process(eh).await;
+            let _ = ch_e_lo.put_f64_process(el).await;
+            let _ = ch_lambda_hi.put_f64_process(lh).await;
+            let _ = ch_lambda_lo.put_f64_process(ll).await;
         } else if changed_pv == pv_y_offset {
             y_offset_val = new_val;
             auto_mode = false;
-            let _ = ch_auto_mode.put_i16(0).await;
+            let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg1
-                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
                 .await;
-            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
         } else if changed_pv == pv_y_mot_rbv {
             // C ml_monoCtl.st:1204-1207 (yMotRdbk_mon): a Y-motor readback change
@@ -721,20 +749,20 @@ pub async fn run(
             // so mirror that here (a self put_f64 posts no monitor event, so the
             // recompute is driven inline rather than via a yOffset re-trigger).
             y_offset_val = new_val;
-            let _ = ch_y_offset.put_f64(y_offset_val).await;
+            let _ = ch_y_offset.put_f64_process(y_offset_val).await;
             auto_mode = false;
-            let _ = ch_auto_mode.put_i16(0).await;
+            let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg1
-                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
                 .await;
-            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
         } else if changed_pv == pv_use_set {
             use_set_mode = new_val as i16 != 0;
             let sv = if use_set_mode { 1i16 } else { 0 };
-            let _ = ch_theta_mot_set_flag.put_i16(sv).await;
-            let _ = ch_theta2_mot_set_flag.put_i16(sv).await;
-            let _ = ch_z_mot_set_flag.put_i16(sv).await;
+            let _ = ch_theta_mot_set_flag.put_i16_process(sv).await;
+            let _ = ch_theta2_mot_set_flag.put_i16_process(sv).await;
+            let _ = ch_z_mot_set_flag.put_i16_process(sv).await;
         }
 
         if !proceed_to_theta_changed {
@@ -743,17 +771,19 @@ pub async fn run(
 
         // -- Theta changed --
         if theta_val <= theta_lo || theta_val >= theta_hi {
-            let _ = ch_msg1.put_string("Theta constrained to LIMIT").await;
-            let _ = ch_alert.put_i16(1).await;
+            let _ = ch_msg1
+                .put_string_process("Theta constrained to LIMIT")
+                .await;
+            let _ = ch_alert.put_i16_process(1).await;
             auto_mode = false;
-            let _ = ch_auto_mode.put_i16(0).await;
-            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            let _ = ch_auto_mode.put_i16_process(0).await;
+            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
         }
 
         lambda_val = theta_to_lambda(theta_val, two_d);
-        let _ = ch_lambda.put_f64(lambda_val).await;
+        let _ = ch_lambda.put_f64_process(lambda_val).await;
         e_val = lambda_to_energy(lambda_val);
-        let _ = ch_e.put_f64(e_val).await;
+        let _ = ch_e.put_f64_process(e_val).await;
 
         let current_rbv = ch_theta_mot_rbv.get_f64().await;
         theta_rdbk_val = current_rbv;
@@ -768,20 +798,22 @@ pub async fn run(
         let theta2_mot_desired = theta_val;
         let z_mot_desired = calc_z_position(theta_val, y_offset_val);
 
-        let _ = ch_theta_set.put_f64(theta_mot_desired).await;
-        let _ = ch_theta2_set.put_f64(theta2_mot_desired).await;
-        let _ = ch_z_set.put_f64(z_mot_desired).await;
+        let _ = ch_theta_set.put_f64_process(theta_mot_desired).await;
+        let _ = ch_theta2_set.put_f64_process(theta2_mot_desired).await;
+        let _ = ch_z_set.put_f64_process(z_mot_desired).await;
 
         // Check Z limits
         if !cc_mode.z_frozen() {
             let z_hi = ch_z_mot_hilim.get_f64().await;
             let z_lo = ch_z_mot_lolim.get_f64().await;
             if z_mot_desired < z_lo || z_mot_desired > z_hi {
-                let _ = ch_msg1.put_string("Z will exceed soft limits").await;
-                let _ = ch_msg2.put_string("Setting to Manual Mode").await;
-                let _ = ch_alert.put_i16(1).await;
+                let _ = ch_msg1
+                    .put_string_process("Z will exceed soft limits")
+                    .await;
+                let _ = ch_msg2.put_string_process("Setting to Manual Mode").await;
+                let _ = ch_alert.put_i16_process(1).await;
                 auto_mode = false;
-                let _ = ch_auto_mode.put_i16(0).await;
+                let _ = ch_auto_mode.put_i16_process(0).await;
             }
         }
 
@@ -808,10 +840,10 @@ pub async fn run(
                 z_speed,
                 cc_mode,
             );
-            let _ = ch_theta_mot_velo.put_f64(new_th).await;
-            let _ = ch_theta2_mot_velo.put_f64(new_th).await;
+            let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
+            let _ = ch_theta2_mot_velo.put_f64_process(new_th).await;
             if !cc_mode.z_frozen() {
-                let _ = ch_z_mot_velo.put_f64(new_z).await;
+                let _ = ch_z_mot_velo.put_f64_process(new_z).await;
             }
 
             let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
@@ -819,7 +851,7 @@ pub async fn run(
             if !cc_mode.z_frozen() {
                 let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
             }
-            let _ = ch_put_vals.put_i16(0).await;
+            let _ = ch_put_vals.put_i16_process(0).await;
             _caused_move = true;
 
             // Wait for motors
@@ -834,10 +866,12 @@ pub async fn run(
                     || ch_theta2_hls.get_i16().await != 0
                     || ch_theta2_lls.get_i16().await != 0
                 {
-                    let _ = ch_msg1.put_string("Theta Motor hit a limit switch!").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1
+                        .put_string_process("Theta Motor hit a limit switch!")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
                     auto_mode = false;
-                    let _ = ch_auto_mode.put_i16(0).await;
+                    let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_theta_mot_stop.put_i16_process(1).await;
                     let _ = ch_theta2_mot_stop.put_i16_process(1).await;
                     let _ = ch_z_stop.put_i16_process(1).await;
@@ -847,10 +881,12 @@ pub async fn run(
                 if !cc_mode.z_frozen()
                     && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
                 {
-                    let _ = ch_msg1.put_string("Z Motor hit a limit switch!").await;
-                    let _ = ch_alert.put_i16(1).await;
+                    let _ = ch_msg1
+                        .put_string_process("Z Motor hit a limit switch!")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
                     auto_mode = false;
-                    let _ = ch_auto_mode.put_i16(0).await;
+                    let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_theta_mot_stop.put_i16_process(1).await;
                     let _ = ch_theta2_mot_stop.put_i16_process(1).await;
                     let _ = ch_z_stop.put_i16_process(1).await;
@@ -865,9 +901,9 @@ pub async fn run(
                 let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
                 let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
                 let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-                let _ = ch_theta_rdbk_echo.put_f64(rbv).await;
+                let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
                 let _ = ch_theta2_rdbk_echo
-                    .put_f64(ch_theta2_mot_rbv.get_f64().await)
+                    .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
                     .await;
 
                 if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 {
@@ -879,10 +915,10 @@ pub async fn run(
             // stopped (C `ml_monoCtl.st` state thetaMotStopped,
             // ml_monoCtl.st:1049-1054). Theta2 tracks Theta's speed and is
             // restored alongside it.
-            let _ = ch_theta_mot_velo.put_f64(old_th_speed).await;
-            let _ = ch_theta2_mot_velo.put_f64(old_th2_speed).await;
+            let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
+            let _ = ch_theta2_mot_velo.put_f64_process(old_th2_speed).await;
             if !cc_mode.z_frozen() {
-                let _ = ch_z_mot_velo.put_f64(old_z_speed).await;
+                let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
             }
 
             if _caused_move {
@@ -897,36 +933,42 @@ pub async fn run(
             let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
             let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
             let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            let _ = ch_moving.put_i16(0).await;
+            let _ = ch_moving.put_i16_process(0).await;
         }
 
         // Update echoes
         let _ = ch_theta_rdbk_echo
-            .put_f64(ch_theta_mot_rbv.get_f64().await)
+            .put_f64_process(ch_theta_mot_rbv.get_f64().await)
             .await;
         let _ = ch_theta2_rdbk_echo
-            .put_f64(ch_theta2_mot_rbv.get_f64().await)
+            .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
             .await;
-        let _ = ch_z_rdbk_echo.put_f64(ch_z_mot_rbv.get_f64().await).await;
+        let _ = ch_z_rdbk_echo
+            .put_f64_process(ch_z_mot_rbv.get_f64().await)
+            .await;
         let _ = ch_theta_vel_echo
-            .put_f64(ch_theta_mot_velo.get_f64().await)
+            .put_f64_process(ch_theta_mot_velo.get_f64().await)
             .await;
         let _ = ch_theta2_vel_echo
-            .put_f64(ch_theta2_mot_velo.get_f64().await)
+            .put_f64_process(ch_theta2_mot_velo.get_f64().await)
             .await;
-        let _ = ch_z_vel_echo.put_f64(ch_z_mot_velo.get_f64().await).await;
+        let _ = ch_z_vel_echo
+            .put_f64_process(ch_z_mot_velo.get_f64().await)
+            .await;
         let _ = ch_theta_dmov_echo
-            .put_i16(ch_theta_dmov.get_i16().await)
+            .put_i16_process(ch_theta_dmov.get_i16().await)
             .await;
         let _ = ch_theta2_dmov_echo
-            .put_i16(ch_theta2_dmov.get_i16().await)
+            .put_i16_process(ch_theta2_dmov.get_i16().await)
             .await;
-        let _ = ch_z_dmov_echo.put_i16(ch_z_dmov.get_i16().await).await;
+        let _ = ch_z_dmov_echo
+            .put_i16_process(ch_z_dmov.get_i16().await)
+            .await;
 
         // Update y offset from readback
         let y_rbv = ch_y_mot_rbv.get_f64().await;
         y_offset_val = y_rbv;
-        let _ = ch_y_offset.put_f64(y_offset_val).await;
+        let _ = ch_y_offset.put_f64_process(y_offset_val).await;
     }
 }
 

@@ -41,6 +41,46 @@ const DBCOMMON_NOMOD: &[&str] = &[
     "PUTF", "RPRO", "TIME", "UTAG",
 ];
 
+thread_local! {
+    /// The origin tag applied to every event posted from the current
+    /// thread's synchronous put+process cascade when the poster itself
+    /// passes origin 0. Set only by [`AmbientWriteOriginScope`], read only
+    /// by [`RecordInstance::notify_field_with_origin`]. An in-process
+    /// writer (a ported SNL state machine) uses this so the whole
+    /// synchronous consequence of its put — the direct field post AND the
+    /// process-cycle posts, FLNK cascade included — carries its origin and
+    /// is filtered from its own subscriptions, while posts from work the
+    /// cascade merely *spawned* (a motor poller on another task) stay
+    /// untagged and visible to it.
+    static AMBIENT_WRITE_ORIGIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII scope for [`AMBIENT_WRITE_ORIGIN`]. Sound only around code with no
+/// `.await` inside: the tag is thread-local, so crossing an await point
+/// would both leak it to interleaved tasks and lose it on work-stealing.
+/// The put paths that use it (`put_record_field_from_ca_no_notify_with_origin`)
+/// wrap a fully synchronous body.
+pub struct AmbientWriteOriginScope {
+    prev: u64,
+}
+
+/// Enter an ambient-origin scope; the previous value is restored on drop
+/// (scopes nest).
+pub fn ambient_write_origin_scope(origin: u64) -> AmbientWriteOriginScope {
+    let prev = AMBIENT_WRITE_ORIGIN.with(|c| c.replace(origin));
+    AmbientWriteOriginScope { prev }
+}
+
+impl Drop for AmbientWriteOriginScope {
+    fn drop(&mut self) {
+        AMBIENT_WRITE_ORIGIN.with(|c| c.set(self.prev));
+    }
+}
+
+fn ambient_write_origin() -> u64 {
+    AMBIENT_WRITE_ORIGIN.with(|c| c.get())
+}
+
 /// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
 /// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
 ///
@@ -4887,6 +4927,12 @@ impl RecordInstance {
         use crate::server::database::filters::FilteredMonitorEvent;
         use crate::server::recgbl::EventMask;
 
+        // Same ambient-origin inheritance as `notify_field_with_origin`:
+        // a process cycle driven by an in-process writer's put tags its
+        // posts with the writer's origin, so the writer's own filtered
+        // subscriptions do not hear its cascade. 0 outside any scope.
+        let origin = ambient_write_origin();
+
         for (field, value, posting_mask) in &snapshot.changed_fields {
             let posting_mask = *posting_mask;
             if let Some(subs) = self.subscribers.get(field) {
@@ -4904,7 +4950,7 @@ impl RecordInstance {
                     if !posting_mask.is_empty() && sub_mask.intersects(posting_mask) {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
-                            origin: 0,
+                            origin,
                             mask: posting_mask,
                         };
                         // Server-side filter chain (3.15.7). Empty chain
@@ -4964,6 +5010,16 @@ impl RecordInstance {
         origin: u64,
     ) {
         use crate::server::database::filters::FilteredMonitorEvent;
+        // A poster that carries no origin of its own inherits the ambient
+        // one (0 outside any scope): this is how every post inside an
+        // SNL writer's synchronous put+process cascade gets the writer's
+        // tag without threading a parameter through the whole processing
+        // machinery. An explicit origin always wins.
+        let origin = if origin != 0 {
+            origin
+        } else {
+            ambient_write_origin()
+        };
         // A value-class post publishes the field to its DBE_VALUE/DBE_LOG
         // subscribers, exactly as C's `dbPut` does for the put field
         // (dbAccess.c:1414) — record it so the next process cycle's

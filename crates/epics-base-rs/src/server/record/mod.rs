@@ -36,7 +36,8 @@ pub use menu_choices::{
 pub use pini::PiniMode;
 pub(crate) use record_instance::value_as_dbr_string;
 pub use record_instance::{
-    AlarmAck, DeferredNotifyPut, NotifyWaitSet, PactExit, ProcessCompletion, RecordInstance,
+    AlarmAck, AmbientWriteOriginScope, DeferredNotifyPut, NotifyWaitSet, PactExit,
+    ProcessCompletion, RecordInstance, ambient_write_origin_scope,
 };
 pub use record_trait::{
     ArrayMonitorPost, Asl, CommonFieldPutResult, ConstantInitLink, CyclePostMask,

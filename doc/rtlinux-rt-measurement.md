@@ -296,6 +296,54 @@ the default is Disabled (unset behaves as `NO`), the inverse of the RTEMS defaul
 (`DEFAULT_POLICY = AllowRealtime` there). The `CaServerLow = 20` mapping matches
 the opt-in SCHED_FIFO path landed in the blocking CA driver.
 
+### §5b The same switch on a whole IOC — every thread, read from `/proc`
+
+§5 probes one thread in a purpose-built binary. This is the census of a real
+IOC: `softioc-rs` built `--features epics-base-rs/linux-rt`, launched
+`sudo chrt -f 10 env EPICS_RS_ALLOW_RT_PRIORITY=YES`, four records, CA on port
+5164. Tip `ad5d77bc`, kernel `7.0.0-28-realtime`. Every row below is `chrt -p
+<tid>` and `/proc/<tid>/stat` field 41 agreeing; `policy=1` is `SCHED_FIFO`.
+
+| thread name | count | POSIX FIFO prio | banded by |
+|---|---|---|---|
+| `softioc-rs-rt` (main) | 1 | 10 | `chrt` (inherited) |
+| `tokio-rt-worker` | 12 | 10 | `chrt` (inherited) |
+| `scan-owner` | 1 | 10 | `enter_ioc_thread(Low)` — see below |
+| `scan-10` | 1 | **59** | `enter_ioc_thread(ScanLow+0)` |
+| `scan-5` | 1 | **60** | `enter_ioc_thread(ScanLow+1)` |
+| `scan-2` | 1 | **61** | `enter_ioc_thread(ScanLow+2)` |
+| `scan-1` | 1 | **62** | `enter_ioc_thread(ScanLow+3)` |
+| `scan-0.5` | 1 | **63** | `enter_ioc_thread(ScanLow+4)` |
+| `scan-0.2` | 1 | **64** | `enter_ioc_thread(ScanLow+5)` |
+| `scan-0.1` | 1 | **65** | `enter_ioc_thread(ScanLow+6)` |
+
+21 threads, 0 of them non-FIFO.
+
+**The seven bold rows are the load-bearing evidence.** They are *not* the
+priority `chrt` handed the process — they are levels the IOC set on itself, so
+they prove the `EPICS_RS_ALLOW_RT_PRIORITY` path ran inside a real IOC rather
+than the process merely inheriting one class. The arithmetic checks out
+exactly: `sched_get_priority_min/max(SCHED_FIFO)` measures `1`/`99` on this
+box, so `map_epics_priority` is `oss = epics × 0.98 + 1` truncated, and EPICS
+`60…66` (`periodic_priority`, `server/scan.rs:68`) lands on POSIX `59…65` —
+each of the seven, no gaps, in the `scan-%g` order C spawns them
+(`dbScan.c:949`).
+
+**Two rows prove nothing on their own, and are listed as such.** `scan-owner`
+self-bands at `ThreadPriority::Low = 10`, which maps to POSIX `10` — the same
+value `chrt -f 10` supplied, so this row cannot distinguish the two mechanisms.
+The 12 `tokio-rt-worker` threads do not self-band at all; they hold FIFO(10)
+purely by inheriting the launch class. **The CA server has no dedicated banded
+thread** — it runs on that unbanded pool. That is the same structural fact
+`doc/rtlinux-scan-tail-decomposition.md` builds its split-process rig around,
+and it is why the CA leg cannot be elevated independently of the client inside
+one process: there is nothing thread-shaped to elevate.
+
+**Positive A/B on the feature itself.** `--features epics-base-rs/linux-rt`
+makes the binary reference `pthread_mutexattr_setprotocol` (1 symbol
+reference); the same binary built without the feature references it 0 times.
+The PI mutex is compiled in, not assumed.
+
 ---
 
 ## §6 Correctness under PREEMPT_RT — the gate on the RT kernel
@@ -315,10 +363,21 @@ compared against the host.
 
 * **The 14 `epics-oracle-rs` failures are env-gated, not RT regressions.**
   `epics-oracle-rs` boots against a C EPICS ground-truth tree at
-  `/home/stevek/work/epics-base/bin/linux-x86_64`, which is absent on the box
-  and present on the host — which is why the host passes all 10182 and the box
-  fails exactly those 14. Excluding the package is the correct isolation, not a
-  workaround for an RT defect.
+  `/home/stevek/work/epics-base/bin/linux-x86_64`, which was absent on the box
+  and present on the host — which is why the host passed all 10182 and the box
+  failed exactly those 14. Excluding the package was the correct isolation, not
+  a workaround for an RT defect.
+
+  **This is no longer the box's state.** The C tree was provisioned on `.129`
+  later the same day — stock base + stock pvxs, 34 record types, recipe and env
+  block in `doc/oracle-ground-truth-provisioning.md`. With it, the exclusion is
+  unnecessary: at tip `ad5d77bc` on the same kernel, `cargo nextest run -p
+  epics-oracle-rs --no-fail-fast` reports **151 tests run: 151 passed, 0
+  skipped** (exit 0, 13.187 s) and `cargo nextest run --workspace
+  --no-fail-fast` reports **10192 tests run: 10192 passed, 2 skipped** (exit 0,
+  60.310 s) — oracle included, no `-E` filter. The table above stays as the
+  measurement taken at its own commit; do not read its `-E 'not
+  package(epics-oracle-rs)'` row as still-required practice on this box.
 * **The one feature-ON base failure is a load-induced ordering flake.**
   `runtime::background::future_exec::tests::a_yielding_task_releases_the_worker_to_a_queued_task`
   failed only inside the concurrent full-workspace run (load avg ~20), in

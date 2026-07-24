@@ -8,7 +8,12 @@ use syn::{Data, DeriveInput, Fields, ItemFn, Lit, parse_macro_input};
 fn epics_base_path() -> proc_macro2::TokenStream {
     if let Ok(found) = crate_name("epics-base-rs") {
         match found {
-            FoundCrate::Itself => quote!(crate),
+            // `crate` would be wrong everywhere except the library target
+            // itself (an integration test or bin under the same package sees
+            // `crate` as *its own* crate root), so refer to the library by
+            // name; `epics-base-rs`'s `extern crate self as epics_base_rs;`
+            // makes that name resolve inside the library target too.
+            FoundCrate::Itself => quote!(::epics_base_rs),
             FoundCrate::Name(name) => {
                 let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
                 quote!(::#ident)
@@ -97,10 +102,19 @@ pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Marks an async function as an EPICS test.
+/// Marks an async function as an EPICS test, driven by whichever backend the
+/// build selected.
 ///
-/// Builds a current-thread tokio runtime (via `epics_base_rs::__tokio`),
-/// matching the default behavior of `#[tokio::test]`.
+/// Expands to a plain `#[test]` whose body runs through
+/// `epics_base_rs::runtime::task::test_block_on`: on the tokio backend that
+/// is a fresh current-thread runtime (exactly what `#[tokio::test]` builds);
+/// on the exec backend (`--features rtems-exec-model` / the RTEMS target) the
+/// test thread drives the future itself and spawns/sleeps land on the
+/// background executor. Use this instead of `#[tokio::test]` for any test
+/// whose body sticks to the `runtime::` abstractions — such a test needs no
+/// backend gating and no `RTEMS-EXEC-MODEL-ALLOW` census entry. A body that
+/// touches `tokio::net`/`tokio::time` directly still needs `#[tokio::test]`
+/// plus a backend gate.
 ///
 /// # Restrictions
 /// - Must be applied to an `async fn` with no arguments and no generics.
@@ -166,11 +180,7 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[test]
         #(#attrs)*
         #vis fn #name() #ret {
-            #base::__tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime")
-                .block_on(async move #body)
+            #base::runtime::task::test_block_on(async move #body)
         }
     }
     .into()

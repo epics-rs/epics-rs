@@ -22,6 +22,13 @@
     clippy::useless_conversion
 )]
 
+// `epics-macros-rs` attribute expansions refer to this crate as
+// `::epics_base_rs` (the spelling that is correct in downstream crates and in
+// this package's own integration tests/bins, where `crate` would name the
+// wrong crate). This alias makes the same spelling resolve inside the library
+// target itself, so one expansion works everywhere.
+extern crate self as epics_base_rs;
+
 /// The upstream EPICS Base release this crate ports — C's
 /// `EPICS_VERSION_FULL`.
 ///

@@ -153,6 +153,38 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
+/// Drive an async test body to completion — the driver behind
+/// `#[epics_test]` (`epics-macros-rs`).
+///
+/// The point of the indirection is that the *backend* picks the driver, not
+/// the test. On `tokio_backend` this builds exactly what `#[tokio::test]`
+/// builds: a fresh current-thread runtime with IO and time enabled. On
+/// `exec_backend` (the RTEMS target, or a host run with
+/// `--features rtems-exec-model`) no tokio runtime exists to build, so the
+/// test thread itself drives the future via [`park_on`], and everything the
+/// body spawns or sleeps on lands on the process-global background executor
+/// (lazily initialised on first use) — the same seam the RTEMS boot path
+/// exercises. A test written with `#[epics_test]` therefore needs no
+/// per-backend gating and no `RTEMS-EXEC-MODEL-ALLOW` census entry.
+#[cfg(tokio_backend)]
+pub fn test_block_on<F: Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio test runtime")
+        .block_on(fut)
+}
+
+/// `exec_backend` twin of [`test_block_on`]: see the `tokio_backend` copy for
+/// the contract. The body's awaits must reach only runtime-agnostic
+/// primitives (`park_on`'s rule) — a body that touches `tokio::net` or
+/// `tokio::time` directly belongs under `#[tokio::test]` with a backend gate
+/// instead.
+#[cfg(exec_backend)]
+pub fn test_block_on<F: Future>(fut: F) -> F::Output {
+    park_on(fut)
+}
+
 // ---------------------------------------------------------------------------
 // Platform-selected task handle types (decision A2 / B)
 //
@@ -265,6 +297,36 @@ where
         DEFAULT_SPAWN_PRIORITY,
         future,
     )
+}
+
+/// Yield the current task once — the seam replacement for
+/// `tokio::task::yield_now`, so no call site names `tokio::task` directly.
+#[cfg(tokio_backend)]
+pub async fn yield_now() {
+    tokio::task::yield_now().await;
+}
+
+/// Exec-backend yield: return `Pending` once with the waker already woken.
+/// On the cooperative background executor that re-enqueues the task behind
+/// whatever else is runnable; under a `park_on` driver the wake sets the
+/// park token, so the driver re-polls immediately — both give one fair
+/// scheduling point, which is all `yield_now` promises.
+#[cfg(exec_backend)]
+pub async fn yield_now() {
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    YieldNow(false).await;
 }
 
 #[cfg(tokio_backend)]

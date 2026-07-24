@@ -1,12 +1,13 @@
 //! The VxWorks 7 backend, for an IOC running as an RTP.
 //!
 //! Unlike [`super`]'s RTEMS backend this compiles no C of its own and needs no
-//! build-script cfg to say whether its symbols exist: everything below goes
-//! through the `libc` crate's `vxworks` module, and an RTP links libc
-//! unconditionally. `target_os = "vxworks"` alone is therefore the whole
-//! selection — there is no `vxworks_boot_linked` counterpart to
-//! `rtems_boot_linked`, and inventing one for symmetry would add a
-//! configuration axis no build can be in.
+//! build-script cfg to say whether its symbols exist: every symbol below is one
+//! an RTP resolves from the C library it links unconditionally, whether the
+//! `libc` crate declares it (`fcntl`, `fstat`, `getsockopt`, `taskIdSelf`) or
+//! [`ffi`] does. `target_os = "vxworks"` alone is therefore the whole selection
+//! — there is no `vxworks_boot_linked` counterpart to `rtems_boot_linked`, and
+//! inventing one for symmetry would add a configuration axis no build can be
+//! in.
 //!
 //! # What an RTP can and cannot see
 //!
@@ -163,6 +164,22 @@ pub(super) fn register_task() {
 }
 
 /// The task census — the `rt top` half.
+///
+/// # How far the format parity goes
+///
+/// The block framing is the C's: `TASKDUMP begin tag=… count=…`, one line per
+/// task, `TASKDUMP end tag=…`. The per-task *fields* are not, and cannot be —
+/// `rtems_stats.c:200` prints `core`, `posix`, `sc` and `obj`, which are the
+/// RTEMS scheduler's own facts and have no VxWorks counterpart, while priority
+/// and stack come from one `TASK_DESC` here. So a scraper reads both blocks the
+/// same way (split on the framing, parse `key=value`) and gets a different set
+/// of keys from each, which is the honest outcome when the two kernels expose
+/// different things.
+///
+/// The per-task line carries `tag=` where `rtems_stats.c:200` leaves it to the
+/// framing. Deliberate, and the same C's `FDCENSUS` lines already do it: two
+/// censuses interleaving on one console cost nothing to tell apart if every
+/// line is self-identifying, and a repeated key costs a scraper nothing.
 pub(super) fn dump_tasks(tag: &str) {
     let (ids, dropped) = registry().snapshot();
     census_header("TASKDUMP", tag, ids.len(), dropped);
@@ -192,6 +209,12 @@ pub(super) fn dump_tasks(tag: &str) {
 /// an RTP, so it is assembled per task from the same `TASK_DESC` the census
 /// above reads — one call per registered task, over the same registry, so the
 /// two blocks cannot describe different sets of threads.
+///
+/// The body therefore diverges further from RTEMS' than [`dump_tasks`] does:
+/// there, `STACKUSE begin`/`end` bracket the RTEMS reporter's own table, which
+/// this backend has nothing to reproduce. The framing is the same and the
+/// measurement is the same — `td_stackHigh` is the high-water mark the RTEMS
+/// checker reports — but the rows are `key=value` rather than that table.
 pub(super) fn stack_report(tag: &str) {
     let (ids, dropped) = registry().snapshot();
     census_header("STACKUSE", tag, ids.len(), dropped);

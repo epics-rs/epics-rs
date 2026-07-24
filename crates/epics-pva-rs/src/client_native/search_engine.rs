@@ -31,13 +31,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 // The UDP SEARCH/beacon transport is compiled out wherever a spawned future
-// has no tokio reactor — `cfg(exec_backend)`, which is the RTEMS target *and*
-// a host `--features rtems-exec-model` build. Two facts, one gate:
+// has no tokio reactor — `cfg(exec_backend)`, which is either embedded
+// target (RTEMS or VxWorks) *and* a host `--features rtems-exec-model`
+// build. Two facts, one gate:
 //
-//   * On the target newlib has no `recvmsg`/`IP_PKTINFO` original-destination
+//   * On RTEMS, newlib has no `recvmsg`/`IP_PKTINFO` original-destination
 //     recovery and `local_addr()` cannot be read back to stamp a SEARCH
 //     response port, so a UDP search would advertise port 0 and never be
-//     answered (doc/pvalink-rtems-design.md §4.2).
+//     answered (doc/pvalink-rtems-design.md §4.2). It is gated out on
+//     VxWorks too — `AsyncUdpV4`'s `tokio::net`/`socket2`/`if-addrs` stack
+//     does not build for either embedded target, so the module stays one
+//     host-only unit rather than a per-target reason each.
 //   * On either backend-free build this engine runs on a callback-pool worker
 //     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
 //     "there is no reactor running" — even when the process has a runtime
@@ -50,7 +54,8 @@ use std::time::Duration;
 // `tokio_backend` is the predicate that means "a reactor exists" and is the
 // one the whole `AsyncUdpV4`/`UdpSocket` surface below carries, so "no UDP in
 // this build" holds by construction. The target's compiled surface is
-// unchanged: `target_os = "rtems"` implies `exec_backend`.
+// unchanged: `epics_embedded_target` (RTEMS or VxWorks) implies
+// `exec_backend`.
 //
 // Either way everything the client reaches goes over TCP name servers via the
 // `SearchTransport::NameServersOnly` seam.

@@ -89,7 +89,8 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // `epics-base-rs`'s `build.rs` defines this rule and this script repeats it,
 // for this crate's own compilation:
 //
-//     exec_backend  ⟺  target_os == "rtems"  ||  feature "rtems-exec-model"
+//     exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
+//                   ||  feature "rtems-exec-model"
 //     tokio_backend ⟺  otherwise
 //
 // Why the PVA client needs it. Every client task is started through
@@ -131,17 +132,22 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(pva_blocking_client)");
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
+    println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
-    let rtems = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("rtems");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let embedded_target = matches!(os.as_str(), "rtems" | "vxworks");
+    if embedded_target {
+        println!("cargo::rustc-cfg=epics_embedded_target");
+    }
+
     let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
-    if rtems || host_exec_model {
+    if embedded_target || host_exec_model {
         println!("cargo::rustc-cfg=exec_backend");
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
 
     let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
-    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if local_account_db(unix, &os) {
         println!("cargo::rustc-cfg=local_account_db");

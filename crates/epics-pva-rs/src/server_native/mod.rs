@@ -9,11 +9,12 @@
 //!   included.
 //! * **Async I/O layer** — [`accept`], [`udp`], [`runtime`]. Built on
 //!   `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
-//!   None of those cross to `armv7-rtems-eabihf` (§8.1), so this layer is
-//!   host-only; RTEMS gets a blocking thread-per-client driver instead
-//!   (design doc §4, §9 phase 6 item 7), which sits on the protocol layer
-//!   above. The gate is the target, not a feature: it is not a choice a
-//!   hosted build can make.
+//!   None of those cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*`
+//!   triples (§8.1), so this layer is host-only; each embedded target gets a
+//!   blocking thread-per-client driver instead (design doc §4, §9 phase 6
+//!   item 7), which sits on the protocol layer above. The gate is
+//!   `epics_embedded_target`, not a feature: it is not a choice a hosted
+//!   build can make.
 //!
 //! [`accept`] is the TCP side's only socket-bearing module; [`tcp`] and the
 //! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
@@ -26,7 +27,7 @@
 //! the host-only modules that held them, tokio handle annotations routed
 //! through the runtime seam, `leaf_convert`'s PUT direction ungated).
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod accept;
 // The blocking thread-per-connection driver — the second driver beside
 // [`accept`], for targets with no reactor (RTEMS item 5 stage 3). Owns
@@ -42,7 +43,7 @@ pub mod op_handle;
 // Per-connection accounting for the report (`pvxsr`). Keyed by peer address
 // and driven from [`tcp`], but it holds no socket of its own.
 pub mod peers;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod runtime;
 // SEARCH parse / name-match / response framing. Protocol only — both the UDP
 // responders and the TCP-circuit handler feed it bytes they read themselves.
@@ -58,10 +59,10 @@ pub mod shared_pv;
 pub mod source;
 // The circuit protocol. Speaks `AsyncRead`/`AsyncWrite` trait objects and
 // spawns through the runtime seam — no socket type, so it is target-neutral;
-// [`accept`] supplies the hosted stream and the RTEMS blocking driver will
-// supply its own.
+// [`accept`] supplies the hosted stream and the embedded-target blocking
+// driver will supply its own.
 pub mod tcp;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod udp;
 
 pub use composite::CompositeSource;
@@ -70,7 +71,7 @@ pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };
 pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use runtime::{
     DEFAULT_MAX_MESSAGE_SIZE, PvaServer, PvaServerConfig, ServerReportHandle, run_pva_server,
 };

@@ -502,10 +502,10 @@ pub(crate) async fn search_matched_cids(
 /// does, because that socket is the only thing that can deliver one:
 /// [`super::udp`] joins `224.0.0.128` on loopback and classifies what arrives
 /// there ([`super::udp::classify_loopback_datagram`]). That module is
-/// `#[cfg(not(target_os = "rtems"))]`, and the driver that replaces it on the
-/// target — [`super::blocking`]'s UDP responder — serves one plain
-/// `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and can
-/// therefore only ever produce [`Origin::Direct`].
+/// `#[cfg(not(epics_embedded_target))]`, and the driver that replaces it on
+/// an embedded target — [`super::blocking`]'s UDP responder — serves one
+/// plain `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and
+/// can therefore only ever produce [`Origin::Direct`].
 ///
 /// So on the target these are not merely unused, they are unreachable, and
 /// carrying them there made the RTEMS gate print `variants FromOriginTag and
@@ -524,9 +524,9 @@ pub(crate) async fn search_matched_cids(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     Direct,
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(not(epics_embedded_target))]
     FromOriginTag,
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(not(epics_embedded_target))]
     Forwarded,
 }
 
@@ -617,9 +617,9 @@ mod tests {
     }
 
     /// **Proven by inspection, pinned by source guard.** The two forwarded
-    /// origins are `cfg`-gated off the RTEMS target, and this pins the fact
-    /// that makes that sound: the driver that serves UDP there constructs
-    /// only [`Origin::Direct`].
+    /// origins are `cfg`-gated off every embedded target, and this pins the
+    /// fact that makes that sound: the driver that serves UDP there
+    /// constructs only [`Origin::Direct`].
     ///
     /// The gate is not cosmetic. `Forwarded` and `FromOriginTag` carry pvxs's
     /// anti-loop rule and its refusal of an `isAny()` reply address
@@ -646,7 +646,7 @@ mod tests {
             assert_eq!(
                 prod.matches(gated).count(),
                 0,
-                "`{gated}` is `#[cfg(not(target_os = \"rtems\"))]`; naming it \
+                "`{gated}` is `#[cfg(not(epics_embedded_target))]`; naming it \
                  from the target's own UDP responder cannot compile there, and \
                  doing so means the loopback-multicast path arrived without \
                  the anti-loop rules that go with it"

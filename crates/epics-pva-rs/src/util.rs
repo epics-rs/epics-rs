@@ -133,16 +133,18 @@ impl SigInt {
         let task = tokio::spawn(async move {
             // tokio::signal::ctrl_c only succeeds on platforms with
             // signal support (Unix/Windows). Errors are non-fatal:
-            // SigInt simply never fires. RTEMS is the same case reached
-            // one level earlier: tokio is built there without the
-            // `signal` feature at all (it pulls signal-hook-registry,
-            // which newlib cannot compile — design doc §8.1), and an
-            // embedded IOC has no console interrupt to trap.
-            #[cfg(not(target_os = "rtems"))]
+            // SigInt simply never fires. Every embedded target is the same
+            // case reached one level earlier: tokio is built there without
+            // the `signal` feature at all (on RTEMS it pulls
+            // signal-hook-registry, which newlib cannot compile — design
+            // doc §8.1; VxWorks drops the same feature for the same
+            // dependency-availability reason), and an embedded IOC has no
+            // console interrupt to trap.
+            #[cfg(not(epics_embedded_target))]
             if (tokio::signal::ctrl_c().await).is_ok() {
                 notify.notify_waiters();
             }
-            #[cfg(target_os = "rtems")]
+            #[cfg(epics_embedded_target)]
             drop(notify);
         });
         std::sync::Arc::new(Self { triggered, task })

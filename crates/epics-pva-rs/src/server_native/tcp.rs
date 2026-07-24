@@ -53,7 +53,7 @@ use super::source::{ChannelInvalidator, DynSource, OpError};
 // host-only, so the re-exports carry its gate — this is the shim, not the
 // protocol, and gating it is what the comment written here at the split
 // already prescribed for the merge with `phase6/pva-rtems-dep-gate`.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit

@@ -37,7 +37,8 @@ pub use env::{
     server_broadcast_port, server_intf_addr_list, server_port, server_tls_keychain_password,
 };
 
-// Both need live interface enumeration (`if-addrs`), which newlib cannot
-// build — see [`env::Config`] for what closing that for real requires.
-#[cfg(not(target_os = "rtems"))]
+// Both need live interface enumeration (`if-addrs`), which neither newlib
+// (RTEMS) nor VxWorks's `libc` module provides `getifaddrs`/`ifaddrs` for —
+// see [`env::Config`] for what closing that for real requires.
+#[cfg(not(epics_embedded_target))]
 pub use env::{Config, list_broadcast_addresses};

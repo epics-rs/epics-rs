@@ -105,7 +105,32 @@ epics-base-rs is the foundation of the [epics-rs](https://github.com/epics-rs/ep
 
 Driver authors should use this facade instead of depending on tokio directly.
 
-## Architecture
+### Real-time deployment (Linux PREEMPT_RT)
+
+This crate owns the two real-time levers a Linux RT deployment uses:
+
+- **`--features linux-rt`** — wires `runtime::sync::PriorityInheritanceMutex`
+  to a `pthread_mutex_t` configured with `PTHREAD_PRIO_INHERIT`, so a
+  low-priority lock holder inherits its waiter's priority instead of inverting
+  it. Off by default (the default is a `parking_lot` fallback with no PI);
+  only meaningful on systems actually running SCHED_FIFO/SCHED_RR. No-op on
+  non-Linux.
+- **`EPICS_RS_ALLOW_RT_PRIORITY=YES`** — opts the process into best-effort
+  SCHED_FIFO banding for IOC threads (falls back to default scheduling when
+  the OS refuses). The default is `NO` on hosted targets and `YES` on RTEMS;
+  an explicit value wins in both directions. Granting the privilege on Linux
+  is the operator's side: an `RTPRIO` rlimit, `CAP_SYS_NICE`, or launching
+  under `chrt`.
+
+The `rtems-exec-model` feature is the matching execution-model switch for a
+blocking-front-end deployment (dedicated OS threads, no tokio reactor) — its
+comment in `Cargo.toml` states the intended Linux PREEMPT_RT use.
+
+Measured on a PREEMPT_RT kernel in `doc/rtlinux-rt-measurement.md`: with PI on,
+the record-gate priority inversion the mutex was built to kill collapses to the
+critical-section bound (worst case 24.9 ms → 10.1 ms on the measured guest;
+absolute numbers are VM-relative, the ratios are the defensible part). The scan
+latency decomposition lives in `doc/rtlinux-scan-tail-decomposition.md`.
 
 ```
 epics-base-rs/src/

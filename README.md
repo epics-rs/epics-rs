@@ -355,6 +355,26 @@ wired in `.cargo/config.toml` — plain `cargo build` is the whole interface.
 The full build manual, including the PVA/QSRV image and the spec escape hatch,
 is in [`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
 
+### Run on RT Linux (PREEMPT_RT)
+
+On a PREEMPT_RT kernel the ordinary host build is the whole build — real time
+is enabled at run/feature level, not by cross-compiling:
+
+```bash
+# build with priority-inheritance mutexes (PTHREAD_PRIO_INHERIT)
+cargo build --release --features epics-base-rs/linux-rt
+
+# opt the IOC into SCHED_FIFO thread banding (default is off on hosted targets),
+# granting the privilege via an RTPRIO rlimit, CAP_SYS_NICE, or chrt
+EPICS_RS_ALLOW_RT_PRIORITY=YES ./your-ioc
+```
+
+Both levers are documented in
+[`crates/epics-base-rs/README.md`](crates/epics-base-rs/README.md) ("Real-time
+deployment"); the measured evidence — PI collapsing the record-gate priority
+inversion to its critical-section bound on a real PREEMPT_RT kernel — is in
+`doc/rtlinux-rt-measurement.md`.
+
 ### Run a Soft IOC
 
 ```bash

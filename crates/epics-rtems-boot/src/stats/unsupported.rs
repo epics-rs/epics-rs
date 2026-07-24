@@ -33,3 +33,11 @@ pub(super) fn dump_tasks(_tag: &str) {}
 pub(super) fn stack_report(_tag: &str) {}
 
 pub(super) fn fd_census(_tag: &str) {}
+
+/// Nothing to record for a census that prints nothing.
+///
+/// This one is called on every build, not only on a target — it rides
+/// `enter_ioc_thread`, so a host `cargo test` reaches it once per IOC thread.
+/// Empty is the whole implementation and it must stay cheap enough to be
+/// uninteresting there.
+pub(super) fn register_task() {}

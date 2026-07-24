@@ -1103,6 +1103,7 @@ version = "0.25.0"
 dependencies = [
  "chrono",
  "epics-macros-rs",
+ "epics-rtems-boot",
  "hostname",
  "if-addrs",
  "libc",

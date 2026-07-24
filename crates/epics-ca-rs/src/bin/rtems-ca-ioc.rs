@@ -380,6 +380,18 @@ mod ioc {
         //     console, the clock, libbsd and DHCP, and called us.
         epics_rtems_boot::link_anchor();
 
+        // (0-reg) Announce this thread to the statistics funnel's thread
+        //     census. Every other IOC thread does this from
+        //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
+        //     not call — it is the one thread that keeps the band the OS
+        //     started it with — so it is also the one thread that has to
+        //     register itself. Without this the census would be missing the
+        //     thread that owns the database.
+        //
+        //     No `#[cfg]`: the funnel is portable and every backend but
+        //     VxWorks' takes this as a no-op.
+        epics_rtems_boot::stats::register_task();
+
         // (0-probe) C6 PROBE: the target's CA search configuration.
         // `rtems_init.c:195` hands `main` a fixed one-element argv and
         // `POSIX_Init` calls `setenv` zero times, so on the target nothing

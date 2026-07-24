@@ -65,6 +65,12 @@ pub(super) fn fd_census(tag: &str) {
     unsafe { with_tag(tag, ffi::epics_rtems_boot_fd_census) }
 }
 
+/// Nothing to record: `rtems_task_iterate` walks the kernel's own thread table,
+/// so the census sees every thread whether or not it announced itself — including
+/// the ones that never call `enter_ioc_thread`, which the VxWorks backend cannot
+/// see at all.
+pub(super) fn register_task() {}
+
 /// Hand a Rust tag to a C printer as a NUL-terminated string.
 ///
 /// `unwrap_or_default` rather than `expect`: an interior NUL in a caller's tag

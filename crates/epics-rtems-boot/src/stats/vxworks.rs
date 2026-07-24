@@ -24,17 +24,22 @@
 //! supports 7 only. So "parity" here means parity with the RTEMS backend beside
 //! it — same classification rules, same output format, same scraper.
 //!
-//! # Three readings are not bound yet
+//! # Hand-written externs, and what admits one
 //!
-//! [`mem_usage`], [`dump_tasks`] and [`stack_report`] need symbols the `libc`
-//! crate does not declare, so binding them means hand-written `extern "C"`
-//! declarations — and on this target a declaration that is never called links
-//! clean whether or not the symbol exists, so "it built" is not evidence. Each
-//! is therefore left explicitly unavailable, saying so on the console rather
-//! than going quiet, until the RTP-callable symbol table measured with `nm`
-//! against the SDK arrives. See each one for what it is waiting on.
+//! Three of the five readings need symbols the `libc` crate does not declare,
+//! so they go through the [`ffi`] block below. On this target a declaration
+//! that is never called links clean whether or not the symbol exists — the
+//! `killpg` bring-up proved that — so "it built" is not evidence a symbol is
+//! there. Every entry in [`ffi`] was therefore measured DEFINED with `nm` over
+//! the SDK's RTP libraries before being declared, and the one foreign *struct*
+//! ([`TaskDesc`], which would link clean while reading the wrong bytes) is
+//! pinned to the SDK's layout by `offset_of!` assertions that fail the build.
+//!
+//! Two readings stay unavailable by measurement rather than by omission:
+//! `MemUsage::free` and `MemUsage::largest_free`. See [`mem_usage`].
 
 use std::io;
+use std::sync::Mutex;
 
 use super::{FdUsage, MemUsage};
 
@@ -139,33 +144,120 @@ pub(super) fn mem_usage() -> MemUsage {
     }
 }
 
-/// Not bound yet — prints one line saying so.
+/// Note this thread in the census registry. Called once per IOC thread.
 ///
-/// Silence is what the no-backend fallback does, and it is the wrong answer
-/// here: a VxWorks probe image is a target that *should* have a census, so a
-/// missing `TASKDUMP` block reads to a scraper exactly like a census that ran
-/// and found nothing. Saying "unavailable, and here is why" is the console form
-/// of the `None`-is-not-zero rule the value readers follow.
+/// The RTEMS backend needs no such call — `rtems_task_iterate` walks the
+/// kernel's own thread table. VxWorks has no RTP-side equivalent: measured,
+/// `taskIdListGet` and `taskEach` are ABSENT from every RTP library, kernel-mode
+/// only. An RTP can ask about a task it can name, and cannot ask what tasks
+/// exist, so the list has to be built as the threads are created.
 ///
-/// What it needs: `taskIdListGet` and `taskPriorityGet` confirmed as defined,
-/// RTP-callable symbols. `taskNameGet` the `libc` crate already declares, so
-/// the names are covered; it is the enumeration and the priority read that are
-/// not. Both are documented as kernel-mode routines, so this may end up
-/// enumerating through the RTP's own POSIX threads instead — which is a design
-/// question the symbol table settles, not one to guess.
-pub(super) fn dump_tasks(tag: &str) {
-    println!("TASKDUMP unavailable tag={tag} reason=taskIdListGet/taskPriorityGet not bound");
+/// `taskIdSelf()` rather than `pthread_self()`: the downstream consumer
+/// `taskInfoGet` speaks `TASK_ID`, so capturing the VxWorks-native id at
+/// registration avoids needing a `pthread_t` → `TASK_ID` conversion that has no
+/// RTP-callable spelling either.
+pub(super) fn register_task() {
+    // SAFETY: `taskIdSelf` takes nothing and reads no memory of ours.
+    let id = unsafe { libc::taskIdSelf() };
+    registry().insert(id);
 }
 
-/// Not bound yet — prints one line saying so. Same reasoning as [`dump_tasks`].
+/// The task census — the `rt top` half.
+pub(super) fn dump_tasks(tag: &str) {
+    let (ids, dropped) = registry().snapshot();
+    census_header("TASKDUMP", tag, ids.len(), dropped);
+    for id in &ids {
+        match task_info(*id) {
+            Some(d) => println!(
+                "TASKDUMP tag={tag} id=0x{:08x} prio={} name={} stack_high={} stack_margin={}",
+                *id as u32,
+                d.td_priority,
+                name_of(&d),
+                d.td_stack_high,
+                d.td_stack_margin,
+            ),
+            // A registered id whose task has exited. Reported rather than
+            // skipped: "a thread that was here at boot and is gone now" is a
+            // finding, and a silent skip would present it as never having run.
+            None => println!("TASKDUMP tag={tag} id=0x{:08x} state=gone", *id as u32),
+        }
+    }
+    println!("TASKDUMP end tag={tag}");
+}
+
+/// Stack high-water per task — the `rt stackuse` half.
 ///
-/// What it needs: `taskInfoGet` plus the `TASK_DESC` layout, whose stack
-/// high-water fields are the report. This one carries an ABI risk the others do
-/// not — a function signature that is wrong fails to link, but a struct layout
-/// that is wrong links clean and reports garbage — so `TASK_DESC` wants field
-/// offsets from the SDK header, not just a symbol name.
+/// RTEMS gets this from `rtems_stack_checker_report_usage`, the shell command's
+/// own implementation. VxWorks has no such whole-system reporter callable from
+/// an RTP, so it is assembled per task from the same `TASK_DESC` the census
+/// above reads — one call per registered task, over the same registry, so the
+/// two blocks cannot describe different sets of threads.
 pub(super) fn stack_report(tag: &str) {
-    println!("STACKUSE unavailable tag={tag} reason=taskInfoGet/TASK_DESC not bound");
+    let (ids, dropped) = registry().snapshot();
+    census_header("STACKUSE", tag, ids.len(), dropped);
+    for id in &ids {
+        match task_info(*id) {
+            Some(d) => println!(
+                "STACKUSE tag={tag} id=0x{:08x} name={} size={} current={} high={} margin={}",
+                *id as u32,
+                name_of(&d),
+                d.td_stack_size,
+                d.td_stack_current,
+                d.td_stack_high,
+                d.td_stack_margin,
+            ),
+            None => println!("STACKUSE tag={tag} id=0x{:08x} state=gone", *id as u32),
+        }
+    }
+    println!("STACKUSE end tag={tag}");
+}
+
+/// The two header lines every registry-backed census block opens with.
+///
+/// The scope line is not decoration and is deliberately not a source comment:
+/// this census lists what registered itself, and a reader who takes it for the
+/// RTP's thread table will under-count and not know it. The RTEMS block carries
+/// no such line because `rtems_task_iterate` really does see everything.
+///
+/// `dropped` is printed even when zero, so a truncated census cannot be
+/// mistaken for a complete one — a cap that stays quiet reads as coverage.
+fn census_header(kind: &str, tag: &str, count: usize, dropped: u32) {
+    println!(
+        "{kind} begin tag={tag} count={count} capacity={MAX_TASKS} dropped={dropped} \
+         source=registry"
+    );
+    println!(
+        "{kind} scope tag={tag} lists only threads that called \
+         runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task \
+         enumerator (taskIdListGet is kernel-only), so a std::thread spawned \
+         outside the runtime seam is invisible here"
+    );
+}
+
+/// `td_name` as a `str`, stopping at the first NUL.
+///
+/// Bounded by the field rather than by a trusted terminator: the array length
+/// is derived from `sizeof(TASK_DESC) - offsetof(td_name)`, so if the SDK ever
+/// puts another field after the name this reads at most to the struct's end and
+/// never past it.
+fn name_of(d: &TaskDesc) -> String {
+    let bytes: Vec<u8> = d
+        .td_name
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// One task's descriptor, or [`None`] if the id names no live task.
+fn task_info(id: TaskId) -> Option<TaskDesc> {
+    // SAFETY: `taskInfoGet` writes only into the descriptor it is given, which
+    // is a zeroed `TaskDesc` whose layout is pinned to the SDK's by the
+    // `offset_of!` assertions below.
+    let mut desc: TaskDesc = unsafe { std::mem::zeroed() };
+    let rc = unsafe { ffi::taskInfoGet(id, &mut desc) };
+    (rc == 0).then_some(desc)
 }
 
 /// Name every open descriptor, in the RTEMS backend's format.
@@ -315,6 +407,129 @@ fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
+/// The census registry: every thread that announced itself, by `TASK_ID`.
+///
+/// Capacity is fixed and matches the RTEMS shim's `EPICS_RTEMS_DUMP_MAX_TASKS`,
+/// so the two targets truncate at the same count rather than at whatever each
+/// happened to allocate.
+const MAX_TASKS: usize = 192;
+
+/// `TASK_ID` is `OBJ_HANDLE` is `int` — measured 4 bytes, and asserted below
+/// beside the descriptor offsets.
+type TaskId = libc::c_int;
+
+fn registry() -> std::sync::MutexGuard<'static, TaskRegistry> {
+    static TASKS: Mutex<TaskRegistry> = Mutex::new(TaskRegistry::new());
+    // A panic while holding this lock would have to come from `println!`
+    // inside the snapshot, which does not run under it — but a poisoned lock
+    // must not silence the census either, so the guard is taken either way.
+    TASKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct TaskRegistry {
+    ids: [TaskId; MAX_TASKS],
+    len: usize,
+    /// Registrations refused for want of room, counted so the census can say
+    /// it truncated instead of quietly under-reporting.
+    dropped: u32,
+}
+
+impl TaskRegistry {
+    const fn new() -> Self {
+        Self {
+            ids: [0; MAX_TASKS],
+            len: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Record `id`, compacting away exited tasks first if that is what it takes
+    /// to make room.
+    ///
+    /// Compaction is why this is not a plain append. `TASK_ID`s accumulate: an
+    /// IOC creates a thread per client connection, so over a long run the
+    /// registry would fill with ids of tasks that have exited and stop
+    /// recording live ones — the census would go stale in exactly the
+    /// long-uptime case it is read for. Sweeping only when full keeps the cost
+    /// off the common path; it is a read-only kernel query per entry, at thread
+    /// startup, at most once per overflow.
+    fn insert(&mut self, id: TaskId) {
+        if self.ids[..self.len].contains(&id) {
+            return;
+        }
+        if self.len == MAX_TASKS {
+            self.retain_live();
+        }
+        if self.len == MAX_TASKS {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.ids[self.len] = id;
+        self.len += 1;
+    }
+
+    fn retain_live(&mut self) {
+        let mut kept = 0;
+        for i in 0..self.len {
+            if task_info(self.ids[i]).is_some() {
+                self.ids[kept] = self.ids[i];
+                kept += 1;
+            }
+        }
+        self.len = kept;
+    }
+
+    /// The ids to report, and how many registrations were refused.
+    ///
+    /// Copied out so the console printing below runs with the lock released: a
+    /// census that held the registry across its own `println!`s would block
+    /// every thread trying to start while the probe wrote to a serial console.
+    fn snapshot(&self) -> (Vec<TaskId>, u32) {
+        (self.ids[..self.len].to_vec(), self.dropped)
+    }
+}
+
+/// VxWorks' `TASK_DESC`, pinned to the SDK's layout by the assertions below.
+///
+/// This is the one declaration in the backend where being wrong would not fail
+/// to link. A mis-declared *function* is a link error; a mis-declared *struct*
+/// links clean and reports garbage — a plausible stack high-water read out of
+/// the wrong eight bytes. So the offsets are asserted rather than commented,
+/// and the assertions are mandatory: an SDK whose layout drifts must stop the
+/// build.
+///
+/// Only the five fields the census prints are named. The padding between them
+/// carries no meaning and is named for the field it precedes; the whole run
+/// 0..68 is padding because `td_id` and `td_rtpId` live there and neither is
+/// read — the registry already holds the id, and an RTP's tasks are all its
+/// own. Offsets measured with `wr-cc` against `taskLibCommon.h` (via
+/// `<taskLib.h>`), `x86_64-wrs-vxworks`, LP64; the SDK spells these fields
+/// `td_stackSize`, `td_stackCurrent`, `td_stackHigh`, `td_stackMargin`.
+#[repr(C)]
+struct TaskDesc {
+    _pad_priority: [u8; 68],
+    td_priority: i32,
+    _pad_stack: [u8; 8],
+    td_stack_size: usize,
+    td_stack_current: usize,
+    td_stack_high: usize,
+    td_stack_margin: isize,
+    _pad_name: [u8; 16],
+    td_name: [libc::c_char; 80],
+}
+
+const _VXWORKS_TASK_DESC_LAYOUT: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<TaskId>() == 4, "TASK_ID is int");
+    assert!(offset_of!(TaskDesc, td_priority) == 68);
+    assert!(offset_of!(TaskDesc, td_stack_size) == 80);
+    assert!(offset_of!(TaskDesc, td_stack_current) == 88);
+    assert!(offset_of!(TaskDesc, td_stack_high) == 96);
+    assert!(offset_of!(TaskDesc, td_stack_margin) == 104);
+    assert!(offset_of!(TaskDesc, td_name) == 128);
+    assert!(size_of::<TaskDesc>() == 208);
+};
+
 /// Declarations the `libc` crate's vxworks module does not carry.
 ///
 /// Every symbol here was measured DEFINED — a real `[T]` text symbol with an
@@ -360,5 +575,15 @@ mod ffi {
         /// can have. UNCONFIRMED against the header text itself: no SDK on the
         /// build host.
         pub fn rtpIoTableSizeGet(rtp_id: c_int) -> c_int;
+
+        /// One task's descriptor. DEFINED in `common/libc.a:taskInfo.o`;
+        /// prototype `STATUS taskInfoGet(TASK_ID tid, TASK_DESC *pTaskDesc)`,
+        /// returning `OK` (0) or `ERROR` (-1) — the latter for an id naming no
+        /// live task, which is how [`super::task_info`] tells a task that has
+        /// exited from one it can describe.
+        ///
+        /// `TASK_ID` is `_Vx_OBJ_HANDLE`, `c_int`, asserted beside the
+        /// descriptor offsets.
+        pub fn taskInfoGet(tid: c_int, desc: *mut super::TaskDesc) -> c_int;
     }
 }

@@ -10,6 +10,10 @@
 //!   has no shell to ask: with no `iocsh` and no console input path, the only
 //!   way to get `rt top`, `rt stackuse` or a descriptor listing off the board
 //!   is for the image to print them itself.
+//! * **The thread-census hook** — [`register_task`], which is neither a reading
+//!   nor a printer but the one thing a backend may need *before* it can print
+//!   one. It is here rather than in a consumer because which OS needs it is a
+//!   backend's business, and the caller is the same either way.
 //!
 //! This module is the *funnel* for both: the types, and one entry point per
 //! reading that every consumer calls. The per-OS half lives in a `backend`
@@ -198,6 +202,37 @@ pub fn stack_report(tag: &str) {
 /// run while the pumps own their sockets.
 pub fn fd_census(tag: &str) {
     backend::fd_census(tag)
+}
+
+/// Note the calling thread in the backend's thread census. A no-op on every
+/// backend whose OS can enumerate its own threads.
+///
+/// [`dump_tasks`] and [`stack_report`] need a list of threads to describe.
+/// RTEMS hands one over — `rtems_task_iterate` walks the kernel's own table —
+/// and needs nothing from the caller. An RTP on VxWorks 7 cannot ask: measured,
+/// `taskIdListGet` and `taskEach` are kernel-mode only and absent from every RTP
+/// library, so a task can be described once it is named but the set of tasks
+/// cannot be discovered. There the list has to be built as the threads start,
+/// and this is the call that builds it.
+///
+/// # Where this is called from, and why only there
+///
+/// `epics_libcom_rs::runtime::task::enter_ioc_thread`, plus `main` in each
+/// target IOC binary, which does not go through it. That is one site because
+/// `enter_ioc_thread` is already the single owner of the thread-transition it
+/// rides on: every IOC thread calls it to take its scheduling band, so "every
+/// thread that bands itself registers itself" is the same invariant with one
+/// more consequence, not a new rule to remember at each spawn.
+///
+/// A thread that starts *outside* that seam is therefore invisible to the
+/// VxWorks census. That is a real limitation and it is printed in the census
+/// output's own header rather than left in this comment, because a reader who
+/// takes the block for the RTP's thread table would under-count and have no way
+/// to know.
+///
+/// Idempotent, so a thread that ends up here twice is registered once.
+pub fn register_task() {
+    backend::register_task()
 }
 
 #[cfg(test)]

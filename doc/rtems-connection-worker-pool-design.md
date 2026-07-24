@@ -247,12 +247,17 @@ loop {
   is. A connection job that panics with nobody joining it is announced by
   the worker loop itself.
 
-## 9. The CA server (site C) — RESOLVED: capacity is the fd wall, 142
+## 9. The CA server (site C) — RESOLVED: capacity is the fd wall **minus one**, 141
 
-**Status: converted.** This section was written before the CA sites were
-done, and recorded the decision they needed. The decision has been taken and
-the sites are now pooled; what follows is the question as it stood, the
-answer, and the arithmetic behind the number.
+**Status: converted, then corrected by measurement.** This section was
+written before the CA sites were done and recorded the decision they needed;
+the decision was taken (capacity = the fd wall, 142) and the sites pooled.
+The on-target run —
+[`doc/rtems-ca-worker-pool-on-target-measurement.md`](rtems-ca-worker-pool-on-target-measurement.md)
+— then falsified the argument for that number, in the direction its author
+did not anticipate, and the capacity is now **141**. What follows is the
+question as it stood, the answer that was taken, what the target said about
+it, and the correction.
 
 ### The question
 
@@ -269,72 +274,118 @@ choosing one. The two candidates as originally stated:
 2. Capacity as a new, documented CA connection limit. Honest, but a
    deviation from `rsrv`.
 
-### The decision — neither; the capacity **is** the fd wall
+### The decision as first taken — the capacity **is** the fd wall, 142
 
 **256 is rejected.** It is not merely arbitrary, it is *unreachable*: the
 143rd client cannot be accepted at all, so a 256-set pool could never lease
 its 143rd set. Its `EAGAIN` arm would be dead code, `worker_count()` would
 never approach its bound, and §12's verification ("at capacity, `acquire`
 returns `WouldBlock` and creates no thread") would be unassertable on the
-target. A bound nothing can reach does not bound anything.
+target. A bound nothing can reach does not bound anything. *(This half of
+the argument survives the measurement; the next half does not.)*
 
 Option 2 is rejected for the reason already stated: it is a count limit C
 has not got.
 
-**`CAS_CLIENT_POOL_CAPACITY = 142`**, the measured fd wall itself. Every
-term below is read out of a named source file or out of
-`doc/rtems-fd-ceiling-deviation.md`, whose ramp drove *this* driver (raw CA
-TCP, VERSION handshake, one `CA_PROTO_CREATE_CHAN`).
+That gave `CAS_CLIENT_POOL_CAPACITY = 142`, the measured fd wall itself,
+with the claim that setting it *at* the wall is what keeps the `EAGAIN` arm
+from being dead code.
+
+### What the target said — the EAGAIN arm is unreachable at 142 too
+
+Measured, §3 of the measurement doc: 142 clients established, all held,
+`FD_CNT = FD_MAX = 150` with **zero descriptors free**, `SETS = CAP = 142` —
+and `REFUSED` **0**, for the whole run. The 143rd client's `accept` failed
+`ENFILE`, so `acquire` was never called and the pool's refusal never ran.
+
+The peer got **nothing**: "the guest accepted nothing and sent nothing — the
+host's `recv` returned end-of-stream with zero bytes, no `VERSION` reply".
+
+So capacity 142 has the same defect 256 had, for the same reason: *both*
+walls are at 142 and the fd one is always first. The refusal path is
+unreachable at any capacity ≥ the wall, not just at capacities above it.
+That matters more than a dead code arm, because it means the contract
+`refuse_client` documents — refuse after `accept`, tell the peer with
+`CA_PROTO_ERROR`/`ECA_ALLOCMEM`, log to the console — **can never execute at
+the wall**, which is the one place it was written for. The silent close it
+exists to remove is exactly what a client at the wall still sees.
+
+### The correction — `CAS_CLIENT_POOL_CAPACITY = 141`
+
+**A refusal that happens after `accept` needs a descriptor to happen on.**
+The server must therefore stop one short of the wall and keep that
+descriptor in hand:
+
+| clients held | process descriptors | client #142 dials |
+|---:|---|---|
+| 142 (capacity = wall) | 150 of 150, none free | `accept` fails `ENFILE`; peer told nothing |
+| **141 (capacity = wall − 1)** | **149 of 150, one free** | `accept` **succeeds** on the last one; `acquire` → `WouldBlock`; `refuse_client` sends `ECA_ALLOCMEM` and closes, returning the descriptor |
+
+The accept loop is single-threaded, so a burst of refusals is served one at
+a time through that one spare rather than racing for it. The cost is one
+concurrent client — 141 instead of 142.
 
 | term | value | source |
 |---|---|---|
 | descriptors configured | 150 | `crates/epics-rtems-boot/csrc/rtems_config.c` §F |
-| held by the IOC at idle | 8 | measured; published as `FD_CNT` = 8, `FD_FREE` = 142 |
-| **fd wall** | **142** | 150 − 8; client #143 fails `accept` with `ENFILE` |
+| held by the IOC at idle | 8 | measured; `FD_CNT` = 8, `FD_FREE` = 142 |
+| **fd wall** | **142** | 150 − 8; measured `FD_CNT = FD_MAX = 150`, `CA_CONN_CNT = 142` |
 | descriptors per CA client | 1 | `FD_CNT + FD_FREE = 150` at every row of the ramp |
 | set stack (`Big` + `Medium`) | 1,572,864 B | 1,048,576 + 524,288; `StackSizeClass::bytes` is `f × 0x10000 × size_of::<usize>()`, `usize` = 4 on `armv7-rtems-eabihf` |
-| 142 sets of stack | 223,346,688 B | 142 × 1,572,864 |
-| free heap at idle | 241,199,000 B | measured, ramp row "held 0" |
-| **memory wall** | **151** | measured on an fd-cap-400 image: `(259,803,736 − 19,880,696) / 1,589,000 = 150.99` |
+| **measured cost per client set** | **1,591,854 B** | measurement §3.1: (254,509,936 − 28,466,624) / 142; the 18,990 B over the stack pair is allocator overhead and per-connection buffers |
+| free heap at idle | **231,289,888 B** | measurement §4, this image |
+| **memory wall** | **≈145** | 231,289,888 / 1,591,854 |
+| **capacity** | **141** | fd wall − 1 |
 
-`capacity = min(fd wall, memory wall) = min(142, 151) = 142`.
+`capacity = (fd wall) − 1 = 141`, and `141 < 145`, so memory does not bind.
 
-The two walls are close because they measure the same connection: at 142
-sets the residual heap is 241,199,000 − 223,346,688 ≈ 17.9 MB, which is the
-17,148,200 B `MEM_FREE` measured with 141 clients held. So 142 sets fit,
-with the same margin the un-pooled driver already ran with at that load.
+**The memory numbers moved and the conclusion did not.** The first
+derivation used 241,199,000 B free at idle and 1,589,000 B per connection
+from `doc/rtems-fd-ceiling-deviation.md`, giving a memory wall of 151. This
+image measures 231,289,888 B free and 1,591,854 B per set, giving ≈145. Both
+are above the fd wall, so the binding term is the same one either way — but
+the margin is 3 sets, not 9, and at the wall the guest had only 5,246,576 B
+of free heap left. Anyone tempted to raise the fd cap (the `-D` route in
+`doc/rtems-fd-ceiling-deviation.md` §5) should note that memory binds at
+about 145 on this image, so raising the cap buys ~4 clients, not 9.
 
-### What 142 buys and what it does not change
+### What 141 buys and what it does not change
 
-* **Creations are bounded**: 142 × 2 = **284** threads for the life of the
-  process, ≈ 50.5 kB of RTEMS TLS residue *once*, against a per-accept leak
-  with no ceiling. That is the whole point of the conversion.
-* **The refusal a client meets stays where C has it.** At capacity the fd
-  layer refuses first — `accept` fails with `ENFILE` before any of our code
-  sees a socket — exactly as it did before, and `CA_REFUSED_CNT` stays 0 at
-  that wall for the reason `doc/rtems-fd-ceiling-deviation.md` §4 already
-  records. The pool's `WouldBlock` arm is reachable only in the narrow
-  window where a client's descriptor is closed but its set has not yet
-  re-idled; it goes to the same `refuse_client` owner as a thread-resource
-  failure, so that window produces a refusal *with* a `CA_PROTO_ERROR` and a
-  console line rather than a silent close.
-* **It does not raise or lower the connection ceiling** (§2). 142 is what
-  the target already served.
+* **The documented refusal can execute.** That is the whole reason for the
+  −1, and it is the only property the change adds.
+* **Creations are bounded**: 141 × 2 = **282** threads for the life of the
+  process, ≈ 50 kB of RTEMS TLS residue *once*, against a per-accept leak
+  with no ceiling. That is the point of the conversion, and it is measured:
+  a 30-cycle serial connect/disconnect ramp added **zero** sets and zero
+  workers (measurement §2), and 284 distinct `PRIOPROBE` labels over the
+  whole run confirm no worker was ever created twice.
+* **The refusal a client meets past 141 is still a resource refusal, not a
+  count.** 141 is derived from the descriptor budget and moves with the fd
+  cap; §9's rejected option 2 was a limit independent of the resource. The
+  client that would have been #142 is not turned away silently — it is
+  accepted and answered.
+* **It does not raise the connection ceiling** (§2), and it lowers the
+  served ceiling by exactly one.
 
 ### Deviations this introduces
 
 * **The pool never shrinks.** After a peak of *n* concurrent clients the
-  process keeps *n* sets — *n* × 1,572,864 B of stack — for its whole life,
+  process keeps *n* sets — *n* × 1,591,854 B measured — for its whole life,
   where the per-accept driver returned each client's stacks on disconnect.
-  At the extreme (a peak of 142) that is 223 MB held permanently on a 256 MB
-  guest. This is the price of removing the creation residue and it is
+  This is measured, not projected: after a 142-client peak fully
+  disconnected, **224,657,080 B stays allocated with zero clients connected**
+  and free heap ends at 2.87 % of its idle value (measurement §4). At
+  capacity 141 the corresponding figure is 141 × 1,591,854 ≈ 224.4 MB on a
+  256 MB guest. This is the price of removing the creation residue and it is
   bounded by the high-water mark, which is exactly what that peak already
   cost while it was live; there is no load at which the pooled driver needs
-  more memory than the un-pooled one *needed at its worst moment*.
+  more memory than the un-pooled one *needed at its worst moment*. What it
+  does change is that the IOC does not get that memory back afterwards, so a
+  single burst permanently sizes the process.
 * **The pool is process-wide (`static`), not per-server.** The resource it
   bounds — descriptors, stacks, heap — is process-wide, the same argument
   `refused_clients()` already makes for its counter, so two servers in one
-  process must share one bound rather than have 142 each. It also removes a
+  process must share one bound rather than have 141 each. It also removes a
   teardown ordering CA cannot state: `WorkerPool::drop` joins every worker,
   and a worker inside a live client takes its `Stop` only on disconnect, so
   a server-owned pool would need a registry of live sockets to shut first
@@ -396,7 +447,19 @@ Mirroring `DialPool::worker_count` / `queue_depth`:
   is the connection immediately after a release (§4.3).
 * A connection whose job panics returns its set: the next `acquire`
   succeeds and `worker_count()` is unchanged.
-* At capacity, `acquire` returns `WouldBlock` and creates no thread.
+* At capacity, `acquire` returns `WouldBlock` and creates no thread. **A
+  unit test asserting this proves nothing about the target**: on the target
+  the capacity is only reached if some *other* resource does not bind first.
+  The CA measurement is the case in point — at capacity 142 the descriptor
+  cap bound first, `accept` failed `ENFILE`, and `REFUSED` stayed 0 for the
+  whole run with `SETS = CAP = 142`
+  ([`doc/rtems-ca-worker-pool-on-target-measurement.md`](rtems-ca-worker-pool-on-target-measurement.md)
+  §3). So the on-target form of this check is: hold `capacity` connections,
+  dial one more, and require that the peer is *answered* — a refusal frame,
+  not an end-of-stream — and that `REFUSED` incremented. For a socket
+  server that means the capacity must leave a descriptor for the refusal to
+  happen on (§9's `fd wall − 1`); a capacity at or above the wall makes this
+  bullet untestable rather than true.
 * A set is not reused while any of its jobs is still running.
 * Concurrency tests are run 50× in isolation and the pass ratio reported —
   the exec-backend class shows ~90% green on a single run, so one green run

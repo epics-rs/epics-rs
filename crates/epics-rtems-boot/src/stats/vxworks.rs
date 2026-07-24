@@ -81,24 +81,62 @@ fn io_table_size() -> Option<u32> {
     u32::try_from(size).ok().filter(|s| *s > 0)
 }
 
-/// Not bound yet — always [`None`].
+/// Heap usage: `used` only. `free` and `largest_free` do not exist here.
 ///
-/// The obvious binding is `memPartInfoGet(memSysPartId, …)`, and it would be
-/// **wrong**: VxWorks 7's libc allocator is mimalloc, so an RTP's `malloc` does
-/// not come out of the system memory partition at all. Publishing the kernel
-/// partition's free bytes as this IOC's heap would be a confident number about
-/// the wrong heap — strictly worse than `NaN`, because an operator would
-/// believe it.
+/// `used` is mimalloc's `current_commit` — bytes this RTP has committed —
+/// which is the counter the allocator itself would answer "how much is out"
+/// with. One call, no walk.
 ///
-/// What it needs, in order: whether the RTP's mimalloc exposes a statistics
-/// entry point (`mi_process_info` or the `mi_stats_*` family) as a *defined*
-/// symbol in the SDK's libc, and if so which of its counters correspond to
-/// `Free.total` / `Used.total` / `Free.largest`. The third is the one worth
-/// checking hardest: `largest_free` is the fragmentation signal an allocation
-/// actually fails on, and a mimalloc heap's answer to it is not simply the
-/// largest free run.
+/// The other two are absent by measurement, not by omission:
+///
+/// * `memPartInfoGet(memSysPartId, …)` is the shape devIocStats' vxWorks OSD
+///   uses and is **rejected twice over**. VxWorks 7's libc allocator is
+///   mimalloc, so an RTP's `malloc` does not come out of the system memory
+///   partition at all — and `memSysPartId` is in any case ABSENT from every
+///   RTP library, so the partition cannot even be named. Publishing the kernel
+///   partition's free bytes as this IOC's heap would be a confident number
+///   about the wrong heap, which is worse than `NaN` because an operator would
+///   believe it.
+/// * `free` has no scalar counter. It is derivable only by walking
+///   `mi_heap_visit_blocks` over the default heap and subtracting in-use
+///   blocks from committed areas — approximate, default-heap-only, and a
+///   pseudo-number by the same rule that rejects the partition read. The walk
+///   is rejected; `mi_stats_get` is DEFINED but has no public struct in the
+///   SDK header, so it is not callable on stable terms either.
+/// * `largest_free` has no source at all. mimalloc exposes no free-run metric
+///   and its block visitor reports allocated blocks only, never free runs. The
+///   RTEMS backend's `Free.largest` — the fragmentation signal an allocation
+///   actually fails on — has no VxWorks analogue, and `MEM_BLK` on this target
+///   is `NaN` for that reason rather than because nobody wired it.
 pub(super) fn mem_usage() -> MemUsage {
-    MemUsage::default()
+    let mut elapsed_msecs = 0usize;
+    let mut user_msecs = 0usize;
+    let mut system_msecs = 0usize;
+    let mut current_rss = 0usize;
+    let mut peak_rss = 0usize;
+    let mut current_commit = 0usize;
+    let mut peak_commit = 0usize;
+    let mut page_faults = 0usize;
+    // SAFETY: every argument is a pointer to a live local of the declared
+    // type, which is the whole contract — `mi_process_info` writes each
+    // out-param and reads nothing of ours. It has no failure return.
+    unsafe {
+        ffi::mi_process_info(
+            &mut elapsed_msecs,
+            &mut user_msecs,
+            &mut system_msecs,
+            &mut current_rss,
+            &mut peak_rss,
+            &mut current_commit,
+            &mut peak_commit,
+            &mut page_faults,
+        );
+    }
+    MemUsage {
+        free: None,
+        used: Some(current_commit as u64),
+        largest_free: None,
+    }
 }
 
 /// Not bound yet — prints one line saying so.
@@ -285,9 +323,29 @@ fn errno() -> i32 {
 /// bring-up purely because nothing called it, so "the image built" is not
 /// evidence that a declared symbol exists.
 mod ffi {
-    use libc::c_int;
+    use libc::{c_int, size_t};
 
     unsafe extern "C" {
+        /// mimalloc's process counters. DEFINED in `common/libc.a:stats.o`;
+        /// prototype `mimalloc.h:160`, whose eight out-params are all
+        /// `size_t*` and none of which is optional in this call.
+        ///
+        /// Only `current_commit` is read. The rest are named rather than
+        /// passed as null because the prototype takes eight pointers and this
+        /// declaration mirrors it exactly — guessing which ones tolerate null
+        /// is a second assumption for no gain.
+        #[allow(clippy::too_many_arguments)]
+        pub fn mi_process_info(
+            elapsed_msecs: *mut size_t,
+            user_msecs: *mut size_t,
+            system_msecs: *mut size_t,
+            current_rss: *mut size_t,
+            peak_rss: *mut size_t,
+            current_commit: *mut size_t,
+            peak_commit: *mut size_t,
+            page_faults: *mut size_t,
+        );
+
         /// Size of an RTP's file-descriptor table.
         ///
         /// DEFINED in `common/libc.a:ioLib.o` @0x9f0 (nm, defined-only scan

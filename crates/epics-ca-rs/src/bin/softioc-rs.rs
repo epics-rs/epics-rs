@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 /// A simple soft IOC that hosts PVs over Channel Access.
 ///
-/// Example: rsoftioc --pv TEMP:double:25.0 --record ai:TEMP_REC:25.0 --db test.db
+/// Example: softioc-rs --pv TEMP:double:25.0 --record ai:TEMP_REC:25.0 --db test.db
 #[derive(Parser)]
 #[command(name = "softioc")]
 struct Args {

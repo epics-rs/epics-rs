@@ -20,6 +20,8 @@ jobs:
         toolchain: 1.94.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    - name: Format
+      run: cargo fmt --all -- --check
     # Cargo registry + target cache. Placed after the toolchain step
     # because the cache key includes the rustc version. The explicit
     # `key` names the *feature resolution* this job builds: each job in

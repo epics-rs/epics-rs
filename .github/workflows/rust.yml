@@ -84,28 +84,70 @@ jobs:
       run: cargo nextest run -p epics-pva-rs --features rtems-exec-model
     - name: epics-bridge-rs (rtems-exec-model)
       run: cargo nextest run -p epics-bridge-rs --features rtems-exec-model
-    # DO NOT add `./scripts/rtems-check.sh` here. It is deliberately RED on the
-    # committed tree and wiring it in would ship a permanently-red required
-    # check. The image configuration is now compiled and its failure is fatal,
-    # so the gate reports six red `[image]` targets / twelve `error[E0080]` /
-    # both layout refusals — that is the true state of the workspace: with a
-    # stock `libc` it cannot build a bootable image. It goes green the moment a
-    # `libc` carrying the documented workaround is patched in, and it is blocked
-    # on that decision and on nothing else. See
-    # doc/rtems-scope-b-session-handoff.md §8.1 item 3.
-    #
-    # Tolerating "the two refusals we already know about" and exiting 0 was
-    # considered and rejected by measurement: the incident that motivated the
-    # refusals fires exactly one of the two, so an allowlist admits it.
-    #
-    # NOTE (has-thread-local spec deviation, 2026-07-24): there is deliberately
-    # NOTHING here that wires the custom `has-thread-local: true` target spec
-    # (`scripts/rtems-tls-spec.sh`). That spec only matters when the RTEMS
-    # *target* is compiled, and no CI job compiles it: the RTEMS coverage in CI
-    # is the `rtems-exec-model` feature built for the host (linux), which is
-    # spec-independent, and the RTEMS-target gate (`rtems-check.sh`) is excluded
-    # for the reason above. The spec gate runs on the bring-up box, not here.
-    # See doc/rtems-tls-spec-deviation.md §3 (the "CI" row) for why this is n/a.
+    # `./scripts/rtems-check.sh` — the RTEMS *target* gate — runs in its own
+    # `rtems-closure` job below, not here: it needs a nightly toolchain
+    # (`-Zbuild-std`) while this job runs the pinned stable, and its feature
+    # resolutions are per-crate RTEMS configurations, not this job's.
+
+  # Type-checks the whole RTEMS closure — every RTEMS crate, binary, and both
+  # build configurations (`portability` and `image`) — for armv7-rtems-eabihf.
+  # Tier-3 target: nightly + rust-src + `-Zbuild-std`, but no cross-toolchain
+  # and no BSP (type-check only, nothing is linked).
+  #
+  # History: this gate was deliberately excluded from CI while it was RED on
+  # the committed tree — with a stock `libc` the image configuration cannot
+  # build, by design (compile-time layout refusals). It went green when the
+  # RTEMS `libc` fixes were pinned in the workspace `[patch.crates-io]`
+  # (see Cargo.toml), so CI runners now resolve the same patched `libc` as a
+  # local checkout and the exclusion reason is gone.
+  #
+  # The nightly channel floats on purpose. `scripts/rtems-tls-spec.sh` derives
+  # the one-key `has-thread-local: true` spec deviation from the ACTIVE
+  # nightly (doc/rtems-tls-spec-deviation.md) and REFUSES — turning this job
+  # red — the moment upstream flips the key in the builtin spec, which is
+  # exactly the retirement trip-wire the deviation doc requires. Pinning a
+  # nightly here would mute that trip-wire and drift from what
+  # `cargo +nightly` means on a developer machine.
+  rtems-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        components: rust-src
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-closure
+    - name: Type-check the RTEMS closure
+      run: ./scripts/rtems-check.sh
+
+  # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback
+  # onto a real `PTHREAD_PRIO_INHERIT` pthread mutex
+  # (crates/epics-libcom-rs/src/runtime/sync.rs). No other job turns the
+  # feature on, so without this job the PI implementation would compile and
+  # test only on maintainer machines. The two crates below are the ones that
+  # declare (`epics-libcom-rs`) or forward (`epics-base-rs`) the feature.
+  # No RT kernel is needed to *run* PI mutexes — only to measure their
+  # latency effect, which happens off-CI (doc/rtlinux-rt-measurement.md).
+  linux-rt:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: linux-rt
+    - name: epics-libcom-rs (linux-rt)
+      run: cargo nextest run -p epics-libcom-rs --features linux-rt
+    - name: epics-base-rs (linux-rt)
+      run: cargo nextest run -p epics-base-rs --features linux-rt
 
   # Commit b7a6b0ab found the no-default-features debt was three masked *build
   # breaks*, not warnings — code that simply does not compile once the default

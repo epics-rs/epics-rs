@@ -1,6 +1,94 @@
 # Changelog
 
-## Unreleased
+## v0.25.0 — 2026-07-24
+
+Minor release. RTEMS 6 goes from "type-checks" to a verified embedded target —
+a reactor-free execution model, blocking CA/PVA drivers, worker-pool thread
+accounting, and `pva://`/`ca://` links, all measured on QEMU/BSP hardware — and
+Linux PREEMPT_RT becomes a first-class real-time deployment with
+priority-inheritance locking proven on a real RT kernel. The runtime/socket
+layer is extracted into the new `epics-libcom-rs` crate, and the async test
+suites move onto `#[epics_test]`, whose driver is selected by the build's
+backend. Four breaking API changes (epics-ca-rs, epics-pva-rs) plus one on the
+iocsh surface. Workspace version 0.24.3 -> 0.25.0, internal
+`[workspace.dependencies]` pins move to 0.25.0 in lockstep.
+
+### Breaking
+
+- **epics-ca-rs: the audit and replay writers go through the filesystem
+  seam.** File-backed constructors take the seam handle instead of opening
+  `std::fs` paths directly, so the RTEMS target and tests control the sink.
+
+- **epics-pva-rs: the ACF host is derived from the peer socket, never from
+  the wire.** A client-asserted host name can no longer influence access
+  decisions; `with_server_derived(peer)` is the single funnel.
+
+- **epics-pva-rs: `ChannelSource` returns the monitor stream, not an
+  `mpsc` receiver.** Custom sources hand back the stream type; the server
+  owns queueing/pipelining uniformly (this is what lets one source serve
+  both the tokio and the RTEMS blocking drivers).
+
+- **epics-pva-rs: the RTEMS dependency gate moved off `server_native::tcp`
+  onto the accept path**, so the module surface compiled for the target no
+  longer drags the tokio server in.
+
+- **epics-base-rs: the iocsh surface no longer traffics in
+  `tokio::runtime::Handle`.** `CommandContext::runtime_handle()` is gone;
+  `CommandContext::bridge()` returns a `runtime::task::BlockingBridge`
+  (tokio backend: a captured handle; exec backend: the global executor), and
+  `IocShell::new` / `optics-rs::seq_start` take the bridge. Registered
+  commands become startable on runtimes without a tokio reactor — RTEMS
+  included — and a command that tries to smuggle a raw handle is now a
+  compile error.
+
+### RTEMS 6 (armv7-rtems-eabihf)
+
+The workspace cross-compiles and *boots*: `rtems-ca-ioc` and `rtems-pva-ioc`
+serve CA and PVA (including QSRV Q:group PVs) from a libbsd BSP, verified on
+QEMU xilinx-zynq with live client traffic.
+
+- **Reactor-free execution model** (`rtems-exec-model`): the `runtime::task`
+  seam routes `spawn`/timers to a cooperative band-priority background
+  executor (release-on-Pending, re-enqueue-on-wake), and connection I/O runs
+  on parked blocking threads (`park_on`). No tokio reactor exists on target.
+- **Blocking protocol drivers**: sans-io CA server/client and the PVA
+  server/client byte paths run on dedicated blocking threads with the same
+  wire behavior as the async drivers (refusal parity, recv accumulation
+  caps, ECA_TOLARGE/ECA_ALLOCMEM).
+- **Thread accounting via worker pools**: CA server clients, PVA connection
+  sets, and every protocol dial borrow threads from bounded pools
+  (capacity = fd wall − 1, so the refusal path always keeps a descriptor),
+  closing the per-thread 128 B RTEMS TLS leak and the per-attempt creation
+  residue. A CA circuit is retired the moment either pump dies (per-circuit
+  death guard), so a dial broken after establish always reaches the redial
+  owner.
+- **`pva://` and `ca://` links on target**: pvalink and calink run over
+  name-server TCP search (no UDP socket on the target arm), mounted in the
+  IOC binaries; on-target two-IOC gates pass for both.
+- **Scanning hoisted into the IOC core** (`ScanOwner`), and QSRV group
+  drains moved to a dedicated thread — never a shared band worker.
+- **Real thread priorities**: every IOC thread is banded
+  (`posix = 56 + epics`, a deliberate deviation from base-on-RTEMS-6's
+  linear map, recorded in `doc/`), measured on target via SCHED_FIFO.
+- **Toolchain**: `epics-rtems-boot` carries the boot shim and link
+  contract; the `has-thread-local: true` target-spec deviation is applied
+  automatically by a rustc wrapper — plain `cargo build` is the whole
+  interface, and `./scripts/rtems-check.sh` type-checks the closure without
+  a cross toolchain.
+
+### Linux PREEMPT_RT
+
+- **`epics-base-rs/linux-rt`**: the record-gate and scan-side lock family
+  becomes `PTHREAD_PRIO_INHERIT` priority-inheritance mutexes; every gate
+  scope was restructured to hold zero awaits (dbProcess parity), external
+  link opens are staged at iocInit (dbCaAddLink parity), and link puts go
+  through dbCa-parity staging.
+- **Opt-in SCHED_FIFO banding** on hosted targets via
+  `EPICS_RS_ALLOW_RT_PRIORITY=YES` (default on for RTEMS, off elsewhere).
+- **Measured**: on a PREEMPT_RT kernel the record-gate priority inversion
+  collapses from 24.9 ms to 10.1 ms worst-case with PI on
+  (`doc/rtlinux-rt-measurement.md`); the scan leg is solved by FIFO
+  (84.7×). `examples/rt-probe` is the measurement rig.
 
 ### New crate: `epics-libcom-rs`
 
@@ -12,26 +100,65 @@
 
   **No downstream source change.** `epics-base-rs` re-exports both modules at
   their original paths (`pub use epics_libcom_rs::{net, runtime};`), so
-  `epics_base_rs::runtime::…` and `epics_base_rs::net::…` resolve as before,
-  and so does `crate::runtime::…` inside `epics-base-rs` itself. `WallTime`
-  moved with its producer and is re-exported at `epics_base_rs::types::
-  WallTime`. Not one call site in the workspace changed.
+  `epics_base_rs::runtime::…` and `epics_base_rs::net::…` resolve as before.
+  `WallTime` moved with its producer and is re-exported at
+  `epics_base_rs::types::WallTime`. Both feature levers are forwarded, so
+  `--features epics-base-rs/linux-rt` and
+  `--features epics-base-rs/rtems-exec-model` are unchanged for callers.
 
-  Both feature levers are forwarded, so `--features epics-base-rs/linux-rt`
-  and `--features epics-base-rs/rtems-exec-model` are unchanged for callers.
+- **Two seams that used to be intra-crate are now pinned at compile time**
+  (`const _: () = assert!(…)`): the scanOnce band count against the
+  periodic-rate count, and the `exec_backend`/`tokio_backend` predicate both
+  build scripts derive against `epics_libcom_rs::EXEC_BACKEND` — a feature
+  forward that stops being wired fails the build instead of splitting the
+  workspace across two task backends.
 
-- **Two seams that used to be intra-crate are now pinned at compile time.**
-  The extraction removed the shared crate that made them implicit, so each is
-  now a `const _: () = assert!(…)` that fails the build rather than a comment
-  that can drift:
+### optics-rs (SNL)
 
-  - the scanOnce worker's band against the periodic-rate count —
-    `epics-base-rs`'s `PERIODIC_SCANS.len()` against
-    `epics-libcom-rs`'s `PERIODIC_SCAN_BAND_COUNT`;
-  - the `exec_backend` / `tokio_backend` predicate, derived by both crates'
-    build scripts, against `epics_libcom_rs::EXEC_BACKEND` — so a
-    `rtems-exec-model` forward that stops being wired is a compile error
-    instead of a workspace split across two task backends.
+- **SNL `pvPut` now translates to put-and-process, not put-and-post.**
+  seq's `pvPut` is a CA put — dbPutField semantics: write the field, then
+  process through the PP gate. The ports wrote-and-posted without ever
+  processing, so every readback the state machines maintain stayed
+  UDF/INVALID forever. All 70 sites across the six SNL ports now go through
+  the dbPutField fire-and-forget tier, carrying the writer origin (simple-PV
+  posts are origin-tagged end to end) so a record's own posts are not
+  mistaken for external CA puts. (#57)
+
+### Testing: `#[epics_test]`
+
+- **The backend picks the test driver, not the test.** `#[epics_test]`
+  expands to a plain `#[test]` driving the body through
+  `runtime::task::test_block_on` — tokio `current_thread` on the default
+  backend, `park_on` under `rtems-exec-model` — so the feature-ON suites
+  exercise 1,251 migrated test bodies through the exec seam.
+  Reactor-bound tests (tokio::net via production code, flavored runtimes,
+  tokio-as-subject) stay `#[tokio::test]`, and each crate's
+  `rtems_exec_model_gate` census pins their exact count — a new unmarked
+  `#[tokio::test]` fails the gate. (#58)
+
+### CI
+
+- New standing gates: the RTEMS closure type-check, `linux-rt`,
+  `rtems-exec-model` (plus a 50-iteration exec-backend cancel stress job),
+  and `no-default-features`. `cargo fmt` runs in CI
+  (thanks @bolinocroustibat, #50; also #51, #53).
+
+### Fixed
+
+- **epics-ca-rs**: the server's per-client worker pool capacity is 141
+  (fd wall − 1) — at 142 the wall client's accept fails ENFILE before the
+  pool can refuse, so the documented ECA_ALLOCMEM refusal could never
+  execute; a refusal that happens after accept needs a descriptor to happen
+  on. Also: nameserver recv cap; circuit-retirement redial ownership (see
+  RTEMS section).
+- **epics-base-rs**: both iocsh threads are banded at
+  `ThreadPriority::Iocsh`; CP link holders process on access-rights loss
+  (dbCa.c:1076-1102 parity); `cancel()`/`is_done()` terminal state has a
+  single owner (`reached_terminal_state`), fixing an exec-backend
+  cancel/completion race pre-existing on the seam.
+- **epics-pva-rs**: monitor connection transitions are owned by
+  `ConnEventOwner`; `SubscriptionHandle::wait` removed; the gateway
+  disconnect boundary fires on plain upstream loss.
 
 ## v0.24.3 — 2026-07-20
 

@@ -629,13 +629,14 @@ impl IocApplication {
         db.begin_load()
             .expect("a database created a line ago has not run iocInit");
 
-        // On RTEMS, bring up the background executor (callback pool, delayed
-        // timer, scanOnce worker) before any record processing can defer a
-        // tail — C parity: `callbackInit` runs early in `iocInit`
-        // (callback.c:286). Hosted builds drive tails on the tokio runtime and
-        // skip this; a spawn/sleep/interval on a path that never reaches here
-        // still lazy-inits the same executor on first use.
-        #[cfg(target_os = "rtems")]
+        // On an embedded target (RTEMS or VxWorks), bring up the background
+        // executor (callback pool, delayed timer, scanOnce worker) before any
+        // record processing can defer a tail — C parity: `callbackInit` runs
+        // early in `iocInit` (callback.c:286). Hosted builds drive tails on
+        // the tokio runtime and skip this; a spawn/sleep/interval on a path
+        // that never reaches here still lazy-inits the same executor on
+        // first use.
+        #[cfg(epics_embedded_target)]
         crate::runtime::task::background_init();
 
         let bridge = crate::runtime::task::BlockingBridge::capture();
@@ -1133,17 +1134,18 @@ impl IocApplication {
         tokio::pin!(runner_fut);
         // SIGINT/SIGTERM racing is host-only: `tokio::signal` needs the tokio
         // `signal` feature (signal-hook-registry + mio), which is dropped for
-        // the RTEMS target. On RTEMS both arms are `pending()`, so `run` simply
-        // awaits the runner; process-signal shutdown is the RTEMS driver's
-        // concern (a later increment). RTEMS is `cfg(unix)` too, so the guard is
-        // `all(unix, not(target_os = "rtems"))`, not `unix` alone.
-        #[cfg(not(target_os = "rtems"))]
+        // both embedded targets (RTEMS, VxWorks). On either, both arms are
+        // `pending()`, so `run` simply awaits the runner; process-signal
+        // shutdown is the embedded driver's concern (a later increment).
+        // Both embedded targets are `cfg(unix)` too, so the guard is
+        // `all(unix, not(epics_embedded_target))`, not `unix` alone.
+        #[cfg(not(epics_embedded_target))]
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        #[cfg(target_os = "rtems")]
+        #[cfg(epics_embedded_target)]
         let ctrl_c = std::future::pending::<()>();
-        #[cfg(all(unix, not(target_os = "rtems")))]
+        #[cfg(all(unix, not(epics_embedded_target)))]
         let sigterm = async {
             if let Ok(mut sig) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1153,7 +1155,7 @@ impl IocApplication {
                 std::future::pending::<()>().await;
             }
         };
-        #[cfg(not(all(unix, not(target_os = "rtems"))))]
+        #[cfg(not(all(unix, not(epics_embedded_target))))]
         let sigterm = std::future::pending::<()>();
 
         tokio::select! {

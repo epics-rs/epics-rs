@@ -37,34 +37,39 @@ epics-libcom-rs = { workspace = true }
 epics-rtems-boot = { workspace = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 
-# Host-only dependencies — gated out for the RTEMS target (armv7-rtems-eabihf).
+# Host-only dependencies — gated out for the embedded targets (RTEMS's
+# armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).
 #
-# `rustyline` pulls `nix`, which does not build for RTEMS (no `sa_sigaction` in
-# the RTEMS libc). It backs only the *interactive* iocsh line editor
-# (`iocsh::Iocsh::run_repl_interactive`); the piped-stdin REPL covers
-# non-interactive use, and RTEMS iocsh wiring is a later increment.
+# `rustyline` pulls `nix`, which does not build for either: no `sa_sigaction`
+# in the RTEMS libc, and `nix` carries no VxWorks target support at all (no
+# `armv7-rtems-eabihf`/`*-wrs-vxworks*` arm anywhere in its source — confirmed
+# by grepping the pinned dependency). It backs only the *interactive* iocsh
+# line editor (`iocsh::Iocsh::run_repl_interactive`); the piped-stdin REPL
+# covers non-interactive use, and embedded-target iocsh wiring is a later
+# increment.
 #
 # `socket2` + `if-addrs` back the async UDP net stack (`net::async_udp_v4` /
-# `net::iface_map`); the whole `net` module is gated out on RTEMS (S1 raw-libc
-# CA driver), so its deps go host-only too.
+# `net::iface_map`); the whole `net` module is gated out on `epics_embedded_target`
+# (S1 raw-libc CA driver), so its deps go host-only too.
 #
-# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# tokio: the hosted build uses the full runtime; the embedded build drops the
 # `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf. Declared per-target rather than in shared `[dependencies]`
-# because Cargo UNIONS a dependency's features across all matching tables, so a
-# shared `full` would re-add the dropped features on RTEMS. The retained set
+# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
+# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
+# features across all matching tables, so a shared `full` would re-add the
+# dropped features on either embedded target. The retained set
 # (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
 # always-compiled base code uses (Handle, block_in_place, select!, sync
-# primitives) compiling on RTEMS; those paths are unused there (the sans-io seam
+# primitives) compiling there; those paths are unused there (the sans-io seam
 # routes to the background executor) but must still type-check for `--lib`.
-[target.'cfg(not(target_os = "rtems"))'.dependencies]
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 rustyline = "18"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 
-[target.'cfg(target_os = "rtems")'.dependencies]
+[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

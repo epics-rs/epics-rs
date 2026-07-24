@@ -14,24 +14,31 @@
 //! which fails to compile if this crate's `rtems-exec-model` ever stops
 //! forwarding to the runtime crate's.
 //!
-//! * `exec_backend` — the std-thread background executor. The RTEMS target's
-//!   only option (no tokio reactor there), and — via the `rtems-exec-model`
-//!   cargo feature — the host-selectable RTEMS execution model.
+//! * `exec_backend` — the std-thread background executor. The only option on
+//!   `epics_embedded_target` (RTEMS or VxWorks — no tokio reactor on
+//!   either), and — via the `rtems-exec-model` cargo feature — the
+//!   host-selectable RTEMS execution model.
 //! * `tokio_backend` — the tokio runtime. The hosted default (feature off,
-//!   non-RTEMS target).
+//!   non-embedded target).
 //!
 //! Exactly one of the two is set for any build.
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
+    println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
-    let rtems = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("rtems");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    if embedded_target {
+        println!("cargo::rustc-cfg=epics_embedded_target");
+    }
+
     // Cargo exports `CARGO_FEATURE_<NAME>` (uppercased, `-` → `_`) for every
     // enabled feature of this crate.
     let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
 
-    if rtems || host_exec_model {
+    if embedded_target || host_exec_model {
         println!("cargo::rustc-cfg=exec_backend");
     } else {
         println!("cargo::rustc-cfg=tokio_backend");

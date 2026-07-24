@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::path::PathBuf;
 
 use epics_base_rs::server::autosave::error::AutosaveError;
@@ -26,7 +24,7 @@ fn test_macros_in_pv() {
     assert_eq!(entries[0].expanded_from.as_deref(), Some("$(P)temp.VAL"));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_file_include_relative_path() {
     let dir = tempfile::tempdir().unwrap();
     let sub_dir = dir.path().join("sub");
@@ -48,7 +46,7 @@ async fn test_file_include_relative_path() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_nested_include() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -68,7 +66,7 @@ async fn test_nested_include() {
     assert_eq!(names, vec!["MAIN_PV", "LEVEL1_PV", "LEVEL2_PV"]);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_depth_limit() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -90,7 +88,7 @@ async fn test_depth_limit() {
     ));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_circular_include() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -132,7 +130,7 @@ fn test_request_entry_source_info() {
     assert_eq!(entries[2].line_no, 3);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_include_with_macros() {
     let dir = tempfile::tempdir().unwrap();
 

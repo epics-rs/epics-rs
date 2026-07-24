@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::path::Path;
 
 use crate::server::database::PvDatabase;
@@ -153,7 +151,7 @@ mod tests {
     /// file into an empty `Vec` and the report claimed everything
     /// was fine — hiding exactly the corruption `asVerify` exists to
     /// catch.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn verify_on_corrupt_save_file_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.sav");
@@ -176,7 +174,7 @@ mod tests {
 
     /// H4: a well-formed save file (with `<END>`) still verifies
     /// normally — the corruption guard does not break the happy path.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn verify_on_valid_save_file_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ok.sav");

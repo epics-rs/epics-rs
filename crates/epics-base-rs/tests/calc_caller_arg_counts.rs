@@ -55,8 +55,6 @@
 //! | lnkCalc, asLib ASG | 21           | both allocate `CALCPERFORM_NARGS`     |
 //! | swait              | **12**       | `swaitRecord.c:409` `&pwait->a` = A..L |
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::calc::{
@@ -334,7 +332,7 @@ fn a_count_above_the_array_clamps_to_it() {
 
 /// The record-level case: swait must hand the engine its count, so an `M` in a
 /// live swait's CALC is inert. In C this same database reads and rewrites LA.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_swait_calc_cannot_reach_past_l() {
     let (db, _) = IocBuilder::new()
         .db_string(

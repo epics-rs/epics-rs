@@ -22,8 +22,6 @@
 //! `recGblResetAlarms` does. That is what makes an `MS` consumer inherit
 //! INVALID from a source that has not processed yet.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -35,7 +33,7 @@ use epics_base_rs::types::EpicsValue;
 
 /// The `doInitRecord0` prologue: a record born UDF=1/STAT=UDF advertises the
 /// UDFS severity from creation, on the programmatic path too.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn add_record_runs_the_init_udf_prologue() {
     let db = PvDatabase::new();
     db.add_record("AI", Box::new(AiRecord::new(0.0)))
@@ -57,7 +55,7 @@ async fn add_record_runs_the_init_udf_prologue() {
 /// CALC_ERR_NULL_ARG → -1), so a default `calcout` inits with CLCV = -1 and a
 /// compiled one with 0. A record created through `add_record` never ran the
 /// pass, so both came up 0 — "healthy" for an expression C calls invalid.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn add_record_runs_init_record_pass_zero() {
     let db = PvDatabase::new();
     db.add_record("CO_EMPTY", Box::new(CalcoutRecord::default()))
@@ -84,7 +82,7 @@ async fn add_record_runs_init_record_pass_zero() {
 
 /// The post-init UDF tail (R17-66's owner) rides along: it is part of the same
 /// passes, so `add_record` gets it too.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn add_record_runs_the_post_init_udf_tail() {
     let db = PvDatabase::new();
 

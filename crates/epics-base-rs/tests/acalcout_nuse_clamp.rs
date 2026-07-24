@@ -26,8 +26,6 @@
 //! Boundaries: NUSE < NELM (nothing happens), NUSE == NELM (the edge: not
 //! illegal), NUSE > NELM through each of C's three sites.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -64,7 +62,7 @@ async fn process(db: &PvDatabase) {
 /// *"Make sure.  Autosave is capable of setting NUSE to an illegal value."*
 /// Here the field store is written directly, exactly as a restore does, and the
 /// next cycle must repair AND post it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_process_time_clamp_posts_the_corrected_nuse() {
     let db = acalcout_db(4, 2).await;
     assert_eq!(nuse(&db).await, 2, "legal at init");
@@ -92,7 +90,7 @@ async fn the_process_time_clamp_posts_the_corrected_nuse() {
 /// `special(NUSE)` — C clamps, posts a bare `DBE_VALUE`, and returns -1, so the
 /// PUT FAILS. The client is told its value was illegal instead of the record
 /// silently rewriting it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_of_an_illegal_nuse_is_refused_and_the_clamped_value_is_posted() {
     let db = acalcout_db(4, 0).await;
 
@@ -113,7 +111,7 @@ async fn a_put_of_an_illegal_nuse_is_refused_and_the_clamped_value_is_posted() {
 }
 
 /// A LEGAL put is unaffected — the refusal is not a blanket rejection of NUSE.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_legal_nuse_put_succeeds() {
     let db = acalcout_db(10, 0).await;
 
@@ -124,7 +122,7 @@ async fn a_legal_nuse_put_succeeds() {
 }
 
 /// The edge: `NUSE == NELM` is NOT illegal — C's test is `>`, not `>=`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nuse_equal_to_nelm_is_legal() {
     let db = acalcout_db(4, 0).await;
 
@@ -140,7 +138,7 @@ async fn nuse_equal_to_nelm_is_legal() {
 /// verbatim and `init_record` clamps once, against the FINAL nelm. Clamping in
 /// the store instead measured NUSE against the default NELM of 1 and silently
 /// turned 5 into 1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn nuse_listed_before_nelm_survives_the_load() {
     let db = acalcout_db(10, 5).await; // the helper puts NELM first, so do it by hand
     assert_eq!(nuse(&db).await, 5);

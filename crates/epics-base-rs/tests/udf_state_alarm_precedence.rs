@@ -19,8 +19,6 @@
 //! after), so the equal-severity UDF could not displace STATE and STAT came out
 //! STATE. Verified against the C source, not the running oracle.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::bo::BoRecord;
@@ -62,7 +60,7 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16) {
 
 /// Fresh bo (VAL=0, UDF=1), `caput ZSV 3` (INVALID). STAT=UDF, SEVR=INVALID —
 /// the equal-severity STATE alarm does not overwrite the leading UDF.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_udf_beats_equal_severity_state() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     caput(&db, "ZSV", "3").await;
@@ -74,7 +72,7 @@ async fn bo_udf_beats_equal_severity_state() {
 }
 
 /// Fresh mbbo (VAL=0, UDF=1), `caput ZRSV 3` (INVALID). STAT=UDF, SEVR=INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_udf_beats_equal_severity_state() {
     let db = db_with(Box::new(MbboRecord::new(0))).await;
     caput(&db, "ZRSV", "3").await;
@@ -91,7 +89,7 @@ async fn mbbo_udf_beats_equal_severity_state() {
 /// displayed SEVR stays INVALID (`recGblResetAlarms` clamps). This is the
 /// regression the raw-ordinal compare fixes — clamping `zsv=4` to `Invalid(3)`
 /// before the compare would tie UDF and wrongly leave STAT=UDF.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_over_max_state_severity_overrides_udf() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     caput_raw(&db, "ZSV", 4).await;
@@ -104,7 +102,7 @@ async fn bo_over_max_state_severity_overrides_udf() {
 
 /// Negative STATE severity ordinal (`ZSV=-1` → `65535`) also overrides: the raw
 /// `DBF_MENU` field holds `65535`, numerically greater than UDFS's `3`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_negative_state_severity_overrides_udf() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     caput_raw(&db, "ZSV", -1).await;
@@ -115,7 +113,7 @@ async fn bo_negative_state_severity_overrides_udf() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_over_max_state_severity_overrides_udf() {
     let db = db_with(Box::new(MbboRecord::new(0))).await;
     caput_raw(&db, "ZRSV", 4).await;
@@ -126,7 +124,7 @@ async fn mbbo_over_max_state_severity_overrides_udf() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_negative_state_severity_overrides_udf() {
     let db = db_with(Box::new(MbboRecord::new(0))).await;
     caput_raw(&db, "ZRSV", -1).await;
@@ -142,7 +140,7 @@ async fn mbbo_negative_state_severity_overrides_udf() {
 /// put clears UDF (bo `clears_udf()==false`, but a VAL put defines it), and a
 /// following ZSV put then yields STATE, proving UDF is not suppressing STATE
 /// unconditionally.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_state_alarm_stands_when_defined() {
     let db = db_with(Box::new(BoRecord::new(0))).await;
     // Define VAL=0 (clears UDF).

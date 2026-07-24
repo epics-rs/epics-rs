@@ -8,8 +8,6 @@
 //! `modules/database/src/ioc/db/callback.c` (delayed re-entry) and
 //! `dbNotify.c` (put-notify wait-set / completion).
 
-// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -86,7 +84,7 @@ async fn db_with_record(name: &str) -> (PvDatabase, Arc<AtomicU32>) {
 
 /// (1) A fresh `AsyncToken` drives a process re-entry: firing it runs the
 /// record's `process()` once (C `callbackRequestDelayed` → `(*process)`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn async_token_fire_drives_process_reentry() {
     let (db, count) = db_with_record("T1").await;
     let baseline = count.load(Ordering::Relaxed);
@@ -108,7 +106,7 @@ async fn async_token_fire_drives_process_reentry() {
 /// (2) Cancel via the generation gate makes a stale re-entry a structural
 /// no-op: after `cancel_async_reentry`, the outstanding token is no longer
 /// current and `fire` re-enters nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn async_token_stale_after_cancel_is_noop() {
     let (db, count) = db_with_record("T2").await;
 
@@ -144,7 +142,7 @@ async fn async_token_stale_after_cancel_is_noop() {
 /// (2b) Minting a newer token supersedes the prior one (C
 /// `callbackRequestDelayed` replacing an outstanding delayed callback):
 /// the older token's `fire` is a no-op, the newer one's fires.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn newer_mint_supersedes_prior_token() {
     let (db, count) = db_with_record("T2B").await;
 
@@ -171,7 +169,7 @@ async fn newer_mint_supersedes_prior_token() {
 /// (3) `post_fields` applies an async-side field update and posts a monitor
 /// event for it (C `db_post_events(precord, &prec->field, DBE_VALUE|DBE_LOG)`),
 /// without running a process cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn post_fields_applies_and_posts_async_update() {
     let (db, count) = db_with_record("T3").await;
     let baseline = count.load(Ordering::Relaxed);
@@ -220,7 +218,7 @@ async fn post_fields_applies_and_posts_async_update() {
 /// (4a) A put-notify wait-set resolves its completion oneshot when the
 /// downstream operation completes (C `dbNotifyCompletion` draining the
 /// waitList to zero).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_notify_oneshot_resolves_on_downstream_completion() {
     let (notify, rx) = PvDatabase::new_put_notify();
     assert!(
@@ -239,7 +237,7 @@ async fn put_notify_oneshot_resolves_on_downstream_completion() {
 /// (4b) `reprocess_on_notify` wires a put-notify completion to an
 /// `AsyncToken`: when the downstream completes, the waiting record's
 /// `process()` is re-entered (SSEQ `WAITn` shape).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn reprocess_on_notify_reenters_waiter_on_completion() {
     let (db, count) = db_with_record("T4").await;
     let baseline = count.load(Ordering::Relaxed);
@@ -264,7 +262,7 @@ async fn reprocess_on_notify_reenters_waiter_on_completion() {
 /// A cancelled token wired through `reprocess_on_notify` re-enters nothing
 /// even when the downstream completes — the wiring inherits the structural
 /// no-op from `AsyncToken::fire`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn reprocess_on_notify_with_cancelled_token_is_noop() {
     let (db, count) = db_with_record("T5").await;
     let baseline = count.load(Ordering::Relaxed);
@@ -301,7 +299,7 @@ async fn poll_until<F: Fn() -> bool>(label: &str, pred: F) {
         if pred() {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
     panic!("timed out waiting for: {label}");
 }
@@ -432,7 +430,7 @@ impl Record for AbortSourceRecord {
 /// out-of-band `post_fields`, and because the handle is a `Weak` reference,
 /// dropping the only strong `PvDatabase` reports the handle dead (no
 /// ownership-cycle leak) and makes further posts a no-op.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn set_async_context_delivers_working_cycle_free_handle() {
     let sink: Arc<Mutex<Option<AsyncDbHandle>>> = Arc::new(Mutex::new(None));
     let db = PvDatabase::new();
@@ -492,7 +490,7 @@ async fn set_async_context_delivers_working_cycle_free_handle() {
 /// (S2) The `WriteDbLinkNotify` ProcessAction arm writes the downstream OUT
 /// link (DST.VAL) through a put-notify wait-set and re-enters the *source*
 /// when the downstream completes — the in-band `sseq` `WAITn` step.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
     let db = PvDatabase::new();
     let src_count = Arc::new(AtomicU32::new(0));
@@ -587,7 +585,7 @@ impl Record for PendingNotifyWriteSource {
 /// pass (motorRecord.cc:1495), so dropping the action on the pending cycle
 /// would lose one of the target's process cycles. Pre-fix the
 /// `AsyncPendingNotify` branch dropped `outcome.actions` entirely.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
     let db = PvDatabase::new();
 
@@ -632,7 +630,7 @@ async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
 /// re-entry generation, so an outstanding token (a pending DLYn/WAITn
 /// re-entry) becomes a structural no-op — the `sseq` `ABORT` path, with no
 /// runtime is-aborted check on the re-entry.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn cancel_reprocess_action_supersedes_outstanding_token() {
     let db = PvDatabase::new();
     let count = Arc::new(AtomicU32::new(0));

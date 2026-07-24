@@ -22,8 +22,6 @@
 //! "now" instead of the pre-update time the differential oracle observed from
 //! C's QSRV2 monitor.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -48,7 +46,7 @@ async fn bare_sseq() -> PvDatabase {
 /// the second cycle's VAL carries the timestamp the FIRST cycle restamped to —
 /// the one-completion lag C's `asyncFinish` produces (VAL at `:474` before
 /// `recGblGetTimeStamp` at `:501`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_val_timestamp_is_pre_restamp_and_lags_one_cycle() {
     let db = bare_sseq().await;
     let inst = db.get_record("SQV").unwrap();

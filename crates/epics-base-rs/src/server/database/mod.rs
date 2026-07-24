@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
-
 pub mod db_access;
 mod field_io;
 pub mod filters;
@@ -1002,7 +1000,7 @@ impl PvDatabase {
         if total == 0 {
             return (0, 0);
         }
-        // `std::time::Instant`, not `tokio::time::Instant`: the sleep below
+        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep below
         // is the runtime seam, whose clock is std's on both backends. Reading
         // the deadline off tokio's clock made the two disagree — under
         // `start_paused` tokio's clock advances only when the runtime decides
@@ -1453,7 +1451,7 @@ impl PvDatabase {
     /// have yet.
     ///
     /// This used to be papered over by starting each such future with a
-    /// `tokio::task::yield_now()`, on the assumption that yielding hands the
+    /// `crate::runtime::task::yield_now()`, on the assumption that yielding hands the
     /// thread back to the in-progress `add_record`. That assumption holds only
     /// on a current-thread runtime: on a multi-thread one the yield can return
     /// before the insert lands, and under `rtems-exec-model` the init runs on
@@ -2246,13 +2244,13 @@ mod tests {
     /// Drives the wait_for_external_links time-budget tests below.
     struct DelayedConnectLset {
         names: Vec<String>,
-        connect_at: tokio::time::Instant,
+        connect_at: crate::runtime::task::Instant,
     }
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
         fn is_connected(&self, _: &str) -> bool {
-            tokio::time::Instant::now() >= self.connect_at
+            crate::runtime::task::Instant::now() >= self.connect_at
         }
         fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
@@ -2265,7 +2263,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_for_external_links_returns_zero_zero_when_no_lsets() {
         let db = PvDatabase::new();
         let (c, t) = db
@@ -2274,7 +2272,7 @@ mod tests {
         assert_eq!((c, t), (0, 0));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_for_external_links_connected_quickly() {
         let db = PvDatabase::new();
         // Local-target forced-CA links (dbChannelTest==0 → isLocal): these
@@ -2283,7 +2281,7 @@ mod tests {
         db.add_pv("pv:B", EpicsValue::Long(0)).await.unwrap();
         let lset = Arc::new(DelayedConnectLset {
             names: vec!["pv:A".to_string(), "pv:B".to_string()],
-            connect_at: tokio::time::Instant::now(),
+            connect_at: crate::runtime::task::Instant::now(),
         });
         // Registered under "ca": the iocInit wait is CA-facility only, so
         // the working set comes from the "ca" link set (these forced-CA
@@ -2295,7 +2293,7 @@ mod tests {
         assert_eq!((c, t), (2, 2));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_for_external_links_returns_partial_on_timeout() {
         let db = PvDatabase::new();
         // Local target so the link is in the init-wait set (dbLink.c:130);
@@ -2304,10 +2302,10 @@ mod tests {
         db.add_pv("slow:pv", EpicsValue::Long(0)).await.unwrap();
         let lset = Arc::new(DelayedConnectLset {
             names: vec!["slow:pv".to_string()],
-            connect_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
         });
         db.register_link_set("ca", lset).await;
-        let started = tokio::time::Instant::now();
+        let started = crate::runtime::task::Instant::now();
         let (c, t) = db
             .wait_for_external_links(std::time::Duration::from_millis(250))
             .await;
@@ -2330,16 +2328,16 @@ mod tests {
     /// must not block on it. An areaDetector `test CP MS` placeholder — a CP
     /// link to a PV that exists nowhere — must drop straight through, leaving
     /// the link to connect (or dangle) asynchronously and silently, like C.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn wait_for_external_links_skips_nonlocal_targets() {
         let db = PvDatabase::new();
         // "test" has no local record and would never connect.
         let lset = Arc::new(DelayedConnectLset {
             names: vec!["test".to_string()],
-            connect_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
         });
         db.register_link_set("ca", lset).await;
-        let started = tokio::time::Instant::now();
+        let started = crate::runtime::task::Instant::now();
         let (c, t) = db
             .wait_for_external_links(std::time::Duration::from_secs(10))
             .await;
@@ -2357,7 +2355,7 @@ mod tests {
 
     // epics-base PR #336 — alias parsing + lookup integration tests.
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alias_resolves_through_find_entry() {
         let db = PvDatabase::new();
         db.add_record(
@@ -2380,14 +2378,14 @@ mod tests {
         assert!(!db.has_name("NOT:THERE").await);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alias_target_must_exist() {
         let db = PvDatabase::new();
         let err = db.add_alias("DANGLING", "MISSING_TARGET").await;
         assert!(err.is_err(), "alias to missing target must be rejected");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alias_collision_with_existing_record_rejected() {
         let db = PvDatabase::new();
         db.add_record(
@@ -2409,7 +2407,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_record_resolves_alias() {
         // Regression: get_record must transparently resolve
         // aliases so dbpf / dbgf / dbpr / CA put paths see the same
@@ -2437,7 +2435,7 @@ mod tests {
     /// `LINR >= 3` conversion resolves — without any explicit per-call-site
     /// `install_breaktable_registry`. This covers the dbCreateRecord and
     /// inline-record creation paths that previously skipped the install.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn add_record_installs_breaktable_registry_from_snapshot() {
         let db = PvDatabase::new();
         let ramp = crate::server::cvt_bpt::BrkTable::build(
@@ -2465,7 +2463,7 @@ mod tests {
     /// records added before dbLoadRecords; merge-reloads repointing LINR) can
     /// still resolve `LINR >= 3`. Without the re-install the record keeps an
     /// empty registry and never linearises.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn add_breaktables_reinstalls_registry_into_existing_records() {
         let db = PvDatabase::new();
         // Record added while the registry is still empty: add_record installs
@@ -2489,7 +2487,7 @@ mod tests {
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn get_record_no_resolve_skips_alias_table() {
         // Strict variant must NOT see aliases — keeps the canonical
         // distinction available for builder code paths.
@@ -2509,7 +2507,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn register_cp_link_normalises_alias_to_canonical() {
         // Regression: CP link registration must store the
         // canonical record names. dispatch_cp_targets looks up by
@@ -2543,7 +2541,7 @@ mod tests {
         assert!(alias_lookup.is_empty());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn aliases_for_record_returns_sorted_targets_only() {
         let db = PvDatabase::new();
         db.add_record(
@@ -2573,7 +2571,7 @@ mod tests {
         assert!(db.aliases_for_record("MISSING").is_empty());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn all_alias_names_returns_registered_aliases() {
         let db = PvDatabase::new();
         db.add_record(
@@ -2592,7 +2590,7 @@ mod tests {
         assert!(!aliases.contains(&"TARGET".to_string()));
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn complete_async_record_accepts_alias() {
         // Invariant audit: complete_async_record (the
         // entry point used by async device-support callbacks to
@@ -2614,7 +2612,7 @@ mod tests {
         db.complete_async_record("TARGET").await.unwrap();
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_record_accepts_alias() {
         // Regression: process_record must accept an alias
         // name. Pre-fix it walked `inner.records` directly.
@@ -2635,7 +2633,7 @@ mod tests {
         assert!(db.process_record("MISSING").await.is_err());
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn process_record_with_links_accepts_alias_and_avoids_cycle() {
         // Regression: process_record_with_links normalises
         // the alias so that (a) the records-map lookup hits and
@@ -2667,7 +2665,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alias_duplicate_rejected() {
         let db = PvDatabase::new();
         db.add_record(
@@ -2687,7 +2685,7 @@ mod tests {
     /// refuse to silently replace an existing registration. Mirrors
     /// epics-base C IOC which treats a duplicate `dbLoadRecords` name
     /// as a fatal load error.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn add_pv_and_add_record_reject_duplicates_across_namespaces() {
         use crate::server::records::ai::AiRecord;
 
@@ -2733,7 +2731,7 @@ mod tests {
     /// that pointed AT it. Otherwise the alias name stays
     /// "registered" forever and `add_pv` / `add_record` rejecting
     /// reuse causes a permanent name leak.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn remove_record_purges_dangling_aliases() {
         use crate::server::records::ai::AiRecord;
 
@@ -2762,7 +2760,7 @@ mod tests {
     /// `add_alias` must reject collisions with
     /// every namespace, including simple PVs (which the pre-fix
     /// code missed).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn add_alias_rejects_simple_pv_collision() {
         use crate::server::records::ai::AiRecord;
 
@@ -2780,24 +2778,27 @@ mod tests {
     /// exactly one succeeds. Pre-fix the two methods grabbed
     /// different write locks first, opening a cross-lock-order
     /// deadlock window.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn concurrent_add_pv_and_add_record_do_not_deadlock() {
         use crate::server::records::ai::AiRecord;
 
         let db = std::sync::Arc::new(PvDatabase::new());
         let db1 = db.clone();
         let db2 = db.clone();
-        let h1 = tokio::spawn(async move { db1.add_pv("RACE", EpicsValue::Double(1.0)).await });
-        let h2 =
-            tokio::spawn(async move { db2.add_record("RACE", Box::new(AiRecord::new(0.0))).await });
+        let h1 = crate::runtime::task::spawn(async move {
+            db1.add_pv("RACE", EpicsValue::Double(1.0)).await
+        });
+        let h2 = crate::runtime::task::spawn(async move {
+            db2.add_record("RACE", Box::new(AiRecord::new(0.0))).await
+        });
         // Both complete within a reasonable bound — pre-fix this
         // could hang because T1 holds simple_pvs.write and waits
         // for records.read while T2 holds records.write and waits
         // for simple_pvs.read.
-        let r1 = tokio::time::timeout(std::time::Duration::from_secs(2), h1)
+        let r1 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h1)
             .await
             .expect("add_pv must not block on add_record");
-        let r2 = tokio::time::timeout(std::time::Duration::from_secs(2), h2)
+        let r2 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h2)
             .await
             .expect("add_record must not block on add_pv");
         let r1 = r1.unwrap();
@@ -2810,7 +2811,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn existence_gate_blocks_cached_simple_pv_per_request() {
         // A cached simple PV must re-pass the installed existence gate on
         // both the search (`has_name_from`) and create (`find_entry_from`)
@@ -2871,7 +2872,7 @@ mod tests {
     /// its monitor opened at iocInit. Enumerating the canonical
     /// `common.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
     /// every link field including device-support INP/OUT.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn record_link_fields_surfaces_device_support_inp() {
         use crate::server::record::ParsedLink;
         use crate::server::records::ai::AiRecord;

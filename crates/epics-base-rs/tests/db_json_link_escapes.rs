@@ -21,8 +21,6 @@
 //!     dbgf J2.VAL -> "x\\ny"    stored: x, BACKSLASH, n, y
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -38,7 +36,7 @@ async fn val(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Str
 }
 
 /// The two records softIoc was measured on, byte for byte.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_const_json_link_string_reaches_the_record_decoded() {
     let db_text = concat!(
         r#"record(stringin,"J1") { field(DTYP,"Soft Channel") field(INP,{const:"a\tb"}) }"#,
@@ -66,7 +64,7 @@ async fn a_const_json_link_string_reaches_the_record_decoded() {
 }
 
 /// The escape set, one case per yajl production — the boundary, not a story.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn every_yajl_escape_is_translated_in_a_const_seed() {
     let cases: [(&str, &str, &[u8]); 6] = [
         ("E1", r#"{const:"a\nb"}"#, b"a\nb"),
@@ -103,7 +101,7 @@ async fn every_yajl_escape_is_translated_in_a_const_seed() {
 /// A QUOTED (non-brace) value keeps its own translator — C runs
 /// `dbTranslateEscape` on it (R18-91), not yajl. The two regimes must both
 /// hold; fixing one must not disturb the other.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_quoted_value_still_uses_the_db_translator() {
     let (db, _) = IocBuilder::new()
         .db_string(

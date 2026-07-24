@@ -31,8 +31,6 @@
 //!   - sCalcout/aCalcout NON-numeric inputs, which C's `fieldIndex <= INPL`
 //!     guard excludes -> no re-seed
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -82,7 +80,7 @@ async fn calcout_db() -> PvDatabase {
 /// The new link is CONSTANT: the value field takes the constant immediately —
 /// no process needed, exactly as the init seed does — and the next calculation
 /// uses it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_put_to_a_constant_inp_reseeds_the_value_field() {
     let db = calcout_db().await;
     assert_eq!(field(&db, "CO", "B").await, EpicsValue::Double(2.0));
@@ -97,7 +95,7 @@ async fn calcout_put_to_a_constant_inp_reseeds_the_value_field() {
 /// C posts the re-seeded value field with a literal `DBE_VALUE`
 /// (`calcoutRecord.c:376`). Nothing else would: `B` is not `pp(TRUE)`, and the
 /// put was to `INPB`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_reseed_posts_the_value_field() {
     let db = calcout_db().await;
     let inst = db.get_record("CO").unwrap();
@@ -116,7 +114,7 @@ async fn calcout_reseed_posts_the_value_field() {
 /// touches nothing (C `dbLoadLink` is a constant-link-only lset entry). The
 /// value field keeps what it had until the LINK delivers — the process-time read
 /// owns it from here on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_put_of_a_pv_link_does_not_reseed() {
     let db = calcout_db().await;
     let mut src = CalcRecord::new("0");
@@ -135,7 +133,7 @@ async fn calcout_put_of_a_pv_link_does_not_reseed() {
 /// C's `calcRecord::special` (`calcRecord.c:139-157`) handles ONLY `SPC_CALC` —
 /// calc's INPA..INPL are not `special(SPC_MOD)` at all, so a runtime put to a
 /// constant INPn re-seeds nothing. calc must NOT inherit calcout's behaviour.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calc_put_to_a_constant_inp_does_not_reseed() {
     let db = PvDatabase::new();
     let mut c = CalcRecord::new("A+B");
@@ -154,7 +152,7 @@ async fn calc_put_to_a_constant_inp_does_not_reseed() {
 /// STRING input does not — C guards the load with
 /// `if (fieldIndex <= scalcoutRecordINPL)`, and `pvalue = &pcalc->a + lnkIndex`
 /// is a `double *` that cannot address AA at all.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_reseeds_numeric_inputs_only() {
     let db = PvDatabase::new();
     let mut sc = ScalcoutRecord::new();
@@ -179,7 +177,7 @@ async fn scalcout_reseeds_numeric_inputs_only() {
 
 /// aCalcout: same guard (`aCalcoutRecord.c:534`) — the numeric input re-seeds,
 /// the ARRAY input does not.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_reseeds_numeric_inputs_only() {
     let db = PvDatabase::new();
     let mut ac = AcalcoutRecord::new();
@@ -206,7 +204,7 @@ async fn acalcout_reseeds_numeric_inputs_only() {
 /// the anchor (`recGblInitConstantLink` inside a `special()` body) across every
 /// C record in base and synApps calc. Its post carries `DBE_VALUE | DBE_LOG`
 /// (`:718`), unlike the calcout family's bare `DBE_VALUE`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
     use epics_base_rs::server::records::transform::TransformRecord;
 

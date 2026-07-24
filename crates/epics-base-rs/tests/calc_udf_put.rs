@@ -21,8 +21,6 @@
 //! UDF -1/255` → C=-1, port=1); this is verified against the C source, not the
 //! running oracle, per the panel's constraints.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ProcessCompletion;
@@ -66,7 +64,7 @@ async fn caput_udf(db: &PvDatabase, rec: &str, text: &str) {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_udf_byte_fidelity_across_the_five_boundaries() {
     let db = build().await;
 
@@ -95,7 +93,7 @@ async fn acalcout_udf_byte_fidelity_across_the_five_boundaries() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_udf_byte_fidelity_across_the_five_boundaries() {
     let db = build().await;
 

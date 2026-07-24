@@ -36,8 +36,6 @@
 //! HG.MDEL  DBF_SHORT      HG.MCNT  DBF_SHORT
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -70,7 +68,7 @@ async fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
 
 /// The unsigned-long family: every count / index / offset field on
 /// waveform, aai, aao, subArray and compress.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_count_fields_are_unsigned_long() {
     let db = build().await;
 
@@ -88,7 +86,7 @@ async fn the_count_fields_are_unsigned_long() {
 
 /// The two that are genuinely signed. A blanket "make the counters unsigned"
 /// sweep would have broken these; the dbd distinguishes them.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn subarray_nord_and_compress_inpn_stay_signed_long() {
     let db = build().await;
 
@@ -102,7 +100,7 @@ async fn subarray_nord_and_compress_inpn_stay_signed_long() {
 }
 
 /// histogram's counters are the 16-bit pair, and NELM is the unsigned one.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn histogram_nelm_is_ushort_and_mdel_mcnt_are_short() {
     let db = build().await;
 
@@ -123,7 +121,7 @@ async fn histogram_nelm_is_ushort_and_mdel_mcnt_are_short() {
 /// The point of the declaration: it is what each wire projects the native
 /// type from. This pins the CA half against the `cainfo` transcript above —
 /// DBF_ULONG promotes to DBR_DOUBLE, DBF_USHORT to DBR_LONG, DBF_SHORT stays.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_ca_native_type_matches_the_compiled_ioc() {
     let db = build().await;
 

@@ -16,8 +16,6 @@
 //! framework's async-simulation delay (`processing.rs` reads it through
 //! `get_field("SDLY")`, defaulting an absent field to -1.0 = synchronous).
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -115,7 +113,7 @@ async fn assert_sim_block_loaded(db: &PvDatabase, rec: &str) {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn aai_db_load_carries_sim_and_post_fields() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())
@@ -126,7 +124,7 @@ async fn aai_db_load_carries_sim_and_post_fields() {
     assert_sim_block_loaded(&db, "ARR:AAI").await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn aao_db_load_carries_sim_and_post_fields() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())
@@ -137,7 +135,7 @@ async fn aao_db_load_carries_sim_and_post_fields() {
     assert_sim_block_loaded(&db, "ARR:AAO").await;
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn waveform_db_load_carries_sim_and_post_fields() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())
@@ -152,7 +150,7 @@ async fn waveform_db_load_carries_sim_and_post_fields() {
 /// branch: with `SIMM=YES` and `SDLY >= 0`, C's `readValue` arms the delayed
 /// callback and holds PACT (`aaiRecord.c:365-374`), so the SIOL value lands
 /// only AFTER the delay — not within the first process call.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn loaded_sdly_defers_the_simulated_aai_read() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())
@@ -184,7 +182,7 @@ async fn loaded_sdly_defers_the_simulated_aai_read() {
 
     // After the delay the deferred continuation lands the SIOL array.
     for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         if field(&db, "ARR:AAI").await == EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0]) {
             return;
         }

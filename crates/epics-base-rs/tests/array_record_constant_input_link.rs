@@ -23,8 +23,6 @@
 //! Boundaries: constant array INP vs unset INP vs real DB INP; before-first-
 //! process vs after; NORD and UDF on each.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -79,7 +77,7 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 
 /// The constant array is in VAL before any process, with NORD = element count
 /// and UDF clear (C `dbLoadLinkArray` -> `nord = nRequest; udf = FALSE`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_array_inp_is_loaded_at_init() {
     let db = build().await;
 
@@ -103,7 +101,7 @@ async fn constant_array_inp_is_loaded_at_init() {
 }
 
 /// Process must not re-apply the constant over data a client put into VAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_inp_is_not_re_applied_at_process() {
     let db = build().await;
 
@@ -128,7 +126,7 @@ async fn constant_inp_is_not_re_applied_at_process() {
 /// The common case: an UNSET INP is a constant link (`dbLink.c:220`), so a
 /// device-fed / client-fed array record keeps the data it was given across
 /// scans. This is the case the pre-fix port wiped on every process.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unset_inp_does_not_wipe_client_data() {
     let db = build().await;
 
@@ -146,7 +144,7 @@ async fn unset_inp_does_not_wipe_client_data() {
 }
 
 /// A REAL input link is unaffected: it still reads its source every cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn real_db_inp_still_reads_every_cycle() {
     let db = build().await;
 

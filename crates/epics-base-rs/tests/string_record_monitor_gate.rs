@@ -39,8 +39,6 @@
 //! C compares strings, never a `to_f64()` deadband. The port emitted one VAL
 //! event per subscriber per cycle for all three.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -186,7 +184,7 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
 
 /// The whole finding, as the client sees it: six process cycles on an
 /// unchanging stringin deliver ZERO VAL monitor events.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unchanging_stringin_posts_no_val_events_across_scan_cycles() {
     // The first cycle is a real change (OVAL starts empty, as in C, where
     // init_record leaves oval NUL and the first process posts once).
@@ -199,7 +197,7 @@ async fn unchanging_stringin_posts_no_val_events_across_scan_cycles() {
 }
 
 /// And MPST=Always is not a dead field: it posts every cycle, as `T:SIA` does.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mpst_always_stringin_posts_every_cycle() {
     let events = cycles_posted(ALWAYS, "SI:ALWAYS").await;
     assert_eq!(

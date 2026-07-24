@@ -16,8 +16,6 @@
 //! differs by one scan cycle, which C also spends in LINK/INVALID whenever the
 //! link has not connected yet.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,7 +113,7 @@ async fn val_of(db: &PvDatabase, name: &str) -> Option<f64> {
 /// thread: it stages the open on the link work owner and returns nothing this
 /// cycle, which is C returning -1 for a link that is not connected
 /// (`dbCa.c:459-464`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -156,7 +154,7 @@ async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
 /// Boundary — cache hit. Once the work owner has opened the link and the
 /// monitor has published a value, the read serves it with no further opens
 /// and still no network read.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_warm_cache_is_read_without_opening_or_network() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -197,7 +195,7 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
 /// link (`dbCaAddLink`, `dbCa.c:735-800`) and libca owns every retry from
 /// then on. So a record scanning against a dead remote must produce one
 /// connect attempt, not one per scan.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
@@ -222,7 +220,7 @@ async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
 
 /// Boundary — distinct links each get their own open. The once-only rule is
 /// per link, not global; a second link must not be starved by the first.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn distinct_links_are_each_opened_once() {
     let opens = Arc::new(AtomicUsize::new(0));
     let reads = Arc::new(AtomicUsize::new(0));

@@ -32,8 +32,6 @@
 //! dbgf T:A.STAT  DBF_STRING:  "SOFT"
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -76,7 +74,7 @@ record(ai, "AI:BPT") {{
 /// value inside the first fitted segment, one deep in the middle, one past the
 /// last breakpoint (C extrapolates on the final slope rather than clamping), and
 /// one on a second table so a single hard-coded table cannot pass.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_standard_linr_converts_to_the_value_the_c_ioc_produces() {
     // (LINR, RVAL, VAL measured on the C softIoc)
     let cases: [(&str, i32, f64); 4] = [
@@ -100,7 +98,7 @@ async fn a_standard_linr_converts_to_the_value_the_c_ioc_produces() {
 /// no table — and the conversion fails rather than inventing one, exactly as C's
 /// `dbFindBrkTable` returning NULL does. Only `typeJ*`/`typeK*` have data, in C
 /// and here.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_menu_convert_name_with_no_shipped_data_still_has_no_table() {
     use epics_base_rs::server::cvt_bpt::BreakTableRegistry;
 
@@ -142,7 +140,7 @@ async fn a_menu_convert_name_with_no_shipped_data_still_has_no_table() {
 /// The vendored tables are seeded by construction, so no load path can produce a
 /// registry that has forgotten them. This is what makes the fix structural
 /// rather than a call someone must remember to make.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn every_registry_holds_the_vendored_tables_from_construction() {
     assert!(!BreakTableRegistryProbe::fresh().is_empty());
     assert!(!BreakTableRegistryProbe::defaulted().is_empty());

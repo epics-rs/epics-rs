@@ -16,8 +16,6 @@
 //! accepted put — exactly what C does (oracle c_side: value 0, NO_ALARM,
 //! put_accepted=true). The fix only flips put_accepted false→true.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,7 +58,7 @@ async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
 /// `caput -c TMAX.B0 255` is ACCEPTED. The `pp(TRUE)` put processes the record,
 /// which re-derives the bit from the unchanged VAL=0 → B0 reads back 0. Live C
 /// (oracle): `put_accepted=true, B0=0, STAT=NO_ALARM, SEVR=NO_ALARM`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn type_max_bit_put_is_accepted() {
     let db = ioc().await;
 

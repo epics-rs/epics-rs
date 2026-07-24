@@ -18,8 +18,6 @@
 //! The port gave VAL the framework default `DBE_VALUE | DBE_LOG`, so a
 //! `DBE_LOG`-only archiver was sent the event name on every process.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -48,7 +46,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 /// The post carries `DBE_VALUE` and nothing else: no alarm moved, and event has
 /// no ADEL to put `DBE_LOG` into the mask.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_77_event_val_posts_dbe_value_without_dbe_log() {
     let db = PvDatabase::new();
     db.add_record("EV", Box::new(EventRecord::new("shutter")))
@@ -78,7 +76,7 @@ async fn r9_77_event_val_posts_dbe_value_without_dbe_log() {
 
 /// C posts VAL unguarded on every `monitor()` call, so a second cycle with an
 /// unchanged event name posts again — and again without `DBE_LOG`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_77_event_val_reposts_each_cycle_still_without_log() {
     let db = PvDatabase::new();
     db.add_record("EV", Box::new(EventRecord::new("shutter")))
@@ -104,7 +102,7 @@ async fn r9_77_event_val_reposts_each_cycle_still_without_log() {
 
 /// A `DBE_LOG`-only subscriber — an archiver — receives event VAL on no cycle
 /// at all. This is the observable the forced LOG bit broke.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_77_dbe_log_only_subscriber_receives_nothing() {
     let db = PvDatabase::new();
     db.add_record("EV", Box::new(EventRecord::new("shutter")))
@@ -143,7 +141,7 @@ async fn r9_77_dbe_log_only_subscriber_receives_nothing() {
 /// The rule is per-record, not a framework-wide change: calc's VAL still takes
 /// `DBE_LOG` from its own ADEL deadband (`calcRecord.c:411`, the standard
 /// `if (monitor_mask) db_post_events(&prec->val, monitor_mask)`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_77_calc_val_still_logs_on_adel_crossing() {
     let db = PvDatabase::new();
     // `CalcRecord::new` compiles RPCL at construction; a bare `put_field`

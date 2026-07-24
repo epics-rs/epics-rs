@@ -26,8 +26,6 @@
 //! record(stringout,"SO3"){field(DOL,"1.50")} VAL="1.50"  UDF=0
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -65,7 +63,7 @@ async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
 
 /// The whole `recGblInitConstantLink(&prec->dol, …) → udf = FALSE` family, one
 /// record per value-type boundary.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_constant_dol_clears_udf_for_every_out_record() {
     let db = build(
         r#"
@@ -113,7 +111,7 @@ async fn a_constant_dol_clears_udf_for_every_out_record() {
 
 /// ao/dfanout use `udf = isnan(val)`, so a NaN constant loads VAL and leaves
 /// the record UNDEFINED (`aoRecord.c:113`, `dfanoutRecord.c:106`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_nan_constant_dol_leaves_the_record_undefined() {
     let db = build(
         r#"
@@ -139,7 +137,7 @@ async fn a_nan_constant_dol_leaves_the_record_undefined() {
 /// bo loads the constant into a temporary and stores its BOOLEAN
 /// (`boRecord.c:147`: `prec->val = !!ival`), so DOL="5" is VAL=1, not 5 — and
 /// DOL="0" still clears UDF (the load SUCCEEDED; the value is simply 0).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_bo_constant_dol_stores_the_boolean_of_the_constant() {
     let db = build(
         r#"
@@ -168,7 +166,7 @@ async fn a_bo_constant_dol_stores_the_boolean_of_the_constant() {
 /// state is derived from the seeded value: ao's OVAL/PVAL/MLST, mbbo's
 /// convert() → RVAL. Pre-fix the iocsh/`dbLoadRecords` path never ran the tail
 /// at all, and the builder path ran it against a VAL of 0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_init_tail_runs_after_the_constant_load() {
     let db = build(
         r#"
@@ -192,7 +190,7 @@ async fn a_init_tail_runs_after_the_constant_load() {
 /// `dbConstLink.c:34-35` — *"constants may contain hex numbers, whereas
 /// database conversions can't"*. softIoc: `record(longout,"LOHEX")
 /// {field(DOL,"0x1f")}` comes up at VAL=31.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_hex_constant_dol_loads_into_an_integer_field() {
     let db = build(r#"record(longout, "LOHEX") { field(DOL, "0x1f") }"#).await;
 
@@ -203,7 +201,7 @@ async fn a_hex_constant_dol_loads_into_an_integer_field() {
 /// A DOL that names a PV is NOT a constant — nothing is seeded and the record
 /// stays undefined until it processes (C: `recGblInitConstantLink` returns
 /// FALSE for a PV_LINK).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_pv_dol_seeds_nothing_and_leaves_udf_set() {
     let db = build(
         r#"

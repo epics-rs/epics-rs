@@ -35,8 +35,6 @@
 //! in `menu_common_field_scan_pini.rs`. `caput` sends a numeric put for an enum
 //! channel whose text matches no choice, which is the row measured above.)
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::ScanType;
 use epics_base_rs::types::EpicsValue;
@@ -85,7 +83,7 @@ async fn scanned_anywhere(db: &PvDatabase, name: &str) -> bool {
 }
 
 /// The menu boundary: 9 is the last choice, 10 is the first illegal index.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_last_menu_choice_scans_and_the_first_illegal_index_does_not() {
     let db = db_with_scanned_ai().await;
 
@@ -107,7 +105,7 @@ async fn the_last_menu_choice_scans_and_the_first_illegal_index_does_not() {
 
 /// `-1` reaches the field as the `epicsEnum16` 65535 — still stored, still
 /// scanned by nothing, and still not `Passive`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_top_of_the_enum_is_stored_and_is_not_passive() {
     let db = db_with_scanned_ai().await;
 
@@ -128,7 +126,7 @@ async fn the_top_of_the_enum_is_stored_and_is_not_passive() {
 
 /// A legal index put back after an illegal one re-joins its list — the illegal
 /// state is carried, not sticky.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_illegal_index_is_left_behind_when_a_legal_one_is_written() {
     let db = db_with_scanned_ai().await;
 
@@ -147,7 +145,7 @@ async fn an_illegal_index_is_left_behind_when_a_legal_one_is_written() {
 
 /// SSCN is the same menu, so it carries an illegal index too — and 10 is NOT
 /// the 65535 "unset" sentinel that `recGblCheckSimm` bails on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sscn_carries_an_illegal_index_and_only_65535_is_the_sentinel() {
     let db = db_with_scanned_ai().await;
 

@@ -15,8 +15,6 @@
 //! boundary is RANGE, not fractionality — `strtol` trailing-text tolerance keeps
 //! `"5volts"` -> `5`. Mirrors the int64in/int64out Cause B fix (commit 224d5ad5).
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::longin::LonginRecord;
@@ -47,7 +45,7 @@ async fn db_with(record: Box<dyn Record>) -> PvDatabase {
 /// `2147483648` is `2^31`, one past `i32::MAX`; `-2147483649` is one past
 /// `i32::MIN`. `epicsParseInt32` refuses both — so the put must be REFUSED and
 /// the field must keep its prior value (0).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn longin_adel_mdel_over_i32_are_refused() {
     let db = db_with(Box::new(LonginRecord::new(0))).await;
     for field in ["ADEL", "MDEL"] {
@@ -67,7 +65,7 @@ async fn longin_adel_mdel_over_i32_are_refused() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn longout_adel_mdel_over_i32_are_refused() {
     let db = db_with(Box::new(LongoutRecord::new(0))).await;
     for field in ["ADEL", "MDEL"] {
@@ -90,7 +88,7 @@ async fn longout_adel_mdel_over_i32_are_refused() {
 /// The band edge (`i32::MAX` / `i32::MIN`) still lands, served as `Long` — the
 /// gate is RANGE, not fractionality (`strtol` trailing-text tolerance keeps
 /// `"5volts"` -> `5`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn longin_longout_adel_accept_the_i32_band_and_trailing_text() {
     for db in [
         db_with(Box::new(LonginRecord::new(0))).await,

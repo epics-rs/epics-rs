@@ -31,8 +31,6 @@
 //! MCNT:      0   2   0   2      <- zeroed by the post on cycle 4
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -73,7 +71,7 @@ async fn mcnt(db: &PvDatabase, rec: &str) -> f64 {
 
 /// The softIoc transcript, value for value: MCNT counts up to MDEL+1, the post
 /// zeroes it, and it counts up again.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mcnt_is_counts_since_the_last_posted_val() {
     let db = build().await;
 
@@ -99,7 +97,7 @@ async fn mcnt_is_counts_since_the_last_posted_val() {
 /// The traffic half: MDEL is the histogram's only VAL-monitor rate limiter.
 /// Six processes with MDEL=3 produce exactly ONE VAL event (on the 4th); the
 /// port produced six.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mdel_rate_limits_the_val_monitor() {
     let db = build().await;
     let rec = db.get_record("HG").unwrap();
@@ -131,7 +129,7 @@ async fn mdel_rate_limits_the_val_monitor() {
 /// MDEL=0 (the dbd default) posts every cycle: the first count already makes
 /// `mcnt (1) > mdel (0)`. The gate must not suppress a default-configured
 /// histogram.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_default_mdel_of_zero_posts_every_process() {
     let db = IocBuilder::new()
         .db_string(

@@ -1,5 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
+// RTEMS-EXEC-MODEL-ALLOW(1): CaServerBuilder::build binds a tokio::net listener (needs a reactor); runs and passes in the feature-ON suite.
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
@@ -15,6 +14,9 @@ fn test_register_record_type() {
     drop(builder);
 }
 
+// `#[tokio::test]`, not `#[epics_test]`: `CaServerBuilder::build` binds a
+// `tokio::net` listener, which needs a real reactor on both backends. The
+// census marker accounts for it.
 #[tokio::test]
 async fn test_db_file_load() {
     let db = r#"

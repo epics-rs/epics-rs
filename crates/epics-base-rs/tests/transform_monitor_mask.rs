@@ -25,8 +25,6 @@
 //! folded in by `dbGetLink`), so the same cycle both moves A and raises the
 //! severity.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -81,7 +79,7 @@ async fn transform_with_an_ms_input() -> PvDatabase {
 /// The finding: on the alarm-transition cycle, A posts with a literal
 /// `DBE_VALUE|DBE_LOG` — no alarm bit — while STAT (posted by
 /// `recGblResetAlarms` itself, not by `monitor()`) does carry `DBE_ALARM`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
     let db = transform_with_an_ms_input().await;
     let inst = db.get_record("T").unwrap();
@@ -134,7 +132,7 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
 
 /// The subscriber-side statement of the same fact, across both alarm
 /// transitions.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_64_an_alarm_only_subscriber_on_a_transform_channel_never_fires() {
     let db = transform_with_an_ms_input().await;
     let inst = db.get_record("T").unwrap();

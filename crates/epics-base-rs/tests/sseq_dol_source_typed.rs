@@ -17,8 +17,6 @@
 //! One test per boundary of that switch, plus the failed-store path the read
 //! owner used to discard silently.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -53,7 +51,7 @@ async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
                 return;
             }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!("{label}: {dst}.VAL never received the step's forwarded value");
 }
@@ -70,7 +68,7 @@ async fn field(db: &PvDatabase, record: &str, name: &str) -> EpicsValue {
 /// `DBF_ENUM` source (mbbi): C reads it with `DBR_STRING`, so `STRn` gets the
 /// state LABEL and `DOn` gets `atof(label)`. Pre-fix the port stored the index
 /// (`DO1 = 2`, `STR1 = "2"`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_enum_dol_delivers_state_label_not_index() {
     let db = PvDatabase::new();
 
@@ -117,7 +115,7 @@ async fn sseq_enum_dol_delivers_state_label_not_index() {
 
 /// `DBF_MENU` source (a menu-index field — here the mbbi's `SIMM`): the same
 /// `DBR_STRING` arm, resolved through the field's `menu()` choices.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_menu_dol_delivers_choice_label() {
     let db = PvDatabase::new();
 
@@ -148,7 +146,7 @@ async fn sseq_menu_dol_delivers_choice_label() {
 /// `DBF_CHAR` array source (the long-string idiom): C reads up to 40 bytes into
 /// `s` and sets `dov = atof(s)`. Pre-fix the native `CharArray` reached `DOn`,
 /// `to_f64()` failed, and the error was discarded — `DO1`/`STR1` stayed stale.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_char_array_dol_delivers_string_and_atof() {
     let db = PvDatabase::new();
 
@@ -192,7 +190,7 @@ async fn sseq_char_array_dol_delivers_string_and_atof() {
 
 /// A numeric source keeps the `DBR_DOUBLE` arm: `DOn` is the value and `STRn`
 /// is re-rendered at the record's PREC.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_numeric_dol_keeps_double_arm() {
     let db = PvDatabase::new();
 
@@ -225,7 +223,7 @@ async fn sseq_numeric_dol_keeps_double_arm() {
 /// A CONSTANT `DOLn` is C's `default:` arm at process time: seeded ONCE at
 /// init (the link TEXT into `s`, `dov = atof(s)`), never re-read. A client put
 /// to `DO1` therefore survives the next cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_constant_dol_seeds_at_init_and_is_never_re_read() {
     let db = PvDatabase::new();
 
@@ -341,7 +339,7 @@ impl Record for PickyReader {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_link_store_raises_link_invalid() {
     let db = PvDatabase::new();
 

@@ -15,8 +15,6 @@
 //! keep the current behavior: return `Err` and process NOTHING, matching C
 //! `dbPutField` (dbAccess.c:1263 processes only when `dbPut` status==0).
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -94,7 +92,7 @@ const BAD: fn() -> EpicsValue = || EpicsValue::String("notanumber".into());
 
 /// Notify path: the rejected conversion still drives exactly one process cycle,
 /// and the client still receives the failure.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_notify_put_still_processes() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -119,7 +117,7 @@ async fn rejected_notify_put_still_processes() {
 
 /// Plain `ca_put` path: the rejected conversion returns Err and processes
 /// NOTHING — the notify-only fix must not touch the fire-and-forget path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_plain_put_does_not_process() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -138,7 +136,7 @@ async fn rejected_plain_put_does_not_process() {
 
 /// Sanity: an ACCEPTED put on the notify path processes exactly once and writes
 /// the value — the fix only adds a cycle on the FAILING path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn accepted_notify_put_processes_and_writes() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;

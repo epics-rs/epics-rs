@@ -24,8 +24,6 @@
 //! the `dispatch_multi_output` path (dfanout OUTx), the recovery cycle, and
 //! NMS (no propagation at all).
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -71,7 +69,7 @@ async fn add_target(db: &PvDatabase, name: &str) {
 /// Boundary 1 + 4 — the `WriteDbLink` action path (transform `OUTx`).
 /// `OUTA` is MS, `OUTB` is bare (NMS). One process of TR must leave the MS
 /// target INVALID and the NMS target clean.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_61_write_db_link_out_inherits_this_cycles_pending_severity() {
     let db = PvDatabase::new();
     add_source(&db).await;
@@ -112,7 +110,7 @@ async fn r15_61_write_db_link_out_inherits_this_cycles_pending_severity() {
 /// Boundary 2 — the recovery cycle. The source clears, and the MS target must
 /// clear in the SAME cycle. Reading the committed alarm would hand the target
 /// the previous cycle's INVALID one cycle after the source recovered.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_61_ms_out_target_clears_in_the_cycle_the_source_clears() {
     let db = PvDatabase::new();
     add_source(&db).await;
@@ -154,7 +152,7 @@ async fn r15_61_ms_out_target_clears_in_the_cycle_the_source_clears() {
 /// Boundary 3 — the `dispatch_multi_output` path (dfanout `OUTx`). Same
 /// snapshot, a different writer: dfanout's own HIHI/HHSV puts it INVALID this
 /// cycle, and its MS `OUTA` must carry that INVALID out with the value.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_61_dfanout_ms_out_inherits_this_cycles_pending_severity() {
     let db = PvDatabase::new();
     add_target(&db, "DF_TGT").await;

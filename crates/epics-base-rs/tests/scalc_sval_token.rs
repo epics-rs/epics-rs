@@ -24,8 +24,6 @@
 //! which takes no `psresult`, and the numeric `postfix()` element table has no
 //! SVAL token — so neither C nor the port has an SVAL in swait.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::calc::{
@@ -170,7 +168,7 @@ fn engines_reject_each_others_tokens_at_compile_time() {
 /// discriminator: the string engine compiles it, produces `Str("42")`, and the
 /// coercion lands **42.0** in VAL — a value C's swait can never produce, since
 /// its compiler cannot lex a string literal at all.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
     use epics_base_rs::server::records::swait::SwaitRecord;
 
@@ -215,7 +213,7 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
 /// scalcout CALC: SVAL is the record's previous SVAL, so a self-referential
 /// `SVAL+'x'` accumulates across process cycles (C `:357-359` passes
 /// `pcalc->sval` as `psresult`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_calc_sval_reads_the_previous_sval() {
     let db = PvDatabase::new();
 
@@ -244,7 +242,7 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
 /// scalcout OCAL (DOPT=Use_OVAL): C passes `pcalc->osv` as `psresult`
 /// (`:768-770`), so SVAL inside OCAL is the previous **OSV** — not the SVAL
 /// that CALC produced this very cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
     let db = PvDatabase::new();
 

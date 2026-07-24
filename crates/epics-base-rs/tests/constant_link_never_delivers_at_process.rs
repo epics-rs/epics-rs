@@ -24,8 +24,6 @@
 //! vs after a client put (sseq `SELL`), a constant with no init seed at all
 //! (compress `INP`), and the real-link owner path that must keep delivering.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -70,7 +68,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 /// C `sseqRecord.c:186-191`: a constant `SELL` is loaded into `SELN` once, at
 /// init, by `recGblInitConstantLink(&pR->sell, DBF_USHORT, &pR->seln)`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn constant_sell_seeds_seln_at_init() {
     let db = build().await;
 
@@ -86,7 +84,7 @@ async fn constant_sell_seeds_seln_at_init() {
 /// `caput SELN 5` + process leaves `SELN = 5`, because `dbGetLink` on the
 /// constant writes nothing. The port re-applied the constant every cycle and
 /// reset it to 3 — firing step 3 where C fires step 5.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn client_put_to_seln_survives_a_constant_sell() {
     let db = build().await;
 
@@ -104,7 +102,7 @@ async fn client_put_to_seln_survives_a_constant_sell() {
 
 /// The owner path stays intact: a REAL `SELL` link is re-read every cycle and
 /// overwrites `SELN` (C `dbGetLink` on a DB link — `sseqRecord.c:314-317`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_real_sell_link_still_delivers_every_cycle() {
     let db = build().await;
 
@@ -125,7 +123,7 @@ async fn a_real_sell_link_still_delivers_every_cycle() {
 /// leaves the circular buffer empty. The port's executor was pushing the
 /// constant into the buffer on every cycle — `VAL = [5, 5, 5]` against C's
 /// empty buffer.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_constant_inp_never_fills_a_compress_buffer() {
     let db = build().await;
 

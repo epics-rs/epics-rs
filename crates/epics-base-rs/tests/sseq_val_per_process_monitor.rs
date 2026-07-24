@@ -19,8 +19,6 @@
 //! and `monitor_always_post = (true, false)`, encoding "value class always,
 //! archive class never".
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -43,7 +41,7 @@ async fn bare_sseq() -> PvDatabase {
 
 /// `caput VAL 1;2;2;3` posts four `DBE_VALUE` events — the repeated `2` posts a
 /// second time, because C posts VAL every process regardless of value change.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
     let db = bare_sseq().await;
     let inst = db.get_record("SQV").unwrap();

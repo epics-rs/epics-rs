@@ -12,8 +12,6 @@
 //! UDF/INVALID because the process-decision gate special-cased PROC and omitted
 //! UDF, so a UDF put stored the field but drove no process cycle.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -88,7 +86,7 @@ async fn record_with(count: Arc<AtomicU32>) -> Arc<PvDatabase> {
 
 /// A put to `UDF` on a Passive record drives exactly one process cycle — the
 /// `dbCommon` `pp(TRUE)` field that the gate previously omitted.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_to_udf_drives_processing() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -106,7 +104,7 @@ async fn put_to_udf_drives_processing() {
 
 /// The `-c` (callback / put-notify) route drives the same cycle — the gate is
 /// shared between the plain and notify paths.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_notify_to_udf_drives_processing() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;
@@ -124,7 +122,7 @@ async fn put_notify_to_udf_drives_processing() {
 
 /// Boundary: the fix adds UDF specifically, not a blanket "every dbCommon put
 /// processes". A put to a non-`pp` common field (DESC) drives NO cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_to_a_non_pp_common_field_does_not_process() {
     let count = Arc::new(AtomicU32::new(0));
     let db = record_with(count.clone()).await;

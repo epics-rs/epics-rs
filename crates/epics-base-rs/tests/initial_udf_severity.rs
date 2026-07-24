@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): IocShell::new takes a tokio Handle, so one test needs an ambient tokio runtime; runs and passes in the feature-ON suite.
 //! R16-82: the initial UDF severity — a record that has never processed is
 //! INVALID, not NO_ALARM.
 //!
@@ -27,8 +28,6 @@
 //! consumer inherited NOTHING from a not-yet-processed source — the IOC-startup
 //! ordering case MS exists for.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -48,7 +47,7 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 }
 
 /// Every record type: born UDF, so `iocInit` publishes STAT=UDF SEVR=INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_never_processed_record_is_udf_invalid_after_init() {
     let db = build(
         r#"
@@ -80,7 +79,7 @@ async fn a_never_processed_record_is_udf_invalid_after_init() {
 /// The case the finding is about: an `MS` consumer of a not-yet-processed
 /// source inherits INVALID and reports LINK — the IOC-startup ordering the MS
 /// modifier exists for. softIoc: CON.STAT=LINK, CON.SEVR=INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ms_inherits_the_initial_udf_severity_from_an_unprocessed_source() {
     let db = build(
         r#"
@@ -124,7 +123,7 @@ async fn ms_inherits_the_initial_udf_severity_from_an_unprocessed_source() {
 /// ```
 ///
 /// STAT stays UDF in both: `iocInit` lowers nothing, it only raises SEVR.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
     let db = build(
         r#"
@@ -166,6 +165,10 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
 /// The same rule on the runtime `dbLoadRecords` path — the second `.db` loader.
 /// The seed is evaluated by the creation sink, which both loaders now hand
 /// their complete field set to, so neither can init a half-loaded record.
+///
+/// `#[tokio::test]`, not `#[epics_test]`: `IocShell::new` takes a
+/// `tokio::runtime::Handle`, so this body needs an ambient tokio runtime on
+/// both backends (the census marker accounts for it).
 #[tokio::test]
 async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
     use epics_base_rs::server::iocsh::IocShell;
@@ -209,7 +212,7 @@ async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
 
 /// UDFS is the severity the rule uses — a record that declares
 /// `field(UDFS,"MINOR")` starts MINOR, not INVALID.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_initial_severity_comes_from_udfs() {
     let db = build(r#"record(ai, "A2") { field(UDFS, "MINOR") }"#).await;
     let rec = db.get_record("A2").unwrap();
@@ -221,7 +224,7 @@ async fn the_initial_severity_comes_from_udfs() {
 /// A record whose value is defined at init (a constant INP loaded by the
 /// init-seed owner) clears UDF on its first process and the initial severity
 /// goes away — the alarm is not sticky.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_initial_severity_clears_on_the_first_successful_process() {
     let db = build(r#"record(calc, "C2") { field(INPA, "5") field(CALC, "A+1") }"#).await;
 

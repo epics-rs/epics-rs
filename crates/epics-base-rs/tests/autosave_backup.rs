@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::time::Duration;
 
 use epics_base_rs::server::autosave::backup::{
@@ -15,7 +13,7 @@ fn make_entry(name: &str, val: &str) -> SaveEntry {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_savb_created() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
@@ -42,7 +40,7 @@ async fn test_savb_created() {
     assert!(savb_path.exists());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
@@ -61,7 +59,7 @@ async fn test_seq_rotation() {
         write_save_file(&sav_path, &[make_entry("PV1", &i.to_string())])
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
         rotate_backups(&sav_path, &config, &mut state)
             .await
             .unwrap();
@@ -73,7 +71,7 @@ async fn test_seq_rotation() {
     assert!(sav_path.with_extension("sav2").exists());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_dated_filename() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
@@ -108,13 +106,15 @@ async fn test_dated_filename() {
     assert_eq!(entries.len(), 1);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_corrupt_sav_fallback_to_savb() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
 
     // Write corrupt .sav (no END marker)
-    tokio::fs::write(&sav_path, "PV1 1.0\n").await.unwrap();
+    epics_base_rs::runtime::fs::write(&sav_path, "PV1 1.0\n")
+        .await
+        .unwrap();
 
     // Write valid .savB
     let savb_path = sav_path.with_extension("savB");
@@ -127,7 +127,7 @@ async fn test_corrupt_sav_fallback_to_savb() {
     assert_eq!(best.unwrap(), savb_path);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_no_sav_only_savb() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
@@ -144,14 +144,16 @@ async fn test_no_sav_only_savb() {
     assert_eq!(best.unwrap(), savb_path);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_seq_file_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");
 
     // Write corrupt .sav and .savB
-    tokio::fs::write(&sav_path, "PV1 1.0\n").await.unwrap();
-    tokio::fs::write(sav_path.with_extension("savB"), "PV1 1.0\n")
+    epics_base_rs::runtime::fs::write(&sav_path, "PV1 1.0\n")
+        .await
+        .unwrap();
+    epics_base_rs::runtime::fs::write(sav_path.with_extension("savB"), "PV1 1.0\n")
         .await
         .unwrap();
 
@@ -168,20 +170,22 @@ async fn test_seq_file_fallback() {
     assert_eq!(best.unwrap(), sav_path.with_extension("sav1"));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_partial_write_corrupt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("partial.sav");
 
     // Simulate partial write (no END)
-    tokio::fs::write(&path, "PV1 1.0\nPV2 2.0\n").await.unwrap();
+    epics_base_rs::runtime::fs::write(&path, "PV1 1.0\nPV2 2.0\n")
+        .await
+        .unwrap();
 
     let config = BackupConfig::default();
     let best = find_best_save_file(&path, &config).await;
     assert!(best.is_none());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_rotate_preserves_existing() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("test.sav");

@@ -16,8 +16,6 @@
 //!   - record type with NO SoftRaw dset in C (longin/longout): the DTYP must
 //!     fall back to the VAL-direct soft path, not drop the value.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -133,7 +131,7 @@ async fn put_val(db: &PvDatabase, name: &str, value: EpicsValue) {
 /// `devAiSoftRaw.c::read_ai` (52): `dbGetLink(pinp, DBR_LONG, &prec->rval)` — no
 /// mask — then `aiRecord.c:158` runs `convert()`. With the default
 /// LINR=NO CONVERSION / ASLO=1 / AOFF=0 that gives VAL == RVAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ai_raw_soft_channel_link_lands_in_rval_and_converts() {
     let db = ioc().await;
     process(&db, "RAI").await;
@@ -150,7 +148,7 @@ async fn ai_raw_soft_channel_link_lands_in_rval_and_converts() {
 /// softIoc 7.0.10.1-DEV oracle, `field(INP,"12")` + `DTYP="Raw Soft Channel"`:
 /// at init RVAL=12 VAL=0 UDF=1 STAT=UDF; after `caput RAI:CONST.PROC 1`
 /// RVAL=12 VAL=12 UDF=0.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ai_raw_soft_channel_constant_inp_seeds_rval_not_val_at_init() {
     let db = ioc().await;
 
@@ -171,7 +169,7 @@ async fn ai_raw_soft_channel_constant_inp_seeds_rval_not_val_at_init() {
 /// its `init_record` (60-64) defaulted to `0xffffffff` (NOBT==0) and shifted by
 /// SHFT. `mbbiRecord.c` then matches RVAL against the state values: ONVL=37 with
 /// RVAL=37 selects state 1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbi_raw_soft_channel_nobt_zero_masks_all_bits_then_matches_state() {
     let db = ioc().await;
     process(&db, "RMBI").await;
@@ -182,7 +180,7 @@ async fn mbbi_raw_soft_channel_nobt_zero_masks_all_bits_then_matches_state() {
 
 /// SHFT boundary: NOBT=4/SHFT=4 makes the dset mask `0xf << 4 == 0xf0`, so bits
 /// outside the field are dropped. Source 293 == 0x125; 0x125 & 0xf0 == 0x20.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbi_raw_soft_channel_shft_masks_out_of_field_bits() {
     let db = ioc().await;
     process(&db, "RMBI:SHFT").await;
@@ -196,7 +194,7 @@ async fn mbbi_raw_soft_channel_shft_masks_out_of_field_bits() {
 /// `devMbbiDirectSoftRaw.c::read_mbbi` (57-58): same mask rule; `mbbiDirect`
 /// then spreads `RVAL >> SHFT` across B0..BF. 293 == 0x125, NOBT==0 so nothing
 /// is masked out, and the low bits 0/2/5/8 are set.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbi_direct_raw_soft_channel_masks_then_spreads_bits() {
     let db = ioc().await;
     process(&db, "RMBID").await;
@@ -214,7 +212,7 @@ async fn mbbi_direct_raw_soft_channel_masks_then_spreads_bits() {
 /// `devAoSoftRaw.c::write_ao` (44): `dbPutLink(&prec->out, DBR_LONG,
 /// &prec->rval, 1)`. The ao's `convert()` puts VAL into RVAL (default linear
 /// conversion), and RVAL is what reaches the target.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ao_raw_soft_channel_writes_rval_to_out_link() {
     let db = ioc().await;
     put_val(&db, "RAO", EpicsValue::Double(37.0)).await;
@@ -225,7 +223,7 @@ async fn ao_raw_soft_channel_writes_rval_to_out_link() {
 
 /// `devBoSoftRaw.c::write_bo` (65): the OUT link carries RVAL. `boRecord.c`
 /// converts VAL=1 -> RVAL=1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn bo_raw_soft_channel_writes_rval_to_out_link() {
     let db = ioc().await;
     put_val(&db, "RBO", EpicsValue::Enum(1)).await;
@@ -236,7 +234,7 @@ async fn bo_raw_soft_channel_writes_rval_to_out_link() {
 /// `devMbboSoftRaw.c::write_mbbo` (71-75): `data = prec->rval & prec->mask`.
 /// ONVL=37 and VAL=1 give RVAL=37; NOBT==0 makes the dset mask all-ones, so the
 /// target sees 37 — NOT the 1 the plain Soft Channel dset would have sent.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_raw_soft_channel_writes_masked_rval_to_out_link() {
     let db = ioc().await;
     put_val(&db, "RMBO", EpicsValue::Enum(1)).await;
@@ -249,7 +247,7 @@ async fn mbbo_raw_soft_channel_writes_masked_rval_to_out_link() {
 /// NOBT=4/SHFT=4 makes the dset mask `0xf << 4 == 0xf0`. ONVL=499 (0x1f3) with
 /// VAL=1 gives RVAL = 0x1f3 << 4 == 0x1f30 (`mbboRecord.c::convert` 428-433,
 /// which does NOT mask), so the OUT link must carry 0x1f30 & 0xf0 == 0x30.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_raw_soft_channel_dset_mask_trims_rval_before_out_link() {
     let db = ioc().await;
     put_val(&db, "RMBO:SHFT", EpicsValue::Enum(1)).await;
@@ -268,7 +266,7 @@ async fn mbbo_raw_soft_channel_dset_mask_trims_rval_before_out_link() {
 /// NOBT==0 rule (`mask = 0xffffffff`): nothing is trimmed, so the whole raw word
 /// reaches the target — the VAL-direct dset would have sent the same number
 /// here, which is exactly why the mbbo case above is the discriminating one.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_direct_raw_soft_channel_nobt_zero_passes_whole_raw_word() {
     let db = ioc().await;
     put_val(&db, "RMBOD", EpicsValue::ULong(0x125)).await;
@@ -288,7 +286,7 @@ async fn mbbo_direct_raw_soft_channel_nobt_zero_passes_whole_raw_word() {
 /// keeps the plain VAL-direct soft path instead of routing the value into an
 /// RVAL that does not exist. (C rejects that DTYP at init; the port reads soft
 /// DTYPs leniently, and leniency must not turn the write into a silent no-op.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn record_without_a_softraw_dset_falls_back_to_val_direct() {
     let db = ioc().await;
     process(&db, "RLI").await;

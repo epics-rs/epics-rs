@@ -18,8 +18,6 @@
 //!   * `bo` HIGH: the momentary reset arms and (on the timer reprocess) drives
 //!     the simulated output back to 0.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -33,7 +31,7 @@ use epics_base_rs::types::EpicsValue;
 /// body computes OVAL=1, so the SIOL target receives 1 — NOT the un-limited
 /// VAL=10. The pre-fix short-circuit skipped `convert()`, leaving OVAL=0 and
 /// writing VAL=10 straight through, so this assertion pins the body running.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
     let db = PvDatabase::new();
     // SIML reads 1 -> SIMM=YES; SIOL target starts at a sentinel.
@@ -87,7 +85,7 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
 /// runs the body again, sees the pending reset, sets VAL=0, and writes 0 to
 /// SIOL. The pre-fix short-circuit never ran the body, so the reset never armed
 /// and the simulated output stayed latched at 1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
     let db = PvDatabase::new();
     db.add_record("BOHI_SW", Box::new(AoRecord::new(1.0)))
@@ -145,7 +143,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
 /// in-range VAL (`nsev < INVALID` at the gate) takes the normal `writeValue`
 /// branch and DOES write OVAL to SIOL, even though SIMS=INVALID makes the
 /// final SEVR=INVALID. The IVOA Don't_drive veto is never consulted.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_output_sims_invalid_does_not_veto_siol_write() {
     let db = PvDatabase::new();
     db.add_record("AOIV_SW", Box::new(AoRecord::new(1.0)))
@@ -188,7 +186,7 @@ async fn sim_output_sims_invalid_does_not_veto_siol_write() {
 /// C skips `writeValue` — no SIOL write, and (because `writeValue` is skipped)
 /// SIMM_ALARM is never raised, so STAT stays STATE_ALARM. This guards that the
 /// switch to the pre-SIMM `real_sev` did not disable the genuine veto.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
     use epics_base_rs::server::records::bo::BoRecord;
 
@@ -246,7 +244,7 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
 /// `OSV=MINOR`, `VAL=1`, `SIMS=MINOR` must report STAT=STATE_ALARM, not
 /// STAT=SIMM_ALARM. (Pre-fix the SIMM raise preceded `checkAlarms`, so SIMM won
 /// the tie and STAT was wrongly SIMM_ALARM.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
     use epics_base_rs::server::records::bo::BoRecord;
 

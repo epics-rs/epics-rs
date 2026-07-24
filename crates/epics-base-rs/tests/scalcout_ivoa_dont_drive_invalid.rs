@@ -12,8 +12,6 @@
 //! `skip_out` path already enforced, closing the family for all INVALID
 //! sources (and for both `scalcout` and `acalcout`).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -24,7 +22,7 @@ use epics_base_rs::types::EpicsValue;
 
 /// Non-calc-fail INVALID (NaN VAL → UDF) + IVOA=Don't_drive + output due:
 /// the OUT link must NOT be written.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
     let db = PvDatabase::new();
 

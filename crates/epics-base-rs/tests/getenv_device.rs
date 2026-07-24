@@ -19,8 +19,6 @@
 //! `std::env::set_var` is race-free here: nextest runs each `#[test]` in its own
 //! process, so the variable set below is private to this test's process.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -32,7 +30,7 @@ use epics_base_rs::types::EpicsValue;
 /// environment variable into `VAL` — proving the static builtin factory wired
 /// the device and its read ran end-to-end (the pre-wiring default `VAL` is an
 /// empty string, so a non-empty match proves the device ran).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn getenv_stringin_reads_env_var_through_iocbuilder() {
     // SAFETY: nextest isolates each test in its own process (see module doc),
     // so this set_var cannot race another test.
@@ -78,7 +76,7 @@ record(stringin, "GETENV_SI") {
 /// record-type gate Errs in `init()`, so `wire_device_to_record` flags an
 /// `ai` with `DTYP="getenv"` INVALID at build time — proving the device
 /// attached and gated rather than being silently accepted.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn getenv_wrong_record_type_is_invalid() {
     let (db, _) = IocBuilder::new()
         .db_string(
@@ -109,7 +107,7 @@ record(ai, "GETENV_AI") {
 /// :114-118). base-rs surfaces the SAME UDF_ALARM via the device `last_alarm()`
 /// channel — not READ_ALARM (which the earlier soft-Err path produced) and with
 /// no per-cycle stderr spam.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn getenv_unset_var_raises_udf_alarm_not_read_alarm() {
     // SAFETY: nextest isolates each test in its own process (see module doc), so
     // removing this variable cannot race another test.
@@ -164,7 +162,7 @@ record(stringin, "GETENV_UNSET") {
 /// reason `set_process_context` exists: drop the `ctx.udfs` capture and the
 /// severity reverts to the INVALID default, failing this assertion (the
 /// default-UDFS test above would still pass, so it cannot catch that regression).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn getenv_unset_var_honors_user_lowered_udfs() {
     // SAFETY: nextest isolates each test in its own process (see module doc), so
     // removing this variable cannot race another test.

@@ -31,8 +31,6 @@
 //! record(lsi,"L4"){field(INP,"5")}                 VAL ""          LEN 1  UDF 0
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -68,7 +66,7 @@ async fn state(db: &PvDatabase, rec: &str) -> (String, u32, bool) {
     (val, len, inst.common.udf != 0)
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_numeric_constant_link_defines_the_record_without_text() {
     let db = build(
         r#"
@@ -91,7 +89,7 @@ async fn a_numeric_constant_link_defines_the_record_without_text() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_json_const_string_is_the_only_text_form() {
     let db = build(
         r#"
@@ -115,7 +113,7 @@ async fn a_json_const_string_is_the_only_text_form() {
 
 /// SIZV bounds the copy (`strncpy(pbuffer, pstr, --size)`, lnkConst.c:446-448),
 /// so the text is truncated to `SIZV-1` and LEN counts the NUL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_json_const_string_is_clamped_at_sizv() {
     let db = build(
         r#"
@@ -132,7 +130,7 @@ async fn a_json_const_string_is_clamped_at_sizv() {
 }
 
 /// A PV link has no init-time `loadLS` at all, so the record stays undefined.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_pv_link_loads_nothing_and_leaves_the_record_undefined() {
     let db = build(
         r#"

@@ -15,8 +15,6 @@
 //! two different orders — one boot succeeding, the next failing with "opcuaItem
 //! record ... is not loaded yet".
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -63,7 +61,7 @@ fn load_ordered_names() -> Vec<String> {
 /// `wire_device_support_binds_in_database_load_order`). Pinned here so the two
 /// paths cannot silently diverge — an IOC must wire the same way whether its
 /// database came from the builder or from iocsh `dbLoadRecords`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn builder_wires_device_support_in_database_load_order() {
     let names = load_ordered_names();
 
@@ -105,7 +103,7 @@ async fn builder_wires_device_support_in_database_load_order() {
 /// The ordering owner itself: every whole-database walk goes through
 /// `all_record_names`, so pinning it pins `wire_device_support`,
 /// `setup_io_intr`, `setup_cp_links`, `dbl`, and the rest.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn all_record_names_returns_load_order() {
     let db = Arc::new(PvDatabase::new());
     let names = load_ordered_names();
@@ -125,7 +123,7 @@ async fn all_record_names_returns_load_order() {
 /// PINI processing is a whole-database walk too: C `initialProcess` iterates
 /// with `dbFirstRecord`/`dbNextRecord`, so a PINI record that depends on an
 /// earlier PINI record's output processes after it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pini_records_returns_load_order() {
     let db = Arc::new(PvDatabase::new());
     let names = load_ordered_names();

@@ -24,8 +24,6 @@
 //! on a cycle whose output fires (ODLY delay-end included), so a non-firing
 //! cycle neither refreshes DOLD nor posts it.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -72,7 +70,7 @@ async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
     g.record.get_field(f).and_then(|v| v.to_f64())
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
     let db = swait_db(1, "W_SRC", 0, 0.0).await;
 
@@ -105,7 +103,7 @@ async fn r9_65_use_dol_drives_out_from_the_live_dol_link() {
 
 /// DOPT="Use VAL" never reads DOL — C guards the `recDynLinkGet` with
 /// `if (pwait->dopt)`. DOLD keeps its client-put value and VAL goes out.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_65_use_val_never_reads_the_dol_link() {
     let db = swait_db(0, "W_SRC", 0, 0.0).await;
 
@@ -126,7 +124,7 @@ async fn r9_65_use_val_never_reads_the_dol_link() {
 
 /// DOPT="Use DOL" with DOLN unset is C's `dolv == NO_PV`: the get is skipped
 /// and the current DOLD — whatever a client put there — is what goes out.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_65_use_dol_without_a_link_writes_the_client_put_dold() {
     let db = swait_db(1, "", 0, 0.0).await;
 
@@ -143,7 +141,7 @@ async fn r9_65_use_dol_without_a_link_writes_the_client_put_dold() {
 /// A cycle whose output does not fire (OOPT="Never") must not read DOL at all
 /// — C reaches the `recDynLinkGet` only from inside `execOutput`, which
 /// `process` calls only when the OOPT test passes.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_65_non_firing_cycle_does_not_refresh_dold() {
     let db = swait_db(1, "W_SRC", 6, 0.0).await; // OOPT=6 = "Never"
 
@@ -165,7 +163,7 @@ async fn r9_65_non_firing_cycle_does_not_refresh_dold() {
 
 /// ODLY>0: C schedules `execOutput` on the watchdog, so the DOL fetch happens
 /// at delay END. A source that moves during the delay window is picked up.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_65_odly_fetches_dol_at_delay_end_not_delay_start() {
     let db = swait_db(1, "W_SRC", 0, 100.0).await;
 

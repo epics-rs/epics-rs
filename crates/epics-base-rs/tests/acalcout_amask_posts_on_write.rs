@@ -22,8 +22,6 @@
 //! array this cycle", which is what an aCalcout-driven waveform client waits on;
 //! a second identical process must therefore not go silent.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -55,7 +53,7 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
 /// process. The second process changes nothing, so the framework's change
 /// detection posted nothing — but AMASK bit 0 is set on that cycle too, and C
 /// posts AA from the bit alone.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
     let db = PvDatabase::new();
     acalcout(&db, "P1", "AA:=BB*2;SUM(AA)").await;
@@ -100,7 +98,7 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
 /// The mask is per-cycle, not sticky: an expression that stores nothing leaves
 /// AMASK 0 (`aCalcPerform.c:326` zeroes it at entry), so the write-gated post
 /// must stop with it. Without this the fix would post AA forever after one store.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P2", "AA:=BB*2;SUM(AA)").await;
@@ -143,7 +141,7 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
 
 /// Only the flagged arrays post. `CC := AA` sets bit 2; BB (bit 1) is read, not
 /// written, and must stay silent.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c5_only_the_flagged_arrays_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P3", "CC:=BB;SUM(CC)").await;

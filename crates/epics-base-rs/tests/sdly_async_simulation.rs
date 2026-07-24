@@ -18,8 +18,6 @@
 //! as the swait/scalcout ODLY tests do) so the assertions are deterministic and
 //! do not race the real timer (`SDLY = 100s` makes it unfireable here).
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -38,7 +36,7 @@ async fn is_processing(db: &PvDatabase, name: &str) -> bool {
 /// the continuation while holding PACT. On the fresh cycle VAL is untouched and
 /// no alarm is raised; the continuation reads SIOL into VAL, raises SIMM_ALARM,
 /// and clears PACT.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sdly_async_defers_input_sim_read_to_continuation() {
     let db = PvDatabase::new();
     // SIML source reads 1 -> SIMM=YES; SIOL source carries the simulated value.
@@ -108,7 +106,7 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
 /// Regression guard: the default `SDLY = -1.0` reads synchronously on the single
 /// cycle (`pact || sdly < 0` takes the sync branch) — the async defer is gated
 /// strictly on `sdly >= 0`, so VAL is set immediately and PACT is never held.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sdly_negative_reads_input_synchronously() {
     let db = PvDatabase::new();
     db.add_record("SDLYN_SW", Box::new(AoRecord::new(1.0)))
@@ -151,7 +149,7 @@ async fn sdly_negative_reads_input_synchronously() {
 /// gating the SIML read on `!is_continuation`; without that gate the
 /// continuation would re-read SIML, switch to `NotSimulated`, and read the real
 /// (here empty) device — a value-source divergence.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
     let db = PvDatabase::new();
     db.add_record("SDLYL_SW", Box::new(AoRecord::new(1.0)))
@@ -225,7 +223,7 @@ async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
 /// re-resolve SIMM=YES, matching C. (Twin of
 /// `sdly_continuation_keeps_simm_latched_from_fresh_cycle`, which pins the other
 /// boundary: a PACT-held continuation must NOT re-resolve.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pact_false_retrigger_reresolves_simm_from_siml() {
     use epics_base_rs::server::records::bo::BoRecord;
 
@@ -284,7 +282,7 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
 /// shares the same async branch as the input read). On the fresh cycle the
 /// SIOL target keeps its value and PACT is held; the continuation writes VAL to
 /// the target and clears PACT.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sdly_async_defers_output_sim_write_to_continuation() {
     let db = PvDatabase::new();
     db.add_record("SDLYO_SW", Box::new(AoRecord::new(1.0)))

@@ -7,8 +7,6 @@
 //! the Rust udf was VAL-based only (`value_is_undefined` default), so OCAL→NaN
 //! drove NaN to the OUT link with NO_ALARM — a silent-wrong-value divergence.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -17,7 +15,7 @@ use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
     let db = PvDatabase::new();
 
@@ -72,7 +70,7 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
 /// The effective UDF condition is `isnan(VAL) OR isnan(OVAL)`, not OVAL alone.
 /// A first cut of the fix *replaced* the VAL-based udf with the OVAL one and
 /// regressed this path to NO_ALARM; this pins the OR.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
     let db = PvDatabase::new();
 
@@ -109,7 +107,7 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
 
 /// Both VAL and OVAL finite on a Use_OVAL output cycle → NO_ALARM. Pins that
 /// the OR fix did not introduce a false-positive UDF when neither is NaN.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
     let db = PvDatabase::new();
 

@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! Access-security iocsh commands — the `as*` family.
 //!
 //! C registers the whole `as*` command family in
@@ -10,8 +11,6 @@
 //! `asSetSubstitutions`, and the parsed [`AccessSecurityConfig`]
 //! activated by `asInit`. The C flow is identical: `asSetFilename`
 //! has "no immediate effect", `asInit` does the (re)load.
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Mutex;
 

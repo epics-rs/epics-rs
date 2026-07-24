@@ -20,8 +20,6 @@
 //! stays `true` throughout (C's lset `isConnected`, `dbCa.c:633-641`, does
 //! not consult access rights) and only the value read fails.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{LinkSet, PvDatabase};
@@ -105,7 +103,7 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
 /// (`dbCa.c:1094-1099`) and that calink did not: without it the holder is
 /// Passive, is never processed again, and reports its last good value
 /// with SEVR=0 for as long as the server denies reads.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
     use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
 
@@ -150,7 +148,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
 /// Recovery: C dispatches NOTHING on a full rights regain
 /// (`dbCa.c:1091` `goto done`), so the alarm clears on the next monitor
 /// event — modelled here as the next dispatch after the gate reopens.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {
     let lset = ReadGateLset::new(7.25);
     let db = holder_db(lset.clone()).await;

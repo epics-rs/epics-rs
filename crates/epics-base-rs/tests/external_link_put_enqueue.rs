@@ -22,8 +22,6 @@
 //!
 //! Each test below is one boundary of that queue, not one narrative.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -182,7 +180,7 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 ///
 /// This is the property the whole change exists for: the last network
 /// suspension inside the record's advisory write gate is gone.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn plain_put_returns_before_the_wire_write_completes() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -231,7 +229,7 @@ async fn plain_put_returns_before_the_wire_write_completes() {
 /// (`dbCa.c:558-561`: `if (!pca->isConnected || !pca->hasWriteAccess) return
 /// -1`), so `put_value` must never run and the writing record must alarm in
 /// this cycle (`dbLink.c:434-448` `setLinkAlarm`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn disconnected_link_stages_nothing_and_alarms() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
@@ -273,7 +271,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
 /// Here: put 1.0 goes in flight (gated), 2.0 is staged behind it, 3.0
 /// overwrites 2.0. Exactly two writes reach the wire, in order, and the
 /// middle value is dropped — which is `nNoWrite == 1`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pending_put_is_overwritten_latest_wins() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -325,7 +323,7 @@ async fn pending_put_is_overwritten_latest_wins() {
 /// C guarantees this by having a single `dbCaTask` service `workList` FIFO
 /// (`dbCa.c:1180-1197`); ours by keeping at most one write in flight per link
 /// and re-queueing a restaged value at its tail (`link_put_queue::finish`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn per_link_put_ordering_is_preserved() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
@@ -363,7 +361,7 @@ async fn per_link_put_ordering_is_preserved() {
 /// source record's `NotifyWaitSet` must stay unsettled until the completion
 /// resolves. On the pre-H6 shape `process()` awaited the completion, so this
 /// test would deadlock on the gate rather than fail an assertion.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn async_put_completion_is_reported_through_the_notify_chain() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -429,7 +427,7 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
 /// If the queue owner ever dropped a completion instead of resolving it, this
 /// test would hang rather than fail — which is why `PutCompletion` resolves on
 /// `Drop` as well as on the success path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn async_put_wire_failure_settles_the_chain_without_alarming() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
@@ -468,7 +466,7 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
 /// writes to every other link. C gets this free (`ca_array_put` only queues
 /// into libca's send buffer); ours needs the owner to keep one in-flight write
 /// PER LINK rather than one globally.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_blocked_link_does_not_stall_other_links() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -504,7 +502,7 @@ async fn a_blocked_link_does_not_stall_other_links() {
         if completed.lock().unwrap().contains(&2.0) {
             break;
         }
-        tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::yield_now().await;
     }
     let mid = completed.lock().unwrap().clone();
     assert_eq!(

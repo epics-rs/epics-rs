@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use crate::error::{CaError, CaResult};
@@ -2342,7 +2340,7 @@ mod tests {
     /// downstream subscribers — without the simple-PV branch, every
     /// upstream event was silently dropped and the gateway delivered
     /// no monitors.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_pv_and_post_handles_simple_pv() {
         let db = PvDatabase::new();
         db.add_pv("gw:test", EpicsValue::Double(0.0)).await.unwrap();
@@ -2363,7 +2361,7 @@ mod tests {
     /// PR #336 silently returned `ChannelNotFound`. A later fix closed
     /// `get_record` but the same defect was hiding in field_io.rs.
     /// All four CA-server-and-bridge entry points must accept aliases.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn field_io_entry_points_accept_aliases() {
         use crate::server::records::ai::AiRecord;
 
@@ -2406,7 +2404,7 @@ mod tests {
     /// Covers the `put_pv` (`put_pv_inner`) and `put_pv_and_post` coercion
     /// sites; the CA field-put path (`put_record_field_from_ca_inner`) shares
     /// the identical `coerce_write_value` helper.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn write_path_menu_label_resolves_against_field_menu() {
         use crate::server::records::sel::SelRecord;
 
@@ -2441,7 +2439,7 @@ mod tests {
     /// installed limits/units, and a `DBE_PROPERTY` subscriber must NOT
     /// have received anything (nothing *changed* yet). An unknown / record
     /// name is rejected with `ChannelNotFound`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn set_pv_metadata_installs_without_posting() {
         use crate::error::CaError;
         use crate::server::snapshot::{DisplayInfo, Snapshot};
@@ -2499,7 +2497,7 @@ mod tests {
     /// `DBE_PROPERTY` subscribers only. This is the DB-routing layer the
     /// gateway's property monitor drives on every upstream `DBE_PROPERTY`
     /// event. An unknown / record name is rejected with `ChannelNotFound`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn post_pv_property_refreshes_and_posts_property_event() {
         use crate::error::CaError;
         use crate::server::snapshot::{DisplayInfo, Snapshot};
@@ -2579,7 +2577,7 @@ mod tests {
     /// only consulted `inner.records` directly. Also exercises the
     /// canonical-name normalisation that protects subsequent
     /// `process_record_with_links` / `update_scan_index` calls.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn put_record_field_from_ca_accepts_alias() {
         use crate::server::records::ai::AiRecord;
 
@@ -2608,7 +2606,7 @@ mod tests {
     /// Pre-fix the ack field posted only itself with DBE_VALUE|DBE_LOG, so no
     /// alarm-mask subscriber observed the acknowledgement, and the post fired
     /// on every put regardless of whether `ackt` changed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn alarm_ack_put_posts_record_wide_dbe_alarm() {
         use crate::server::recgbl::EventMask;
         use crate::server::records::ai::AiRecord;
@@ -2677,7 +2675,7 @@ mod tests {
     /// runtime enum re-propagation drives (devAsynInt32.c callbackEnum). A
     /// `DBE_VALUE`-only subscriber on the same field must NOT receive it:
     /// re-keying enum strings is a property change, not a value change.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn post_property_fields_writes_and_posts_dbe_property_only() {
         use crate::server::recgbl::EventMask;
         use crate::server::records::mbbi::MbbiRecord;
@@ -2734,7 +2732,7 @@ mod tests {
     /// the reprocess cycle for a non-`pp` VAL, so the operator's write fired
     /// no monitor at all. calc's VAL is not in its `pp` field set, so the
     /// immediate post is the only event that can fire.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn ca_put_to_non_pp_val_posts_monitor() {
         use crate::server::database::db_access::DbSubscription;
         use crate::server::records::calc::CalcRecord;
@@ -2752,7 +2750,7 @@ mod tests {
             .await
             .expect("CA put to CALC1.VAL must succeed");
 
-        let got = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv_f64())
+        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(1), sub.recv_f64())
             .await
             .expect("a DBE_VALUE monitor must fire for a direct VAL put to a non-pp record");
         assert_eq!(got, Some(5.0));
@@ -2771,7 +2769,7 @@ mod tests {
     /// Before the fix the producer parked the newest value in a side coalesce
     /// slot and `next_event`, finding it set, discarded the whole queued backlog
     /// — the burst came out as one event instead of {1..=appended-1, N}.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn r8_22_db_burst_keeps_earlier_distinct_updates() {
         use crate::server::database::db_access::DbSubscription;
         use crate::server::event_queue::{event_que_size, events_per_que};
@@ -2799,7 +2797,8 @@ mod tests {
         // last event has nothing queued and times out, ending collection.
         let mut seq = Vec::new();
         while let Ok(Some(v)) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv_f64()).await
+            crate::runtime::task::timeout(std::time::Duration::from_millis(200), sub.recv_f64())
+                .await
         {
             seq.push(v);
         }

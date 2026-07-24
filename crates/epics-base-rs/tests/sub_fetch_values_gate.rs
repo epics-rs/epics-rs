@@ -27,8 +27,6 @@
 //!
 //! `aSubRecord.c` (fetch 277-289, process 216-218) has the identical shape.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -86,7 +84,7 @@ async fn sub_db(inpb: &str) -> PvDatabase {
     db
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
     // INPB names a PV that does not exist: C's `dbGetLink` fails here and
     // `fetch_values` returns -1 before ever reaching INPC.
@@ -121,7 +119,7 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
 /// An *unset* INPB is a CONSTANT link, not a failure — C `dbGetLink` returns
 /// success for it, so the subroutine still runs. Guards the gate against
 /// arming on "no link configured".
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_69_unset_link_is_not_a_fetch_failure() {
     let db = sub_db("").await;
 
@@ -142,7 +140,7 @@ async fn r9_69_unset_link_is_not_a_fetch_failure() {
 /// aSub is the same C shape (`aSubRecord.c::fetch_values` 277-289 returns on
 /// the first failure; `process` 216-218 gates `do_sub`). Its VAL is the
 /// subroutine's return status, so a skipped run leaves VAL untouched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
     let db = PvDatabase::new();
     db.add_record("SRCA", Box::new(AiRecord::new(10.0)))

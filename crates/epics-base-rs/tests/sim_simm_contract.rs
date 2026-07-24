@@ -25,8 +25,6 @@
 //! `NotSimulated` before SIMM was even read whenever SIML and SIOL were both
 //! empty, so the idiom was a complete no-op on every record type.
 
-// RTEMS-EXEC-MODEL-ALLOW(15): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -38,7 +36,7 @@ use epics_base_rs::types::EpicsValue;
 /// NO SIML and NO SIOL: C reads SIMM (YES), raises SIMM_ALARM at SIMS, reads
 /// the (constant, unset) SIOL — status 0, SVAL untouched — and publishes
 /// `VAL = SVAL = 42` with UDF cleared.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(7); // VAL = 7 (the pre-simulation value)
@@ -84,7 +82,7 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
 
 /// The same record with SIMM back at NO must NOT simulate: the SVAL is ignored
 /// and the real (soft, empty INP) device path runs, leaving VAL alone.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_no_with_unset_links_does_not_simulate() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(7);
@@ -146,7 +144,7 @@ const SCAN_PASSIVE: u16 = 0;
 /// periodic scan, and SSCN comes back holding the scan the record just left.
 /// Leaving simulation swaps them back. Both directions are a swap, not an
 /// assignment.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_transition_swaps_scan_with_sscn() {
     let db = PvDatabase::new();
     db.add_record("SWAP", Box::new(LonginRecord::new(1)))
@@ -202,7 +200,7 @@ async fn simm_transition_swaps_scan_with_sscn() {
 /// `*psscn == USHRT_MAX` (the dbd default, `initial("65535")`) — C returns
 /// immediately from BOTH recGblSaveSimm and recGblCheckSimm, so SCAN is
 /// untouched and OLDSIMM is never even latched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
     let db = PvDatabase::new();
     db.add_record("NOSSCN", Box::new(LonginRecord::new(1)))
@@ -235,7 +233,7 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
 /// OLDSIMM, and `busyRecord.c` calls neither recGblSaveSimm nor
 /// recGblCheckSimm — it has no `special()` at all. So a SIMM transition on a
 /// busy record must NOT move its SCAN, even with SSCN set. Same for `swait`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     let db = PvDatabase::new();
     db.add_record("BUSY", Box::new(BusyRecord::new()))
@@ -289,7 +287,7 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
 use epics_base_rs::server::recgbl::alarm_status;
 
 /// The 21 recGblGetSimm records: STAT=LINK_ALARM, SEVR untouched.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
@@ -321,7 +319,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
 
 /// `busy` reads SIML with a plain `dbGetLink`, so its failure is a full
 /// `setLinkAlarm` — LINK_ALARM at INVALID severity.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     let db = PvDatabase::new();
     let mut b = BusyRecord::new();
@@ -371,7 +369,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
 
 /// The headline: with the DEFAULT `SIMS = NO_ALARM`, a broken SIOL is reported
 /// as LINK_ALARM/INVALID with AMSG "field SIOL". The port reported NO_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
@@ -407,7 +405,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
 /// base record raised SIMM FIRST — so the strict-greater `recGblSetSevr` leaves
 /// SIMM_ALARM in STAT and the LINK_ALARM loses the tie. (AMSG is empty: the
 /// SIMM raise went through message-less `recGblSetSevr`, which CLEARS namsg.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(5);
@@ -465,7 +463,7 @@ use epics_base_rs::server::records::longout::LongoutRecord;
 
 /// A menuYesNo INPUT record with SIMM=2: SOFT_ALARM/INVALID, and SVAL is NOT
 /// copied into VAL (C never reaches the SIOL read on this arm).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
     let db = PvDatabase::new();
     let mut li = LonginRecord::new(7);
@@ -497,7 +495,7 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
 /// A menuYesNo OUTPUT record with SIMM=2: SOFT_ALARM/INVALID, and NOTHING is
 /// written — not the device/OUT link, not SIOL. C `writeValue` returns -1 from
 /// the default arm, before either write.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
     let db = PvDatabase::new();
     db.add_record("SINK", Box::new(LonginRecord::new(0)))
@@ -529,7 +527,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
 
 /// `busy` is menuYesNo too (`busyRecord.c:409-413` is the `else` of its YES
 /// test): SIMM=2 raises SOFT_ALARM/INVALID and writes nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
     let db = PvDatabase::new();
     db.add_record("BSINK", Box::new(LonginRecord::new(0)))
@@ -556,7 +554,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
 /// The guard on the other side: `ai` IS `menu(menuSimm)`, so SIMM=2 is the
 /// legal RAW arm — it must still simulate (SIOL -> SVAL -> RVAL -> conversion),
 /// with SIMM_ALARM and no SOFT_ALARM.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn simm_raw_on_a_menu_simm_record_still_simulates() {
     use epics_base_rs::server::records::ai::AiRecord;
 
@@ -606,7 +604,7 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
 
 /// A broken SIML on a `busy` with a local OUT link: C returns from
 /// `writeValue` before the write, so the OUT target must not be driven.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     let db = PvDatabase::new();
     db.add_record("E5TGT", Box::new(LonginRecord::new(0)))
@@ -646,7 +644,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
 
 /// The same busy in SIMM=YES: the abort precedes the SIOL redirect too, so a
 /// failed SIML read means NO write of any kind — not even the simulated one.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
     let db = PvDatabase::new();
     db.add_record("E5STGT", Box::new(LonginRecord::new(0)))

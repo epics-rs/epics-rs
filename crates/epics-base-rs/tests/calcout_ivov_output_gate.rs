@@ -10,8 +10,6 @@
 //! spurious OVAL monitor on a non-output cycle (D3). The fix gates the OVAL
 //! write on the record's `cached_should_output`.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -20,7 +18,7 @@ use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// Non-output INVALID cycle: OVAL must NOT become IVOV.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_ivov_not_applied_on_non_output_cycle() {
     let db = PvDatabase::new();
 
@@ -65,7 +63,7 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
 
 /// Control: when output IS due, IVOA=Set_to_IVOV still clobbers OVAL→IVOV.
 /// Pins that the gate suppresses only non-output cycles, not all of them.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_ivov_applied_on_output_cycle() {
     let db = PvDatabase::new();
 

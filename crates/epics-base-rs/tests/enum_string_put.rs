@@ -43,8 +43,6 @@
 //! The cases below are the CONVERTER's boundaries, one per boundary, driven
 //! through the same `dbPut` entry the CA server uses.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::bo::BoRecord;
@@ -84,7 +82,7 @@ async fn put(db: &PvDatabase, name: &str, value: &str) -> Result<(), String> {
 
 // --- Boundary: the name IS a defined state --------------------------------
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn state_name_resolves_to_its_index() {
     let db = db_with("M", mbbo_three_states()).await;
 
@@ -97,7 +95,7 @@ async fn state_name_resolves_to_its_index() {
 
 // --- Boundary: the name is NOT a defined state ----------------------------
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn unmatched_name_fails_the_put_and_stores_nothing() {
     let db = db_with("M", mbbo_three_states()).await;
     put(&db, "M", "Two").await.unwrap();
@@ -113,7 +111,7 @@ async fn unmatched_name_fails_the_put_and_stores_nothing() {
 
 /// C's `strncmp` is case-SENSITIVE. (The `busy` record's put arm matched
 /// case-insensitively AND coerced any unmatched name to state 0.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn wrong_case_is_not_a_state_name() {
     let db = db_with("M", mbbo_three_states()).await;
 
@@ -123,7 +121,7 @@ async fn wrong_case_is_not_a_state_name() {
 
 // --- Boundary: the numeric fallback, either side of `no_str` --------------
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn numeric_string_below_no_str_is_accepted() {
     let db = db_with("M", mbbo_three_states()).await;
 
@@ -131,7 +129,7 @@ async fn numeric_string_below_no_str_is_accepted() {
     assert_eq!(val_of(&db, "M").await, EpicsValue::Enum(2));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn numeric_string_at_or_above_no_str_is_badchoice() {
     let db = db_with("M", mbbo_three_states()).await;
     put(&db, "M", "1").await.unwrap();
@@ -144,7 +142,7 @@ async fn numeric_string_at_or_above_no_str_is_badchoice() {
 /// The `no_str` bound is the record's OWN table, not a fixed 2 or 16: a `bo`
 /// with a ZNAM and an empty ONAM advertises one state (`boRecord.c:342-352`),
 /// so index 1 is out of range.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn binary_no_str_trim_bounds_the_numeric_fallback() {
     let mut rec = BoRecord::new(0);
     rec.put_field("ZNAM", EpicsValue::String("Closed".into()))
@@ -164,7 +162,7 @@ async fn binary_no_str_trim_bounds_the_numeric_fallback() {
 /// `mbbiDirect`/`mbboDirect` leave the slot NULL (`mbboDirectRecord.c:58`
 /// `#define put_enum_str NULL`) — their `VAL` is `DBF_LONG`, so a string put
 /// takes C's numeric converter and a state NAME is never resolvable.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn mbbo_direct_has_no_enum_state_table() {
     let rec = MbboDirectRecord::default();
     assert!(

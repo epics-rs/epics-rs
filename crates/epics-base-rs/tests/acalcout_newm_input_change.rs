@@ -25,8 +25,6 @@
 //! zeroes it. It is NOT the same mask — AMASK is the arrays the EXPRESSION stored
 //! into (`aCalcPerform.c:487`), NEWM the arrays the LINK changed.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -70,7 +68,7 @@ async fn wf_into_aa(db: &PvDatabase, data: Vec<f64>) {
 /// field = the caput value) differs from the fetched value, so NEWM bit 0 is set
 /// and `monitor()` posts AA. Change detection alone sees the same value it last
 /// posted and says nothing.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     let db = PvDatabase::new();
     wf_into_aa(&db, vec![1.0, 2.0, 3.0, 4.0]).await;
@@ -128,7 +126,7 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
 /// NEWM is per-cycle: `monitor()` zeroes it (`:1036`). A cycle whose link delivers
 /// nothing new must not re-post — this is the control that the mask is taken, not
 /// accumulated.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c4_an_unchanged_link_value_does_not_post_aa() {
     let db = PvDatabase::new();
     wf_into_aa(&db, vec![1.0, 2.0, 3.0, 4.0]).await;
@@ -165,7 +163,7 @@ async fn r11_c4_an_unchanged_link_value_does_not_post_aa() {
 /// NEWM tracks the LINK, not the client. A caput to AA sets no NEWM bit — C only
 /// ever writes `newm` in `fetch_values`. (The put posts on its own path; what must
 /// not happen is the next process cycle re-posting it from a NEWM bit.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r11_c4_a_caput_alone_sets_no_newm_bit() {
     let db = PvDatabase::new();
 

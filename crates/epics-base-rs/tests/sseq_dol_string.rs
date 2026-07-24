@@ -10,8 +10,6 @@
 //! ReadDbLink`, which delivers the link target's NATIVE `EpicsValue`; `sseq`
 //! preserves a string in `STRn` (byte-exact) instead of coercing to `DOn`.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -39,7 +37,7 @@ async fn poll_field(db: &PvDatabase, record: &str, field: &str, label: &str) -> 
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!("{label}: {record}.{field} did not receive the forwarded value before timeout");
 }
@@ -48,7 +46,7 @@ async fn poll_field(db: &PvDatabase, record: &str, field: &str, label: &str) -> 
 /// `LNKn` target byte-exact — no numeric coercion, no `as_str_lossy` on the
 /// value path. Pre-fix the read funnelled through `DOn` (Double), so the
 /// bytes were lost.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_string_dol_forwards_string_byte_exact() {
     let db = PvDatabase::new();
 
@@ -100,7 +98,7 @@ async fn sseq_string_dol_forwards_string_byte_exact() {
 
 /// A numeric `DOLn` source still forwards a `Double` to `LNKn` — the
 /// pre-existing behavior must be unchanged.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_numeric_dol_forwards_double_unchanged() {
     let db = PvDatabase::new();
 
@@ -136,7 +134,7 @@ async fn sseq_numeric_dol_forwards_double_unchanged() {
 /// `cvtDoubleToString(dov, str, prec)` and posts it (sseqRecord.c:676-679). A
 /// client GET of `STRn` must return the record-PREC rendering of the numeric
 /// value, not the stale string left over from before the read.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sseq_numeric_dol_refreshes_strn_with_prec() {
     let db = PvDatabase::new();
 

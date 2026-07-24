@@ -33,8 +33,6 @@
 //! `1e308*10` → `st=-1 d=inf`; `ACOS(2)` → `st=-1 d=nan`; `1/0` → `st=-1 d=0`
 //! (nothing written).
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -76,7 +74,7 @@ async fn channel(db: &PvDatabase, field: &str) -> f64 {
 
 /// The boundary: overflow to `+inf`. C writes it into the channel and returns
 /// -1 — the record alarms AND keeps the infinity.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_overflowing_result_is_stored_in_the_channel_and_alarms() {
     let db = transform_db().await;
     put(&db, "CLCA", EpicsValue::String("1e308*10".into())).await;
@@ -101,7 +99,7 @@ async fn an_overflowing_result_is_stored_in_the_channel_and_alarms() {
 
 /// The same rule with a NaN — C's tail tests `isnan(*presult)` too, and the
 /// written cell is the NaN.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_nan_result_is_stored_in_the_channel_and_alarms() {
     let db = transform_db().await;
     put(&db, "CLCB", EpicsValue::String("ACOS(2)".into())).await;
@@ -120,7 +118,7 @@ async fn a_nan_result_is_stored_in_the_channel_and_alarms() {
 /// The value C wrote is a value like any other: the OUTx loop fans it out.
 /// This is what made the discard observable off-record — a downstream ao that
 /// C drives to `inf` saw nothing at all.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_non_finite_value_is_fanned_out_through_outa() {
     let db = transform_db().await;
     db.add_record("T_TGT", Box::new(AoRecord::new(0.0)))
@@ -146,7 +144,7 @@ async fn the_non_finite_value_is_fanned_out_through_outa() {
 /// REFUSES returns -1 from inside the loop, so C never reaches the epilogue and
 /// `*pval` keeps its old value. `1/0` (`sCalcPerform.c:1022-1030`) must NOT
 /// write the channel — the alarm is raised all the same.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_operator_refusal_leaves_the_channel_untouched() {
     let db = transform_db().await;
     // Seed the channel so "untouched" is distinguishable from "written 0".
@@ -171,7 +169,7 @@ async fn an_operator_refusal_leaves_the_channel_untouched() {
 }
 
 /// Control — a finite result is status 0: no alarm, no UDF, value stored.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_finite_result_stores_the_value_and_does_not_alarm() {
     let db = transform_db().await;
     put(&db, "CLCA", EpicsValue::String("1e308/10".into())).await;

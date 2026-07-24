@@ -15,8 +15,6 @@
 //! `LNK0..LNKF` are `DBF_FWDLINK` (`dbScanFwdLink`), driving no value and
 //! raising no put alarm.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -42,7 +40,7 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 /// of the seq must leave LINK/INVALID committed: this is the whole point of
 /// the finding, and it is what a one-shot passive seq (processed once by a
 /// client put, never scanned again) can observe.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_62_failed_seq_lnk_put_alarms_in_the_same_cycle() {
     let db = PvDatabase::new();
     db.add_record("SEQ_SRC", Box::new(AoRecord::new(7.0)))
@@ -68,7 +66,7 @@ async fn r15_62_failed_seq_lnk_put_alarms_in_the_same_cycle() {
 /// Boundary 2 — the recovery cycle: every LNKn put succeeds, so the seq must
 /// commit NO_ALARM and the target must hold the driven value. Guards against
 /// a fix that simply pins the alarm on.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_62_successful_seq_lnk_put_leaves_no_alarm() {
     let db = PvDatabase::new();
     db.add_record("SEQ_SRC", Box::new(AoRecord::new(7.0)))
@@ -102,7 +100,7 @@ async fn r15_62_successful_seq_lnk_put_leaves_no_alarm() {
 /// with `dbScanFwdLink` (fanoutRecord.c:110). A link naming a record that does
 /// not exist scans nothing and raises NOTHING — there is no put and so no
 /// `setLinkAlarm`. It must not be dragged into the value-put phase.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r15_62_fanout_forward_links_still_raise_no_put_alarm() {
     let db = PvDatabase::new();
     db.add_record("FO_DST", Box::new(AoRecord::new(0.0)))

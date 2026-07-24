@@ -17,8 +17,6 @@
 //! a record type that does not declare the field, so a record driving its own
 //! link is not driven twice per cycle).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -86,7 +84,7 @@ const OUT_LINK: &str = "#C0 S0 @scaler1";
 /// The db file's `OUT` value must reach the dynamic device-support factory.
 /// Before the fix `ctx.out` was `""` and a factory keying on the link (C
 /// `scaler_init_record`) could not tell two boards apart.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn record_owned_out_link_reaches_device_support_context() {
     let seen: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&seen);
@@ -142,7 +140,7 @@ record(ownsOut, "SCALER:1") {{
 /// `parsed_out` were populated here, a record driving its own link (`acalcout`
 /// and `scalcout` via `multi_output_links`, `motorRecord`/`scalerRecord` via
 /// device support) would write that link twice per process cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn record_owned_out_link_does_not_arm_framework_dispatch() {
     let db = r#"
 record(ownsOut, "SCALER:2") {

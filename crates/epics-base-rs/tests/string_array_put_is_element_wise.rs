@@ -37,8 +37,6 @@
 //! caput -a WD 3 1.5 2.5 3.5 -> WD = 1.5 2.5 3.5 NORD = 3
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
@@ -67,7 +65,7 @@ async fn nord(db: &PvDatabase, rec: &str) -> f64 {
 }
 
 /// The finding's exact case: `caput -a WV 3 7 8 9` on a `FTVL=LONG` waveform.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ca_string_array_put_writes_every_element() {
     let db = build().await;
 
@@ -84,7 +82,7 @@ async fn ca_string_array_put_writes_every_element() {
 }
 
 /// A `DOUBLE` waveform takes the same path with the float parse.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn ca_string_array_put_to_a_double_waveform() {
     let db = build().await;
 
@@ -102,7 +100,7 @@ async fn ca_string_array_put_to_a_double_waveform() {
 /// Per-element semantics are the SCALAR string semantics, applied N times:
 /// truncation toward zero into an integer target, and `dbConvertBase = 0`
 /// hex. softIoc: `7.5 -3.9` → `7 -3`; `0x10 12` → `16 12`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn per_element_conversion_matches_the_scalar_string_rules() {
     let db = build().await;
 
@@ -127,7 +125,7 @@ async fn per_element_conversion_matches_the_scalar_string_rules() {
 
 /// The fix lives in the one coercion owner (`EpicsValue::convert_to`), so every
 /// numeric array target gets it — not just the waveform put route.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn convert_to_is_element_wise_for_every_numeric_target() {
     let src = strings(&["1", "2", "3"]);
 

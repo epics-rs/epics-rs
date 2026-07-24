@@ -11,8 +11,6 @@
 //! (record_instance.rs:1653) raises CALC_ALARM/INVALID from the CALC_ALARM
 //! field, so `sevr == INVALID` and `apply_invalid_output_value` runs.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -21,7 +19,7 @@ use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// calc-fail + IVOA=Set_to_IVOV + output due: OVAL = IVOV, VAL = -1 (sentinel).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
     let db = PvDatabase::new();
 

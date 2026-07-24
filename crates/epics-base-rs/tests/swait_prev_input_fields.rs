@@ -17,8 +17,6 @@
 //! LA, both with `monitor_mask | DBE_VALUE` — the mask R9-72 gave A. The port
 //! had no LA..LL fields at all.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -63,7 +61,7 @@ async fn subscribe(db: &PvDatabase, field: &str) -> EventReader {
 }
 
 /// LA tracks A: after a cycle that fetched A=7 through INAN, LA reads 7.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_75_la_holds_previous_input_value() {
     let db = swait_db().await;
     process(&db).await;
@@ -84,7 +82,7 @@ async fn r9_75_la_holds_previous_input_value() {
 
 /// The advanced LA is posted with the same mask as A: `monitor_mask |
 /// DBE_VALUE`, with no forced DBE_LOG (ADEL=1000 is not crossed by 7 -> 8).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_75_la_posts_with_the_inputs_monitor_mask() {
     let db = swait_db().await;
     let mut rx_a = subscribe(&db, "A").await;
@@ -119,7 +117,7 @@ async fn r9_75_la_posts_with_the_inputs_monitor_mask() {
 
 /// An unchanged input posts nothing — C's `if (*pnew != *pprev)` guard covers
 /// both `db_post_events` calls, so LA is silent on a no-change cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r9_75_la_is_silent_when_the_input_did_not_change() {
     let db = swait_db().await;
     let mut rx_la = subscribe(&db, "LA").await;

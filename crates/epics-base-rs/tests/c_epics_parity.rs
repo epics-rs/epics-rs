@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! Tests ported from C EPICS Base test suite.
 //!
 //! Source files:
@@ -8,8 +9,6 @@
 //!   - modules/database/test/ioc/db/recGblCheckDeadbandTest.c
 //!   - modules/database/test/ioc/db/dbDbLinkTest.c
 //!   - modules/database/test/ioc/db/dbPutGetTest.c
-
-// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashSet;
 
@@ -474,7 +473,7 @@ fn deadband_infinity_handling() {
 // ============================================================
 
 /// C EPICS: testAlarm - alarm propagation through DB links
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn db_link_alarm_propagation() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -551,7 +550,7 @@ fn type_coercion_double_to_long() {
 // ============================================================
 
 /// C EPICS: dbHeaderTest — common fields NAME, DESC, SCAN
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn common_fields_access() {
     let rec = AoRecord::new(0.0);
     let mut inst = RecordInstance::new("TEST:header".to_string(), rec);
@@ -612,7 +611,7 @@ fn record_field_lists_non_empty() {
 // ============================================================
 
 /// C EPICS: testGroup0 — soft channel input reads from source via DB link
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn soft_input_reads_from_db_link() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -648,7 +647,7 @@ fn constant_link_record_init() {
 }
 
 /// C EPICS: testGroup3 — output records write values
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn soft_output_writes_to_db() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1289,7 +1288,7 @@ fn sub_record_field_access() {
 // ============================================================
 
 /// C EPICS: multiple records in database, independent access
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_multiple_records() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1320,7 +1319,7 @@ async fn database_multiple_records() {
 }
 
 /// C EPICS: record not found returns error
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_record_not_found() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1331,7 +1330,7 @@ async fn database_record_not_found() {
 }
 
 /// C EPICS: put to record field via database
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_put_record_field() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1360,7 +1359,7 @@ async fn database_put_record_field() {
 }
 
 /// C EPICS: DISP field blocks CA puts
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_disp_blocks_ca_put() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1384,7 +1383,7 @@ async fn database_disp_blocks_ca_put() {
 }
 
 /// C EPICS: PROC put triggers processing
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_proc_triggers_processing() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1411,7 +1410,7 @@ async fn database_proc_triggers_processing() {
 /// (dbAccess.c:1265) matches the proc field by pointer with no value
 /// check, so `caput REC.PROC 0` force-processes the record exactly like
 /// `caput REC.PROC 1`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_proc_zero_still_triggers_processing() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1440,7 +1439,7 @@ async fn database_proc_zero_still_triggers_processing() {
 /// `dbPut` stores the raw byte in `prec->proc` (retained; C never resets it)
 /// AND `pp(TRUE)` force-processes the record. The byte is served back SIGNED
 /// as `DBR_CHAR` (put-defect cluster PROC), so `caput PROC 255` reads back -1.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_proc_stores_byte_and_still_processes() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1480,7 +1479,7 @@ async fn database_proc_stores_byte_and_still_processes() {
 }
 
 /// C EPICS: all record names returned from database
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_all_record_names() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1759,7 +1758,7 @@ fn time_ordering() {
 // ============================================================
 
 /// C EPICS: database can be initialized and cleaned up
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_init_cleanup_cycle() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1785,7 +1784,7 @@ async fn database_init_cleanup_cycle() {
 }
 
 /// C EPICS: process chain doesn't panic on empty database
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn database_process_empty() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1802,7 +1801,7 @@ async fn database_process_empty() {
 
 /// C EPICS: Chain 1 — FLNK record processing chain
 /// Source record processes and triggers target via forward link
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn flnk_chain_processes_target() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1837,7 +1836,7 @@ async fn flnk_chain_processes_target() {
 
 /// C EPICS: Chain 3 — Loop breaking via visited set
 /// Record chain A → B → A should not infinite loop
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn flnk_loop_does_not_infinite_loop() {
     use epics_base_rs::server::database::PvDatabase;
     use std::collections::HashSet;
@@ -1875,7 +1874,7 @@ async fn flnk_loop_does_not_infinite_loop() {
 }
 
 /// C EPICS: Chain 4/5 — RPRO reprocessing prevention
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rpro_reprocessing() {
     use epics_base_rs::server::database::PvDatabase;
     use std::collections::HashSet;
@@ -1909,7 +1908,7 @@ async fn rpro_reprocessing() {
 }
 
 /// C EPICS: Multiple rapid puts to same record
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rapid_puts_to_same_record() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1939,7 +1938,7 @@ async fn rapid_puts_to_same_record() {
 // ============================================================
 
 /// C EPICS: process_record processes and clears UDF
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn process_record_clears_udf() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;
@@ -1966,7 +1965,7 @@ async fn process_record_clears_udf() {
 }
 
 /// C EPICS: PINI=YES processes record at init time
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn pini_flag() {
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::record::PiniMode;
@@ -2001,7 +2000,7 @@ async fn pini_flag() {
 // ============================================================
 
 /// C EPICS: independent records don't interfere
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn independent_records_no_interference() {
     use epics_base_rs::server::database::PvDatabase;
     use std::sync::Arc;

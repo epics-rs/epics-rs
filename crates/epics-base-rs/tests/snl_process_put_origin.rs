@@ -11,8 +11,6 @@
 //! (clamp → rollback → clamp ping-pong, measured on the mini-beamline
 //! example 2026-07-24).
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbChannel, DbSubscription};
 use epics_base_rs::server::records::ao::AoRecord;
@@ -29,7 +27,7 @@ async fn setup() -> PvDatabase {
 
 /// The writer's own filtered subscription must NOT see its `put_f64_process`:
 /// the process-cycle VAL post carries the channel's origin.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn process_put_is_invisible_to_its_own_origin() {
     let db = setup().await;
     let mut own = DbSubscription::subscribe_filtered(&db, "SP.VAL", WRITER)
@@ -48,7 +46,7 @@ async fn process_put_is_invisible_to_its_own_origin() {
 
 /// The same put MUST stay visible to everyone else: a subscription with a
 /// different (or no) filter origin receives the process-cycle post.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn process_put_is_visible_to_other_origins() {
     let db = setup().await;
     let mut other = DbSubscription::subscribe_filtered(&db, "SP.VAL", WRITER + 1)
@@ -72,7 +70,7 @@ async fn process_put_is_visible_to_other_origins() {
 }
 
 /// An origin-less channel keeps today's behavior: origin 0 is never filtered.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn originless_process_put_reaches_a_filtered_subscription() {
     let db = setup().await;
     let mut sub = DbSubscription::subscribe_filtered(&db, "SP.VAL", WRITER)

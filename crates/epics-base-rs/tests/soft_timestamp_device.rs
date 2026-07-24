@@ -6,8 +6,6 @@
 //! before `is_soft_dtyp` stopped classifying "Soft Timestamp" as a soft
 //! channel).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -24,7 +22,7 @@ async fn read_val(db: &epics_base_rs::server::database::PvDatabase, name: &str) 
 /// `TSE=0` (wall clock) writes `VAL = secPastEpoch + frac`. In 2026 that is
 /// well over 1e9 seconds past the 1990 EPICS epoch, so a `VAL > 1.0e9`
 /// proves the device ran (the pre-fix silent no-op left `VAL == 0.0`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn soft_timestamp_ai_writes_current_seconds_past_epoch() {
     let db_content = r#"
 record(ai, "TS_AI") {
@@ -58,7 +56,7 @@ record(ai, "TS_AI") {
 /// into VAL. With `INP="@%Y"` (wall clock, TSE=0) that is the current
 /// four-digit year — proving the instio `INP` format string reached the
 /// device (a missing INP would format an empty string).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn soft_timestamp_stringin_formats_current_year() {
     let db_content = r#"
 record(stringin, "TS_SI") {

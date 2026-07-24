@@ -23,8 +23,6 @@
 //! process path, where C erases the alarm; recorded as a CBUG-F12 allowlist
 //! row.)
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -45,7 +43,7 @@ async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
 /// The process path raises the misconfiguration alarm through `nsta`/`nsev`, so
 /// `recGblResetAlarms` COMMITS it (rather than erasing a direct write) —
 /// SOFT/INVALID. C erases it here (NO_ALARM); the port refuses that dead code.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn inverted_limits_alarm_is_raised_on_the_process_cycle() {
     let db = PvDatabase::new();
     // LLIM=10, ULIM=5 — the compiled-C proof case.
@@ -65,7 +63,7 @@ async fn inverted_limits_alarm_is_raised_on_the_process_cycle() {
 
 /// Inverted limits alarm SOFT/INVALID every process cycle; fixing the limits to
 /// valid clears the alarm on the next cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn process_path_alarms_while_inverted_clears_when_valid() {
     let db = PvDatabase::new();
     db.add_record("H2", Box::new(HistogramRecord::new(16, 10.0, 5.0)))
@@ -93,7 +91,7 @@ async fn process_path_alarms_while_inverted_clears_when_valid() {
 
 /// Equal limits are inverted limits (C's test is `>=`); they too raise
 /// SOFT/INVALID on the process path.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn equal_limits_alarm_on_process_too() {
     let db = PvDatabase::new();
     db.add_record("H3", Box::new(HistogramRecord::new(16, 5.0, 5.0)))
@@ -112,7 +110,7 @@ async fn equal_limits_alarm_on_process_too() {
 /// The SGNL SPC_MOD special path runs `check_alarms` then commits it via
 /// `recGblResetAlarms`, so the SOFT/INVALID is observable — same as the process
 /// path, and same value C's sticky direct write happens to leave here.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sgnl_special_path_raises_the_soft_alarm() {
     let db = PvDatabase::new();
     db.add_record("H5", Box::new(HistogramRecord::new(16, 10.0, 5.0)))
@@ -133,7 +131,7 @@ async fn sgnl_special_path_raises_the_soft_alarm() {
 /// The negative control: valid limits raise nothing on either path. (A histogram
 /// never clears UDF and has no UDF alarm, so a well-formed one publishes
 /// NO_ALARM even though UDF stays 1 — `udf_clear_is_per_record_type` pins that.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn valid_limits_raise_no_alarm() {
     let db = PvDatabase::new();
     db.add_record("H4", Box::new(HistogramRecord::new(16, 0.0, 10.0)))

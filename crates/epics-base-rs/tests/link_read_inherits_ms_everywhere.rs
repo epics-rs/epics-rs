@@ -26,8 +26,6 @@
 //! record(ai,"R4"){field(SIML,"SRC0")}    (no MS)                  -> NO_ALARM
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -66,7 +64,7 @@ async fn alarm(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 
 /// The closed-loop DOL read: `dbGetLink(&prec->dol, ...)` in `fetch_values`
 /// runs the same tail as an INP read.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn closed_loop_dol_inherits_ms() {
     let db = db_with_major_source().await;
 
@@ -107,7 +105,7 @@ async fn closed_loop_dol_inherits_ms() {
 
 /// SIML (`recGblGetSimm` → `dbTryGetLink`) and SIOL (`readValue` →
 /// `dbGetLink`) both run the tail.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn siml_and_siol_inherit_ms() {
     let db = db_with_major_source().await;
     // SIMM must stay out of simulation for the SIML case, so the source's
@@ -172,7 +170,7 @@ async fn siml_and_siol_inherit_ms() {
 
 /// SDIS (`dbAccess.c:566`) and TSEL (`recGbl.c:315`) are `dbGetLink` reads too,
 /// so they inherit as well — the rule is the read, not the field.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sdis_and_tsel_inherit_ms() {
     let db = db_with_major_source().await;
 

@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 
 use crate::error::{CaError, CaResult};
@@ -410,7 +408,7 @@ mod access_checked_tests {
     use super::*;
     use std::sync::Arc;
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn open_gate_grants_read_write() {
         let gate = AccessGate::open();
         let checked = gate.check("any:pv", "h", "u", "anonymous", "").await;
@@ -420,7 +418,7 @@ mod access_checked_tests {
         assert_eq!(checked.pv_name(), "any:pv");
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn required_gate_with_no_acf_attached_is_permissive() {
         let cell = crate::server::access_security::new_acf_cell(None);
         let resolver: AsgAslResolver =
@@ -430,7 +428,7 @@ mod access_checked_tests {
         assert_eq!(checked.level(), AccessLevel::ReadWrite);
     }
 
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn required_gate_with_acf_denies_unprivileged_peer() {
         let cfg = parse_acf(
             r#"
@@ -2908,7 +2906,7 @@ ASG(LOCKED)    { }
     /// with an `INP*` resolver installed, a CALC-gated rule
     /// grants when the expression is true, denies when false, denies on
     /// a bad input, and denies when no resolver is installed.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn calc_gated_rule_evaluates_against_inp_resolver() {
         use std::sync::Arc;
         let cfg =

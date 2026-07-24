@@ -40,8 +40,6 @@
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -169,7 +167,7 @@ async fn rpro(db: &PvDatabase) -> bool {
 
 /// The deferral itself: while the record is PACT the put-notify writes NOTHING
 /// — no value, no RPRO — and its callback has not fired.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_notify_on_a_pact_record_writes_nothing() {
     let f = busy_record().await;
 
@@ -202,7 +200,7 @@ async fn put_notify_on_a_pact_record_writes_nothing() {
 
 /// The restart: when the record's async work completes, `dbNotifyCompletion`
 /// replays the whole put — value, process, and only then the callback.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_and_completes_after_it() {
     let f = busy_record().await;
 
@@ -216,7 +214,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
     // The device round-trip finishes: C `dbNotifyCompletion` runs here.
     f.db.complete_async_record("ASY").await.unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
         .await
         .expect("the put-notify callback must fire after the restarted put")
         .expect("the completion sender must not be dropped");
@@ -245,7 +243,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
 /// C `dbNotify.c:213-217`: a record already owning a put-notify restart refuses
 /// the next one (`S_db_Blocked` → ECA_PUTCBINPROG), rather than silently
 /// dropping the first caller's sender.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_second_put_notify_onto_a_deferred_record_is_refused() {
     let f = busy_record().await;
 
@@ -268,7 +266,7 @@ async fn a_second_put_notify_onto_a_deferred_record_is_refused() {
 
 /// Await a deferred put's callback, failing the test rather than hanging.
 async fn expect_callback(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
         .await
         .unwrap_or_else(|_| panic!("the put parked on the PACT window {site} released was never replayed — its callback never fired"))
         .expect("the completion sender must not be dropped");
@@ -339,7 +337,7 @@ impl Record for OdlyRecord {
 /// PRESENT. The measured defect — `caput -c ASY.A 7` into a `calcout ODLY=20`
 /// window left A=5, the callback never fired, and every later put-callback on
 /// that record was refused.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     let db = PvDatabase::new();
     db.add_record(
@@ -424,7 +422,7 @@ async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
         {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("{name}: the deferred put was never replayed — VAL never reached {want}");
 }
@@ -436,7 +434,7 @@ async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
 /// continuation, not this one. That is the deferral being closed under its own
 /// restart, and it is exactly what the strand looked nothing like: before the
 /// fix VAL stayed at its pre-put value forever.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact() {
     let db = sdly_input_record().await;
 
@@ -478,7 +476,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
 
 /// Boundary: PACT released by the SIM/SDLY OUTPUT continuation (the
 /// `RedirectOutputToSiol` arm), deferral PRESENT.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pact() {
     let db = PvDatabase::new();
     db.add_record("SW", Box::new(AoRecord::new(1.0)))
@@ -529,7 +527,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
 /// `switch (prec->simm) default:` — `recGblSetSevr(SOFT_ALARM, INVALID)`, no
 /// SIOL round-trip), deferral PRESENT. The cycle ends in an alarm, but the put
 /// parked on the window it just released must still be replayed.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pact() {
     let db = sdly_input_record().await;
 
@@ -578,7 +576,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
 /// The fire-and-forget route is NOT deferred: C `dbPutField` on a PACT record
 /// writes the value and raises RPRO (dbAccess.c:1263-1277). Only `dbPutNotify`
 /// waits — the gate must not swallow the ordinary put.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_fire_and_forget_put_on_a_pact_record_still_writes_and_sets_rpro() {
     let f = busy_record().await;
 

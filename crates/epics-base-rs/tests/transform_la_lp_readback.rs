@@ -26,8 +26,6 @@
 //! window between cycles — which is exactly what a `caget .LA` is for. The port
 //! did not serve the fields at all: `caget TR.LA` failed.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -44,7 +42,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 
 /// LA tracks A across the monitor commit, and lags it in the window C exposes:
 /// a value written to A but not yet published leaves LA at the last posted one.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r13_63_la_is_the_previous_posted_value_of_a() {
     let db = PvDatabase::new();
     let mut t = TransformRecord::new();
@@ -75,7 +73,7 @@ async fn r13_63_la_is_the_previous_posted_value_of_a() {
 }
 
 /// SPC_NOMOD: a client may not write LA (`transformRecord.dbd:507`).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r13_63_la_is_read_only() {
     let db = PvDatabase::new();
     db.add_record("TR2", Box::new(TransformRecord::new()))

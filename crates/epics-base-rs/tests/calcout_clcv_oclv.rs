@@ -11,8 +11,6 @@
 //!
 //! Fields are DBF_LONG (calcoutRecord.dbd.pod:729,1049; sCalcoutRecord.dbd:75,438).
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
@@ -26,7 +24,7 @@ const POSTFIX_ERR: i32 = -1;
 /// C `db_post_events(prec, &prec->clcv, DBE_VALUE)` (calcoutRecord.c:335) —
 /// CLCV is not `pp(TRUE)`, so `special()`'s explicit post is the ONLY thing
 /// that tells a monitoring client the expression went invalid.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_calc_put_posts_the_clcv_monitor() {
     let db = PvDatabase::new();
     db.add_record("COM", Box::new(CalcoutRecord::default()))
@@ -40,13 +38,14 @@ async fn a_calc_put_posts_the_clcv_monitor() {
         .await
         .unwrap();
 
-    let posted = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
-        .await
-        .expect("special() must post CLCV");
+    let posted =
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), sub.recv())
+            .await
+            .expect("special() must post CLCV");
     assert_eq!(posted, Some(EpicsValue::Long(POSTFIX_ERR)));
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
     let db = PvDatabase::new();
     db.add_record("CO", Box::new(CalcoutRecord::default()))
@@ -88,7 +87,7 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
     let db = PvDatabase::new();
     db.add_record("SC", Box::new(ScalcoutRecord::default()))
@@ -131,7 +130,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
     );
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
     let db = PvDatabase::new();
     db.add_record("AC", Box::new(AcalcoutRecord::default()))

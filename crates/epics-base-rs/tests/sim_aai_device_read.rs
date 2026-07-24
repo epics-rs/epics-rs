@@ -14,8 +14,6 @@
 //! took the OUTPUT redirect and wrote its VAL array OUT to its DBF_INLINK SIOL
 //! (direction inverted). Classifying it as an input pins the correct SIOL read.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -28,7 +26,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// `dbGetLink(&siol)` when SIMM=YES), raises SIMM_ALARM at the SIMS severity,
 /// and leaves the SIOL source untouched. Under the pre-fix output
 /// misclassification the record instead wrote VAL OUT to the SIOL target.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
     const SIMM_ALARM: i16 = 19;
     const MINOR: i16 = 1;

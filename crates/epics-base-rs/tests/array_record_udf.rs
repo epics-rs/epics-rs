@@ -26,8 +26,6 @@
 //! Boundaries: SIOL read failed vs succeeded; UDF set vs UDF alarm raised; the
 //! three unconditional kinds vs subArray.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -60,7 +58,7 @@ record(waveform, "SIM:WF") {
 
 /// A failed SIOL read must still clear UDF, and must not raise any alarm from
 /// UDF (SIMM_ALARM at SIMS=NO_ALARM is the only thing C raises here).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
     let (db, _) = IocBuilder::new()
         .db_string(DB, &std::collections::HashMap::new())
@@ -128,7 +126,7 @@ fn subarray_keeps_the_status_gated_udf_rules() {
 /// process-time raise that `waveformRecord.c` never calls — is what this record
 /// type genuinely lacks. softIoc, `record(waveform,"UDFWF")` with no INP, never
 /// processed: `STAT=UDF SEVR=INVALID UDF=1`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_undefined_waveform_carries_the_initial_udf_severity() {
     let (db, _) = IocBuilder::new()
         .db_string(

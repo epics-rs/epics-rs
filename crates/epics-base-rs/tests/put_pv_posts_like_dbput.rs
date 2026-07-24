@@ -32,8 +32,6 @@
 //! a caller that needs a monitor there uses `put_record_field_from_ca*` or
 //! `put_pv_and_post`.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -78,7 +76,7 @@ fn udf(db: &PvDatabase, rec: &str) -> bool {
 /// Row 1 — a value field that is NOT `pp(TRUE)` (calc VAL): the `dbPut` post
 /// is the only one there is, and the value-field put clears UDF. This is the
 /// case C's comment in `dbPut` exists for — no reprocess will ever re-post it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_to_a_non_pp_value_field_posts_and_clears_udf() {
     let db = build().await;
     assert!(
@@ -104,7 +102,7 @@ async fn a_put_to_a_non_pp_value_field_posts_and_clears_udf() {
 /// post (the process cycle a `dbPutField` drives is the poster), but the UDF
 /// clear is unconditional on a value-field put. Both halves on one write, so
 /// the two predicates cannot be merged back into one.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_to_a_pp_value_field_is_suppressed_but_clears_udf() {
     let db = build().await;
     assert!(
@@ -134,7 +132,7 @@ async fn a_put_to_a_pp_value_field_is_suppressed_but_clears_udf() {
 /// Row 3 — `pp(TRUE)` but NOT the value field (ai HIHI): suppression requires
 /// BOTH predicates, so this posts. A rule keyed on pp alone would go silent
 /// here; a rule keyed on value-field alone would double-post row 2.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_to_a_pp_non_value_field_still_posts() {
     let db = build().await;
     let mut rx = subscribe(&db, "AI1", "HIHI", DbFieldType::Double);
@@ -157,7 +155,7 @@ async fn a_put_to_a_pp_non_value_field_still_posts() {
 }
 
 /// Row 4 — neither predicate (ai EGU): posts, and UDF stands.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_to_a_plain_field_posts_and_leaves_udf() {
     let db = build().await;
     let mut rx = subscribe(&db, "AI1", "EGU", DbFieldType::String);

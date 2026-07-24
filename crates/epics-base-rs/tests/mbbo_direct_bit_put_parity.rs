@@ -19,8 +19,6 @@
 //! Ground truth captured live from softIoc 7.0.10.1-DEV on this host
 //! (`caput -c`, one fresh `record(mbboDirect,"X"){}` per case).
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -65,7 +63,7 @@ async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16, bool) {
 
 /// Cause 1: `caput -c TMAX.B0 255` is accepted; the bit stores 1 and folds into
 /// VAL. Live C: `TMAX.B0=1 VAL=1 STAT=NO_ALARM UDF=0`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn type_max_bit_put_is_accepted_and_stores_one() {
     let db = ioc().await;
 
@@ -97,7 +95,7 @@ async fn type_max_bit_put_is_accepted_and_stores_one() {
 /// Cause 2 (over-max): `caput -c OMAX.B0 256` is REFUSED, but the after-put
 /// special still clears UDF and the record processes → NO_ALARM. Live C:
 /// `put FAILED, B0=0 STAT=NO_ALARM SEVR=NO_ALARM UDF=0`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_over_max_bit_put_clears_udf_reads_no_alarm() {
     let db = ioc().await;
 
@@ -120,7 +118,7 @@ async fn rejected_over_max_bit_put_clears_udf_reads_no_alarm() {
 }
 
 /// Cause 2 (non-numeric): `caput -c NONNUM.B0 notanumber` — same as over-max.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_non_numeric_bit_put_clears_udf_reads_no_alarm() {
     let db = ioc().await;
 
@@ -140,7 +138,7 @@ async fn rejected_non_numeric_bit_put_clears_udf_reads_no_alarm() {
 /// VAL put must KEEP UDF/INVALID — VAL's UDF clear is `isValueField`, which runs
 /// AFTER the status check, so a rejected conversion never reaches it. Live C:
 /// `caput -c VALREJ.VAL notanumber` → `STAT=UDF SEVR=INVALID UDF=1`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn rejected_val_put_keeps_udf_invalid() {
     let db = ioc().await;
 

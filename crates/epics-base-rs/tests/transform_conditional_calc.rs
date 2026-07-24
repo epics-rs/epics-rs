@@ -21,8 +21,6 @@
 //!
 //! One case per boundary of the gate.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::transform::TransformRecord;
@@ -71,7 +69,7 @@ fn s(v: &str) -> EpicsValue {
 /// number. `field(INPA,"2")` seeds A=2 and leaves the channel UNLINKED, so
 /// Conditional mode evaluates CLCA every cycle. (The port used to read the
 /// text's emptiness: A sat at 2 forever.)
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_constant_valued_inp_link_is_no_inlink_so_the_channel_still_calcs() {
     let db = transform_db(&[("INPA", s("2")), ("CLCA", s("A+1"))]).await;
     assert_eq!(field(&db, "T", "A").await, 2.0, "the init seed");
@@ -87,7 +85,7 @@ async fn a_constant_valued_inp_link_is_no_inlink_so_the_channel_still_calcs() {
 /// `transformRecord.dbd:409-414`, so `dbPutField` processes the record) leaves
 /// the value alone. `:600` clears the map, so the NEXT cycle calculates again:
 /// the put survives exactly one cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_put_to_the_value_field_suppresses_one_cycle_then_calc_resumes() {
     let db = transform_db(&[("CLCA", s("A+1"))]).await;
 
@@ -107,7 +105,7 @@ async fn a_put_to_the_value_field_suppresses_one_cycle_then_calc_resumes() {
 /// (A != LA) that makes the channel new and stops CLCA from overwriting the
 /// value the operator just seeded. This is the case the port's `map`-only gate
 /// got wrong: it recalculated immediately and the re-seed was invisible.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_constant_inp_reseed_is_new_by_the_same_test_not_by_the_map_bit() {
     let db = transform_db(&[("INPA", s("2")), ("CLCA", s("A+1"))]).await;
 
@@ -131,7 +129,7 @@ async fn a_constant_inp_reseed_is_new_by_the_same_test_not_by_the_map_bit() {
 /// compare would call the channel new. C's first clause overrides exactly that:
 /// two zeroes of any sign are the same, so the channel is NOT new and CLCA runs
 /// on the very next cycle.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_reseed_of_negative_zero_is_same_as_positive_zero_so_calc_is_not_suppressed() {
     let db = transform_db(&[("CLCA", s("A+1"))]).await;
     assert_eq!(field(&db, "T", "A").await, 0.0);
@@ -148,7 +146,7 @@ async fn a_reseed_of_negative_zero_is_same_as_positive_zero_so_calc_is_not_suppr
 
 /// `no_inlink` false — a channel driven by a real PV link is never calculated in
 /// Conditional mode, whatever its value did.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_pv_linked_channel_is_not_calculated_in_conditional_mode() {
     let db = transform_db(&[("INPA", s("SRC")), ("CLCA", s("A+1"))]).await;
     let mut src = TransformRecord::default();
@@ -162,7 +160,7 @@ async fn a_pv_linked_channel_is_not_calculated_in_conditional_mode() {
 /// `copt == ALWAYS` — the other arm of the gate. It overrides BOTH `no_inlink`
 /// and `new_value`: a linked channel, and a channel that was just put, are
 /// calculated anyway.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn copt_always_calculates_a_linked_channel_and_a_freshly_put_one() {
     let db = transform_db(&[
         ("COPT", EpicsValue::Short(1)),
@@ -185,7 +183,7 @@ async fn copt_always_calculates_a_linked_channel_and_a_freshly_put_one() {
 /// `postfix_ok` — an EMPTY CLCx is never evaluated (`*pclcbuf` is false), so an
 /// unlinked channel with no expression keeps its value forever. It is the
 /// passthrough shape: INPx -> A -> OUTx with no calc at all.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn an_empty_clc_is_never_evaluated() {
     let db = transform_db(&[("INPA", s("2"))]).await;
 

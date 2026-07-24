@@ -1,5 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -39,7 +37,7 @@ async fn setup_db() -> Arc<PvDatabase> {
     db
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_periodic_save_set() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("periodic.sav");
@@ -66,7 +64,7 @@ async fn test_periodic_save_set() {
     let handle = mgr.clone().start(db.clone());
 
     // Wait for at least one save cycle
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
     mgr.shutdown();
     let _ = handle.await;
 
@@ -76,7 +74,7 @@ async fn test_periodic_save_set() {
     assert_eq!(entries.len(), 2);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_manual_save() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("manual.sav");
@@ -102,7 +100,7 @@ async fn test_manual_save() {
     assert!(sav_path.exists());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_multiple_sets_independent() {
     let dir = tempfile::tempdir().unwrap();
     let db = setup_db().await;
@@ -139,7 +137,7 @@ async fn test_multiple_sets_independent() {
     assert!(dir.path().join("b.sav").exists());
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_restore_all() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("restore_all.sav");
@@ -186,7 +184,7 @@ async fn test_restore_all() {
     }
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_one_set_failure_no_impact() {
     let dir = tempfile::tempdir().unwrap();
     let db = setup_db().await;
@@ -236,7 +234,7 @@ async fn test_one_set_failure_no_impact() {
     assert_eq!(results[1].1.as_ref().unwrap().restored, 1);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_concurrent_manual_periodic_serialized() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("concurrent.sav");
@@ -265,7 +263,7 @@ async fn test_concurrent_manual_periodic_serialized() {
     // Manual saves while periodic is running
     for _ in 0..5 {
         let _ = mgr.manual_save("concurrent", &db).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }
 
     mgr.shutdown();
@@ -277,7 +275,7 @@ async fn test_concurrent_manual_periodic_serialized() {
     assert_eq!(entries.len(), 1);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_shutdown_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let db = setup_db().await;
@@ -302,17 +300,17 @@ async fn test_shutdown_cleanup() {
     let mgr = Arc::new(mgr);
     let handle = mgr.clone().start(db.clone());
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     mgr.shutdown();
 
     // Should complete within a reasonable time
-    tokio::time::timeout(Duration::from_secs(2), handle)
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle)
         .await
         .expect("shutdown timed out")
         .unwrap();
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_save_once_failure_updates_stats() {
     let dir = tempfile::tempdir().unwrap();
     let db = setup_db().await;
@@ -340,7 +338,7 @@ async fn test_save_once_failure_updates_stats() {
     assert_eq!(set.stats().error_count.load(Ordering::Relaxed), 1);
 }
 
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn test_empty_pv_list_noop() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("empty.sav");

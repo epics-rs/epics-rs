@@ -15,8 +15,6 @@
 //! the previous cycle's result only when nothing wrote VAL in between — and a
 //! `prev_sval` that nothing read.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -74,7 +72,7 @@ async fn on_change_db(mdel: f64) -> PvDatabase {
 
 /// PVAL is C's `pval`: the VAL from the END of the previous cycle. It is
 /// readable, and it is what the OOPT comparison uses.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_pval_holds_the_previous_cycles_val() {
     let db = on_change_db(0.0).await;
 
@@ -101,7 +99,7 @@ async fn r10_66_pval_holds_the_previous_cycles_val() {
 /// moved the port's previous-value cell. C's `pval` is untouched by a `dbPut` to
 /// VAL, so the next On-Change test still compares against the last COMPUTED
 /// value — here 5, so a recompute back to 5 must NOT drive OUT.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_a_val_put_between_cycles_does_not_move_pval() {
     let db = on_change_db(0.0).await;
 
@@ -140,7 +138,7 @@ async fn r10_66_a_val_put_between_cycles_does_not_move_pval() {
 /// PVAL is a plain DBF_DOUBLE in C — writable. An operator aims the next OOPT
 /// decision with it: set PVAL away from VAL and the next cycle sees a change
 /// even though the computed value did not move.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_pval_is_writable_and_aims_the_next_output() {
     let db = on_change_db(0.0).await;
 
@@ -163,7 +161,7 @@ async fn r10_66_pval_is_writable_and_aims_the_next_output() {
 
 /// Negative control on the deadband: the On-Change test is `fabs(pval - val) >
 /// mdel`, so a move inside MDEL drives nothing even though PVAL differs.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_pval_change_inside_mdel_drives_no_output() {
     let db = on_change_db(2.0).await;
 
@@ -184,7 +182,7 @@ async fn r10_66_pval_change_inside_mdel_drives_no_output() {
 
 /// PSVL is the SVAL C last posted (`monitor()`, :842-846), so after a completed
 /// cycle it equals SVAL.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_psvl_tracks_the_posted_sval() {
     let db = PvDatabase::new();
     let mut c = scalcout("'ab'+'cd'");
@@ -211,7 +209,7 @@ async fn r10_66_psvl_tracks_the_posted_sval() {
 }
 
 /// PSVL is `special(SPC_NOMOD)` — C refuses a client put outright.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r10_66_psvl_is_read_only() {
     let db = PvDatabase::new();
     db.add_record("SC", Box::new(scalcout("0"))).await.unwrap();

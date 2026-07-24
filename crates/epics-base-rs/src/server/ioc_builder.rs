@@ -4,8 +4,6 @@
 //! record type factories, subroutine registrations, and autosave config,
 //! then materialises a populated [`PvDatabase`] in a single async `build()`.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -447,7 +445,7 @@ mod tests {
     /// an alias on the resulting `PvDatabase` so that lookup by the
     /// alias resolves to the same record as lookup by the canonical
     /// name. Pre-fix, `ioc_builder` discarded `def.aliases`.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_string_registers_aliases() {
         let db_content = r#"
 record(ai, "REAL:NAME") {
@@ -475,7 +473,7 @@ record(ai, "REAL:NAME") {
     /// stored on the resulting RecordInstance. Pre-fix, no consumer
     /// existed for `def.info_tags` — every record's `info` map was
     /// silently empty after build.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_string_populates_info_tags() {
         let db_content = r#"
 record(ai, "AI:WITH:INFO") {
@@ -503,7 +501,7 @@ record(ai, "AI:WITH:INFO") {
     /// `LINR` names it must, after `build()`, resolve the name to its
     /// `menuConvert` index AND convert raw -> eng through the installed
     /// registry. Proves the full loader -> registry -> record wiring.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn db_string_breaktable_linr_resolves_and_converts() {
         let db_content = r#"
 breaktable(ramp) {
@@ -541,7 +539,7 @@ record(ai, "AI:BPT") {
     /// `universal_asyn_factory`, areaDetector plugin dispatch) only
     /// attach when records are loaded through IocApplication's
     /// startup-script path, never the pure-Rust IocBuilder path.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn dynamic_device_factory_attaches_when_static_missing() {
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
@@ -593,7 +591,7 @@ record(ai, "AI:DYN") {
     /// factory wins for matching DTYPs; non-matching DTYPs fall
     /// through to previously registered factories. Mirrors
     /// `IocApplication::register_dynamic_device_support` chaining.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn dynamic_factories_chain_lifo_with_fallthrough() {
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;

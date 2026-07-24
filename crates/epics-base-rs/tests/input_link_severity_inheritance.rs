@@ -28,8 +28,6 @@
 //! folded a record's OWN committed severity back into its pending alarm, which
 //! `recGblResetAlarms` then re-committed: a self-sustaining latch.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -61,7 +59,7 @@ async fn alarm(db: &PvDatabase, rec: &str) -> (u16, AlarmSeverity) {
 }
 
 /// R16-61: the ReadDbLink reader (compress INP) inherits MS from a healthy read.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_read_db_link_input_inherits_ms_severity() {
     let db = build(
         r#"
@@ -88,7 +86,7 @@ async fn a_read_db_link_input_inherits_ms_severity() {
 }
 
 /// NMS (the default) still inherits nothing — the MS class is what selects it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_read_db_link_input_without_ms_inherits_nothing() {
     let db = build(
         r#"
@@ -111,7 +109,7 @@ async fn a_read_db_link_input_without_ms_inherits_nothing() {
 /// committed severity back in — C's `precord != dbChannelRecord(chan)` guard.
 /// Without it the alarm latches: reset_alarms commits it, next cycle inherits
 /// it again, forever.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_self_referencing_ms_link_does_not_latch_the_record_alarm() {
     let db = build(
         r#"record(calc, "SELF") { field(INPA, "SELF.VAL MS") field(CALC, "A")

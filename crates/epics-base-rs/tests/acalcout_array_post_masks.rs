@@ -32,8 +32,6 @@
 //! DBE_LOG`: one event instead of two, and the AMASK event carrying an alarm bit
 //! C never puts on it.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -88,7 +86,7 @@ async fn subscribe_aa(db: &PvDatabase) -> epics_base_rs::server::event_queue::Ev
 /// AA is in BOTH masks: the link delivered a changed array (NEWM bit 0) and the
 /// expression stored into it (AMASK bit 0). C posts it twice — `afterCalc` with
 /// a literal DBE_VALUE|DBE_LOG, then `monitor()` with the alarm bit folded in.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
     let db = PvDatabase::new();
     // `AA := AA + 0` stores AA (AMASK bit 0) without altering the fetched value.
@@ -129,7 +127,7 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
 
 /// The AMASK half alone: the expression stores into CC, no link feeds it. Even on
 /// an alarm-transition cycle the post carries no alarm bit.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn w10_a5_an_amask_only_array_posts_a_literal_value_log() {
     let db = PvDatabase::new();
     acalcout_with(&db, "CC:=AA+0;SUM(AA)").await;

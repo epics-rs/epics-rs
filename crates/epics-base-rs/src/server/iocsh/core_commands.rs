@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! Core iocsh commands beyond the database/record family.
 //!
 //! a stock `st.cmd` relies on a set of core commands
@@ -7,8 +8,6 @@
 //! implementable in-process; `iocshCmd` / `iocshRun` / `on` are
 //! handled directly in `IocShell::execute_line` because they need
 //! the shell itself, not just a `CommandContext`.
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 
 use super::registry::*;
 

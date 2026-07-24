@@ -12,8 +12,6 @@
 //! bodies: `put_pv` (`dbPutLink` route, via `put_pv_already_locked`)
 //! and `put_pv_and_post` (gateway/sequencer route).
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -80,7 +78,7 @@ fn tracking_record() -> (Pass0TrackingRecord, Arc<AtomicU32>, Arc<AtomicU32>) {
 /// (`write_db_link_value` → `put_pv_already_locked` → `put_pv_inner`):
 /// pass-0 must run before the write, pass-1 after, exactly like the
 /// external-put body.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_pv_runs_pass0_special() {
     let db = PvDatabase::new();
     let (rec, pass0, pass1) = tracking_record();
@@ -94,7 +92,7 @@ async fn put_pv_runs_pass0_special() {
 
 /// `put_pv_and_post` is the third `dbPut` body (gateway / sequencer
 /// route) and must match the other two.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn put_pv_and_post_runs_pass0_special() {
     let db = PvDatabase::new();
     let (rec, pass0, pass1) = tracking_record();

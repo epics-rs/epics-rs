@@ -41,8 +41,6 @@
 //! (NELM == 1 / NELM > 1) — the two axes that decide which of the three rules
 //! above is the one that answers.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
-
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -95,7 +93,7 @@ record(subArray,"S:CONST") { field(FTVL,"DOUBLE") field(MALM,"5") field(NELM,"2"
 
 /// Every row of the measured table, in one pass over one loaded database — the
 /// same `.db` the softIoc was given.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r21_nord_at_init_matches_the_soft_dset() {
     let db = db_of(DB).await;
 
@@ -133,7 +131,7 @@ async fn r21_nord_at_init_matches_the_soft_dset() {
 /// The NELM=1 seed is the thing the three dsets disagree about, so it gets its
 /// own case: same NELM, same (absent) link, three different answers, and each
 /// answer is its dset's.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn r21_the_nelm_one_seed_survives_only_on_aai() {
     let db = db_of(DB).await;
     assert_eq!(nord_udf(&db, "W:BARE").await.0, 0, "devWfSoft zeroes it");

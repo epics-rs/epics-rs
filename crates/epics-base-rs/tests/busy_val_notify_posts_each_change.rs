@@ -15,8 +15,6 @@
 //! posted only the first event (VAL=1 "Busy") instead of C's three
 //! (Busy → Illegal_Value(2) → Illegal_Value(3)).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -49,7 +47,7 @@ fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
 /// (1, 2, 3), the repeated 2 coalesced by the `mlst != val` monitor gate. Each
 /// `ca_put_callback` (WRITE_NOTIFY) must complete synchronously so the next one
 /// is not refused with `PutCallbackInProgress`.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn busy_val_notify_sequence_posts_each_change() {
     let db = build().await;
     let r = db.get_record("B").unwrap();

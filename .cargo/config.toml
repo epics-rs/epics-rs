@@ -1,8 +1,20 @@
-# Read on EVERY cargo invocation in this workspace, so it holds exactly one
-# thing: the linker for the RTEMS target. A `[target.<triple>]` table applies
-# only when that triple is selected, so the host build is untouched — and
-# nothing RTEMS may ever go in `[build]`, whose `target`/`rustflags` would
-# apply to every build and break `cargo nextest run --workspace`.
+# Read on EVERY cargo invocation in this workspace, so it holds exactly two
+# things, both RTEMS-inert on the host:
+#
+# - the linker for the RTEMS target — a `[target.<triple>]` table applies only
+#   when that triple is selected, so the host build is untouched;
+# - the rustc-wrapper that reroutes `--target armv7-rtems-eabihf` through the
+#   generated has-thread-local spec (`doc/rtems-tls-spec-deviation.md`).
+#   cargo has no per-target wrapper, so this must sit in `[build]`, but the
+#   wrapper self-scopes: unless the builtin RTEMS triple is selected it execs
+#   rustc through unchanged (and `RTEMS_USE_STOCK_SPEC=1` disables the rewrite
+#   entirely). Its path is config-relative, so it resolves from any cwd.
+#   Caveat: `build.rustc-wrapper` here overrides a user-level wrapper (e.g.
+#   sccache) for this workspace, and an environment `RUSTC_WRAPPER` overrides
+#   this file — losing the flip; use the scripts' explicit-spec path then.
+#
+# Nothing else RTEMS may ever go in `[build]`, whose `target`/`rustflags`
+# would apply to every build and break `cargo nextest run --workspace`.
 #
 # Everything else about the RTEMS link — the BSP prefix, the multilib
 # selectors, `-qrtems`, `-u POSIX_Init`, `-lbsd -lm -lz` — is emitted from
@@ -14,5 +26,8 @@
 # `arm-rtems6-gcc` is resolved from PATH: the toolchain prefix differs per
 # machine, so naming it absolutely here would commit one machine's layout.
 # Export `$RTEMS_BSP_PREFIX/bin` on PATH before building for RTEMS.
+[build]
+rustc-wrapper = "scripts/rtems-rustc-wrapper.sh"
+
 [target.armv7-rtems-eabihf]
 linker = "arm-rtems6-gcc"

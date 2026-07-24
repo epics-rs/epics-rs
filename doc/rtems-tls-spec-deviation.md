@@ -55,6 +55,7 @@ spec whose only difference from that nightly's builtin is the one key.
 |---|---|---|
 | `scripts/rtems-check.sh` (the portability gate) | default `TARGET="$(./scripts/rtems-tls-spec.sh)"` + `-Zjson-target-spec`; `RTEMS_USE_STOCK_SPEC=1` reverts to the builtin | yes |
 | `scripts/rtems-tls-spec.sh` | the generator itself | yes |
+| plain `cargo build/check --target armv7-rtems-eabihf` (2026-07-24) | `.cargo/config.toml` sets `build.rustc-wrapper = scripts/rtems-rustc-wrapper.sh`, which rewrites the builtin triple to the generated spec (cached per rustc under `target/rtems-tls-spec/`, generated from the *wrapped* rustc via `RTEMS_TLS_SPEC_RUSTC`) and appends `-Zunstable-options`; everything else — host builds, the explicit `-tls.json` paths above — passes through untouched. Same `RTEMS_USE_STOCK_SPEC=1` escape hatch. Toggling the hatch — and adopting the wrapper over a `target/armv7-rtems-eabihf` dir that still holds stock-built artifacts from before the wiring — needs `rm -rf target/armv7-rtems-eabihf` first: flipped and stock artifacts carry different rustc-side triples (the JSON spec gets a content-hash suffix), so mixing fails loudly with E0461, never silently reuses the wrong spec (measured both directions 2026-07-24). Caveats: an environment `RUSTC_WRAPPER` (e.g. sccache) overrides the config and silently drops the flip; the wrapper is a bash script, so this wiring is Linux/macOS-only. | yes |
 | box `~/rtems-bringup/build-{ca,measure,qsrv,stage5,pva}.sh` (real image + measurement builds) | `--target "$(…/rtems-tls-spec.sh)" -Zjson-target-spec` + `CARGO_TARGET_ARMV7_RTEMS_EABIHF_TLS_LINKER=arm-rtems6-gcc`, all behind `RTEMS_USE_STOCK_SPEC=1` | no — box tooling, not tracked here; updated on the box the same day. `build-ca.sh`/`build-measure.sh` 2026-07-24 morning, the other three the same evening (they were left alone while a measurement panel was mid-run). See §3.1 for `build-pva.sh`. |
 | CI (`.github/workflows/rust.yml`) | **nothing to wire.** CI does not build the RTEMS target: its RTEMS coverage is the `rtems-exec-model` feature compiled for the *host* (linux), which is spec-independent, and `rtems-check.sh` is deliberately excluded from CI (it is red on stock `libc`, unrelated to this spec). The spec gate runs on the box. | n/a |
 
@@ -101,7 +102,10 @@ to
 1. set `RTEMS_USE_STOCK_SPEC=1` permanently (or delete the `JSON_SPEC_FLAGS`
    branch so the gate uses the builtin triple),
 2. delete `scripts/rtems-tls-spec.sh` and the box build-script spec plumbing,
-3. delete this file.
+3. delete `scripts/rtems-rustc-wrapper.sh` and the `build.rustc-wrapper` line
+   in `.cargo/config.toml` (the wrapper fails the same trip-wire way: its spec
+   generation goes through the refusing generator),
+4. delete this file.
 
 Until then the deviation stands, and every RTEMS image this workspace ships is
 built with the flip, so the gate compiles the same native-TLS codegen the

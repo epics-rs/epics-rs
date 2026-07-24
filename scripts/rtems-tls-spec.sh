@@ -25,13 +25,16 @@
 #   ./scripts/rtems-tls-spec.sh /path.json # write the spec to /path.json
 #
 # Requires the nightly toolchain (`-Zunstable-options --print target-spec-json`)
-# and `jq`.
+# and `jq`. `RTEMS_TLS_SPEC_RUSTC=/path/to/rustc` derives the spec from that
+# exact rustc instead of the rustup `+nightly` shim — the rustc-wrapper path
+# (`scripts/rtems-rustc-wrapper.sh`) uses it so the spec always matches the
+# toolchain actually compiling.
 
 set -euo pipefail
 
 STOCK_TARGET="armv7-rtems-eabihf"
 
-if ! cargo +nightly --version >/dev/null 2>&1; then
+if [[ -z "${RTEMS_TLS_SPEC_RUSTC:-}" ]] && ! cargo +nightly --version >/dev/null 2>&1; then
     echo "error: the nightly toolchain is required to print the target spec." >&2
     exit 1
 fi
@@ -40,8 +43,17 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-stock="$(rustc +nightly -Zunstable-options --print target-spec-json \
-    --target "$STOCK_TARGET" 2>/dev/null)"
+if [[ -n "${RTEMS_TLS_SPEC_RUSTC:-}" ]]; then
+    stock="$("$RTEMS_TLS_SPEC_RUSTC" -Zunstable-options --print target-spec-json \
+        --target "$STOCK_TARGET" 2>/dev/null)" || {
+        echo "error: $RTEMS_TLS_SPEC_RUSTC cannot print the target spec" >&2
+        echo "(a nightly rustc is required for -Zunstable-options)." >&2
+        exit 1
+    }
+else
+    stock="$(rustc +nightly -Zunstable-options --print target-spec-json \
+        --target "$STOCK_TARGET" 2>/dev/null)"
+fi
 
 # Refuse if the stock spec already sets the key — then the deviation is over and
 # this script (and the whole wiring) should be retired, not silently no-op.

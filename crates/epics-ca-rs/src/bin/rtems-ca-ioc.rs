@@ -51,11 +51,15 @@
 //!
 //! # Build configurations
 //!
-//! The real entry point is compiled when the `runtime::task` seam is on its
-//! **executor** backend — that is exactly `target_os = "rtems"` (the RTEMS
-//! target has no other option) or the host-selectable `rtems-exec-model`
-//! feature, the same predicate `epics-base-rs/build.rs` uses to set
-//! `exec_backend`. Under the hosted default (tokio backend) this binary is
+//! The real entry point is compiled for `target_os = "rtems"`, `target_os =
+//! "vxworks"`, or the host-selectable `rtems-exec-model` feature. RTEMS has
+//! no other option; on VxWorks this binary-level gate is necessary but not
+//! sufficient — `epics-base-rs/build.rs` still only sets the `exec_backend`
+//! cfg (the `runtime::task` seam's executor backend) for `target_os =
+//! "rtems"` or the `rtems-exec-model` feature, so a VxWorks build also needs
+//! that feature, or the lib-side predicate this gate anticipates, until the
+//! `exec_backend` derivation itself recognizes `target_os = "vxworks"`.
+//! Under the hosted default (tokio backend) this binary is
 //! still built — so it stays compiled and linted in the default test set — but
 //! refuses to run: with `runtime::task::spawn` routed to tokio, an
 //! asynchronous record tail would need a runtime that this entry point
@@ -72,7 +76,12 @@ use std::process::ExitCode;
 /// such PV" on a serial console with no shell to ask. The `test` arm is what
 /// lets the guards at the bottom of this file parse it; the `rtems` and
 /// `rtems-exec-model` arms are the production use.
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model", test))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model",
+    test
+))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -175,7 +184,11 @@ mod demo_db {
     );
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -815,17 +828,25 @@ mod ioc {
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(target_os = "rtems", feature = "rtems-exec-model")))]
+#[cfg(not(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+)))]
 fn main() -> ExitCode {
     eprintln!(
         "rtems-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf`, or on a host with \
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host with \
          `--features rtems-exec-model`."
     );
     ExitCode::FAILURE

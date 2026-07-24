@@ -43,9 +43,10 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # executor on a hosted target, which is what compiles `rtems-pva-ioc`'s real
 # entry point off RTEMS so it can be linted and tested here. OFF by default.
 #
-# It is NOT what selects the executor on the target: `armv7-rtems-eabihf`
-# reaches the same backend through `target_os = "rtems"`, so
-# `scripts/rtems-check.sh` does not pass this feature. Declaring it here buys
+# It is NOT what selects the executor on the target: `armv7-rtems-eabihf` (and
+# the `*-wrs-vxworks*` triples) reach the same backend through
+# `epics_embedded_target`, so `scripts/rtems-check.sh` does not pass this
+# feature. Declaring it here buys
 # the *host* half — and with it the `rtems-exec-gate` census below, which is
 # the price of the feature and the reason it landed as its own stage
 # (doc/qsrv-rtems-design.md §6.3, §7 stage 4).
@@ -230,29 +231,33 @@ regex = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 
-# tokio: the hosted build uses the full runtime; the RTEMS build drops the
-# `net`, `signal`, and `process` features — the ones that pull `mio`,
-# `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf. Measured: with everything else at the zero-error state
-# and only this dependency left unsplit, the target build produces 58 errors —
-# 31 in `mio` (`file not found for module `selector``, `... `waker``,
-# `unresolved import `crate::sys::IoSourceState``), the rest in `socket2`
-# (`unresolved import `libc::SOCK_RAW``) and `signal-hook-registry`.
+# tokio: the hosted build uses the full runtime; the embedded build (RTEMS or
+# VxWorks) drops the `net`, `signal`, and `process` features — the ones that
+# pull `mio`, `signal-hook-registry`, and `socket2`, none of which build for
+# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Measured on RTEMS: with
+# everything else at the zero-error state and only this dependency left
+# unsplit, the target build produces 58 errors — 31 in `mio` (`file not found
+# for module `selector``, `... `waker``, `unresolved import
+# `crate::sys::IoSourceState``), the rest in `socket2` (`unresolved import
+# `libc::SOCK_RAW``) and `signal-hook-registry`. Not separately measured on
+# VxWorks, but the same three deps are Linux/BSD-reactor-specific crates with
+# no `*-wrs-vxworks*` support either, so the split follows the same
+# dependency-availability rule, not a per-target error count.
 #
 # Declared per-target rather than in shared `[dependencies]` because Cargo
 # UNIONS a dependency's features across all matching tables, so a shared `full`
-# would re-add exactly what the RTEMS table drops. Same split, same retained
-# set, and the same reason as `epics-base-rs` and `epics-pva-rs`.
+# would re-add exactly what the embedded table drops. Same split, same
+# retained set, and the same reason as `epics-base-rs` and `epics-pva-rs`.
 #
 # `macros` is load-bearing here, not cargo-culted: the four `select!` sites in
 # `qsrv` (`monitor.rs`, `pva_adapter.rs` x3) are `tokio::select!`, and `sync` is
 # what keeps every mpsc channel and lock in the serving path legal on the
 # target — `park_on`'s contract names `tokio::sync` primitives as the ones a
 # future may await under it.
-[target.'cfg(not(target_os = "rtems"))'.dependencies]
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 
-[target.'cfg(target_os = "rtems")'.dependencies]
+[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

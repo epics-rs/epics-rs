@@ -1445,12 +1445,13 @@ pub async fn pvalink_link_set_install(
 ///
 /// Two independent requirements, so two clauses, and both are load-bearing:
 ///
-/// * `not(target_os = "rtems")` — both servers this starts are themselves
-///   RTEMS-gated in their own crates. `epics_ca_rs::server::CaServer` and
-///   `epics_pva_rs::server::PvaServer` are each behind
-///   `cfg(not(target_os = "rtems"))`, because the target runs the blocking
-///   thread-per-client drivers instead of the async reactor front ends. This
-///   function was the last caller that had not followed.
+/// * `not(epics_embedded_target)` — both servers this starts are themselves
+///   embedded-target-gated in their own crates. `epics_ca_rs::server::CaServer`
+///   and `epics_pva_rs::server::PvaServer` are each behind
+///   `cfg(not(epics_embedded_target))`, because the target (RTEMS or
+///   VxWorks) runs the blocking thread-per-client drivers instead of the
+///   async reactor front ends. This function was the last caller that had
+///   not followed.
 /// * `feature = "qsrv"` — `epics-ca-rs` is a dependency of `qsrv`, not of
 ///   `qsrv-core`. Gating on the target alone would compile this body in a
 ///   host `--features qsrv-core` build, where the crate is not linked at all
@@ -1459,7 +1460,7 @@ pub async fn pvalink_link_set_install(
 ///   `qsrv-core` split exists to avoid.
 ///
 /// The target's equivalent entry point is `epics-pva-rs`'s `rtems-pva-ioc`.
-#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
+#[cfg(all(feature = "qsrv", not(epics_embedded_target)))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
 ) -> epics_base_rs::error::CaResult<()> {

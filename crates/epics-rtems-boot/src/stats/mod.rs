@@ -46,18 +46,25 @@
 //!
 //! # `None` means unavailable, not zero
 //!
-//! Both readers return [`Option`], and both return [`None`] on any build whose
-//! OS has no backend. See `unsupported.rs` for why that distinction is
-//! load-bearing rather than decorative.
+//! Every reading is an [`Option`] and is [`None`] on any build whose OS has no
+//! backend — a whole [`Option<FdUsage>`](FdUsage) for descriptors, which are one
+//! measurement, and a per-field one for [`MemUsage`], whose three come from one
+//! call on RTEMS but not everywhere. See `unsupported.rs` for why the
+//! distinction from zero is load-bearing rather than decorative, and
+//! [`MemUsage`] for why the optionality is on the fields.
 //!
 //! # Cost
 //!
 //! [`fd_usage`] walks the descriptor table, so it is O(descriptor-table size) —
 //! 150 entries on the RTEMS BSP. [`mem_usage`] walks the heap under the
-//! allocator's lock; devIocStats' own header comment says gathering heap
-//! statistics "could be expensive" and warns against running it too often.
-//! Neither is on any serving path; both are called once per tick by the status
-//! pusher, whose interval is one second.
+//! allocator's lock on RTEMS; devIocStats' own header comment says gathering
+//! heap statistics "could be expensive" and warns against running it too often.
+//! On VxWorks it is one counter read, no walk. Neither is on any serving path;
+//! both are called once per tick by the status pusher, whose interval is one
+//! second.
+//!
+//! [`register_task`] is O(registered threads) only when the registry is full,
+//! and O(1) otherwise. It runs once per thread, at thread start.
 
 // The one place this module knows what OS it is on. Exactly one arm is live in
 // any build, so everything below is written once.

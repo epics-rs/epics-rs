@@ -41,7 +41,8 @@
 //! for this crate's own compilation:
 //!
 //! ```text
-//! exec_backend  ⟺  target_os == "rtems"  ||  feature "rtems-exec-model"
+//! exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
+//!               ||  feature "rtems-exec-model"
 //! tokio_backend ⟺  otherwise
 //! ```
 //!
@@ -71,10 +72,22 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
     println!("cargo::rustc-check-cfg=cfg(ca_beacon_monitor)");
+    println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
-    let rtems = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("rtems");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // The reactor-free targets: no tokio reactor exists on either, so every
+    // module gate above this crate's async front-end (`server/mod.rs`,
+    // `server/udp.rs`, `server/tcp.rs`, `server/addr_list.rs`, `lib.rs`'s
+    // `discovery`/`repeater`/`hostname`/`cli`/`copt`) gates on this one
+    // capability cfg instead of repeating `any(target_os = "rtems", target_os
+    // = "vxworks")`.
+    let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+    if embedded_target {
+        println!("cargo::rustc-cfg=epics_embedded_target");
+    }
+
     let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
-    let tokio_backend = !(rtems || host_exec_model);
+    let tokio_backend = !(embedded_target || host_exec_model);
     if tokio_backend {
         println!("cargo::rustc-cfg=tokio_backend");
     } else {

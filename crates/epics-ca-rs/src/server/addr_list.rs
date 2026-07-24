@@ -7,8 +7,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 // `IpAddr` is used only by the `if-addrs` interface-enumeration helpers, which
-// are host-only (their RTEMS stubs return empty results).
-#[cfg(not(target_os = "rtems"))]
+// are host-only (their embedded-target stubs return empty results).
+#[cfg(not(epics_embedded_target))]
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -357,10 +357,11 @@ fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Add
 /// Discover IPv4 broadcast addresses for all up, non-loopback interfaces.
 /// Returns an empty vec if interface enumeration fails (e.g. unsupported OS).
 ///
-/// Host-only: interface enumeration (`if-addrs`) does not build for RTEMS.
-/// The RTEMS build (blocking `std::net` driver) emits no beacons/broadcast,
-/// so the shared `resolve_from_env` config path takes the empty stub below.
-#[cfg(not(target_os = "rtems"))]
+/// Host-only: interface enumeration (`if-addrs`) does not build for RTEMS or
+/// VxWorks. The embedded build (blocking `std::net` driver) emits no
+/// beacons/broadcast, so the shared `resolve_from_env` config path takes the
+/// empty stub below.
+#[cfg(not(epics_embedded_target))]
 pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     let Ok(ifs) = if_addrs::get_if_addrs() else {
@@ -390,9 +391,9 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     out
 }
 
-/// RTEMS stub — `if-addrs` is host-only. The blocking driver emits no
-/// beacons/broadcast, so auto-discovery yields nothing.
-#[cfg(target_os = "rtems")]
+/// Embedded-target stub — `if-addrs` is host-only. The blocking driver
+/// emits no beacons/broadcast, so auto-discovery yields nothing.
+#[cfg(epics_embedded_target)]
 pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     Vec::new()
 }
@@ -409,7 +410,7 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
 /// Caveat, shared with the sibling [`discover_broadcast_addrs`]: `if_addrs`
 /// does not expose `IFF_UP`, so a down interface that still carries an address
 /// would be picked here where C skips it.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub fn osi_local_addr() -> Ipv4Addr {
     static CACHED: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -425,10 +426,10 @@ pub fn osi_local_addr() -> Ipv4Addr {
     })
 }
 
-/// RTEMS stub — `if-addrs` is host-only. Falls back to `INADDR_LOOPBACK`,
-/// the same value C `osiLocalAddr` returns when interface enumeration finds
-/// no up, non-loopback `AF_INET` interface.
-#[cfg(target_os = "rtems")]
+/// Embedded-target stub — `if-addrs` is host-only. Falls back to
+/// `INADDR_LOOPBACK`, the same value C `osiLocalAddr` returns when interface
+/// enumeration finds no up, non-loopback `AF_INET` interface.
+#[cfg(epics_embedded_target)]
 pub fn osi_local_addr() -> Ipv4Addr {
     Ipv4Addr::LOCALHOST
 }
@@ -450,7 +451,7 @@ pub fn osi_local_addr() -> Ipv4Addr {
 ///   * no matching interface was found, or that interface lacks a
 ///     broadcast addr (point-to-point links / odd kernel configs);
 ///   * the discovered broadcast is `0.0.0.0` (libcom drops these).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     if match_ip.is_unspecified() || match_ip.is_loopback() {
         return None;
@@ -488,9 +489,10 @@ pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     None
 }
 
-/// RTEMS stub — `if-addrs` is host-only. The blocking driver binds no
-/// secondary broadcast responder, so no per-interface broadcast is resolved.
-#[cfg(target_os = "rtems")]
+/// Embedded-target stub — `if-addrs` is host-only. The blocking driver binds
+/// no secondary broadcast responder, so no per-interface broadcast is
+/// resolved.
+#[cfg(epics_embedded_target)]
 pub fn broadcast_for_ip(_match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     None
 }
@@ -501,10 +503,10 @@ pub fn broadcast_for_ip(_match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
 /// `broadcast` for `IFF_BROADCAST` interfaces; P2P interfaces
 /// (VPN tun, PPP, WireGuard) need this path or beacons toward the
 /// tunnel peer are silently dropped from auto-expansion.
-/// Mirrors C `osdNetIfAddrs.c:130-151`. Host-only: the RTEMS libc has no
-/// `getifaddrs`/`ifaddrs`, and the RTEMS `broadcast_for_ip` stub never calls
-/// this.
-#[cfg(all(unix, not(target_os = "rtems")))]
+/// Mirrors C `osdNetIfAddrs.c:130-151`. Host-only: neither the RTEMS nor the
+/// VxWorks `libc` has `getifaddrs`/`ifaddrs`, and the embedded-target
+/// `broadcast_for_ip` stub never calls this.
+#[cfg(all(unix, not(epics_embedded_target)))]
 fn ifa_dstaddr_for_ipv4(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     // SAFETY: `getifaddrs` returns a linked list of `ifaddrs`
     // structs we walk read-only and free via `freeifaddrs` before

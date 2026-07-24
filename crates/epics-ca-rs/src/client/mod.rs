@@ -830,8 +830,8 @@ impl CaClient {
         // exactly this call site (`doc/calink-rtems-design.md` §4.5, §6 stage
         // C5).
         //
-        // `exec_backend` is the RTEMS target *and* a host
-        // `--features rtems-exec-model` build. It used to be spelled
+        // `exec_backend` is either embedded target (RTEMS or VxWorks) *and* a
+        // host `--features rtems-exec-model` build. It used to be spelled
         // `target_os = "rtems"` here, which let the hosted exec-model build
         // take the UDP arm and panic on the bind (§10.10 item 2).
         //

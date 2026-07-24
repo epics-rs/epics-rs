@@ -616,13 +616,14 @@ impl RecvBodyPolicy {
 ///   measured on target).
 ///
 /// The arm is chosen by the *backend*, not by the target. `exec_backend` is
-/// `target_os = "rtems"` **or** `--features rtems-exec-model` (`build.rs`), and
-/// what both share is that a future started through `runtime::task::spawn`
-/// runs with no tokio reactor entered — on RTEMS because there is none and
-/// `tokio::net` does not compile for the triple, on a host exec-model build
-/// because the future lands on a callback-pool worker the runtime was never
-/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
-/// reactor running") even though the process has a runtime elsewhere. Gating
+/// `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) **or**
+/// `--features rtems-exec-model` (`build.rs`), and what both share is that a
+/// future started through `runtime::task::spawn` runs with no tokio reactor
+/// entered — on RTEMS or VxWorks because there is none and `tokio::net` does
+/// not compile for either triple, on a host exec-model build because the
+/// future lands on a callback-pool worker the runtime was never entered on.
+/// A `tokio::net::TcpStream::connect` there panics ("there is no reactor
+/// running") even though the process has a runtime elsewhere. Gating
 /// this seam on `target_os = "rtems"` named the target where the fact it needs
 /// is the backend, which is why `rtems-ca-ioc` still panicked on its first
 /// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10

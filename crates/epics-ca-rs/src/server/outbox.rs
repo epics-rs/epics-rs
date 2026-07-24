@@ -94,8 +94,8 @@ impl OutboxDrain {
     ///
     /// Used only by the async connection loop (`tcp::handle_client`); the
     /// blocking driver drains synchronously via [`OutboxDrain::try_next`].
-    /// Host-only.
-    #[cfg(not(target_os = "rtems"))]
+    /// Host-only (not `epics_embedded_target`).
+    #[cfg(not(epics_embedded_target))]
     pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
         self.rx.recv().await
     }

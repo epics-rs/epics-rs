@@ -334,6 +334,27 @@ The command-line tools (`softioc-rs`, `caget-rs`, `caput-rs`, `camonitor-rs`, `c
 export PATH="$PWD/target/release:$PATH"
 ```
 
+### Build for RTEMS (armv7-rtems-eabihf)
+
+The workspace also cross-compiles to RTEMS 6 — a tier-3 target, so it needs a
+nightly toolchain with `rust-src` (plus `jq`), and `-Zbuild-std`:
+
+```bash
+# type-check the whole RTEMS closure — no cross-toolchain or BSP needed
+./scripts/rtems-check.sh
+
+# bootable CA IOC image (needs arm-rtems6-gcc on PATH and a libbsd BSP)
+RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+    -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
+    -p epics-ca-rs --bin rtems-ca-ioc --no-default-features --features client-core
+```
+
+The custom target spec this workspace deviates on (`has-thread-local: true`,
+`doc/rtems-tls-spec-deviation.md`) is applied automatically by a rustc-wrapper
+wired in `.cargo/config.toml` — plain `cargo build` is the whole interface.
+The full build manual, including the PVA/QSRV image and the spec escape hatch,
+is in [`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
+
 ### Run a Soft IOC
 
 ```bash

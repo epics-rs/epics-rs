@@ -1,0 +1,73 @@
+# epics-rtems-boot
+
+The RTEMS boot shim and link contract for epics-rs IOCs. An RTEMS image is a
+Rust binary plus a C entry task (`POSIX_Init`) that configures the kernel,
+brings up libbsd, and only then calls `main`; this crate owns that C code and
+the link flags, once, for every IOC binary in the workspace. On every
+non-RTEMS target it is empty and costs a host build nothing.
+
+This README is the build manual for the RTEMS target. The crate-level rustdoc
+(`src/lib.rs`) documents the boot/link contract itself.
+
+## Prerequisites
+
+| what | needed for | notes |
+|---|---|---|
+| nightly toolchain + `rust-src` | everything below | `armv7-rtems-eabihf` is tier 3: no prebuilt `std`, so `-Zbuild-std` |
+| `jq` | the target-spec generation | see "The target spec" below |
+| RTEMS 6 toolchain (`arm-rtems6-gcc` on `PATH`) | linking a bootable image | `.cargo/config.toml` names the linker by bare name, resolved from `PATH` |
+| libbsd BSP install, `RTEMS_BSP_PREFIX` env | linking a bootable image | this crate's `build.rs` derives every link flag from it |
+
+Type-checking needs only the first two rows — no cross-toolchain, no BSP.
+
+## Type-check the RTEMS closure (any dev machine)
+
+```bash
+./scripts/rtems-check.sh
+```
+
+This is the portability gate: it compiles every RTEMS crate, binary, and both
+build configurations (`portability` and `image`) for the target, with no
+toolchain present.
+
+## Build a bootable image
+
+```bash
+# CA IOC
+RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+    -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
+    -p epics-ca-rs --bin rtems-ca-ioc --no-default-features --features client-core
+
+# PVA (QSRV) IOC
+RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+    -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
+    -p epics-bridge-rs --bin rtems-pva-ioc --no-default-features --features qsrv-core,pvalink
+```
+
+The feature selections are deliberate, not defaults — `scripts/rtems-check.sh`
+documents why each one is the target's configuration (in short:
+`--no-default-features` keeps `ring`/`getrandom` off a target that cannot
+compile them, and the named features put the record-link resolvers on the
+image).
+
+## The target spec (applied automatically)
+
+Every build of the builtin `armv7-rtems-eabihf` triple in this workspace goes
+through the one-key spec deviation `has-thread-local: true`
+(`doc/rtems-tls-spec-deviation.md` — it takes std's per-thread TLS leak on
+RTEMS from 136 B to 0). You do not pass anything: `.cargo/config.toml` wires
+`build.rustc-wrapper = scripts/rtems-rustc-wrapper.sh`, which rewrites the
+triple to a spec generated from the exact rustc in use and leaves every other
+invocation (host builds included) untouched.
+
+Two operational notes:
+
+- `RTEMS_USE_STOCK_SPEC=1` builds against the stock builtin spec instead.
+  Toggling it — or first building after the wrapper was introduced, over a
+  `target/armv7-rtems-eabihf` dir holding stock-built artifacts — needs
+  `rm -rf target/armv7-rtems-eabihf` once; mixed spec artifacts fail loudly
+  with E0461, never silently.
+- An environment `RUSTC_WRAPPER` (e.g. sccache) overrides the config wiring
+  and silently drops the flip; unset it for RTEMS builds, or build through
+  `scripts/rtems-check.sh`, whose explicit spec path does not depend on the
+  wrapper.

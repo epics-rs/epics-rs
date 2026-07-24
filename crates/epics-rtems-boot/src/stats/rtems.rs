@@ -28,17 +28,23 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
     (rc == 0).then_some(FdUsage { used, max })
 }
 
-pub(super) fn mem_usage() -> Option<MemUsage> {
+/// All three fields come from one `_Protected_heap_Get_information` call, so on
+/// this backend they are present or absent together — the per-field `Option`
+/// exists for backends whose sources differ, not because RTEMS' can be partial.
+pub(super) fn mem_usage() -> MemUsage {
     let mut free = 0u64;
     let mut used = 0u64;
     let mut largest_free = 0u64;
     // SAFETY: as above — three pointers to live locals of the right type.
     let rc = unsafe { ffi::epics_rtems_boot_mem_usage(&mut free, &mut used, &mut largest_free) };
-    (rc == 0).then_some(MemUsage {
-        free,
-        used,
-        largest_free,
-    })
+    if rc != 0 {
+        return MemUsage::default();
+    }
+    MemUsage {
+        free: Some(free),
+        used: Some(used),
+        largest_free: Some(largest_free),
+    }
 }
 
 pub(super) fn dump_tasks(tag: &str) {

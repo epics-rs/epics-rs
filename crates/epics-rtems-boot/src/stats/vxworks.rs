@@ -81,8 +81,8 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
 /// checking hardest: `largest_free` is the fragmentation signal an allocation
 /// actually fails on, and a mimalloc heap's answer to it is not simply the
 /// largest free run.
-pub(super) fn mem_usage() -> Option<MemUsage> {
-    None
+pub(super) fn mem_usage() -> MemUsage {
+    MemUsage::default()
 }
 
 /// Not bound yet — prints one line saying so.

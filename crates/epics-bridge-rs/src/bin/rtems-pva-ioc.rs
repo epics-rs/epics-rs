@@ -458,10 +458,10 @@ mod ioc {
         // nothing next to an attempt count of 1.
         let (dial_workers, dial_attempts) =
             epics_pva_rs::client_native::server_conn::dial_pool_probe();
-        let (mem_free, mem_used) = match epics_rtems_boot::stats::mem_usage() {
-            Some(m) => (m.free as i64, m.used as i64),
-            None => (-1, -1),
-        };
+        // Each field carries its own -1 — see the same site in `rtems-ca-ioc`.
+        let mem = epics_rtems_boot::stats::mem_usage();
+        let mem_free = mem.free.map_or(-1, |v| v as i64);
+        let mem_used = mem.used.map_or(-1, |v| v as i64);
         println!(
             "STAGE5 seq={seq} dialpool workers={dial_workers} attempts={dial_attempts} \
              MEM_FREE={mem_free} MEM_USED={mem_used}",

@@ -311,10 +311,12 @@ mod ioc {
         // nothing next to an attempt count of 1.
         let (dial_workers, dial_attempts, dial_queued, dial_dialing) =
             epics_ca_rs::client::dial_pool_probe();
-        let (mem_free, mem_used) = match epics_rtems_boot::stats::mem_usage() {
-            Some(m) => (m.free as i64, m.used as i64),
-            None => (-1, -1),
-        };
+        // Each field carries its own -1: a target can measure one and not the
+        // other, and blanking a reading it has because of one it has not is
+        // how a probe line loses the number the run was for.
+        let mem = epics_rtems_boot::stats::mem_usage();
+        let mem_free = mem.free.map_or(-1, |v| v as i64);
+        let mem_used = mem.used.map_or(-1, |v| v as i64);
         println!(
             "C6 seq={seq} dialpool workers={dial_workers} attempts={dial_attempts} \
              queued={dial_queued} dialing={dial_dialing} \

@@ -17,8 +17,8 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
     None
 }
 
-pub(super) fn mem_usage() -> Option<MemUsage> {
-    None
+pub(super) fn mem_usage() -> MemUsage {
+    MemUsage::default()
 }
 
 /// Silence, not a placeholder line.

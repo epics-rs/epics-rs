@@ -101,16 +101,30 @@ impl FdUsage {
     }
 }
 
-/// Malloc-heap usage.
+/// Malloc-heap usage: three independent measurements, each present or not.
 ///
 /// The RTEMS *workspace* is a separate allocator and is not counted here;
 /// devIocStats keeps it in its own OSD file for the same reason.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// # Why the fields are optional and the struct is not
+///
+/// The three come from one call on RTEMS but not everywhere: VxWorks 7's
+/// mimalloc reports committed bytes and has no free-run metric at all, so
+/// `used` is a real reading on a target where `largest_free` does not exist.
+/// An all-or-nothing `Option<MemUsage>` forces a backend in that position to
+/// throw away a measurement it has, or to invent the two it does not.
+///
+/// Optional *fields* also leave exactly one way to say "no reading". An
+/// `Option<MemUsage>` whose fields were plain `u64` would have two — an absent
+/// struct and a struct of zeros — and the second is indistinguishable from a
+/// genuinely exhausted heap, which is the reading an operator most needs to
+/// believe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemUsage {
     /// Bytes free in the malloc heap, summed over every free block.
-    pub free: u64,
+    pub free: Option<u64>,
     /// Bytes currently allocated from the malloc heap.
-    pub used: u64,
+    pub used: Option<u64>,
     /// The largest single free block.
     ///
     /// Reported separately from [`free`](Self::free) because it is the
@@ -118,19 +132,22 @@ pub struct MemUsage {
     /// total. A heap with megabytes free in kilobyte fragments cannot start a
     /// connection whose thread wants a 512 KiB stack, and only this field says
     /// so.
-    pub largest_free: u64,
+    pub largest_free: Option<u64>,
 }
 
 impl MemUsage {
-    /// Free plus allocated.
+    /// Free plus allocated, or [`None`] unless both are readings.
     ///
     /// Derived here rather than in a backend, because it is arithmetic on two
     /// measurements rather than a third measurement. devIocStats computes the
     /// same sum (`osdMemUsage.c:73`) and its own header comment flags that this
     /// is *not* the true total the allocator was given — the difference is
     /// allocator overhead.
-    pub fn total(&self) -> u64 {
-        self.free.saturating_add(self.used)
+    ///
+    /// A sum over one known part and one unknown one would be a lower bound
+    /// wearing a total's name, so a missing part makes the total missing too.
+    pub fn total(&self) -> Option<u64> {
+        Some(self.free?.saturating_add(self.used?))
     }
 }
 
@@ -139,8 +156,10 @@ pub fn fd_usage() -> Option<FdUsage> {
     backend::fd_usage()
 }
 
-/// Read heap usage, or [`None`] on a build whose OS has no backend.
-pub fn mem_usage() -> Option<MemUsage> {
+/// Read heap usage. Every field is [`None`] on a build whose OS has no
+/// backend, and individual fields are [`None`] where the OS cannot measure
+/// them.
+pub fn mem_usage() -> MemUsage {
     backend::mem_usage()
 }
 
@@ -210,7 +229,19 @@ mod tests {
     #[test]
     fn a_host_build_reports_no_reading_rather_than_a_made_up_one() {
         assert_eq!(fd_usage(), None);
-        assert_eq!(mem_usage(), None);
+        assert_eq!(mem_usage(), MemUsage::default());
+        assert_eq!(mem_usage().total(), None);
+    }
+
+    /// `MemUsage::default()` is what a backend returns when it has nothing, so
+    /// it must be three absent readings and not three zeros. A zeroed default
+    /// would publish "0 bytes free" — an exhausted heap — on every host build.
+    #[test]
+    fn the_empty_heap_reading_is_absent_rather_than_zero() {
+        let none = MemUsage::default();
+        assert_eq!(none.free, None);
+        assert_eq!(none.used, None);
+        assert_eq!(none.largest_free, None);
     }
 
     /// `free` is the number an operator watches approach zero, so it must not
@@ -250,11 +281,27 @@ mod tests {
     #[test]
     fn the_heap_total_is_exactly_free_plus_used() {
         let m = MemUsage {
-            free: 3_000_000,
-            used: 5_000_000,
-            largest_free: 1_500_000,
+            free: Some(3_000_000),
+            used: Some(5_000_000),
+            largest_free: Some(1_500_000),
         };
-        assert_eq!(m.total(), 8_000_000);
+        assert_eq!(m.total(), Some(8_000_000));
+    }
+
+    /// A backend that knows `used` but not `free` — VxWorks, whose mimalloc
+    /// reports committed bytes and has no free-run metric — must not publish a
+    /// total. Adding a known part to an unknown one yields a lower bound, and
+    /// `MEM_MAX` is read as a capacity, so a lower bound there reads as an IOC
+    /// with less memory than it has.
+    #[test]
+    fn a_partial_heap_reading_has_no_total() {
+        let partial = MemUsage {
+            free: None,
+            used: Some(5_000_000),
+            largest_free: None,
+        };
+        assert_eq!(partial.total(), None);
+        assert_eq!(partial.used, Some(5_000_000), "the known part survives");
     }
 
     /// The largest free block is a distinct measurement, not a restatement of
@@ -263,9 +310,9 @@ mod tests {
     #[test]
     fn the_largest_free_block_is_independent_of_the_free_total() {
         let fragmented = MemUsage {
-            free: 4_000_000,
-            used: 1_000_000,
-            largest_free: 40_000,
+            free: Some(4_000_000),
+            used: Some(1_000_000),
+            largest_free: Some(40_000),
         };
         assert!(
             fragmented.largest_free < fragmented.free,

@@ -802,8 +802,12 @@ impl BlockingPvaServer {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    let Ok(peer) = stream.peer_addr() else {
-                        continue;
+                    let peer = match stream.peer_addr() {
+                        Ok(peer) => peer,
+                        Err(e) => {
+                            warn!(error = %e, "blocking PVA server: peer_addr failed, dropping connection");
+                            continue;
+                        }
                     };
                     if let Err(e) = self.start_connection(stream, peer) {
                         warn!(?peer, error = %e, "blocking PVA server: connection not started");

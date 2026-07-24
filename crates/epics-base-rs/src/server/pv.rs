@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

@@ -11,6 +11,8 @@
 //! (clamp → rollback → clamp ping-pong, measured on the mini-beamline
 //! example 2026-07-24).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbChannel, DbSubscription};
 use epics_base_rs::server::records::ao::AoRecord;

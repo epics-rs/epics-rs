@@ -136,8 +136,12 @@ implementation provides — which is why the venue is rust-lang, alone.
 creation, measured as pooled-vs-per-attempt image *difference* (single-image
 readings are a documented false confirmation), is **176.0 ± 5 B** (CA, 29
 attempts) and **179.1 ± 3 B** (PVA, 87 attempts). The orphaned `Arc`
-accounts for 128 B of that; the remaining ~48–51 B are unattributed (see
-open items).
+accounts for 128 B of that. The remaining ~48–51 B was long carried here as
+"unattributed"; the 2026-07-24 `--wrap=malloc` attribution
+(`measurement-dial-attempt-residue-on-rtems-6.md`) showed it is **not a
+separate allocation at all** — the whole 176/179 B is thread-creation cost,
+and under the flip the two dial shapes grow the heap byte-identically
+(0 B/attempt difference).
 
 **Reach in a Rust IOC:** any thread churn pays it forever — our port's
 client dial path did (one thread per attempt; closed by `DialPool`,
@@ -332,7 +336,9 @@ same source commit.
   independent of the spec, which is why the residue reading below uses the
   guest-internal console gauge, not a wire read.
 - **Residue.** The prior 176.0 ± 5 / 179.1 ± 3 B *per connection attempt* is
-  128 B thread handle + ~40–51 B unattributed. The flip's effect on the
+  128 B thread handle + a ~40–51 B remainder this section treated as separate
+  dial-machinery allocation. **It is not** — see the correction at the end of
+  this bullet. The flip's effect on the
   handle is now measured **four ways** (bare unnamed 136→0, bare named
   160.64→0, C-created 136→0, and a **noise-free dial phase** — `dialattempt-*`,
   a named thread + `TcpStream::connect` to a refused `127.0.0.1:9` per
@@ -350,9 +356,18 @@ same source commit.
   only 10 dial attempts in 10 min, far too coarse to resolve ~40 B — the
   documented single-image false-confirmation the differential exists to avoid.
   This does not affect the adoption verdict (the flip's job is the 128 B
-  handle, which is fully closed); the ~40 B remains for the separate
-  server-side thread-pool / allocation work, which is needed regardless of
-  this flip.
+  handle, which is fully closed).
+
+  **Correction, 2026-07-24.** The full pooled-vs-perattempt IOC differential
+  this bullet says was not run *has* now been run under the flipped spec, with
+  absolute `-Wl,--wrap=malloc` per-call-site accounting instead of a `MEM_FREE`
+  slope — which removes the drift that made it impossible before. The two dial
+  shapes grow the heap **byte-identically** (+1936 B each over the same 209
+  attempts), so the per-attempt residue is **0 B/attempt** and the ~40 B
+  remainder does not exist. The server-side thread pool is still needed for
+  the EAGAIN admission bound and the per-connection fd/memory ceiling, but
+  **not** for this residue. See
+  `measurement-dial-attempt-residue-on-rtems-6.md`.
 
 **Check FIVE — build wiring.** See `doc/rtems-tls-spec-deviation.md`: the
 committed spec, the paths taught to build through it, and the exact condition
@@ -361,14 +376,21 @@ that retires the deviation (upstream setting `has_thread_local: true` in
 
 ## Not measured / open
 
-- The ~48–51 B gap between the attributed `Arc`+header (136 B measured on
-  bare threads) and the total per-*connection-attempt* residue (176–179 B)
-  is unattributed. The 2026-07-24 adoption track (above) narrows it: it is
-  **not** the thread handle and **not** a bare thread+socket dial (both go to
-  0.00 under the flip), so it is other per-attempt allocation in the real dial
-  machinery — flip-independent. It was not isolated to the byte, and a full
-  pooled-vs-perattempt IOC differential under the flipped spec was not run
-  (single-image IOC heap noise ≫ 40 B).
+- ~~The ~48–51 B gap … is unattributed.~~ **CLOSED 2026-07-24 — the gap does
+  not exist.** The pooled-vs-perattempt IOC differential this bullet said was
+  not run *was* run, under the flipped spec, with `-Wl,--wrap=malloc`
+  per-call-site accounting instead of a `MEM_FREE` slope: the two dial shapes
+  grow the heap **byte-identically** (+1936 B each over the same 209 dial
+  attempts, same five size classes, same per-class counts), so the per-attempt
+  residue the `DialPool` removes is **0 B/attempt**, not ~40–51. The 176/179 B
+  was all thread-creation cost; the "remainder" was an arithmetic residue
+  between a bare *unnamed* thread (136 B) and a *named* thread inside the real
+  dial (176 B), not a separate allocation. Under an unreachable name server the
+  only growth left is one 144 B block per ~120 s in
+  `epics_ca_rs::client::search::fire_searches`, bounded by
+  `EPICS_CA_NAMESERVER_QUEUE_DEPTH` (proven by pinning it to 8 and watching the
+  count stop at exactly +8). See
+  `measurement-dial-attempt-residue-on-rtems-6.md`.
 - Current rust master was inspected (target spec), not executed; the
   measured toolchain is nightly `87e5904f5` (2026-07-20).
 - The 2026-07-22 attribution transcript was not re-run on 2026-07-23; its
@@ -395,4 +417,5 @@ that retires the deviation (upstream setting `has_thread_local: true` in
 | adoption checks 1–3 (unwind dtor 55/55 + frame_drops 110/110; C-thread tls_ok 55/55; const-init iso 55/55), each stock 136/native 0.00 | rig 2 `repro/tlsflip/` on box nightly `87e5904f5` 2026-07-24, 8 images (4 phases × 2 specs), each booted twice byte-identical; `SLOPE`/`TLSDTOR2-*` lines in `evidence/tlsflip/{stock,native}-{plain,unwind,cthread,constinit}.run1.log` |
 | key-creation-order contingency of the stock leak (SLOT-first 136.16 vs CURRENT-first 0.00 on one unchanged image) | measured on the box 2026-07-24 by reordering the main-thread key touches in one stock image and re-booting; the reason one phase per image is required |
 | check 4: real `rtems-ca-ioc` builds+boots+DHCP+serves+10-min dial workload fault-free under the flip; native `.tdata 0x98`/`PT_TLS 0x890` vs stock `0x18`/`0x620`, 0 unresolved TLS relocs | box epics-rs `419b59d5d7c`, both specs from one source; `evidence/tlsflip/measure-{native,stock}.log`, `rtems-ca-ioc-tls-segments.txt`, `caflip-native2.log` (DHCP `10.0.2.15` BOUND); linker via `CARGO_TARGET_ARMV7_RTEMS_TLS_LINKER` |
-| check 4 residue: flip zeroes the dial thread+socket cost (`dialattempt` 161.76→0.00 / 1.98→0.00 blocks, refused=55/55), so ~40–51 B gap is non-handle dial-machinery alloc | rig 2 `dialattempt` phase, `evidence/tlsflip/{stock,native}-dialattempt.run1.log`; run-2 slopes (stock 161.12, native 1.28) noted inline in the doc as the ~1 B socket noise floor; **full IOC differential NOT re-run** |
+| check 4 residue: flip zeroes the dial thread+socket cost (`dialattempt` 161.76→0.00 / 1.98→0.00 blocks, refused=55/55) | rig 2 `dialattempt` phase, `evidence/tlsflip/{stock,native}-dialattempt.run1.log`; run-2 slopes (stock 161.12, native 1.28) noted inline in the doc as the ~1 B socket noise floor |
+| ~~~40–51 B gap is non-handle dial-machinery alloc~~ **RETRACTED**: per-attempt minus pooled is 0 B/attempt (+1936 B each over the same 209 attempts, identical size classes) | 2026-07-24 `-Wl,--wrap=malloc` + `arm-rtems6-addr2line` rig, four boots, `evidence/dialresidue/*.log.gz`, `repro/dialresidue/`; written up in `measurement-dial-attempt-residue-on-rtems-6.md` |

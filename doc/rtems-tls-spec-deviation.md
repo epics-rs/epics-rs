@@ -116,9 +116,13 @@ unwinding, `const`-init, and C-created (raw `pthread_create`) — and the real
 fault-free under the flip, with real Rust TLS segments and zero unresolved TLS
 relocations.
 
-Does **not** buy: the server-side thread pool. The per-*connection-attempt*
-residue had a ~40–51 B component above the thread handle; the flip zeroes the
-handle (measured four ways) but that remaining component is other per-attempt
-allocation in the dial machinery, orthogonal to `has_thread_local`. The EAGAIN
-admission bound and the per-connection fd/memory ceiling still need the pool
-regardless of this flip — this deviation does not replace that work.
+Does **not** buy: the server-side thread pool. This paragraph used to say the
+per-*connection-attempt* residue had a ~40–51 B component above the thread
+handle that the flip could not reach. **That was wrong** — the 2026-07-24
+`-Wl,--wrap=malloc` attribution
+(`doc/upstream-rtems-bugs/measurement-dial-attempt-residue-on-rtems-6.md`)
+measured the per-attempt and pooled dial shapes growing the heap
+byte-identically under the flip, so the per-attempt residue is 0 B/attempt and
+the flip closes it entirely. The EAGAIN admission bound and the per-connection
+fd/memory ceiling still need the pool regardless of this flip — this deviation
+does not replace that work, it just does not owe it any residue.

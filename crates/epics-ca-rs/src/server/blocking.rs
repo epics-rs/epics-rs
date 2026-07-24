@@ -36,7 +36,10 @@
 //! [`WorkerPool::acquire`] is the only fallible step before a client is served,
 //! and its failure — a full process or a target out of thread resources — is
 //! the one refusal, taken after `accept` with the socket still open, where C
-//! `rsrv` takes its own (`caservertask.c:1240-1250`).
+//! `rsrv` takes its own (`caservertask.c:1240-1250`). The pool's capacity is
+//! deliberately **one below** the target's descriptor wall so that refusal has
+//! a descriptor to happen on; see [`CAS_CLIENT_POOL_CAPACITY`], where the
+//! measurement that forced the "one below" is cited.
 //!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
 //! the analogue of C's `CAS-UDP` thread (`cast_server`, `cast_server.c:113`):
@@ -199,35 +202,57 @@ const CAS_UDP_PRIORITY: ThreadPriority =
 /// The most CA clients this **process** can serve at once, and therefore the
 /// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
 ///
-/// Not an arbitrary headroom number: it is the target's measured fd wall, and
-/// every term is read out of a source file or a measurement recorded in
-/// `doc/rtems-fd-ceiling-deviation.md` (the ramp that produced them drove this
-/// very driver — raw CA TCP, VERSION handshake, one `CA_PROTO_CREATE_CHAN`).
+/// **One below the target's fd wall, and the "one below" is the whole point.**
+/// Every term is read out of a source file or out of a measurement:
+/// `doc/rtems-fd-ceiling-deviation.md` for the wall, and
+/// `doc/rtems-ca-worker-pool-on-target-measurement.md` for this driver's own
+/// ramp to it (142 established and held 140 s at the wall, the 143rd's `accept`
+/// failing with nothing said to the peer — which is what forced the "one
+/// below").
 ///
 /// * **fd wall = 142.** `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150
 ///   (`crates/epics-rtems-boot/csrc/rtems_config.c` §F) and the IOC holds 8
-///   descriptors at idle, so 142 client sockets fit and the 143rd `accept`
-///   fails with `ENFILE` — measured, and published as `FD_FREE` = 142 at idle.
-///   A CA client is exactly one descriptor, so 142 is also the most sets that
-///   can be leased simultaneously.
-/// * **stack wall ≥ 142.** A set is `Big` + `Medium` = 1,048,576 + 524,288 =
+///   descriptors at idle, so 142 client sockets fit. Measured on this driver:
+///   `FD_CNT = FD_MAX = 150`, `CA_CONN_CNT = 142`, zero descriptors free.
+/// * **memory wall ≈ 145.** A set is `Big` + `Medium` = 1,048,576 + 524,288 =
 ///   1,572,864 B of stack on `armv7-rtems-eabihf` (`StackSizeClass::bytes` is
-///   `f × 0x10000 × size_of::<usize>()`, and `usize` is 4 there). All 142 sets
-///   grown is 223,346,688 B against the 241,199,000 B free at idle — the ~17.9
-///   MB left over is the measured `MEM_FREE` at 141 clients held. The memory
-///   wall itself was measured at **151** connections, on an image whose fd cap
-///   was raised to 400 so it could be reached at all.
-/// * **capacity = min(142, 151) = 142.**
+///   `f × 0x10000 × size_of::<usize>()`, and `usize` is 4 there); the measured
+///   cost of a whole client set at the wall is **1,591,854 B**, and this image
+///   has **231,289,888 B** free at idle, so 231,289,888 / 1,591,854 ≈ 145.
+/// * **capacity = fd wall − 1 = 141**, *not* `min(142, 145) = 142`.
 ///
-/// That minimum is why §9 of `doc/rtems-connection-worker-pool-design.md`
-/// proposed 256 and why the number is 142 instead: a capacity above the fd
-/// wall can never be reached, so it would bound nothing that `accept` does not
-/// already bound, and the pool's own refusal would be dead code. A capacity
-/// *below* 142 would be the other thing C `rsrv` does not have — a connection
-/// count limit. At exactly the fd wall the pool bounds thread **creations**
-/// (142 × 2 = 284, once) while the refusal a client actually meets stays where
-/// C has it: the resource failure, not a count.
-const CAS_CLIENT_POOL_CAPACITY: usize = 142;
+/// # Why one below, and not the wall itself
+///
+/// At capacity 142 the pool's refusal is **unreachable**, and this is measured
+/// rather than argued: at the wall `REFUSED` stayed **0** for the whole run
+/// while `SETS = CAP = 142`. Set #143 would have been refused with `WouldBlock`
+/// — but client #143's `accept` fails `ENFILE` first, because 142 clients hold
+/// every descriptor the process has. The peer receives *nothing*: the guest
+/// accepted nothing and sent nothing, so a client at the wall sees the socket
+/// close with zero bytes on it.
+///
+/// That is the silent close [`refuse_client`] exists to remove. **A refusal
+/// after `accept` needs a descriptor to refuse on**, so the server must keep
+/// one in hand: at 141 clients the process holds 149 of 150 descriptors, client
+/// #142's `accept` succeeds on the last one, `acquire` refuses it with
+/// `WouldBlock`, [`refuse_client`] tells it why with `ECA_ALLOCMEM` and closes
+/// — returning the descriptor for the next one. The accept loop is single
+/// threaded, so a burst of refusals is served one at a time through that one
+/// spare rather than racing for it.
+///
+/// The cost is one concurrent client. What it buys is that the documented
+/// refusal contract can actually execute, on the only path that can reach it.
+///
+/// # What this is still not
+///
+/// Not a connection-count limit of the kind C `rsrv` lacks. 141 is derived from
+/// the descriptor budget, not chosen as a policy on clients, and it moves with
+/// the fd cap; §9's rejected option 2 was a limit *independent* of the
+/// resource. The client that would have been #142 is not turned away — it is
+/// accepted and answered, which is strictly more than it got before. And a
+/// capacity *above* the wall (§9's rejected 256) remains unreachable for the
+/// same reason, now with a measurement behind it.
+const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 
 /// The two roles one CA client borrows together, in the order
 /// [`CAS_CLIENT_POOL`] hands them out: `[client, event]`.
@@ -386,8 +411,10 @@ impl BlockingCaServer {
     /// a resource failure, never on a count), and neither do we — this exists
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
-    /// libbsd socket zone with `ENFILE`, with free heap good for about 9.7
-    /// more. Watching it climb is how an operator sees that coming.
+    /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
+    /// now stops one short of that, at [`CAS_CLIENT_POOL_CAPACITY`] = 141, so
+    /// the descriptor client #142 needs to *hear why* is still there. Watching
+    /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -1866,38 +1893,57 @@ mod tests {
         }
     }
 
-    /// The pool's capacity is the target's measured fd wall, and nothing else.
+    /// The pool's capacity leaves exactly one descriptor for the refusal.
     ///
     /// The number is a decision, so it is pinned here with its derivation rather
-    /// than left as a literal somebody rounds up later
+    /// than left as a literal somebody rounds later
     /// (`doc/rtems-connection-worker-pool-design.md` §9,
-    /// `doc/rtems-fd-ceiling-deviation.md` §3):
+    /// `doc/rtems-fd-ceiling-deviation.md` §3,
+    /// `doc/rtems-ca-worker-pool-on-target-measurement.md` §3):
     ///
     /// * 150 descriptors configured minus the 8 the IOC holds at idle = **142**
-    ///   client sockets, and the 143rd `accept` fails `ENFILE` — measured.
-    /// * 142 sets × (`Big` + `Medium`) = 223,346,688 B of stack against the
-    ///   241,199,000 B free at idle; the memory wall is 151 connections, and was
-    ///   only reachable at all on an image with the fd cap raised to 400.
+    ///   client sockets; measured on this driver as `FD_CNT = FD_MAX = 150`
+    ///   with `CA_CONN_CNT = 142` and zero free.
+    /// * memory: a client set costs a measured 1,591,854 B and the image has
+    ///   231,289,888 B free at idle, so **≈145** sets — not the 151 the first
+    ///   derivation used, which came from a different image's idle heap.
+    /// * capacity = **fd wall − 1 = 141**, so the client that cannot be served
+    ///   can still be *accepted* and told why.
     ///
-    /// Above 142 the capacity can never be reached, so the pool's refusal would
-    /// be dead code and the creation bound unassertable; below 142 it becomes a
-    /// CA connection *count* limit, which C `rsrv` does not have
-    /// (`caservertask.c:110-118`, `:1234-1250` both refuse on a resource
-    /// failure). At exactly the wall the creations are bounded and the refusal a
-    /// client meets is still the resource failure.
+    /// The last line is the one the target forced. At capacity = the wall the
+    /// pool's refusal is unreachable — `REFUSED` stayed 0 through a full ramp
+    /// while `SETS = CAP = 142`, because client #143's `accept` fails `ENFILE`
+    /// before `acquire` is ever called, and the peer is sent nothing at all.
+    /// Refusing after `accept` needs a descriptor to refuse on; this keeps one.
     #[test]
-    fn the_client_pool_capacity_is_the_measured_fd_wall() {
+    fn the_client_pool_capacity_leaves_one_descriptor_for_the_refusal() {
         const CONFIGURED_DESCRIPTORS: usize = 150;
         const IOC_HELD_AT_IDLE: usize = 8;
-        const MEMORY_WALL_CONNECTIONS: usize = 151;
+        /// 231,289,888 B free at idle / 1,591,854 B measured per client set.
+        const MEMORY_WALL_CONNECTIONS: usize = 145;
 
         let fd_wall = CONFIGURED_DESCRIPTORS - IOC_HELD_AT_IDLE;
         assert_eq!(fd_wall, 142, "the fd wall is the cap minus the idle hold");
+        assert!(
+            fd_wall <= MEMORY_WALL_CONNECTIONS,
+            "the fd wall is the binding one; if memory ever binds first, the \
+             spare descriptor this capacity reserves no longer buys a refusal"
+        );
         assert_eq!(
             CAS_CLIENT_POOL_CAPACITY,
-            fd_wall.min(MEMORY_WALL_CONNECTIONS),
-            "the capacity is the lower of the two measured walls; a larger one \
-             is unreachable and a smaller one is a connection limit C has not got"
+            fd_wall - 1,
+            "capacity must sit one below the fd wall: at the wall itself the \
+             pool's WouldBlock arm is unreachable (measured REFUSED=0 with \
+             SETS=CAP) because accept fails ENFILE first, and the peer is told \
+             nothing"
+        );
+        // The property that spare descriptor exists for: at capacity, one more
+        // client can still be accepted, which is what `refuse_client` needs.
+        assert_eq!(
+            CONFIGURED_DESCRIPTORS - (IOC_HELD_AT_IDLE + CAS_CLIENT_POOL_CAPACITY),
+            1,
+            "a full server must still be able to accept the client it is about \
+             to refuse"
         );
     }
 
@@ -2065,9 +2111,10 @@ mod tests {
     /// back when it goes.
     ///
     /// This is the number the bring-up box measured the ceiling in (142
-    /// concurrent, 143 refused with `ENFILE`), so it is the one an operator
-    /// watches climb. It is a count and never a limit — nothing in this file
-    /// reads it to decide anything.
+    /// concurrent, the 143rd's `accept` failing `ENFILE` with nothing said to
+    /// the peer), so it is the one an operator watches climb — now to
+    /// [`CAS_CLIENT_POOL_CAPACITY`] = 141, one below that wall. It is a count
+    /// and never a limit — nothing in this file reads it to decide anything.
     #[test]
     fn a_served_client_is_counted_and_gives_the_slot_back() {
         let db = seed_db(&[("BLK:CNT", EpicsValue::Double(1.0))]);

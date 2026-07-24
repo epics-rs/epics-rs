@@ -2854,6 +2854,20 @@ mod tests {
     /// first reply (queue not yet drained) and flushes both together on drain
     /// — C `cast_server.c:268-281`. Bytes equal the shared decode driven
     /// through ONE batch, and no second datagram is emitted.
+    ///
+    /// unix-only: the "queued BEFORE the responder starts" premise is the
+    /// POSIX loopback contract — `send_to` enqueues synchronously and
+    /// FIONREAD reports the queue total. Windows's loopback delivery is
+    /// asynchronous, so the responder observed an empty queue after datagram
+    /// 1 and replied per datagram (measured, PR #56 CI 2026-07-24). The
+    /// driver under test runs on `exec_backend`, which refuses Windows at
+    /// compile time (`epics-libcom-rs/src/lib.rs`).
+    ///
+    /// `udp_source_change_flushes_held_batch_to_prior_peer` below shares the
+    /// premise but stays ungated: its observable outcome (each peer gets
+    /// exactly its own reply bytes) is the same whether or not the burst was
+    /// queued when the responder first read, and it passes on Windows.
+    #[cfg(unix)]
     #[test]
     fn udp_same_source_burst_coalesces_into_one_reply() {
         let db = seed_db(&[("BLK:BURST", EpicsValue::Double(1.0))]);

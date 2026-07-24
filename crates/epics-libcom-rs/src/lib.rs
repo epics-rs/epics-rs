@@ -40,6 +40,22 @@
     clippy::manual_range_contains
 )]
 
+// The exec backend's blocking pumps end a parked reader with a local
+// `shutdown(Shutdown::Both)` and bound a stuck writer through loopback
+// send-backpressure (`runtime::blocking_io`). Both are POSIX blocking-socket
+// semantics; Windows provides neither (measured, PR #56 CI 2026-07-24: a
+// parked `recv` outlived shutdown by the full 120 s test bound, and an
+// 8 MiB frame to a never-reading peer was swallowed in 12 ms), so a Windows
+// build selecting this backend would hang on connection teardown instead of
+// failing visibly. Refuse it at compile time rather than ship that.
+#[cfg(all(windows, exec_backend))]
+compile_error!(
+    "the exec backend (`rtems-exec-model`) relies on POSIX blocking-socket \
+     semantics (shutdown wakes a parked read; loopback sends see \
+     backpressure) that Windows does not provide; build the default tokio \
+     backend on Windows instead"
+);
+
 pub mod net;
 pub mod runtime;
 pub mod walltime;

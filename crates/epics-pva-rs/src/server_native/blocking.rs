@@ -1623,6 +1623,17 @@ mod tests {
     /// them; only the accumulator can. Without that check a peer streams
     /// SegFirst → SegMiddle … forever and `seg_buf` grows until the
     /// allocator says no.
+    ///
+    /// unix-only, like every `#[cfg(unix)]` test in this module: the retire
+    /// assertion is the POSIX teardown contract — a local
+    /// `shutdown(Shutdown::Both)` returns a connection parked in a blocking
+    /// `read` behind the ~64,000 s `op_timeout` (§1.6). Windows does not
+    /// provide that wake (measured, PR #56 CI 2026-07-24: all eight of these
+    /// tests timed out on their retire bounds on both Windows runners), which
+    /// is why `exec_backend` refuses Windows at compile time
+    /// (`epics-libcom-rs/src/lib.rs`) — no production build can reach this
+    /// driver there.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reassembly_is_capped_on_the_accumulated_size_not_the_segment() {
         let order = ByteOrder::Little;
@@ -1858,6 +1869,9 @@ mod tests {
     ///
     /// Mutation-checked: make `ConnWake::wake` a no-op and this test fails on
     /// its retire bound instead of hanging, because `wait_retired` is bounded.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_wakes_a_connection_parked_in_its_read() {
         let order = ByteOrder::Little;
@@ -1962,6 +1976,9 @@ mod tests {
     /// arrives. The connection must still retire — teardown drains `channels`,
     /// which drops each `OpState` and fires its guards — rather than the
     /// in-flight op holding the loop open.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_retires_a_connection_with_an_operation_in_flight() {
         let order = ByteOrder::Little;
@@ -2011,6 +2028,9 @@ mod tests {
     /// Boundary: `stop` called more than once, including after everything has
     /// already gone. It is a latch, not a toggle, and the second call must not
     /// find a half-removed entry or panic on one.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_is_idempotent() {
         let registry = Arc::new(ConnRegistry::new());
@@ -2076,6 +2096,9 @@ mod tests {
     /// Mutation-checked: delete the socket shutdown at the end of
     /// `runtime::blocking_io`'s writer pump and the parked reader here is never
     /// released.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[test]
     fn a_writer_that_ends_wakes_a_reader_parked_on_the_socket() {
         // The client stays connected and silent, so the only thing that can
@@ -2195,6 +2218,9 @@ mod tests {
     /// `read` behind an `op_timeout` of ~64,000 s, holding its socket and
     /// descriptor for the life of the IOC — while `live_connections()` read 0
     /// and the `max_connections` slot came back, so nothing looked wrong.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[test]
     fn a_reader_is_released_when_connection_setup_fails_after_it_is_spawned() {
         // The client stays connected and silent, so nothing but a wake from
@@ -2243,6 +2269,9 @@ mod tests {
     /// The same guard on the panic path, which no cleanup on the error branch
     /// could have covered — `catch_unwind` stands in for a panic unwinding out
     /// of `handle_connection_io`.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[test]
     fn a_reader_is_released_when_the_connection_handler_panics() {
         let (_client, server, peer) = socket_pair();
@@ -2601,6 +2630,9 @@ mod tests {
     /// itself. This is the half CA's blocking server still lacks — stopping
     /// the accept loop leaves its clients running — and the reason the server
     /// owns a `ConnRegistry`.
+    // unix-only: POSIX shutdown-wakes-a-parked-read contract; see
+    // `reassembly_is_capped_on_the_accumulated_size_not_the_segment`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_also_ends_a_live_connection() {
         let order = ByteOrder::Little;

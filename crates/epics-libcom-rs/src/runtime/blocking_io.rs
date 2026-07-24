@@ -75,6 +75,14 @@
 //! dropping the guards in that order, or by declaring them in the reverse of
 //! it.
 //!
+//! The reader guard's row is a POSIX contract: `shutdown` waking a thread
+//! parked in a blocking `read` is what unix (RTEMS included) provides and
+//! Windows does not (measured, PR #56 CI 2026-07-24 — the parked read
+//! outlived a 120 s bound). That is why `exec_backend`, the only
+//! configuration that runs these pumps in production, refuses Windows at
+//! compile time (`lib.rs`), and why the tests asserting this contract are
+//! `#[cfg(unix)]`.
+//!
 //! # Where the async goes
 //!
 //! [`block_on_sync`] is the single bridge, in both pumps. On a bare thread it
@@ -1288,6 +1296,15 @@ mod tests {
     }
 
     /// A peer that never reads must not hold the writer pump past the deadline.
+    ///
+    /// unix-only: this asserts the POSIX loopback send-backpressure contract —
+    /// a bounded send buffer, so a never-reading peer parks the sender.
+    /// Windows grows the loopback send backlog dynamically and accepted the
+    /// whole 8 MiB frame in 12 ms (measured, PR #56 CI 2026-07-24), so there
+    /// is no backpressure for the deadline to trip there. The drivers that
+    /// need the deadline run on `exec_backend`, which refuses Windows at
+    /// compile time (`lib.rs`).
+    #[cfg(unix)]
     #[test]
     fn the_deadline_loop_ends_a_trickling_peer() {
         let (client, server) = socket_pair();
@@ -1348,6 +1365,14 @@ mod tests {
 
     /// The reader guard's whole purpose: a pump parked in `read` behind a
     /// timeout longer than the test could wait is returned by the guard's drop.
+    ///
+    /// unix-only: this asserts the POSIX teardown contract — a local
+    /// `shutdown(Shutdown::Both)` returns a thread parked in a blocking
+    /// `read`. Windows does not provide that wake (measured, PR #56 CI
+    /// 2026-07-24: the parked read outlived the 120 s test bound on x86_64),
+    /// which is why `exec_backend` refuses Windows at compile time
+    /// (`lib.rs`) — nothing there can reach the pumps' teardown.
+    #[cfg(unix)]
     #[test]
     fn the_reader_guard_returns_a_pump_parked_in_read() {
         let (client, server) = socket_pair();

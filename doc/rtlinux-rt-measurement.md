@@ -89,15 +89,20 @@ CA and measures `|actual period − 100 ms|`. n=200 per arm.
 | SCHED_FIFO(60) | 12× | 165.6 | **27.6** | **75.2** | 4926.8 | 8324.2 |
 (µs of deviation from the 100 ms period)
 
+**The last column is one sample, not a percentile.** `report()` computes
+`us[ceil(n·p)−1]`, so at **n=200** `p99.9` resolves to index 199 — the
+maximum. The header says "p99.9 / max" because at this sample size they are
+the same number. Every figure in that column is therefore a single worst
+event, and the 8324.2 µs entry in particular must not be read as a
+steady-state tail; see the second correction below.
+
 **Comparative finding:** FIFO scheduling roughly halves typical jitter
 (quiet mean 65.7 vs 118.8 µs; loaded p50 27.6 vs 162.2 µs — the body of the
-distribution is 6× tighter under load). **But the FIFO tail under load is
-worse, not better** (p99.9 8324 vs 3061 µs). That tail is the RT-throttle
-interaction: the callback path is *not* one uninterrupted FIFO thread — the
-scan fires, the CA server serialises the update over tokio worker
-threads that are **not** all FIFO, and the 95 % RT cap (`sched_rt_runtime_us`)
-periodically parks the FIFO portion for 50 ms/period, landing on the tail
-samples.
+distribution is 6× tighter under load). The tail column appears to move the
+other way (8324 vs 3061 µs), but at n=200 that comparison is one FIFO sample
+against one SCHED_OTHER sample and it does not survive a larger run: **at
+matched n=1799 FIFO beats SCHED_OTHER on every statistic including the
+tail** — see the second correction below.
 
 **Correction (2026-07-24) — the tail is not scan-on-the-pool.** The first
 version of this section attributed the tail to `pi-lock-evaluation.md` §6
@@ -119,13 +124,47 @@ the two CA legs are tokio-pool tasks and are the remaining SCHED_OTHER
 exposure. Re-attributing the tail to them is consistent with §3, where the CA
 server path is exactly what FIFO scheduling tightens.
 
-**Not measured:** the re-attribution above is an argument from where the
-threads are, not a measurement — the tail was not decomposed per leg (no
-per-stage timestamps between record process, CA server serialisation and
-client delivery), so the split between the RT-throttle and the CA-pool legs is
-unquantified. Also unmeasured: jitter observed at the record rather than
-through CA (which would isolate the scan leg outright); jitter at scan rates
-other than 10 Hz.
+**Second correction (2026-07-24) — the tail was decomposed, and three of the
+claims above did not survive it.** `doc/rtlinux-scan-tail-decomposition.md`
+supplies the per-stage timestamps this section lacked. Every CA monitor update
+already carries the record's own `DBR_TIME_*` stamp, written by
+`recGblGetTimeStamp` inside record processing on `scan-0.1`; pairing it with
+the client's arrival stamp off the same `CLOCK_REALTIME` gives the identity
+`dB = dA + dC` by construction, so each microsecond of chain deviation is
+scan-side or hop-side arithmetically. Measured identity residual: `0.000000 µs`
+on every arm. What that says about this section:
+
+* **The 8324.2 µs headline is a single rare stall, not a tail.** The same
+  FIFO + 12× arm re-run at **n=5199** (520 s) gives **max 1155.9 µs** and
+  **p99.9 406.6 µs** — 7.2× and 20× below the figure above. Multi-millisecond
+  stalls of that size are real but isolated, at roughly one per 500 s of FIFO
+  monitoring (~0.04 % of samples).
+* **There is no FIFO tail penalty.** At matched **n=1799**, FIFO(60) + 12×
+  against SCHED_OTHER + 12× is **chain p99 130.8 vs 2670.7 µs (20.4×)** and
+  **chain max 199.7 vs 3795.1 µs (19.0×)**. FIFO wins on every statistic; the
+  apparent inversion above is the n=200 artefact.
+* **The RT-throttle hypothesis is refuted.** Setting
+  `sched_rt_runtime_us = -1` (throttle off entirely) and re-running the same
+  arm changes nothing: chain max **173.7 µs off vs 199.7 µs on**, and hop
+  transit p50 moves the *wrong* way (183.6 off vs 167.4 on). A 95 %/1 s cap
+  would park FIFO threads 50 ms once a second — ~500 events across the 520 s
+  long arm; **zero** deviations above 1155.9 µs were seen. The mechanism never
+  fitted either: these FIFO threads are near-0 % duty (10 Hz scan, epoll-blocked
+  CA workers).
+* **Which leg dominates flips with the scheduling class.** Under SCHED_OTHER +
+  load the **scan leg** owns 18/18 of the worst 1 % (scan-leg p99 2634.6 µs) —
+  a dedicated `scan-0.1` thread is preempted by the hogs like anything else.
+  Under FIFO the scan leg collapses to p99 **31.1 µs** (84.7×) and the **CA hop
+  is the entire residual** (48 of the worst 52 samples at n=5199). So the
+  re-attribution above is right in direction for the FIFO arm, and wrong about
+  the SCHED_OTHER arm it was not making a claim about.
+
+**Not measured:** jitter observed at the record rather than through CA is now
+covered (that is the decomposition's scan-leg series); jitter at scan rates
+other than 10 Hz remains unmeasured. The decomposition splits the hop only into
+"server side" vs "client side" by scheduling class — encode, `write`, socket,
+`read`, decode and the `mpsc` hop stay one bucket — and it leaves the rare
+multi-millisecond hop stall unexplained.
 
 ---
 
@@ -304,12 +343,26 @@ compared against the host.
   value, not an upper.
 * **Loopback only, scalar only.** No array payloads, no real network, no
   many-subscriber fan-out in §2/§3.
-* **The scan-tail item in §2 is open — but not against scan.** The
-  FIFO-under-load p99.9 blowup is measured as present. Its cause is *not*
-  `pi-lock-evaluation.md` §6 step 2 (periodic scan was already off the tokio
-  pool at this commit — see §2's correction); the remaining pool legs in the
-  measured chain are the CA server and CA client, and no per-leg decomposition
-  was run to apportion the tail between them and the RT throttle.
+* **The scan-tail item in §2 is closed; one narrower item replaces it.** The
+  per-leg decomposition is `doc/rtlinux-scan-tail-decomposition.md`. It
+  apportions the chain arithmetically (`dB = dA + dC`, residual `0.000000 µs`),
+  retires the FIFO-under-load p99.9 blowup as an n=200 percentile artefact
+  (n=5199: max 1155.9 µs, p99.9 406.6 µs), refutes the RT throttle by
+  disabling it, and finds the dominant leg to be the **scan leg under
+  SCHED_OTHER** and the **CA hop under FIFO**. What stays open is the **rare
+  multi-millisecond hop stall**: 2 events across ~1000 s of FIFO arms (5657.1
+  µs and 1155.9 µs, 99.5 % and 99.96 % hop-side), ~1 per 500 s. Its mechanism
+  is unidentified — nothing there distinguishes a tokio scheduling artefact,
+  a loopback TCP interaction, or host-side KVM preemption — and its rate makes
+  it expensive to bisect.
+* **No CA-leg refactor is justified from this box.** The decomposition's §6
+  verdict: under FIFO the residual hop is chain p99 144.8 µs / hop-transit p99
+  354.3 µs, at or below the ~0.5 ms cyclictest floor §1 measures on this
+  guest. A refactor aimed at it would be targeting a quantity smaller than the
+  floor it must be measured through, so any claimed gain would be
+  unfalsifiable here. The lever that does pay already exists —
+  `EPICS_RS_ALLOW_RT_PRIORITY` plus the banded priorities, 84.7× on the
+  dominant leg — and needs adoption, not restructuring.
 
 This closes `pi-lock-evaluation.md` §7's *"Nothing was measured"* for the Linux
 PI path and delivers its §6 step 7 measurable-regression: the record gate under

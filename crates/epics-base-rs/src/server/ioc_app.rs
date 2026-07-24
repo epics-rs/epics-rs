@@ -638,7 +638,7 @@ impl IocApplication {
         #[cfg(target_os = "rtems")]
         crate::runtime::task::background_init();
 
-        let handle = tokio::runtime::Handle::current();
+        let bridge = crate::runtime::task::BlockingBridge::capture();
 
         let Self {
             port,
@@ -689,7 +689,7 @@ impl IocApplication {
         // use Handle::block_on() which panics inside the tokio runtime context.
         if let Some(script) = startup_script {
             let db1 = db.clone();
-            let h1 = handle.clone();
+            let b1 = bridge.clone();
 
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
@@ -704,7 +704,7 @@ impl IocApplication {
                     let _ = crate::runtime::task::enter_ioc_thread(
                         crate::runtime::task::ThreadPriority::Iocsh,
                     );
-                    let shell = iocsh::IocShell::new(db1, h1);
+                    let shell = iocsh::IocShell::new(db1, b1);
                     for cmd in startup_commands {
                         shell.register(cmd);
                     }
@@ -1064,7 +1064,7 @@ impl IocApplication {
         let pending = db.take_after_ioc_running();
         if !pending.is_empty() {
             let db1 = db.clone();
-            let h1 = handle.clone();
+            let b1 = bridge.clone();
             let shell_cmds_clone = shell_commands.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
@@ -1076,7 +1076,7 @@ impl IocApplication {
                     let _ = crate::runtime::task::enter_ioc_thread(
                         crate::runtime::task::ThreadPriority::Iocsh,
                     );
-                    let shell = iocsh::IocShell::new(db1, h1);
+                    let shell = iocsh::IocShell::new(db1, b1);
                     for cmd in shell_cmds_clone {
                         shell.register(cmd);
                     }
@@ -1632,7 +1632,11 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let shell = iocsh::IocShell::new(db, rt.handle().clone());
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let shell = iocsh::IocShell::new(db, bridge);
         shell.register(db_load_group_startup_command());
 
         // Two distinct group files (the command probes existence early).

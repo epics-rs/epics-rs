@@ -401,7 +401,7 @@ async fn main() -> CaResult<()> {
                 ArgValue::String(s) => s.clone(),
                 _ => return Err("expected macros string".into()),
             };
-            optics_rs::seq_runner::seq_start(&program, &macros, ctx.runtime_handle(), ctx.db())?;
+            optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())?;
             Ok(CommandOutcome::Continue)
         },
     ));

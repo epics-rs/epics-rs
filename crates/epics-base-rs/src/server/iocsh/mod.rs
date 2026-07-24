@@ -46,7 +46,11 @@ pub struct IocShell {
 
 impl IocShell {
     /// Create a new shell with built-in commands registered.
-    pub fn new(db: Arc<PvDatabase>, handle: tokio::runtime::Handle) -> Self {
+    ///
+    /// `bridge` carries the runtime access the shell's blocking thread needs;
+    /// capture it where the runtime is known (`BlockingBridge::capture()` on
+    /// the async setup path).
+    pub fn new(db: Arc<PvDatabase>, bridge: crate::runtime::task::BlockingBridge) -> Self {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
         // C `iocshRegisterCommon` publishes the base version and target arch as
@@ -55,7 +59,7 @@ impl IocShell {
         crate::runtime::env::register_iocsh_env_vars();
         Self {
             registry: Arc::new(RwLock::new(registry)),
-            ctx: CommandContext::new(db, handle),
+            ctx: CommandContext::new(db, bridge),
             on_error: std::cell::Cell::new(OnError::Continue),
         }
     }
@@ -721,14 +725,17 @@ mod tests {
     fn make_shell() -> IocShell {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let handle = rt.handle().clone();
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
         rt.block_on(async {
             db.add_record("TEST_REC", Box::new(AiRecord::new(42.0)))
                 .await
                 .unwrap();
         });
         std::mem::forget(rt);
-        IocShell::new(db, handle)
+        IocShell::new(db, bridge)
     }
 
     /// C `iocshRegisterCommon` publishes the base version and the target arch

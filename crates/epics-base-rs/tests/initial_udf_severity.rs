@@ -1,4 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): IocShell::new takes a tokio Handle, so one test needs an ambient tokio runtime; runs and passes in the feature-ON suite.
 //! R16-82: the initial UDF severity — a record that has never processed is
 //! INVALID, not NO_ALARM.
 //!
@@ -165,11 +164,7 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
 /// The same rule on the runtime `dbLoadRecords` path — the second `.db` loader.
 /// The seed is evaluated by the creation sink, which both loaders now hand
 /// their complete field set to, so neither can init a half-loaded record.
-///
-/// `#[tokio::test]`, not `#[epics_test]`: `IocShell::new` takes a
-/// `tokio::runtime::Handle`, so this body needs an ambient tokio runtime on
-/// both backends (the census marker accounts for it).
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
     use epics_base_rs::server::iocsh::IocShell;
 
@@ -185,10 +180,11 @@ async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
     let db = std::sync::Arc::new(PvDatabase::new());
     {
         // iocsh commands block on the runtime, so they run off the async thread.
-        let (db, handle) = (db.clone(), tokio::runtime::Handle::current());
+        let db = db.clone();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
         let line = format!("dbLoadRecords(\"{}\")", db_file.display());
         std::thread::spawn(move || {
-            IocShell::new(db, handle).execute_line(&line).unwrap();
+            IocShell::new(db, bridge).execute_line(&line).unwrap();
         })
         .join()
         .unwrap();

@@ -266,8 +266,11 @@ mod tests {
     fn make_ctx() -> CommandContext {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
-        let handle = rt.handle().clone();
-        let ctx = CommandContext::new(db, handle);
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(db, bridge);
         std::mem::forget(rt);
         ctx
     }

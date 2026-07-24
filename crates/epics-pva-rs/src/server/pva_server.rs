@@ -296,7 +296,7 @@ impl PvaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
-        let handle = tokio::runtime::Handle::current();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
             .autosave_manager
@@ -313,7 +313,7 @@ impl PvaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, handle);
+            let shell = iocsh::IocShell::new(db, bridge);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {
@@ -353,7 +353,7 @@ impl PvaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
-        let handle = tokio::runtime::Handle::current();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
             .autosave_manager
@@ -372,7 +372,7 @@ impl PvaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, handle);
+            let shell = iocsh::IocShell::new(db, bridge);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {

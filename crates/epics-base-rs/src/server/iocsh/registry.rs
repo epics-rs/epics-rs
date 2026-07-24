@@ -87,16 +87,16 @@ impl CommandDef {
 /// Sync→async bridge for commands running on a blocking thread.
 pub struct CommandContext {
     db: Arc<PvDatabase>,
-    handle: tokio::runtime::Handle,
+    bridge: crate::runtime::task::BlockingBridge,
     /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
     output: std::cell::RefCell<Box<dyn std::io::Write>>,
 }
 
 impl CommandContext {
-    pub fn new(db: Arc<PvDatabase>, handle: tokio::runtime::Handle) -> Self {
+    pub fn new(db: Arc<PvDatabase>, bridge: crate::runtime::task::BlockingBridge) -> Self {
         Self {
             db,
-            handle,
+            bridge,
             output: std::cell::RefCell::new(Box::new(std::io::stdout())),
         }
     }
@@ -106,9 +106,11 @@ impl CommandContext {
         &self.db
     }
 
-    /// Access the tokio runtime handle (e.g., for spawning tasks from iocsh commands).
-    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
-        &self.handle
+    /// The captured runtime access — for spawning tasks or blocking on async
+    /// work from iocsh command handlers (which run on the blocking shell
+    /// thread, where the tokio backend's runtime is otherwise unreachable).
+    pub fn bridge(&self) -> &crate::runtime::task::BlockingBridge {
+        &self.bridge
     }
 
     /// Print a line to the current output (stdout or redirected file).
@@ -154,11 +156,7 @@ impl CommandContext {
     /// # Panics
     /// Panics if called from within a tokio runtime thread.
     pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "CommandContext::block_on() must not be called from a tokio runtime thread"
-        );
-        self.handle.block_on(future)
+        self.bridge.block_on(future)
     }
 }
 

@@ -14,11 +14,14 @@ use epics_base_rs::server::iocsh::IocShell;
 fn shell_with_ad_ioc_startup_commands(ioc: &AdIoc) -> IocShell {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let db = Arc::new(PvDatabase::new());
-    let handle = rt.handle().clone();
+    let bridge = {
+        let _guard = rt.enter();
+        epics_base_rs::runtime::task::BlockingBridge::capture()
+    };
     // The shell's command handlers block on this runtime; it must outlive them.
     std::mem::forget(rt);
 
-    let shell = IocShell::new(db, handle);
+    let shell = IocShell::new(db, bridge);
     for def in ioc.app().startup_commands() {
         shell.register(def.clone());
     }

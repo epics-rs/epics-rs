@@ -153,6 +153,96 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
+/// A capability, captured where the backend's executor is reachable, to run
+/// async work from a plain blocking thread (iocsh, a REPL, a script thread).
+///
+/// [`block_on_sync`] answers "may I block *here*, now?" per call and can only
+/// use whatever runtime is visible on the calling thread. This type answers
+/// the reachability question once, at [`capture`](Self::capture) time, and
+/// carries the answer to a thread the runtime is otherwise invisible from: a
+/// tokio handle is thread-local state, so a blocking thread spawned *before*
+/// it exists has no way to find it. The exec backend's executor is
+/// process-global, so there is nothing to carry and the bridge is a ZST —
+/// which is what makes an API taking a `BlockingBridge` compile and work on
+/// both backends, where one taking `tokio::runtime::Handle` pinned every
+/// caller to tokio.
+#[cfg(tokio_backend)]
+#[derive(Clone)]
+pub struct BlockingBridge {
+    handle: tokio::runtime::Handle,
+}
+
+/// See the `tokio_backend` definition. The executor here is the
+/// process-global background executor, reachable from any thread, so there is
+/// no state to capture.
+#[cfg(exec_backend)]
+#[derive(Clone)]
+pub struct BlockingBridge;
+
+#[cfg(tokio_backend)]
+impl BlockingBridge {
+    /// Capture the current tokio runtime.
+    ///
+    /// # Panics
+    /// Panics when no runtime is entered on this thread — call it on the
+    /// async setup path (where the runtime is known), not on the blocking
+    /// thread the bridge is being made for.
+    pub fn capture() -> Self {
+        Self {
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+
+    /// Drive `fut` to completion on this thread, with the captured runtime
+    /// entered so the future may spawn and use the reactor.
+    ///
+    /// # Panics
+    /// Panics on a runtime worker thread: blocking one parks tasks that may
+    /// include the future's own wakers (the same refusal `block_on_sync`
+    /// reports as a value).
+    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        assert!(
+            RuntimeHandle::try_current().is_err(),
+            "BlockingBridge::block_on must not be called from a runtime thread"
+        );
+        self.handle.block_on(fut)
+    }
+
+    /// Spawn `future` onto the captured runtime — [`spawn`] for a thread the
+    /// runtime is not entered on.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+}
+
+#[cfg(exec_backend)]
+impl BlockingBridge {
+    /// The exec backend's executor is process-global; capturing is a no-op
+    /// and never panics.
+    pub fn capture() -> Self {
+        Self
+    }
+
+    /// Drive `fut` on this thread via [`park_on`]; whatever it spawns or
+    /// sleeps on lands on the background executor.
+    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        park_on(fut)
+    }
+
+    /// [`spawn`] — the global executor needs no captured state.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn(future)
+    }
+}
+
 /// Drive an async test body to completion — the driver behind
 /// `#[epics_test]` (`epics-macros-rs`).
 ///

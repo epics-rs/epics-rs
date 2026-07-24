@@ -846,19 +846,19 @@ async fn apply_pf4_actions(
     ch_filter_glass: &DbChannel,
 ) {
     if let Some(t) = actions.write_transmission {
-        let _ = ch_trans.put_f64_post(t).await;
+        let _ = ch_trans.put_f64_process(t).await;
     }
     if let Some(t) = actions.write_inv_transmission {
-        let _ = ch_inv_trans.put_f64_post(t).await;
+        let _ = ch_inv_trans.put_f64_process(t).await;
     }
     if let Some(t) = actions.write_filter_al {
-        let _ = ch_filter_al.put_f64_post(t).await;
+        let _ = ch_filter_al.put_f64_process(t).await;
     }
     if let Some(t) = actions.write_filter_ti {
-        let _ = ch_filter_ti.put_f64_post(t).await;
+        let _ = ch_filter_ti.put_f64_process(t).await;
     }
     if let Some(t) = actions.write_filter_glass {
-        let _ = ch_filter_glass.put_f64_post(t).await;
+        let _ = ch_filter_glass.put_f64_process(t).await;
     }
 }
 

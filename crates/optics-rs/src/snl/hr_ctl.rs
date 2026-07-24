@@ -542,12 +542,12 @@ pub async fn run(
         op_mode,
         geom,
     );
-    let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
-    let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
-    let _ = ch_phi2_rdbk.put_f64_post(rdbk.phi2_rdbk).await;
-    let _ = ch_theta2_rdbk.put_f64_post(rdbk.theta2_rdbk).await;
-    let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
-    let _ = ch_e_rdbk.put_f64_post(rdbk.e_rdbk).await;
+    let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
+    let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
+    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
+    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
+    let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
+    let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
 
     let _ = ch_msg1.put_string("HR Control Ready").await;
     let _ = ch_msg2.put_string(" ").await;
@@ -668,13 +668,13 @@ pub async fn run(
                 op_mode,
                 geom,
             );
-            let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
-            let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
-            let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
-            let _ = ch_e_rdbk.put_f64_post(rdbk.e_rdbk).await;
+            let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
+            let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
+            let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
+            let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
             if op_mode != HrOpMode::Single {
-                let _ = ch_phi2_rdbk.put_f64_post(rdbk.phi2_rdbk).await;
-                let _ = ch_theta2_rdbk.put_f64_post(rdbk.theta2_rdbk).await;
+                let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
+                let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
             }
         } else if changed_pv == pv_world_off {
             world_off = ch_world_off.get_f64().await;
@@ -799,13 +799,13 @@ pub async fn run(
             op_mode,
             geom,
         );
-        let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
-        let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
-        let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
-        let _ = ch_e_rdbk.put_f64_post(rdbk.e_rdbk).await;
+        let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
+        let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
+        let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
+        let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
         if op_mode != HrOpMode::Single {
-            let _ = ch_phi2_rdbk.put_f64_post(rdbk.phi2_rdbk).await;
-            let _ = ch_theta2_rdbk.put_f64_post(rdbk.theta2_rdbk).await;
+            let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
+            let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
         }
 
         // -- Calc motor movements --
@@ -891,13 +891,13 @@ pub async fn run(
                     op_mode,
                     geom,
                 );
-                let _ = ch_phi1_rdbk.put_f64_post(rdbk.phi1_rdbk).await;
-                let _ = ch_theta1_rdbk.put_f64_post(rdbk.theta1_rdbk).await;
-                let _ = ch_lambda_rdbk.put_f64_post(rdbk.lambda_rdbk).await;
-                let _ = ch_e_rdbk.put_f64_post(rdbk.e_rdbk).await;
+                let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
+                let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
+                let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
+                let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
                 if op_mode != HrOpMode::Single {
-                    let _ = ch_phi2_rdbk.put_f64_post(rdbk.phi2_rdbk).await;
-                    let _ = ch_theta2_rdbk.put_f64_post(rdbk.theta2_rdbk).await;
+                    let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
+                    let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
                 }
 
                 let d1_done = ch_phi1_dmov.get_i16().await != 0;

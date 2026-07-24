@@ -1038,7 +1038,7 @@ pub async fn run(
                 // 671-679). NOT into {P}a, which is a user lattice-param input.
                 for (i, row) in ch_a0.iter().enumerate() {
                     for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_post(a0[i][j]).await;
+                        let _ = ch.put_f64_process(a0[i][j]).await;
                     }
                 }
             }
@@ -1046,7 +1046,7 @@ pub async fn run(
                 // C: OMTX[i][j] -> {P}OMTX_ij, pvPut each (orient_st.st:534-539).
                 for (i, row) in ch_omtx.iter().enumerate() {
                     for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_post(omtx[i][j]).await;
+                        let _ = ch.put_f64_process(omtx[i][j]).await;
                     }
                 }
             }

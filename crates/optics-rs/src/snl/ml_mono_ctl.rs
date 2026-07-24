@@ -674,9 +674,9 @@ pub async fn run(
             theta_rdbk_val = rbv;
             lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
             e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
+            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
+            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
+            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
         } else if changed_pv == pv_theta2_mot_rbv {
             let _ = ch_theta2_rdbk_echo.put_f64(new_val).await;
         } else if changed_pv == pv_theta_hilim {
@@ -759,9 +759,9 @@ pub async fn run(
         theta_rdbk_val = current_rbv;
         lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
         e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-        let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
-        let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
-        let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
+        let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
+        let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
+        let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
 
         // -- Calc movements --
         let theta_mot_desired = theta_val;
@@ -862,9 +862,9 @@ pub async fn run(
                 theta_rdbk_val = rbv;
                 lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
                 e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
+                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
+                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
+                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
                 let _ = ch_theta_rdbk_echo.put_f64(rbv).await;
                 let _ = ch_theta2_rdbk_echo
                     .put_f64(ch_theta2_mot_rbv.get_f64().await)
@@ -894,9 +894,9 @@ pub async fn run(
             theta_rdbk_val = rbv;
             lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
             e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_post(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_post(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_post(e_rdbk_val).await;
+            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
+            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
+            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
             let _ = ch_moving.put_i16(0).await;
         }
 

@@ -15,6 +15,8 @@
 //! keep the current behavior: return `Err` and process NOTHING, matching C
 //! `dbPutField` (dbAccess.c:1263 processes only when `dbPut` status==0).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -109,7 +111,7 @@ async fn rejected_notify_put_still_processes() {
         "C db_put_process returns didPut=1 despite the failure, so the record still processes"
     );
     assert_eq!(
-        db.get_pv("REC.VAL").await.unwrap(),
+        db.get_pv("REC.VAL").unwrap(),
         EpicsValue::Double(0.0),
         "no field was written — dbChannelPut wrote nothing on the rejected conversion"
     );
@@ -151,7 +153,7 @@ async fn accepted_notify_put_processes_and_writes() {
         "the accepted put processes once"
     );
     assert_eq!(
-        db.get_pv("REC.VAL").await.unwrap(),
+        db.get_pv("REC.VAL").unwrap(),
         EpicsValue::Double(3.5),
         "and the value landed"
     );

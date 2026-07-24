@@ -23,6 +23,8 @@
 //! process path, where C erases the alarm; recorded as a CBUG-F12 allowlist
 //! row.)
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
@@ -35,8 +37,8 @@ async fn process(db: &PvDatabase, name: &str) {
 
 /// (SEVR, STAT) as a client would read them.
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     (inst.common.sevr, inst.common.stat)
 }
 

@@ -45,7 +45,7 @@
 //!
 //! ## pvalink (PVA links for record INP/OUT)
 //!
-//! Resolves record INP/OUT link strings of the form `@pva://<remote-pv>`
+//! Resolves record INP/OUT link strings of the form `pva://<remote-pv>`
 //! to a live PVA client that periodically reads the remote PV (INP) or
 //! pushes record output to it (OUT). Mirrors pvxs `ioc/pvalink*.cpp`.
 //!
@@ -63,10 +63,10 @@ pub use error::{BridgeError, BridgeResult};
 // bridge and PVA links — both need to translate record values to/from
 // pvData. Gated on the consumers that enable `epics-pva-rs` (the only
 // extra dependency it uses) so a CA-only build still drops it.
-#[cfg(any(feature = "qsrv", feature = "pvalink"))]
+#[cfg(any(feature = "qsrv-core", feature = "pvalink"))]
 pub mod convert;
 
-#[cfg(feature = "qsrv")]
+#[cfg(feature = "qsrv-core")]
 pub mod qsrv;
 
 #[cfg(feature = "ca-gateway")]
@@ -89,7 +89,7 @@ pub use async_trait::async_trait;
 
 // Convenience re-exports for the QSRV bridge (default feature).
 // External users can write `epics_bridge_rs::BridgeProvider` directly.
-#[cfg(feature = "qsrv")]
+#[cfg(feature = "qsrv-core")]
 pub use qsrv::{
     AccessContext, AccessControl, AllowAllAccess, AnyChannel, AnyMonitor, BridgeChannel,
     BridgeMonitor, BridgeProvider, Channel, ChannelProvider, ClientCreds, FieldMapping,

@@ -1,3 +1,10 @@
+//! Reactor-dependent in full: its mock source delays `slow` with `tokio::time::sleep` inside
+//! `get_introspection`/`get_value`, and under `rtems-exec-model` the
+//! `runtime::task` seam drives that future on a `cbMedium` executor worker
+//! with no tokio reactor, so the fixture panics with "there is no reactor
+//! running". Gated at file scope because every test here shares that source.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 //! pvxs `pvxget` / `pvxinfo` install a per-operation `.result()` callback
 //! that fires the instant *that* op completes (tools/get.cpp:107-119,
 //! tools/info.cpp:86-99), so a fast PV is visible before a slow or missing
@@ -56,7 +63,10 @@ impl ChannelSource for TwoSpeedSource {
     async fn is_writable(&self, _name: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _name: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }

@@ -1,3 +1,10 @@
+//! Reactor-dependent in full: its mock source drives the monitor stream from a bare
+//! `tokio::spawn` that sleeps between posts, and under `rtems-exec-model` the
+//! `runtime::task` seam drives that future on a `cbMedium` executor worker
+//! with no tokio reactor, so the fixture panics with "there is no reactor
+//! running". Gated at file scope because every test here shares that source.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 //! Server-side regression: a mid-stream SET_BYTE_ORDER must re-latch the
 //! outbound order for an ALREADY-RUNNING monitor task, not only for the
 //! connection's synchronous replies and heartbeat.
@@ -16,6 +23,7 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -65,7 +73,7 @@ impl ChannelSource for StreamingSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
         let (tx, rx) = mpsc::channel::<PvField>(8);
         tokio::spawn(async move {
             let mut i = 1.0f64;
@@ -74,7 +82,7 @@ impl ChannelSource for StreamingSource {
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
         });
-        Some(rx)
+        Some(rx.into())
     }
 }
 

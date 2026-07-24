@@ -13,14 +13,15 @@
 //! assertion that the info reaches the server report.
 
 #![cfg(test)]
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 // `ChannelSource` trait methods return `impl Future` (RPITIT); test impls
 // mirror that shape rather than `async fn`, as in the sibling test files.
 #![allow(clippy::manual_async_fn)]
 
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::mpsc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer};
@@ -72,7 +73,7 @@ impl ChannelSource for InfoSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     /// The hook under test: attach per-channel info for the served PV.
@@ -172,7 +173,7 @@ async fn default_source_leaves_report_info_none() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }

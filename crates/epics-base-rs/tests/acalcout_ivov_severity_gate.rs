@@ -17,6 +17,8 @@
 //! IVOA=Set_output_to_IVOV. Severity is the framework's — the record may not
 //! re-derive it from a private flag.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,8 +108,8 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     let mut v = HashSet::new();
     db.process_record_with_links("AC", &mut v, 0).await.unwrap();
 
-    let rec = db.get_record("AC").await.unwrap();
-    let guard = rec.read().await;
+    let rec = db.get_record("AC").unwrap();
+    let guard = rec.read();
     assert_eq!(
         guard.common.sevr,
         AlarmSeverity::Invalid,
@@ -161,8 +163,8 @@ async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
     db.process_record_with_links("AC", &mut v, 0).await.unwrap();
 
     assert_eq!(writes.load(Ordering::SeqCst), 0, "OOPT=Never: no OUT write");
-    let rec = db.get_record("AC").await.unwrap();
-    let guard = rec.read().await;
+    let rec = db.get_record("AC").unwrap();
+    let guard = rec.read();
     assert_eq!(
         guard.record.get_field("VAL"),
         Some(EpicsValue::Double(10.0)),

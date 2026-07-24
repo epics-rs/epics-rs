@@ -3,31 +3,30 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
+// RTEMS-EXEC-MODEL-ALLOW(28): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::client_native::context::PvGetResult; // not used; kept for re-export hygiene
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::SourceRead;
 use crate::server_native::{ChannelSource, OpError};
 
-use epics_base_rs::server::access_security::AccessSecurityConfig;
+use crate::server_native::source::{MonitorStream, UpstreamMonitor};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{EpicsValue, WallTime};
-use tokio::sync::RwLock;
 
-/// Shared, mutable ACF cell. Changed from
-/// `Arc<Option<AccessSecurityConfig>>` to `Arc<RwLock<...>>` so
-/// `PvaServer::reload_acf_from` can swap the policy at runtime
-/// (mirrors `CaServer::reload_acf`). All `PvDatabaseSource` ACF
-/// check sites acquire a read guard; the `/reload-acf` introspection
-/// endpoint and any future site-policy SIGHUP handler acquire a
-/// write guard via `PvaServer::reload_acf_from`.
-pub type AcfCell = Arc<RwLock<Option<AccessSecurityConfig>>>;
+/// Shared, mutable ACF cell — an alias for the base type, so the PVA server,
+/// the CA server and the gateway all share one cell type. Lock-free:
+/// `PvaServer::reload_acf_from` (and the `/reload-acf` introspection endpoint
+/// behind it) publishes a new policy, and every `PvDatabaseSource` ACF check
+/// takes an `Arc` snapshot rather than a read guard. See
+/// `doc/rtems-priority-locks-design.md` §3 row L9.
+pub type AcfCell = epics_base_rs::server::access_security::AcfCell;
 
 /// Native `ChannelSource` over a `PvDatabase`.
 pub struct PvDatabaseSource {
@@ -44,7 +43,7 @@ pub struct PvDatabaseSource {
 
 impl PvDatabaseSource {
     pub fn new(db: Arc<PvDatabase>) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let gate = Self::build_gate(db.clone(), acf, None);
         Self { db, gate }
     }
@@ -83,8 +82,8 @@ impl PvDatabaseSource {
             let db = asg_db.clone();
             Box::pin(async move {
                 let (base, _field) = parse_pv_name(&pv_name);
-                if let Some(rec) = db.get_record(base).await {
-                    let inst = rec.read().await;
+                if let Some(rec) = db.get_record(base) {
+                    let inst = rec.read();
                     return (inst.common.access_group().to_string(), inst.common.asl);
                 }
                 ("DEFAULT".to_string(), 0u8)
@@ -99,8 +98,8 @@ impl PvDatabaseSource {
             Box::pin(async move {
                 let (base, field) = parse_pv_name(&link);
                 let field = if field.is_empty() { "VAL" } else { field };
-                let rec = db.get_record(base).await?;
-                let inst = rec.read().await;
+                let rec = db.get_record(base)?;
+                let inst = rec.read();
                 inst.resolve_field(field).and_then(|v| v.to_f64())
             })
         });
@@ -572,9 +571,9 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
     let (_base, field) = parse_pv_name(name);
     match db.find_entry(name).await? {
-        PvEntry::Simple(pv) => Some(pv.snapshot().await),
+        PvEntry::Simple(pv) => Some(pv.snapshot()),
         PvEntry::Record(rec) => {
-            let inst = rec.read().await;
+            let inst = rec.read();
             inst.snapshot_for_field(field)
         }
     }
@@ -594,7 +593,7 @@ impl ChannelSource for PvDatabaseSource {
             // a PVA client doing channelList must see them so it can
             // connect by alias. has_name and find_entry already
             // resolve aliases on the server side.
-            names.extend(db.all_alias_names().await);
+            names.extend(db.all_alias_names());
             names
         }
     }
@@ -729,11 +728,11 @@ impl ChannelSource for PvDatabaseSource {
             // processing, and the client cannot stamp them.
             match db.find_entry(&name).await {
                 Some(PvEntry::Simple(pv)) => {
-                    let prior = pv.snapshot().await;
+                    let prior = pv.snapshot();
                     let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
                         OpError::failed("PUT value not representable as EpicsValue")
                     })?;
-                    pv.set_snapshot(snap).await;
+                    pv.set_snapshot(snap);
                     Ok(())
                 }
                 // A record-backed channel is an EXTERNAL client put, so it
@@ -845,7 +844,7 @@ impl ChannelSource for PvDatabaseSource {
         ctx: crate::server_native::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
     > + Send {
         let db = self.db.clone();
         async move {
@@ -867,49 +866,29 @@ impl ChannelSource for PvDatabaseSource {
             // same events arrive; each is narrowed by its own posted mask
             // below. The prior VALUE|LOG subscription could not deliver a
             // DBE_PROPERTY event at all.
-            let mut sub = DbSubscription::subscribe_with_mask(
+            let sub = DbSubscription::subscribe_with_mask(
                 &db,
                 &name,
                 0,
                 crate::nt::monitor_mask().bits(),
             )
             .await?;
-            let (tx, rx) = mpsc::channel::<crate::server_native::source::MonitorUpdate>(64);
-            tokio::spawn(async move {
-                while let Some(ev) = sub.recv_event().await {
-                    let marked = crate::nt::event_leaves(
-                        ev.mask,
-                        ev.snapshot.properties,
-                        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
-                    );
-                    // A class that marks nothing is an event with no wire
-                    // meaning — C would have assigned no leaf either.
-                    if marked.is_empty() {
-                        continue;
-                    }
-                    let update = crate::server_native::source::MonitorUpdate {
-                        marked: Some(marked),
-                        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(
-                            &ev.snapshot,
-                        ))
-                    };
-                    if tx.send(update).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(rx)
+            // The subscription IS the stream: `marked_update` runs as the
+            // server pulls, so no task stands between the two.
+            Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
+                sub,
+                marked_update,
+            )))
         }
     }
 
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let db = self.db.clone();
         let name = name.to_string();
         async move {
-            let (tx, rx) = mpsc::channel::<PvField>(64);
             let entry = db.find_entry(&name).await?;
             match entry {
                 PvEntry::Simple(pv) => {
@@ -922,51 +901,68 @@ impl ChannelSource for PvDatabaseSource {
                     // `ProcessVariable::set` -> `notify_subscribers`.
                     use epics_base_rs::server::pv::PvSubscription;
                     match PvSubscription::subscribe(pv.clone()).await {
-                        Some(mut sub) => {
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
-                            tokio::spawn(async move {
-                                if tx.send(initial).await.is_err() {
-                                    return;
-                                }
-                                while let Some(snap) = sub.recv_snapshot().await {
-                                    let field = snapshot_to_pv_field(&snap);
-                                    if tx.send(field).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                // `sub` drops here → its `Drop` removes the
-                                // subscriber slot from the ProcessVariable.
-                            });
+                        Some(sub) => {
+                            let initial = snapshot_to_pv_field(&pv.snapshot());
+                            // The seed rides on the stream and is handed out
+                            // ahead of the subscription's own events, exactly
+                            // as the bridge's `tx.send(initial)` did before it
+                            // entered the loop. Dropping the stream drops
+                            // `sub`, whose `Drop` removes the subscriber slot
+                            // from the ProcessVariable.
+                            Some(MonitorStream::Upstream(
+                                UpstreamMonitor::from_pv(sub, event_field).with_seed(initial),
+                            ))
                         }
                         None => {
                             // Per-PV subscriber cap reached: still honour the
                             // connect-time read so the client at least sees
-                            // the current value.
-                            let initial = snapshot_to_pv_field(&pv.snapshot().await);
-                            let _ = tx.send(initial).await;
+                            // the current value, then end the stream.
+                            let (tx, rx) = mpsc::channel::<PvField>(1);
+                            let _ = tx.send(snapshot_to_pv_field(&pv.snapshot())).await;
+                            Some(MonitorStream::Channel(rx))
                         }
                     }
                 }
                 PvEntry::Record(_rec) => {
                     // Subscribe via the public DbSubscription API.
                     use epics_base_rs::server::database::db_access::DbSubscription;
-                    let mut sub = match DbSubscription::subscribe(&db, &name).await {
-                        Some(s) => s,
-                        None => return None,
-                    };
-                    tokio::spawn(async move {
-                        while let Some(snap) = sub.recv_snapshot().await {
-                            let pv = snapshot_to_pv_field(&snap);
-                            if tx.send(pv).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    let sub = DbSubscription::subscribe(&db, &name).await?;
+                    Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
+                        sub,
+                        event_field,
+                    )))
                 }
             }
-            Some(rx)
         }
     }
+}
+
+/// The per-event transform the record-backed marked-monitor bridge task used
+/// to apply. A free `fn` so it can be a [`UpstreamMonitor`] map pointer.
+///
+/// `None` (the bridge's `continue`) is an event whose `DBE_*` class marks no
+/// leaf — no wire meaning, since C would have assigned none either.
+fn marked_update(
+    ev: epics_base_rs::server::pv::MonitorEvent,
+) -> Option<crate::server_native::source::MonitorUpdate> {
+    let marked = crate::nt::event_leaves(
+        ev.mask,
+        ev.snapshot.properties,
+        matches!(&ev.snapshot.value, EpicsValue::Enum(_)),
+    );
+    if marked.is_empty() {
+        return None;
+    }
+    Some(crate::server_native::source::MonitorUpdate {
+        marked: Some(marked),
+        ..crate::server_native::source::MonitorUpdate::from(snapshot_to_pv_field(&ev.snapshot))
+    })
+}
+
+/// The unmarked transform of the two plain `subscribe` bridge tasks: every
+/// event yields its snapshot as a `PvField`, none are filtered.
+fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
+    Some(snapshot_to_pv_field(&ev.snapshot))
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
@@ -1208,8 +1204,6 @@ fn scalar_to_epics(v: &ScalarValue) -> EpicsValue {
 
 #[allow(unused_imports)]
 use crate::error::PvaError;
-#[allow(unused_imports)]
-type _Pvr = PvGetResult;
 
 #[cfg(test)]
 mod tests {
@@ -1250,7 +1244,7 @@ mod tests {
             &self,
             pv: &str,
             ctx: ChannelContext,
-        ) -> Option<tokio::sync::mpsc::Receiver<PvField>>;
+        ) -> Option<MonitorStream<PvField>>;
     }
 
     impl PvaSourceTestExt for PvDatabaseSource {
@@ -1279,7 +1273,7 @@ mod tests {
             &self,
             pv: &str,
             ctx: ChannelContext,
-        ) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        ) -> Option<MonitorStream<PvField>> {
             let checked = self
                 .access()
                 .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
@@ -2246,19 +2240,21 @@ mod tests {
     /// sent one snapshot and dropped the channel, so a PVA PUT through the
     /// same server never reached the monitor. pvxs `SharedPV::post()` fans
     /// every update out to its stored subscribers (`sharedpv.cpp:417-440`).
+    /// The `value` leaf of a monitor frame, whether the source framed a bare
+    /// scalar or a full NT structure.
+    fn monitor_double(field: &PvField) -> Option<f64> {
+        match field {
+            PvField::Scalar(ScalarValue::Double(v)) => Some(*v),
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::Scalar(ScalarValue::Double(v))) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn simple_pv_monitor_observes_later_puts() {
-        fn monitor_double(field: &PvField) -> Option<f64> {
-            match field {
-                PvField::Scalar(ScalarValue::Double(v)) => Some(*v),
-                PvField::Structure(s) => match s.get_field("value") {
-                    Some(PvField::Scalar(ScalarValue::Double(v))) => Some(*v),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-
         let db = Arc::new(PvDatabase::new());
         db.add_pv("SIMPLE:MON", EpicsValue::Double(1.0))
             .await
@@ -2319,12 +2315,12 @@ ASG(SECURE) {
             .await
             .unwrap();
         // Mark the record as belonging to the SECURE ASG.
-        let rec = db.get_record("AI:SECURE").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        let rec = db.get_record("AI:SECURE").unwrap();
+        rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Allowed: admin from lab-pc1 — must succeed.
@@ -2375,12 +2371,12 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LOCKED").await.unwrap();
-        rec.write().await.common.asg = "LOCKED".to_string();
+        let rec = db.get_record("AI:LOCKED").unwrap();
+        rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // alice gets a value back.
@@ -2415,12 +2411,12 @@ ASG(LOCKED) {
         db.add_record("AI:MON", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:MON").await.unwrap();
-        rec.write().await.common.asg = "LOCKED".to_string();
+        let rec = db.get_record("AI:MON").unwrap();
+        rec.write().common.asg = "LOCKED".to_string();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         let rx = source
@@ -2452,14 +2448,14 @@ ASG(SECURE) {
 "#,
         )
         .unwrap();
-        let cell: AcfCell = Arc::new(RwLock::new(Some(lockdown)));
+        let cell: AcfCell = epics_base_rs::server::access_security::new_acf_cell(Some(lockdown));
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("AI:LIVE", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:LIVE").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        let rec = db.get_record("AI:LIVE").unwrap();
+        rec.write().common.asg = "SECURE".to_string();
 
         let source = PvDatabaseSource::new_with_acf(db.clone(), cell.clone());
 
@@ -2486,7 +2482,7 @@ ASG(SECURE) {
 "#,
         )
         .unwrap();
-        *cell.write().await = Some(permissive);
+        cell.store(Some(Arc::new(permissive)));
 
         // Second put: succeeds under the new policy.
         source
@@ -2545,17 +2541,11 @@ ASG(LOCKED) {
         db.add_record("AI:LOCKED", Box::new(AiRecord::new(7.5)))
             .await
             .unwrap();
-        db.get_record("AI:LOCKED")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .asg = "LOCKED".into();
+        db.get_record("AI:LOCKED").unwrap().write().common.asg = "LOCKED".into();
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Allowed peer: gate mints a ReadWrite/Read token → source
@@ -3058,13 +3048,7 @@ ASG(DEFAULT) {
         // ASL is a u8; the parser clamps to 0/1 via put_common_field,
         // but the underlying field accepts any u8 — set it directly
         // for the test to exercise the gate above C's 0/1 range.
-        db.get_record("AI:LOCKED")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .asl = 3;
+        db.get_record("AI:LOCKED").unwrap().write().common.asl = 3;
 
         db.add_record("AI:OPEN", Box::new(AiRecord::new(0.0)))
             .await
@@ -3073,7 +3057,7 @@ ASG(DEFAULT) {
 
         let source = PvDatabaseSource::new_with_acf(
             db.clone(),
-            Arc::new(tokio::sync::RwLock::new(Some(acf))),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
         );
 
         // Locked: WRITE rule skipped (record_asl 3 > rule.level 2),
@@ -3173,7 +3157,7 @@ ASG(DEFAULT) {
         let ctx = make_ctx("localhost", "op", "ca");
 
         assert_eq!(
-            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            db.get_pv("CALC:PUT.UDF").expect("UDF get"),
             EpicsValue::UChar(1),
             "a record that has never processed is UDF"
         );
@@ -3191,13 +3175,13 @@ ASG(DEFAULT) {
             .expect("PUT must succeed");
 
         assert_eq!(
-            db.get_pv("CALC:PUT.UDF").await.expect("UDF get"),
+            db.get_pv("CALC:PUT.UDF").expect("UDF get"),
             EpicsValue::UChar(0),
             "an external PUT owes dbPutField, which processes a PASSIVE record \
              and clears UDF — `put_pv` (dbPut) would leave it set"
         );
         assert_eq!(
-            db.get_pv("CALC:PUT.VAL").await.expect("VAL get"),
+            db.get_pv("CALC:PUT.VAL").expect("VAL get"),
             EpicsValue::Double(3.0),
             "processing must evaluate CALC=\"A\" into VAL"
         );
@@ -3308,6 +3292,116 @@ ASG(DEFAULT) {
             !property.iter().any(|l| l == "value" || l == "timeStamp"),
             "a property-only post assigns no value/timeStamp, got {property:?}"
         );
+    }
+
+    // ── UpstreamMonitor boundaries ─────────────────────────────────────
+    //
+    // The three monitor bridge tasks became `MonitorStream::Upstream`
+    // adapters that own the subscription and apply the transform on pull.
+    // Three boundaries the deleted tasks used to hold, one test each:
+    // the seed ordering, the empty-mask filter, and Empty-vs-Disconnected
+    // on the non-blocking path (the whole reason the adapters exist).
+
+    /// The `PvSubscription` bridge sent the connect-time snapshot before
+    /// entering its loop. The adapter must hand the same value out first —
+    /// and, unlike the task, without the consumer awaiting anything: this
+    /// is the property that lets an RTEMS operation thread drain a monitor
+    /// without a reactor.
+    #[tokio::test]
+    async fn the_upstream_seed_is_the_first_item_and_needs_no_await() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("SEED:MON", EpicsValue::Double(7.0))
+            .await
+            .unwrap();
+        let src = PvDatabaseSource::new(db.clone());
+
+        let mut rx = src
+            .subscribe_ctx("SEED:MON", make_ctx("127.0.0.1", "anon", "ca"))
+            .await
+            .expect("subscribe to simple PV");
+
+        let first = rx.try_recv().expect("the seed is available with no await");
+        assert_eq!(
+            monitor_double(&first),
+            Some(7.0),
+            "the first item is the connect-time snapshot"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "after the seed and before any post the stream is Empty, not \
+             Disconnected — the producer is alive"
+        );
+    }
+
+    /// The marked bridge's `if marked.is_empty() { continue; }`. The adapter
+    /// expresses it as `map -> None`, so the filter has to survive as a
+    /// property of the transform itself.
+    #[test]
+    fn an_event_whose_class_marks_nothing_is_filtered_out() {
+        use epics_base_rs::server::recgbl::EventMask;
+        use epics_base_rs::server::snapshot::Snapshot;
+
+        let mk = |mask: EventMask| epics_base_rs::server::pv::MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+            origin: 0,
+            mask,
+        };
+
+        assert!(
+            marked_update(mk(EventMask::from_bits(0))).is_none(),
+            "a class that marks no leaf has no wire meaning — C assigns none \
+             either, so it must not reach the client as an update"
+        );
+        let value = marked_update(mk(EventMask::VALUE)).expect("a DBE_VALUE post is an update");
+        assert!(
+            value
+                .marked
+                .expect("a record update declares its marks")
+                .iter()
+                .any(|m| m == "value"),
+            "the positive control: a marking event still comes through"
+        );
+    }
+
+    /// A record monitor with nothing posted yet reports `Empty` (park), and
+    /// only reports `Disconnected` when the producer is really gone. Getting
+    /// this backwards would make an RTEMS drain loop tear down every idle
+    /// monitor, which is why the mapping is spelled once in `from_queue_err`.
+    #[tokio::test]
+    async fn an_idle_record_monitor_is_empty_not_disconnected() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:IDLE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = make_ctx("localhost", "op", "ca");
+        let checked = source
+            .access()
+            .check("AI:IDLE", &ctx.host, &ctx.account, &ctx.method, "")
+            .await;
+
+        let mut rx = source
+            .subscribe_checked_opts_marked(checked, ctx, Default::default())
+            .await
+            .expect("record subscribe");
+
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "an armed record monitor with no post yet is Empty"
+        );
+
+        db.put_record_field_from_ca_no_notify("AI:IDLE", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put");
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an update must post within 2s")
+            .expect("stream open");
     }
 
     /// A simple/mailbox PV has no record body; PROCESS reports unsupported

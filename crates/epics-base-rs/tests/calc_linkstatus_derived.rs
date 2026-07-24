@@ -16,6 +16,8 @@
 //! model the field at all, so a caget fell through to that same `.dbd` initial),
 //! and neither refused the seed. This drives the whole path through the loader.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -48,7 +50,7 @@ async fn link_status_reads_derived_constant_after_load() {
     ];
     for (rec, fields) in cases {
         for f in *fields {
-            let got = db.get_pv(&format!("{rec}.{f}")).await.unwrap();
+            let got = db.get_pv(&format!("{rec}.{f}")).unwrap();
             assert_eq!(
                 got.to_f64(),
                 Some(3.0),
@@ -71,7 +73,7 @@ async fn link_status_put_is_refused_and_value_stands() {
             err.is_err(),
             "{rec}.{f} is SPC_NOMOD — a client put must be refused, got {err:?}"
         );
-        let got = db.get_pv(&format!("{rec}.{f}")).await.unwrap();
+        let got = db.get_pv(&format!("{rec}.{f}")).unwrap();
         assert_eq!(
             got.to_f64(),
             Some(3.0),

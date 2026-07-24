@@ -30,6 +30,8 @@
 //! (the in-process subscribe seam emits no connect snapshot, so every event
 //! here would be an over-post) while VAL still stores the last put.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -45,18 +47,17 @@ async fn caput_val(db: &PvDatabase, text: &str) {
 }
 
 async fn stored_val(db: &PvDatabase) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field("VAL").unwrap()
 }
 
 /// Subscribe a VALUE|LOG monitor on `REC.VAL`, drive the oracle's put sequence,
 /// and return the number of value events delivered (must be 0).
 async fn per_put_value_events(db: &PvDatabase) -> usize {
-    let inst = db.get_record("REC").await.unwrap();
+    let inst = db.get_record("REC").unwrap();
     let mut rx = inst
         .write()
-        .await
         .add_subscriber(
             "VAL",
             1,

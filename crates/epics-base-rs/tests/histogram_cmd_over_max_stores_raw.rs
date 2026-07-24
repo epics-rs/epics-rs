@@ -27,6 +27,8 @@
 //! catch-all `_ => clear_histogram(); cmd = 0`, so an over-max CMD read back as
 //! 0/"Read" — the divergence this test pins.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::types::EpicsValue;
@@ -43,8 +45,8 @@ async fn caput_cmd(db: &PvDatabase, ordinal: i16) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 

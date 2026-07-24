@@ -14,6 +14,8 @@
 //! carries a `ReprocessAfter`) — so a foreign `dbProcess` during the delay
 //! bails at the PACT entry guard instead of firing the deferred OUT early.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -96,13 +98,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("AC")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .record
-            .get_field("DLYA"),
+        db.get_record("AC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::UShort(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );
@@ -142,13 +138,7 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         "continuation writes AVAL=[42] to OUT after the ODLY delay"
     );
     assert_eq!(
-        db.get_record("AC")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .record
-            .get_field("DLYA"),
+        db.get_record("AC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::UShort(0)),
         "continuation clears DLYA"
     );
@@ -204,8 +194,8 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("AC").await.unwrap();
-        let guard = rec.read().await;
+        let rec = db.get_record("AC").unwrap();
+        let guard = rec.read();
         assert_eq!(
             guard.record.get_field("DLYA"),
             Some(EpicsValue::UShort(1)),
@@ -281,13 +271,7 @@ async fn acalcout_odly_dont_drive_still_defers() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("AC")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .record
-            .get_field("DLYA"),
+        db.get_record("AC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::UShort(1)),
         "IVOA=Don't_drive + OOPT-fires + ODLY>0 must STILL defer (C gates the \
          defer on doOutput, the Don't_drive veto is inside execOutput)"
@@ -305,13 +289,7 @@ async fn acalcout_odly_dont_drive_still_defers() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("AC")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .record
-            .get_field("DLYA"),
+        db.get_record("AC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::UShort(0)),
         "continuation clears DLYA"
     );

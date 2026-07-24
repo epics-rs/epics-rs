@@ -4,6 +4,8 @@
 //! [`epics_base_rs::server::ioc_builder::IocBuilder`] and adds only
 //! CA-specific configuration (port, access security).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -11,9 +13,9 @@ use epics_base_rs::runtime::net::cas_server_port;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
+use super::stats::ServerStats;
 use super::{addr_list, beacon, tcp, udp};
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::scan::ScanScheduler;
 use epics_base_rs::server::{access_security, autosave, device_support, ioc_builder, iocsh};
 
 /// Builder for CaServer configuration.
@@ -275,7 +277,7 @@ impl CaServerBuilder {
     /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
         #[cfg(feature = "experimental-rust-tls")]
         let tls = self.tls.and_then(|t| match t {
             crate::tls::TlsConfig::Server(arc) => Some(Arc::new(std::sync::RwLock::new(arc))),
@@ -307,7 +309,6 @@ impl CaServerBuilder {
             autosave_config,
             autosave_manager: None,
             conn_events: Some(conn_tx),
-            after_init_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "experimental-rust-tls")]
             tls,
             #[cfg(feature = "experimental-rust-tls")]
@@ -337,99 +338,6 @@ impl CaServerBuilder {
     ) -> Self {
         self.cap_token_verifier = Some(verifier);
         self
-    }
-}
-
-/// A Channel Access server (IOC) that hosts process variables.
-/// Lightweight live-connection counters surfaced by [`CaServer::stats`]
-/// and the `casr` iocsh command. Mirrors RSRV's `casr` output at the
-/// summary level — total connects / disconnects since startup, plus
-/// the running active count derived from their delta.
-#[derive(Debug, Default)]
-pub struct ServerStats {
-    pub connects_total: std::sync::atomic::AtomicU64,
-    pub disconnects_total: std::sync::atomic::AtomicU64,
-    pub started_at: std::sync::OnceLock<std::time::Instant>,
-    /// Total bytes received from clients since startup. Incremented
-    /// by `handle_client` on every TCP read. Mirrors the
-    /// `caServerBytes_in` counter from PR #592's `dbServerStats`.
-    pub bytes_in: std::sync::atomic::AtomicU64,
-    /// Total bytes sent to clients since startup. Mirrors
-    /// `caServerBytes_out`. Updated when the per-client BufWriter
-    /// reports successful flushes; CA over TLS counts post-decrypt
-    /// plaintext (the rustls handshake bytes are not surfaced).
-    pub bytes_out: std::sync::atomic::AtomicU64,
-    /// Total CREATE_CHAN successes across the server lifetime.
-    /// PR #592's `caServerChannelCount` minus the closes (which we
-    /// track separately so the open-channel count is computable).
-    pub channels_opened_total: std::sync::atomic::AtomicU64,
-    /// Total CLEAR_CHANNEL successes. Subtract from
-    /// `channels_opened_total` for the live channel count.
-    pub channels_closed_total: std::sync::atomic::AtomicU64,
-    /// Total successful EVENT_ADD setups. Mirrors
-    /// `caServerSubscriptionCount`.
-    pub subscriptions_opened_total: std::sync::atomic::AtomicU64,
-    /// Total successful EVENT_CANCEL / channel-close subscription
-    /// teardowns. Subtract from opened for the live subscription
-    /// count.
-    pub subscriptions_closed_total: std::sync::atomic::AtomicU64,
-    /// Cumulative monitor events posted to client subscriptions since
-    /// startup — counted once per subscription update the server
-    /// dequeues for delivery (the initial value post plus every later
-    /// monitor event). The PCAS `caServer::subscriptionEventsPosted()`
-    /// counter; the CA gateway derives `serverPostRate` from its delta
-    /// (ca-gateway `gateServer.cc:2147-2148`). RSRV has no equivalent —
-    /// this is a portable-CA-server (gateway) concept.
-    pub subscription_events_posted: std::sync::atomic::AtomicU64,
-    /// Cumulative monitor events processed (successfully written to a
-    /// client) since startup. Trails `subscription_events_posted` when a
-    /// dequeued event is suppressed before the wire (read access denied)
-    /// or the client write fails mid-delivery. The PCAS
-    /// `caServer::subscriptionEventsProcessed()` counter; the CA gateway
-    /// derives `serverEventRate` from its delta (same C site).
-    pub subscription_events_processed: std::sync::atomic::AtomicU64,
-}
-
-impl ServerStats {
-    pub fn active_clients(&self) -> u64 {
-        let c = self
-            .connects_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let d = self
-            .disconnects_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        c.saturating_sub(d)
-    }
-
-    /// Number of channels currently open across all clients.
-    /// Mirrors PR #592's `caServerChannelCount`.
-    pub fn active_channels(&self) -> u64 {
-        let o = self
-            .channels_opened_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let c = self
-            .channels_closed_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        o.saturating_sub(c)
-    }
-
-    /// Number of subscriptions currently active across all clients.
-    /// Mirrors PR #592's `caServerSubscriptionCount`.
-    pub fn active_subscriptions(&self) -> u64 {
-        let o = self
-            .subscriptions_opened_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let c = self
-            .subscriptions_closed_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        o.saturating_sub(c)
-    }
-
-    pub fn uptime(&self) -> std::time::Duration {
-        self.started_at
-            .get()
-            .map(|t| t.elapsed())
-            .unwrap_or_default()
     }
 }
 
@@ -500,10 +408,11 @@ pub struct CaServer {
     /// `start()` that subscribes to `conn_events`. Surfaced via
     /// [`Self::stats`] and the `casr` iocsh command.
     stats: Arc<ServerStats>,
-    /// Active access security configuration. Wrapped in `RwLock` so
-    /// `reload_acf` can swap it without restarting the server. Access
-    /// checks acquire a read lock; reload acquires write.
-    acf: Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
+    /// Active access security configuration. A lock-free snapshot cell so
+    /// `reload_acf` can swap it without restarting the server: an access
+    /// check takes an `Arc` of the policy and never blocks, and a reload
+    /// publishes a new one without waiting for in-flight checks.
+    acf: epics_base_rs::server::access_security::AcfCell,
     /// Path the ACF was originally loaded from, retained so the no-arg
     /// `reload_acf()` knows which file to re-read. None when the server
     /// was built via the in-memory `acf(config)` setter.
@@ -522,8 +431,6 @@ pub struct CaServer {
     /// Optional broadcast channel for connection lifecycle events.
     /// Subscribers (e.g. ca-gateway) get one event per accept/disconnect.
     conn_events: Option<tokio::sync::broadcast::Sender<crate::server::tcp::ServerConnectionEvent>>,
-    /// Callbacks to run after PINI processing (e.g., start pollers).
-    after_init_hooks: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// Optional TLS configuration. When set, accepted TCP connections
     /// are wrapped in a `tokio_rustls::server::TlsStream` before the
     /// CA handshake runs. mTLS configurations additionally extract a
@@ -599,7 +506,7 @@ impl CaServer {
     }
 
     /// Construct a CaServer from pre-populated parts.
-    /// Used by [`ioc_app::IocApplication`] after st.cmd execution and
+    /// Used by [`epics_base_rs::server::ioc_app::IocApplication`] after st.cmd execution and
     /// device support wiring. `tcp_port` carries the optional split-port
     /// TCP override (`EPICS_CAS_SERVER_PORT`); pass `None` to share the
     /// UDP discovery port with the TCP listener.
@@ -632,13 +539,12 @@ impl CaServer {
             tcp,
             udp,
             stats,
-            acf: Arc::new(tokio::sync::RwLock::new(acf)),
+            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
             acf_source_path: std::sync::Mutex::new(None),
             acf_reload_tx,
             autosave_config,
             autosave_manager,
             conn_events: Some(conn_tx),
-            after_init_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "experimental-rust-tls")]
             tls: None,
             #[cfg(feature = "experimental-rust-tls")]
@@ -709,7 +615,7 @@ impl CaServer {
     /// without holding the full `&self` borrow.
     pub(crate) async fn reload_acf_inner(
         path: &str,
-        acf: &Arc<tokio::sync::RwLock<Option<access_security::AccessSecurityConfig>>>,
+        acf: &epics_base_rs::server::access_security::AcfCell,
         reload_tx: &tokio::sync::broadcast::Sender<()>,
     ) -> CaResult<()> {
         // std::fs::read_to_string blocks the worker thread on slow
@@ -722,10 +628,7 @@ impl CaServer {
             .map_err(|e| CaError::Io(std::io::Error::other(e)))?
             .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
-        {
-            let mut guard = acf.write().await;
-            *guard = Some(parsed);
-        }
+        acf.store(Some(Arc::new(parsed)));
         // Notify every active TCP client to recompute and push fresh
         // CA_PROTO_ACCESS_RIGHTS for its open channels. Send-error
         // (no live subscribers) is a normal transient state.
@@ -776,11 +679,6 @@ impl CaServer {
         AccessRightsNotifier {
             tx: self.acf_reload_tx.clone(),
         }
-    }
-
-    /// Set callbacks to run after PINI processing completes.
-    pub fn set_after_init_hooks(&mut self, hooks: Vec<Box<dyn FnOnce() + Send>>) {
-        *self.after_init_hooks.lock().unwrap() = hooks;
     }
 
     /// Install a TLS server config on a CaServer that was constructed
@@ -853,7 +751,7 @@ impl CaServer {
     }
 
     /// Subscribe to connection lifecycle events. Returns a broadcast
-    /// receiver that receives [`ServerConnectionEvent::Connected`] /
+    /// receiver that receives [`crate::server::tcp::ServerConnectionEvent::Connected`] /
     /// `Disconnected` for each accepted client.
     ///
     /// Idempotent: calling multiple times shares the same broadcast sender.
@@ -950,7 +848,7 @@ impl CaServer {
 
     /// Get a PV value.
     pub async fn get(&self, name: &str) -> CaResult<EpicsValue> {
-        self.db.get_pv(name).await
+        self.db.get_pv(name)
     }
 
     /// Run the server (UDP + TCP + beacon + scan scheduler).
@@ -1013,7 +911,6 @@ impl CaServer {
 
         let db_udp = self.db.clone();
         let db_tcp = self.db.clone();
-        let db_scan = self.db.clone();
         let acf = self.acf.clone();
         let port = self.port;
         // Sockets were bound at construction (`bind_sockets`), so the
@@ -1024,7 +921,14 @@ impl CaServer {
         let bound_tcp = self.tcp.clone();
         let bound_udp = self.udp.clone();
 
-        let scanner = ScanScheduler::new(db_scan);
+        // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
+        // is owned by the IOC core — `epics_base_rs::server::scan::
+        // ScanOwner`, started by `IocApplication::run` at the C `scanRun`
+        // point or by the IOC entry binary — never by a protocol server.
+        // The "PINI before after-init hooks" ordering the scheduler arm
+        // used to provide lives in `IocApplication::run` (Phase 2b.6 runs
+        // PINI, H3 drains the hooks after it, both before this server can
+        // accept a client).
 
         // Spawn autosave: prefer existing manager, otherwise build one from SaveSetConfig
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
@@ -1303,7 +1207,7 @@ impl CaServer {
                     let acf = acf_clone.clone();
                     let reload_tx = acf_reload_tx_clone.clone();
                     tokio::spawn(async move {
-                        *acf.write().await = Some(cfg);
+                        acf.store(Some(Arc::new(cfg)));
                         let _ = reload_tx.send(());
                     });
                     Ok(())
@@ -1402,10 +1306,6 @@ impl CaServer {
                 eprintln!("Beacon emitter exited: {r:?}");
                 r
             }
-            _ = scanner.run_with_hooks(self.after_init_hooks.lock().unwrap().drain(..).collect()) => {
-                eprintln!("Scan scheduler exited");
-                Ok(())
-            }
         };
 
         // Tear down spawned tasks whose JoinHandles were moved into the
@@ -1459,16 +1359,17 @@ fn tls_paths_from_env() -> Option<TlsPaths> {
 fn audit_from_env() -> Option<crate::audit::AuditLogger> {
     if let Some(path) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT_FILE") {
         if !path.is_empty() {
-            // Open the file synchronously; tokio's `spawn_blocking` would
-            // be cleaner but `from_parts` is sync.
+            // Opened synchronously because this runs during server
+            // construction, before any runtime is guaranteed. The handle stays
+            // a `std::fs::File`: `AuditSink` writes it through the filesystem
+            // seam, so no runtime is needed here or at any later write.
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
             {
                 Ok(f) => {
-                    let async_file = tokio::fs::File::from_std(f);
-                    let sink = crate::audit::AuditSink::File(tokio::sync::Mutex::new(async_file));
+                    let sink = crate::audit::AuditSink::File(crate::audit::AuditFile::from_std(f));
                     return Some(crate::audit::AuditLogger::new(sink));
                 }
                 Err(e) => {

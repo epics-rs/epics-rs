@@ -148,7 +148,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
 /// no gate to observe here because there is no way to run this against a
 /// half-built database.
-pub async fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16, i16) {
+pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
         // Empty / constant link: C → CON. The field-type code is the direction's
         // (see [`DBF_NOACCESS`]).
@@ -162,7 +162,7 @@ pub async fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -
         // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
         // type. A DB-syntax link whose target is not on this IOC resolves to
         // `None` and falls through to EXT_NC (C `init_record` else branch).
-        LinkType::Db => match handle.link_target_field_type(link).await {
+        LinkType::Db => match handle.link_target_field_type(link) {
             Some(ft) => (LINK_LOC, dbf_static_code(ft)),
             None => (LINK_EXT_NC, DBF_UNKNOWN),
         },
@@ -197,14 +197,14 @@ pub const SWAIT_NO_PV: i16 = 2;
 /// record is `PV_OK`, and every name that cannot be resolved here — an unknown
 /// record, a CA/PVA target, a bare constant that is not a PV name at all —
 /// stays at the `PV_NC` C leaves it in until a search succeeds.
-pub async fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
+pub fn classify_swait_pv(handle: &AsyncDbHandle, name: &str) -> i16 {
     if name.trim().is_empty() {
         return SWAIT_NO_PV;
     }
     // Same `iocInit` boundary as `classify_link`: this only ever runs against
     // the completed database, so a forward-referenced local record is PV_OK.
     match parse_link_v2(name).link_type() {
-        LinkType::Db => match handle.link_target_field_type(name).await {
+        LinkType::Db => match handle.link_target_field_type(name) {
             Some(_) => SWAIT_PV_OK,
             None => SWAIT_PV_NC,
         },

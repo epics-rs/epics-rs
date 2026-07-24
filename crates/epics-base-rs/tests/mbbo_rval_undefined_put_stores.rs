@@ -24,6 +24,8 @@
 //! unconditionally and clobbered RVAL to 0; opting mbbo into the framework's
 //! undefined-skip mirrors C's `goto CONTINUE`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::mbbo::MbboRecord;
@@ -39,8 +41,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 

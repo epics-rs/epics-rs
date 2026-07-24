@@ -14,6 +14,8 @@
 //! `can_device_write()`, so a "not INVALID" assertion alone would pass even
 //! when nothing is printed.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -84,8 +86,8 @@ async fn build_and_process(db_content: &str, record: &str) -> AlarmSeverity {
         .await
         .unwrap();
 
-    let rec = db.get_record(record).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(record).expect("record exists");
+    let inst = rec.read();
     inst.common.sevr
 }
 
@@ -150,8 +152,8 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
         .await
         .unwrap();
 
-    let rec = db.get_record("LSO_ERR").await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record("LSO_ERR").expect("record exists");
+    let inst = rec.read();
     assert_ne!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -213,8 +215,8 @@ record(stringin, "SI_STDIO") {
         .await
         .unwrap();
 
-    let rec = db.get_record("SI_STDIO").await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record("SI_STDIO").expect("record exists");
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,

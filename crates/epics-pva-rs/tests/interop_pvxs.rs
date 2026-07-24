@@ -66,10 +66,10 @@ mod rpc_and_get_field;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tls"))]
 #[path = "interop_pvxs_mods/tls_interop.rs"]
 mod tls_interop;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tls"))]
 #[path = "interop_pvxs_mods/tls_mtls.rs"]
 mod tls_mtls;
 #[cfg(unix)]

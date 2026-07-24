@@ -23,6 +23,11 @@
 //! entry. See `UpstreamEntry::is_retained` for the full rationale and
 //! the (Low) cost of the narrowing.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -442,8 +447,8 @@ impl UpstreamEntry {
     }
 }
 
-/// Drop guard that aborts a tokio task when the entry is dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
+/// Drop guard that aborts a spawned task when the entry is dropped.
+struct AbortOnDrop(epics_base_rs::runtime::task::TaskAbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -596,7 +601,7 @@ pub struct ChannelCache {
     /// all operate on channels, not monitor variants.
     entries: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Cleanup-tick handle. Aborted on `ChannelCache` drop.
-    cleanup_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cleanup_task: parking_lot::Mutex<Option<epics_base_rs::runtime::task::TaskHandle<()>>>,
     /// Hard cap on the number of cached *channels* (`entries.len()`) —
     /// defends against probe-storm DoS where a client searches N random
     /// names and forces N upstream channels. A new channel past this limit
@@ -688,8 +693,8 @@ impl ChannelCache {
             invalidator: OnceLock::new(),
         });
         let weak = Arc::downgrade(&cache);
-        let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(cleanup_interval);
+        let task = epics_base_rs::runtime::task::spawn(async move {
+            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // skip first immediate tick
             loop {
                 tick.tick().await;
@@ -861,7 +866,7 @@ impl ChannelCache {
                 let entries = self.cache.entries.clone();
                 let pv_name = self.pv_name.to_string();
                 let req_key = self.req_key.to_vec();
-                tokio::spawn(async move {
+                epics_base_rs::runtime::task::spawn(async move {
                     let mut map = entries.lock().await;
                     remove_variant(&mut map, &pv_name, &req_key);
                 });
@@ -930,9 +935,10 @@ impl ChannelCache {
         // Connect through the owned client (one-shot, bounded by the
         // caller's connect timeout exactly as the prior direct `pvconnect`
         // was). On failure nothing is recorded — the next probe re-resolves.
-        let addr = tokio::time::timeout(connect_timeout, self.client.pvconnect(pv_name))
-            .await
-            .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
+        let addr =
+            epics_base_rs::runtime::task::timeout(connect_timeout, self.client.pvconnect(pv_name))
+                .await
+                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
         // Record / refresh the connection admission (poked recent).
         self.entries
             .lock()
@@ -982,12 +988,12 @@ impl ChannelCache {
         // connection.
         let pv_request_for_task = pv_request;
 
-        let join = tokio::spawn(async move {
+        let join = epics_base_rs::runtime::task::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // Whether the current subscription delivered any upstream event
             // before it ended. Set by `raw_cb` on the first frame, read +
-            // reset after `handle.wait()` to decide whether to re-arm the
+            // reset after `handle.wait_terminal()` to decide whether to re-arm the
             // backoff floor (healthy connection that dropped) or keep the
             // grown backoff (a clean MONITOR FINISH that ended without ever
             // delivering an event must not tight-loop).
@@ -1105,6 +1111,47 @@ impl ChannelCache {
                         // Fan out raw body — refcount only, no copy.
                         let _ = tx_raw_inner.send(raw_ev);
                     };
+                // The upstream monitor's CONNECTION-STATE stream — where
+                // this task learns that the upstream came or went.
+                //
+                // It must not be inferred from the subscription handle
+                // terminating: `spawn_raw_frames_handle` re-subscribes
+                // INTERNALLY on `MonitorEnd::ConnectionLost` (announce, sleep
+                // 200 ms, loop), so a plain upstream loss never makes the
+                // handle's task return and the boundary below never fired —
+                // downstream monitors kept being served the cached value of a
+                // dead IOC at NoAlarm (doc/pvalink-rtems-design.md §12.10).
+                // pva2pva surfaces a lost upstream as downstream *unlisten*
+                // (`moncache.cpp:212-235`); `signal_disconnect_boundary` is
+                // that unlisten and is idempotent per outage, so calling it
+                // from both observers (here and after the terminal end
+                // below) fires it exactly once — the same two-observer,
+                // one-owner shape `inp_disconnect_scan` has in pvalink.
+                let state_conn = state_for_task.clone();
+                let latest_raw_conn = latest_raw_for_task.clone();
+                let tx_conn = tx_for_task.clone();
+                let tx_raw_conn = tx_raw_for_task.clone();
+                let pv_name_conn = pv_name_owned.clone();
+                let conn_cb = move |ev: epics_pva_rs::client_native::ops_v2::MonitorConnEvent| {
+                    use epics_pva_rs::client_native::ops_v2::MonitorConnEvent;
+                    match ev {
+                        MonitorConnEvent::Connected { .. } => {}
+                        MonitorConnEvent::Disconnected | MonitorConnEvent::Finished => {
+                            tracing::debug!(
+                                pv = %pv_name_conn,
+                                "pva-gateway: upstream monitor left the connected state — \
+                                 revoking the cached value with a monitor-unlisten boundary"
+                            );
+                            signal_disconnect_boundary(
+                                &state_conn,
+                                &latest_raw_conn,
+                                &tx_conn,
+                                &tx_raw_conn,
+                            );
+                        }
+                    }
+                };
+
                 // Open the upstream monitor with the downstream's
                 // forwarded pvRequest when one was captured (so the
                 // upstream server applies the same field projection /
@@ -1115,12 +1162,17 @@ impl ChannelCache {
                 let handle_result = match pv_request_for_task.clone() {
                     Some(req) => {
                         client
-                            .pvmonitor_raw_frames_handle_with_request(&pv_name_owned, req, raw_cb)
+                            .pvmonitor_raw_frames_handle_with_request(
+                                &pv_name_owned,
+                                req,
+                                raw_cb,
+                                conn_cb,
+                            )
                             .await
                     }
                     None => {
                         client
-                            .pvmonitor_raw_frames_handle(&pv_name_owned, raw_cb)
+                            .pvmonitor_raw_frames_handle(&pv_name_owned, raw_cb, conn_cb)
                             .await
                     }
                 };
@@ -1152,26 +1204,34 @@ impl ChannelCache {
                             &tx_raw_for_task,
                         );
                         // guard removed — cleanup_tick aborts via AbortOnDrop.
-                        tokio::time::sleep(backoff).await;
+                        epics_base_rs::runtime::task::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
                     }
                 };
-                let raw_result = handle.wait().await;
-                // Upstream disconnected — surface it to downstream PVA
+                // Why the subscription ENDED — never why it disconnected.
+                // `MonitorTermination` carries no connection state by
+                // construction; the disconnect already reached `conn_cb`
+                // above, whether or not the loop ended.
+                let raw_result = handle.wait_terminal().await;
+                // The subscription ended for good, which is also a departure
+                // from the connected state: surface it to downstream PVA
                 // monitors as a subscription boundary (MONITOR FINISH →
                 // reopen), mirroring pva2pva moncache.cpp unlisten rather than
-                // fabricating an INVALID alarm value. The subscription stays
-                // alive for transparent reconnect; the first real upstream
-                // event after reconnect repopulates the snapshot via the
-                // normal monitor callback path.
+                // fabricating an INVALID alarm value. Idempotent per outage,
+                // so this is a no-op when `conn_cb` already fired for the same
+                // outage. The gateway's own loop re-subscribes; the first real
+                // upstream event after reconnect repopulates the snapshot via
+                // the normal monitor callback path.
                 signal_disconnect_boundary(
                     &state_for_task,
                     &latest_raw_for_task,
                     &tx_for_task,
                     &tx_raw_for_task,
                 );
-                if let Err(e) = raw_result {
+                if let epics_pva_rs::client_native::ops_v2::MonitorTermination::Failed(e) =
+                    raw_result
+                {
                     tracing::warn!(
                         pv = %pv_name_owned,
                         error = %e,
@@ -1199,7 +1259,7 @@ impl ChannelCache {
                     Duration::from_millis(250),
                     max_backoff,
                 );
-                tokio::time::sleep(delay).await;
+                epics_base_rs::runtime::task::sleep(delay).await;
                 backoff = next_backoff;
                 // guard removed — cleanup_tick aborts via AbortOnDrop.
 
@@ -1250,7 +1310,7 @@ impl ChannelCache {
         if entry.snapshot().is_some() {
             return Ok(entry);
         }
-        let res = tokio::time::timeout(connect_timeout, &mut notified).await;
+        let res = epics_base_rs::runtime::task::timeout(connect_timeout, &mut notified).await;
         if res.is_err() && entry.snapshot().is_none() {
             return Err(GwError::UpstreamTimeout(entry.pv_name.clone()));
         }
@@ -1479,7 +1539,7 @@ impl ChannelCache {
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
-        let task = tokio::spawn(std::future::pending::<()>());
+        let task = epics_base_rs::runtime::task::spawn(std::future::pending::<()>());
         let entry = Arc::new(UpstreamEntry {
             pv_name: pv_name.to_string(),
             state: Arc::new(RwLock::new(EntryState::default())),
@@ -1944,8 +2004,8 @@ mod tests {
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
-        let task = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+        let task = epics_base_rs::runtime::task::spawn(async {
+            epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
         });
         let entry = UpstreamEntry {
             pv_name: "X".into(),
@@ -1977,7 +2037,7 @@ mod tests {
             drop(rx0);
             let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
             drop(rx0_raw);
-            let task = tokio::spawn(std::future::pending::<()>());
+            let task = epics_base_rs::runtime::task::spawn(std::future::pending::<()>());
             UpstreamEntry {
                 pv_name: "X".into(),
                 state: Arc::new(RwLock::new(EntryState::default())),

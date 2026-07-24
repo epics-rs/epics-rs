@@ -25,6 +25,8 @@
 //! zeroes it. It is NOT the same mask — AMASK is the arrays the EXPRESSION stored
 //! into (`aCalcPerform.c:487`), NEWM the arrays the LINK changed.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -42,8 +44,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).unwrap()
 }
 
@@ -72,11 +74,10 @@ async fn wf_into_aa(db: &PvDatabase, data: Vec<f64>) {
 async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     let db = PvDatabase::new();
     wf_into_aa(&db, vec![1.0, 2.0, 3.0, 4.0]).await;
-    let inst = db.get_record("A").await.unwrap();
+    let inst = db.get_record("A").unwrap();
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,
@@ -131,11 +132,10 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
 async fn r11_c4_an_unchanged_link_value_does_not_post_aa() {
     let db = PvDatabase::new();
     wf_into_aa(&db, vec![1.0, 2.0, 3.0, 4.0]).await;
-    let inst = db.get_record("A").await.unwrap();
+    let inst = db.get_record("A").unwrap();
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,

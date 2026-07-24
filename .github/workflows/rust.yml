@@ -22,6 +22,14 @@ jobs:
     - uses: taiki-e/install-action@nextest
     - name: Format
       run: cargo fmt --all -- --check
+    # Cargo registry + target cache. Placed after the toolchain step
+    # because the cache key includes the rustc version. The explicit
+    # `key` names the *feature resolution* this job builds: each job in
+    # this file resolves features differently, so their target dirs are
+    # not interchangeable and must not share a cache entry.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: default-features
     - name: Clippy
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Build
@@ -40,3 +48,189 @@ jobs:
         cargo nextest run -p asyn-rs --features epics
         cargo nextest run -p ad-core-rs --features ioc
         cargo nextest run -p ad-plugins-rs --features ioc
+
+  # `rtems-exec-model` is a *different feature resolution*, not an extra file:
+  # it routes the `runtime::task` seam off the tokio reactor onto the std-thread
+  # background executor — the backend the RTEMS build actually runs. The `checks`
+  # job above builds only the default-feature workspace, so nothing there
+  # compiles, let alone exercises, that backend. Every exec-backend regression
+  # found so far (scan ownership, group drain starvation, gateway spawns) was
+  # caught by hand. This job is the standing gate.
+  #
+  # Its own job rather than a step in `checks`: the feature resolution differs,
+  # so the artifacts cannot be shared with the default build anyway, and a
+  # separate job reports the failure under its own name.
+  #
+  # These are the four crates that declare the feature. `epics-base-rs` forwards
+  # to `epics-ca-rs` (see crates/epics-base-rs/Cargo.toml) and `epics-bridge-rs`
+  # forwards to all three, because Cargo unifies features per package and a
+  # partial forward builds the split state the `HAS_TOKIO_REACTOR` const guard
+  # exists to refuse.
+  rtems-exec-model:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-exec-model
+    - name: epics-base-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-base-rs --features rtems-exec-model
+    - name: epics-ca-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-ca-rs --features rtems-exec-model
+    - name: epics-pva-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-pva-rs --features rtems-exec-model
+    - name: epics-bridge-rs (rtems-exec-model)
+      run: cargo nextest run -p epics-bridge-rs --features rtems-exec-model
+    # `./scripts/rtems-check.sh` — the RTEMS *target* gate — runs in its own
+    # `rtems-closure` job below, not here: it needs a nightly toolchain
+    # (`-Zbuild-std`) while this job runs the pinned stable, and its feature
+    # resolutions are per-crate RTEMS configurations, not this job's.
+
+  # Type-checks the whole RTEMS closure — every RTEMS crate, binary, and both
+  # build configurations (`portability` and `image`) — for armv7-rtems-eabihf.
+  # Tier-3 target: nightly + rust-src + `-Zbuild-std`, but no cross-toolchain
+  # and no BSP (type-check only, nothing is linked).
+  #
+  # History: this gate was deliberately excluded from CI while it was RED on
+  # the committed tree — with a stock `libc` the image configuration cannot
+  # build, by design (compile-time layout refusals). It went green when the
+  # RTEMS `libc` fixes were pinned in the workspace `[patch.crates-io]`
+  # (see Cargo.toml), so CI runners now resolve the same patched `libc` as a
+  # local checkout and the exclusion reason is gone.
+  #
+  # The nightly channel floats on purpose. `scripts/rtems-tls-spec.sh` derives
+  # the one-key `has-thread-local: true` spec deviation from the ACTIVE
+  # nightly (doc/rtems-tls-spec-deviation.md) and REFUSES — turning this job
+  # red — the moment upstream flips the key in the builtin spec, which is
+  # exactly the retirement trip-wire the deviation doc requires. Pinning a
+  # nightly here would mute that trip-wire and drift from what
+  # `cargo +nightly` means on a developer machine.
+  rtems-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        components: rust-src
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-closure
+    - name: Type-check the RTEMS closure
+      run: ./scripts/rtems-check.sh
+
+  # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback
+  # onto a real `PTHREAD_PRIO_INHERIT` pthread mutex
+  # (crates/epics-libcom-rs/src/runtime/sync.rs). No other job turns the
+  # feature on, so without this job the PI implementation would compile and
+  # test only on maintainer machines. The two crates below are the ones that
+  # declare (`epics-libcom-rs`) or forward (`epics-base-rs`) the feature.
+  # No RT kernel is needed to *run* PI mutexes — only to measure their
+  # latency effect, which happens off-CI (doc/rtlinux-rt-measurement.md).
+  linux-rt:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: linux-rt
+    - name: epics-libcom-rs (linux-rt)
+      run: cargo nextest run -p epics-libcom-rs --features linux-rt
+    - name: epics-base-rs (linux-rt)
+      run: cargo nextest run -p epics-base-rs --features linux-rt
+
+  # Commit b7a6b0ab found the no-default-features debt was three masked *build
+  # breaks*, not warnings — code that simply does not compile once the default
+  # features come off, invisible to every other job here because they all build
+  # with defaults on. Those are fixed; this job is what keeps them fixed.
+  #
+  # `check`, not `build`/`nextest`: the failure mode being gated is compilation
+  # under a feature resolution nobody exercises locally, and a type-check catches
+  # all three of the breaks b7a6b0ab found at a fraction of the cost.
+  no-default-features:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: no-default-features
+    - name: Check (no default features)
+      run: cargo check --workspace --no-default-features
+
+  # Every job above runs each test exactly ONCE, and that is the hole two
+  # exec-backend defects walked through: `cancel_is_a_sync_point_resource_released`
+  # (fixed by 96b0d3fb) and `cancel_after_completion_reports_not_active` (fixed by
+  # 5d5e5b04). Both were probabilistic and feature-ON only — measured on the
+  # defective tree at 3-5 failures per 50 runs and 2-5 per 50 respectively. A
+  # single-run gate sees such a defect with probability ~1/25 and reports green
+  # the other ~96% of the time, which is exactly what happened: the fixes came
+  # from hand-repetition, not from CI.
+  #
+  # This job gates the CLASS, not those two names. It repeats the whole
+  # cancel/termination test module, whose members all turn on the same
+  # abort-versus-drop ordering the two defects lived in.
+  #
+  # Why 50 iterations: for a per-run failure probability p, N clean iterations
+  # miss the defect with probability (1-p)^N. At the lower end of the measured
+  # band, p = 2/50 = 1/25:
+  #     N=10 → 0.96^10 = 0.66 (34% detection — worse than useless)
+  #     N=25 → 0.96^25 = 0.36 (64%)
+  #     N=50 → 0.96^50 = 0.13 (>85% detection)
+  # 50 is the smallest round count clearing 85% at the weakest reproducer's
+  # rate; the stronger one (5/50) is caught >99% of the time at that N. The
+  # module runs in ~1 s, so 50 iterations cost under two minutes.
+  #
+  # Why a shell loop: cargo-nextest has no repeat-until-N-runs mode for PASSING
+  # tests. `--retries` only re-runs tests that already failed, which is the
+  # opposite of what a flake hunt needs. `--retries 0` is passed explicitly so
+  # this job can never inherit a retrying profile — a retry would convert the
+  # red iteration this gate exists to produce back into a green run.
+  exec-backend-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rtems-exec-model-stress
+    # Compile once up front so a build break reports as a build break rather
+    # than as "iteration 1 failed".
+    - name: Build test binary (rtems-exec-model)
+      run: cargo build -p epics-pva-rs --features rtems-exec-model --lib --tests
+    - name: Stress cancel/termination tests, 50 iterations (exec backend ON)
+      run: |
+        set -u
+        iterations=50
+        for i in $(seq 1 "$iterations"); do
+          echo "::group::iteration $i/$iterations"
+          if ! cargo nextest run -p epics-pva-rs --features rtems-exec-model \
+               --lib --retries 0 \
+               -E 'test(/^client_native::operation::tests::/)'; then
+            echo "::endgroup::"
+            echo "::error::exec-backend stress FAILED on iteration $i of $iterations"
+            exit 1
+          fi
+          echo "::endgroup::"
+        done
+        echo "exec-backend stress: $iterations/$iterations iterations green"

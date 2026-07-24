@@ -14,6 +14,8 @@
 //! took the OUTPUT redirect and wrote its VAL array OUT to its DBF_INLINK SIOL
 //! (direction inverted). Classifying it as an input pins the correct SIOL read.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -59,26 +61,26 @@ async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
         .unwrap();
 
     // 1. VAL read inward from SIOL (the soft device reads SIOL when SIMM=YES).
-    let val = db.get_pv("AAIIN").await.unwrap();
+    let val = db.get_pv("AAIIN").unwrap();
     assert!(
         matches!(val, EpicsValue::DoubleArray(ref a) if a.as_slice() == [10.0, 20.0, 30.0]),
         "simulated aai read its SIOL array INTO VAL, got {val:?}"
     );
 
     // 2. SIOL source untouched (input direction, not a VAL->SIOL write).
-    let siol = db.get_pv("AAI_SIOL").await.unwrap();
+    let siol = db.get_pv("AAI_SIOL").unwrap();
     assert!(
         matches!(siol, EpicsValue::DoubleArray(ref a) if a.as_slice() == [10.0, 20.0, 30.0]),
         "aai must NOT write VAL out to its SIOL target, got {siol:?}"
     );
 
     // 3. SIMM_ALARM raised at the SIMS severity.
-    let sevr = db.get_pv("AAIIN.SEVR").await.unwrap();
+    let sevr = db.get_pv("AAIIN.SEVR").unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(MINOR)),
         "simulated aai raises SIMM_ALARM at SIMS severity MINOR, got {sevr:?}"
     );
-    let stat = db.get_pv("AAIIN.STAT").await.unwrap();
+    let stat = db.get_pv("AAIIN.STAT").unwrap();
     assert!(
         matches!(stat, EpicsValue::Short(SIMM_ALARM)),
         "simulated aai STAT is SIMM_ALARM, got {stat:?}"

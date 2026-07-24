@@ -40,6 +40,8 @@
 //! a user that wants to own `server` must register at an explicit order
 //! `< -1`.
 
+// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::types::PvString;
@@ -69,6 +71,62 @@ const NO_SUCH_FIELD: &str = "No such field";
 /// [`super::CompositeSource`]. pvxs uses `"__server"`; the leading
 /// `__` marks it internal (pvxs convention, see `composite.rs`).
 pub const SERVER_SOURCE_NAME: &str = "__server";
+
+/// Wrap a user source in the composite every PVA server must serve from.
+///
+/// # Why this is a function and not two call sites
+///
+/// It used to be written out in `runtime.rs` only, and
+/// `blocking::BlockingPvaServer::bind` — the driver the whole RTEMS path uses
+/// — bound the user source *directly*. The result was a server that came up,
+/// served its user PVs and looked healthy while `pvxlist -i`,
+/// `pvxlist <address>` and `pvlist-rs` all failed with "Refused to create
+/// Channel":
+/// the reserved [`SERVER_PV_NAME`] channel did not exist, so the server could
+/// not be asked what it was. On a target with no shell that is the difference
+/// between a diagnosable IOC and an opaque one.
+///
+/// The defect was not that one caller forgot a step; it was that the
+/// composition rule lived in a caller at all, so every new server driver had
+/// to rediscover it. Both drivers now call this, and a third cannot skip it
+/// without deliberately not calling the only thing that returns a bindable
+/// source.
+///
+/// # The rule
+///
+/// The built-in `__server` source registers at order **-1**, ahead of the
+/// default-order (0) user source, matching pvxs registering its `ServerSource`
+/// at `(order = -1, "__server")` (`server.cpp:542-547`) where the lowest order
+/// is consulted first (`server.h:108-118`). The built-in source only claims
+/// the reserved `server` name, so running it first shadows a user PV called
+/// `server` — the pvxs diagnostic-source contract — while every other name
+/// still falls through. A user that genuinely wants to own `server` must
+/// register at an explicit order < -1.
+///
+/// The channel lister enumerates the **user** source directly rather than the
+/// composite. Going through the composite would also include the built-in
+/// source; that is harmless because its `list_pvs` is empty, but naming the
+/// user half keeps the intent explicit.
+///
+/// # Errors
+///
+/// Only if a `(name, order)` pair is already registered, which a freshly
+/// created composite cannot have. Returned rather than asserted so the two
+/// callers keep their own error prefixes.
+pub fn compose_with_server_info(user_source: super::DynSource) -> Result<super::DynSource, String> {
+    let server_info = Arc::new(ServerInfoSource::new({
+        let user_source = user_source.clone();
+        move || {
+            let user_source = user_source.clone();
+            async move { user_source.list_pvs().await }
+        }
+    }));
+
+    let composite = super::CompositeSource::new();
+    composite.add_source("__user", user_source, 0)?;
+    composite.add_source(SERVER_SOURCE_NAME, server_info as super::DynSource, -1)?;
+    Ok(composite as super::DynSource)
+}
 
 /// Built-in source exposing the `server` PV. Cheap to clone — every
 /// field is `Arc`-shared or `Copy`.
@@ -306,7 +364,10 @@ impl ChannelSource for ServerInfoSource {
     /// The `server` PV is queried with one-shot GET/RPC, not MONITOR
     /// — pvxs's `ServerSource` installs no `onSubscribe`. Returning
     /// `None` makes a MONITOR INIT against `server` fail cleanly.
-    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _name: &str,
+    ) -> Option<crate::server_native::source::MonitorStream<PvField>> {
         None
     }
 

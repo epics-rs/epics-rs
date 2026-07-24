@@ -13,6 +13,8 @@
 //! reference-leak diagnostic (`pvxs/ioc/iochooks.cpp:479-484`), not a
 //! pvalink command.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
@@ -408,7 +410,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> PvaLinkResolver {
-        PvaLinkResolver::new(tokio::runtime::Handle::current())
+        PvaLinkResolver::new()
     }
 
     #[tokio::test]

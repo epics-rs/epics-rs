@@ -11,6 +11,8 @@
 //! (record_instance.rs:1653) raises CALC_ALARM/INVALID from the CALC_ALARM
 //! field, so `sevr == INVALID` and `apply_invalid_output_value` runs.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -39,8 +41,8 @@ async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
         .await
         .unwrap();
 
-    let rec = db.get_record("SC_IVOV").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SC_IVOV").unwrap();
+    let inst = rec.read();
 
     // Precondition: the cycle is INVALID and output is due — the IVOA trigger.
     assert_eq!(

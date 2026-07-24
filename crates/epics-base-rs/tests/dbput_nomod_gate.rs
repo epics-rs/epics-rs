@@ -22,6 +22,8 @@
 //! Pre-fix the port enforced `read_only` only on the CA route, so the OUT link
 //! truncated NELM (and the data with it) and the writer stayed NO_ALARM.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;
@@ -61,22 +63,23 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
     let mut v = HashSet::new();
     db.process_record_with_links("AO", &mut v, 0).await.unwrap();
 
-    let wf = db.get_record("WF").await.unwrap();
-    let wf = wf.read().await;
-    assert_eq!(
-        wf.record.get_field("NELM").unwrap(),
-        EpicsValue::ULong(10),
-        "C: dbPut refuses the SPC_NOMOD NELM — the link cannot truncate a waveform"
-    );
-    assert_eq!(
-        wf.record.get_field("NORD").unwrap(),
-        EpicsValue::ULong(3),
-        "and the data the waveform already holds is untouched"
-    );
-    drop(wf);
+    let wf = db.get_record("WF").unwrap();
+    {
+        let wf = wf.read();
+        assert_eq!(
+            wf.record.get_field("NELM").unwrap(),
+            EpicsValue::ULong(10),
+            "C: dbPut refuses the SPC_NOMOD NELM — the link cannot truncate a waveform"
+        );
+        assert_eq!(
+            wf.record.get_field("NORD").unwrap(),
+            EpicsValue::ULong(3),
+            "and the data the waveform already holds is untouched"
+        );
+    }
 
-    let ao = db.get_record("AO").await.unwrap();
-    let ao = ao.read().await;
+    let ao = db.get_record("AO").unwrap();
+    let ao = ao.read();
     assert_eq!(
         ao.common.stat,
         alarm_status::LINK_ALARM,
@@ -110,8 +113,8 @@ async fn every_put_route_is_refused_on_a_nomod_field() {
         );
     }
 
-    let wf = db.get_record("WF").await.unwrap();
-    let wf = wf.read().await;
+    let wf = db.get_record("WF").unwrap();
+    let wf = wf.read();
     assert_eq!(wf.record.get_field("NELM").unwrap(), EpicsValue::ULong(10));
     assert_eq!(wf.record.get_field("NORD").unwrap(), EpicsValue::ULong(3));
 }
@@ -126,9 +129,9 @@ async fn the_load_path_still_sets_nelm() {
     wf.put_field("NELM", EpicsValue::Long(7)).unwrap();
     db.add_record("WF2", Box::new(wf)).await.unwrap();
 
-    let rec = db.get_record("WF2").await.unwrap();
+    let rec = db.get_record("WF2").unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("NELM").unwrap(),
+        rec.read().record.get_field("NELM").unwrap(),
         EpicsValue::ULong(7)
     );
 }
@@ -158,8 +161,8 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
         .unwrap();
 
     let (stat0, sevr0) = {
-        let rec = db.get_record("AO2").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("AO2").unwrap();
+        let inst = rec.read();
         (inst.common.stat, inst.common.sevr)
     };
 
@@ -196,8 +199,8 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
     }
 
     // Nothing landed: the alarm state a client tried to forge is still clean.
-    let rec = db.get_record("AO2").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("AO2").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.sevr, sevr0, "forged SEVR never landed");
     assert_eq!(inst.common.stat, stat0, "forged STAT never landed");
     assert_eq!(inst.common.acks, AlarmSeverity::NoAlarm);
@@ -233,8 +236,8 @@ async fn alarm_acknowledge_travels_the_dbr_type_route_not_the_field() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("ACK:AI").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("ACK:AI").unwrap();
+        let mut inst = rec.write();
         inst.common.sevr = AlarmSeverity::Major;
         inst.common.acks = AlarmSeverity::Major;
     }
@@ -245,20 +248,20 @@ async fn alarm_acknowledge_travels_the_dbr_type_route_not_the_field() {
             .await,
         Err(CaError::ReadOnlyField(_))
     ));
-    let rec = db.get_record("ACK:AI").await.unwrap();
-    assert_eq!(rec.read().await.common.acks, AlarmSeverity::Major);
+    let rec = db.get_record("ACK:AI").unwrap();
+    assert_eq!(rec.read().common.acks, AlarmSeverity::Major);
 
     // A MINOR acknowledgement is too low: C's `*psev >= precord->acks` fails.
     db.put_alarm_ack_from_ca("ACK:AI", "VAL", AlarmAck::Severity, 1)
         .await
         .unwrap();
-    assert_eq!(rec.read().await.common.acks, AlarmSeverity::Major);
+    assert_eq!(rec.read().common.acks, AlarmSeverity::Major);
 
     // A MAJOR acknowledgement clears ACKS and leaves SEVR alone.
     db.put_alarm_ack_from_ca("ACK:AI", "VAL", AlarmAck::Severity, 2)
         .await
         .unwrap();
-    let inst = rec.read().await;
+    let inst = rec.read();
     assert_eq!(inst.common.acks, AlarmSeverity::NoAlarm);
     assert_eq!(inst.common.sevr, AlarmSeverity::Major);
 }

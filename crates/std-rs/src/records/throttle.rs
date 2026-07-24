@@ -206,25 +206,21 @@ impl ThrottleRecord {
         let token = link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
-        sched.schedule_record_init(async move {
-            // Let `add_record` finish registering before the init post —
-            // this task may be spawned from `set_async_context`, which runs
-            // just before the record is inserted into the map.
-            tokio::task::yield_now().await;
+        // The parking key; `name` itself moves into the future below.
+        let init_key = name.clone();
+        sched.schedule_record_init(&init_key, async move {
             // OUT is written to, SINP is read from — the classifier answers a
             // CONSTANT link's field-type code by direction.
-            let (ov, _) = classify_link(&handle, &out, LinkRole::Output).await;
-            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input).await;
+            let (ov, _) = classify_link(&handle, &out, LinkRole::Output);
+            let (siv, _) = classify_link(&handle, &sinp, LinkRole::Input);
             if link_gen.is_current(token) {
-                let _ = handle
-                    .post_fields(
-                        &name,
-                        vec![
-                            ("OV".to_string(), EpicsValue::Short(ov)),
-                            ("SIV".to_string(), EpicsValue::Short(siv)),
-                        ],
-                    )
-                    .await;
+                let _ = handle.post_fields(
+                    &name,
+                    vec![
+                        ("OV".to_string(), EpicsValue::Short(ov)),
+                        ("SIV".to_string(), EpicsValue::Short(siv)),
+                    ],
+                );
             }
         });
     }
@@ -264,7 +260,7 @@ impl ThrottleRecord {
             }
             // C posts SYNC=Idle last (throttleRecord.c:651).
             fields.push(("SYNC".to_string(), EpicsValue::Short(THROTTLE_SYNC_IDLE)));
-            let _ = handle.post_fields(&name, fields).await;
+            let _ = handle.post_fields(&name, fields);
         });
     }
 

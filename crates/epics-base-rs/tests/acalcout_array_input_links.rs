@@ -15,6 +15,8 @@
 //!     destination: `dbGetLink(..., DBR_DOUBLE, pvalue, 0, 0)`)
 //!   * scalar source -> scalar field, unchanged (negative control)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -32,8 +34,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).unwrap()
 }
 

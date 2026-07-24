@@ -19,6 +19,8 @@
 //! implementations was unverified at the test level — Rust↔Rust
 //! covered it but not pvxs↔Rust.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{PVXMONITOR, PVXPUT, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -199,14 +201,18 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     let received = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
     let received_cb = received.clone();
     let handle = client
-        .pvmonitor_handle("W:INT", move |_desc, v| {
-            if let PvField::Structure(s) = v
-                && let Some((_, PvField::Scalar(ScalarValue::Int(i)))) =
-                    s.fields.iter().find(|(n, _)| n == "value")
-            {
-                received_cb.lock().unwrap().push(*i);
-            }
-        })
+        .pvmonitor_handle(
+            "W:INT",
+            move |_desc, v| {
+                if let PvField::Structure(s) = v
+                    && let Some((_, PvField::Scalar(ScalarValue::Int(i)))) =
+                        s.fields.iter().find(|(n, _)| n == "value")
+                {
+                    received_cb.lock().unwrap().push(*i);
+                }
+            },
+            |_| {},
+        )
         .await
         .expect("subscribe");
 

@@ -25,14 +25,16 @@
 //! (`RecordInstance::run_init_passes`) off the record's `init_record_parks_pact`,
 //! not by a record reaching into common state.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn pact_of(db: &PvDatabase, name: &str) -> EpicsValue {
-    let arc = db.get_record(name).await.expect("record exists");
-    let inst = arc.read().await;
+    let arc = db.get_record(name).expect("record exists");
+    let inst = arc.read();
     inst.client_field_value("PACT").expect("PACT resolves")
 }
 

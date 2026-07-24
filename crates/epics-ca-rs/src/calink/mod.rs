@@ -45,7 +45,7 @@
 //!     .await
 //! ```
 //!
-//! The lower-level [`install_calink_resolver`] is also available for
+//! The lower-level [`crate::calink::install_calink_resolver`] is also available for
 //! callers that drive their own database assembly (it must run before
 //! `setup_cp_links`). The shared CA client is created lazily on the
 //! first CA link open, so an IOC with no CA links never spins one up.
@@ -72,6 +72,6 @@ pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver}
 /// manual [`CaLinkResolver::open`] calls. The shared CA client is
 /// created lazily on the first link open.
 pub async fn calink_link_set_install(db: Arc<PvDatabase>) -> Vec<CommandDef> {
-    let resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    let resolver = install_calink_resolver(&db).await;
     register_calink_commands(resolver)
 }

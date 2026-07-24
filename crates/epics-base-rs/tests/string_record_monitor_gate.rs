@@ -39,6 +39,8 @@
 //! C compares strings, never a `to_f64()` deadband. The port emitted one VAL
 //! event per subscriber per cycle for all three.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
@@ -161,8 +163,8 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
     db.add_record(name, Box::new(rec)).await.unwrap();
 
     let mut rx = {
-        let inst = db.get_record(name).await.unwrap();
-        let mut inst = inst.write().await;
+        let inst = db.get_record(name).unwrap();
+        let mut inst = inst.write();
         inst.add_subscriber("VAL", 1, DbFieldType::String, EventMask::VALUE.bits())
             .unwrap()
     };

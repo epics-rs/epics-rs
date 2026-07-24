@@ -19,6 +19,8 @@
 //! and `monitor_always_post = (true, false)`, encoding "value class always,
 //! archive class never".
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::sseq::SseqRecord;
@@ -44,11 +46,10 @@ async fn bare_sseq() -> PvDatabase {
 #[tokio::test]
 async fn sseq_val_posts_every_process_including_the_unchanged_repeat() {
     let db = bare_sseq().await;
-    let inst = db.get_record("SQV").await.unwrap();
+    let inst = db.get_record("SQV").unwrap();
 
     let mut val_rx = inst
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::Long, full())
         .unwrap();
 

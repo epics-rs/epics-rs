@@ -15,6 +15,8 @@
 //! posted only the first event (VAL=1 "Busy") instead of C's three
 //! (Busy → Illegal_Value(2) → Illegal_Value(3)).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -50,9 +52,9 @@ fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
 #[tokio::test]
 async fn busy_val_notify_sequence_posts_each_change() {
     let db = build().await;
-    let r = db.get_record("B").await.unwrap();
+    let r = db.get_record("B").unwrap();
     let mut rx = {
-        let mut inst = r.write().await;
+        let mut inst = r.write();
         inst.add_subscriber("VAL", 1, DbFieldType::Enum, EventMask::VALUE.bits())
             .unwrap()
     };
@@ -65,7 +67,7 @@ async fn busy_val_notify_sequence_posts_each_change() {
             .await
             .unwrap_or_else(|e| panic!("caput B {v}: {e:?}"));
         assert!(
-            held.is_none(),
+            held.is_sync(),
             "busy put-callback must complete synchronously (val={v})"
         );
     }
@@ -83,6 +85,6 @@ async fn busy_val_notify_sequence_posts_each_change() {
 
     // The raw out-of-range index round-trips (C stores it; get_enum_str renders
     // "Illegal_Value").
-    let inst = r.read().await;
+    let inst = r.read();
     assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(3)));
 }

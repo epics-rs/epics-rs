@@ -13,6 +13,8 @@
 //! `write_out_link_value`'s single-raise invariant. SIOL now goes through the
 //! put owner like every other OUT link.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -28,8 +30,8 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
-    let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 
@@ -43,8 +45,8 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
     ao.siml = "SIM_ON".to_string();
     ao.siol = siol.to_string();
     db.add_record(name, Box::new(ao)).await.unwrap();
-    let rec = db.get_record(name).await.unwrap();
-    let mut inst = rec.write().await;
+    let rec = db.get_record(name).unwrap();
+    let mut inst = rec.write();
     inst.common.udf = 0;
 }
 
@@ -64,36 +66,22 @@ async fn r15_63_siol_pp_processes_the_passive_target() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("SIOL_TGT").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("SIOL_TGT").unwrap();
+        let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TGT".into()))
             .unwrap();
     }
-    let before = db
-        .get_record("FLNK_TGT")
-        .await
-        .unwrap()
-        .read()
-        .await
-        .common
-        .time;
+    let before = db.get_record("FLNK_TGT").unwrap().read().common.time;
 
     add_simulated_ao(&db, "AO_SIM", "SIOL_TGT PP", 42.0).await;
     process(&db, "AO_SIM").await;
 
     assert_eq!(
-        db.get_pv("SIOL_TGT").await.unwrap(),
+        db.get_pv("SIOL_TGT").unwrap(),
         EpicsValue::Double(42.0),
         "the simulated output still reaches the SIOL target"
     );
-    let after = db
-        .get_record("FLNK_TGT")
-        .await
-        .unwrap()
-        .read()
-        .await
-        .common
-        .time;
+    let after = db.get_record("FLNK_TGT").unwrap().read().common.time;
     assert_ne!(
         before, after,
         "a `PP` SIOL must processTarget, which runs the target's FLNK \
@@ -114,8 +102,8 @@ async fn r15_63_siol_ms_inherits_the_writers_severity() {
     add_simulated_ao(&db, "AO_SIM", "SIOL_TGT MS PP", 200.0).await;
     {
         // HIHI=100/HHSV=MAJOR — the ao goes MAJOR in the cycle that writes SIOL.
-        let rec = db.get_record("AO_SIM").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("AO_SIM").unwrap();
+        let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(100.0))
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))

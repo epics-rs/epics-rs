@@ -2083,7 +2083,7 @@ impl AsynRecord {
                 if changed.is_empty() {
                     return;
                 }
-                let _ = db.post_fields(&name, changed).await;
+                let _ = db.post_fields(&name, changed);
             });
         });
         self.except_cb = Some((mgr, id));
@@ -2340,7 +2340,7 @@ impl AsynRecord {
             return;
         };
         rt.spawn(async move {
-            let _ = db.post_fields(&name, changed).await;
+            let _ = db.post_fields(&name, changed);
         });
     }
 
@@ -3321,7 +3321,7 @@ impl AsynRecord {
             // force_finish_reentry / WAITn completion. A token whose record
             // was meanwhile removed (mint `None`) or superseded by an AQR
             // cancel re-enters nothing, by the generation gate.
-            if let Some(token) = db.mint_async_token(&name).await {
+            if let Some(token) = db.mint_async_token(&name) {
                 let (waitset, completion) = AsyncDbHandle::new_put_notify();
                 waitset.leave();
                 let _ = db.reprocess_on_notify(token, completion);
@@ -5621,11 +5621,8 @@ mod tests {
             .await
             .unwrap();
 
-        let rec = db
-            .get_record("TEST:ASYN:UDF")
-            .await
-            .expect("asyn record loaded");
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:ASYN:UDF").expect("asyn record loaded");
+        let inst = rec.read();
         assert_eq!(
             inst.get_common_field("UDF"),
             Some(EpicsValue::UChar(0)),
@@ -8550,8 +8547,8 @@ mod tests {
         let want = new_mask.bits() as i32;
         let mut posted = false;
         for _ in 0..2000 {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let got = inst.read().await.record.get_field("TMSK");
+            let inst = db.get_record(rec_name).unwrap();
+            let got = inst.read().record.get_field("TMSK");
             if got == Some(EpicsValue::Long(want)) {
                 posted = true;
                 break;
@@ -8563,8 +8560,8 @@ mod tests {
             "trace change must post TMSK immediately, no process()"
         );
 
-        let inst = db.get_record(rec_name).await.unwrap();
-        let g = inst.read().await;
+        let inst = db.get_record(rec_name).unwrap();
+        let g = inst.read();
         assert_eq!(g.record.get_field("TMSK"), Some(EpicsValue::Long(want)));
         assert_eq!(
             g.record.get_field("TB0"),
@@ -8648,8 +8645,8 @@ mod tests {
         // its db handle, so this is the order production runs in, and the only one
         // in which `connectDevice`'s own posts (R14-47) are observable at all.
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8787,8 +8784,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8808,8 +8805,8 @@ mod tests {
         // `pasynUser->errorMessage` to ERRS and frees the user (:571-576); the
         // operator's ERRS monitor must fire with it.
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8834,8 +8831,8 @@ mod tests {
         // `strncmp(errs, old.errs)` (:2044): a record retrying a down port must
         // not fire a monitor per retry with text the client already has.
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8853,8 +8850,8 @@ mod tests {
         // Boundary 3 — the clear. C `resetError` (:2050-2060) posts the empty
         // string, so the operator's screen loses the stale message.
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -8954,8 +8951,8 @@ mod tests {
 
         // The operator puts PORT — C `special()` :502-517 runs `connectDevice`.
         {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let mut g = inst.write().await;
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
             let rec = g
                 .record
                 .as_any_mut()
@@ -9067,8 +9064,8 @@ mod tests {
 
         let mut posted = false;
         for _ in 0..2000 {
-            let inst = db.get_record(rec_name).await.unwrap();
-            let got = inst.read().await.record.get_field("CNCT");
+            let inst = db.get_record(rec_name).unwrap();
+            let got = inst.read().record.get_field("CNCT");
             if got == Some(EpicsValue::Enum(0)) {
                 posted = true;
                 break;
@@ -9082,8 +9079,8 @@ mod tests {
 
         // ENBL / AUCT are re-read by the same refresh and are unchanged, so
         // POST_IF_NEW leaves them alone — the record still shows them true.
-        let inst = db.get_record(rec_name).await.unwrap();
-        let g = inst.read().await;
+        let inst = db.get_record(rec_name).unwrap();
+        let g = inst.read();
         assert_eq!(g.record.get_field("ENBL"), Some(EpicsValue::Enum(1)));
         assert_eq!(g.record.get_field("AUCT"), Some(EpicsValue::Enum(1)));
     }

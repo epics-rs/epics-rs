@@ -1330,7 +1330,7 @@ fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
 /// Checks the external factory registry first, then falls back to built-in types.
 ///
 /// The record comes back holding its `.dbd` initial values — see
-/// [`apply_dbd_initials`]. Every load path (`IocBuilder`, `dbLoadRecords`,
+/// `apply_dbd_initials`. Every load path (`IocBuilder`, `dbLoadRecords`,
 /// `dbCreateRecord`) goes through here, so no record can reach the database
 /// disagreeing with its `.dbd` about a default.
 pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {

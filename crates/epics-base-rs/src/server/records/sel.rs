@@ -520,7 +520,7 @@ impl Record for SelRecord {
     }
 
     /// C `selRecord.c::fetch_values` (lines 421-431): in `Specified`
-    /// (SELM==0) mode only INP[SELN] is read; `High`/`Low`/`Median` read
+    /// (SELM==0) mode only `INP[SELN]` is read; `High`/`Low`/`Median` read
     /// every input to compare them. `selector` is the NVL-resolved SELN for
     /// this cycle (the framework reads NVL before the input fetch), else the
     /// record's current SELN. A SELN >= SEL_MAX fetches nothing — C

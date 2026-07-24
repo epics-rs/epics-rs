@@ -29,10 +29,12 @@
 
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
-
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::spawn;
+// The seam handle, not a bare `tokio::task::JoinHandle`: `spawn` (imported
+// below) returns this, and under `rtems-exec-model` it is the executor's
+// `JoinFuture`. Byte-identical to `tokio::task::JoinHandle` under the default.
+use epics_base_rs::runtime::task::TaskHandle as JoinHandle;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use super::CaChannel;
@@ -168,7 +170,10 @@ impl SyncGroup {
             }
         };
 
-        match tokio::time::timeout(timeout, collect).await {
+        // `runtime::task::timeout`, not `tokio::time::timeout`: this module
+        // is compiled for the RTEMS target under `client-core`, where no
+        // tokio timer exists to drive the latter.
+        match epics_base_rs::runtime::task::timeout(timeout, collect).await {
             Ok(()) => {
                 // libca: a successful block clears the outstanding set.
                 let mut gets = Vec::new();
@@ -235,7 +240,13 @@ impl SyncGroup {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only: the shared `push_delayed_get` harness spawns
+// `tokio::time::sleep` through the `runtime::task` seam, which under
+// `rtems-exec-model` lands on a background-executor worker with no tokio
+// reactor. Three of the four tests here build their batch with it. Module
+// granularity follows `server_connection_drop_tests`; only
+// `empty_group_blocks_immediately` would stand alone under the feature.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod tests {
     use super::*;
 

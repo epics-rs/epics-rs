@@ -17,8 +17,8 @@
 //! or per-peer backlog/state, so the config level here is the
 //! bound-endpoint summary and those pvxs lines are omitted.
 //!
-//! Wiring is automatic — [`PvaServer::run_with_shell`] and
-//! [`PvaServer::run_with_source_and_shell`] register `pvxsr` themselves
+//! Wiring is automatic — [`crate::server::pva_server::PvaServer::run_with_shell`] and
+//! [`crate::server::pva_server::PvaServer::run_with_source_and_shell`] register `pvxsr` themselves
 //! (the way they already register the autosave commands), fed by the
 //! [`ServerReportHandle`] the native server publishes once it has bound.
 

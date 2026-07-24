@@ -31,6 +31,8 @@
 //! single owner in `process_record_with_links_inner`, and every output path
 //! (OUT, SIOL, the generic multi-output pairs, dfanout's push) consumes it.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -68,7 +70,7 @@ async fn add_dfanout(db: &PvDatabase, ivoa: i16, invalid: bool, outa: &str) {
     // `record(dfanout,"DFBU"){field(SELM,"Specified") field(SELN,"99")}`
     // reports INVALID/UDF, while the same record with `field(VAL,"1")` reports
     // INVALID/SOFT.
-    db.get_record("DF").await.unwrap().write().await.common.udf = 0;
+    db.get_record("DF").unwrap().write().common.udf = 0;
 }
 
 /// Boundary 1 — INVALID cycle, IVOA=Set_output_to_IVOV: the targets get IVOV,
@@ -83,10 +85,8 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
 
     let mut val_rx = db
         .get_record("DF")
-        .await
         .unwrap()
         .write()
-        .await
         .add_subscriber(
             "VAL",
             1,
@@ -98,13 +98,13 @@ async fn r15_65_ivoa_ivov_overwrites_val_and_posts_it() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(9.0),
         "IVOA=Set_output_to_IVOV assigns prec->val = prec->ivov \
          (dfanoutRecord.c:137) — VAL itself, not just the pushed copy"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(9.0),
         "push_values sends prec->val, which is now IVOV"
     );
@@ -128,12 +128,12 @@ async fn r15_65_a_failed_push_does_not_retro_trigger_the_ivov_arm() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_record("DF").await.unwrap().read().await.common.sevr,
+        db.get_record("DF").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "precondition: the failed OUTA put alarms the record (dbLink.c:444-446)"
     );
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "the IVOA switch is decided on the checkAlarms severity BEFORE the push \
          (dfanoutRecord.c:128); an INVALID raised BY the push must not reach \
@@ -154,12 +154,12 @@ async fn r15_65_ivoa_continue_pushes_val_unchanged() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "Continue_normally leaves VAL alone"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(200.0),
         "…and pushes it"
     );
@@ -178,12 +178,12 @@ async fn r15_65_ivoa_dont_drive_suppresses_the_push() {
     process(&db, "DF").await;
 
     assert_eq!(
-        db.get_pv("DF").await.unwrap(),
+        db.get_pv("DF").unwrap(),
         EpicsValue::Double(200.0),
         "Don't_drive leaves VAL alone"
     );
     assert_eq!(
-        db.get_pv("DF_TGT").await.unwrap(),
+        db.get_pv("DF_TGT").unwrap(),
         EpicsValue::Double(0.0),
         "…and drives nothing"
     );

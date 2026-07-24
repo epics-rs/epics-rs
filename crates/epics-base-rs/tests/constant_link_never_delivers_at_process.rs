@@ -24,6 +24,8 @@
 //! vs after a client put (sseq `SELL`), a constant with no init seed at all
 //! (compress `INP`), and the real-link owner path that must keep delivering.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -73,7 +75,7 @@ async fn constant_sell_seeds_seln_at_init() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("SEQ:CONST.SELN").await.unwrap().to_f64(),
+        db.get_pv("SEQ:CONST.SELN").unwrap().to_f64(),
         Some(3.0),
         "C recGblInitConstantLink(&sell, DBF_USHORT, &seln) at init_record"
     );
@@ -94,7 +96,7 @@ async fn client_put_to_seln_survives_a_constant_sell() {
     process(&db, "SEQ:CONST").await;
 
     assert_eq!(
-        db.get_pv("SEQ:CONST.SELN").await.unwrap().to_f64(),
+        db.get_pv("SEQ:CONST.SELN").unwrap().to_f64(),
         Some(5.0),
         "a constant SELL delivers nothing at process; SELN keeps the client's put"
     );
@@ -112,7 +114,7 @@ async fn a_real_sell_link_still_delivers_every_cycle() {
     process(&db, "SEQ:LINK").await;
 
     assert_eq!(
-        db.get_pv("SEQ:LINK.SELN").await.unwrap().to_f64(),
+        db.get_pv("SEQ:LINK.SELN").unwrap().to_f64(),
         Some(7.0),
         "a DB SELL link overwrites SELN on every process"
     );
@@ -131,7 +133,7 @@ async fn a_constant_inp_never_fills_a_compress_buffer() {
         process(&db, "CMP:CONST").await;
     }
 
-    let val = db.get_pv("CMP:CONST").await.unwrap();
+    let val = db.get_pv("CMP:CONST").unwrap();
     let filled = match &val {
         EpicsValue::DoubleArray(v) => v.contains(&5.0),
         _ => panic!("compress VAL is a DOUBLE array, got {val:?}"),
@@ -142,7 +144,7 @@ async fn a_constant_inp_never_fills_a_compress_buffer() {
          circular buffer, got {val:?}"
     );
     assert_eq!(
-        db.get_pv("CMP:CONST.NUSE").await.unwrap().to_f64(),
+        db.get_pv("CMP:CONST.NUSE").unwrap().to_f64(),
         Some(0.0),
         "no element was ever delivered, so the buffer holds none"
     );

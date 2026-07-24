@@ -27,6 +27,8 @@
 //! epoch. ao/bo/longout stamp UNCONDITIONALLY in their `if (!pact)` block, so
 //! they are NOT in this family and must keep stamping while undefined.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::runtime::general_time::epics_epoch;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -39,14 +41,14 @@ async fn add(db: &PvDatabase, name: &str, record: Box<dyn Record>) {
 }
 
 async fn time_of(db: &PvDatabase, name: &str) -> std::time::SystemTime {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.common.time
 }
 
 async fn udf_of(db: &PvDatabase, name: &str) -> u8 {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.common.udf
 }
 

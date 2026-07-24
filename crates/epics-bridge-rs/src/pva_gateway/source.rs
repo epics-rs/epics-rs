@@ -8,6 +8,11 @@
 //! through a per-entry tokio broadcast channel so multiple downstream
 //! clients share one upstream subscription.
 
+// RTEMS-EXEC-MODEL-ALLOW(24): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
+
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -28,7 +33,8 @@ use epics_pva_rs::client::{AssertedIdentity, MarkedRead, PvaClient};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{
-    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, OpError, SourceRead,
+    AccessChecked, ChannelContext, ChannelInvalidator, ChannelSource, MonitorStream, OpError,
+    SourceRead,
 };
 
 use super::channel_cache::{
@@ -336,7 +342,7 @@ pub struct GatewayChannelSource {
     /// `check_access_method` BEFORE the upstream forward, so the
     /// gateway can deny clients that the upstream IOC would also
     /// deny (or apply site-local policy on top of the upstream
-    /// rules). Wrapped in an AcfCell so policy may be hot-swapped
+    /// rules). Held in an AcfCell so policy may be hot-swapped
     /// at runtime via `set_acf`. None means pass-through (legacy
     /// behaviour) — pvxs `pva2pva` parity for sites
     /// that delegate all ACL to upstream.
@@ -410,7 +416,7 @@ fn upstream_op_error(e: epics_pva_rs::error::PvaError) -> OpError {
 
 impl GatewayChannelSource {
     pub fn new(cache: Arc<ChannelCache>) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(None));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(None);
         let asg_resolver = Arc::new(RwLock::new(default_asg_resolver()));
         let gate = Self::build_gate(acf.clone(), asg_resolver.clone());
         Self {
@@ -473,14 +479,14 @@ impl GatewayChannelSource {
     /// disables gateway-level enforcement and falls back to
     /// pass-through (upstream IOC remains the sole authority).
     pub async fn set_acf(&self, cfg: Option<AccessSecurityConfig>) {
-        *self.acf.write().await = cfg;
+        self.acf.store(cfg.map(std::sync::Arc::new));
         // bump the gate's ACL generation — see comment on
         // `set_asg_resolver`.
         self.gate.bump_acl_version();
     }
 
     // the `acf_cell()` accessor was removed. It
-    // returned a clone of the inner `Arc<RwLock<Option<...>>>` so an
+    // returned a clone of the inner `AcfCell` so an
     // external coordinator (e.g. a multi-source PvaServer) could
     // hot-swap the policy by writing the cell directly — but that
     // path bypassed `gate.bump_acl_version()`, leaving monitor
@@ -505,10 +511,9 @@ impl GatewayChannelSource {
     /// in a non-test build is `self.gate`.
     #[cfg(test)]
     async fn acl_level(&self, pv: &str, ctx: &ChannelContext) -> AccessLevel {
-        let guard = self.acf.read().await;
-        match *guard {
+        match self.acf.load_full() {
             None => AccessLevel::ReadWrite,
-            Some(ref cfg) => {
+            Some(cfg) => {
                 // read-lock the resolver cell; the closure
                 // runs while the read lock is held so the swap is
                 // serialized vs. in-flight evaluations. The closure
@@ -826,7 +831,7 @@ impl GatewayChannelSource {
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -941,7 +946,7 @@ impl GatewayChannelSource {
         let initial = entry.snapshot();
         let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             struct CounterGuard(Arc<AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -1014,9 +1019,9 @@ impl GatewayChannelSource {
 /// MONITOR FINISH.
 fn monitor_updates_to_values(
     mut rx: mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
-) -> mpsc::Receiver<PvField> {
+) -> MonitorStream<PvField> {
     let (tx, out) = mpsc::channel(64);
-    tokio::spawn(async move {
+    epics_base_rs::runtime::task::spawn(async move {
         while let Some(update) = rx.recv().await {
             if update.type_changed {
                 continue;
@@ -1026,7 +1031,7 @@ fn monitor_updates_to_values(
             }
         }
     });
-    out
+    MonitorStream::Channel(out)
 }
 
 impl ChannelSource for GatewayChannelSource {
@@ -1106,10 +1111,13 @@ impl ChannelSource for GatewayChannelSource {
         // (`p2pApp/channel.cpp:99-148`); `pvinfo` issues a one-shot
         // GET_FIELD that reuses the client's connection pool and no longer
         // waits on a first monitor event (see `has_pv`).
-        tokio::time::timeout(self.connect_timeout, self.cache.client().pvinfo(name))
-            .await
-            .ok()?
-            .ok()
+        epics_base_rs::runtime::task::timeout(
+            self.connect_timeout,
+            self.cache.client().pvinfo(name),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     /// a credentialed downstream CREATE_CHANNEL resolves existence by
@@ -1145,7 +1153,7 @@ impl ChannelSource for GatewayChannelSource {
         name: &str,
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
-        tokio::time::timeout(
+        epics_base_rs::runtime::task::timeout(
             self.connect_timeout,
             self.upstream_client_for(&ctx).pvinfo(name),
         )
@@ -1386,7 +1394,7 @@ impl ChannelSource for GatewayChannelSource {
         // No monitor-gated preflight (see `put_value`): the RPC forwards
         // through the shared client, which connects on demand and surfaces
         // the upstream error itself.
-        let result = tokio::time::timeout(
+        let result = epics_base_rs::runtime::task::timeout(
             self.rpc_timeout,
             self.cache
                 .client()
@@ -1461,7 +1469,7 @@ impl ChannelSource for GatewayChannelSource {
                 None => client.pvrpc(name, &request_desc, &request_value).await,
             }
         };
-        let result = tokio::time::timeout(self.rpc_timeout, call).await;
+        let result = epics_base_rs::runtime::task::timeout(self.rpc_timeout, call).await;
         match result {
             Ok(Ok(pair)) => Ok(pair),
             Ok(Err(e)) => Err(upstream_op_error(e)),
@@ -1689,15 +1697,15 @@ impl ChannelSource for GatewayChannelSource {
     async fn subscribe_raw(
         &self,
         name: &str,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_raw_seeded`).
         self.subscribe_raw_inner(self.cache.clone(), name, None)
             .await
-            .map(|(_initial, updates)| updates)
+            .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         // legacy ctx-less path: updates-only, seed discarded (the
         // single-seed server path uses `subscribe_seeded`). The internal
         // stream is `MonitorUpdate`; adapt to bare `PvField` for this
@@ -1785,7 +1793,7 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         if !checked.allows_read() {
             return None;
         }
@@ -1803,7 +1811,7 @@ impl ChannelSource for GatewayChannelSource {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         if !checked.allows_read() {
             return None;
         }
@@ -1813,7 +1821,7 @@ impl ChannelSource for GatewayChannelSource {
             ctx.pv_request.as_ref(),
         )
         .await
-        .map(|(_initial, updates)| updates)
+        .map(|(_initial, updates)| MonitorStream::Channel(updates))
     }
 
     /// decoded MONITOR with the downstream's event-affecting
@@ -1843,7 +1851,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         _opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         // Delegate to the ACF-gated `subscribe_checked` path, which
         // forwards `ctx.pv_request` to a per-pvRequest upstream monitor.
         // The cooked `subscribe_checked_opts_marked` variant the server
@@ -1860,7 +1868,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         ctx: ChannelContext,
         _opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::RawMonitorEvent>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::RawMonitorEvent>> {
         self.subscribe_raw_checked(checked, ctx).await
     }
 
@@ -1912,7 +1920,7 @@ impl ChannelSource for GatewayChannelSource {
             // other rule — they carry the upstream event's own changed bitset
             // through `MonitorUpdate::marked` (`moncache.cpp:142`).
             initial,
-            updates,
+            updates: MonitorStream::Channel(updates),
             on_start: None,
         })
     }
@@ -1947,7 +1955,7 @@ impl ChannelSource for GatewayChannelSource {
             // through the decoded path, so it goes on the wire with exactly
             // that bitset.
             initial,
-            updates,
+            updates: MonitorStream::Channel(updates),
             on_start: None,
         })
     }

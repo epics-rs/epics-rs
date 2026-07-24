@@ -17,7 +17,7 @@
 //! array (`toArray(ps,1)`); an array result's scalar is `arr[0]`
 //! (`to_double`). `aCalcPerform` returns `-1` when the scalar result is
 //! NaN/Inf. The Rust `ArrayStackValue` API matches this exactly:
-//! `as_f64()` (Double→v, Array→arr[0]) is `VAL`, and `broadcast(n)`
+//! `as_f64()` (Double→v, Array→`arr[0]`) is `VAL`, and `broadcast(n)`
 //! (Double→`[v;n]`, Array→arr) is `AVAL`; a non-finite `VAL` is the
 //! failure signal.
 //!
@@ -1274,7 +1274,7 @@ impl Record for AcalcoutRecord {
     /// (`:1031-1036`) — see [`Self::take_cycle_posted_fields`].
     ///
     /// The comparison window is `acalcGetNumElements` (NUSE, else NELM) with the
-    /// tail zero-filled: [`AcalcoutRecord::array_field_value`] is exactly that
+    /// tail zero-filled: `AcalcoutRecord::array_field_value` is exactly that
     /// view, so comparing it across the write is C's compare.
     ///
     /// This is the INTERNAL write path — the framework's input-link delivery

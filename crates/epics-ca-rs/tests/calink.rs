@@ -5,6 +5,13 @@
 //! `ca` link set, and a soft-channel record whose INP is a CA link fetches the
 //! remote PV's value through the monitor-backed cache — the C `dbCa.c` model.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +89,7 @@ async fn ca_link_resolves_remote_value() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     // Open the link + wait for the first monitor event to populate
     // the cache.
@@ -100,7 +107,7 @@ async fn ca_link_resolves_remote_value() {
         "CA link must return the upstream PV's value"
     );
     assert!(
-        LinkSet::is_connected(&resolver, "CALINK:SRC").await,
+        LinkSet::is_connected(&resolver, "CALINK:SRC"),
         "CA link must report connected once a value is cached"
     );
     assert_eq!(resolver.link_count(), 1);
@@ -122,7 +129,7 @@ async fn ca_link_resolves_with_scheme_prefix() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("ca://CALINK:SCHEME", Duration::from_secs(5))
@@ -158,7 +165,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     let client = Arc::new(pinned_client(port).await);
     let db = PvDatabase::new();
     // Register the CA link set on the database.
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
 
     // Pre-open the link and wait so the synchronous lset read serves
@@ -174,8 +181,8 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("CADST").await.expect("record exists");
-        let mut inst = rec.write().await;
+        let rec = db.get_record("CADST").expect("record exists");
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:INP:SRC CA".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -186,8 +193,8 @@ async fn record_with_ca_inp_link_reads_remote_value() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CADST").await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record("CADST").expect("record exists");
+    let inst = rec.read();
     assert_eq!(
         inst.record.val().and_then(|v| v.to_f64()),
         Some(19.25),
@@ -240,8 +247,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+        let mut inst = rec.write();
         inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP".into()))
             .unwrap();
         inst.common.udf = 0;
@@ -256,7 +263,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // the monitor callback can dispatch CP holders (this
     // fix). Uses its own client, which picks
     // up the pinned env set above.
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    let _resolver = install_calink_resolver(&db).await;
 
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
@@ -268,8 +275,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let v = {
-            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(5.0) {
@@ -298,8 +305,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let v = {
-            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
+            let inst = rec.read();
             inst.record.val().and_then(|v| v.to_f64())
         };
         if v == Some(42.0) {
@@ -335,7 +342,7 @@ async fn ca_link_out_write_updates_remote_pv() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     // Open the link + wait for the first monitor event so the channel
     // is connected and the OUT write has a live circuit to push on.
@@ -411,7 +418,7 @@ async fn ca_link_out_write_async_waits_for_completion() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("CALINK:OUT:ASYNC", Duration::from_secs(5))
@@ -462,7 +469,7 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("ca://CALINK:OUT:SCHEME", Duration::from_secs(5))
@@ -521,7 +528,7 @@ async fn ca_link_exposes_remote_metadata() {
     let _server = tokio::spawn(async move { server.run().await });
 
     let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+    let resolver = CaLinkResolver::with_client(client);
 
     let connected = resolver
         .wait_for_link_connected("CALINK:META:SRC", Duration::from_secs(5))
@@ -533,7 +540,7 @@ async fn ca_link_exposes_remote_metadata() {
     // so poll until the cached metadata lands.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let md = loop {
-        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC").await {
+        if let Some(md) = LinkSet::link_metadata(&resolver, "CALINK:META:SRC") {
             // Wait for the CTRL get to fill the limits, not just the
             // channel-info type/count from a partial first store.
             if md.graphic_limits.is_some() {
@@ -568,7 +575,7 @@ async fn ca_link_exposes_remote_metadata() {
 
     // While connected the metadata is served; the read path gates on the
     // connection flag exactly like the value/alarm getters.
-    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC").await);
+    assert!(LinkSet::is_connected(&resolver, "CALINK:META:SRC"));
 }
 
 /// `install_calink_resolver` registers under the `ca` scheme so the
@@ -583,7 +590,7 @@ async fn install_registers_ca_scheme() {
     pin_env(port);
 
     let db = PvDatabase::new();
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    let _resolver = install_calink_resolver(&db).await;
     let schemes = db.registered_link_schemes().await;
     assert!(
         schemes.contains(&"ca".to_string()),
@@ -678,9 +685,8 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                     let rec = config
                         .db
                         .get_record("CALINK:SEAM:HOLDER")
-                        .await
                         .expect("holder loaded via dbLoadRecords");
-                    let inst = rec.read().await;
+                    let inst = rec.read();
                     inst.record.val().and_then(|v| v.to_f64())
                 };
                 if v == Some(5.0) {

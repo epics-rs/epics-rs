@@ -21,14 +21,16 @@
 //!     dbgf J2.VAL -> "x\\ny"    stored: x, BACKSLASH, n, y
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
 async fn val(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> String {
-    let inst = db.get_record(rec).await.unwrap_or_else(|| panic!("{rec}"));
-    let inst = inst.read().await;
+    let inst = db.get_record(rec).unwrap_or_else(|| panic!("{rec}"));
+    let inst = inst.read();
     match inst.record.get_field("VAL") {
         Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
         other => panic!("{rec}.VAL: {other:?}"),

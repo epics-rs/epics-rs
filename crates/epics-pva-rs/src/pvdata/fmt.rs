@@ -3,7 +3,7 @@
 //!
 //! pvxs streams a `Value` through `operator<<(std::ostream&, const Value&)`
 //! (`src/pvxs/data.h:940-943`), which is `strm << val.format()` with the
-//! DEFAULT [`Fmt`]: `_format = Tree`, `_showValue = true`, `_limit = 0`
+//! DEFAULT `Fmt`: `_format = Tree`, `_showValue = true`, `_limit = 0`
 //! (`data.h:787-813`). `FmtTree::show()` (`src/datafmt.cpp:124-311`) then
 //! writes
 //!

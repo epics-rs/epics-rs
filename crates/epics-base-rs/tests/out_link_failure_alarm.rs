@@ -16,6 +16,8 @@
 //! boundary of the put owner: local DB target, external `ca://` target, SIOL
 //! simulated output, and the recovery cycle.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -31,11 +33,14 @@ struct FailingLset;
 
 #[async_trait::async_trait]
 impl LinkSet for FailingLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         false
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Err("not connected".to_string())
@@ -49,11 +54,14 @@ struct OkLset {
 
 #[async_trait::async_trait]
 impl LinkSet for OkLset {
-    async fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &str) -> bool {
         true
     }
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, name: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         self.puts.lock().unwrap().push(name.to_string());
@@ -67,16 +75,16 @@ async fn add_ao_with_out(db: &PvDatabase, name: &str, out: &str) {
     db.add_record(name, Box::new(AoRecord::new(3.0)))
         .await
         .unwrap();
-    let rec = db.get_record(name).await.expect("just added");
-    let mut inst = rec.write().await;
+    let rec = db.get_record(name).expect("just added");
+    let mut inst = rec.write();
     inst.put_common_field("OUT", EpicsValue::String(out.into()))
         .unwrap();
     inst.common.udf = 0;
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
-    let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 
@@ -187,6 +195,12 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
         .await
         .unwrap();
 
+    // A plain OUT put is staged on the link-put queue and the record returns
+    // — C `dbCaPutLink` does the same (`dbCa.c:622-624`), and the wire write
+    // happens on the `dbCaTask`. `dbCaSync` (`dbCa.c:1191-1194`) is the
+    // barrier that makes it observable.
+    db.sync_external_link_puts().await;
+
     assert_eq!(
         puts.lock().unwrap().as_slice(),
         ["REMOTE:OUT"],
@@ -221,7 +235,7 @@ async fn r14_62_successful_local_out_put_raises_no_alarm() {
         "a successful OUT put must leave the writing record un-alarmed"
     );
     assert_eq!(
-        db.get_pv("AO_GOOD_DEST").await.unwrap().to_f64(),
+        db.get_pv("AO_GOOD_DEST").unwrap().to_f64(),
         Some(3.0),
         "…and the value must have landed on the target"
     );

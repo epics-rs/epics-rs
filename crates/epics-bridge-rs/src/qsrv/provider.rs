@@ -5,6 +5,8 @@
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
 //! once that crate's native PVA server exposes them directly.
 
+// RTEMS-EXEC-MODEL-ALLOW(20): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -173,8 +175,8 @@ impl AcfAccessControl {
     /// group means granting a write the ACF denies.
     async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8) {
         let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
-        if let Some(rec) = self.db.get_record(record_name).await {
-            let inst = rec.read().await;
+        if let Some(rec) = self.db.get_record(record_name) {
+            let inst = rec.read();
             return (inst.common.access_group().to_string(), inst.common.asl);
         }
         ("DEFAULT".to_string(), 0u8)
@@ -619,6 +621,11 @@ impl Channel for AnyChannel {
 /// and pluggable access control.
 pub struct BridgeProvider {
     db: Arc<PvDatabase>,
+    /// The server-wide QSRV group drain — pvxs's one `qsrvGroup` event pump
+    /// per `GroupSource` (`ioc/groupsource.cpp:96`). Every group channel
+    /// this provider vends shares it, so ALL group subscriptions on the
+    /// served IOC drain through ONE task (doc/qsrv-rtems-design.md §9.15).
+    group_pump: Arc<super::group_pump::GroupPump>,
     /// Group PV registry. Wrapped in [`parking_lot::RwLock`] so iocsh
     /// commands (`dbLoadGroup`, `processGroups`) can mutate the
     /// registry through a shared `Arc<BridgeProvider>` after the
@@ -638,7 +645,16 @@ pub struct BridgeProvider {
     /// Metadata cache for single-record channels: (NtType, DbFieldType).
     /// Avoids repeated record introspection on every create_channel() call.
     /// Corresponds to C++ PDBProvider's transient_pv_map.
-    record_cache: tokio::sync::RwLock<HashMap<String, (NtType, DbFieldType)>>,
+    ///
+    /// [`parking_lot::RwLock`], like every other lock in this struct: the
+    /// critical section is a `HashMap` get/insert with no I/O in it, so an
+    /// async lock bought nothing and cost a PI-invisible wait on the
+    /// GET/PUT hot path (doc/qsrv-rtems-design.md §5, L-A). The guard is
+    /// `!Send`, so a future that held one across an `.await` would fail the
+    /// `+ Send` bound the `QsrvPvStore` source methods impose on every
+    /// caller of this provider — the rule is enforced by construction, not
+    /// by review.
+    record_cache: parking_lot::RwLock<HashMap<String, (NtType, DbFieldType)>>,
     /// Live access-control cell. Channels and AccessContexts hold an
     /// `Arc<LiveAccessProxy>` that points at this cell, so
     /// `set_access_control` is observed by all existing channels on
@@ -742,8 +758,9 @@ impl BridgeProvider {
     pub fn new_with_serving(db: Arc<PvDatabase>, enabled: bool) -> Self {
         Self {
             db,
+            group_pump: super::group_pump::GroupPump::new(),
             groups: parking_lot::RwLock::new(HashMap::new()),
-            record_cache: tokio::sync::RwLock::new(HashMap::new()),
+            record_cache: parking_lot::RwLock::new(HashMap::new()),
             access_cell: Arc::new(parking_lot::RwLock::new(Arc::new(AllowAllAccess))),
             channels_created: std::sync::atomic::AtomicU64::new(0),
             ops_get: std::sync::atomic::AtomicU64::new(0),
@@ -771,13 +788,13 @@ impl BridgeProvider {
             return true;
         }
         let (record, _field) = epics_base_rs::server::database::parse_pv_name(name);
-        let Some(rec_arc) = self.db.get_record(record).await else {
+        let Some(rec_arc) = self.db.get_record(record) else {
             // PVA-plugin PVs (NTNDArray) aren't records — caller
             // (qsrv pva_adapter) should consult its own pva_pvs map.
             // Default false here so unknown names refuse PUT upfront.
             return false;
         };
-        let inst = rec_arc.read().await;
+        let inst = rec_arc.read();
         inst.common.disp == 0
     }
 
@@ -1138,7 +1155,7 @@ impl BridgeProvider {
     /// only conflicts when it is *locally* a record, exactly as
     /// `dbChannelTest` tests the local database.
     async fn record_exists(&self, name: &str) -> bool {
-        self.db.get_record(name).await.is_some() || self.db.find_pv(name).await.is_some()
+        self.db.get_record(name).is_some() || self.db.find_pv(name).await.is_some()
     }
 
     /// Resolve `name` to a group definition only when no backing
@@ -1236,7 +1253,7 @@ impl BridgeProvider {
         ) {
             return None;
         }
-        self.db.get_pv(&channel).await.ok()
+        self.db.get_pv(&channel).ok()
     }
 
     /// Write a single field of a group. Mirrors pvxs `putGroupField`.
@@ -1273,8 +1290,11 @@ impl BridgeProvider {
     }
 
     /// Clear the record metadata cache.
-    pub async fn clear_cache(&self) {
-        self.record_cache.write().await.clear();
+    ///
+    /// Synchronous: the whole body is one `parking_lot` write guard over a
+    /// `HashMap::clear`, with nothing to await.
+    pub fn clear_cache(&self) {
+        self.record_cache.write().clear();
     }
 }
 
@@ -1318,7 +1338,7 @@ impl ChannelProvider for BridgeProvider {
         // names — a PVA client running channelList expects them so
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
-        names.extend(self.db.all_alias_names().await);
+        names.extend(self.db.all_alias_names());
         // Only groups the serve gate hands out are listed: a name shadowed by
         // a record is listed once (as the record — the record wins, pvxs
         // `defineGroups` ioc/groupconfigprocessor.cpp:177), and a group that
@@ -1393,7 +1413,9 @@ impl BridgeProvider {
         // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
         if let Some(def) = self.servable_group(name).await {
             return Ok(AnyChannel::Group(
-                GroupChannel::new(self.db.clone(), def).with_access(access_ctx),
+                GroupChannel::new(self.db.clone(), def)
+                    .with_access(access_ctx)
+                    .with_pump(self.group_pump.clone()),
             ));
         } else if self.groups.read().contains_key(name) {
             tracing::warn!(
@@ -1429,7 +1451,9 @@ impl BridgeProvider {
         // construction path through `BridgeChannel::new` so the
         // per-channel filter chain is parsed.
         if parsed.json_suffix.is_none() {
-            let cache = self.record_cache.read().await;
+            // Sync guard, scoped to this block: nothing inside it awaits, and
+            // it is dropped before the `has_name` await below.
+            let cache = self.record_cache.read();
             if let Some(&(nt_type, value_dbf)) = cache.get(name) {
                 return Ok(AnyChannel::Single(
                     BridgeChannel::from_cached(
@@ -1458,7 +1482,7 @@ impl BridgeProvider {
             // are NOT cached — each filtered subscription parses
             // its own chain.
             if parsed.json_suffix.is_none() {
-                let mut cache = self.record_cache.write().await;
+                let mut cache = self.record_cache.write();
                 cache.insert(name.to_string(), (channel.nt_type(), channel.value_dbf()));
             }
 
@@ -1478,10 +1502,10 @@ pub async fn channel_property_support(
     name: &str,
 ) -> epics_base_rs::server::snapshot::PropertySupport {
     let (record, field) = epics_base_rs::server::database::parse_pv_name(name);
-    let Some(rec_arc) = db.get_record(record).await else {
+    let Some(rec_arc) = db.get_record(record) else {
         return epics_base_rs::server::snapshot::PropertySupport::NONE;
     };
-    let inst = rec_arc.read().await;
+    let inst = rec_arc.read();
     inst.property_support_for_field(field)
 }
 
@@ -1664,8 +1688,8 @@ mod tests {
         // DISP=1 so the served record is NOT writable; a leaked group
         // predicate would still advertise writable=true.
         {
-            let rec = db.get_record("SH:rec").await.unwrap();
-            rec.write().await.common.disp = 1;
+            let rec = db.get_record("SH:rec").unwrap();
+            rec.write().common.disp = 1;
         }
 
         let provider = BridgeProvider::new(db);
@@ -1915,8 +1939,8 @@ ASG(SECURE) {
         db.add_record("AI:SEC", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record("AI:SEC").await.unwrap();
-        rec.write().await.common.asg = "SECURE".to_string();
+        let rec = db.get_record("AI:SEC").unwrap();
+        rec.write().common.asg = "SECURE".to_string();
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
         // Anyone can read.
@@ -1975,28 +1999,28 @@ ASG(ROLE_GATED) {
         //   AI:ASL1 has asl=1; RULE(0, WRITE) is skipped (1 > 0) → alice CANNOT write.
         //   Pre-fix: hardcoded asl=0 caused AI:ASL1 write to return true (WRONG).
         {
-            let rec = db.get_record("AI:ASL0").await.unwrap();
-            let mut w = rec.write().await;
+            let rec = db.get_record("AI:ASL0").unwrap();
+            let mut w = rec.write();
             w.common.asg = "ASL_GATED".to_string();
             w.common.asl = 0;
         }
         {
-            let rec = db.get_record("AI:ASL1").await.unwrap();
-            let mut w = rec.write().await;
+            let rec = db.get_record("AI:ASL1").unwrap();
+            let mut w = rec.write();
             w.common.asg = "ASL_GATED".to_string();
             w.common.asl = 1;
         }
         {
-            let rec = db.get_record("AI:METH").await.unwrap();
-            rec.write().await.common.asg = "METHOD_GATED".to_string();
+            let rec = db.get_record("AI:METH").unwrap();
+            rec.write().common.asg = "METHOD_GATED".to_string();
         }
         {
-            let rec = db.get_record("AI:AUTH").await.unwrap();
-            rec.write().await.common.asg = "AUTHORITY_GATED".to_string();
+            let rec = db.get_record("AI:AUTH").unwrap();
+            rec.write().common.asg = "AUTHORITY_GATED".to_string();
         }
         {
-            let rec = db.get_record("AI:ROLE").await.unwrap();
-            rec.write().await.common.asg = "ROLE_GATED".to_string();
+            let rec = db.get_record("AI:ROLE").unwrap();
+            rec.write().common.asg = "ROLE_GATED".to_string();
         }
 
         let acl = AcfAccessControl::new(db.clone(), cfg);
@@ -2338,8 +2362,8 @@ ASG(ANON_GATED) {
             .await
             .unwrap();
         {
-            let rec = db.get_record("AI:ANON").await.unwrap();
-            rec.write().await.common.asg = "ANON_GATED".to_string();
+            let rec = db.get_record("AI:ANON").unwrap();
+            rec.write().common.asg = "ANON_GATED".to_string();
         }
         let acl = AcfAccessControl::new(db.clone(), cfg);
 

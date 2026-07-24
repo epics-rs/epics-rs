@@ -1,0 +1,22 @@
+[package]
+name = "epics-rtems-boot"
+version.workspace = true
+edition.workspace = true
+description = "RTEMS boot shim (POSIX_Init + kernel configuration) and link contract for epics-rs IOCs"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+
+# `cc` cross-compiles the C shim in `csrc/`. It is unconditional rather than
+# `[target.'cfg(target_os = "rtems")'.build-dependencies]` because a
+# target-cfg build-dependency is evaluated against the HOST platform, so that
+# table would never match. The build script itself no-ops off RTEMS, so `cc`
+# is compiled but never invoked on a host build.
+[build-dependencies]
+cc = "1"
+
+# Only the RTEMS libc layout guard in `lib.rs` uses this. Unlike the
+# build-dependency table above, a *regular* target-cfg dependency IS evaluated
+# against the target, so this gate works and costs a host build nothing.
+[target.'cfg(target_os = "rtems")'.dependencies]
+libc = "0.2"

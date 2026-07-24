@@ -11,6 +11,8 @@
 //!
 //! Fields are DBF_LONG (calcoutRecord.dbd.pod:729,1049; sCalcoutRecord.dbd:75,438).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
@@ -54,9 +56,9 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
     db.put_record_field_from_ca("CO", "CALC", EpicsValue::String("A+B".into()))
         .await
         .unwrap();
-    let rec = db.get_record("CO").await.unwrap();
+    let rec = db.get_record("CO").unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -65,7 +67,7 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
         .await
         .expect("calcout special() returns 0 even for an uncompilable CALC");
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -74,14 +76,14 @@ async fn calcout_bad_calc_put_is_accepted_and_lands_in_clcv() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
     db.put_record_field_from_ca("CO", "OCAL", EpicsValue::String("A*2".into()))
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(0))
     );
 }
@@ -92,13 +94,13 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
     db.add_record("SC", Box::new(ScalcoutRecord::default()))
         .await
         .unwrap();
-    let rec = db.get_record("SC").await.unwrap();
+    let rec = db.get_record("SC").unwrap();
 
     db.put_record_field_from_ca("SC", "CALC", EpicsValue::String("A+B".into()))
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -106,7 +108,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .expect("scalcout accepts the put");
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -116,7 +118,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(0))
     );
 
@@ -124,7 +126,7 @@ async fn scalcout_clcv_oclv_track_scalcpostfix_status() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 }
@@ -135,7 +137,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
     db.add_record("AC", Box::new(AcalcoutRecord::default()))
         .await
         .unwrap();
-    let rec = db.get_record("AC").await.unwrap();
+    let rec = db.get_record("AC").unwrap();
 
     db.put_record_field_from_ca("AC", "CALC", EpicsValue::String("1+".into()))
         .await
@@ -143,7 +145,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
     // Pre-fix this read back 1; C `aCalcPostfix` returns -1
     // (aCalcPostfix.c:801-809).
     assert_eq!(
-        rec.read().await.record.get_field("CLCV"),
+        rec.read().record.get_field("CLCV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 
@@ -151,7 +153,7 @@ async fn acalcout_bad_calc_stores_minus_one_not_a_generic_one() {
         .await
         .unwrap();
     assert_eq!(
-        rec.read().await.record.get_field("OCLV"),
+        rec.read().record.get_field("OCLV"),
         Some(EpicsValue::Long(POSTFIX_ERR))
     );
 }

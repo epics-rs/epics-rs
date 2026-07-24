@@ -2,22 +2,45 @@
 
 pub mod access_token;
 pub mod addr_list;
+// The async server front-end — the `tokio::net` accept/beacon/introspection
+// stack and the `CaServer` orchestrator (which also drives `tokio::signal` and
+// the `discovery` stack) — is host-only; its deps do not build for RTEMS. The
+// RTEMS build serves CA through the `std::net` `blocking` driver plus the
+// runtime-agnostic shared logic in `tcp`/`udp`/`monitor`/`stats`. Gated out for
+// the RTEMS target (armv7-rtems-eabihf).
+#[cfg(not(target_os = "rtems"))]
 pub mod beacon;
+pub mod blocking;
+#[cfg(not(target_os = "rtems"))]
 pub mod ca_server;
+#[cfg(not(target_os = "rtems"))]
 pub mod introspection;
 pub mod ioc_app;
 pub mod iocsh;
 pub mod monitor;
+pub mod outbox;
 pub mod rate_limit;
-#[cfg(feature = "cap-tokens")]
+pub(crate) mod recv;
+#[cfg(all(feature = "cap-tokens", not(target_os = "rtems")))]
 pub mod signed_beacon;
+pub mod stats;
 pub mod tcp;
 pub mod udp;
 
-pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder, ServerStats};
+#[cfg(not(target_os = "rtems"))]
+pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
+/// Live-connection / byte / channel / subscription counters. Runtime-agnostic
+/// (pure atomics) and shared by the async server and the blocking driver's
+/// monitor path, so it lives outside the host-only [`ca_server`] module.
+pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 
+// `run_ca_ioc` (below) builds a `CaServer` — the async front-end — so both it
+// and these imports are host-only. The RTEMS IOC entry point is the blocking
+// server driver (`server::blocking`).
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::error::CaResult;
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
 /// Convert a `$`-channel snapshot value from `EpicsValue::String` to
@@ -101,7 +124,7 @@ pub(super) fn apply_long_string_mode(
 
 /// Run an IOC with the Channel Access protocol.
 ///
-/// This is the standard protocol runner for [`IocApplication::run`].
+/// This is the standard protocol runner for [`epics_base_rs::server::ioc_app::IocApplication::run`].
 /// It creates a [`CaServer`] from the provided configuration and
 /// starts the CA server with an interactive iocsh shell.
 ///
@@ -113,8 +136,9 @@ pub(super) fn apply_long_string_mode(
 ///     .run(epics_ca_rs::server::run_ca_ioc)
 ///     .await
 /// ```
+#[cfg(not(target_os = "rtems"))]
 pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
-    let mut server = CaServer::from_parts(
+    let server = CaServer::from_parts(
         config.db,
         config.port,
         config.tcp_port,
@@ -123,7 +147,10 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
         config.autosave_manager,
     )
     .await?;
-    server.set_after_init_hooks(config.after_init_hooks);
+    // `config.after_init_hooks` is always handed over EMPTY —
+    // `IocApplication::run` drains the hooks itself after PINI (H3) and
+    // owns scanning via the core `ScanOwner`, so the CA server neither
+    // runs hooks nor scans.
     let casr = iocsh::casr_command(server.stats());
     server
         .run_with_shell(move |shell| {

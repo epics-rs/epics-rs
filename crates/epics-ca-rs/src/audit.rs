@@ -22,18 +22,47 @@
 //! `caput`, `acf_deny`, `subscribe`, `unsubscribe`. Keep additions
 //! strictly additive — downstream log shippers parse the JSON.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::path::Path;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Where audit events go. The bundled implementations cover the two
 /// common cases (file with append-write, stderr) but a custom `Sink`
 /// can wrap an HTTP shipper, syslog, or similar.
 pub enum AuditSink {
-    File(Mutex<tokio::fs::File>),
+    File(AuditFile),
     Stderr,
     Custom(Box<dyn AuditWriter + Send + Sync>),
+}
+
+/// The append-only file behind [`AuditSink::File`].
+///
+/// Opaque on purpose. It used to be a bare `Mutex<tokio::fs::File>` in the
+/// variant, and that spelling does not build a working audit log under
+/// `rtems-exec-model`: `tokio::fs` is a blocking `std::fs` call handed to
+/// tokio's `spawn_blocking` pool, so it requires an entered tokio runtime,
+/// and the writer task this sink is drained by runs on the background
+/// executor there, not on a tokio worker. The write now goes through
+/// [`epics_base_rs::runtime::fs`], which both backends implement.
+///
+/// Holding the handle behind this type instead of exposing the mutex means a
+/// caller cannot put a runtime-bound handle back into the variant.
+pub struct AuditFile(Arc<Mutex<std::fs::File>>);
+
+impl AuditFile {
+    /// Adopt an already-open file. Synchronous, so a caller that opened the
+    /// file itself (`CaServer`'s `EPICS_CAS_AUDIT_FILE` handling) needs no
+    /// runtime to build the sink.
+    pub fn from_std(file: std::fs::File) -> Self {
+        Self(Arc::new(Mutex::new(file)))
+    }
+}
+
+impl std::fmt::Debug for AuditFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuditFile")
+    }
 }
 
 /// Hook for application-supplied audit destinations.
@@ -47,21 +76,42 @@ impl AuditSink {
     /// neither truncated nor rotated — pair with `logrotate` or
     /// systemd-journald via stderr.
     pub async fn file(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        Ok(AuditSink::File(Mutex::new(f)))
+        let path = path.as_ref().to_path_buf();
+        let f = epics_base_rs::runtime::fs::blocking(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        })
+        .await?;
+        Ok(AuditSink::File(AuditFile::from_std(f)))
     }
 
     pub async fn write(&self, line: &str) {
+        // THE write point for every sink and every renderer. One record in,
+        // one line out — `to_aslog_line` interpolates the peer-supplied
+        // `user`, `host`, `pv` and `value` straight into a text line, and a
+        // CA CLIENT_NAME may legally contain a newline (the server checks
+        // only NUL-termination and a 511-byte cap, `server/tcp.rs:2416`).
+        // Applied uniformly rather than per-renderer: the JSON encoder has
+        // already removed every raw control byte, so this is a no-op there.
+        let line = &*epics_base_rs::runtime::log::single_line(line);
         match self {
-            AuditSink::File(m) => {
-                let mut f = m.lock().await;
-                let _ = f.write_all(line.as_bytes()).await;
-                let _ = f.write_all(b"\n").await;
-                let _ = f.flush().await;
+            AuditSink::File(AuditFile(handle)) => {
+                // The lock is taken inside the closure rather than held across
+                // an await, so the "never interleave mid-line" invariant is
+                // unchanged: two concurrent events still serialise on this one
+                // mutex, now on the blocking worker instead of on the task.
+                let mut bytes = line.as_bytes().to_vec();
+                bytes.push(b'\n');
+                let handle = handle.clone();
+                let _ = epics_base_rs::runtime::fs::blocking(move || {
+                    use std::io::Write as _;
+                    let mut f = handle.lock().unwrap_or_else(|e| e.into_inner());
+                    f.write_all(&bytes)?;
+                    f.flush()
+                })
+                .await;
             }
             AuditSink::Stderr => {
                 eprintln!("{line}");
@@ -246,7 +296,11 @@ impl AuditLogger {
     pub fn new_with_format(sink: AuditSink, format: AuditFormat) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(AUDIT_QUEUE_CAPACITY);
         let sink = Arc::new(sink);
-        tokio::spawn(async move {
+        // `runtime::task::spawn`, not `tokio::spawn`: this is the one task that
+        // ever touches the sink, so if it cannot be created on a backend then
+        // nothing the sink does matters. `tokio::sync::mpsc` stays — it
+        // suspends on a runtime-agnostic primitive and needs no reactor.
+        epics_base_rs::runtime::task::spawn(async move {
             while let Some(line) = rx.recv().await {
                 sink.write(&line).await;
             }
@@ -254,7 +308,7 @@ impl AuditLogger {
         Self { tx, format }
     }
 
-    pub async fn log(&self, ev: AuditEvent<'_>) {
+    pub fn log(&self, ev: AuditEvent<'_>) {
         let line = match self.format {
             AuditFormat::Json => ev.to_json(),
             AuditFormat::LegacyAslog => ev.to_aslog_line(),
@@ -272,6 +326,64 @@ impl AuditLogger {
 mod tests {
     use super::*;
 
+    /// The point of the change: an audit file can be opened and written with
+    /// no tokio runtime anywhere in the picture — a plain `std::thread`
+    /// driving the future with `park_on`, which is the shape
+    /// `BlockingCaServer` uses for every per-client command.
+    ///
+    /// Feature-gated because it is only true on the exec backend. On the
+    /// tokio backend `runtime::task::spawn_blocking` is `tokio::task::
+    /// spawn_blocking`, which needs an entered runtime exactly as `tokio::fs`
+    /// did — the seam does not invent a blocking pool where there is none, it
+    /// routes to whichever one the backend has.
+    #[cfg(feature = "rtems-exec-model")]
+    #[test]
+    fn a_file_sink_writes_with_no_runtime_entered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let p = path.clone();
+        std::thread::spawn(move || {
+            epics_base_rs::runtime::task::block_on_sync(async move {
+                let sink = AuditSink::file(&p).await.expect("open through the seam");
+                sink.write("one").await;
+                sink.write("two").await;
+            })
+            .expect("a bare thread has no runtime, so park_on drives it");
+        })
+        .join()
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body, "one\ntwo\n",
+            "both lines landed, each terminated, in order"
+        );
+    }
+
+    /// Neither this module nor `replay` may name the crate the seam replaces.
+    ///
+    /// Comment lines are stripped before the search, not because they do not
+    /// matter but because both files must be free to *explain* the spelling
+    /// they no longer use — and a whole-file search matches the explanation.
+    /// Measured: the first version of this test failed on `EventRecorder`'s
+    /// own doc comment saying what the handle used to be.
+    #[test]
+    fn the_audit_and_replay_writers_do_not_name_tokio_fs() {
+        for (name, src) in [
+            ("audit.rs", include_str!("audit.rs")),
+            ("replay.rs", include_str!("replay.rs")),
+        ] {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(concat!("tokio", "::fs")),
+                "{name} reached for the convenient spelling again"
+            );
+        }
+    }
+
     #[test]
     fn json_basic() {
         let ev = AuditEvent {
@@ -287,6 +399,84 @@ mod tests {
         assert!(s.contains("\"ev\":\"caput\""));
         assert!(s.contains("\"pv\":\"MOTOR:VAL\""));
         assert!(s.contains("\"result\":\"ok\""));
+    }
+
+    /// B1, second instance: `to_aslog_line` interpolates every peer-supplied
+    /// field into a text line with no escaping, and a CA `CLIENT_NAME` may
+    /// legally contain a newline — the server checks only NUL-termination
+    /// and a 511-byte cap (`server/tcp.rs:2416`). A VERIFIED cap-token's
+    /// `claims.sub` becomes `state.username` (`tcp.rs:2474`) and lands in
+    /// the same field, so this needs neither a forged identity nor a
+    /// rejected token.
+    ///
+    /// Boundary sweep over the fields, and over both renderers, because the
+    /// framing is applied at the sink and must therefore hold for whichever
+    /// one is configured.
+    #[tokio::test]
+    async fn no_wire_field_can_forge_a_second_audit_record() {
+        const FORGE: &str = "x\n04/09/2026 09:00:00 ASUSER W root@localhost caput: SAFETY:ILK=0 ok";
+
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl AuditWriter for Capture {
+            async fn write_line(&self, line: &str) {
+                self.0.lock().unwrap().push(line.to_string());
+            }
+        }
+
+        for field in ["user", "host", "pv", "value", "result"] {
+            let pick = |name: &str, clean: &'static str| {
+                if name == field { FORGE } else { clean }
+            };
+            let ev = AuditEvent {
+                event: "caput",
+                peer: "10.0.0.5:1234",
+                user: pick("user", "alice"),
+                host: pick("host", "opi-1"),
+                pv: pick("pv", "MOTOR:VAL"),
+                value: pick("value", "3.14"),
+                result: pick("result", "ok"),
+            };
+            for (name, rendered) in [("aslog", ev.to_aslog_line()), ("json", ev.to_json())] {
+                let cap = Capture::default();
+                let sink = AuditSink::Custom(Box::new(cap.clone()));
+                sink.write(&rendered).await;
+                let got = cap.0.lock().unwrap().clone();
+                assert_eq!(got.len(), 1, "{name}/{field}: one event, one write");
+                assert!(
+                    !got[0].contains('\n') && !got[0].contains('\r'),
+                    "{name}/{field}: the record must not carry a line break: {:?}",
+                    got[0]
+                );
+                assert!(
+                    got[0].contains("SAFETY:ILK"),
+                    "{name}/{field}: the injected text must survive, escaped"
+                );
+            }
+        }
+
+        // The JSON renderer's own escaping must survive the sink unchanged —
+        // this is what makes one uniform rule at the writer safe.
+        let ev = AuditEvent {
+            event: "caput",
+            peer: "p",
+            user: "a\nb",
+            host: "h",
+            pv: "P",
+            value: "v",
+            result: "ok",
+        };
+        assert!(
+            ev.to_json().contains(r#""user":"a\nb""#),
+            "the JSON encoder escapes the newline itself"
+        );
+        let json = ev.to_json();
+        assert_eq!(
+            &*epics_base_rs::runtime::log::single_line(&json),
+            json,
+            "the sink must not re-escape already-escaped JSON"
+        );
     }
 
     /// libca asLib-compatible text format. Verifies the line

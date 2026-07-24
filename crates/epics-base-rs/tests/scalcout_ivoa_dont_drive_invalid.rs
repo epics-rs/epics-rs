@@ -12,6 +12,8 @@
 //! `skip_out` path already enforced, closing the family for all INVALID
 //! sources (and for both `scalcout` and `acalcout`).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -55,32 +57,33 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
         .await
         .unwrap();
 
-    let sc_rec = db.get_record("SC_DD").await.unwrap();
-    let sc_inst = sc_rec.read().await;
+    let sc_rec = db.get_record("SC_DD").unwrap();
+    {
+        let sc_inst = sc_rec.read();
 
-    // Preconditions: INVALID cycle, output is due, OVAL is the defined 5 — so
-    // the only thing standing between OVAL and the target is the IVOA gate.
-    assert_eq!(
-        sc_inst.common.sevr,
-        AlarmSeverity::Invalid,
-        "NaN VAL must drive the cycle INVALID via UDF (a non-calc-fail source)"
-    );
-    assert!(
-        sc_inst.record.should_output(),
-        "Every_Time always requests output"
-    );
-    assert_eq!(
-        sc_inst.record.get_field("OVAL"),
-        Some(EpicsValue::Double(5.0)),
-        "OCAL=5 under DOPT=Use_OVAL computes OVAL=5 regardless of the IVOA gate"
-    );
-    drop(sc_inst);
+        // Preconditions: INVALID cycle, output is due, OVAL is the defined 5 — so
+        // the only thing standing between OVAL and the target is the IVOA gate.
+        assert_eq!(
+            sc_inst.common.sevr,
+            AlarmSeverity::Invalid,
+            "NaN VAL must drive the cycle INVALID via UDF (a non-calc-fail source)"
+        );
+        assert!(
+            sc_inst.record.should_output(),
+            "Every_Time always requests output"
+        );
+        assert_eq!(
+            sc_inst.record.get_field("OVAL"),
+            Some(EpicsValue::Double(5.0)),
+            "OCAL=5 under DOPT=Use_OVAL computes OVAL=5 regardless of the IVOA gate"
+        );
+    }
 
     // The gate: IVOA=Don't_drive on an INVALID cycle suppresses the OUT write,
     // so the target keeps its 0.0 sentinel — it is NOT driven to OVAL=5.
-    let tgt = db.get_record("SC_TGT").await.unwrap();
+    let tgt = db.get_record("SC_TGT").unwrap();
     assert_eq!(
-        tgt.read().await.record.get_field("VAL"),
+        tgt.read().record.get_field("VAL"),
         Some(EpicsValue::Double(0.0)),
         "IVOA=Don't_drive must suppress the OUT write on a non-calc-fail \
          INVALID cycle (C execOutput nsev>=INVALID → break, sCalcoutRecord.c:794)"

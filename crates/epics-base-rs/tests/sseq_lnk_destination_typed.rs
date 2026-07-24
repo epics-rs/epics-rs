@@ -18,6 +18,8 @@
 //!
 //! One test per boundary of that switch.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,11 +92,14 @@ struct ExtLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for ExtLset {
-    async fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &str) -> bool {
         self.metadata.is_some()
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(
         &self,
@@ -105,7 +110,7 @@ impl LinkSet for ExtLset {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         self.metadata.clone()
     }
 }
@@ -327,7 +332,7 @@ async fn unresolved_destination_is_not_written_at_all() {
     );
     // The sequence still completes — the step is not stranded.
     assert_eq!(
-        db.get_pv("SSEQ_UN.BUSY").await.unwrap(),
+        db.get_pv("SSEQ_UN.BUSY").unwrap(),
         EpicsValue::Short(0),
         "the sequence finishes even though the step wrote nothing"
     );

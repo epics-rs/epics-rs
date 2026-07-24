@@ -9,7 +9,7 @@ and the C `file:line`.
 - **Reference:** `/Users/stevek/codes/epics-modules/motor/motorApp/MotorSrc/`
   at `R7-4-5-g78b474cd` (PR #250 merge, 2026-04-06), `motorRecord.cc` VERSION 7.4
 - **Baseline (not re-audited):** the 2026-05 changelog gap-analysis
-  `crates/motor-rs/doc/parity-review.md` (kept) + the 30 recent line-parity fix
+  `crates/motor-rs/crates/motor-rs/doc/parity-review.md` (kept) + the 30 recent line-parity fix
   commits `1440f1d0`..`d25bb7f9` (verified for completeness, not re-filed).
 
 This doc is the Codex inventory. The older `parity-review.md` was a PR/issue

@@ -20,6 +20,8 @@
 //! subscribes to a known set of upstream PVs at startup. It is not
 //! required for lazy resolution to work.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -296,7 +298,7 @@ struct ReplayState {
     replay: Arc<ConnEventReplay>,
     /// Forwarder task: drains the CaServer broadcast, sequence-numbers
     /// each event, appends to the log, and re-broadcasts on `tx`.
-    forwarder: tokio::task::JoinHandle<()>,
+    forwarder: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 impl DownstreamServer {
@@ -496,8 +498,8 @@ fn spawn_conn_event_forwarder(
     mut raw_rx: broadcast::Receiver<ServerConnectionEvent>,
     tx: broadcast::Sender<SeqConnEvent>,
     replay: Arc<ConnEventReplay>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
+    epics_base_rs::runtime::task::spawn(async move {
         // Sequence numbers start at 1 so a consumer's initial
         // `last_seq = 0` means "I have seen nothing"; `events_since(0)`
         // then returns the whole log.

@@ -26,6 +26,8 @@
 //! drains the in-flight set before finishing.
 #![allow(clippy::all)]
 
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,11 +82,14 @@ struct CaHoldLset(Arc<CaHoldState>);
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CaHoldLset {
-    async fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &str) -> bool {
         true
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let held = op == LinkPutOp::Async;
@@ -96,13 +101,20 @@ impl LinkSet for CaHoldLset {
         if held {
             // The completion-aware put stays outstanding until the test
             // completes it — this is what keeps the sseq's `WAITn` parked.
+            //
+            // `runtime::task::sleep`, not `tokio::time::sleep`: this body is
+            // an lset callback, so the framework runs it wherever it runs
+            // callbacks. Under `rtems-exec-model` that is the background
+            // executor's `cbMedium` thread, which has no tokio reactor, and
+            // a `tokio::time` timer there panics rather than sleeping —
+            // taking the whole test's sequence down with it.
             while !self.0.released.lock().unwrap().contains(name) {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
             }
         }
         Ok(())
     }
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         // Connected, DBF_DOUBLE scalar: the destination type sseq's
         // `processCallback` switch resolves (R16-1) so the step is put at all.
         Some(LinkMetadata {
@@ -209,7 +221,7 @@ async fn kick(db: &PvDatabase, name: &str) {
 /// Poll a `DBF_SHORT` status field until it equals `want`.
 async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     for _ in 0..400 {
-        if let Ok(EpicsValue::Short(v)) = db.get_pv(pv).await {
+        if let Ok(EpicsValue::Short(v)) = db.get_pv(pv) {
             if v == want {
                 return;
             }
@@ -218,7 +230,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     }
     panic!(
         "{label}: {pv} did not reach Short({want}) before timeout (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
@@ -228,7 +240,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
 /// (DOLnV/LNKnV) without caring which the field uses.
 async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     for _ in 0..400 {
-        if let Ok(v) = db.get_pv(pv).await {
+        if let Ok(v) = db.get_pv(pv) {
             if v.to_f64().map(|f| f as i16) == Some(want) {
                 return;
             }
@@ -237,14 +249,13 @@ async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
 /// Read an integer-valued status PV's current numeric value as `i16`.
 async fn read_i16(db: &PvDatabase, pv: &str) -> i16 {
     db.get_pv(pv)
-        .await
         .ok()
         .and_then(|v| v.to_f64())
         .map(|f| f as i16)
@@ -254,7 +265,7 @@ async fn read_i16(db: &PvDatabase, pv: &str) -> i16 {
 /// Poll a `DBF_DOUBLE` PV until it equals `want`.
 async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
     for _ in 0..400 {
-        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv).await {
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
                 return;
             }
@@ -263,7 +274,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
@@ -309,13 +320,13 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
     // Step 1 fires after its (zero) delay and parks on the WAIT callback.
     poll_short(&db, "SSEQ_W.WTG1", 1, "WAIT step parks").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_W.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_W.BUSY").ok()),
         1,
         "BUSY must be held high while the WAIT step is outstanding"
     );
     // The downstream is still pending → step 2 must NOT have fired.
     assert_eq!(
-        db.get_pv("SSEQ_W_TGT2").await.unwrap(),
+        db.get_pv("SSEQ_W_TGT2").unwrap(),
         EpicsValue::Double(0.0),
         "step 2 must not fire while the WAIT step's put-callback is pending"
     );
@@ -323,12 +334,12 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
     // Settle: confirm the block is stable, not just not-yet-arrived.
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert_eq!(
-        db.get_pv("SSEQ_W_TGT2").await.unwrap(),
+        db.get_pv("SSEQ_W_TGT2").unwrap(),
         EpicsValue::Double(0.0),
         "step 2 stayed gated while the WAIT step is outstanding"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_W.WTG1").await.ok()),
+        read_short(db.get_pv("SSEQ_W.WTG1").ok()),
         1,
         "WTG1 stays high until the put-callback completes"
     );
@@ -429,7 +440,7 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
         "step 3 LNKn dispatched exactly once"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_ONCE.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_ONCE.BUSY").ok()),
         0,
         "BUSY cleared after the final step"
     );
@@ -482,12 +493,12 @@ async fn sseq_abort_during_delay_finishes_without_dispatch() {
     poll_short(&db, "SSEQ_AB.BUSY", 0, "abort finishes the sequence").await;
     // finish() resets abort/aborting.
     assert_eq!(
-        read_short(db.get_pv("SSEQ_AB.ABORT").await.ok()),
+        read_short(db.get_pv("SSEQ_AB.ABORT").ok()),
         0,
         "ABORT cleared by asyncFinish"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_AB.ABORTING").await.ok()),
+        read_short(db.get_pv("SSEQ_AB.ABORTING").ok()),
         0,
         "ABORTING cleared by asyncFinish"
     );
@@ -532,12 +543,12 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
     poll_short(&db, "SSEQ_HUNG.ABORTING", 1, "first abort sets ABORTING").await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_HUNG.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_HUNG.BUSY").ok()),
         1,
         "first abort on a hung WAIT callback does NOT finish — it waits"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_HUNG.WTG1").await.ok()),
+        read_short(db.get_pv("SSEQ_HUNG.WTG1").ok()),
         1,
         "WTG1 stays high after the first abort (callback still outstanding)"
     );
@@ -549,12 +560,12 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
     poll_short(&db, "SSEQ_HUNG.BUSY", 0, "second abort forces the finish").await;
     poll_short(&db, "SSEQ_HUNG.WTG1", 0, "second abort clears WTG1").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_HUNG.ABORTING").await.ok()),
+        read_short(db.get_pv("SSEQ_HUNG.ABORTING").ok()),
         0,
         "ABORTING cleared by the forced finish"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_HUNG.ABORT").await.ok()),
+        read_short(db.get_pv("SSEQ_HUNG.ABORT").ok()),
         0,
         "ABORT cleared by the forced finish"
     );
@@ -593,8 +604,8 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
     // kick returns with the alarm already evaluated.
     kick(&db, "SSEQ_SELN").await;
 
-    let rec = db.get_record("SSEQ_SELN").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SSEQ_SELN").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -614,7 +625,7 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
         "an invalid selection must dispatch no LNKn"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_SELN.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_SELN.BUSY").ok()),
         0,
         "BUSY cleared after the invalid selection finished"
     );
@@ -825,7 +836,7 @@ async fn sseq_waitn_on_local_db_link_does_not_wait() {
     .await;
     poll_short(&db, "SSEQ_WDB.BUSY", 0, "sequence finishes without waiting").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_WDB.WTG1").await.ok()),
+        read_short(db.get_pv("SSEQ_WDB.WTG1").ok()),
         0,
         "the step never entered the waiting set (C never sets `waiting` here)"
     );
@@ -870,12 +881,12 @@ async fn sseq_wait_full_barrier_serialises_steps() {
     poll_short(&db, "SSEQ_FB.WTG1", 1, "step 1 Wait parks").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_FB.WTG2").await.ok()),
+        read_short(db.get_pv("SSEQ_FB.WTG2").ok()),
         0,
         "a Wait full barrier blocks step 2 from even dispatching"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_FB.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_FB.BUSY").ok()),
         1,
         "BUSY held while the Wait step is outstanding"
     );
@@ -938,13 +949,13 @@ async fn sseq_after_n_overlaps_then_barriers() {
     // barrier on index 0 or 1); step 3 (index 2) is blocked → not dispatched.
     poll_short(&db, "SSEQ_OV.WTG2", 1, "step 2 dispatches concurrently").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_OV.WTG1").await.ok()),
+        read_short(db.get_pv("SSEQ_OV.WTG1").ok()),
         1,
         "step 1 is still in flight while step 2 is also in flight (overlap)"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_OV.WTG3").await.ok()),
+        read_short(db.get_pv("SSEQ_OV.WTG3").ok()),
         0,
         "step 3 (index 2) is barriered by the After2 steps → not dispatched"
     );
@@ -954,12 +965,12 @@ async fn sseq_after_n_overlaps_then_barriers() {
     poll_short(&db, "SSEQ_OV.WTG1", 0, "step 1 cleared").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_OV.WTG3").await.ok()),
+        read_short(db.get_pv("SSEQ_OV.WTG3").ok()),
         0,
         "step 3 waits for BOTH After2 steps — still blocked after only one"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_OV.WTG2").await.ok()),
+        read_short(db.get_pv("SSEQ_OV.WTG2").ok()),
         1,
         "step 2 remains in flight",
     );
@@ -1012,7 +1023,7 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     poll_short(&db, "SSEQ_DR.WTG1", 1, "step 1 in flight").await;
     poll_short(&db, "SSEQ_DR.WTG2", 1, "step 2 in flight concurrently").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_DR.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_DR.BUSY").ok()),
         1,
         "BUSY held while draining two in-flight callbacks"
     );
@@ -1022,12 +1033,12 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     poll_short(&db, "SSEQ_DR.WTG1", 0, "step 1 drained").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_DR.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_DR.BUSY").ok()),
         1,
         "the drain finishes only after BOTH complete — one is not enough"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_DR.WTG2").await.ok()),
+        read_short(db.get_pv("SSEQ_DR.WTG2").ok()),
         1,
         "step 2 still outstanding"
     );
@@ -1073,7 +1084,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     poll_short(&db, "SSEQ_ABD.ABORTING", 1, "abort accepted, draining").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_ABD.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_ABD.BUSY").ok()),
         1,
         "abort does not finish while callbacks are still outstanding"
     );
@@ -1089,7 +1100,7 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_ABD.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_ABD.BUSY").ok()),
         1,
         "abort drain still waits for the second outstanding callback"
     );
@@ -1105,12 +1116,12 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     .await;
     poll_short(&db, "SSEQ_ABD.WTG2", 0, "second in-flight cleared").await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_ABD.ABORTING").await.ok()),
+        read_short(db.get_pv("SSEQ_ABD.ABORTING").ok()),
         0,
         "ABORTING cleared by the finish"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_ABD.ABORT").await.ok()),
+        read_short(db.get_pv("SSEQ_ABD.ABORT").ok()),
         0,
         "ABORT cleared by the finish"
     );
@@ -1159,12 +1170,12 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     )
     .await;
     assert_eq!(
-        read_short(db.get_pv("SSEQ_NB.WTG1").await.ok()),
+        read_short(db.get_pv("SSEQ_NB.WTG1").ok()),
         1,
         "step 1 is STILL in flight while step 2 has already fired (overlap)"
     );
     assert_eq!(
-        read_short(db.get_pv("SSEQ_NB.BUSY").await.ok()),
+        read_short(db.get_pv("SSEQ_NB.BUSY").ok()),
         1,
         "BUSY held: step 1's After2 callback is still draining"
     );

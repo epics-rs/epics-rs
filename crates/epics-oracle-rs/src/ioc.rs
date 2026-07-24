@@ -218,10 +218,26 @@ impl CTools {
     pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-base/bin/linux-x86_64";
     /// The fat dbd — base's 34 record types plus busy/transform/sseq/acalcout/
     /// scalcout/asyn. A strict superset of base's `softIoc.dbd`.
-    pub const DEFAULT_DBD: &'static str = "/home/stevek/work/oracle-ioc/dbd/softIoc.dbd";
-    /// The fat softIoc binary that serves the `DEFAULT_DBD` record types.
+    ///
+    /// Private on purpose: [`Self::dbd_path`] is the only way to ask where the
+    /// dbd is, so no caller can hardcode this path and silently bypass
+    /// `EPICS_ORACLE_DBD` the way every consumer of the old public constant did.
+    const DEFAULT_DBD: &'static str = "/home/stevek/work/oracle-ioc/dbd/softIoc.dbd";
+    /// The fat softIoc binary that serves the [`Self::dbd_path`] record types.
     pub const DEFAULT_IOC_BIN: &'static str =
         "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc";
+
+    /// The expanded dbd that supplies the denominator, honoring
+    /// `EPICS_ORACLE_DBD` for hosts where the C tree lives elsewhere.
+    ///
+    /// The same override discipline as `EPICS_BASE_BIN`/`EPICS_ORACLE_IOC_BIN`
+    /// in [`Self::discover`]: the harness never invents the path, but it must be
+    /// nameable, or the oracle is runnable on exactly one machine.
+    pub fn dbd_path() -> PathBuf {
+        PathBuf::from(
+            std::env::var("EPICS_ORACLE_DBD").unwrap_or_else(|_| Self::DEFAULT_DBD.to_string()),
+        )
+    }
 
     /// Locate the C tree, honoring `EPICS_BASE_BIN` for hosts where it lives
     /// elsewhere. Verifies every binary the harness actually invokes, so a

@@ -24,6 +24,8 @@
 //! the `dispatch_multi_output` path (dfanout OUTx), the recovery cycle, and
 //! NMS (no propagation at all).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -41,8 +43,8 @@ async fn add_source(db: &PvDatabase) {
     db.add_record("SRC", Box::new(AiRecord::new(200.0)))
         .await
         .unwrap();
-    let rec = db.get_record("SRC").await.unwrap();
-    let mut inst = rec.write().await;
+    let rec = db.get_record("SRC").unwrap();
+    let mut inst = rec.write();
     inst.put_common_field("HIHI", EpicsValue::Double(100.0))
         .unwrap();
     inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
@@ -55,8 +57,8 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
-    let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 

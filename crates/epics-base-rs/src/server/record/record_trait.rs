@@ -177,7 +177,7 @@ impl FieldDesc {
 /// record's C `init_record` — the seed of a CONSTANT input link.
 ///
 /// Declared by [`Record::constant_init_links`] and applied by the single owner
-/// [`crate::server::database::PvDatabase::rec_gbl_init_constant_links`].
+/// `crate::server::database::PvDatabase::rec_gbl_init_constant_links`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstantInitLink {
     /// The link field holding the constant (`INPA`, `NVL`, `SELL`, `DOL1`,
@@ -1213,7 +1213,7 @@ pub enum InputFetchPolicy {
 /// one, and the answer is resolved here:
 ///
 /// * a record type **base's** vendored `.dbd` set covers is declared by the
-///   table generated from that `.dbd` ([`dbd_generated::record_fields`]);
+///   table generated from that `.dbd` ([`crate::server::record::dbd_generated::record_fields`]);
 /// * any other record type is asked for its own declaration,
 ///   [`Record::declared_fields`] — which for the downstream record types is the
 ///   table generated from the `.dbd` *their* crate vendors, and for a synthetic
@@ -1391,7 +1391,7 @@ pub trait Record: Send + Sync + 'static {
     /// separately by the framework, not here.
     ///
     /// INVARIANT — answering here is a claim that the field is `DBF_MENU`, so
-    /// [`Self::field_list`] MUST declare it [`DbFieldType::Enum`]: C's
+    /// [`FieldDeclaration::field_list`] MUST declare it [`DbFieldType::Enum`]: C's
     /// `mapDBFToDBR` serves every `DBF_MENU` as `DBR_ENUM`, and the DECLARED
     /// type is what goes on the wire
     /// ([`RecordInstance::project_to_declared_type`](super::RecordInstance::project_to_declared_type)).
@@ -1423,7 +1423,7 @@ pub trait Record: Send + Sync + 'static {
     /// monitor path (`make_monitor_snapshot`), AFTER the cached
     /// record-level metadata — and computed live on each call, so an
     /// override derived from non-cached fields can never go stale.
-    /// `field` is uppercase, as declared in [`Record::field_list`].
+    /// `field` is uppercase, as declared in [`FieldDeclaration::field_list`].
     /// Default: `None` — record-level metadata serves every field.
     fn field_metadata_override(&self, _field: &str) -> Option<FieldMetadataOverride> {
         None
@@ -1449,7 +1449,7 @@ pub trait Record: Send + Sync + 'static {
     /// telling clients a fabricated `display.units` of `""` and
     /// `valueAlarm` bands of zero were authoritative.
     ///
-    /// The default answers from [`default_property_support`], the
+    /// The default answers from `default_property_support`, the
     /// transcription of the record types epics-base-rs implements itself.
     /// Override it in the record's own file, citing the C rset lines.
     fn property_support(&self) -> crate::server::snapshot::PropertySupport {
@@ -1510,7 +1510,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// It is what a client reads as the `DBR_ENUM` choice list AND the set of
     /// names a `DBR_STRING` put to the record's `DBF_ENUM` `VAL` may name
-    /// (`dbConvert.c::putStringEnum` → [`resolve_enum_state_string`]). Taking
+    /// (`dbConvert.c::putStringEnum` → [`crate::server::record::resolve_enum_state_string`]). Taking
     /// both from one table is the point: a name the record advertises is a name
     /// a client may put, by construction — the two cannot drift.
     ///
@@ -1543,7 +1543,7 @@ pub trait Record: Send + Sync + 'static {
     /// `None` — the record leaves the rset slot NULL (`#define get_enum_str
     /// NULL`), which is every record but `bi`/`bo`/`mbbi`/`mbbo`. A field on
     /// such a record renders from its menu instead; see
-    /// [`RecordInstance::enum_string_form_for`](super::RecordInstance::enum_string_form_for),
+    /// `RecordInstance::enum_string_form_for`,
     /// the single owner that picks between the two.
     fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
         None
@@ -1699,7 +1699,9 @@ pub trait Record: Send + Sync + 'static {
 
     /// Apply a raw device value read *back* from an output record's device
     /// support (the asyn init seed and driver readback callback), the output
-    /// analogue of [`Record::apply_raw_input`]. An output record whose
+    /// counterpart of an input record's raw path, where device support
+    /// writes `RVAL` and the record's own conversion produces `VAL`
+    /// (`device_support.rs:43-46`). An output record whose
     /// `convert()` is forward (engineering → raw) must invert it here — store
     /// the raw value into `RVAL` and compute the engineering `VAL` — because
     /// the framework's forward convert would otherwise recompute `RVAL` from
@@ -1768,7 +1770,7 @@ pub trait Record: Send + Sync + 'static {
     /// `aao` is included here even though it's served by the same
     /// concrete struct as `waveform`/`aai`/`subArray` — the
     /// WaveformRecord's `can_device_write` override picks the right
-    /// answer per [`ArrayKind`], but this default matters for code that
+    /// answer per [`crate::server::records::waveform::ArrayKind`], but this default matters for code that
     /// only has the record-type string.
     fn can_device_write(&self) -> bool {
         matches!(
@@ -2185,7 +2187,7 @@ pub trait Record: Send + Sync + 'static {
     /// C's `if (monitor_mask)` guard). A field named here posts on every change,
     /// with both value classes and no alarm class, whatever the cycle's alarms did.
     ///
-    /// Resolved for every change-detected field by [`aux_change_mask`], the single
+    /// Resolved for every change-detected field by `AuxPostMask::mask_for`, the single
     /// owner of the aux-post mask.
     ///
     /// Default: empty.
@@ -2283,7 +2285,7 @@ pub trait Record: Send + Sync + 'static {
     /// 1 on a C IOC.
     ///
     /// PACT is a `dbCommon` field with a single owner
-    /// ([`RecordInstance::enter_pact`] / [`leave_pact`]), so a record cannot
+    /// ([`crate::server::record::RecordInstance::enter_pact`] / [`leave_pact`]), so a record cannot
     /// park it from `init_record`. It reports the fact here and the owner
     /// performs the transition, once, at the end of the init passes.
     ///
@@ -2313,7 +2315,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Almost no record does this: a not-yet-processed record is normally left
     /// `UDF` so an `MS` consumer inherits `INVALID` at IOC startup (see
-    /// [`RecordInstance::run_init_passes`]). The asyn record is the exception —
+    /// `RecordInstance::run_init_passes`). The asyn record is the exception —
     /// `asynRecord.c` `init_record` pass 0 does `pasynRec->udf = 0;
     /// recGblResetAlarms(pasynRec)` unconditionally, because a device-config
     /// record is defined the moment it loads, even against a disconnected port.
@@ -2821,7 +2823,7 @@ pub trait Record: Send + Sync + 'static {
     /// can raise its own alarms without the framework hardcoding a
     /// per-type `match` on `record_type()`.
     ///
-    /// `common` is the record's [`CommonFields`]; implementations
+    /// `common` is the record's [`crate::server::record::CommonFields`]; implementations
     /// raise alarms with [`crate::server::recgbl::rec_gbl_set_sevr`]
     /// / [`crate::server::recgbl::rec_gbl_set_sevr_msg`].
     ///
@@ -2892,7 +2894,7 @@ pub trait Record: Send + Sync + 'static {
     /// constant link delivers NOTHING at process time (`dbConstGetValue`,
     /// `dbConstLink.c:219-225`), so the ONLY way a `field(INPA,"5")` ever
     /// reaches `A` is this table, applied by the single init-seed owner
-    /// [`crate::server::database::PvDatabase::rec_gbl_init_constant_links`].
+    /// `crate::server::database::PvDatabase::rec_gbl_init_constant_links`.
     /// A record that fetches an input link but declares no seed for it (swait,
     /// whose C uses `recDynLink` and seeds nothing) simply never sees the
     /// constant — which is what its C does.
@@ -2940,7 +2942,7 @@ pub trait Record: Send + Sync + 'static {
     /// selector index (sel's NVL→SELN value, or `None` when no NVL link
     /// drove it). Default `None` = fetch every input link.
     ///
-    /// C `selRecord.c::fetch_values` (lines 421-431) fetches ONLY INP[SELN]
+    /// C `selRecord.c::fetch_values` (lines 421-431) fetches ONLY `INP[SELN]`
     /// in `Specified` mode and all inputs otherwise; sel returns
     /// `Some(vec![INP[SELN]])` so the non-selected inputs are never read and
     /// raise no monitors or link-alarm SEVR.
@@ -3296,7 +3298,7 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Called by the framework immediately before `process()` to push a
-    /// read-only snapshot of framework-owned [`CommonFields`] state
+    /// read-only snapshot of framework-owned [`crate::server::record::CommonFields`] state
     /// ([`ProcessContext`]) that the record's `process()` needs to see.
     ///
     /// The framework owns `RecordInstance.common`; a record `process()`
@@ -3371,7 +3373,7 @@ pub trait Record: Send + Sync + 'static {
     /// `read_xxx`) always returns 2 ("don't convert"), so `aiRecord.c`'s
     /// `if (status==0) convert(prec)` is bypassed for a `Soft Channel`
     /// input record. The framework expresses this by calling
-    /// [`Record::set_device_did_compute(true)`] on the record before
+    /// [`Record::set_device_did_compute`]`(true)` on the record before
     /// `process()`.
     ///
     /// This hook exists so the framework only suppresses `convert()` —
@@ -3417,7 +3419,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// The framework consults this before `process()`: an opted-in output record
     /// with `UDF != 0` and no value source this cycle is told
-    /// [`Self::set_device_did_compute(true)`] so its `process()` skips the
+    /// [`Self::set_device_did_compute`]`(true)` so its `process()` skips the
     /// forward convert. A VAL put (UDF cleared in `field_io`) or a closed-loop
     /// DOL fetch (UDF cleared at the DOL-apply site) leaves `UDF == 0`, so the
     /// convert runs exactly as C's fall-through does.
@@ -3537,16 +3539,16 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
 /// Coerce a written value to a field's stored type — the single owner of C
 /// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table, shared
 /// by the two paths a value can enter a record's field through: a client
-/// `dbPut` ([`crate::server::database::field_io`]) and an internal link /
+/// `dbPut` (`crate::server::database::field_io`) and an internal link /
 /// device-support delivery ([`put_field_internal_default`]).
 ///
 /// Every `DBR_STRING` row of C's put table is a converter that can FAIL, and
 /// none of them is `EpicsValue::convert_to`:
 ///
 /// * `DBF_MENU` → `putStringMenu` — exact label, else an index below `nChoice`
-///   ([`resolve_menu_field_string`]).
+///   ([`crate::server::record::resolve_menu_field_string`]).
 /// * `DBF_ENUM` → `putStringEnum` — the record's state strings, else an index
-///   below `no_str` ([`resolve_enum_state_string`]).
+///   below `no_str` ([`crate::server::record::resolve_enum_state_string`]).
 /// * `DBF_STRING` → `putStringString` — a byte copy, the one row that cannot
 ///   fail.
 /// * every numeric width → `putStringChar` … `putStringDouble`, i.e.

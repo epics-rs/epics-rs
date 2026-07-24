@@ -23,6 +23,13 @@
 //! The port parsed AFTER the print, so a put that never happened still
 //! reported an old value.
 
+// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
+// process. Those binaries are built with this feature too, so their
+// `CaClient` stack routes `spawn` to the background executor and then
+// reaches tokio I/O with no reactor. Inapplicable under the executor
+// backend; the RTEMS model has no async CLI client.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::process::Command;
 
 use epics_base_rs::server::records::mbbo::MbboRecord;

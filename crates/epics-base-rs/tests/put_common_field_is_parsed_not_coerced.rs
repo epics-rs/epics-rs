@@ -28,6 +28,8 @@
 //! (`dbAccess.c:1263-1264`) processes only when `dbPut` returned 0, so the
 //! fire-and-forget path does NOT process a rejected put. The port mirrors both.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -111,7 +113,7 @@ async fn caput_ff(db: &PvDatabase, field: &str, text: &str) -> Result<(), String
 }
 
 async fn read_proc(db: &PvDatabase) -> EpicsValue {
-    db.get_pv("REC.PROC").await.unwrap()
+    db.get_pv("REC.PROC").unwrap()
 }
 
 // --- PROC rejected: the put fails, byte not stored, process depends on path ---

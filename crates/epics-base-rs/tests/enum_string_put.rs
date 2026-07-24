@@ -43,6 +43,8 @@
 //! The cases below are the CONVERTER's boundaries, one per boundary, driven
 //! through the same `dbPut` entry the CA server uses.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::bo::BoRecord;
@@ -68,8 +70,8 @@ fn mbbo_three_states() -> Box<dyn Record> {
 }
 
 async fn val_of(db: &PvDatabase, name: &str) -> EpicsValue {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     inst.record.get_field("VAL").unwrap()
 }
 

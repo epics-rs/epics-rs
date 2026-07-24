@@ -19,6 +19,8 @@
 //! primitives, prefer `tokio::sync::mpsc` / `parking_lot::Mutex`
 //! directly.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::fmt;
 
 /// Server identity emitted in BEACON / SEARCH_RESPONSE frames.
@@ -132,10 +134,17 @@ impl SigInt {
         let task = tokio::spawn(async move {
             // tokio::signal::ctrl_c only succeeds on platforms with
             // signal support (Unix/Windows). Errors are non-fatal:
-            // SigInt simply never fires.
+            // SigInt simply never fires. RTEMS is the same case reached
+            // one level earlier: tokio is built there without the
+            // `signal` feature at all (it pulls signal-hook-registry,
+            // which newlib cannot compile — design doc §8.1), and an
+            // embedded IOC has no console interrupt to trap.
+            #[cfg(not(target_os = "rtems"))]
             if (tokio::signal::ctrl_c().await).is_ok() {
                 notify.notify_waiters();
             }
+            #[cfg(target_os = "rtems")]
+            drop(notify);
         });
         std::sync::Arc::new(Self { triggered, task })
     }

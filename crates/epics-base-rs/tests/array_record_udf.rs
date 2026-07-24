@@ -26,6 +26,8 @@
 //! Boundaries: SIOL read failed vs succeeded; UDF set vs UDF alarm raised; the
 //! three unconditional kinds vs subArray.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -68,9 +70,9 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
         .unwrap();
 
     for rec in ["SIM:AAI", "SIM:AAO", "SIM:WF"] {
-        let handle = db.get_record(rec).await.unwrap();
+        let handle = db.get_record(rec).unwrap();
         assert!(
-            handle.read().await.common.udf != 0,
+            handle.read().common.udf != 0,
             "{rec}: undefined before the first process"
         );
 
@@ -79,7 +81,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
             .await
             .unwrap();
 
-        let common = &handle.read().await.common;
+        let common = &handle.read().common;
         assert!(
             common.udf == 0,
             "{rec}: C `process` clears UDF after readValue whatever its status"
@@ -138,26 +140,23 @@ async fn an_undefined_waveform_carries_the_initial_udf_severity() {
         .await
         .unwrap();
 
-    let handle = db.get_record("UDF:WF").await.unwrap();
-    assert!(
-        handle.read().await.common.udf != 0,
-        "never processed, so UDF"
-    );
+    let handle = db.get_record("UDF:WF").unwrap();
+    assert!(handle.read().common.udf != 0, "never processed, so UDF");
 
     assert_eq!(
-        db.get_pv("UDF:WF.SEVR").await.unwrap().to_f64(),
+        db.get_pv("UDF:WF.SEVR").unwrap().to_f64(),
         Some(AlarmSeverity::Invalid as i32 as f64),
         "iocInit gives every never-processed record SEVR = UDFS (INVALID)"
     );
     assert_eq!(
-        db.get_pv("UDF:WF.STAT").await.unwrap().to_f64(),
+        db.get_pv("UDF:WF.STAT").unwrap().to_f64(),
         Some(f64::from(
             epics_base_rs::server::recgbl::alarm_status::UDF_ALARM
         )),
         "STAT is born UDF (dbCommon.dbd initial(\"UDF\"))"
     );
     assert_eq!(
-        db.get_pv("UDF:WF").await.unwrap(),
+        db.get_pv("UDF:WF").unwrap(),
         EpicsValue::DoubleArray(vec![])
     );
 }

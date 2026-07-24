@@ -128,6 +128,36 @@ impl ScanList {
     pub fn scan(self) -> ScanType {
         self.0
     }
+
+    /// How many scan lists exist: the `menuScan` choices minus `Passive`,
+    /// i.e. `Event`, `IoIntr` and the seven periodic rates. C sizes its own
+    /// list array the same way — `nPeriodic + SCAN_1ST_PERIODIC`
+    /// (`dbScan.c:250`) over `papPeriodic` plus the two special lists.
+    pub const COUNT: usize = 9;
+
+    /// Dense slot in `0..COUNT`, so a per-list table can be a fixed array
+    /// rather than a map behind its own lock.
+    ///
+    /// Total by construction: [`Self::of`] is the only constructor and it
+    /// refuses `Passive` (menu index 0) and every out-of-menu index, so the
+    /// wrapped [`ScanType`] is always one of the nine indices `1..=9`.
+    pub fn slot(self) -> usize {
+        self.0.to_u16() as usize - 1
+    }
+
+    /// Every scan list, in menu order — the enumeration a per-list table is
+    /// built from.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self(ScanType::Event),
+        Self(ScanType::IoIntr),
+        Self(ScanType::Sec10),
+        Self(ScanType::Sec5),
+        Self(ScanType::Sec2),
+        Self(ScanType::Sec1),
+        Self(ScanType::Sec05),
+        Self(ScanType::Sec02),
+        Self(ScanType::Sec01),
+    ];
 }
 
 /// `SSCN` — the simulation-mode scan field (`DBF_MENU`, `menu(menuScan)`).
@@ -323,5 +353,33 @@ mod sim_mode_scan_tests {
         for v in 0u16..=9 {
             assert_eq!(ScanType::from_u16(v).to_u16(), v);
         }
+    }
+
+    /// `slot()` is a total, collision-free index into a `COUNT`-sized array —
+    /// the property the per-list scan-index table indexes by, without a
+    /// bounds check or a fallible lookup.
+    ///
+    /// Boundary cases, not a narrative: every `of`-admissible SCAN maps into
+    /// `0..COUNT`; `ALL` is exactly that set in slot order; and both values
+    /// `of` refuses (`Passive`, out-of-menu) yield no slot at all.
+    #[test]
+    fn every_scan_list_has_a_distinct_slot() {
+        let mut seen = [false; ScanList::COUNT];
+        for v in 0u16..=9 {
+            let Some(list) = ScanType::from_u16(v).scan_list() else {
+                assert_eq!(v, 0, "only Passive names no list inside the menu");
+                continue;
+            };
+            let slot = list.slot();
+            assert!(slot < ScanList::COUNT, "slot {slot} out of the table");
+            assert!(!seen[slot], "slot {slot} claimed twice");
+            seen[slot] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "every slot must be claimed");
+
+        for (i, list) in ScanList::ALL.iter().enumerate() {
+            assert_eq!(list.slot(), i, "ALL must be in slot order");
+        }
+        assert_eq!(ScanType::Illegal(65535).scan_list(), None);
     }
 }

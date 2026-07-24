@@ -1,0 +1,11 @@
+# Same one thing the epics-rs workspace config holds: the RTEMS linker.
+# Two tables because the custom-spec build selects the target by JSON file
+# stem, which cargo treats as a different triple name.
+[target.armv7-rtems-eabihf]
+linker = "arm-rtems6-gcc"
+
+[target.armv7-rtems-tls]
+linker = "arm-rtems6-gcc"
+
+[target.armv7-rtems-ctl]
+linker = "arm-rtems6-gcc"

@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// Was 18: the nine that left are the three virtual-time watchdog modules
+// (read_loop_tests, recv_watchdog_tests, write_loop_timeout_tests), now gated
+// off under the feature because the circuit path's deadlines moved onto the
+// runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
+// DOWN, never up, without running the survivors under the feature.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]
@@ -7,6 +14,11 @@ use std::time::Duration;
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+// The reactor-driven transport only: `tokio::net` does not compile for
+// `armv7-rtems-eabihf`, and the blocking transport reaches `std::net` through
+// `runtime::blocking_io` instead. Every use of this name is inside a
+// `not(any(exec_backend, ca_blocking_client))` arm of the `dial_ca` seam.
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
 use tokio::net::TcpStream;
 
 use crate::channel::AccessRights;
@@ -98,18 +110,31 @@ const ECHO_TIMEOUT_SECS: u64 = 5;
 /// occupancy source (or none, in tests).
 type OsRecvQueueProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD`; a failed
-/// ioctl reports "nothing pending", which is the safe answer — it can only
-/// clear flow control early, never latch it on.
+/// Occupancy probe over a live socket fd. Non-blocking `FIONREAD` through the
+/// workspace's one owner of that ioctl
+/// ([`epics_base_rs::runtime::blocking_io::pending_bytes`], which is also C
+/// `rsrv`'s batch-up gate); a failed ioctl reports "nothing pending", which is
+/// the safe answer — it can only clear flow control early, never latch it on.
+///
+/// Reached through the shared owner rather than a local `libc::ioctl` because
+/// the constant is not the same everywhere: `libc` omits `FIONREAD` for
+/// `armv7-rtems-eabihf` entirely, and the value newlib defines there had to be
+/// derived by hand. A second copy of that derivation is a second thing to get
+/// wrong.
 #[cfg(unix)]
 fn fd_recv_queue_probe(fd: std::os::fd::RawFd) -> OsRecvQueueProbe {
+    /// `AsRawFd` over a borrowed descriptor this probe does not own. The fd
+    /// belongs to the reader half held by the `read_loop` that holds this
+    /// closure, so it stays open for the closure's life; wrapping it (rather
+    /// than an `OwnedFd`) is what keeps that ownership where it is.
+    struct BorrowedSocket(std::os::fd::RawFd);
+    impl std::os::fd::AsRawFd for BorrowedSocket {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.0
+        }
+    }
     std::sync::Arc::new(move || {
-        let mut pending: libc::c_int = 0;
-        // SAFETY: `fd` belongs to the reader half owned by the `read_loop`
-        // that holds this closure, so it stays open for the closure's life.
-        // FIONREAD writes a single `c_int`.
-        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
-        rc == 0 && pending > 0
+        epics_base_rs::runtime::blocking_io::pending_bytes(&BorrowedSocket(fd)).is_ok_and(|n| n > 0)
     })
 }
 
@@ -125,6 +150,685 @@ fn fd_recv_queue_probe(_fd: std::os::raw::c_int) -> OsRecvQueueProbe {
 #[cfg(test)]
 fn drained_socket_probe() -> OsRecvQueueProbe {
     std::sync::Arc::new(|| false)
+}
+
+// ---------------------------------------------------------------------------
+// The circuit's TCP dial — one seam, two transports
+// ---------------------------------------------------------------------------
+
+/// TCP keepalive on a virtual circuit: probe after this much idle time.
+///
+/// One number for both transports, so the *policy* has a single home even
+/// though the syscall does not (`socket2` where it exists, raw `libc` where it
+/// does not — see [`set_circuit_keepalive`]). The CA server's accept loop
+/// applies the same ladder to the other end of the same wire
+/// (`server/tcp.rs:1455-1464`).
+const CIRCUIT_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+
+/// TCP keepalive on a virtual circuit: interval between probes once idle.
+/// Three failures end the connection, so ~30 s to detect a half-open peer.
+const CIRCUIT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The EPICS priority a circuit's **receive** pump thread runs at.
+///
+/// C parity, derived rather than chosen: libca creates `CAC-TCP-recv` at
+/// `cac::highestPriorityLevelBelow(initializing thread)` (`tcpiiu.cpp:677`),
+/// and the thread that initializes the CA context for record links is C's
+/// `dbCaLink` worker at `epicsThreadPriorityMedium`
+/// (`dbCa.c:340`). On RTEMS `epicsThreadHighestPriorityLevelBelow` is exactly
+/// `p - 1` (`RTEMS-score/osdThread.c:120-131`), so this is **49**.
+#[cfg(any(exec_backend, ca_blocking_client))]
+const CAC_RECV_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    epics_base_rs::runtime::task::ThreadPriority::Custom(
+        epics_base_rs::runtime::task::ThreadPriority::Medium.value() - 1,
+    );
+
+/// The EPICS priority a circuit's **send** pump thread runs at.
+///
+/// `cac::lowestPriorityLevelAbove(...)` (`tcpiiu.cpp:681`) — **51**, one band
+/// *above* the receiver and above the link worker itself. The asymmetry is
+/// libca's and is load-bearing: "the send thread runs at a higher priority
+/// than the [receive thread]" (`tcpiiu.cpp:1716`), so a circuit whose receive
+/// side is busy still drains its send queue promptly. Collapsing the two onto
+/// one band would make a PUT wait behind an unrelated monitor burst.
+#[cfg(any(exec_backend, ca_blocking_client))]
+const CAC_SEND_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    epics_base_rs::runtime::task::ThreadPriority::Custom(
+        epics_base_rs::runtime::task::ThreadPriority::Medium.value() + 1,
+    );
+
+/// Every TCP dial this client makes, on a bounded set of permanent threads.
+///
+/// One pool for the process, at `CAC_RECV_PRIORITY` — the band C's own
+/// `CAC-TCP-recv` connect runs on (`tcpiiu.cpp:677`), and the band of the
+/// receive pump this dial precedes. The pool is per *band*, which is why the
+/// PVA client cannot share it: its dials belong to `PVA_CLIENT_PRIORITY`.
+///
+/// `"CAC-dial"` and not `"CAC-connect {server_addr}"`: a reused worker cannot
+/// be named for one circuit. A thread dump therefore still says *how many*
+/// dials are stuck but no longer *which server* is not answering — the trade
+/// for bounding the count, the same one the PVA pool makes. The server stays
+/// in the `tracing::warn!` on every failure arm below.
+#[cfg(any(exec_backend, ca_blocking_client))]
+static CA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
+    epics_base_rs::runtime::blocking_io::DialPool::new("CAC-dial", CAC_RECV_PRIORITY);
+
+/// The most concurrent CA circuits this process serves with blocking pumps.
+///
+/// A bound on *creations*, like the dial pool's: every circuit that opens
+/// borrows one two-thread set from [`CA_CIRCUIT_POOL`] and returns it when the
+/// circuit drops, so a client that reconnects to the same server over and over
+/// reuses threads rather than leaking 2 × 176 B per reconnect on RTEMS. Past
+/// the bound a new circuit's pumps are refused (`EAGAIN`), which surfaces as a
+/// failed dial the search engine re-offers — the same shape a refused dial
+/// takes. Generous, because a CA client legitimately holds a circuit per
+/// distinct server.
+#[cfg(any(exec_backend, ca_blocking_client))]
+const CA_CIRCUIT_POOL_CAPACITY: usize = 64;
+
+/// The pumps for every CA circuit, borrowed from a bounded set of permanent
+/// threads. Two bands, asymmetric like C's: the receive pump at
+/// `CAC_RECV_PRIORITY` and the send pump one level above at `CAC_SEND_PRIORITY`
+/// (`tcpiiu.cpp:677-682`), so a client that stops reading cannot starve the
+/// sender. Per band, so it is a separate pool from the PVA client's.
+#[cfg(any(exec_backend, ca_blocking_client))]
+static CA_CIRCUIT_POOL: std::sync::LazyLock<epics_base_rs::runtime::worker_pool::WorkerPool<2>> =
+    std::sync::LazyLock::new(|| {
+        epics_base_rs::runtime::worker_pool::WorkerPool::new(
+            "CAC",
+            epics_base_rs::runtime::blocking_io::circuit_roster(
+                CAC_RECV_PRIORITY,
+                CAC_SEND_PRIORITY,
+            ),
+            CA_CIRCUIT_POOL_CAPACITY,
+        )
+    });
+
+/// BRING-UP PROBE: dial attempts submitted to [`CA_DIAL_POOL`] since boot.
+///
+/// The denominator of the on-target bound measurement. `worker_count()` alone
+/// cannot distinguish "bounded" from "never dialled twice", so the rig needs
+/// the attempt count next to it — and on a target with no shell and no
+/// reachable `caget` the only place to read either is the serial console.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+static CA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// BRING-UP PROBE: `(workers created, dial attempts submitted, dials queued,
+/// workers dialing)` for the CA client's dial pool.
+///
+/// Behind `bringup-probes` with the rest of the measurement rig
+/// (`doc/calink-rtems-design.md` §11.7 item 3): a default image compiles
+/// neither the counter nor this accessor.
+///
+/// The last two are what make the `MAX_DIAL_WORKERS` bound readable rather
+/// than inferable: at the bound the worker count stops climbing, and the only
+/// way to tell that from "no more dials were offered" is that `queued` is
+/// non-zero while `dialing` sits at the bound.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+pub fn dial_pool_probe() -> (usize, usize, usize, usize) {
+    let (queued, dialing) = CA_DIAL_POOL.queue_depth();
+    (
+        CA_DIAL_POOL.worker_count(),
+        CA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        queued,
+        dialing,
+    )
+}
+
+/// Apply the circuit keepalive ladder to a connected socket.
+///
+/// `socket2` is the portability owner for this on every host: the option
+/// names differ across unixes (`TCP_KEEPIDLE` on Linux and the BSDs,
+/// `TCP_KEEPALIVE` on Darwin) and `libc` does not define the Darwin spelling
+/// at all, so hand-rolling it here would trade one working call for a per-OS
+/// table. See [`set_circuit_keepalive`]'s RTEMS sibling for the one target
+/// where `socket2` is not in the dependency graph.
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
+fn set_circuit_keepalive(stream: &TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(CIRCUIT_KEEPALIVE_IDLE)
+        .with_interval(CIRCUIT_KEEPALIVE_INTERVAL);
+    let _ = sock.set_keepalive(true);
+    let _ = sock.set_tcp_keepalive(&keepalive);
+}
+
+/// The same ladder through raw `libc`, for the transport `socket2` cannot
+/// reach.
+///
+/// `socket2` is host-only in this crate's manifest (it does not build for
+/// `armv7-rtems-eabihf`), so the blocking transport sets the three options
+/// itself — the shape `server/blocking.rs:551` already uses for the server's
+/// listening sockets. RTEMS's stack is FreeBSD's (`libbsd`), so the constants
+/// are the BSD ones (`TCP_KEEPIDLE` = 256, `TCP_KEEPINTVL` = 512), supplied by
+/// `libc` for the target.
+///
+/// Failures are ignored, exactly as on the `socket2` path: keepalive is a
+/// backstop under CA's own echo watchdog (`ECHO_TIMEOUT_SECS`), not the
+/// mechanism that detects a dead circuit.
+#[cfg(all(unix, any(exec_backend, ca_blocking_client)))]
+fn set_circuit_keepalive(stream: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    fn set_opt(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
+        // SAFETY: `fd` is a valid open socket owned by the caller for the
+        // duration of the call; `value` outlives it; the size matches a
+        // `c_int` option value.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    let fd = stream.as_raw_fd();
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPIDLE,
+        CIRCUIT_KEEPALIVE_IDLE.as_secs() as libc::c_int,
+    );
+    set_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        CIRCUIT_KEEPALIVE_INTERVAL.as_secs() as libc::c_int,
+    );
+}
+
+/// A circuit driven by two blocking pump threads instead of a reactor.
+///
+/// One value rather than a loose pair so the dial seam has one return type on
+/// both transports, and so the TLS path — which needs a duplex, not two halves
+/// — can wrap it exactly as it wraps a `TcpStream`.
+#[cfg(any(exec_backend, ca_blocking_client))]
+pub(super) struct PumpedCircuit {
+    reader: epics_base_rs::runtime::blocking_io::GuardedReader,
+    writer: epics_base_rs::runtime::blocking_io::GuardedWriter,
+}
+
+#[cfg(any(exec_backend, ca_blocking_client))]
+impl AsyncRead for PumpedCircuit {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+#[cfg(any(exec_backend, ca_blocking_client))]
+impl AsyncWrite for PumpedCircuit {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
+}
+
+/// What [`dial_ca`] returns: a `tokio::net::TcpStream` on a hosted build, a
+/// [`PumpedCircuit`] where there is no reactor to register one with.
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
+pub(super) type CaCircuit = TcpStream;
+/// See the hosted definition.
+#[cfg(any(exec_backend, ca_blocking_client))]
+pub(super) type CaCircuit = PumpedCircuit;
+
+/// Split a dialled circuit into the two halves `read_loop` / `write_loop` take.
+///
+/// A free function rather than a method so the two transports' *different*
+/// half types stay concrete — `read_loop` and `write_loop` are generic over
+/// `AsyncRead`/`AsyncWrite`, so neither boxing nor a trait object is needed on
+/// either side. The hosted arm keeps `into_split`'s owned halves (no `BiLock`,
+/// unchanged from before this seam existed).
+#[cfg(not(any(exec_backend, ca_blocking_client)))]
+pub(super) fn split_circuit(
+    stream: CaCircuit,
+) -> (
+    tokio::net::tcp::OwnedReadHalf,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    stream.into_split()
+}
+
+/// See the hosted definition.
+#[cfg(any(exec_backend, ca_blocking_client))]
+pub(super) fn split_circuit(
+    stream: CaCircuit,
+) -> (
+    epics_base_rs::runtime::blocking_io::GuardedReader,
+    epics_base_rs::runtime::blocking_io::GuardedWriter,
+) {
+    (stream.reader, stream.writer)
+}
+
+// ---------------------------------------------------------------------------
+// The CA client's one TCP framing path
+// ---------------------------------------------------------------------------
+
+/// Why [`next_frame`] refuses the bytes at the head of a receive buffer.
+///
+/// Both variants mean the same thing to a caller — C
+/// `tcpiiu.cpp::processIncoming:1197-1202` closes the circuit — and the
+/// `Display` text is what each caller logs, so the two loops report the same
+/// two failures in the same two words.
+pub(super) enum FrameError {
+    /// The header bytes are all present and the parser still rejected them.
+    Header(epics_base_rs::error::CaError),
+    /// `m_postsize & 0x7 != 0`. The wire spec requires an 8-byte-aligned
+    /// payload; silently rounding up (an earlier `align8`) lets a hostile peer
+    /// slide the framer into the middle of the next message.
+    MisalignedPayload(usize),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header(e) => write!(f, "malformed TCP header ({e})"),
+            Self::MisalignedPayload(n) => write!(f, "misaligned payload (postsize={n})"),
+        }
+    }
+}
+
+/// What the bytes at the head of a CA receive buffer are.
+pub(super) enum Frame {
+    /// A header was parsed. `hdr_size + body_len` is the message's total
+    /// length on the wire — **the body may not have arrived yet**. What to do
+    /// about that is the caller's business — but the size rule the caller
+    /// applies is not per-circuit: both circuits run [`RecvBodyPolicy`], C's
+    /// over-`EPICS_CA_MAX_ARRAY_BYTES` ignore-and-drain
+    /// (`tcpiiu.cpp:1269-1283`), because C runs `processIncoming` on a
+    /// name-service `tcpiiu` exactly as on a data one.
+    Header {
+        hdr: CaHeader,
+        hdr_size: usize,
+        body_len: usize,
+    },
+    /// Not enough bytes to decide yet — read more, keep what is here.
+    Incomplete,
+    /// Definitively malformed. C closes the circuit; so do both callers.
+    Malformed(FrameError),
+}
+
+/// **The CA client's one TCP framing step**, shared by the upstream circuit's
+/// [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's reader
+/// (`client/search.rs::run_nameserver_connection`).
+///
+/// The name-service circuit used to carry its own ~100-line copy of these
+/// rules, which is the shape `doc/calink-rtems-design.md` §6 C2 named: "one
+/// seam, two callers, not two seams and three framing loops". The dial became
+/// one seam in `aa91860b` ([`dial_ca`]); this is the framing half. The two
+/// copies had already drifted apart once — the misaligned-postsize close and
+/// the partial-extended-header wait were fixed twice, separately — which is
+/// the cost this function removes.
+///
+/// It answers **only** the header-level question, deliberately: how many bytes
+/// this message occupies and whether the peer is still speaking CA. Body
+/// policy (the receive-side size limit, the drain-across-reads) stays with the
+/// loop that owns the receive buffer, because that policy is genuinely
+/// per-circuit — see [`Frame::Header`].
+pub(super) fn next_frame(buf: &[u8]) -> Frame {
+    if buf.len() < CaHeader::SIZE {
+        return Frame::Incomplete;
+    }
+    // C `tcpiiu.cpp::processIncoming` distinguishes a *partial* extended
+    // header (await more bytes) from a *definitively malformed* one (close).
+    // Extended form is `m_postsize == 0xffff` alone (`tcpiiu.cpp:1168`), and
+    // it demands 24 header bytes rather than 16; fewer than that present is
+    // the one legitimate "await more" case beyond a short base header.
+    let base_post = u16::from_be_bytes([buf[2], buf[3]]);
+    if base_post == 0xFFFF && buf.len() < CaHeader::SIZE + 8 {
+        return Frame::Incomplete;
+    }
+    let (hdr, hdr_size) = match CaHeader::from_bytes_extended(buf) {
+        Ok(v) => v,
+        // `from_bytes_extended` rejects exactly two inputs — under 16 bytes,
+        // and `0xFFFF` with under 24 — and both are excluded above, so this
+        // arm is unreachable today. It is C's close rather than an
+        // `unreachable!` on purpose: a parser that later grows a rejection
+        // must reach the peer-is-malformed path, not panic the circuit's task.
+        Err(e) => return Frame::Malformed(FrameError::Header(e)),
+    };
+    let body_len = hdr.actual_postsize();
+    if body_len & 0x7 != 0 {
+        return Frame::Malformed(FrameError::MisalignedPayload(body_len));
+    }
+    Frame::Header {
+        hdr,
+        hdr_size,
+        body_len,
+    }
+}
+
+/// **The CA client's one receive-side body limit**, shared by the upstream
+/// circuit's [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's reader
+/// (`client/search.rs::run_nameserver_connection`) — the body-policy half of
+/// the seam whose framing half is [`next_frame`].
+///
+/// C `tcpiiu::processIncoming`'s limit and its ignore-don't-close policy
+/// (`tcpiiu.cpp:1207-1283`) apply to *every* `tcpiiu`, and a name-service
+/// circuit is a `tcpiiu` (`isNameService()`), so C runs one rule on both.
+/// `None` — the C default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the
+/// circuit accepts any payload the server announces; an operator who turns it
+/// off gets a limit, and over-limit responses are dropped one-by-one with a
+/// single log line per circuit. Neither case ever closes the circuit.
+///
+/// Pre-fix the name-service reader carried no limit at all: with
+/// `EPICS_CA_AUTO_ARRAY_BYTES=NO` the data circuit refused and drained an
+/// over-limit body while the name-server circuit buffered whatever a header
+/// announced — up to 4 GiB from one 24-byte extended header — which is
+/// exactly the "two copies drift" failure the framing seam exists to prevent.
+pub(super) struct RecvBodyPolicy {
+    limit: Option<usize>,
+    /// C `tcpiiu.cpp:1276-1282` drains an ignored oversize body across reads
+    /// with `recvQue.removeBytes` and returns to await the rest. This is that
+    /// counter: while it is non-zero every byte received belongs to a message
+    /// already refused, so it is consumed before framing resumes.
+    bytes_to_drain: usize,
+    oversize_logged: bool,
+}
+
+impl RecvBodyPolicy {
+    pub(super) fn new() -> Self {
+        Self::with_limit(crate::protocol::max_recv_body_bytes())
+    }
+
+    /// Test seam: the boundary table below injects a limit instead of
+    /// mutating the process environment under a parallel test runner.
+    fn with_limit(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            bytes_to_drain: 0,
+            oversize_logged: false,
+        }
+    }
+
+    /// First step of every receive iteration: consume bytes still owed to an
+    /// already-refused message from the head of `accumulated`. Returns `true`
+    /// while the refused message has bytes outstanding beyond this read — the
+    /// caller reads again instead of framing.
+    pub(super) fn drain_refused(&mut self, accumulated: &mut Vec<u8>) -> bool {
+        if self.bytes_to_drain > 0 {
+            let take = self.bytes_to_drain.min(accumulated.len());
+            accumulated.drain(..take);
+            self.bytes_to_drain -= take;
+        }
+        self.bytes_to_drain > 0
+    }
+
+    /// Whether a message announcing `body_len` payload bytes is refused under
+    /// the operator's limit. The first refusal on a circuit logs C's one line
+    /// (`tcpiiu.cpp:1271`); the rest are silent so a misbehaving server
+    /// cannot flood the log.
+    pub(super) fn refuses(&mut self, peer: SocketAddr, body_len: usize) -> bool {
+        let over = self.limit.is_some_and(|limit| body_len > limit);
+        if over && !self.oversize_logged {
+            eprintln!(
+                "CA: {peer}: response with payload size={body_len} \
+                 > EPICS_CA_MAX_ARRAY_BYTES ignored"
+            );
+            self.oversize_logged = true;
+        }
+        over
+    }
+
+    /// Register the still-arriving tail of a refused message, to be consumed
+    /// by [`Self::drain_refused`] on subsequent reads.
+    pub(super) fn owe(&mut self, bytes: usize) {
+        self.bytes_to_drain = bytes;
+    }
+}
+
+/// **The CA client's one TCP dial**, and the one place a circuit's socket
+/// options are set.
+///
+/// Two implementations, selected at compile time and never at runtime:
+///
+/// * `tokio_backend` — `tokio::net::TcpStream`, the reactor-driven socket this
+///   client has always used;
+/// * `exec_backend` or `--cfg ca_blocking_client` —
+///   `runtime::blocking_io`'s two pump threads over one `Arc<TcpStream>`
+///   (never `try_clone`: `F_DUPFD` fails `ENXIO` on any libbsd socket,
+///   measured on target).
+///
+/// The arm is chosen by the *backend*, not by the target. `exec_backend` is
+/// `target_os = "rtems"` **or** `--features rtems-exec-model` (`build.rs`), and
+/// what both share is that a future started through `runtime::task::spawn`
+/// runs with no tokio reactor entered — on RTEMS because there is none and
+/// `tokio::net` does not compile for the triple, on a host exec-model build
+/// because the future lands on a callback-pool worker the runtime was never
+/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
+/// reactor running") even though the process has a runtime elsewhere. Gating
+/// this seam on `target_os = "rtems"` named the target where the fact it needs
+/// is the backend, which is why `rtems-ca-ioc` still panicked on its first
+/// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
+/// item 2).
+///
+/// Both return the OS receive-queue probe alongside the circuit, because the
+/// fd it reads has to be captured *before* the socket is split or wrapped —
+/// making that one step is what stops a caller from forgetting it and
+/// silently disabling libca's flow control (`fd_recv_queue_probe`).
+///
+/// `None` on failure, with the reason logged: the search engine retries the
+/// address on its own cadence, which is what C's `disconnectNotify` + `break`
+/// leaves to the same layer.
+pub(super) async fn dial_ca(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
+    #[cfg(not(any(exec_backend, ca_blocking_client)))]
+    {
+        // No application-level connect deadline. C `tcpRecvThread::connect`
+        // (`tcpiiu.cpp:606-661`) issues a *blocking* `::connect()` and lets the
+        // OS TCP stack bound it — on Linux that is tcp_syn_retries, ~130 s of
+        // exponentially backed-off SYNs. A hardcoded 5 s cap here made every
+        // server whose handshake takes longer than that (SYN-lossy path,
+        // congested WAN link) permanently unreachable from the port while a C
+        // client on the same wire connects fine.
+        let stream = match TcpStream::connect(server_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");
+                return None;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        set_circuit_keepalive(&stream);
+        let probe = recv_queue_probe_for(&stream);
+        Some((stream, probe))
+    }
+    #[cfg(any(exec_backend, ca_blocking_client))]
+    {
+        dial_blocking(server_addr).await
+    }
+}
+
+/// The blocking dial: connect on a thread of its own, set the options, start
+/// the two pumps.
+///
+/// # Why the connect gets a thread
+///
+/// It is a *blocking* `::connect()` with **no application-level deadline** —
+/// C's exact shape (`tcpiiu.cpp:606-661`), and the property
+/// `connect_deadline_tests::tcp_connect_has_no_application_level_deadline`
+/// pins for both transports. Which OS bound applies is the *target's*
+/// question, not the host's: this arm is the RTEMS/blocking one, where libbsd
+/// ends an unanswered handshake at `TCPTV_KEEP_INIT` (`75 * hz`), measured at
+/// 75 s. A Linux host instead runs `tcp_syn_retries`, ~130 s of exponentially
+/// backed-off SYNs — that is the figure for the async arm above, not for this
+/// one.
+///
+/// Running that on the calling task's worker would park it for the whole
+/// ladder. On this target the caller is a cooperative-executor worker shared
+/// with every other future on its callback band — record-processing tails
+/// included — so one unreachable server would stall the band for the full
+/// 75 s.
+/// C does not have that problem because its connect is already on the
+/// circuit's own `CAC-TCP-recv` thread (`tcpiiu.cpp:677`), created before the
+/// connect rather than after it.
+///
+/// So the connect takes a thread here too, at the same band C's receive thread
+/// takes — but a *borrowed* one, not a created one.
+///
+/// # Why the thread is borrowed and not created
+///
+/// The first cut created the thread per attempt and let it exit, which reads
+/// as strictly cheaper than C's permanent per-circuit `CAC-TCP-recv`: fewer
+/// live threads, one `std::thread` TLS-key allocation (128 B on RTEMS,
+/// measured) more per attempt. That accounting is wrong in the term that
+/// matters. On RTEMS the 128 B is *never returned* — the TLS key is freed
+/// before the key's destructor runs — so the cost is per thread **creation**,
+/// and C's permanent thread pays it exactly once per circuit while a
+/// per-attempt thread pays it once per *attempt*. `run_nameserver_connection`
+/// (`client/search.rs`) redials a failed address every `EPICS_CA_CONN_TMO`
+/// (30 s) indefinitely, which is C's own cadence and is not going to change,
+/// so a name server that is down leaked without a ceiling for as long as the
+/// IOC ran.
+///
+/// The dial thread therefore comes from [`CA_DIAL_POOL`] — at most
+/// `MAX_DIAL_WORKERS` permanent workers for the whole process — and is
+/// returned to it when the connect resolves. The bound is by construction:
+/// past the first dial at each concurrency level there is nothing left to
+/// create, whatever the redial cadence. See `runtime::blocking_io::DialPool`,
+/// and `doc/pvalink-rtems-design.md` §9.11 for the PVA half of the same fix.
+///
+/// A worker is still the socket's single finalizer: a receiver dropped by an
+/// aborted caller only makes the send fail, and the fresh socket is dropped —
+/// and closed — right there, before the worker takes its next request.
+///
+/// # What the pool does *not* do
+///
+/// It adds no deadline. R7-19 (`connect_deadline_tests`) is unchanged: the
+/// worker issues a plain blocking `::connect()` and the awaiting side below
+/// applies no bound of its own, so the OS remains the only thing that ends a
+/// dial — C's shape (`tcpiiu.cpp:606-661`). The consequence, stated rather
+/// than papered over: a worker pinned against a SYN-blackholed server is held
+/// for the OS ladder — 75 s on the RTEMS target (libbsd `TCPTV_KEEP_INIT`),
+/// ~130 s on a Linux host (`tcp_syn_retries`) — and with every worker so
+/// pinned a further dial waits in the queue instead of connecting at once.
+/// That is a latency regression only in a case the contract already permits
+/// the full ladder for, and it
+/// takes `MAX_DIAL_WORKERS` *distinct* blackholed servers dialed at once to
+/// reach — a circuit is dialed once per address at a time
+/// (`connect_server`'s map lookup), so the re-offer loop cannot produce it by
+/// retrying one address.
+#[cfg(any(exec_backend, ca_blocking_client))]
+async fn dial_blocking(server_addr: SocketAddr) -> Option<(CaCircuit, OsRecvQueueProbe)> {
+    use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
+
+    #[cfg(feature = "bringup-probes")]
+    let attempt = CA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let dialed_rx = match CA_DIAL_POOL.dial(server_addr) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!(server = %server_addr, error = %e, "cannot start the circuit dial thread");
+            return None;
+        }
+    };
+    // BRING-UP PROBE: how long one dial holds a worker, printed at submit and
+    // at resolve so a console reader can pair them. The target installs no
+    // tracing subscriber, so `println!` is the only reader; the pair is what
+    // distinguishes a dial that was pinned in the OS connect ladder from one
+    // that waited in the pool's queue behind four that were.
+    #[cfg(feature = "bringup-probes")]
+    let submitted = std::time::Instant::now();
+    #[cfg(feature = "bringup-probes")]
+    {
+        let (workers, _, queued, dialing) = dial_pool_probe();
+        println!(
+            "DIALPROBE submit n={attempt} target={server_addr} \
+             workers={workers} queued={queued} dialing={dialing}"
+        );
+    }
+    let dialed = dialed_rx.await;
+    #[cfg(feature = "bringup-probes")]
+    {
+        let outcome = match &dialed {
+            Ok(Ok(_)) => "connected".to_string(),
+            Ok(Err(e)) => format!("error:{e}"),
+            Err(_) => "worker-gone".to_string(),
+        };
+        println!(
+            "DIALPROBE resolve n={attempt} target={server_addr} \
+             elapsed_ms={} outcome={outcome}",
+            submitted.elapsed().as_millis()
+        );
+    }
+    let stream = match dialed {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");
+            return None;
+        }
+        Err(_) => {
+            // The thread ended without sending: it panicked. Nothing to
+            // retry here — the search engine re-offers the address.
+            tracing::warn!(server = %server_addr, "circuit dial thread ended without a result");
+            return None;
+        }
+    };
+    set_circuit_keepalive(&stream);
+    let probe = recv_queue_probe_for(&stream);
+    // `read_timeout` keeps `PumpConfig`'s effectively-infinite default. The
+    // reader pump ends the connection when its `SO_RCVTIMEO` expires, so any
+    // finite value here is an idle-disconnect bound — and an idle CA circuit is
+    // *supposed* to be silent: `read_loop` sends CA_PROTO_ECHO after
+    // `EPICS_CA_CONN_TMO` of quiet and only its echo watchdog
+    // (`ECHO_TIMEOUT_SECS`) is entitled to call the circuit dead. `send_timeout`
+    // is the bound on writing one whole frame, which is the same number
+    // `write_loop` already applies to its own send.
+    let (reader, writer) = match drive_socket_blocking(
+        &CA_CIRCUIT_POOL,
+        stream,
+        &server_addr.to_string(),
+        &PumpConfig {
+            send_timeout: connection_timeout(),
+            ..PumpConfig::default()
+        },
+    ) {
+        Ok(halves) => halves,
+        Err(e) => {
+            tracing::warn!(server = %server_addr, error = %e, "circuit pump threads failed to start");
+            return None;
+        }
+    };
+    Some((PumpedCircuit { reader, writer }, probe))
+}
+
+/// Capture the OS receive-queue probe for a socket that is about to be split.
+///
+/// C `tcpiiu::bytesArePendingInOS()` is an ioctl on the circuit's socket. The
+/// fd has to be taken while the whole socket is still in hand — the reader
+/// half handed to `read_loop` keeps it open for exactly as long as the probe
+/// can be called.
+#[cfg(unix)]
+fn recv_queue_probe_for<S: std::os::fd::AsRawFd>(sock: &S) -> OsRecvQueueProbe {
+    fd_recv_queue_probe(sock.as_raw_fd())
+}
+
+/// See the unix definition; no `FIONREAD` equivalent is wired up elsewhere.
+#[cfg(not(unix))]
+fn recv_queue_probe_for<S>(_sock: &S) -> OsRecvQueueProbe {
+    fd_recv_queue_probe(0)
 }
 
 /// `EPICS_CA_CONN_TMO` — C's `cac::connectionTimeout()`, default 30 s.
@@ -259,9 +963,13 @@ struct ServerConnection {
     /// causing the watchdog to expire on schedule and probe the
     /// circuit then). Mirrors libca's `tcpRecvWatchdog` model — see
     /// `TransportCommand::BeaconArrivalNotify` for full rationale.
+    #[cfg(ca_beacon_monitor)]
     beacon_arrival_tx: mpsc::UnboundedSender<bool>,
-    _read_task: tokio::task::JoinHandle<()>,
-    _write_task: tokio::task::JoinHandle<()>,
+    // Spawned via `runtime::task::spawn`, so typed as the seam handle.
+    // Byte-identical to `tokio::task::JoinHandle` under the hosted default;
+    // the executor's `JoinFuture` under `rtems-exec-model`.
+    _read_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _write_task: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 /// Hard-stop on drop: abort both the per-server read and write tasks.
@@ -281,6 +989,55 @@ impl Drop for ServerConnection {
         self._read_task.abort();
         self._write_task.abort();
     }
+}
+
+/// Reports a circuit pump's exit to its single owner, [`run_transport_manager`].
+///
+/// A circuit dies when either of its pumps stops running: `read_loop` returning
+/// on an EOF / read error / malformed frame, `write_loop` returning on a send
+/// error, or either task being aborted or unwinding on panic. Every one of
+/// those is an exit of the pump future, so a guard whose `Drop` fires the
+/// circuit key covers them all — there is no way to run a pump without also
+/// holding the guard that reports its exit, which is what makes "a pump exited
+/// but the manager still holds a live-looking circuit" unrepresentable.
+///
+/// The manager retiring the circuit on this signal is what frees a reader pump
+/// still parked in a blocking `read` that a peer RST never woke (RTEMS libbsd,
+/// measured): removing the `ServerConnection` runs its `Drop`, which aborts the
+/// sibling task and drops the [`GuardedReader`]/[`GuardedWriter`] guards, and
+/// those `shutdown(Both)` the socket — the only thing that returns that read.
+/// Before this signal the circuit was retired only lazily, at the next
+/// `CreateChannel`; during a prolonged upstream outage that reconnect never
+/// arrives (its search is blocked on the also-down name-service circuit), so
+/// the dead circuit — socket and all — leaked for the whole outage.
+struct CircuitDeathGuard {
+    dead_tx: mpsc::UnboundedSender<CircuitKey>,
+    circuit: CircuitKey,
+}
+
+impl Drop for CircuitDeathGuard {
+    fn drop(&mut self) {
+        // The manager may already be gone (shutdown); a failed send is then
+        // the correct no-op — there is no circuit registry left to retire.
+        let _ = self.dead_tx.send(self.circuit);
+    }
+}
+
+/// Spawn a circuit pump future under a [`CircuitDeathGuard`], so its exit —
+/// however it exits — retires the circuit through the transport manager. Used
+/// for both the read and write pumps of every established circuit.
+fn spawn_guarded_pump<F>(
+    dead_tx: mpsc::UnboundedSender<CircuitKey>,
+    circuit: CircuitKey,
+    fut: F,
+) -> epics_base_rs::runtime::task::TaskHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    epics_base_rs::runtime::task::spawn(async move {
+        let _death = CircuitDeathGuard { dead_tx, circuit };
+        fut.await;
+    })
 }
 
 /// Per-task transport manager.
@@ -320,14 +1077,23 @@ pub(crate) async fn run_transport_manager(
     // TCP circuits (libca `caServerID`).
     let mut connections: HashMap<CircuitKey, ServerConnection> = HashMap::new();
     // Pending connect_server tasks. Spawning each connect into a
-    // JoinSet (rather than `.await`-ing inline) is what lets a
+    // task set (rather than `.await`-ing inline) is what lets a
     // slow TCP/TLS handshake on circuit A stop blocking unrelated
     // commands: BeaconArrivalNotify for already-connected
     // circuits, fast-path CreateChannel for circuit B, etc. The
     // task returns its `CircuitKey` alongside the result so
     // `join_next` can pair completion with the right state.
-    let mut pending_connects: tokio::task::JoinSet<(CircuitKey, Option<ServerConnection>)> =
-        tokio::task::JoinSet::new();
+    //
+    // `runtime::task::TaskSet`, not `tokio::task::JoinSet`: this loop runs on
+    // a callback band on the RTEMS target, where `JoinSet::spawn` — which is
+    // `tokio::spawn` under another name — panics with *"there is no reactor
+    // running"* at the first connect and takes the band worker with it
+    // (measured, `doc/calink-rtems-design.md` §11.1). The seam type keeps
+    // the concurrency, the completion pairing and the abort-on-drop.
+    let mut pending_connects: epics_base_rs::runtime::task::TaskSet<(
+        CircuitKey,
+        Option<ServerConnection>,
+    )> = epics_base_rs::runtime::task::TaskSet::new();
     // Commands waiting on a pending connect. Keyed by the command's
     // target circuit. CreateChannel is the only command that *causes*
     // a connect to start; subsequent CreateChannels for the same
@@ -335,6 +1101,16 @@ pub(crate) async fn run_transport_manager(
     // arrive before connect completes) all queue here and get drained
     // when the connect resolves.
     let mut queued_per_server: HashMap<CircuitKey, Vec<TransportCommand>> = HashMap::new();
+
+    // Circuit death funnel: every established circuit's pumps hold a
+    // `CircuitDeathGuard` that fires this channel on exit (return, `?`, panic,
+    // or abort). This is the ONLY circuit-death signal the manager acts on for
+    // retirement, so a dead circuit is retired the moment a pump stops — not
+    // deferred to the next `CreateChannel`. A pump also still emits
+    // `TransportEvent::TcpClosed` to the coordinator for the redial decision;
+    // the two are independent, and the manager owns retirement while the
+    // coordinator owns reconnect.
+    let (circuit_dead_tx, mut circuit_dead_rx) = mpsc::unbounded_channel::<CircuitKey>();
 
     // Helper: resolve the right SNI / cert-verification name for a
     // particular target address. Lookup order:
@@ -413,6 +1189,7 @@ pub(crate) async fn run_transport_manager(
                         let in_flight_clone = in_flight.clone();
                         let last_rx_clone = last_rx_at.clone();
                         let identity_clone = client_identity.clone();
+                        let circuit_dead_clone = circuit_dead_tx.clone();
                         pending_connects.spawn(async move {
                             #[cfg(feature = "experimental-rust-tls")]
                             let conn = connect_server(
@@ -422,6 +1199,7 @@ pub(crate) async fn run_transport_manager(
                                 in_flight_clone,
                                 last_rx_clone,
                                 identity_clone,
+                                circuit_dead_clone,
                                 tls_clone.as_ref(),
                                 sni.as_deref(),
                             )
@@ -434,6 +1212,7 @@ pub(crate) async fn run_transport_manager(
                                 in_flight_clone,
                                 last_rx_clone,
                                 identity_clone,
+                                circuit_dead_clone,
                             )
                             .await;
                             (circuit, conn)
@@ -478,6 +1257,7 @@ pub(crate) async fn run_transport_manager(
                         // Emit BEFORE replaying queued commands so the
                         // reset is observed before any subsequent
                         // anomaly classification on this circuit.
+                        #[cfg(feature = "client")]
                         let _ = event_tx.send(TransportEvent::ServerConnected { server_addr });
                         for queued_cmd in queued {
                             process_command(
@@ -505,6 +1285,27 @@ pub(crate) async fn run_transport_manager(
                         }
                         let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                     }
+                }
+            }
+            Some(dead) = circuit_dead_rx.recv() => {
+                // A pump of this circuit exited, so the circuit is dead. Retire
+                // it here, in its single owner, the instant it dies — the
+                // structural close for the wedge where a circuit killed by a
+                // peer RST lingered until the next `CreateChannel` (which, on a
+                // prolonged upstream outage, never comes because its reconnect
+                // search is blocked on the also-down name-service circuit).
+                //
+                // Removing the `ServerConnection` runs its `Drop`, which aborts
+                // the sibling pump and drops the reader/writer guards; those
+                // `shutdown(Both)` the socket, which is the only thing that
+                // frees a reader pump still parked in a blocking `read` that
+                // the RST never woke (RTEMS libbsd). Idempotent: the sibling
+                // pump's guard fires a second `dead` for the same key, and the
+                // `remove` then finds nothing — so exactly one retirement runs
+                // per circuit. `server_writers` is cleared in lockstep so no
+                // command is framed onto a socket that is being torn down.
+                if connections.remove(&dead).is_some() {
+                    server_writers.remove(&dead);
                 }
             }
         }
@@ -556,6 +1357,7 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             priority,
             ..
         } => Some((*server_addr, *priority)),
+        #[cfg(ca_beacon_monitor)]
         TransportCommand::BeaconArrivalNotify { .. } => None,
     }
 }
@@ -805,6 +1607,7 @@ fn process_command(
                 event_tx,
             );
         }
+        #[cfg(ca_beacon_monitor)]
         TransportCommand::BeaconArrivalNotify {
             server_addr,
             anomaly,
@@ -957,51 +1760,20 @@ async fn connect_server(
     in_flight: super::types::InFlightOps,
     last_rx_at: super::types::ServerLastRxAt,
     identity: super::types::ClientIdentitySlot,
+    // Fires the circuit key back to the transport manager the moment either
+    // pump exits, so the manager — the single owner of the `connections` map —
+    // retires the dead circuit at once rather than waiting for the next
+    // `CreateChannel`. See [`CircuitDeathGuard`].
+    circuit_dead: mpsc::UnboundedSender<CircuitKey>,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<&ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<&str>,
 ) -> Option<ServerConnection> {
+    let circuit: CircuitKey = (server_addr, priority);
     tracing::debug!(server = %server_addr, "establishing TCP virtual circuit");
-    // No application-level connect deadline. C `tcpRecvThread::connect`
-    // (`tcpiiu.cpp:606-661`) issues a *blocking* `::connect()` and lets the
-    // OS TCP stack bound it — on Linux that is tcp_syn_retries, ~130 s of
-    // exponentially backed-off SYNs. A hardcoded 5 s cap here made every
-    // server whose handshake takes longer than that (SYN-lossy path,
-    // congested WAN link) permanently unreachable from the port while a C
-    // client on the same wire connects fine. The search engine retries the
-    // address on its own cadence if this attempt fails, which is what C's
-    // `disconnectNotify` + `break` leaves to the same layer.
-    let stream = match TcpStream::connect(server_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(server = %server_addr, error = %e, "TCP connect failed");
-            return None;
-        }
-    };
-
-    let _ = stream.set_nodelay(true);
-
-    // TCP keepalive: detect dead connections on idle circuits.
-    // OS sends probes after 15s idle, every 5s, giving up after 3 failures (~30s total).
-    {
-        let sock = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(15))
-            .with_interval(Duration::from_secs(5));
-        let _ = sock.set_keepalive(true);
-        let _ = sock.set_tcp_keepalive(&keepalive);
-    }
-
-    // C `tcpiiu::bytesArePendingInOS()` is an ioctl on the circuit's socket.
-    // Capture the fd before the stream is split (or wrapped in TLS): the
-    // reader half handed to `read_loop` keeps it open for exactly as long as
-    // the probe can be called.
-    #[cfg(unix)]
-    let bytes_pending_in_os = {
-        use std::os::fd::AsRawFd;
-        fd_recv_queue_probe(stream.as_raw_fd())
-    };
-    #[cfg(not(unix))]
-    let bytes_pending_in_os = fd_recv_queue_probe(0);
+    // The dial, its socket options and its receive-queue probe are one step
+    // and one seam — see `dial_ca`. It selects the transport at compile time,
+    // so nothing below this line knows which one it got.
+    let (stream, bytes_pending_in_os) = dial_ca(server_addr).await?;
 
     let (write_tx, write_rx) = mpsc::unbounded_channel();
     let pending_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1028,6 +1800,15 @@ async fn connect_server(
     // of a `CircuitUnresponsive` still in flight from the write loop.
     let unresponsive = std::sync::Arc::new(UnresponsiveGate::new());
     let (beacon_arrival_tx, beacon_arrival_rx) = mpsc::unbounded_channel::<bool>();
+    // A build with no beacon monitor has nothing that will ever send on
+    // this. Dropping the sender here puts `read_loop`'s arrival arm in the
+    // state a shutdown leaves it in — closed on first poll, then disarmed —
+    // rather than leaving a channel alive that no code can feed. (The arm
+    // itself cannot be `cfg`'d: `tokio::select!` does not accept attributes
+    // on a branch.) That is `client-core`, and equally the reactor-free
+    // `exec_backend`, where the monitor's UDP socket cannot exist.
+    #[cfg(not(ca_beacon_monitor))]
+    drop(beacon_arrival_tx);
 
     // Build initial CA handshake.
     let handshake = build_client_handshake(priority, &identity);
@@ -1064,7 +1845,17 @@ async fn connect_server(
         // enough to fall through to the next NAME_SERVER candidate.
         let hs_timeout = tls_handshake_timeout();
         let tls_stream =
-            match tokio::time::timeout(hs_timeout, connector.connect(server_name, stream)).await {
+            // Seam, for the same reason as the two pumps below: this is on the
+            // circuit path, and a tokio timer there panics on a target with no
+            // reactor. Not reached in today's target build (the TLS feature is
+            // off there), but leaving one tokio timer on the circuit path is
+            // what re-opens the family.
+            match epics_base_rs::runtime::task::timeout(
+                hs_timeout,
+                connector.connect(server_name, stream),
+            )
+            .await
+            {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(server = %server_addr, error = %e, "TLS handshake failed");
@@ -1078,81 +1869,105 @@ async fn connect_server(
             };
         tracing::debug!(server = %server_addr, "TLS handshake complete");
         let (reader, writer) = tokio::io::split(tls_stream);
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     } else {
-        let (reader, writer) = stream.into_split();
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let (reader, writer) = split_circuit(stream);
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     };
 
     #[cfg(not(feature = "experimental-rust-tls"))]
     let (read_task, write_task) = {
-        let (reader, writer) = stream.into_split();
-        let write_task = epics_base_rs::runtime::task::spawn(write_loop(
-            writer,
-            write_rx,
-            server_addr,
-            priority,
-            event_tx.clone(),
-            pending_frames.clone(),
-            unresponsive.clone(),
-        ));
-        let read_task = epics_base_rs::runtime::task::spawn(read_loop(
-            reader,
-            server_addr,
-            priority,
-            event_tx,
-            write_tx.clone(),
-            beacon_arrival_rx,
-            in_flight.clone(),
-            last_rx_at.clone(),
-            unresponsive.clone(),
-            bytes_pending_in_os.clone(),
-            server_minor.clone(),
-        ));
+        let (reader, writer) = split_circuit(stream);
+        let write_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            write_loop(
+                writer,
+                write_rx,
+                server_addr,
+                priority,
+                event_tx.clone(),
+                pending_frames.clone(),
+                unresponsive.clone(),
+            ),
+        );
+        let read_task = spawn_guarded_pump(
+            circuit_dead.clone(),
+            circuit,
+            read_loop(
+                reader,
+                server_addr,
+                priority,
+                event_tx,
+                write_tx.clone(),
+                beacon_arrival_rx,
+                in_flight.clone(),
+                last_rx_at.clone(),
+                unresponsive.clone(),
+                bytes_pending_in_os.clone(),
+                server_minor.clone(),
+            ),
+        );
         (read_task, write_task)
     };
 
@@ -1160,6 +1975,7 @@ async fn connect_server(
         write_tx,
         pending_frames,
         server_minor,
+        #[cfg(ca_beacon_monitor)]
         beacon_arrival_tx,
         _read_task: read_task,
         _write_task: write_task,
@@ -1260,8 +2076,10 @@ impl UnresponsiveGate {
         }
     }
 
-    /// Test-only read of the current unresponsive state.
-    #[cfg(test)]
+    /// Test-only read of the current unresponsive state. Gated exactly like
+    /// its only callers (`write_loop_timeout_tests`), which the virtual clock
+    /// keeps out of the feature-ON suite.
+    #[cfg(all(test, not(feature = "rtems-exec-model")))]
     fn is_unresponsive(&self) -> bool {
         *self.state.lock().unwrap()
     }
@@ -1312,7 +2130,16 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(
         // without abandoning a partial frame.
         let mut written = 0usize;
         while written < batch.len() {
-            match tokio::time::timeout(send_timeout, writer.write(&batch[written..])).await {
+            // The `runtime::task` seam, not `tokio::time::timeout`: on the
+            // RTEMS target this pump runs with no tokio reactor anywhere in
+            // the process, and a tokio timer panics the task rather than
+            // firing (§11.1).
+            match epics_base_rs::runtime::task::timeout(
+                send_timeout,
+                writer.write(&batch[written..]),
+            )
+            .await
+            {
                 Ok(Ok(0)) => {
                     // Peer will accept no more bytes — dead socket.
                     let _ = event_tx.send(TransportEvent::TcpClosed {
@@ -1412,14 +2239,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
     // C `tcpiiu::processIncoming`'s receive-side body limit and its
-    // ignore-don't-close policy (`tcpiiu.cpp:1207-1283`). `None` — the C
-    // default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`) — means the circuit accepts
-    // any payload the server announces; an operator who turns it off gets a
-    // limit, and over-limit responses are dropped one-by-one with a single
-    // log line. Neither case ever closes the circuit.
-    let recv_body_limit = crate::protocol::max_recv_body_bytes();
-    let mut bytes_to_drain: usize = 0;
-    let mut oversize_logged = false;
+    // ignore-don't-close policy — see [`RecvBodyPolicy`], shared with the
+    // name-service circuit's reader.
+    let mut body_policy = RecvBodyPolicy::new();
     let idle_timeout = Duration::from_secs(echo_idle_secs());
     let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
     let mut echo_pending = false;
@@ -1512,15 +2334,21 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // carries the running count for observability.
     let mut cap_warned = false;
 
-    // Single long-lived `Sleep` whose deadline we mutate in place
-    // via `Sleep::reset`. This is what makes the libca model
-    // expressible: we can extend the watchdog deadline on healthy
-    // beacons and data arrival without restarting the read future,
-    // and we can leave the deadline untouched on anomaly beacons so
-    // the timer still expires on its original schedule.
-    let mut deadline = tokio::time::Instant::now() + idle_timeout;
-    let sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(sleep);
+    // The watchdog deadline is the state; the sleep future is derived from
+    // it inside the `select!` below. This is what makes the libca model
+    // expressible: we extend the watchdog deadline on healthy beacons and on
+    // data arrival, and we leave it untouched on anomaly beacons so the timer
+    // still expires on its original schedule.
+    //
+    // An **absolute** `std::time::Instant` re-slept each iteration, not a
+    // pinned `tokio::time::Sleep` mutated by `Sleep::reset`: the seam's
+    // `sleep_until` has no `reset`, and it does not need one — re-deriving a
+    // future for the *same* absolute deadline is the same deadline. Leaving
+    // `deadline` alone is still "do not touch the watchdog". The seam is not
+    // optional here: on the RTEMS target this loop runs with no tokio reactor
+    // in the process, and `tokio::time::sleep_until` panics the task instead
+    // of firing (§11.1).
+    let mut deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
 
     loop {
         // Refresh the suspend-detection anchor at the top of each
@@ -1564,8 +2392,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         // anomaly outstanding) and aren't already
                         // probing.
                         if !beacon_anomaly && !echo_pending {
-                            deadline = tokio::time::Instant::now() + idle_timeout;
-                            sleep.as_mut().reset(deadline);
+                            deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
                         }
                     }
                     None => {
@@ -1579,7 +2406,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             // Watchdog deadline expired. Disabled while the watchdog is
             // cancelled (C: unresponsive circuit, timer not restarted).
-            _ = &mut sleep, if watchdog_armed => {
+            _ = epics_base_rs::runtime::task::sleep_until(deadline), if watchdog_armed => {
                 // libca Issue #190: detect suspend wake. If wall-clock
                 // skipped far more than expected for this sleep, the
                 // tokio reactor was paused (laptop suspend / VM stop).
@@ -1643,8 +2470,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 } else {
                     echo_timeout
                 };
-                deadline = tokio::time::Instant::now() + probe;
-                sleep.as_mut().reset(deadline);
+                deadline = epics_base_rs::runtime::task::Instant::now() + probe;
                 continue;
             }
             // Data from the server.
@@ -1672,8 +2498,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
         // an unresponsive circuit's cancelled timer comes back here).
         watchdog_armed = true;
-        deadline = tokio::time::Instant::now() + idle_timeout;
-        sleep.as_mut().reset(deadline);
+        deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
         // Phase D: bump the per-server "last RX" stamp before any
         // protocol parsing so that even ECHO replies and frames the
         // parser later rejects still count as proof of liveness.
@@ -1691,90 +2516,50 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // `bytesArePendingInOS()` (`tcpiiu.cpp:543-546`).
         accumulated.extend_from_slice(&buf[..n]);
 
-        // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1276-1282`) drains an
-        // ignored oversize body across reads with `recvQue.removeBytes` and
-        // returns to await the rest. `bytes_to_drain` is that counter: while
-        // it is non-zero every byte read belongs to a message we already
-        // decided to ignore, so it is consumed before framing resumes.
-        if bytes_to_drain > 0 {
-            let take = bytes_to_drain.min(accumulated.len());
-            accumulated.drain(..take);
-            bytes_to_drain -= take;
-            if bytes_to_drain > 0 {
-                continue;
-            }
+        // Bytes owed to an already-refused oversize message are consumed
+        // before framing resumes (C `recvQue.removeBytes`, see
+        // [`RecvBodyPolicy::drain_refused`]).
+        if body_policy.drain_refused(&mut accumulated) {
+            continue;
         }
 
         let mut offset = 0;
-        while offset + CaHeader::SIZE <= accumulated.len() {
-            let frame = &accumulated[offset..];
-            // C `tcpiiu.cpp::processIncoming` distinguishes a *partial*
-            // extended header (await more bytes) from a *definitively
-            // malformed* one (close the connection). Detect the only
-            // legitimate "await more" case — an extended-form header
-            // (`postsize == 0xFFFF`) with fewer than its 24 bytes present —
-            // and treat every other parse error as a hard close.
-            let is_partial_extended_header =
-                frame.len() >= 4 && frame[2] == 0xFF && frame[3] == 0xFF && frame.len() < 24;
-            let (hdr, hdr_size) = match CaHeader::from_bytes_extended(frame) {
-                Ok(v) => v,
-                Err(_) if is_partial_extended_header => {
-                    // Genuine TCP segment boundary inside an extended
-                    // header — wait for the remaining bytes.
-                    break;
-                }
-                Err(e) => {
-                    // The parser carries no size policy (an oversize body is
-                    // a valid header — see `max_recv_body_bytes`, and the
-                    // ignore-don't-close handling below), so the only way to
-                    // land here is a header too short to parse, which the
-                    // loop condition and the partial-annex arm above have
-                    // already excluded. Treat it as a malformed peer.
-                    eprintln!("CA: {server_addr}: malformed TCP header ({e}), closing");
+        loop {
+            // The shared framing step (`next_frame`) — "await more bytes" and
+            // "this peer is definitively malformed" are its answer, not this
+            // loop's, so the name-service circuit's reader cannot drift away
+            // from these rules again (§6 C2).
+            let (hdr, hdr_size, actual_post) = match next_frame(&accumulated[offset..]) {
+                Frame::Incomplete => break,
+                Frame::Malformed(e) => {
+                    // C `tcpiiu.cpp::processIncoming:1197-1202` closes the
+                    // connection on either a header it cannot parse or a
+                    // misaligned `m_postsize`. Silently rounding the latter
+                    // via `align8` (the prior behavior) lets a malicious
+                    // server desync our framer; drop the circuit so the
+                    // reconnect loop rebuilds from a clean state.
+                    eprintln!("CA: {server_addr}: {e}, closing");
                     let _ = event_tx.send(TransportEvent::TcpClosed {
                         server_addr,
                         priority,
                     });
                     return;
                 }
+                Frame::Header {
+                    hdr,
+                    hdr_size,
+                    body_len,
+                } => (hdr, hdr_size, body_len),
             };
-            let actual_post = hdr.actual_postsize();
-            // C `tcpiiu.cpp::processIncoming` (line 1198) closes the
-            // connection if `m_postsize & 0x7 != 0`. The wire spec
-            // requires every payload to be 8-byte aligned; an
-            // unaligned postsize is either a malformed peer or an
-            // attempt to push our parser into reading the next
-            // message's header as the tail of this one. Silently
-            // rounding via `align8` (the prior behavior) lets a
-            // malicious server desync our framer. Match C: drop the
-            // connection so the reconnect loop can rebuild from a
-            // clean state.
-            if actual_post & 0x7 != 0 {
-                eprintln!(
-                    "CA: {server_addr}: misaligned payload (postsize={actual_post}), closing"
-                );
-                let _ = event_tx.send(TransportEvent::TcpClosed {
-                    server_addr,
-                    priority,
-                });
-                return;
-            }
             let msg_len = hdr_size + actual_post;
 
             // C `tcpiiu::processIncoming` (`tcpiiu.cpp:1269-1283`): a body the
             // circuit's cache cannot hold is IGNORED — logged once, drained
             // with `recvQue.removeBytes`, circuit kept. Unreachable with C's
-            // default (`recv_body_limit == None`), which is the whole point:
-            // a C client reads a 33 MB waveform from a C IOC without
-            // complaint, so ours must too.
-            if recv_body_limit.is_some_and(|limit| actual_post > limit) {
-                if !oversize_logged {
-                    eprintln!(
-                        "CA: {server_addr}: response with payload size={actual_post} \
-                         > EPICS_CA_MAX_ARRAY_BYTES ignored"
-                    );
-                    oversize_logged = true;
-                }
+            // default (no limit), which is the whole point: a C client reads
+            // a 33 MB waveform from a C IOC without complaint, so ours must
+            // too. The rule itself lives in [`RecvBodyPolicy`].
+            if body_policy.refuses(server_addr, actual_post) {
                 let present = accumulated.len() - offset;
                 if msg_len <= present {
                     offset += msg_len;
@@ -1783,7 +2568,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 // The body is still arriving: consume what is here and carry
                 // the remainder into the next reads (C keeps `curDataBytes`
                 // and returns true to await more).
-                bytes_to_drain = msg_len - present;
+                body_policy.owe(msg_len - present);
                 offset = accumulated.len();
                 break;
             }
@@ -2358,7 +3143,20 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod read_loop_tests {
     //! Virtual-time tests for the libca-style lazy-echo watchdog.
     //!
@@ -2549,7 +3347,11 @@ mod read_loop_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only: constructs `ServerConnection` tasks with `tokio::spawn` and
+// asserts tokio abort semantics. Under `rtems-exec-model` the task fields are
+// `JoinFuture` (not tokio handles) and the async client stack has no reactor to
+// run on, so this test is inapplicable there.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod server_connection_drop_tests {
     //! Verifies the per-circuit `ServerConnection::drop` aborts both
     //! its read and write tasks. Without this, every `connections`
@@ -2583,12 +3385,14 @@ mod server_connection_drop_tests {
         let write_abort = write_task.abort_handle();
 
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        #[cfg(ca_beacon_monitor)]
         let (beacon_arrival_tx, _ba_rx) = mpsc::unbounded_channel::<bool>();
 
         let conn = ServerConnection {
             server_minor: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             write_tx,
             pending_frames: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(ca_beacon_monitor)]
             beacon_arrival_tx,
             _read_task: read_task,
             _write_task: write_task,
@@ -3280,7 +4084,20 @@ mod flow_control_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod recv_watchdog_tests {
     //! R6-16: an echo-probe timeout on the receive watchdog must mark the
     //! circuit unresponsive and KEEP the socket. C `tcpRecvWatchdog::expire`
@@ -3512,7 +4329,20 @@ mod recv_watchdog_tests {
     }
 }
 
-#[cfg(test)]
+// Host/tokio-only, and for one reason: these are **virtual-time** tests. They
+// compress 30-50 s of watchdog arithmetic into microseconds with
+// `#[tokio::test(start_paused = true)]`, which advances *tokio's* clock. The
+// circuit path now takes its deadlines and its timeouts from the
+// `runtime::task` seam (it has to — the RTEMS target has no tokio reactor for
+// them to run on, doc/calink-rtems-design.md §11.1), and under
+// `rtems-exec-model` that seam is the delayed-callback timer on the real
+// `std::time` clock, which `start_paused` cannot move. So under that feature
+// these would wait out the wall clock rather than test anything, in the same
+// way `server_connection_drop_tests` below is inapplicable there.
+//
+// What they cover — the deadline arithmetic itself — is backend-independent
+// and is covered in the default configuration, which is where they run.
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
 mod write_loop_timeout_tests {
     //! R2-40: a send-side stall in `write_loop` must mark the circuit
     //! unresponsive (`CircuitUnresponsive`) and KEEP the socket, resuming
@@ -3866,6 +4696,7 @@ mod connect_deadline_tests {
         let (addr, _listener, _filler) = syn_blackhole();
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (circuit_dead_tx, _circuit_dead_rx) = mpsc::unbounded_channel();
         let identity = Arc::new(parking_lot::RwLock::new(
             crate::client::types::ClientIdentity::from_env(),
         ));
@@ -3876,6 +4707,7 @@ mod connect_deadline_tests {
             InFlightOps::new(),
             ServerLastRxAt::default(),
             identity,
+            circuit_dead_tx,
             #[cfg(feature = "experimental-rust-tls")]
             None,
             #[cfg(feature = "experimental-rust-tls")]
@@ -3893,6 +4725,277 @@ mod connect_deadline_tests {
     }
 }
 
+/// The dial seam borrows its thread from a bounded pool rather than creating
+/// one per attempt.
+///
+/// `exec_backend`-gated because that is where `dial_blocking` exists at all —
+/// the hosted arm of `dial_ca` is `tokio::net::TcpStream::connect` and has no
+/// thread to bound. Linux-only for the same reason as
+/// `connect_deadline_tests` above: the blackhole relies on Linux answering an
+/// overflowing SYN with silence.
+#[cfg(all(test, exec_backend, target_os = "linux"))]
+mod dial_pool_tests {
+    use super::*;
+    use epics_base_rs::runtime::blocking_io::MAX_DIAL_WORKERS;
+
+    /// A local address whose SYNs the kernel drops, with saturation
+    /// *verified* rather than assumed.
+    ///
+    /// `connect_deadline_tests::syn_blackhole` fills the one-slot accept
+    /// queue with a single connection and trusts it. That races: a handshake
+    /// completing through the SYN queue lands in the accept queue a beat
+    /// after the filler's `connect()` returns, so a dial issued right behind
+    /// it can still be admitted (observed on the PVA side). One admitted dial
+    /// out of the twelve below would quietly weaken the count this test is
+    /// about, so this copy keeps adding established fillers until a fresh
+    /// nonblocking connect is still unanswered 300 ms in — on loopback a
+    /// queued handshake completes in microseconds and a dropped SYN's first
+    /// retransmit is at ~1 s, so an unanswered probe proves the queue is
+    /// full. Closing the probe in SYN-SENT aborts the attempt, so it cannot
+    /// steal a slot later.
+    fn syn_blackhole() -> (SocketAddr, socket2::Socket, Vec<std::net::TcpStream>) {
+        use socket2::{Domain, Socket, Type};
+
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .expect("bind");
+        // Backlog 0 → the kernel rounds to a 1-slot accept queue.
+        sock.listen(0).expect("listen");
+        let addr: SocketAddr = sock.local_addr().expect("local_addr").as_socket().unwrap();
+
+        let mut fillers = Vec::new();
+        loop {
+            let probe = Socket::new(Domain::IPV4, Type::STREAM, None).expect("probe");
+            probe.set_nonblocking(true).expect("probe nonblocking");
+            match probe.connect(&addr.into()) {
+                Ok(()) => {}
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("probe connect: {e}"),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            if probe.peer_addr().is_ok() {
+                // Admitted: the queue had room. Keep it as a filler.
+                probe.set_nonblocking(false).expect("filler blocking");
+                fillers.push(probe.into());
+            } else {
+                // Still SYN-SENT after 300 ms: the queue is full.
+                return (addr, sock, fillers);
+            }
+        }
+    }
+
+    /// Every thread this client creates for a dial, whatever shape the dial
+    /// seam has.
+    ///
+    /// Both prefixes on purpose: `"CAC-connect <addr>"` is the per-attempt
+    /// thread the pool replaced and `"CAC-dial <n>"` is a pool worker, so a
+    /// count taken through this function is comparable across the change and
+    /// the bound below is asserted against the old shape as well as the new
+    /// one. (`comm` is truncated to 15 bytes, so both are matched on their
+    /// stable prefix.)
+    fn dial_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("task dir")
+            .filter(|e| {
+                let Ok(e) = e else { return false };
+                std::fs::read_to_string(e.path().join("comm"))
+                    .is_ok_and(|c| c.starts_with("CAC-connect") || c.starts_with("CAC-dial"))
+            })
+            .count()
+    }
+
+    /// The bound the dial seam owes the target: **N dial attempts must not
+    /// cost N threads.**
+    ///
+    /// Every `std::thread` leaks 128 B permanently on RTEMS — its TLS key is
+    /// freed before the key's destructor runs — so the cost that matters is
+    /// thread *creations*, not threads alive. `run_nameserver_connection`
+    /// redials a failed address every `EPICS_CA_CONN_TMO` (30 s) for as long
+    /// as the IOC runs, which is C's own cadence; under a per-attempt dial
+    /// thread that is a leak with no ceiling.
+    ///
+    /// **The 200 ms bound below is the test's, not the client's.** R7-19
+    /// (`connect_deadline_tests::tcp_connect_has_no_application_level_deadline`)
+    /// is the standing rule that the *client* imposes no deadline on a
+    /// connect, and this change does not touch it. The bound is here only to
+    /// make the attempts sequential: without one a blackholed CA dial never
+    /// resolves, so there would be no "next attempt" to count.
+    ///
+    /// The dials are aimed at a blackhole rather than at a refused port for a
+    /// reason that is easy to get wrong. The production leak path — a name
+    /// server that is *down* — refuses instantly, and a per-attempt thread
+    /// serving it exits before this test could sample `/proc`, so counting
+    /// live threads there would report ~0 and pass on the broken code. Under
+    /// a blackhole every per-attempt thread is still pinned under the OS
+    /// connect ladder and is countable, which makes the creation count
+    /// observable by proxy.
+    ///
+    /// Fails on the per-attempt shape (12 live `CAC-connect` threads, one per
+    /// attempt); passes on the pool (at most `MAX_DIAL_WORKERS`, and past the
+    /// first four every further attempt queues).
+    #[test]
+    fn sequential_unanswered_dials_do_not_grow_the_dial_thread_count() {
+        // Long enough to outgrow the bound it asserts, whatever the bound is
+        // set to.
+        const DIALS: usize = MAX_DIAL_WORKERS * 3;
+
+        let (addr, _listener, _fillers) = syn_blackhole();
+        let before = dial_threads();
+
+        for i in 0..DIALS {
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    epics_base_rs::runtime::task::timeout(
+                        Duration::from_millis(200),
+                        dial_blocking(addr),
+                    )
+                    .await
+                    .is_err(),
+                );
+            });
+            let timed_out = rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap_or_else(|e| panic!("attempt {i} must resolve at the test's bound: {e}"));
+            assert!(
+                timed_out,
+                "attempt {i} toward a blackhole must still be in the OS's \
+                 hands at the test's 200 ms bound"
+            );
+        }
+
+        let after = dial_threads();
+        assert!(
+            after <= before + MAX_DIAL_WORKERS,
+            "{DIALS} sequential dial attempts created {} dial threads (from \
+             {before} to {after}); the dial seam must borrow from a bounded \
+             set of at most {MAX_DIAL_WORKERS} permanent workers, not create \
+             one per attempt — on RTEMS each creation leaks 128 B that is \
+             never returned",
+            after - before
+        );
+    }
+
+    /// Boundary: an abandoned dial leaks no socket, and costs no worker.
+    ///
+    /// A caller that goes away mid-dial leaves the pool in one of exactly two
+    /// states, and **both are correct** — which is why this test branches
+    /// rather than assuming one of them:
+    ///
+    /// * the worker was already inside its `connect`, so a socket exists and
+    ///   the worker must be its single finalizer — its send to the dropped
+    ///   receiver fails and the fresh socket is dropped, and closed, before
+    ///   it takes its next request;
+    /// * the worker only reached the request *after* the caller had gone, saw
+    ///   `Sender::is_closed()` and skipped the connect, so no socket was ever
+    ///   opened.
+    ///
+    /// An earlier draft asserted the first unconditionally and hung under a
+    /// loaded suite roughly half the time: between the single `poll` and the
+    /// `drop` this test does a `/proc` scan, which is milliseconds of window
+    /// for the worker to not yet have popped the request, and the blocking
+    /// `accept` then waited forever for a connection that was correctly never
+    /// made. Which branch is taken is genuinely a scheduling race, so it is
+    /// the assertion that has to accommodate it — not a sleep.
+    ///
+    /// The worker itself deliberately does *not* retire either way; that is
+    /// the bound. So the tail asserts the stronger property unconditionally:
+    /// the same worker goes on to serve the next dial.
+    #[test]
+    fn abandoned_dial_leaks_no_socket_and_returns_its_worker() {
+        use std::future::Future;
+
+        let (addr, listener, fillers) = syn_blackhole();
+        let mut fut = Box::pin(dial_blocking(addr));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // The first poll submits the dial and parks on the oneshot.
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "a dial toward a blackhole must be pending, not resolved on the \
+             caller's thread"
+        );
+        // Read the pool's own count, not `/proc`. A thread's OS name is set by
+        // the *child* — `std`'s `Builder::name` is applied inside the spawned
+        // closure — so between `pthread_create` returning to `dial()` and the
+        // worker's first instruction the thread exists under its parent's
+        // `comm` and `dial_threads()` reports 0. `dial()` runs to completion
+        // inside this very poll, so that window is exactly where the sample
+        // below falls, and under a loaded suite the child loses the race often
+        // enough to fail the run. `worker_count()` is incremented under the
+        // pool's lock on *this* thread before `dial()` returns, so it states
+        // the same fact — one worker now owns this connect — with no dependency
+        // on when the child is scheduled.
+        assert_eq!(
+            CA_DIAL_POOL.worker_count(),
+            1,
+            "the first poll must have handed the connect to a dial worker"
+        );
+
+        // The caller goes away mid-dial.
+        drop(fut);
+
+        // Un-blackhole: drain the fillers so that, if the worker did enter its
+        // connect, the abandoned dial's SYN retry (~1 s, ~3 s) completes.
+        for _ in 0..fillers.len() {
+            let _ = listener.accept().expect("drain a filler");
+        }
+        drop(fillers);
+
+        // `accept` honours `SO_RCVTIMEO` on Linux, so this is the branch
+        // discriminator: a connection means the worker was mid-connect, and
+        // `WouldBlock` past the SYN ladder's first two retries means it
+        // skipped. Either way nothing may be left open.
+        listener
+            .set_read_timeout(Some(Duration::from_secs(6)))
+            .expect("accept timeout");
+        match listener.accept() {
+            Ok((ours, _)) => {
+                let ours: std::net::TcpStream = ours.into();
+                ours.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
+                assert_eq!(
+                    n, 0,
+                    "the worker was inside its connect, so it owns the socket \
+                     it opened and must close it once its receiver is gone"
+                );
+            }
+            Err(e) if epics_base_rs::runtime::blocking_io::is_socket_timeout(e.kind()) => {
+                // The worker reached the request after the caller had gone and
+                // skipped the connect: no socket was opened, so there is none
+                // to finalise.
+            }
+            Err(e) => panic!("accept on the abandoned dial: {e}"),
+        }
+
+        // …and it is back in service rather than retired: the next dial is
+        // served without a second thread being created.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live_addr = live.local_addr().expect("addr");
+        let acceptor = std::thread::spawn(move || live.accept().expect("accept").0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        epics_base_rs::runtime::task::spawn(async move {
+            let _ = tx.send(dial_blocking(live_addr).await.is_some());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(6))
+                .expect("the next dial must resolve"),
+            "a dial to a live listener must succeed"
+        );
+        assert_eq!(
+            dial_threads(),
+            1,
+            "the worker that finalised the abandoned socket must serve the \
+             next dial, not be replaced by a fresh thread"
+        );
+        drop(acceptor.join().expect("acceptor"));
+    }
+}
+
 #[cfg(test)]
 mod priority_circuit_tests {
     //! priority is part of the virtual-circuit identity. Two
@@ -3901,12 +5004,17 @@ mod priority_circuit_tests {
     //! message carries the priority in its `m_dataType` field, and
     //! tearing one priority circuit down leaves the other connected.
     use super::*;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use crate::client::types::{InFlightOps, ServerLastRxAt};
     use crate::protocol::{CA_PROTO_VERSION, CaHeader};
+    #[cfg(not(feature = "rtems-exec-model"))]
     use std::collections::HashMap;
     use std::sync::Arc;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use std::time::Duration;
+    #[cfg(not(feature = "rtems-exec-model"))]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(not(feature = "rtems-exec-model"))]
     use tokio::net::{TcpListener, TcpStream};
 
     /// Identity slot resolved from this process's env — the same source
@@ -4004,6 +5112,8 @@ mod priority_circuit_tests {
     /// Spawn a transport manager wired to fresh channels; return its
     /// command sender, event receiver, and the (observable) per-circuit
     /// writer registry.
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn spawn_manager() -> (
         mpsc::UnboundedSender<TransportCommand>,
         mpsc::UnboundedReceiver<TransportEvent>,
@@ -4046,6 +5156,8 @@ mod priority_circuit_tests {
     /// because the test shares this process's USER/host env) leaves the
     /// socket positioned at the next frame, so a later read observes
     /// genuinely new traffic rather than buffered handshake bytes.
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn drain_handshake(stream: &mut TcpStream) -> u8 {
         let mut head = [0u8; 16];
         stream
@@ -4064,6 +5176,8 @@ mod priority_circuit_tests {
         pri
     }
 
+    // Only the gated async circuit tests use this.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn wait_for_writers(sw: &DirectServerWriters, n: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sw.len() < n {
@@ -4079,6 +5193,9 @@ mod priority_circuit_tests {
     /// Test 1: two channels to the same server at different priorities
     /// open two independent transport circuit entries, and the server
     /// sees both priorities on the wire.
+    // Spawns the async circuit manager, which has no tokio reactor
+    // under `rtems-exec-model`; same reason as `server_connection_drop_tests`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_priorities_open_two_circuits() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4143,6 +5260,9 @@ mod priority_circuit_tests {
     /// Test 3: dropping one priority circuit closes only that circuit;
     /// the sibling circuit at another priority stays connected and keeps
     /// carrying frames.
+    // Spawns the async circuit manager, which has no tokio reactor
+    // under `rtems-exec-model`; same reason as `server_connection_drop_tests`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_one_priority_circuit_leaves_the_other() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4245,6 +5365,235 @@ mod priority_circuit_tests {
     }
 }
 
+// Host/tokio-only: drives the real `run_transport_manager`, which spawns its
+// per-circuit tasks with `tokio::spawn` and has no reactor under
+// `rtems-exec-model` (same reason as `priority_circuit_tests`' async cases).
+#[cfg(all(test, not(feature = "rtems-exec-model")))]
+mod circuit_retirement_tests {
+    //! The wedge measured on the RTEMS target (topology-B, an 11-minute
+    //! upstream outage, `~/rtems-bringup/topoB/wedge-fd3-*`): a data circuit's
+    //! socket was killed by a SLIRP-forged RST after it had sent CREATE_CHAN,
+    //! and it was never retired for the whole outage — leaked as a zombie fd
+    //! (mode 0140000, peer=none/ENOTCONN) while the name-service circuit
+    //! redialed normally.
+    //!
+    //! Root cause, host-reproducible here: `run_transport_manager` retired a
+    //! dead `ServerConnection` only lazily, at the next `CreateChannel`. That
+    //! reconnect never arrives during a prolonged outage — the search that
+    //! would produce it is itself blocked on the also-down name-service
+    //! circuit — so the dead circuit, its pump tasks and its socket lingered.
+    //!
+    //! Invariant: an established circuit MUST be retired the moment either of
+    //! its pumps exits, through the manager (its single owner), independent of
+    //! any later `CreateChannel`.
+    use super::*;
+    use crate::client::types::{InFlightOps, ServerLastRxAt};
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The fake server's listener, used only by a `std::thread` peer — so it
+    /// is born a `std` listener, blocking from birth. It used to be a tokio
+    /// listener converted with `into_std()` + `set_nonblocking(false)`; on
+    /// Windows that conversion does not return the socket to blocking mode
+    /// (measured, PR #56 CI 2026-07-24: the peer's `accept` failed
+    /// WSAEWOULDBLOCK on a listener this test believed it had made blocking).
+    fn std_listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    fn spawn_manager() -> (
+        mpsc::UnboundedSender<TransportCommand>,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        DirectServerWriters,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let in_flight = InFlightOps::new();
+        let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
+        let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
+        let observable = server_writers.clone();
+        let identity = Arc::new(parking_lot::RwLock::new(
+            crate::client::types::ClientIdentity::from_env(),
+        ));
+        #[cfg(not(feature = "experimental-rust-tls"))]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+            identity,
+        ));
+        #[cfg(feature = "experimental-rust-tls")]
+        tokio::spawn(run_transport_manager(
+            cmd_rx,
+            event_tx,
+            in_flight,
+            server_writers,
+            last_rx_at,
+            identity,
+            None,
+            None,
+            std::collections::HashMap::new(),
+        ));
+        (cmd_tx, event_rx, observable)
+    }
+
+    /// Accept one client, drain its handshake + CREATE_CHAN, then force an RST
+    /// with `SO_LINGER 0` — the forged-RST-after-establish shape libslirp
+    /// produced on the box, reproduced locally with a real socket.
+    fn accept_then_rst_after_create_chan(listener: std::net::TcpListener) {
+        let (sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        // The client's handshake is 80 bytes here (VERSION + CLIENT_NAME +
+        // HOST_NAME for this process's identity); wait until CREATE_CHAN's
+        // 16-byte header is also in before killing the socket.
+        for _ in 0..8 {
+            match (&sock).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= 80 + 16 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let s2 = socket2::Socket::from(sock);
+        s2.set_linger(Some(Duration::ZERO)).expect("SO_LINGER 0");
+        drop(s2);
+    }
+
+    /// Wait for `ServerConnected` (establishment) and `TcpClosed` (death) on
+    /// the event stream, then poll the writer map for retirement. Shared by
+    /// both cases. Returns `(established, saw_closed, retired)`.
+    async fn observe_establish_close_retire(
+        event_rx: &mut mpsc::UnboundedReceiver<TransportEvent>,
+        sw: &DirectServerWriters,
+        circuit: CircuitKey,
+    ) -> (bool, bool, bool) {
+        let mut established = false;
+        let mut saw_closed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline && !(established && saw_closed) {
+            match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                Ok(Some(TransportEvent::ServerConnected { .. })) => established = true,
+                Ok(Some(TransportEvent::TcpClosed { .. })) => saw_closed = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        // Retirement: with NO reconnect CreateChannel sent, the writer entry
+        // must become absent on its own. Pre-fix it lingers until a later
+        // CreateChannel (which a prolonged outage never delivers) → this poll
+        // times out and `retired` stays false → the test fails, as it must on
+        // the pre-fix commit.
+        let retire_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < retire_by && sw.contains_key(&circuit) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let retired = !sw.contains_key(&circuit);
+        (established, saw_closed, retired)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rst_after_create_chan_retires_the_circuit_without_a_reconnect() {
+        let (std_listener, addr) = std_listener();
+
+        let (cmd_tx, mut event_rx, sw) = spawn_manager();
+
+        let l1 = std_listener.try_clone().unwrap();
+        let peer = std::thread::spawn(move || accept_then_rst_after_create_chan(l1));
+
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "WEDGE:PV".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+
+        let (established, saw_closed, retired) =
+            observe_establish_close_retire(&mut event_rx, &sw, (addr, 0)).await;
+        peer.join().unwrap();
+
+        assert!(
+            established,
+            "the circuit must establish (ServerConnected) before it can wedge"
+        );
+        assert!(saw_closed, "the RST must be classified as TcpClosed");
+        assert!(
+            retired,
+            "a circuit killed by a peer RST must be retired by the manager the \
+             moment its pump exits — not left registered until the next \
+             CreateChannel that a prolonged outage never delivers"
+        );
+    }
+
+    /// The owner path: a clean peer close (FIN, no lingering data) must retire
+    /// the circuit the same way — the death guard fires on the read pump's EOF
+    /// exit, not only on an RST. Guards against a fix that keyed on the RST
+    /// error specifically rather than on "the pump exited".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clean_peer_close_also_retires_the_circuit() {
+        let (std_listener, addr) = std_listener();
+
+        let (cmd_tx, mut event_rx, sw) = spawn_manager();
+
+        let l1 = std_listener.try_clone().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = l1.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 4096];
+            // Establish fully first — drain handshake + CREATE_CHAN — so the
+            // circuit registers before we close; only then a plain FIN.
+            let mut total = 0usize;
+            for _ in 0..8 {
+                match (&sock).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        if total >= 80 + 16 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Plain FIN: drop without SO_LINGER.
+            drop(sock);
+        });
+
+        cmd_tx
+            .send(TransportCommand::CreateChannel {
+                cid: 1,
+                pv_name: "WEDGE:PV".into(),
+                server_addr: addr,
+                priority: 0,
+            })
+            .unwrap();
+
+        let (established, saw_closed, retired) =
+            observe_establish_close_retire(&mut event_rx, &sw, (addr, 0)).await;
+        peer.join().unwrap();
+
+        assert!(established, "the circuit must establish first");
+        assert!(saw_closed, "a clean close must be classified as TcpClosed");
+        assert!(
+            retired,
+            "a circuit whose peer closed cleanly must also be retired at once"
+        );
+    }
+}
+
 #[cfg(test)]
 mod conn_tmo_env_tests {
     //! Per-boundary coverage of `EPICS_CA_CONN_TMO` resolution (R15-16).
@@ -4312,6 +5661,392 @@ mod conn_tmo_env_tests {
                     "EPICS_CA_CONN_TMO={raw:?} must resolve to {want:?}"
                 );
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    //! Per-boundary coverage of [`next_frame`], the CA client's one TCP
+    //! framing step.
+    //!
+    //! These cases used to have no home. The rules lived twice — once in
+    //! `read_loop`, once inline in `client/search.rs::run_nameserver_connection`
+    //! — and each copy was only reachable through a live socket, so both were
+    //! tested (when at all) end to end through whichever circuit owned them.
+    //! That is exactly how the two copies drifted: the misaligned-postsize
+    //! close and the partial-extended-header wait were each fixed twice,
+    //! separately. One function, one boundary table, both callers.
+    //!
+    //! By boundary, not by scenario: the input is a byte prefix and the
+    //! interesting values are the lengths at which the answer changes —
+    //! 15/16 for the base header, 23/24 for the extended annex — plus the
+    //! alignment predicate on either header form.
+    use super::{Frame, FrameError, next_frame};
+    use crate::protocol::{CA_PROTO_SEARCH, CaHeader};
+
+    /// A 16-byte base header with the given raw `postsize`, no annex.
+    fn base_header(postsize: u16) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_SEARCH);
+        hdr.postsize = postsize;
+        hdr.to_bytes().to_vec()
+    }
+
+    /// A 24-byte extended header (`postsize == 0xFFFF`) declaring
+    /// `ext_postsize` payload bytes.
+    fn extended_header(ext_postsize: u32) -> Vec<u8> {
+        let mut buf = base_header(0xFFFF);
+        buf.extend_from_slice(&ext_postsize.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // extended count
+        buf
+    }
+
+    fn header_of(frame: Frame) -> (usize, usize) {
+        match frame {
+            Frame::Header {
+                hdr_size, body_len, ..
+            } => (hdr_size, body_len),
+            Frame::Incomplete => panic!("expected a parsed header, got Incomplete"),
+            Frame::Malformed(e) => panic!("expected a parsed header, got Malformed({e})"),
+        }
+    }
+
+    /// Boundary: 0..=15 bytes cannot name a message. Every length below the
+    /// base header is "read more", never a close — a TCP segment boundary in
+    /// the middle of a header is ordinary.
+    #[test]
+    fn under_a_base_header_is_incomplete_at_every_length() {
+        let full = base_header(0);
+        for n in 0..CaHeader::SIZE {
+            assert!(
+                matches!(next_frame(&full[..n]), Frame::Incomplete),
+                "{n} bytes is short of a 16-byte header and must be Incomplete"
+            );
+        }
+    }
+
+    /// The other side of that boundary: exactly 16 bytes with an empty body
+    /// is a whole message, and the body it declares is zero — so a caller
+    /// that adds `hdr_size + body_len` consumes 16 and no more.
+    #[test]
+    fn exactly_a_base_header_with_no_body_is_a_whole_message() {
+        assert_eq!(header_of(next_frame(&base_header(0))), (16, 0));
+    }
+
+    /// Boundary: `postsize == 0xFFFF` promises an 8-byte annex, so 16..=23
+    /// bytes are still "read more". This is the case a pure 16-byte parse
+    /// gets catastrophically wrong — it would read the sentinel as a literal
+    /// size and consume 65,540 bytes for a message whose true length is
+    /// `24 + payload`.
+    #[test]
+    fn a_partial_extended_annex_is_incomplete_not_malformed() {
+        let full = extended_header(8);
+        for n in CaHeader::SIZE..24 {
+            assert!(
+                matches!(next_frame(&full[..n]), Frame::Incomplete),
+                "{n} bytes is short of the 24-byte extended header and must be \
+                 Incomplete, not a close"
+            );
+        }
+        assert_eq!(header_of(next_frame(&full)), (24, 8));
+    }
+
+    /// The header is complete the moment its own bytes are present; the body
+    /// arriving later is the caller's business, not the framer's.
+    ///
+    /// This is the contract that lets one function serve both circuits: the
+    /// data circuit needs the length of a body it has not received yet (to
+    /// decide whether to drain it past `EPICS_CA_MAX_ARRAY_BYTES`), the
+    /// name-service circuit just waits. A framer that returned `Incomplete`
+    /// here could not serve the first caller at all.
+    #[test]
+    fn a_header_parses_before_its_body_arrives() {
+        let mut buf = base_header(64);
+        buf.extend_from_slice(&[0u8; 8]); // 8 of the 64 body bytes
+        assert_eq!(header_of(next_frame(&buf)), (16, 64));
+    }
+
+    /// C `tcpiiu.cpp::processIncoming:1198` closes the connection when
+    /// `m_postsize & 0x7 != 0`. Every unaligned value below 8 must reach that
+    /// close — rounding one of them up (the pre-fix `align8`) is what let a
+    /// hostile peer slide the framer into the middle of the next message.
+    #[test]
+    fn every_misaligned_base_postsize_is_malformed() {
+        for postsize in 1..8u16 {
+            match next_frame(&base_header(postsize)) {
+                Frame::Malformed(FrameError::MisalignedPayload(n)) => {
+                    assert_eq!(n as u16, postsize)
+                }
+                Frame::Header { body_len, .. } => {
+                    panic!("postsize={postsize} is misaligned but parsed as body_len={body_len}")
+                }
+                Frame::Incomplete => panic!("a whole 16-byte header is not Incomplete"),
+                Frame::Malformed(e) => panic!("wrong refusal for postsize={postsize}: {e}"),
+            }
+        }
+    }
+
+    /// The alignment rule applies to the *actual* payload size, so it must
+    /// still bite when that size came from the extended annex rather than
+    /// from the base header's `m_postsize`.
+    #[test]
+    fn a_misaligned_extended_postsize_is_malformed() {
+        assert!(matches!(
+            next_frame(&extended_header(12)),
+            Frame::Malformed(FrameError::MisalignedPayload(12))
+        ));
+        // The aligned neighbour on either side is accepted, so the assertion
+        // above is about alignment and not about the annex.
+        assert_eq!(header_of(next_frame(&extended_header(8))), (24, 8));
+        assert_eq!(header_of(next_frame(&extended_header(16))), (24, 16));
+    }
+
+    /// Walking a buffer of chained messages is what both callers actually do,
+    /// and the answer must be positional: the same bytes at a different
+    /// offset yield the same framing. Mixed base and extended forms, because
+    /// a stream that alternates is where a wrong `hdr_size` desyncs.
+    #[test]
+    fn chained_messages_are_consumed_one_at_a_time() {
+        let mut stream = Vec::new();
+        let mut expected = Vec::new();
+        for (hdr, body) in [(base_header(8), 8usize), (extended_header(16), 16)] {
+            expected.push(hdr.len() + body);
+            stream.extend_from_slice(&hdr);
+            stream.extend(std::iter::repeat_n(0u8, body));
+        }
+        stream.extend_from_slice(&base_header(0)[..7]); // a torn third header
+
+        let mut offset = 0;
+        let mut consumed = Vec::new();
+        loop {
+            match next_frame(&stream[offset..]) {
+                Frame::Header {
+                    hdr_size, body_len, ..
+                } => {
+                    let msg_len = hdr_size + body_len;
+                    assert!(offset + msg_len <= stream.len(), "body must be present");
+                    consumed.push(msg_len);
+                    offset += msg_len;
+                }
+                Frame::Incomplete => break,
+                Frame::Malformed(e) => panic!("well-formed chain refused: {e}"),
+            }
+        }
+        assert_eq!(consumed, expected);
+        assert_eq!(
+            stream.len() - offset,
+            7,
+            "the torn header must be left in the buffer for the next read"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recv_body_policy_tests {
+    //! Per-boundary coverage of [`RecvBodyPolicy`], the client's one
+    //! receive-side body limit — the body-policy half of the seam whose
+    //! framing half is `framing_tests` above, and shared by the same two
+    //! callers (`read_loop`, the name-service reader). The limit is injected
+    //! (`with_limit`) rather than read from `EPICS_CA_AUTO_ARRAY_BYTES` /
+    //! `EPICS_CA_MAX_ARRAY_BYTES`, because these run under a parallel test
+    //! runner and the environment is process-global.
+    use super::RecvBodyPolicy;
+    use std::net::SocketAddr;
+
+    fn peer() -> SocketAddr {
+        "127.0.0.1:5064".parse().unwrap()
+    }
+
+    /// `None` is C's default (`EPICS_CA_AUTO_ARRAY_BYTES=YES`): no body is
+    /// ever refused, whatever the header announces.
+    #[test]
+    fn no_limit_refuses_nothing() {
+        let mut policy = RecvBodyPolicy::with_limit(None);
+        assert!(!policy.refuses(peer(), 0));
+        assert!(!policy.refuses(peer(), usize::MAX));
+    }
+
+    /// Boundary: `body_len == limit` is admitted, `limit + 1` is refused —
+    /// C's `if (msgSize > maxBytes)` is strict (`tcpiiu.cpp:1269`), and a
+    /// refusal is sticky per message, not per circuit: the frame after a
+    /// refused one is judged on its own size.
+    #[test]
+    fn refusal_boundary_is_strictly_over_the_limit() {
+        let mut policy = RecvBodyPolicy::with_limit(Some(1024));
+        assert!(!policy.refuses(peer(), 1023));
+        assert!(!policy.refuses(peer(), 1024));
+        assert!(policy.refuses(peer(), 1025));
+        assert!(
+            !policy.refuses(peer(), 1024),
+            "an in-limit frame after a refused one must still be admitted"
+        );
+        assert!(
+            policy.refuses(peer(), 1025),
+            "refusal must not be one-shot — every over-limit frame is dropped"
+        );
+    }
+
+    /// Drain accounting at every boundary of `owed` vs the bytes on hand:
+    /// short reads keep draining, the exact read finishes clean, and an
+    /// over-read leaves the surplus at the head of the buffer for framing.
+    #[test]
+    fn drain_refused_accounts_exactly_at_every_boundary() {
+        // Nothing owed: a no-op that never signals "keep draining".
+        let mut policy = RecvBodyPolicy::with_limit(Some(8));
+        let mut acc = vec![1u8, 2, 3];
+        assert!(!policy.drain_refused(&mut acc));
+        assert_eq!(acc, [1, 2, 3]);
+
+        // owed > present: everything is swallowed and more is owed.
+        policy.owe(5);
+        let mut acc = vec![0u8; 3];
+        assert!(policy.drain_refused(&mut acc));
+        assert!(acc.is_empty());
+
+        // owed == present (the 2 remaining): swallowed, drain complete.
+        let mut acc = vec![0u8; 2];
+        assert!(!policy.drain_refused(&mut acc));
+        assert!(acc.is_empty());
+
+        // owed < present: only the owed prefix goes; the surplus is the next
+        // message's bytes and must survive for the framer.
+        policy.owe(2);
+        let mut acc = vec![9u8, 9, 7, 7];
+        assert!(!policy.drain_refused(&mut acc));
+        assert_eq!(acc, [7, 7], "surplus bytes belong to the next frame");
+    }
+}
+
+#[cfg(test)]
+mod runtime_seam_guard {
+    //! The CA circuit path must reach the runtime only through the seam.
+    //!
+    //! This module is the CA-client twin of `calink`'s
+    //! `calink_production_spawns_go_through_the_runtime_seam` and of the two
+    //! PVA/pvalink timer guards, and it exists because those guards had a
+    //! hole this file fell straight through. Stage C3 pinned *spawns*; the
+    //! pvalink stage-5 measurement then found that a task moved onto the
+    //! callback pool takes its **timers** with it and grew a timer half. Two
+    //! shapes were still unpinned here, and the target found both
+    //! (`doc/calink-rtems-design.md` §11.1):
+    //!
+    //! * `tokio::task::JoinSet::spawn` — a fourth spelling of `tokio::spawn`,
+    //!   which no "no bare `tokio::spawn`" needle matches;
+    //! * `tokio::time::*` on `read_loop` / `write_loop`, the two pumps that
+    //!   run on *every* circuit on the target.
+    //!
+    //! Both panic at runtime, on the target, with a green `cargo check` and a
+    //! green host suite — the exact failure mode a source guard is for.
+
+    /// Production slice: everything before the first column-0 *inline* `mod`
+    /// (`mod name {`) — every one of which, in both files below, is a test
+    /// module. A column-0 `mod name;` declaration is not a boundary:
+    /// `client/mod.rs` opens with eight of them.
+    ///
+    /// NOT "the first `#[cfg(test)]`": `transport.rs` has a `#[cfg(test)]`
+    /// *fn* at column 0 near the top (`drained_socket_probe`), and cutting
+    /// there would shrink the slice past every line this guard exists to
+    /// cover. Nor "the first `#[cfg(test)] mod`", which silently skips a
+    /// module gated `#[cfg(all(test, …))]` and swallows it into the
+    /// production slice — a slice rule that *grows* the covered region when a
+    /// test module is gated is the wrong shape. Cutting at the `mod` line
+    /// itself is invariant to which attribute precedes it. The MUST_CONTAIN
+    /// anchors below fail closed if this ever slips again.
+    fn production(src: &'static str) -> &'static str {
+        let mut off = 0usize;
+        for line in src.split_inclusive('\n') {
+            if line.starts_with("mod ") && line.trim_end().ends_with('{') {
+                return &src[..off];
+            }
+            off += line.len();
+        }
+        src
+    }
+
+    /// Every file the target actually runs on a callback band, each with the
+    /// anchors its production slice must still contain. The anchors are two
+    /// kinds at once and deliberately so: structural ones (`async fn
+    /// read_loop`) make a slice rule that silently shrinks fail here instead
+    /// of passing vacuously, and seam ones (`runtime::task::TaskSet`) assert
+    /// the positive — that this path reaches the runtime *through* the seam,
+    /// not merely that it avoids the banned spellings by having no timers at
+    /// all.
+    const TARGET_LIVE: [(&str, &str, &[&str]); 2] = [
+        (
+            // The transport manager plus both circuit pumps: one instance of
+            // each per virtual circuit, all on `cbMedium` on the target.
+            "client/transport.rs",
+            include_str!("transport.rs"),
+            &[
+                "async fn run_transport_manager",
+                "async fn read_loop",
+                "async fn write_loop",
+                concat!("runtime::task", "::TaskSet"),
+                concat!("runtime::task", "::sleep_until("),
+            ],
+        ),
+        (
+            // Every channel operation's round-trip bound. Target finding 2
+            // (`doc/calink-rtems-design.md` §11.2): four `cbMedium` panics
+            // from `tokio::time::timeout` in the channel read path, which the
+            // transport-only guard could not see.
+            "client/mod.rs",
+            include_str!("mod.rs"),
+            &[
+                "impl CaChannel {",
+                concat!("runtime::task", "::timeout("),
+                concat!("runtime::task", "::timeout_at("),
+            ],
+        ),
+    ];
+
+    /// Drop whole-line comments, so the prose *explaining* why a shape is
+    /// banned cannot itself trip the check. Trailing comments are kept —
+    /// dropping them would need to parse string literals, and a needle in a
+    /// trailing comment is a false positive worth taking over a false
+    /// negative in code.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("*/") || t.starts_with("* "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn circuit_path_reaches_the_runtime_only_through_the_seam() {
+        for (label, src, must_contain) in TARGET_LIVE {
+            let code = code_only(production(src));
+
+            for anchor in must_contain {
+                assert!(
+                    code.contains(anchor),
+                    "{label}: production slice no longer contains `{anchor}`; either \
+                     the slice rule broke before this guard could check anything, or \
+                     this path stopped reaching the runtime through the seam"
+                );
+            }
+
+            // Negative: no shape that needs a tokio runtime survives on the
+            // target-live path. Each of these compiles fine for
+            // `armv7-rtems-eabihf` and panics the callback-band worker at
+            // runtime.
+            for needle in [
+                concat!("tokio::task", "::JoinSet"),
+                concat!("tokio::time", "::"),
+                concat!("tokio", "::spawn("),
+            ] {
+                assert_eq!(
+                    code.matches(needle).count(),
+                    0,
+                    "{label} must not name `{needle}`: on the RTEMS target this file \
+                     runs on a callback band with no tokio runtime in the process, \
+                     and the failure is a runtime panic on the target, not a build \
+                     error"
+                );
+            }
         }
     }
 }

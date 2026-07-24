@@ -39,7 +39,7 @@ use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 
 /// Opaque proof that an access-level lookup has been performed for
 /// a CA channel (SID). Construction is via
-/// [`crate::server::tcp::ClientState::lookup_access`] only; the
+/// `crate::server::tcp::ClientState::lookup_access` only; the
 /// private `_seal` field blocks external struct-literal builds.
 #[derive(Debug, Clone, Copy)]
 pub struct CaAccessChecked {

@@ -15,6 +15,9 @@
 //! Public API stays compatible with the previous shape so existing callers
 //! (pvget-rs, pvput-rs, pvmonitor-rs, pvinfo-rs) keep working.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,10 +31,10 @@ use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get, op_get_get, op_get_put,
-    op_monitor, op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
-    op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request,
-    op_process_with_request_value, op_put, op_put_get, op_rpc,
+    MonitorConnEvent, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
+    op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
+    op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
+    op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
 use super::search_engine::{ClientSearchConfig, SearchEngine};
 
@@ -506,12 +509,17 @@ pub enum CacheAction {
 /// searches are held only by an awaiting caller's `oneshot` receiver), so
 /// dropping it here cannot orphan engine state.
 async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration) {
-    let mut tick = tokio::time::interval(period);
+    // Through the seam so this loop runs on the RTEMS callback band as well as
+    // the tokio runtime (stage 3). The seam ticker is `MissedTickBehavior::
+    // Burst`, not `Delay`; for a periodic cache sweeper the two differ only in
+    // how a *missed* deadline is made up (Burst fires the backlog immediately,
+    // Delay spreads it) and the work is idempotent — an extra sweep removes
+    // nothing a later one would have — so the distinction is immaterial here.
+    let mut tick = epics_base_rs::runtime::task::interval(period);
     // pvxs arms the timer with `event_add(cacheCleaner, &channelCacheCleanInterval)`
     // (client.cpp:666), i.e. the first sweep fires after one interval, not at
     // startup. Consume the immediate first tick so the first real sweep is one
     // `period` away.
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tick.tick().await;
@@ -736,7 +744,7 @@ impl PvaClient {
         // `Weak<ClientInner>` and is spawned inside the Tokio runtime that
         // every channel op already runs in; `Once` guarantees a single task.
         self.inner.cache_cleaner.call_once(|| {
-            tokio::spawn(cache_clean_loop(
+            epics_base_rs::runtime::task::spawn(cache_clean_loop(
                 Arc::downgrade(&self.inner),
                 CHANNEL_CACHE_CLEAN_INTERVAL,
             ));
@@ -1661,13 +1669,19 @@ impl PvaClient {
     /// `pva_gateway` uses this to forward downstream watermark events
     /// into upstream pipeline-pause control msgs without an
     /// intermediate decode/encode cycle.
-    pub async fn pvmonitor_raw_frames_handle<F>(
+    ///
+    /// `on_conn` carries the subscription's connection-state transitions —
+    /// the only sanctioned source of upstream connect/disconnect for a
+    /// handle monitor (see [`MonitorConnEvent`]).
+    pub async fn pvmonitor_raw_frames_handle<F, C>(
         &self,
         pv_name: &str,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_raw_frames_handle(
@@ -1675,6 +1689,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1689,14 +1704,16 @@ impl PvaClient {
     /// correct). pvxs `p2pApp/channel.cpp:157-193` forwards the
     /// serialized downstream pvRequest; `moncache.cpp:34-37` caches one
     /// upstream monitor per distinct request.
-    pub async fn pvmonitor_raw_frames_handle_with_request<F>(
+    pub async fn pvmonitor_raw_frames_handle_with_request<F, C>(
         &self,
         pv_name: &str,
         pv_request: crate::pvdata::PvField,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_raw_frames_handle_with_request(
@@ -1704,6 +1721,7 @@ impl PvaClient {
             pv_request,
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1771,13 +1789,19 @@ impl PvaClient {
     /// for stats. Mirrors pvxs `Context::monitor(name).exec()` →
     /// `Subscription`. The returned handle owns the inner task; call
     /// `stop()` to terminate or drop after `stop()` returns.
-    pub async fn pvmonitor_handle<F>(
+    ///
+    /// `on_conn` carries the subscription's connection-state transitions —
+    /// the only sanctioned source of upstream connect/disconnect for a
+    /// handle monitor (see [`MonitorConnEvent`]).
+    pub async fn pvmonitor_handle<F, C>(
         &self,
         pv_name: &str,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, &PvField) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         Ok(op_monitor_handle(
@@ -1785,6 +1809,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -1792,14 +1817,16 @@ impl PvaClient {
     /// pvxs `MonitorBuilder::server(addr).exec()`. The handle owns its
     /// own per-call channel — it does not affect the shared cache for
     /// `pv_name`.
-    pub async fn pvmonitor_handle_from<F>(
+    pub async fn pvmonitor_handle_from<F, C>(
         &self,
         pv_name: &str,
         server: SocketAddr,
         callback: F,
+        on_conn: C,
     ) -> PvaResult<SubscriptionHandle>
     where
         F: FnMut(&FieldDesc, &PvField) + Send + 'static,
+        C: FnMut(MonitorConnEvent) + Send + 'static,
     {
         let ch = self.channel_with_forced(pv_name, Some(server)).await?;
         Ok(op_monitor_handle(
@@ -1807,6 +1834,7 @@ impl PvaClient {
             &[],
             self.inner.pipeline_size,
             callback,
+            on_conn,
         ))
     }
 
@@ -2639,7 +2667,7 @@ impl PvaClient {
             if failed_warm.contains(&wi) {
                 continue;
             }
-            let frame_res = tokio::time::timeout(op_timeout, rx).await;
+            let frame_res = epics_base_rs::runtime::task::timeout(op_timeout, rx).await;
             let value = match frame_res {
                 // Decode with no shared cache. The reader side
                 // (`flatten_type_cache_markers`) has already flattened every
@@ -2985,7 +3013,7 @@ impl<'a> ConnectBuilder<'a> {
         // held under the cancel select, so dropping the handle stops it.
         let ch_drive = ch.clone();
         let cancel_drive = cancel.clone();
-        let driver = tokio::spawn(async move {
+        let driver = epics_base_rs::runtime::task::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -3008,7 +3036,7 @@ impl<'a> ConnectBuilder<'a> {
             }
         });
 
-        let task = tokio::spawn(async move {
+        let task = epics_base_rs::runtime::task::spawn(async move {
             // pvxs invokes the initial callback right after building the
             // channel: `onConnect` if already active, otherwise
             // `onDisconnect` once (client.cpp:274-282). A fresh channel
@@ -3114,7 +3142,7 @@ impl<'a> ConnectBuilder<'a> {
 ///   [`ConnectHandle::wait`].
 pub struct ConnectHandle {
     cancel: tokio_util::sync::CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<epics_base_rs::runtime::task::TaskHandle<()>>,
     /// Teardown mode selected by [`ConnectBuilder::sync_cancel`]; consulted
     /// only by `Drop` (an explicit `wait()` is always synchronous).
     sync_cancel: bool,
@@ -3400,6 +3428,11 @@ mod tests {
     /// which guards the same invariant at the `ensure_active` layer; this
     /// guards that the public `context.rs` one-shot APIs actually route
     /// through the op-timeout owner rather than bare `ensure_active`.
+    // Drives a search that never resolves and asserts the op-timeout owner
+    // fires; the search engine's spawned tick `interval` now runs on the
+    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     async fn pva_fr_12_one_shot_ops_fail_at_op_timeout_not_hang() {
         use std::time::Duration;
@@ -3528,7 +3561,7 @@ mod tests {
         let reached_end = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let flag = reached_end.clone();
                 let c = cancel.clone();
                 async move {
@@ -3559,7 +3592,7 @@ mod tests {
         let did_complete = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let flag = did_complete.clone();
                 async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3598,7 +3631,7 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let g = gate.clone();
                 let s = started.clone();
                 let f = finished.clone();
@@ -3632,7 +3665,7 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(tokio::spawn({
+            task: Some(epics_base_rs::runtime::task::spawn({
                 let c = cancel2.clone();
                 let d = done.clone();
                 async move {

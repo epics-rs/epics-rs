@@ -14,6 +14,8 @@
 //! because the OUT write and its event are both suppressed (C execOutput
 //! `nsev >= INVALID` → `break`, no `postEvent`).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,13 +65,12 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         .await
         .unwrap();
     {
-        let r = db.get_record(name).await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record(name).unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = evnt.to_string();
     }
-    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
+    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
 
 /// Poll until `cond` holds — the OEVT post is spawned (like
@@ -143,8 +144,8 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     // Precondition: INVALID cycle, and output WOULD be due — so only the IVOA
     // gate stands between OEVT and the post.
     {
-        let rec = db.get_record("CALC_DD").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("CALC_DD").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.common.sevr,
             AlarmSeverity::Invalid,

@@ -14,6 +14,9 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -21,7 +24,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command as TokioCommand};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -367,7 +370,7 @@ async fn pvxs_pvxget_against_rust_server_under_burst_load() {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }

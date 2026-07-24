@@ -24,7 +24,7 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
 /// record has no MDEL/ADEL deadband, matching C's pure
 /// `strncmp(oval, val)` test.
 ///
-/// B<Deprecated> in upstream EPICS (slated for removal in EPICS 7.1; replace
+/// **Deprecated** in upstream EPICS (slated for removal in EPICS 7.1; replace
 /// with a `stringin`). C `init_record` pass 0 prints a deprecation warning;
 /// the port mirrors it in [`Record::init_record`].
 pub struct StateRecord {

@@ -21,6 +21,8 @@
 //! accumulates across cycles; it is visible to the second pass of the same
 //! cycle (calcout CALC → OCAL, transform channel → channel).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -67,7 +69,7 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn f64_of(db: &PvDatabase, pv: &str) -> f64 {
-    db.get_pv(pv).await.unwrap().to_f64().unwrap()
+    db.get_pv(pv).unwrap().to_f64().unwrap()
 }
 
 /// Compiled softIoc, `record(calc)` with `CALC="A:=A+1;A"`, 3 × PROC:
@@ -128,7 +130,7 @@ async fn scalcout_stores_both_the_numeric_and_the_string_arg() {
     process(&db, "C:SCALC").await;
     assert_eq!(f64_of(&db, "C:SCALC.A").await, 1.0, "`A:=A+1` writes A");
     assert_eq!(
-        db.get_pv("C:SCALC.AA").await.unwrap(),
+        db.get_pv("C:SCALC.AA").unwrap(),
         EpicsValue::String("hit".into()),
         "`AA:='hit'` writes the string arg AA (C strncpy into psarg[0])"
     );

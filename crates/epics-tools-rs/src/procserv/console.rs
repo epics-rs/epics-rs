@@ -168,6 +168,10 @@ impl ConsoleStream {
         // SAFETY: fd 0 is a valid fd for the lifetime of the process;
         // `try_clone_to_owned` dups it, so the threads keep working even
         // if something later replaces fd 0.
+        // NOT RTEMS-SAFE if this crate is ever built for RTEMS: `F_DUPFD`
+        // there calls the file's `open_h` (`libcsupport/src/fcntl.c:47-77`).
+        // A console fd survives that; a libbsd SOCKET does not — see
+        // `epics-ca-rs/src/server/blocking.rs::handle_client_blocking`.
         let fd: Arc<OwnedFd> =
             Arc::new(unsafe { BorrowedFd::borrow_raw(CONSOLE_FD) }.try_clone_to_owned()?);
 

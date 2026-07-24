@@ -2,7 +2,7 @@
 //!
 //! Tracks which `(server, guid)` incarnations have been seen so the search
 //! engine can de-duplicate `Discovered` events and pace reconnect pokes.
-//! Bounded by [`BEACON_TRACK_LIMIT`] and aged out by [`prune_stale`].
+//! Bounded by `BEACON_TRACK_LIMIT` and aged out by [`BeaconTracker::prune_stale`].
 //!
 //! Note: there is intentionally **no** per-server GUID-change suppression.
 //! pvxs treats a GUID change as a `Change` and pokes pending searches

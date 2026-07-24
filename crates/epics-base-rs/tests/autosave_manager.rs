@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -178,7 +180,7 @@ async fn test_restore_all() {
     assert_eq!(result.restored, 1);
 
     // Verify value was restored
-    match db.get_pv("TEMP").await.unwrap() {
+    match db.get_pv("TEMP").unwrap() {
         EpicsValue::Double(v) => assert!((v - 99.9).abs() < 1e-10),
         other => panic!("expected Double, got {:?}", other),
     }

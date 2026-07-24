@@ -18,7 +18,7 @@
 //! (carried over from C macro syntax) silently stripped. Empty payload
 //! is treated as "unknown env var" and produces an empty VAL with a
 //! UDF_ALARM. Supported record types: `stringin`, `lsi`. Anything
-//! else returns an [`UnsupportedRecord`](epics-base style) error and
+//! else returns an `UnsupportedRecord` (epics-base style) error and
 //! flags the record alarm.
 //!
 //! The env-var name comes from the record's INST_IO `INP`, which only the

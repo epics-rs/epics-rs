@@ -16,6 +16,13 @@
 //! first element is checked rather than the exact length so the
 //! assertion is robust to any requested-count padding on the wire.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::time::Duration;
 
 use epics_base_rs::server::records::waveform::WaveformRecord;

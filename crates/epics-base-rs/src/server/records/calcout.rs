@@ -424,24 +424,22 @@ impl CalcoutRecord {
         // still loading (so a forward-referenced target is LOCAL, and the
         // status is final when `iocInit` returns), spawned at once once the
         // database is complete.
-        sched.schedule_record_init(async move {
-            // Let `add_record` finish registering this record before the init
-            // post (this task may be spawned from `set_async_context`, which
-            // runs just before the record is inserted into the map).
-            tokio::task::yield_now().await;
+        // The parking key; `name` itself moves into the future below.
+        let init_key = name.clone();
+        sched.schedule_record_init(&init_key, async move {
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(22);
             for (i, link) in inputs.iter().enumerate() {
-                let (status, _ft) = classify_link(&handle, link, LinkRole::Input).await;
+                let (status, _ft) = classify_link(&handle, link, LinkRole::Input);
                 fields.push((
                     CALCOUT_INAV_FIELDS[i].to_string(),
                     EpicsValue::Enum(status as u16),
                 ));
             }
-            let (out_status, _ft) = classify_link(&handle, &out, LinkRole::Output).await;
+            let (out_status, _ft) = classify_link(&handle, &out, LinkRole::Output);
             fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
             // Publish only if no newer refresh was issued meanwhile.
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&name, fields).await;
+                let _ = handle.post_fields(&name, fields);
             }
         });
     }

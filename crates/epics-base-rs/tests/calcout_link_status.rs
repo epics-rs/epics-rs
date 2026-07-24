@@ -19,6 +19,8 @@
 //!     holds its `CON` default until the first process re-points it through
 //!     `check_alarms`.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -37,7 +39,7 @@ const CON: i16 = 3;
 /// equals `want`.
 async fn poll_status(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     for _ in 0..400 {
-        if let Ok(v) = db.get_pv(pv).await
+        if let Ok(v) = db.get_pv(pv)
             && v.to_f64().map(|f| f as i16) == Some(want)
         {
             return;
@@ -46,13 +48,12 @@ async fn poll_status(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     }
     panic!(
         "{label}: {pv} did not reach {want} before timeout (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
 async fn read_status(db: &PvDatabase, pv: &str) -> i16 {
     db.get_pv(pv)
-        .await
         .ok()
         .and_then(|v| v.to_f64())
         .map(|f| f as i16)

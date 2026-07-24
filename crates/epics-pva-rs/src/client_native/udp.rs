@@ -36,6 +36,9 @@
 //! destination, which is all the fan-out predicate needs. This keeps the
 //! receive core independent of the wire codec.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// (1 live-UDP recv_loop test gated out feature-ON below; §4.2 UDP search, stage 3.)
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -312,7 +315,7 @@ impl CollectorState {
         // the state, so it neither keeps the collector alive nor leaks the
         // socket: when the last handle drops, the next idle re-check (or the
         // post-datagram upgrade) fails and the task exits.
-        tokio::spawn(recv_loop(sock, is_v6, Arc::downgrade(&state)));
+        epics_base_rs::runtime::task::spawn(recv_loop(sock, is_v6, Arc::downgrade(&state)));
 
         Ok(state)
     }
@@ -1010,7 +1013,12 @@ mod tests {
     // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
     // `orig_dest == None` by construction (see `enable_recv_orig_dest`),
     // so the assertion is gated to the two that actually recover it.
+    // Binds a real `tokio::net` UDP socket and drives `recv_loop`, whose spawn
+    // now lands on the reactor-less callback pool under `rtems-exec-model`
+    // (§4.2 UDP search is deferred). Reactor-dependent — gated out feature-ON
+    // (stage 3).
     #[cfg(any(unix, windows))]
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wildcard_listener_receives_with_orig_dest() {
         let mgr = UdpManager::new();

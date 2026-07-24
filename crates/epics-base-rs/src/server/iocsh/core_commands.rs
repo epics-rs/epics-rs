@@ -8,6 +8,8 @@
 //! handled directly in `IocShell::execute_line` because they need
 //! the shell itself, not just a `CommandContext`.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use super::registry::*;
 
 /// Register the core iocsh command set on `registry`.

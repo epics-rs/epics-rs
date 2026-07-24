@@ -1,10 +1,27 @@
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
+// The bound-socket UDP responder stack (`socket2` shared-port setup, the
+// `tokio::net::UdpSocket` recv loops, the `epics_base_rs::net` RX-overflow
+// helpers) is the async host-only front-end. The RTEMS build answers SEARCH
+// through `server::blocking`'s `std::net` responder, reusing only the shared
+// decode/shape logic (`SearchReplyBatch`, `parse_search_datagram`,
+// `shape_search_reply_dg`) below. Those imports are gated out for RTEMS.
+#[cfg(not(target_os = "rtems"))]
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
+// `Ipv4Addr`, `Arc`, and `CaResult` are used only by the bound-socket responder
+// stack, which is host-only; the shared decode path uses `SocketAddr` only.
+#[cfg(not(target_os = "rtems"))]
+use std::net::Ipv4Addr;
+#[cfg(not(target_os = "rtems"))]
 use std::sync::Arc;
+#[cfg(not(target_os = "rtems"))]
 use tokio::net::UdpSocket;
 
 use crate::protocol::*;
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::error::CaResult;
+#[cfg(not(target_os = "rtems"))]
 use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
 
@@ -35,6 +52,7 @@ use epics_base_rs::server::database::PvDatabase;
 /// that produces an extra group-only responder. A wildcard
 /// interface is therefore the single owner of ordinary
 /// unicast/broadcast SEARCH traffic, matching C's `conf->udp`.
+#[cfg(not(target_os = "rtems"))]
 fn plan_responder_specs(
     intf_addrs: Vec<Ipv4Addr>,
     mcast_addrs: &[Ipv4Addr],
@@ -59,6 +77,7 @@ fn plan_responder_specs(
 /// datagrams in the kernel, so a SEARCH that arrives before
 /// `CaServer::run()` is polled is answered once the recv loop starts
 /// rather than dropped.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone)]
 pub struct BoundResponder {
     bind_ip: Ipv4Addr,
@@ -71,12 +90,14 @@ pub struct BoundResponder {
 }
 
 /// The UDP search responders of one server, all bound to one port.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Clone)]
 pub struct BoundUdp {
     responders: Vec<BoundResponder>,
     port: u16,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl BoundUdp {
     /// The UDP port every responder is bound to. With a requested port
     /// of 0 this is the ephemeral port the kernel chose — the value a
@@ -99,6 +120,7 @@ impl BoundUdp {
 /// clients are pointed at exactly one. This is the race-free way to
 /// take a port — a caller that probes for a free port first and passes
 /// the number can still lose it to another socket in between.
+#[cfg(not(target_os = "rtems"))]
 pub fn bind_udp_responders(
     port: u16,
     intf_addrs: Vec<Ipv4Addr>,
@@ -129,6 +151,7 @@ pub fn bind_udp_responders(
 ///
 /// `ignore_addrs` filters out source addresses that should never receive
 /// search replies (EPICS_CAS_IGNORE_ADDR_LIST).
+#[cfg(not(target_os = "rtems"))]
 pub async fn run_udp_search_responder(
     db: Arc<PvDatabase>,
     bound: BoundUdp,
@@ -166,6 +189,7 @@ pub async fn run_udp_search_responder(
     result
 }
 
+#[cfg(not(target_os = "rtems"))]
 fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
@@ -265,6 +289,7 @@ fn bind_single_responder(
     })
 }
 
+#[cfg(not(target_os = "rtems"))]
 async fn run_single_responder(
     db: Arc<PvDatabase>,
     responder: BoundResponder,
@@ -301,6 +326,7 @@ async fn run_single_responder(
 /// Build and configure the per-bind UDP socket. Centralised so the
 /// primary (interface IP) and secondary (interface broadcast addr)
 /// sockets share identical socket-option setup.
+#[cfg(not(target_os = "rtems"))]
 fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // This is a *datagram fanout* socket, so it mirrors libcom's
@@ -384,6 +410,323 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
 // `run_single_responder` now owns the joins for both specific and
 // wildcard interfaces, matching C.
 
+/// Cross-datagram accumulator for the UDP SEARCH responder: the reply
+/// batch under construction plus the per-datagram VERSION-echo state
+/// ([`shape_search_reply_dg`] consults both at flush time). Persisting it
+/// across [`parse_search_datagram`] calls lets a caller coalesce several
+/// same-source datagrams into one reply — C `cast_server.c:266-281` drains
+/// the recv queue (FIONREAD) into a single `cas_send_dg_msg`.
+#[derive(Default)]
+pub(crate) struct SearchReplyBatch {
+    /// One outbound datagram in progress. Byte 0 holds the seeded VERSION
+    /// placeholder; SEARCH replies are appended after it.
+    send_buf: Vec<u8>,
+    /// Client sequence captured from a leading VERSION with
+    /// `m_dataType == sequenceNoIsValid`; echoed in the reply VERSION.
+    client_seq: Option<u32>,
+    /// Largest VERSION minor seen this datagram; drives the CA_V411
+    /// keep/strip decision at flush time.
+    client_minor: Option<u16>,
+}
+
+impl SearchReplyBatch {
+    /// Shape the trailing (post-last-flush) batch into its on-wire bytes,
+    /// or `None` when empty. The blocking responder
+    /// (`crate::server::blocking`) calls this to emit the final datagram
+    /// after [`parse_search_datagram`] returns; the async responder does the
+    /// equivalent through [`flush_send_buf`]. Encapsulates the private batch
+    /// fields so the shaping stays in one place.
+    pub(crate) fn shape_trailing(&self) -> Option<Vec<u8>> {
+        shape_search_reply_dg(&self.send_buf, self.client_minor, self.client_seq)
+    }
+
+    /// Shape the current batch into its on-wire datagram (or `None` when
+    /// empty), then reset the batch to empty. The blocking responder
+    /// (`crate::server::blocking`) calls this to flush at a coalescing-group
+    /// boundary — a recv-queue drain (FIONREAD == 0), a peer change, or
+    /// shutdown — which is byte-equivalent to the async responder's
+    /// [`flush_send_buf`] (shape + `send_buf.clear()`) followed by the
+    /// peer-change `client_seq`/`client_minor` reset (`recv_loop`,
+    /// udp.rs:846-849). Resetting the whole batch keeps the invariant "a
+    /// non-empty batch's `client_*` echo state belongs to its own replies"
+    /// true by construction for the next group.
+    pub(crate) fn take_reply(&mut self) -> Option<Vec<u8>> {
+        let dg = self.shape_trailing();
+        *self = SearchReplyBatch::default();
+        dg
+    }
+}
+
+/// Parse one inbound UDP datagram's CA messages (VERSION + SEARCH),
+/// appending SEARCH-reply bytes to `batch`. This is the shared
+/// decode/respond core of the CA UDP name-search responder: the async
+/// reactor front-end ([`recv_loop`]) and the blocking thread-per-client
+/// front-end (`crate::server::blocking`, the RTEMS server) both call it,
+/// so a search reply is byte-identical on either path.
+///
+/// `batch` persists across calls so the caller can coalesce several
+/// same-source datagrams into one reply datagram (C FIONREAD drain). When
+/// the accumulated batch would exceed the ~1 KB UDP flush threshold, the
+/// current batch is shaped ([`shape_search_reply_dg`]) and pushed to
+/// `ready`, and a fresh batch is begun — mirroring `cas_copy_in_header`'s
+/// mid-batch flush (`caserverio.c:280-294`). The caller sends each `ready`
+/// datagram; the trailing `batch.send_buf` is shaped and sent when the
+/// caller's recv queue drains or the peer changes.
+///
+/// `lookup_src` is the datagram source threaded into `has_name_from` for
+/// host-scoped gateway `.pvlist` admission (C `pvExistTest`).
+///
+/// Contains no socket I/O: the only await is the database name lookup,
+/// which resolves on the first poll for a local record, so it is safe to
+/// drive under `park_on` on a runtime-less RTEMS thread.
+///
+/// C: `search_reply_udp` / `udp_version_action` (`rsrv/camessage.c`).
+pub(crate) async fn parse_search_datagram(
+    input: &[u8],
+    db: &PvDatabase,
+    tcp_port: u16,
+    lookup_src: SocketAddr,
+    batch: &mut SearchReplyBatch,
+    ready: &mut Vec<Vec<u8>>,
+) {
+    // match C's `MAX_UDP_SEND = 1024` (`caProto.h:66`).
+    // `cas_copy_in_header` (`caserverio.c:280-294`) flushes when the next
+    // message would push `stk > maxstk`, so C never builds a UDP reply
+    // datagram larger than ~1024 bytes. Third-party CA implementations
+    // (Java CAJ, asyncio-ca, embedded ports) may assume that contract and
+    // truncate the tail of larger replies. libca peers pre-allocate
+    // `recvBuf[MAX_UDP_RECV]` so they tolerate larger, but the wire-byte
+    // parity argument favors matching the C constant.
+    const UDP_FLUSH_THRESHOLD: usize = 1024;
+    let SearchReplyBatch {
+        send_buf,
+        client_seq,
+        client_minor,
+    } = batch;
+    let mut offset = 0;
+    while offset + CaHeader::SIZE <= input.len() {
+        let hdr = match CaHeader::from_bytes(&input[offset..]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+        // UDP path drops silently (no error response). Without this
+        // check, the `align8(postsize)` advancement would jump
+        // into the next message's body, mis-parsing chained
+        // SEARCH datagrams.
+        if (hdr.postsize as usize) & 0x7 != 0 {
+            break;
+        }
+        let payload_size = hdr.postsize as usize;
+        let msg_len = CaHeader::SIZE + payload_size;
+
+        if offset + msg_len > input.len() {
+            break;
+        }
+
+        // C UDP dispatcher (camessage.c:2505-2516) allows only
+        // udp_version_action (cmd 0) and search_reply_udp (cmd 6)
+        // to succeed. Every other cmd index in the udpJumpTable
+        // is bound to bad_udp_cmd_action which returns RSRV_ERROR
+        // — the dispatcher loop then `break`s out, dropping the
+        // rest of this datagram. Pre-fix Rust just advanced
+        // `offset` and parsed the next message regardless;
+        // a peer could chain a junk cmd before a SEARCH and the
+        // chained SEARCH would still be processed even though
+        // C IOC would have stopped parsing at the junk cmd.
+        //
+        // VERSION's UDP handler (udp_version_action, camessage.c:
+        // 2094-2110) is a no-op for the stateless Rust responder:
+        // it only stored per-client minor_version_number +
+        // seqNoOfReq in C; Rust doesn't track UDP-per-datagram
+        // state, so we just allow the VERSION header to pass and
+        // continue.
+        if hdr.cmmd != CA_PROTO_VERSION && hdr.cmmd != CA_PROTO_SEARCH {
+            break;
+        }
+        if hdr.cmmd == CA_PROTO_VERSION {
+            // C `udp_version_action` (rsrv/camessage.c:2094-2110)
+            // stores `pclient->seqNoOfReq = m_cid` and the version
+            // when the leading VERSION header marks the seq valid
+            // (`m_dataType == sequenceNoIsValid`, caProto.h:128).
+            // Capture it here so the SEARCH-reply branch can
+            // populate its VERSION echo and match
+            // `cas_send_dg_msg` byte-for-byte.
+            //
+            // C `udp_version_action` returns RSRV_ERROR on
+            // `!CA_VSUPPORTED(m_count)` and the UDP dispatcher
+            // breaks out of the current datagram on any non-OK
+            // status. Pre-fix Rust accepted any VERSION and
+            // happily kept parsing later messages in the same
+            // datagram — a malformed VERSION-first datagram could
+            // still elicit a Rust SEARCH reply where rsrv would
+            // have dropped the rest. Mirror C: bad version
+            // breaks the per-datagram parse.
+            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                break;
+            }
+            // track the largest VERSION minor seen so the
+            // flush-time placeholder strip/keep decision matches
+            // `CA_V411(minor_version_number)` regardless of
+            // whether the inbound's leading frame is VERSION,
+            // SEARCH, or chained.
+            *client_minor = Some(client_minor.unwrap_or(0).max(hdr.count));
+            if hdr.data_type == 1 {
+                *client_seq = Some(hdr.cid);
+            }
+        }
+        if hdr.cmmd == CA_PROTO_SEARCH {
+            // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
+            // rejects unsupported minor versions BEFORE the
+            // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
+            // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
+            // returns RSRV_ERROR which skips the reply. Ancient
+            // libca clients (pre-V4.4) parse search replies with a
+            // different layout; emitting our V4.13 reply confuses
+            // them or worse, fabricates a usable channel they
+            // can't actually open.
+            // C `search_reply_udp` (camessage.c:2151-2154)
+            // returns RSRV_ERROR on unsupported minor version and
+            // the UDP dispatcher breaks out of the datagram. Pre-
+            // fix Rust skipped only the offending SEARCH and kept
+            // parsing later messages in the same datagram, so a
+            // malformed SEARCH-first datagram could still elicit
+            // a Rust reply for a later message where rsrv would
+            // have dropped the rest. Match C: bad-version SEARCH
+            // ends the per-datagram parse.
+            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+                break;
+            }
+            // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
+            // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
+            // search request") and silently returns RSRV_OK. The
+            // null-terminator alone is 1 byte; a usable PV name
+            // needs at least one non-null byte plus the terminator
+            // (postsize >= 2). Without this guard the Rust path
+            // would parse `pv_name = ""` from an attacker's empty-
+            // postsize SEARCH burst and call `db.has_name("")` on
+            // every datagram — wasted lookups + a non-trivial
+            // amplification vector if a record happened to be
+            // named "" (impossible in practice, but the C side
+            // documents the reject and we match it).
+            if hdr.postsize <= 1 {
+                offset += msg_len;
+                continue;
+            }
+            let payload_start = offset + CaHeader::SIZE;
+            let payload_end = payload_start + hdr.postsize as usize;
+            let payload = &input[payload_start..payload_end];
+
+            // Extract PV name (null-terminated)
+            // C `search_reply_udp` forces
+            // `pName[mp->m_postsize - 1] = '\0'`. Cap the
+            // NUL search at `postsize - 1` so an unterminated
+            // peer name is treated as a `postsize - 1` byte
+            // name (matching rsrv) rather than the full
+            // payload (Rust pre-fix).
+            let scan_end = payload.len().saturating_sub(1).max(0);
+            let pv_name_end = payload[..scan_end]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(scan_end);
+            if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
+                // thread the datagram source address
+                // into the search resolver so the CA gateway can
+                // apply host-scoped `.pvlist` `DENY FROM host`
+                // admission at search time (parity with C
+                // `pvExistTest` passing the client host to
+                // `gateAs::findEntry`).
+                if db.has_name_from(pv_name, Some(lookup_src)).await {
+                    // C parity: `search_reply_udp`
+                    // (`rsrv/camessage.c:2193-2207`) sets
+                    // `sid = ~0U` (INADDR_BROADCAST), telling
+                    // the client to use the UDP packet's source
+                    // address as the server IP. The previous
+                    // code embedded a probe-derived
+                    // `local_ip_for(src)` which (a) diverged from
+                    // C byte-for-byte and (b) could resolve to
+                    // the wrong interface on multi-homed hosts —
+                    // the probe binds 0.0.0.0:0 and `connect`s
+                    // to the client, but the kernel's outgoing-
+                    // interface choice may not match the
+                    // interface the client used to reach us.
+                    // Using the sentinel delegates the IP
+                    // determination to the receiver, which gets
+                    // it right by construction (the UDP source
+                    // IP is whatever the client sees on the
+                    // reply packet).
+                    let mut resp = CaHeader::new(CA_PROTO_SEARCH);
+                    resp.postsize = 8;
+                    resp.data_type = tcp_port;
+                    resp.count = 0;
+                    resp.cid = u32::MAX; // ~0U — "use UDP source address"
+                    resp.available = hdr.available;
+
+                    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+                    ver.count = CA_MINOR_VERSION;
+                    // Placeholder VERSION header — `cid` and
+                    // `data_type` get patched at flush time once
+                    // we know whether the inbound carried a
+                    // CA_V411 VERSION.
+
+                    let resp_bytes = resp.to_bytes();
+                    let mut search_payload = [0u8; 8];
+                    search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
+
+                    // accumulate into send_buf
+                    // and ALWAYS pre-seed a VERSION placeholder
+                    // at byte 0 of a fresh batch — matching
+                    // `rsrv_version_reply`'s up-front seed.
+                    // `cas_send_dg_msg` decides at flush time
+                    // whether to keep (CA_V411 peer) or strip
+                    // (pre-V4.11 peer) those 16 bytes. The
+                    // placeholder always being present means a
+                    // chained inbound that puts SEARCH before
+                    // VERSION still gets a VERSION-led reply.
+                    // Flush before append if the next reply
+                    // would push us over the MTU; the post-
+                    // flush re-seed (handled below) mirrors C's
+                    // per-flush re-seed.
+                    const SEARCH_REPLY_LEN: usize = CaHeader::SIZE + 8;
+                    if !send_buf.is_empty()
+                        && send_buf.len() + SEARCH_REPLY_LEN > UDP_FLUSH_THRESHOLD
+                    {
+                        // Over the ~1 KB MTU: shape the current batch, hand it
+                        // to the caller to send, and begin a fresh batch. C
+                        // `cas_copy_in_header` flushes mid-build the same way
+                        // (`caserverio.c:280-294`).
+                        if let Some(dg) =
+                            shape_search_reply_dg(&send_buf[..], *client_minor, *client_seq)
+                        {
+                            ready.push(dg);
+                        }
+                        send_buf.clear();
+                    }
+                    if send_buf.is_empty() {
+                        send_buf.extend_from_slice(&ver.to_bytes());
+                    }
+                    send_buf.extend_from_slice(&resp_bytes);
+                    send_buf.extend_from_slice(&search_payload);
+                }
+                // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
+                // silently returns on `dbChannelTest` failure for ALL
+                // UDP searches — there is no DO_REPLY branch on the
+                // UDP path. Only `search_reply_tcp` honours the flag
+                // and emits CA_PROTO_NOT_FOUND. Emitting NOT_FOUND
+                // here surprised C libca clients running through a
+                // name-server-list iteration: a UDP NOT_FOUND from a
+                // peer would short-circuit the broadcast search,
+                // missing IOCs that hadn't responded yet.
+            }
+        }
+
+        offset += msg_len;
+    }
+}
+
+#[cfg(not(target_os = "rtems"))]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
     db: Arc<PvDatabase>,
@@ -473,263 +816,20 @@ async fn recv_loop(
         // the parse borrow. Reused via `clear()` + `extend_from_slice`.
         let mut current_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         current_buf.extend_from_slice(&buf[..len]);
-        // Per-datagram client sequence (captured from a leading VERSION
-        // header whose `m_dataType == sequenceNoIsValid`). Echoed in any
-        // VERSION reply we emit for this datagram so the client can
-        // discard stale responses arriving after its search timer
-        // expired (C `cas_send_dg_msg`, `caserverio.c:194-197`). Stays
-        // `None` for peers that don't prepend a VERSION or that send
-        // the older non-flagged form; the reply VERSION then carries
-        // the default zero seq with the flag cleared.
-        let mut client_seq: Option<u32> = None;
-        // largest VERSION minor seen in this inbound. C
-        // `udp_version_action` sets `pclient->minor_version_number`
-        // unconditionally on every CA_VSUPPORTED VERSION; `cas_send_
-        // dg_msg` consults `CA_V411(minor_version_number)` at flush
-        // time. Pre-fix Rust gated the placeholder on
-        // `client_seq.is_some()` which only fires for VERSIONs with
-        // `dataType == sequenceNoIsValid`, missing the case where a
-        // V4.13 client sends `m_count >= 11` without the seq flag.
-        let mut client_minor: Option<u16> = None;
-        // accumulator for the single outbound
-        // datagram. C `cast_server.c:163-281` + `caserverio.c:185-201`
-        // reuse one send buffer across all SEARCH matches and flush
-        // once via `cas_send_dg_msg`. We pre-seed a VERSION
-        // placeholder at byte 0 of every fresh batch (matching
-        // `rsrv_version_reply`); at flush time we either fill in the
-        // final seq fields (CA_V411 peer) or strip the first 16 bytes
-        // (pre-V4.11 peer), matching `cas_send_dg_msg`'s gate.
-        let mut send_buf: Vec<u8> = Vec::new();
-        // match C's `MAX_UDP_SEND = 1024` (`caProto.h:66`).
-        // `cas_copy_in_header` (`caserverio.c:280-294`) flushes when
-        // the next message would push `stk > maxstk`, so C never
-        // builds a UDP reply datagram larger than ~1024 bytes.
-        // Third-party CA implementations (Java CAJ, asyncio-ca,
-        // embedded ports) may assume that contract and truncate the
-        // tail of larger replies. libca peers pre-allocate
-        // `recvBuf[MAX_UDP_RECV]` so they tolerate larger, but the
-        // wire-byte parity argument favors matching the C constant.
-        const UDP_FLUSH_THRESHOLD: usize = 1024;
+        // Reply batch + per-datagram VERSION-echo state, persisted across
+        // this inbound and any same-source datagrams drained below, so a
+        // search storm of N same-peer datagrams yields ONE outbound — C
+        // `cast_server.c:266-281` accumulates into one `cas_send_dg_msg`.
+        let mut batch = SearchReplyBatch::default();
         'parse: loop {
-            let mut offset = 0;
-            while offset + CaHeader::SIZE <= current_buf.len() {
-                let hdr = match CaHeader::from_bytes(&current_buf[offset..]) {
-                    Ok(h) => h,
-                    Err(_) => break,
-                };
-                // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
-                // UDP path drops silently (no error response). Without this
-                // check, the `align8(postsize)` advancement would jump
-                // into the next message's body, mis-parsing chained
-                // SEARCH datagrams.
-                if (hdr.postsize as usize) & 0x7 != 0 {
-                    break;
-                }
-                let payload_size = hdr.postsize as usize;
-                let msg_len = CaHeader::SIZE + payload_size;
-
-                if offset + msg_len > current_buf.len() {
-                    break;
-                }
-
-                // C UDP dispatcher (camessage.c:2505-2516) allows only
-                // udp_version_action (cmd 0) and search_reply_udp (cmd 6)
-                // to succeed. Every other cmd index in the udpJumpTable
-                // is bound to bad_udp_cmd_action which returns RSRV_ERROR
-                // — the dispatcher loop then `break`s out, dropping the
-                // rest of this datagram. Pre-fix Rust just advanced
-                // `offset` and parsed the next message regardless;
-                // a peer could chain a junk cmd before a SEARCH and the
-                // chained SEARCH would still be processed even though
-                // C IOC would have stopped parsing at the junk cmd.
-                //
-                // VERSION's UDP handler (udp_version_action, camessage.c:
-                // 2094-2110) is a no-op for the stateless Rust responder:
-                // it only stored per-client minor_version_number +
-                // seqNoOfReq in C; Rust doesn't track UDP-per-datagram
-                // state, so we just allow the VERSION header to pass and
-                // continue.
-                if hdr.cmmd != CA_PROTO_VERSION && hdr.cmmd != CA_PROTO_SEARCH {
-                    break;
-                }
-                if hdr.cmmd == CA_PROTO_VERSION {
-                    // C `udp_version_action` (rsrv/camessage.c:2094-2110)
-                    // stores `pclient->seqNoOfReq = m_cid` and the version
-                    // when the leading VERSION header marks the seq valid
-                    // (`m_dataType == sequenceNoIsValid`, caProto.h:128).
-                    // Capture it here so the SEARCH-reply branch can
-                    // populate its VERSION echo and match
-                    // `cas_send_dg_msg` byte-for-byte.
-                    //
-                    // C `udp_version_action` returns RSRV_ERROR on
-                    // `!CA_VSUPPORTED(m_count)` and the UDP dispatcher
-                    // breaks out of the current datagram on any non-OK
-                    // status. Pre-fix Rust accepted any VERSION and
-                    // happily kept parsing later messages in the same
-                    // datagram — a malformed VERSION-first datagram could
-                    // still elicit a Rust SEARCH reply where rsrv would
-                    // have dropped the rest. Mirror C: bad version
-                    // breaks the per-datagram parse.
-                    const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
-                    if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
-                        break;
-                    }
-                    // track the largest VERSION minor seen so the
-                    // flush-time placeholder strip/keep decision matches
-                    // `CA_V411(minor_version_number)` regardless of
-                    // whether the inbound's leading frame is VERSION,
-                    // SEARCH, or chained.
-                    client_minor = Some(client_minor.unwrap_or(0).max(hdr.count));
-                    if hdr.data_type == 1 {
-                        client_seq = Some(hdr.cid);
-                    }
-                }
-                if hdr.cmmd == CA_PROTO_SEARCH {
-                    // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
-                    // rejects unsupported minor versions BEFORE the
-                    // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
-                    // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
-                    // returns RSRV_ERROR which skips the reply. Ancient
-                    // libca clients (pre-V4.4) parse search replies with a
-                    // different layout; emitting our V4.13 reply confuses
-                    // them or worse, fabricates a usable channel they
-                    // can't actually open.
-                    // C `search_reply_udp` (camessage.c:2151-2154)
-                    // returns RSRV_ERROR on unsupported minor version and
-                    // the UDP dispatcher breaks out of the datagram. Pre-
-                    // fix Rust skipped only the offending SEARCH and kept
-                    // parsing later messages in the same datagram, so a
-                    // malformed SEARCH-first datagram could still elicit
-                    // a Rust reply for a later message where rsrv would
-                    // have dropped the rest. Match C: bad-version SEARCH
-                    // ends the per-datagram parse.
-                    const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
-                    if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
-                        break;
-                    }
-                    // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
-                    // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
-                    // search request") and silently returns RSRV_OK. The
-                    // null-terminator alone is 1 byte; a usable PV name
-                    // needs at least one non-null byte plus the terminator
-                    // (postsize >= 2). Without this guard the Rust path
-                    // would parse `pv_name = ""` from an attacker's empty-
-                    // postsize SEARCH burst and call `db.has_name("")` on
-                    // every datagram — wasted lookups + a non-trivial
-                    // amplification vector if a record happened to be
-                    // named "" (impossible in practice, but the C side
-                    // documents the reject and we match it).
-                    if hdr.postsize <= 1 {
-                        offset += msg_len;
-                        continue;
-                    }
-                    let payload_start = offset + CaHeader::SIZE;
-                    let payload_end = payload_start + hdr.postsize as usize;
-                    let payload = &current_buf[payload_start..payload_end];
-
-                    // Extract PV name (null-terminated)
-                    // C `search_reply_udp` forces
-                    // `pName[mp->m_postsize - 1] = '\0'`. Cap the
-                    // NUL search at `postsize - 1` so an unterminated
-                    // peer name is treated as a `postsize - 1` byte
-                    // name (matching rsrv) rather than the full
-                    // payload (Rust pre-fix).
-                    let scan_end = payload.len().saturating_sub(1).max(0);
-                    let pv_name_end = payload[..scan_end]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(scan_end);
-                    if let Ok(pv_name) = std::str::from_utf8(&payload[..pv_name_end]) {
-                        // thread the datagram source address
-                        // into the search resolver so the CA gateway can
-                        // apply host-scoped `.pvlist` `DENY FROM host`
-                        // admission at search time (parity with C
-                        // `pvExistTest` passing the client host to
-                        // `gateAs::findEntry`).
-                        if db.has_name_from(pv_name, Some(src)).await {
-                            // C parity: `search_reply_udp`
-                            // (`rsrv/camessage.c:2193-2207`) sets
-                            // `sid = ~0U` (INADDR_BROADCAST), telling
-                            // the client to use the UDP packet's source
-                            // address as the server IP. The previous
-                            // code embedded a probe-derived
-                            // `local_ip_for(src)` which (a) diverged from
-                            // C byte-for-byte and (b) could resolve to
-                            // the wrong interface on multi-homed hosts —
-                            // the probe binds 0.0.0.0:0 and `connect`s
-                            // to the client, but the kernel's outgoing-
-                            // interface choice may not match the
-                            // interface the client used to reach us.
-                            // Using the sentinel delegates the IP
-                            // determination to the receiver, which gets
-                            // it right by construction (the UDP source
-                            // IP is whatever the client sees on the
-                            // reply packet).
-                            let mut resp = CaHeader::new(CA_PROTO_SEARCH);
-                            resp.postsize = 8;
-                            resp.data_type = tcp_port;
-                            resp.count = 0;
-                            resp.cid = u32::MAX; // ~0U — "use UDP source address"
-                            resp.available = hdr.available;
-
-                            let mut ver = CaHeader::new(CA_PROTO_VERSION);
-                            ver.count = CA_MINOR_VERSION;
-                            // Placeholder VERSION header — `cid` and
-                            // `data_type` get patched at flush time once
-                            // we know whether the inbound carried a
-                            // CA_V411 VERSION.
-
-                            let resp_bytes = resp.to_bytes();
-                            let mut search_payload = [0u8; 8];
-                            search_payload[0..2].copy_from_slice(&CA_MINOR_VERSION.to_be_bytes());
-
-                            // accumulate into send_buf
-                            // and ALWAYS pre-seed a VERSION placeholder
-                            // at byte 0 of a fresh batch — matching
-                            // `rsrv_version_reply`'s up-front seed.
-                            // `cas_send_dg_msg` decides at flush time
-                            // whether to keep (CA_V411 peer) or strip
-                            // (pre-V4.11 peer) those 16 bytes. The
-                            // placeholder always being present means a
-                            // chained inbound that puts SEARCH before
-                            // VERSION still gets a VERSION-led reply.
-                            // Flush before append if the next reply
-                            // would push us over the MTU; the post-
-                            // flush re-seed (handled in `flush_send_buf`)
-                            // mirrors C's per-flush re-seed.
-                            const SEARCH_REPLY_LEN: usize = CaHeader::SIZE + 8;
-                            if !send_buf.is_empty()
-                                && send_buf.len() + SEARCH_REPLY_LEN > UDP_FLUSH_THRESHOLD
-                            {
-                                flush_send_buf(
-                                    &socket,
-                                    current_src,
-                                    &mut send_buf,
-                                    client_minor,
-                                    client_seq,
-                                    &bind_ip,
-                                )
-                                .await;
-                            }
-                            if send_buf.is_empty() {
-                                send_buf.extend_from_slice(&ver.to_bytes());
-                            }
-                            send_buf.extend_from_slice(&resp_bytes);
-                            send_buf.extend_from_slice(&search_payload);
-                        }
-                        // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
-                        // silently returns on `dbChannelTest` failure for ALL
-                        // UDP searches — there is no DO_REPLY branch on the
-                        // UDP path. Only `search_reply_tcp` honours the flag
-                        // and emits CA_PROTO_NOT_FOUND. Emitting NOT_FOUND
-                        // here surprised C libca clients running through a
-                        // name-server-list iteration: a UDP NOT_FOUND from a
-                        // peer would short-circuit the broadcast search,
-                        // missing IOCs that hadn't responded yet.
-                    }
-                }
-
-                offset += msg_len;
+            let mut ready: Vec<Vec<u8>> = Vec::new();
+            parse_search_datagram(&current_buf, &db, tcp_port, src, &mut batch, &mut ready).await;
+            // Send this datagram's over-threshold batches to its peer. C
+            // `cas_send_dg_msg` flushes each full batch as it is built
+            // (`caserverio.c:280-294`); the trailing partial batch is flushed
+            // by the peer-change / queue-drain logic below.
+            for dg in ready.drain(..) {
+                send_reply_dg(&socket, current_src, &dg, &bind_ip).await;
             }
             // peek for queued inbounds. C `cast_server.c:266-281`
             // calls `socket_ioctl(FIONREAD, &nchars)` after each
@@ -786,18 +886,10 @@ async fn recv_loop(
                     if peek_src != current_src {
                         // Peer change: flush current batch to the old
                         // src, then reset batch state for the new src.
-                        flush_send_buf(
-                            &socket,
-                            current_src,
-                            &mut send_buf,
-                            client_minor,
-                            client_seq,
-                            &bind_ip,
-                        )
-                        .await;
+                        flush_send_buf(&socket, current_src, &mut batch, &bind_ip).await;
                         current_src = peek_src;
-                        client_seq = None;
-                        client_minor = None;
+                        batch.client_seq = None;
+                        batch.client_minor = None;
                     }
                     // Replace `current_buf` with the accepted
                     // datagram's bytes BEFORE re-entering `'parse` so
@@ -810,69 +902,63 @@ async fn recv_loop(
                 None => break 'parse, // recv queue drained
             }
         } // 'parse
-        // flush the accumulated SEARCH
-        // replies as a single outbound datagram. `cas_send_dg_msg`
-        // does the same after each batch is fully parsed.
-        if !send_buf.is_empty() {
-            flush_send_buf(
-                &socket,
-                current_src,
-                &mut send_buf,
-                client_minor,
-                client_seq,
-                &bind_ip,
-            )
-            .await;
+        // flush the accumulated SEARCH replies as a single outbound
+        // datagram. `cas_send_dg_msg` does the same after each batch is
+        // fully parsed.
+        if !batch.send_buf.is_empty() {
+            flush_send_buf(&socket, current_src, &mut batch, &bind_ip).await;
         }
     }
 }
 
-/// send the accumulated SEARCH-reply batch.
+/// Shape the final on-wire bytes of one accumulated SEARCH-reply batch —
+/// the pure, I/O-free core of `cas_send_dg_msg` (`caserverio.c:185-201`).
+/// Shared by the async responder ([`flush_send_buf`]) and the blocking
+/// thread-per-client responder (`crate::server::blocking`), so a reply is
+/// byte-identical on either front-end.
 ///
-/// If `client_minor >= 11` (CA_V411 peer), patch bytes 0..16 of
-/// `send_buf` with the final VERSION header (cid = client seq if
-/// any, data_type = 1 when seq present). The placeholder was seeded
-/// at first append. Otherwise strip the placeholder by slicing off
-/// the first 16 bytes — pre-V4.11 peers must not see the VERSION
-/// header.
-///
-/// On `send_to` failure, log at warn level instead of silently
-/// discarding (`caserverio.c:214-222` `errlogPrintf` parity).
-async fn flush_send_buf(
-    socket: &UdpSocket,
-    src: SocketAddr,
-    send_buf: &mut Vec<u8>,
+/// If `client_minor >= 11` (CA_V411 peer), the seeded VERSION placeholder
+/// at bytes 0..16 is patched with the final header (cid = client seq if
+/// any, data_type = 1 when seq present). Otherwise the 16-byte placeholder
+/// is stripped — pre-V4.11 peers must not see the VERSION header. Returns
+/// `None` when there is nothing to send. Does not mutate `send_buf`; the
+/// caller clears it after a flush.
+pub(crate) fn shape_search_reply_dg(
+    send_buf: &[u8],
     client_minor: Option<u16>,
     client_seq: Option<u32>,
-    bind_ip: &Ipv4Addr,
-) {
+) -> Option<Vec<u8>> {
     if send_buf.is_empty() {
-        return;
+        return None;
     }
-    let payload: &[u8] = if client_minor.is_some_and(|m| m >= 11) {
+    if client_minor.is_some_and(|m| m >= 11) {
         // Patch placeholder at bytes 0..16 with final seq/data_type.
         // The placeholder was seeded with cid=0, data_type=0.
-        if send_buf.len() >= CaHeader::SIZE {
+        let mut out = send_buf.to_vec();
+        if out.len() >= CaHeader::SIZE {
             let mut ver = CaHeader::new(CA_PROTO_VERSION);
             ver.count = CA_MINOR_VERSION;
             if let Some(seq) = client_seq {
                 ver.cid = seq;
                 ver.data_type = 1;
             }
-            let bytes = ver.to_bytes();
-            send_buf[..CaHeader::SIZE].copy_from_slice(&bytes);
+            out[..CaHeader::SIZE].copy_from_slice(&ver.to_bytes());
         }
-        &send_buf[..]
-    } else {
+        Some(out)
+    } else if send_buf.len() >= CaHeader::SIZE {
         // Pre-V4.11 peer: strip the placeholder.
-        if send_buf.len() >= CaHeader::SIZE {
-            &send_buf[CaHeader::SIZE..]
-        } else {
-            // Defensive: nothing past the placeholder, nothing to send.
-            send_buf.clear();
-            return;
-        }
-    };
+        Some(send_buf[CaHeader::SIZE..].to_vec())
+    } else {
+        // Defensive: nothing past the placeholder, nothing to send.
+        None
+    }
+}
+
+/// Send one already-shaped reply datagram to `src`. On failure, log at warn
+/// level instead of silently discarding (`caserverio.c:214-222`
+/// `errlogPrintf` parity).
+#[cfg(not(target_os = "rtems"))]
+async fn send_reply_dg(socket: &UdpSocket, src: SocketAddr, payload: &[u8], bind_ip: &Ipv4Addr) {
     if let Err(e) = socket.send_to(payload, src).await {
         tracing::warn!(
             target: "epics_ca_rs::server::udp",
@@ -884,7 +970,23 @@ async fn flush_send_buf(
         );
         metrics::counter!("ca_server_udp_search_reply_send_failures_total").increment(1);
     }
-    send_buf.clear();
+}
+
+/// Shape the batch's trailing `send_buf` and send it as one datagram, then
+/// clear the batch buffer. The async responder's flush path.
+#[cfg(not(target_os = "rtems"))]
+async fn flush_send_buf(
+    socket: &UdpSocket,
+    src: SocketAddr,
+    batch: &mut SearchReplyBatch,
+    bind_ip: &Ipv4Addr,
+) {
+    if let Some(payload) =
+        shape_search_reply_dg(&batch.send_buf, batch.client_minor, batch.client_seq)
+    {
+        send_reply_dg(socket, src, &payload, bind_ip).await;
+    }
+    batch.send_buf.clear();
 }
 
 /// Per-source-IP token bucket on the UDP search responder. Mitigates
@@ -895,6 +997,7 @@ async fn flush_send_buf(
 /// comparison per packet otherwise. The implementation is a fixed
 /// 1-second sliding window — coarse but cheap; replace with
 /// per-IP token buckets if a finer policy is ever needed.
+#[cfg(not(target_os = "rtems"))]
 struct UdpRateLimiter {
     enabled: bool,
     cap_per_sec: u32,
@@ -902,6 +1005,7 @@ struct UdpRateLimiter {
         std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl UdpRateLimiter {
     fn from_env() -> Self {
         let cap = epics_base_rs::runtime::env::get("EPICS_CAS_UDP_SEARCH_RATE_LIMIT")

@@ -27,6 +27,8 @@
 //! therefore collapse to a single action, and a burst of different flags
 //! runs in main-loop order, not client write order.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -234,8 +236,8 @@ pub fn spawn_control_owner(
     db: Arc<PvDatabase>,
     command_path: Option<std::path::PathBuf>,
     shutdown: Arc<Notify>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
+    epics_base_rs::runtime::task::spawn(async move {
         loop {
             flags.wake.notified().await;
 
@@ -373,7 +375,7 @@ mod tests {
         for (suffix, _) in CONTROL_FLAGS {
             let name = format!("gw:{suffix}");
             assert!(
-                matches!(db.get_pv(&name).await, Ok(EpicsValue::Double(v)) if v == 0.0),
+                matches!(db.get_pv(&name), Ok(EpicsValue::Double(v)) if v == 0.0),
                 "control flag {name} must register as DBR_DOUBLE (gateStat parity)"
             );
         }
@@ -440,7 +442,7 @@ mod tests {
         let mut reset = false;
         for _ in 0..50 {
             if matches!(
-                db.get_pv("gw:report2Flag").await,
+                db.get_pv("gw:report2Flag"),
                 Ok(EpicsValue::Double(v)) if v == 0.0
             ) {
                 reset = true;

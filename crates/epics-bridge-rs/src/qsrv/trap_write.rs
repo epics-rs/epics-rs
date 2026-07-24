@@ -33,6 +33,8 @@
 //! the access layer; this helper reads only that flag and never
 //! re-derives the trap mask at the emission site.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::access_security::{self, TrapWriteFields, TrapWriteGuard};
 use epics_base_rs::types::EpicsValue;
 
@@ -117,6 +119,51 @@ where
     });
 
     let result = write(value).await;
+
+    guard.complete(if result.is_ok() { "ok" } else { "fail" });
+
+    result
+}
+
+/// [`put_with_trap`]'s synchronous twin, for a write already holding the
+/// member-record advisory gate (the QSRV atomic group PUT, `already_locked`
+/// entries). C's `SecurityLogger` bracket (`pvxs/ioc/securitylogger.h:23-59`)
+/// is plain synchronous C++ with no `async` concept at all — this is that
+/// shape. `write` cannot itself suspend (its `_already_locked` callees are
+/// synchronous post-H6), so there is no cancellation-mid-write case as in
+/// [`put_with_trap`]; the same RAII guard still balances the trap log on a
+/// panic unwinding through `write`.
+pub(crate) fn put_with_trap_already_locked<F>(
+    grant: WriteGrant,
+    meta: TrapWriteMeta<'_>,
+    value: EpicsValue,
+    write: F,
+) -> BridgeResult<()>
+where
+    F: FnOnce(EpicsValue) -> BridgeResult<()>,
+{
+    if !(grant.rule_was_trap && access_security::has_trap_write_listeners()) {
+        return write(value);
+    }
+
+    let value_str = value.display_truncated(64);
+    let no_elements = value.count();
+    let event_id = access_security::next_trap_write_event_id();
+
+    let mut guard = TrapWriteGuard::begin(TrapWriteFields {
+        pv_name: meta.pv_name.to_string(),
+        user: meta.user.to_string(),
+        host: meta.host.to_string(),
+        peer: meta.peer.to_string(),
+        value_str,
+        dbr_type: meta.dbr_type,
+        no_elements,
+        event_id,
+        rule_was_trap: true,
+        cancel_status: "cancel".to_string(),
+    });
+
+    let result = write(value);
 
     guard.complete(if result.is_ok() { "ok" } else { "fail" });
 

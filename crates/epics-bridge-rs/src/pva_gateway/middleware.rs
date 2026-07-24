@@ -21,15 +21,20 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
+// RTEMS-EXEC-MODEL-ALLOW(18): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
-    ChannelSource, DynSource, OpError, OpErrorKind, RawMonitorEvent, SourceRead, WatermarkEvent,
+    ChannelSource, DynSource, MonitorStream, OpError, OpErrorKind, RawMonitorEvent, SourceRead,
+    WatermarkEvent,
 };
-use tokio::sync::mpsc;
 
 /// Wrap a [`ChannelSource`] and produce a new one with extra
 /// behaviour. Implementations override only the methods they need;
@@ -158,7 +163,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn is_writable(&self, _name: &str) -> bool {
         false
     }
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         self.inner.subscribe(name).await
     }
     // Forward type-state op variants to the inner. Without these,
@@ -192,17 +197,17 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         self.inner.subscribe_checked(checked, ctx).await
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
         self.inner.subscribe_raw(name).await
     }
     async fn subscribe_raw_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         self.inner.subscribe_raw_checked(checked, ctx).await
     }
     // forward the cooked (marked) event-affecting-options
@@ -217,7 +222,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
         self.inner
             .subscribe_checked_opts_marked(checked, ctx, opts)
             .await
@@ -227,7 +232,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         self.inner
             .subscribe_raw_checked_opts(checked, ctx, opts)
             .await
@@ -429,7 +434,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         self.inner.subscribe_checked_opts(checked, ctx, opts).await
     }
 }
@@ -777,7 +782,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     async fn is_writable(&self, name: &str) -> bool {
         self.config.allowed(name) && self.inner.is_writable(name).await
     }
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         if !self.config.allowed(name) {
             return None;
         }
@@ -787,13 +792,13 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
         self.inner.subscribe_checked(checked, ctx).await
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
         if !self.config.allowed(name) {
             return None;
         }
@@ -803,7 +808,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
@@ -817,7 +822,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
@@ -830,7 +835,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
@@ -1100,7 +1105,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         if !self.config.allowed(checked.pv_name()) {
             return None;
         }
@@ -1188,7 +1193,7 @@ impl MpscAuditSink {
     /// `record()` is allowed to block.
     pub fn wrap<A: AuditSink>(capacity: usize, inner: A) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AuditEvent>(capacity.max(1));
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 inner.record(ev);
             }
@@ -1597,7 +1602,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1617,7 +1622,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn is_writable(&self, name: &str) -> bool {
         self.inner.is_writable(name).await
     }
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         let result = self.inner.subscribe(name).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1631,7 +1636,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
         // Audit on subscribe_raw too, since the zero-copy
         // path bypasses the typed `subscribe` and would otherwise
         // miss the audit event entirely.
@@ -1657,7 +1662,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1684,7 +1689,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+    ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -1709,7 +1714,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+    ) -> Option<MonitorStream<RawMonitorEvent>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -2007,7 +2012,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
-    ) -> Option<mpsc::Receiver<PvField>> {
+    ) -> Option<MonitorStream<PvField>> {
         let pv = checked.pv_name().to_string();
         let user = ctx.account.clone();
         let host = ctx.host.clone();
@@ -2312,7 +2317,7 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 true
             }
-            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -2440,7 +2445,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -2667,7 +2672,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -2750,7 +2755,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
@@ -2801,7 +2806,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn channel_report_info(&self, _name: &str, _ctx: ChannelContext) -> Option<String> {
@@ -3147,7 +3152,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_checked_opts_marked(
@@ -3155,7 +3160,7 @@ mod tests {
             _checked: AccessChecked,
             _ctx: ChannelContext,
             _opts: epics_pva_rs::server_native::MonitorOptions,
-        ) -> Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>> {
+        ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
             self.opts_reached.store(true, Ordering::SeqCst);
             None
         }
@@ -3164,7 +3169,7 @@ mod tests {
             _checked: AccessChecked,
             _ctx: ChannelContext,
             _opts: epics_pva_rs::server_native::MonitorOptions,
-        ) -> Option<mpsc::Receiver<RawMonitorEvent>> {
+        ) -> Option<MonitorStream<RawMonitorEvent>> {
             self.opts_reached.store(true, Ordering::SeqCst);
             None
         }

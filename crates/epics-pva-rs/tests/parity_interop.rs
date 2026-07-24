@@ -50,6 +50,7 @@ mod testtype_port;
 mod testudp_port;
 #[path = "parity/testxcode_port.rs"]
 mod testxcode_port;
+#[cfg(feature = "tls")]
 #[path = "parity/tls_interop.rs"]
 mod tls_interop;
 #[path = "parity/wire_dump.rs"]

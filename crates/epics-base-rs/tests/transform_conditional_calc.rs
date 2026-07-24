@@ -21,6 +21,8 @@
 //!
 //! One case per boundary of the gate.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::transform::TransformRecord;
@@ -29,10 +31,8 @@ use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> f64 {
     db.get_record(rec)
-        .await
         .unwrap()
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("T.{f} missing"))

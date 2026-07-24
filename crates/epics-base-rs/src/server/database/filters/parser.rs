@@ -330,7 +330,7 @@ fn json5_filter_to_json(src: &str) -> String {
 /// filter whose own parser rejects its configuration. An empty object
 /// (`{}`) is a valid no-filter request and yields an empty chain. The
 /// documented JSON5 unquoted-key forms are accepted via
-/// [`json5_filter_to_json`].
+/// `json5_filter_to_json`.
 pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseError> {
     let normalized = json5_filter_to_json(json);
     let value: serde_json::Value =

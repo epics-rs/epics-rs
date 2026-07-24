@@ -25,6 +25,8 @@
 //! records over CA. Its loader rejects the INP form with
 //! `ERROR: histogram record 'H:INP' doesn't have a field 'INP'`.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::error::CaError;
@@ -67,7 +69,7 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 }
 
 async fn bins(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Vec<u32> {
-    match db.get_pv(rec).await.unwrap() {
+    match db.get_pv(rec).unwrap() {
         // C `cvt_dbaddr` declares the bins DBF_ULONG (histogramRecord.c:304).
         EpicsValue::ULongArray(v) => v,
         other => panic!("{rec}.VAL must be a ULongArray, got {other:?}"),
@@ -83,20 +85,13 @@ async fn constant_svl_seeds_sgnl_at_init_without_counting() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("H:CONST.SGNL").await.unwrap().to_f64(),
+        db.get_pv("H:CONST.SGNL").unwrap().to_f64(),
         Some(2.5),
         "field(SVL,\"2.5\") must seed SGNL at init"
     );
     assert_eq!(bins(&db, "H:CONST").await, vec![0, 0, 0, 0]);
     assert!(
-        db.get_record("H:CONST")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .common
-            .udf
-            == 0,
+        db.get_record("H:CONST").unwrap().read().common.udf == 0,
         "a histogram seeded from a constant SVL is DEFINED"
     );
 }
@@ -129,7 +124,7 @@ async fn real_svl_link_is_read_into_sgnl_and_binned_once_per_process() {
     db.put_pv("SRC", EpicsValue::Double(3.5)).await.unwrap();
     process(&db, "H:LINK").await;
 
-    assert_eq!(db.get_pv("H:LINK.SGNL").await.unwrap().to_f64(), Some(3.5));
+    assert_eq!(db.get_pv("H:LINK.SGNL").unwrap().to_f64(), Some(3.5));
     assert_eq!(
         bins(&db, "H:LINK").await,
         vec![0, 0, 0, 1],
@@ -180,15 +175,7 @@ record(histogram, "H:INP") {
         .unwrap()
         .0;
 
-    let inp = db
-        .get_record("H:INP")
-        .await
-        .unwrap()
-        .read()
-        .await
-        .common
-        .inp
-        .clone();
+    let inp = db.get_record("H:INP").unwrap().read().common.inp.clone();
     assert!(inp.is_empty(), "field(INP) must not land on a histogram");
 
     // And it drives nothing. A process still bins the current SGNL — that is
@@ -196,7 +183,7 @@ record(histogram, "H:INP") {
     // (bucket 0), not SRC2's 1.5 (which would land in bucket 1).
     process(&db, "H:INP").await;
     assert_eq!(
-        db.get_pv("H:INP.SGNL").await.unwrap().to_f64(),
+        db.get_pv("H:INP.SGNL").unwrap().to_f64(),
         Some(0.0),
         "INP must not feed SGNL"
     );
@@ -236,7 +223,6 @@ record(histogram, "H:NS") {
 
     let err = db
         .get_pv("H:NS.INP")
-        .await
         .expect_err("histogram declares no INP — the channel must not exist");
     assert!(
         matches!(err, CaError::FieldNotFound(_) | CaError::ChannelNotFound(_)),
@@ -255,7 +241,7 @@ record(histogram, "H:NS") {
 
     // ...while SVL, the DBF_INLINK a histogram DOES declare, resolves.
     assert_eq!(
-        db.get_pv("H:NS.SVL").await.unwrap(),
+        db.get_pv("H:NS.SVL").unwrap(),
         EpicsValue::String("".into()),
         "SVL (histogramRecord.dbd.pod:212) is the histogram's input link"
     );
@@ -272,7 +258,7 @@ record(histogram, "H:NS") {
         .unwrap()
         .0;
     assert_eq!(
-        db2.get_pv("A:INP.INP").await.unwrap(),
+        db2.get_pv("A:INP.INP").unwrap(),
         EpicsValue::String("1.5".into())
     );
 }

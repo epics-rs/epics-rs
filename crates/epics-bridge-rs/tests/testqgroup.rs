@@ -4,6 +4,14 @@
 //! Loads a JSON group config containing two member records, exercises
 //! [`GroupChannel`] get/put, and verifies the atomic semantics that
 //! pvxs's qsrv promises.
+//!
+//! `qsrv-core` and not `qsrv`: this file reaches only `epics_bridge_rs::qsrv`,
+//! which is what `qsrv-core` selects, and never the `PvaClient` that `qsrv`
+//! additionally restores. Naming the wider feature would gate the file out of
+//! the target's own selection for no reason.
+#![cfg(feature = "qsrv-core")]
+
+// RTEMS-EXEC-MODEL-ALLOW(32): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 
@@ -339,8 +347,8 @@ async fn group_monitor_subscribes_archive_log_events() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::LOG);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::LOG);
     }
     let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -369,8 +377,8 @@ async fn group_monitor_subscribes_archive_log_events() {
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::LOG);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::LOG);
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(200), mon.poll())
@@ -769,8 +777,8 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     let mut mon = GroupMonitor::new(db.clone(), def);
     mon.start().await.expect("start");
     for rec_name in ["TEST:level_na", "TEST:count_na"] {
-        let rec = db.get_record(rec_name).await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record(rec_name).expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
         .await
@@ -835,8 +843,8 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     // mutated either — pvxs rejects the whole operation before any
     // member apply runs.
     let level = {
-        let rec = db.get_record("TEST:level").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:level").unwrap();
+        let inst = rec.read();
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
     assert!(
@@ -935,8 +943,8 @@ async fn br_fr12_named_trigger_marks_only_target() {
 
     // A `level` post triggers only `count`.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -951,8 +959,8 @@ async fn br_fr12_named_trigger_marks_only_target() {
 
     // A `count` post triggers only `level`.
     {
-        let rec = db.get_record("TEST:count").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:count").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1002,8 +1010,8 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
     // function of the DBE mask and the mapping, never of what the snapshot
     // diff happened to see move.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1049,8 +1057,8 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
 
     // Only `level` changes after start; `count` never posts.
     {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
         .await
@@ -1538,8 +1546,8 @@ async fn group_monitor_stop_disables_member_subscriptions() {
     );
 
     async fn post(db: &Arc<PvDatabase>) {
-        let rec = db.get_record("TEST:level").await.expect("rec exists");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:level").expect("rec exists");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
 
     // Active (post-START): a member post wakes the group poll.
@@ -1687,8 +1695,8 @@ async fn r17_31_group_scalar_member_serves_long_string() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstrwf").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:lstrwf").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:lstrwf", EpicsValue::CharArray(b"hi\0".to_vec()))
         .await
@@ -1752,8 +1760,8 @@ async fn r18_26_plain_long_string_member_descriptor_matches_value() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:plls").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:plls").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:plls", EpicsValue::CharArray(b"hi\0".to_vec()))
         .await
@@ -1939,17 +1947,17 @@ async fn r17_35_group_scalar_member_put_derefs_the_nt_wrapper() {
             .unwrap_or_else(|e| panic!("atomic={atomic}: scalar-member PUT rejected: {e}"));
 
         assert_eq!(
-            db.get_pv("TEST:sc_ao.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_ao.VAL").unwrap(),
             EpicsValue::Double(2.5),
             "atomic={atomic}: numeric scalar member must write the value leaf"
         );
         assert_eq!(
-            db.get_pv("TEST:sc_so.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_so.VAL").unwrap(),
             EpicsValue::String("hello".into()),
             "atomic={atomic}: string scalar member must write the value leaf"
         );
         assert_eq!(
-            db.get_pv("TEST:sc_mb.VAL").await.unwrap(),
+            db.get_pv("TEST:sc_mb.VAL").unwrap(),
             EpicsValue::Enum(1),
             "atomic={atomic}: enum scalar member must write value.index"
         );
@@ -1974,7 +1982,7 @@ async fn r17_35_plain_member_put_is_not_unwrapped() {
     ch.put(&put).await.expect("plain member PUT");
 
     assert_eq!(
-        db.get_pv("TEST:level.VAL").await.unwrap(),
+        db.get_pv("TEST:level.VAL").unwrap(),
         EpicsValue::Double(7.5)
     );
 }
@@ -2005,8 +2013,8 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstrwf").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:lstrwf").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
 
     let provider = Arc::new(BridgeProvider::new(db.clone()));
@@ -2022,7 +2030,7 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
     ch.put(&put).await.expect("long-string member PUT");
 
     assert_eq!(
-        db.get_pv("TEST:lstrwf.VAL").await.unwrap(),
+        db.get_pv("TEST:lstrwf.VAL").unwrap(),
         EpicsValue::CharArray(b"hello\0".to_vec()),
         "long-string member PUT must write the NUL-terminated char image"
     );
@@ -2042,4 +2050,122 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
         },
         other => panic!("expected an NTScalar member structure, got {other:?}"),
     }
+}
+
+/// Delivery-keeps-up regression for the doc §9.14 starvation defect
+/// (host-scale stand-in — the measured starvation itself is target-only):
+/// a subscribed 20-member group flooding value posts must not stall an
+/// unrelated single-record monitor's delivery. Pre-fix, the group monitor
+/// spawned ~2 forwarder tasks per member onto the shared callback pool, so
+/// the flood put O(members) task wakes per tick between the scalar
+/// monitor's events (16.9 s stalls on target); with the shared drain the
+/// group costs O(1) wakes per tick, and both channels — created through
+/// the provider, so the group rides the provider's shared pump — keep
+/// delivering with bounded latency while the flood runs.
+#[tokio::test]
+async fn group_flood_does_not_stall_scalar_monitor_delivery() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::AnyChannel;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let db = Arc::new(PvDatabase::new());
+    let mut members = String::new();
+    for i in 0..20 {
+        let rec = format!("TEST:fm{i:02}");
+        db.add_record(&rec, Box::new(AiRecord::new(f64::from(i))))
+            .await
+            .unwrap();
+        if i > 0 {
+            members.push(',');
+        }
+        members.push_str(&format!(
+            r#""f{i:02}": {{"+type": "plain", "+channel": "{rec}.VAL"}}"#
+        ));
+    }
+    db.add_record("TEST:flood_scalar", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(&format!(r#"{{ "TEST:floodgrp": {{ {members} }} }}"#))
+        .expect("20-member group loads");
+
+    // Both monitors through the provider, so the group monitor registers
+    // with the provider's shared GroupPump — the as-deployed wiring.
+    let group_ch = provider
+        .create_channel_for("TEST:floodgrp", "u", "h")
+        .await
+        .expect("group channel");
+    let mut group_mon = group_ch.create_monitor().await.expect("group monitor");
+    group_mon.start().await.expect("group monitor starts");
+
+    let scalar_ch = match provider
+        .create_channel_for("TEST:flood_scalar", "u", "h")
+        .await
+        .expect("scalar channel")
+    {
+        AnyChannel::Single(ch) => ch,
+        other => panic!(
+            "expected a single-record channel, got {:?}",
+            other.channel_name()
+        ),
+    };
+    let mut scalar_mon = scalar_ch.create_monitor().await.expect("scalar monitor");
+    scalar_mon.start().await.expect("scalar monitor starts");
+
+    // Flood every group member from a concurrent task until told to stop,
+    // yielding per round so the current-thread runtime interleaves it with
+    // the drain, the monitors and the assertions below.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let db = db.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut rounds: u32 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..20 {
+                    let rec = db
+                        .get_record(&format!("TEST:fm{i:02}"))
+                        .expect("member record");
+                    rec.write()
+                        .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
+                }
+                rounds += 1;
+                tokio::task::yield_now().await;
+            }
+            rounds
+        })
+    };
+
+    // While the flood runs: every scalar post must be delivered within a
+    // bounded window, five times in a row.
+    for round in 0..5 {
+        {
+            let rec = db.get_record("TEST:flood_scalar").expect("scalar record");
+            rec.write()
+                .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
+        }
+        tokio::time::timeout(Duration::from_secs(2), scalar_mon.poll())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("scalar delivery stalled under the group flood (round {round})")
+            })
+            .expect("scalar update");
+    }
+
+    // The flooded group's own stream flows too (coalesced, not wedged).
+    tokio::time::timeout(Duration::from_secs(2), group_mon.poll())
+        .await
+        .expect("group delivery keeps up under its own flood")
+        .expect("assembled group update");
+
+    stop.store(true, Ordering::Relaxed);
+    let rounds = flood.await.expect("flood task");
+    assert!(rounds > 0, "the flood actually ran");
+
+    group_mon.stop().await;
+    scalar_mon.stop().await;
 }

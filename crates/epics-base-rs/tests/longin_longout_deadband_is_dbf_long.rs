@@ -15,6 +15,8 @@
 //! boundary is RANGE, not fractionality — `strtol` trailing-text tolerance keeps
 //! `"5volts"` -> `5`. Mirrors the int64in/int64out Cause B fix (commit 224d5ad5).
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::longin::LonginRecord;
@@ -31,8 +33,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 

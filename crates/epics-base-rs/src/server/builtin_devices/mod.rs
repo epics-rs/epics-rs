@@ -36,8 +36,8 @@ use crate::server::ioc_app::DeviceSupportContext;
 /// can see. The inner typed record handed to `init`/`read` does NOT expose
 /// `INP`/`OUT` either (those live on the `RecordInstance` common header, not the
 /// record body), so every base builtin is dispatched here and receives the link
-/// at construction. Both [`IocBuilder::new`](crate::server::IocBuilder) and
-/// [`IocApplication::new`](crate::server::IocApplication) pre-register this as
+/// at construction. Both [`IocBuilder::new`](crate::server::ioc_builder::IocBuilder::new) and
+/// [`IocApplication::new`](crate::server::ioc_app::IocApplication::new) pre-register this as
 /// the *base* of the dynamic-factory chain, so a user's
 /// `register_dynamic_device_support` factory takes priority and falls through
 /// to here for the built-in DTYPs.

@@ -23,6 +23,24 @@ pub enum PvaError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// This side ran out of memory growing a buffer for an inbound message,
+    /// and shed the connection rather than dying.
+    ///
+    /// Distinct from [`PvaError::Protocol`] on purpose: a protocol error says
+    /// the *peer* sent something wrong, this says *we* could not accommodate
+    /// something the peer was entitled to send. Conflating them would put a
+    /// capacity problem in the bucket an operator reads as "that client is
+    /// broken".
+    ///
+    /// The alternative is not a different error — it is `handle_alloc_error`,
+    /// which aborts the whole IOC. pvxs cannot abort here: every bufferevent
+    /// callback is wrapped in `catch(std::exception&)` followed by
+    /// `conn->cleanup()` (`conn.cpp:307-335`), so a `bad_alloc` sheds exactly
+    /// one connection and the server keeps serving. This variant is how that
+    /// behaviour is reached in Rust.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     #[error("connection refused")]
     ConnectionRefused,
 

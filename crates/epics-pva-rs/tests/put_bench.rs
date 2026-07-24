@@ -25,6 +25,8 @@
 //! localhost that phase is RTT-bound and small. The CREATE_CHANNEL cost
 //! IS measured (it is the per-channel connect work).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,7 +114,10 @@ impl ChannelSource for BenchSource {
     async fn is_writable(&self, _name: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _name: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         // No monitors in this benchmark.
         None
     }

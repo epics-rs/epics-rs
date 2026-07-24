@@ -15,6 +15,8 @@
 //! (link path), On-Change hash across successive scalar updates, and the OUT
 //! target's received type.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -117,17 +119,17 @@ record(aao, "AAO:CL") {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("AAO:CL").await.unwrap(),
+        db.get_pv("AAO:CL").unwrap(),
         EpicsValue::DoubleArray(vec![3.5]),
         "a scalar DOL lands as element 0 of the array (NORD=1), not a scalar VAL"
     );
     assert_eq!(
-        db.get_pv("AAO:CL.NORD").await.unwrap().to_f64(),
+        db.get_pv("AAO:CL.NORD").unwrap().to_f64(),
         Some(1.0),
         "C: nord = nReq = 1"
     );
     assert_eq!(
-        db.get_pv("AAO:TGT").await.unwrap(),
+        db.get_pv("AAO:TGT").unwrap(),
         EpicsValue::DoubleArray(vec![3.5]),
         "the OUT target receives an ARRAY, not the scalar"
     );

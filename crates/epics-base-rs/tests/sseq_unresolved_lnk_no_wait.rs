@@ -28,6 +28,8 @@
 //! any path where that completion is not delivered, a step waiting forever on a
 //! put that was never made.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -47,7 +49,7 @@ async fn kick(db: &PvDatabase, name: &str) {
 
 async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     for _ in 0..400 {
-        if let Ok(EpicsValue::Short(v)) = db.get_pv(pv).await
+        if let Ok(EpicsValue::Short(v)) = db.get_pv(pv)
             && v == want
         {
             return;
@@ -56,7 +58,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     }
     panic!(
         "{label}: {pv} did not reach Short({want}) (last {:?})",
-        db.get_pv(pv).await
+        db.get_pv(pv)
     );
 }
 
@@ -86,10 +88,8 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
 
     let mut wtg_rx = db
         .get_record("SS_NR")
-        .await
         .unwrap()
         .write()
-        .await
         .add_subscriber(
             "WTG1",
             1,
@@ -103,7 +103,7 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
     // The sequence finishes: step 2 lands and BUSY clears.
     poll_short(&db, "SS_NR.BUSY", 0, "the sequence must complete").await;
     assert_eq!(
-        db.get_pv("SS_NR_TGT2.VAL").await.unwrap(),
+        db.get_pv("SS_NR_TGT2.VAL").unwrap(),
         EpicsValue::Double(22.0),
         "step 2 must still run — step 1 made no put, so it blocks nothing"
     );
@@ -114,7 +114,7 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
          whose LNK resolves to no class must emit NO WTG1 event at all"
     );
     assert_eq!(
-        db.get_pv("SS_NR.WTG1").await.unwrap(),
+        db.get_pv("SS_NR.WTG1").unwrap(),
         EpicsValue::Short(0),
         "WTG1 must never have been raised"
     );
@@ -145,12 +145,12 @@ async fn r17_3_a_wait_step_with_a_resolvable_local_lnk_still_puts() {
     poll_short(&db, "SS_NR2.BUSY", 0, "the sequence must complete").await;
 
     assert_eq!(
-        db.get_pv("SS_NR2_TGT.VAL").await.unwrap(),
+        db.get_pv("SS_NR2_TGT.VAL").unwrap(),
         EpicsValue::Double(33.0),
         "a resolvable target is still written"
     );
     assert_eq!(
-        db.get_pv("SS_NR2.WTG1").await.unwrap(),
+        db.get_pv("SS_NR2.WTG1").unwrap(),
         EpicsValue::Short(0),
         "no put-callback on a DB link (C `dbPutLink`), so no wait"
     );

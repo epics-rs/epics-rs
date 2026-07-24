@@ -27,6 +27,8 @@
 //! consumer inherited NOTHING from a not-yet-processed source — the IOC-startup
 //! ordering case MS exists for.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -59,8 +61,8 @@ async fn a_never_processed_record_is_udf_invalid_after_init() {
     .await;
 
     for name in ["A1", "C1", "B1", "W1"] {
-        let rec = db.get_record(name).await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record(name).unwrap();
+        let inst = rec.read();
         assert!(inst.common.udf != 0, "{name}: never processed, so UDF");
         assert_eq!(
             inst.common.stat,
@@ -93,8 +95,8 @@ async fn ms_inherits_the_initial_udf_severity_from_an_unprocessed_source() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CON").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CON").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -136,8 +138,8 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
     .await;
 
     for name in ["QT1", "QB1", "QS1", "QC1"] {
-        let rec = db.get_record(name).await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record(name).unwrap();
+        let inst = rec.read();
         assert!(
             inst.common.udf == 0,
             "{name}: field(VAL,…) clears UDF at load (C dbPutString)"
@@ -155,8 +157,8 @@ async fn a_db_val_defines_the_record_so_the_seed_does_not_fire() {
     }
 
     // The control: the same load, no VAL, still INVALID.
-    let rec = db.get_record("QT2").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("QT2").unwrap();
+    let inst = rec.read();
     assert!(inst.common.udf != 0);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
@@ -190,14 +192,15 @@ async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
     }
     db.ioc_init().await;
 
-    let rec = db.get_record("RT1").await.unwrap();
-    let inst = rec.read().await;
-    assert!(inst.common.udf == 0, "RT1: field(VAL,…) clears UDF at load");
-    assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
-    drop(inst);
+    let rec = db.get_record("RT1").unwrap();
+    {
+        let inst = rec.read();
+        assert!(inst.common.udf == 0, "RT1: field(VAL,…) clears UDF at load");
+        assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);
+    }
 
-    let rec = db.get_record("RT2").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("RT2").unwrap();
+    let inst = rec.read();
     assert!(inst.common.udf != 0);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 
@@ -209,8 +212,8 @@ async fn the_runtime_db_loader_applies_the_val_udf_rule_too() {
 #[tokio::test]
 async fn the_initial_severity_comes_from_udfs() {
     let db = build(r#"record(ai, "A2") { field(UDFS, "MINOR") }"#).await;
-    let rec = db.get_record("A2").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("A2").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.sevr, AlarmSeverity::Minor);
     assert_eq!(inst.common.stat, alarm_status::UDF_ALARM);
 }
@@ -225,8 +228,8 @@ async fn the_initial_severity_clears_on_the_first_successful_process() {
     let mut v = HashSet::new();
     db.process_record_with_links("C2", &mut v, 0).await.unwrap();
 
-    let rec = db.get_record("C2").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("C2").unwrap();
+    let inst = rec.read();
     assert!(inst.common.udf == 0);
     assert_eq!(inst.common.stat, alarm_status::NO_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::NoAlarm);

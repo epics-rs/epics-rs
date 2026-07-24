@@ -18,6 +18,8 @@
 //! severity is NOT lost, and neutralizing the gate drives the target to OVAL,
 //! proving the suppression is the gate's doing.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -38,8 +40,8 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     {
-        let rec = db.get_record("SRC").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("SRC").unwrap();
+        let mut inst = rec.write();
         inst.put_common_field("HIHI", EpicsValue::Double(100.0))
             .unwrap();
         inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Invalid as i16))
@@ -72,7 +74,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SRC").await.unwrap().read().await.common.sevr,
+        db.get_record("SRC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "SRC must be INVALID with a finite VAL=200 (HIHI=100/HHSV=INVALID)"
     );
@@ -83,18 +85,12 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SC")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .record
-            .get_field("DLYA"),
+        db.get_record("SC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::Short(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUT must not be written on the ODLY delaying cycle"
     );
@@ -107,14 +103,14 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_record("SC").await.unwrap().read().await.common.sevr,
+        db.get_record("SC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
         "continuation commits the carried MS-link nsev to sevr==INVALID \
          (not lost across the ODLY gap) — matches C carrying nsev to the \
          pact cycle"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "IVOA=Don't_drive must suppress the OUT write on the ODLY delayed \
          cycle for a non-persistent (MS-link) INVALID source too \

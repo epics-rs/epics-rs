@@ -10,6 +10,9 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,7 +79,7 @@ impl ChannelSource for FiniteSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let holder = self.tx.clone();
         async move {
             // Hand the subscriber a fresh receiver. The matching sender is
@@ -84,7 +87,7 @@ impl ChannelSource for FiniteSource {
             // triggering the server's MONITOR FINISH emission.
             let (sub_tx, sub_rx) = mpsc::channel::<PvField>(8);
             *holder.lock().await = Some(sub_tx);
-            Some(sub_rx)
+            Some(sub_rx.into())
         }
     }
 }

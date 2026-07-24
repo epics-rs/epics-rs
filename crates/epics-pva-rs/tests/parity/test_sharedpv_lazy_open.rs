@@ -18,6 +18,8 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,9 +114,13 @@ async fn lazy_first_connect_pv_serves_monitor_on_creating_channel() {
     let (tx, rx) = std::sync::mpsc::channel::<PvField>();
     let _handle = tokio::time::timeout(
         Duration::from_secs(3),
-        client.pvmonitor_handle("dut", move |_: &FieldDesc, v: &PvField| {
-            let _ = tx.send(v.clone());
-        }),
+        client.pvmonitor_handle(
+            "dut",
+            move |_: &FieldDesc, v: &PvField| {
+                let _ = tx.send(v.clone());
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("pvmonitor_handle timed out")

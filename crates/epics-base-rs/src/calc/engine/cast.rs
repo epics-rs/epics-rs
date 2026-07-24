@@ -8,20 +8,20 @@
 //!
 //! | dialect | bit / shift ops | MODULO / NINT |
 //! |---|---|---|
-//! | base `calcPerform.c` | [`d2i`] / [`d2ui`] (:324-325, :329-366) | [`d2i`] (MODULO :176-190, NINT :313-317) since `669a25697` / PR #925 |
-//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | [`c_long`] — `(long)` (MODULO :1121, NINT :730) |
-//! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | MODULO [`c_int`] — `(int)` (:661, :685, :711); NINT [`c_long`] — `(long)` (:839, :1096) |
+//! | base `calcPerform.c` | `d2i` / `d2ui` (:324-325, :329-366) | `d2i` (MODULO :176-190, NINT :313-317) since `669a25697` / PR #925 |
+//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | `c_long` — `(long)` (MODULO :1121, NINT :730) |
+//! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | MODULO `c_int` — `(int)` (:661, :685, :711); NINT `c_long` — `(long)` (:839, :1096) |
 //!
-//! MODULO and NINT share the single [`nint`]/[`imod`] owners, but each engine
+//! MODULO and NINT share the single `nint`/`imod` owners, but each engine
 //! passes its OWN dialect's narrowing — one logic, several narrowings. The C
 //! engines have genuinely different integer widths, so the port mirrors each
 //! rather than forcing one; sCalc's `(long)` even loses less than base's `d2i`
 //! (3e9 survives 64-bit intact). Note aCalc is internally inconsistent: its NINT
 //! is `(long)` (64-bit) but its MODULO is `(int)` (32-bit), so the array engine
-//! passes `c_long` to [`nint`] and `c_int` to [`imod`]. The zero-divisor
+//! passes `c_long` to `nint` and `c_int` to `imod`. The zero-divisor
 //! disposition and the `-1 → 0` guard are uniform (CBUG-A2/A1).
 //!
-//! [`d2i`]/[`d2ui`] are *not* general truncating casts: they route a
+//! `d2i`/`d2ui` are *not* general truncating casts: they route a
 //! non-negative double through `epicsUInt32` first, so `3e9` becomes
 //! `-1294967296` (bit pattern preserved) instead of overflowing. That
 //! reinterpretation is exactly what base wants for a bitwise operand and

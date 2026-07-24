@@ -15,6 +15,8 @@
 //! `~/codes/pvxs/bin/<arch>/`, the test prints a SKIP line and
 //! returns OK so a CI host without pvxs built doesn't fail.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{
     DropChild, SOFT_IOC_PVX, pick_localhost_port, pvxs_command, pvxs_dbd_dir, require_pvxs,
 };
@@ -109,9 +111,13 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
     let events = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_cb = events.clone();
     let handle = client
-        .pvmonitor_handle("R1:CNT", move |_desc, _v| {
-            events_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
+        .pvmonitor_handle(
+            "R1:CNT",
+            move |_desc, _v| {
+                events_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            |_| {},
+        )
         .await
         .expect("subscribe");
 

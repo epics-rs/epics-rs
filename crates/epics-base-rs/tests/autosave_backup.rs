@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::time::Duration;
 
 use epics_base_rs::server::autosave::backup::{

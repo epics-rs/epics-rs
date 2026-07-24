@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::error::CaResult;
-use crate::server::event_queue::EventReader;
+use crate::server::event_queue::{EventReader, TryRecvError};
 use crate::server::pv::MonitorEvent;
 use crate::server::recgbl::EventMask;
 use crate::types::{DbFieldType, EpicsValue};
@@ -86,7 +86,6 @@ impl DbChannel {
     pub async fn get_f64(&self) -> f64 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0)
@@ -95,7 +94,6 @@ impl DbChannel {
     pub async fn get_i16(&self) -> i16 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| v.to_f64())
             .map(|f| f as i16)
@@ -103,7 +101,7 @@ impl DbChannel {
     }
 
     pub async fn get_string(&self) -> String {
-        match self.db.get_pv(&self.name).await {
+        match self.db.get_pv(&self.name) {
             Ok(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             Ok(v) => v.to_string(),
             Err(_) => String::new(),
@@ -199,7 +197,6 @@ impl DbChannel {
     pub async fn get_i32(&self) -> i32 {
         self.db
             .get_pv(&self.name)
-            .await
             .ok()
             .and_then(|v| match v {
                 EpicsValue::Long(i) => Some(i),
@@ -234,7 +231,7 @@ pub struct DbSubscription {
     ignore_origin: u64,
     /// Reference back to the record + this subscription's sid, for the
     /// enable/disable (`db_event_disable`) path and the `Drop` reaper.
-    record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
     sid: u32,
 }
 
@@ -249,7 +246,7 @@ pub struct DbSubscription {
 /// stays consistent.
 #[derive(Clone)]
 pub struct SubscriptionActivation {
-    record: std::sync::Arc<tokio::sync::RwLock<crate::server::record::RecordInstance>>,
+    record: std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
     sid: u32,
 }
 
@@ -258,10 +255,7 @@ impl SubscriptionActivation {
     /// flow at the source. Same semantics as [`DbSubscription::set_active`]
     /// — see that method for the `db_event_disable` parity rationale.
     pub async fn set_active(&self, active: bool) {
-        self.record
-            .write()
-            .await
-            .set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.sid, active);
     }
 }
 
@@ -310,10 +304,10 @@ impl DbSubscription {
     ) -> Option<Self> {
         let (record_name, field) = parse_pv_name(pv_name);
         let field = field.to_ascii_uppercase();
-        let rec = db.get_record(record_name).await?;
+        let rec = db.get_record(record_name)?;
         let sid = next_sid();
         let reader = {
-            let mut instance = rec.write().await;
+            let mut instance = rec.write();
             let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
             if let Some(chain) = filters {
                 for filter in chain.iter() {
@@ -341,10 +335,7 @@ impl DbSubscription {
     /// the monitor from the record, it does not touch the event queue).
     /// Idempotent.
     pub async fn set_active(&self, active: bool) {
-        self.record
-            .write()
-            .await
-            .set_subscriber_active(self.sid, active);
+        self.record.write().set_subscriber_active(self.sid, active);
     }
 
     /// A detachable [`SubscriptionActivation`] for this subscription's
@@ -372,6 +363,37 @@ impl DbSubscription {
             }
             return Some(event);
         }
+    }
+
+    /// Non-blocking [`Self::next_event`] — the same `ignore_origin` filter,
+    /// no suspension. Delegates to [`EventReader::try_recv`]
+    /// (`event_queue.rs:570`), which this subscription's queue already
+    /// provides; nothing new is queued or gated here.
+    ///
+    /// Exists so a consumer that adapts this stream (PVA's monitor sources)
+    /// can be polled from a blocking drain loop without a reactor — the RTEMS
+    /// backend, `doc/rtems-runtime-portability-design.md` §9 phase 6. A
+    /// skipped `ignore_origin` event does not end the poll: the loop keeps
+    /// taking until it finds a deliverable event or the queue reports empty,
+    /// so a self-origin post cannot be misread as "nothing available".
+    fn try_next_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        loop {
+            let event = self.reader.try_recv()?;
+            if self.ignore_origin != 0 && event.origin == self.ignore_origin {
+                continue;
+            }
+            return Ok(event);
+        }
+    }
+
+    /// Non-blocking [`Self::recv_snapshot`].
+    pub fn try_recv_snapshot(&mut self) -> Result<crate::server::snapshot::Snapshot, TryRecvError> {
+        self.try_next_event().map(|e| e.snapshot)
+    }
+
+    /// Non-blocking [`Self::recv_event`].
+    pub fn try_recv_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        self.try_next_event()
     }
 
     /// Wait for the next value change. Returns the new value as f64.
@@ -410,6 +432,34 @@ impl DbSubscription {
         self.next_event().await
     }
 
+    /// Poll-based [`Self::recv_event`] — the same `ignore_origin` filter,
+    /// `Poll::Pending` with the caller's waker registered on the queue where
+    /// `recv_event()` would suspend.
+    ///
+    /// Exists so ONE task can await MANY subscriptions without spawning a
+    /// forwarder per reader: the QSRV group drain polls every member's
+    /// subscription in turn and parks once, its waker held in each polled
+    /// queue's [`EvQue`](crate::server::event_queue::EvQue) until
+    /// `wake_readers` flushes it. A skipped `ignore_origin` event does not
+    /// end the poll — the loop keeps taking until it finds a deliverable
+    /// event or the queue parks it, so a self-origin post cannot be misread
+    /// as "nothing available".
+    pub fn poll_recv_event(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<MonitorEvent>> {
+        loop {
+            match self.reader.poll_recv(cx) {
+                std::task::Poll::Ready(Some(event))
+                    if self.ignore_origin != 0 && event.origin == self.ignore_origin =>
+                {
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+
     pub fn pv_name(&self) -> &str {
         &self.pv_name
     }
@@ -434,11 +484,12 @@ impl Drop for DbSubscription {
         // Drop runs in sync context but we need an async write lock.
         // Spawn a fire-and-forget cleanup task. If no tokio runtime is
         // current (e.g., subscription created in a sync test that
-        // never started a runtime), `tokio::spawn` will panic — but
-        // that scenario can't have an active subscription anyway.
+        // never started a runtime), `task::spawn` will panic (it
+        // delegates to `tokio::spawn`) — but that scenario can't have
+        // an active subscription anyway.
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                record.write().await.remove_subscriber(sid);
+            crate::runtime::task::spawn(async move {
+                record.write().remove_subscriber(sid);
             });
         }
     }
@@ -495,7 +546,7 @@ impl DbMultiMonitor {
                 }
             }
             // No events ready — yield briefly then retry
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            crate::runtime::task::sleep(Duration::from_millis(10)).await;
         }
     }
 }

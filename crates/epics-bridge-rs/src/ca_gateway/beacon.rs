@@ -11,6 +11,8 @@
 //! This module just throttles "beacon anomaly" requests according to
 //! the C++ `GATE_RECONNECT_INHIBIT` (5 minutes) so we don't spam.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

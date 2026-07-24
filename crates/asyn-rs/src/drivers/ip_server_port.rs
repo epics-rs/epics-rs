@@ -865,6 +865,10 @@ impl DrvAsynIPServerPort {
     /// accept: a client sat in the backlog until it timed out while the port
     /// reported Connected.
     fn start_accept_loop(&mut self, listener: &TcpListener) -> AsynResult<()> {
+        // NOT RTEMS-SAFE if this crate is ever built for RTEMS: `try_clone`
+        // is `fcntl(F_DUPFD*)`, which fails on any libbsd socket — see
+        // `epics-ca-rs/src/server/blocking.rs::handle_client_blocking`. The
+        // fix there is `Arc<TcpStream>` + `impl Read/Write for &TcpStream`.
         let accept_listener = listener.try_clone().map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("listener try_clone failed: {e}"),

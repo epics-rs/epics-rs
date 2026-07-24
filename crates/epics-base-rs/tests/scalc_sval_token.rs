@@ -24,6 +24,8 @@
 //! which takes no `psresult`, and the numeric `postfix()` element table has no
 //! SVAL token — so neither C nor the port has an SVAL in swait.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::calc::{
@@ -193,16 +195,16 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
             .unwrap();
     }
 
-    let num = db.get_record("SW_NUM").await.unwrap();
+    let num = db.get_record("SW_NUM").unwrap();
     assert_eq!(
-        num.read().await.record.get_field("VAL"),
+        num.read().record.get_field("VAL"),
         Some(EpicsValue::Double(7.0)),
         "a numeric swait CALC must still evaluate"
     );
 
-    let strr = db.get_record("SW_STR").await.unwrap();
+    let strr = db.get_record("SW_STR").unwrap();
     assert_eq!(
-        strr.read().await.record.get_field("VAL"),
+        strr.read().record.get_field("VAL"),
         Some(EpicsValue::Double(0.0)),
         "a string swait CALC must not compile (C postfix() has no string tokens), \
          so VAL keeps its initial value — pre-fix the string engine evaluated it \
@@ -229,8 +231,8 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
             .await
             .unwrap();
 
-        let rec = db.get_record("SC_SVAL").await.unwrap();
-        let sval = rec.read().await.record.get_field("SVAL");
+        let rec = db.get_record("SC_SVAL").unwrap();
+        let sval = rec.read().record.get_field("SVAL");
         assert_eq!(
             sval,
             Some(EpicsValue::String(expected.into())),
@@ -266,8 +268,8 @@ async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
             .await
             .unwrap();
 
-        let rec = db.get_record("SC_OSV").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("SC_OSV").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.record.get_field("SVAL"),
             Some(EpicsValue::String("abc".into())),

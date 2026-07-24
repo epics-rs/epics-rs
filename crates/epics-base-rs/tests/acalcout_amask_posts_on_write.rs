@@ -22,6 +22,8 @@
 //! array this cycle", which is what an aCalcout-driven waveform client waits on;
 //! a second identical process must therefore not go silent.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -57,11 +59,10 @@ async fn acalcout(db: &PvDatabase, name: &str, calc: &str) {
 async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
     let db = PvDatabase::new();
     acalcout(&db, "P1", "AA:=BB*2;SUM(AA)").await;
-    let inst = db.get_record("P1").await.unwrap();
+    let inst = db.get_record("P1").unwrap();
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,
@@ -103,11 +104,10 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
 async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P2", "AA:=BB*2;SUM(AA)").await;
-    let inst = db.get_record("P2").await.unwrap();
+    let inst = db.get_record("P2").unwrap();
 
     let mut aa_rx = inst
         .write()
-        .await
         .add_subscriber(
             "AA",
             1,
@@ -121,7 +121,7 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
 
     // Swap in an expression with no store at all. AA keeps its value.
     {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         g.record
             .put_field("CALC", EpicsValue::String("SUM(BB)".into()))
             .unwrap();
@@ -130,7 +130,7 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
     process(&db, "P2").await;
 
     assert_eq!(
-        inst.read().await.record.get_field("AMASK").unwrap(),
+        inst.read().record.get_field("AMASK").unwrap(),
         EpicsValue::ULong(0),
         "no store this cycle"
     );
@@ -147,10 +147,10 @@ async fn r11_c5_an_array_that_was_not_stored_this_cycle_does_not_post() {
 async fn r11_c5_only_the_flagged_arrays_post() {
     let db = PvDatabase::new();
     acalcout(&db, "P3", "CC:=BB;SUM(CC)").await;
-    let inst = db.get_record("P3").await.unwrap();
+    let inst = db.get_record("P3").unwrap();
 
     let (mut bb_rx, mut cc_rx) = {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         let bb = g
             .add_subscriber(
                 "BB",
@@ -178,7 +178,7 @@ async fn r11_c5_only_the_flagged_arrays_post() {
     process(&db, "P3").await;
 
     assert_eq!(
-        inst.read().await.record.get_field("AMASK").unwrap(),
+        inst.read().record.get_field("AMASK").unwrap(),
         EpicsValue::ULong(0x4),
         "bit 2 = CC"
     );

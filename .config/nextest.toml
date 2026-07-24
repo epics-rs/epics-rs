@@ -87,7 +87,7 @@ final-status-level = "flaky"
 # Test groups — cap per-group parallelism to match the resource the
 # group contends on (network ports, env vars, tempfiles).
 [[profile.default.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate)'
+filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
 test-group = 'pva_listener'
 
 [[profile.default.overrides]]
@@ -100,7 +100,7 @@ test-group = 'ndarray_io'
 
 # Same overrides apply under the `ci` profile.
 [[profile.ci.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate)'
+filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
 test-group = 'pva_listener'
 
 [[profile.ci.overrides]]

@@ -29,7 +29,9 @@
 //! the re-coercion.
 
 use crate::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::types::EpicsValue;
+// Only the PVA → EpicsValue direction rebuilds a `PvString`.
+use epics_base_rs::types::PvString;
 
 /// `EpicsValue` → PVA value-leaf `PvField` (scalar or scalar array).
 ///
@@ -166,6 +168,11 @@ pub(crate) fn epics_value_to_field_desc_leaf(v: &EpicsValue) -> FieldDesc {
 /// a filter incompatible with the negotiated descriptor — never a fabricated
 /// stand-in. `UShort`/`UInt` are not carried here; that is a pre-existing
 /// forward-bridge gap, not part of the `DBF_CHAR` family.
+///
+/// Both directions are target-neutral. This backward direction is only ever
+/// driven by an inbound PUT in `server_native::tcp`, which used to be
+/// host-only and carried this function behind the same gate; `tcp` is now
+/// target-neutral itself, so the gate is gone and RTEMS gets the PUT path.
 pub(crate) fn pv_leaf_to_epics_value(f: &PvField) -> Option<EpicsValue> {
     fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
         Some(match sv {

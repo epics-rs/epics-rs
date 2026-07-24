@@ -5,10 +5,11 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(3): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::mpsc;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -57,7 +58,7 @@ impl ChannelSource for ConstSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }
@@ -151,9 +152,12 @@ async fn pva_client_close_is_terminal_no_reuse() {
         .expect("post-close pvput must fail fast");
     assert!(put.is_err(), "post-close pvput must fail, got {put:?}");
 
-    let mon = tokio::time::timeout(fast, client.pvmonitor_handle("dut", |_: &_, _: &_| {}))
-        .await
-        .expect("post-close pvmonitor must fail fast");
+    let mon = tokio::time::timeout(
+        fast,
+        client.pvmonitor_handle("dut", |_: &_, _: &_| {}, |_| {}),
+    )
+    .await
+    .expect("post-close pvmonitor must fail fast");
     assert!(mon.is_err(), "post-close pvmonitor must fail");
 
     let conn = tokio::time::timeout(fast, client.pvconnect("dut"))

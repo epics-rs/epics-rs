@@ -46,6 +46,8 @@
 //!   sees only global (`FROM`-less) DENY rules — a host-targeted deny
 //!   must not remove a PV that is still admissible for other hosts.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::path::Path;
 
 use regex::Regex;
@@ -154,6 +156,62 @@ impl PvListMatch {
 pub struct PvList {
     pub order: EvaluationOrder,
     pub entries: Vec<PvListEntry>,
+}
+
+/// The identity `.pvlist` `DENY FROM` rules are matched against.
+///
+/// **Constructible only from a peer socket address.** That is the whole
+/// point of the type: the two enforcement points that consult `DENY FROM`
+/// used to disagree about what "host" meant — the search/create path passed
+/// the socket address while the write path passed `WriteContext::host`, the
+/// name the CA client *claims* in `HOST_NAME`. A client therefore chose which
+/// DENY row applied to its own writes, and since `from_hosts` holds only
+/// resolved IPv4 quads after [`PvList::resolve_hosts`], a client sending its
+/// real hostname (CA's default) matched no row at all — the write-side deny
+/// never fired.
+///
+/// C pins this to the socket and nothing else: `gateServer::pvExistTest`
+/// takes `clientAddress.getSockIP()` through `ipAddrToDottedIP` and strips
+/// the port, with the `getClientHostName(ctx, ...)` call left commented out
+/// immediately above (`gateServer.cc:1523-1530`). So this is parity, not
+/// added strictness.
+///
+/// Making it a type rather than a convention is what stops the two points
+/// drifting apart again: a claimed name is not a `PolicyHost` and will not
+/// compile at either call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyHost(String);
+
+impl PolicyHost {
+    /// The bracket-less host form of a peer address (`192.0.2.1`, `::1`),
+    /// which is the shape `from_hosts` holds after resolution.
+    pub fn from_peer(peer: std::net::SocketAddr) -> Self {
+        PolicyHost(peer.ip().to_string())
+    }
+
+    /// Same, from the `"ip:port"` string a `WriteContext` carries.
+    ///
+    /// `None` when the string is not a socket address. Callers must treat
+    /// that as **deny**: if the peer cannot be established, a blacklist
+    /// cannot be shown not to apply.
+    pub fn from_peer_str(peer: &str) -> Option<Self> {
+        peer.parse::<std::net::SocketAddr>()
+            .ok()
+            .map(Self::from_peer)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only escape hatch, so the rule-matching tests can feed the
+    /// unresolved hostnames a `.pvlist` file may contain before
+    /// [`PvList::resolve_hosts`] runs. Deliberately `cfg(test)`: production
+    /// has exactly two constructors and both take a peer.
+    #[cfg(test)]
+    pub(crate) fn for_test(host: &str) -> Self {
+        PolicyHost(host.to_string())
+    }
 }
 
 impl PvList {
@@ -289,7 +347,8 @@ impl PvList {
     /// host-scoped rule — matching C, which converts the requester to an
     /// IPv4 dotted string before `findEntry`. Callers pass the TCP peer IP
     /// in bracket-less form (`192.0.2.1`).
-    pub fn is_host_denied(&self, name: &str, host: &str) -> bool {
+    pub fn is_host_denied(&self, name: &str, host: &PolicyHost) -> bool {
+        let host = host.as_str();
         for entry in &self.entries {
             if let PvListEntry::Deny {
                 pattern,
@@ -411,7 +470,7 @@ impl PvList {
     /// `host` must be the bracket-less socket-address host form derived
     /// from the downstream client's address (`127.0.0.1`, `::1`) so it
     /// matches the `.pvlist` `FROM` syntax — see [`Self::is_host_denied`].
-    pub fn match_name_for_host(&self, name: &str, host: &str) -> Option<PvListMatch> {
+    pub fn match_name_for_host(&self, name: &str, host: &PolicyHost) -> Option<PvListMatch> {
         // Host-scoped DENY FROM is a hard blacklist consulted before the
         // normal allow/deny decision (mirrors gateAs::findEntry).
         if self.is_host_denied(name, host) {
@@ -1506,11 +1565,23 @@ mod tests {
         )
         .unwrap();
         // Listed hosts (by name and by IP) are rejected at search time.
-        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
-        assert!(list.match_name_for_host("PV:x", "10.0.0.9").is_none());
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("bad.host"))
+                .is_none()
+        );
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("10.0.0.9"))
+                .is_none()
+        );
         // Any other host is admitted.
-        assert!(list.match_name_for_host("PV:x", "good.host").is_some());
-        assert!(list.match_name_for_host("PV:x", "10.0.0.1").is_some());
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("good.host"))
+                .is_some()
+        );
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("10.0.0.1"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1527,8 +1598,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
-        assert!(list.match_name_for_host("PV:x", "good.host").is_some());
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("bad.host"))
+                .is_none()
+        );
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("good.host"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1544,9 +1621,18 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(list.match_name_for_host("PV:x", "BAD.HOST").is_none());
-        assert!(list.match_name_for_host("PV:x", "bad.host").is_none());
-        assert!(list.match_name_for_host("PV:x", "other.host").is_some());
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("BAD.HOST"))
+                .is_none()
+        );
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("bad.host"))
+                .is_none()
+        );
+        assert!(
+            list.match_name_for_host("PV:x", &PolicyHost::for_test("other.host"))
+                .is_some()
+        );
     }
 
     /// C ca-gateway precedence is bottom-to-top: a later (lower-in-file),
@@ -1791,9 +1877,9 @@ mod tests {
             panic!("expected Deny");
         }
         // Deny fires for the literal IP.
-        assert!(list.is_host_denied("PV:x", "192.0.2.1"));
+        assert!(list.is_host_denied("PV:x", &PolicyHost::for_test("192.0.2.1")));
         // Other IPs are not denied.
-        assert!(!list.is_host_denied("PV:x", "192.0.2.2"));
+        assert!(!list.is_host_denied("PV:x", &PolicyHost::for_test("192.0.2.2")));
     }
 
     /// A hostname in DENY FROM is resolved and the resolved IP denies
@@ -1821,7 +1907,9 @@ mod tests {
                 );
             }
             // The resolved IP (127.0.0.1) must deny the peer.
-            let denied = from_hosts.iter().any(|ip| list.is_host_denied("PV:x", ip));
+            let denied = from_hosts
+                .iter()
+                .any(|ip| list.is_host_denied("PV:x", &PolicyHost::for_test(ip)));
             assert!(denied, "resolved IP must be denied");
         } else {
             panic!("expected Deny");
@@ -1881,7 +1969,7 @@ mod tests {
         // The rule collapsed to a global deny: no longer host-targeted, so the
         // host-targeted `is_host_denied` check does not match it. The deny is
         // now enforced globally by `match_name` (see `is_global_deny`).
-        assert!(!list.is_host_denied("PV:x", "10.0.0.1"));
+        assert!(!list.is_host_denied("PV:x", &PolicyHost::for_test("10.0.0.1")));
         // Distinguishing assertion (fail-closed vs fail-open): under the default
         // ALLOW,DENY order the collapsed global deny must make `match_name`
         // reject the pattern outright. `is_host_denied` alone is true under both
@@ -1916,7 +2004,7 @@ mod tests {
             "IPv6 literal must be dropped (C aToIPAddr is IPv4-only); got {from_hosts:?}"
         );
         // The IPv6 loopback peer is not host-scoped denied (C cannot scope it).
-        assert!(!list.is_host_denied("PV:x", "::1"));
+        assert!(!list.is_host_denied("PV:x", &PolicyHost::for_test("::1")));
         // Having no surviving host token, the rule is now a global deny — under
         // the default ALLOW,DENY order `match_name` rejects the pattern.
         assert!(
@@ -1948,14 +2036,151 @@ mod tests {
             "only the IPv4 token survives; the IPv6 token is dropped"
         );
         // IPv4 token still scopes the deny to its peer.
-        assert!(list.is_host_denied("PV:x", "192.0.2.1"));
+        assert!(list.is_host_denied("PV:x", &PolicyHost::for_test("192.0.2.1")));
         // IPv6 peer is not denied (no Rust-only scoped IPv6 deny).
-        assert!(!list.is_host_denied("PV:x", "::1"));
+        assert!(!list.is_host_denied("PV:x", &PolicyHost::for_test("::1")));
         // A surviving host token keeps the rule host-targeted, so a different
         // host that is NOT 192.0.2.1 still reaches the ALLOW.
         assert!(
             list.match_name("PV:x").is_some(),
             "a surviving IPv4 host token keeps the deny host-scoped, not global"
+        );
+    }
+    /// The identity a `DENY FROM` row is matched against comes from the
+    /// socket and nothing else — a client cannot select which row applies to
+    /// it by choosing what to claim in CA `HOST_NAME`.
+    ///
+    /// Before this, the write path passed `WriteContext::host` (the claimed
+    /// name) while the search/create path passed the peer address, so the two
+    /// enforcement points disagreed about what "host" meant. Both now take a
+    /// `PolicyHost`, which only a peer address can produce.
+    #[test]
+    fn a_claimed_host_cannot_select_which_deny_row_applies() {
+        let list = parse_pvlist(
+            "EVALUATION ORDER ALLOW, DENY\n             .* ALLOW\n             SECRET:.* DENY FROM 192.0.2.7\n",
+        )
+        .expect("pvlist parses");
+
+        // The denied peer is denied, whatever it claims to be. The claim is
+        // not even expressible here: `from_peer` reads the socket.
+        let denied: std::net::SocketAddr = "192.0.2.7:44321".parse().unwrap();
+        assert!(
+            list.is_host_denied("SECRET:PV", &PolicyHost::from_peer(denied)),
+            "the row must fire on the peer address"
+        );
+        assert!(
+            list.match_name_for_host("SECRET:PV", &PolicyHost::from_peer(denied))
+                .is_none()
+        );
+
+        // A different peer is not denied, and cannot be made denied by
+        // claiming to be the denied host either.
+        let other: std::net::SocketAddr = "198.51.100.9:1234".parse().unwrap();
+        assert!(!list.is_host_denied("SECRET:PV", &PolicyHost::from_peer(other)));
+        assert!(
+            list.match_name_for_host("SECRET:PV", &PolicyHost::from_peer(other))
+                .is_some()
+        );
+
+        // The port is not part of the identity: the same host on any port is
+        // the same policy subject. C strips it explicitly
+        // (`gateServer.cc:1529`, `strchr(hostname, \':\')`).
+        for port in [1u16, 5064, 65535] {
+            let same = std::net::SocketAddr::new(denied.ip(), port);
+            assert!(
+                list.is_host_denied("SECRET:PV", &PolicyHost::from_peer(same)),
+                "port {port} must not change the decision"
+            );
+        }
+
+        // Both enforcement points reach the same verdict for the same peer —
+        // that is the property that was broken.
+        for peer in [denied, other] {
+            let h = PolicyHost::from_peer(peer);
+            assert_eq!(
+                list.is_host_denied("SECRET:PV", &h),
+                list.match_name_for_host("SECRET:PV", &h).is_none(),
+                "the write path and the search path must agree for {peer}"
+            );
+        }
+    }
+
+    /// `WriteContext::peer` is an `"ip:port"` string; the funnel accepts it
+    /// and rejects anything that is not a socket address, so a caller cannot
+    /// smuggle a name in through the string form.
+    #[test]
+    fn the_peer_string_funnel_accepts_only_socket_addresses() {
+        assert_eq!(
+            PolicyHost::from_peer_str("192.0.2.7:44321").map(|h| h.as_str().to_string()),
+            Some("192.0.2.7".to_string())
+        );
+        assert_eq!(
+            PolicyHost::from_peer_str("[::1]:5064").map(|h| h.as_str().to_string()),
+            Some("::1".to_string()),
+            "IPv6 is bracket-less once it is a policy host"
+        );
+        for not_a_peer in [
+            "opi-1",               // a claimed name
+            "trusted-console.lab", // a claimed name that looks authoritative
+            "192.0.2.7",           // an address with no port is not a peer
+            "",
+        ] {
+            assert!(
+                PolicyHost::from_peer_str(not_a_peer).is_none(),
+                "{not_a_peer:?} is not a peer address and must not become a PolicyHost"
+            );
+        }
+    }
+
+    /// Source guard on the property the type is carrying: in production,
+    /// `PolicyHost` can be built ONLY from a peer.
+    ///
+    /// The compiler already enforces the call sites — reverting either
+    /// enforcement point to a claimed name does not compile, because a
+    /// `String` is not a `PolicyHost` and the only test constructor is
+    /// `cfg(test)`. What the compiler cannot notice is someone ADDING a
+    /// production constructor that takes an arbitrary string, which would
+    /// quietly reopen the whole finding. That is what this reads.
+    #[test]
+    fn policy_host_has_no_production_constructor_from_an_arbitrary_string() {
+        let src = include_str!("pvlist.rs");
+        let start = src.find("impl PolicyHost {").expect("impl block");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("end of impl block");
+        let body = &body[..end];
+
+        let mut cfg_test = false;
+        let mut production_fns = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if t == "#[cfg(test)]" {
+                cfg_test = true;
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("pub fn ").or_else(|| t.strip_prefix("fn ")) {
+                let name = rest.split(['(', '<']).next().unwrap_or("").to_string();
+                if cfg_test {
+                    assert_eq!(
+                        name, "for_test",
+                        "the only cfg(test) member may be the test constructor"
+                    );
+                } else {
+                    production_fns.push(name);
+                }
+                cfg_test = false;
+            }
+        }
+        production_fns.sort();
+        assert_eq!(
+            production_fns,
+            vec![
+                "as_str".to_string(),
+                "from_peer".to_string(),
+                "from_peer_str".to_string()
+            ],
+            "PolicyHost's production surface changed. Every constructor must \
+             take a peer address; a constructor accepting an arbitrary string \
+             reopens the claimed-host finding this type exists to close."
         );
     }
 }

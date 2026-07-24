@@ -29,7 +29,7 @@ pub struct CommonFields {
     /// the served byte: `caput UDF 255` stores 255 and `caget` renders it
     /// signed `DBR_CHAR` (-1). Modeled as the raw `u8` so the byte round-trips
     /// on records that do not re-derive it; every predicate reader tests
-    /// `!= 0`, and the record-facing [`ProcessContext::udf`] boundary keeps the
+    /// `!= 0`, and the record-facing [`crate::server::record::ProcessContext::udf`] boundary keeps the
     /// `bool` view.
     pub udf: u8,
     /// `UDFS` (`DBF_MENU menu(menuAlarmSevr)`) — the severity raised for a UDF
@@ -55,7 +55,7 @@ pub struct CommonFields {
     /// (`rec_gbl_check_simm`). Read-only to clients (SPC_NOMOD).
     pub oldsimm: i16,
     /// `PINI` is `DBF_MENU`/`menu(menuPini)` — a six-choice lifecycle
-    /// selector, not a flag (see [`PiniMode`] for the choice semantics). Holds
+    /// selector, not a flag (see [`crate::server::record::PiniMode`] for the choice semantics). Holds
     /// the **raw stored ordinal** as `i16`: C stores `(epicsEnum16)` verbatim on
     /// a numeric put, so `caput REC.PINI 6` keeps `6` and `caput REC.PINI -1`
     /// keeps `65535`. `doRecordPini` compares against the exact valid indices,
@@ -95,7 +95,7 @@ pub struct CommonFields {
     pub asg: String,
     /// Access security level. C `dbCommon.ASL`
     /// (0 or 1, default 0). Compared against `RULE(N, …)` levels
-    /// in [`crate::server::access_security::check_access_method`] —
+    /// in [`crate::server::access_security::AccessSecurityConfig::check_access_method`] —
     /// a rule with `RULE(M, …)` only applies when `ASL ≤ M`. The
     /// earlier code hard-coded ASL=0 at every ACF call site
     /// (CA tcp.rs, PVA native_source GET/PUT/MONITOR), so every

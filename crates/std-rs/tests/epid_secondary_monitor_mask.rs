@@ -94,12 +94,12 @@ async fn set(db: &PvDatabase, rec: &str, v: f64) {
 #[tokio::test]
 async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let full = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
     let mut readers = Vec::new();
     {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         for (i, f) in SECONDARIES.iter().enumerate() {
             let r = g
                 .add_subscriber(f, i as u32 + 1, DbFieldType::Double, full)
@@ -109,12 +109,10 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     }
     let mut val_rx = inst
         .write()
-        .await
         .add_subscriber("VAL", 100, DbFieldType::Double, full)
         .expect("a VAL subscription must be accepted");
     let mut stat_rx = inst
         .write()
-        .await
         .add_subscriber("STAT", 101, DbFieldType::Short, EventMask::ALARM.bits())
         .expect("a STAT subscription must be accepted");
 
@@ -138,7 +136,7 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     // The cycle DID raise an alarm — without this the masks below would be
     // trivially alarm-free and the test would pass on a broken port.
     {
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(
             g.common.sevr,
             AlarmSeverity::Major,
@@ -194,11 +192,11 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
 #[tokio::test]
 async fn r11_64_an_alarm_only_subscriber_on_a_secondary_never_fires() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let mut alarm_only = Vec::new();
     {
-        let mut g = inst.write().await;
+        let mut g = inst.write();
         for (i, f) in SECONDARIES.iter().enumerate() {
             let r = g
                 .add_subscriber(
@@ -222,7 +220,7 @@ async fn r11_64_an_alarm_only_subscriber_on_a_secondary_never_fires() {
     process(&db, "PID").await; // MAJOR -> NO_ALARM
 
     {
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm);
     }
     for (field, rx) in &mut alarm_only {
@@ -240,11 +238,10 @@ async fn r11_64_an_alarm_only_subscriber_on_a_secondary_never_fires() {
 #[tokio::test]
 async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
     let db = closed_loop_epid().await;
-    let inst = db.get_record("PID").await.unwrap();
+    let inst = db.get_record("PID").unwrap();
 
     let mut oval_rx = inst
         .write()
-        .await
         .add_subscriber("OVAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
         .expect("an OVAL subscription must be accepted");
 
@@ -263,7 +260,7 @@ async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
     );
     assert_eq!(second.mask, EventMask::VALUE | EventMask::LOG);
     {
-        let g = inst.read().await;
+        let g = inst.read();
         assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm, "no alarm was raised");
     }
 }

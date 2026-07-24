@@ -40,6 +40,8 @@
 //! the others stranded the put forever AND bricked the record for every later
 //! put-notify.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -141,9 +143,9 @@ async fn busy_record() -> Fixture {
         .await
         .unwrap();
 
-    let rec = db.get_record("ASY").await.unwrap();
+    let rec = db.get_record("ASY").unwrap();
     assert!(
-        rec.read().await.is_processing(),
+        rec.read().is_processing(),
         "the first pass returned AsyncPending: the record must be PACT"
     );
 
@@ -151,8 +153,8 @@ async fn busy_record() -> Fixture {
 }
 
 async fn val(db: &PvDatabase) -> i32 {
-    let rec = db.get_record("ASY").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("ASY").unwrap();
+    let inst = rec.read();
     match inst.record.get_field("VAL") {
         Some(EpicsValue::Long(v)) => v,
         other => panic!("ASY.VAL: {other:?}"),
@@ -160,8 +162,8 @@ async fn val(db: &PvDatabase) -> i32 {
 }
 
 async fn rpro(db: &PvDatabase) -> bool {
-    let rec = db.get_record("ASY").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("ASY").unwrap();
+    let inst = rec.read();
     inst.common.rpro != 0
 }
 
@@ -175,6 +177,7 @@ async fn put_notify_on_a_pact_record_writes_nothing() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .expect("the put is accepted (deferred), not refused")
+            .into_handle()
             .expect("a deferred put-notify hands back a receiver to await");
 
     assert_eq!(
@@ -207,6 +210,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .unwrap()
+            .into_handle()
             .expect("deferred: receiver handed back");
 
     // The device round-trip finishes: C `dbNotifyCompletion` runs here.
@@ -249,6 +253,7 @@ async fn a_second_put_notify_onto_a_deferred_record_is_refused() {
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .unwrap()
+            .into_handle()
             .expect("first put deferred");
 
     let err =
@@ -351,9 +356,9 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     db.process_record_with_links("ODL", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("ODL").await.unwrap();
+    let rec = db.get_record("ODL").unwrap();
     assert!(
-        rec.read().await.is_processing(),
+        rec.read().is_processing(),
         "the ODLY window holds PACT (C keeps the record ACTIVE on the watchdog)"
     );
 
@@ -361,6 +366,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
         .put_record_field_from_ca("ODL", "VAL", EpicsValue::Long(7))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     // The delay expires: the continuation ends the cycle and releases PACT.
@@ -371,11 +377,11 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
 
     expect_callback(rx, "the ODLY continuation").await;
     assert!(
-        !rec.read().await.is_processing(),
+        !rec.read().is_processing(),
         "the continuation left the record idle"
     );
     assert_eq!(
-        rec.read().await.record.get_field("VAL"),
+        rec.read().record.get_field("VAL"),
         Some(EpicsValue::Long(7)),
         "the deferred value must be written by the replay"
     );
@@ -386,7 +392,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
         .await
         .expect("a later put-notify on the now-idle record must be accepted");
     assert_eq!(
-        rec.read().await.record.get_field("VAL"),
+        rec.read().record.get_field("VAL"),
         Some(EpicsValue::Long(9))
     );
 }
@@ -413,7 +419,7 @@ async fn sdly_input_record() -> PvDatabase {
 /// Wait for the queued replay (C's restart callback) to land its value.
 async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
     for _ in 0..500 {
-        if let Ok(EpicsValue::Double(v)) = db.get_pv(name).await
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(name)
             && (v - want).abs() < 1e-10
         {
             return;
@@ -438,9 +444,9 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     db.process_record_with_links("SIMAI", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAI").await.unwrap();
+    let rec = db.get_record("SIMAI").unwrap();
     assert!(
-        rec.read().await.is_processing(),
+        rec.read().is_processing(),
         "SDLY holds PACT across the simulated read"
     );
 
@@ -448,6 +454,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
         .put_record_field_from_ca("SIMAI", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
@@ -466,7 +473,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
         .await
         .unwrap();
     expect_callback(rx, "the simulated-input continuation").await;
-    assert!(!rec.read().await.is_processing());
+    assert!(!rec.read().is_processing());
 }
 
 /// Boundary: PACT released by the SIM/SDLY OUTPUT continuation (the
@@ -490,9 +497,9 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
     db.process_record_with_links("SIMAO", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAO").await.unwrap();
+    let rec = db.get_record("SIMAO").unwrap();
     assert!(
-        rec.read().await.is_processing(),
+        rec.read().is_processing(),
         "SDLY holds PACT across the simulated write"
     );
 
@@ -500,6 +507,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .put_record_field_from_ca("SIMAO", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
@@ -514,7 +522,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .await
         .unwrap();
     expect_callback(rx, "the simulated-output continuation").await;
-    assert!(!rec.read().await.is_processing());
+    assert!(!rec.read().is_processing());
 }
 
 /// Boundary: PACT released by the illegal-SIMM arm of the continuation (C's
@@ -529,20 +537,21 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     db.process_record_with_links("SIMAI", &mut v1, 0)
         .await
         .unwrap();
-    let rec = db.get_record("SIMAI").await.unwrap();
-    assert!(rec.read().await.is_processing());
+    let rec = db.get_record("SIMAI").unwrap();
+    assert!(rec.read().is_processing());
 
     let rx = db
         .put_record_field_from_ca("SIMAI", "VAL", EpicsValue::Double(7.0))
         .await
         .expect("the put is accepted (deferred)")
+        .into_handle()
         .expect("a deferred put-notify hands back a receiver");
 
     // SIMM goes out of menu DURING the delay: the continuation's `switch` takes
     // the `default:` arm (C re-reads SIMM only when `!pact`, so the continuation
     // sees the new value).
     {
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         inst.record.put_field("SIMM", EpicsValue::Short(7)).unwrap();
     }
 
@@ -563,7 +572,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
         .await
         .unwrap();
     expect_callback(rx, "the illegal-SIMM continuation").await;
-    assert!(!rec.read().await.is_processing());
+    assert!(!rec.read().is_processing());
 }
 
 /// The fire-and-forget route is NOT deferred: C `dbPutField` on a PACT record

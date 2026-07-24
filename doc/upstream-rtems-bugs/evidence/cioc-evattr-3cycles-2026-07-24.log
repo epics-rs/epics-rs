@@ -1,0 +1,45 @@
+RTEMShost> cgem0: sending ARP announce (2 of 2)timed outallowing 8 seconds for IPv4LL timeouttimed out#=== ATTR reset ===
+RTEMShost> evtrace reset
+EVTRACE reset
+RTEMShost> evtrace on
+EVTRACE on n=0
+RTEMShost> evtrace off
+EVTRACE off n=30
+RTEMShost> #=== ATTR count ===
+RTEMShost> evtrace count
+EVTRACE count n=30 cap=20000 on=0
+RTEMShost> #=== ATTR dump ===
+RTEMShost> evtrace dump
+EVTRACE dump begin n=30 cap=20000 overflow=0
+EVT 0 C 0x7a06d8 0x147e17
+EVT 1 C 0x7a08d0 0x12fdcb
+EVT 2 C 0x7a0948 0x12fded
+EVT 3 C 0x7a0a58 0x16f49f
+EVT 4 C 0x7a0b88 0x16f49f
+EVT 5 D 0x7a0a58 0x16f893
+EVT 6 D 0x7a0948 0x12fe73
+EVT 7 D 0x7a08d0 0x12fe7b
+EVT 8 D 0x7a06d8 0x147c39
+EVT 9 D 0x7a0b88 0x16f893
+EVT 10 C 0x7a0a98 0x147e17
+EVT 11 C 0x7a0b68 0x12fdcb
+EVT 12 C 0x7a0d88 0x12fded
+EVT 13 C 0x7a0e98 0x16f49f
+EVT 14 C 0x7a0bc8 0x16f49f
+EVT 15 D 0x7a0e98 0x16f893
+EVT 16 D 0x7a0d88 0x12fe73
+EVT 17 D 0x7a0b68 0x12fe7b
+EVT 18 D 0x7a0a98 0x147c39
+EVT 19 D 0x7a0bc8 0x16f893
+EVT 20 C 0x1855538 0x147e17
+EVT 21 C 0x1855608 0x12fdcb
+EVT 22 C 0x7a0d48 0x12fded
+EVT 23 C 0x7a0d68 0x16f49f
+EVT 24 C 0x7a0ab8 0x16f49f
+EVT 25 D 0x7a0d68 0x16f893
+EVT 26 D 0x7a0d48 0x12fe73
+EVT 27 D 0x1855608 0x12fe7b
+EVT 28 D 0x1855538 0x147c39
+EVT 29 D 0x7a0ab8 0x16f893
+EVTRACE dump end
+RTEMShost> #=== ATTR end ===

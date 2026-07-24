@@ -17,6 +17,8 @@
 //! a record type that does not declare the field, so a record driving its own
 //! link is not driven twice per cycle).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -126,11 +128,8 @@ record(ownsOut, "SCALER:1") {{
 
     // The record still stores the field itself — the mirror into the common
     // fields adds a reader, it does not move ownership.
-    let instance = database
-        .get_record("SCALER:1")
-        .await
-        .expect("record loaded");
-    let instance = instance.read().await;
+    let instance = database.get_record("SCALER:1").expect("record loaded");
+    let instance = instance.read();
     assert_eq!(
         instance.record.get_field("OUT"),
         Some(EpicsValue::String(OUT_LINK.into()))
@@ -163,11 +162,8 @@ record(ownsOut, "SCALER:2") {
         .await
         .unwrap();
 
-    let instance = database
-        .get_record("SCALER:2")
-        .await
-        .expect("record loaded");
-    let instance = instance.read().await;
+    let instance = database.get_record("SCALER:2").expect("record loaded");
+    let instance = instance.read();
 
     // Link text: populated, so device support sees it.
     assert_eq!(instance.common.out, "TARGET:PV PP");

@@ -43,6 +43,8 @@
 //! [`PutLogLine::TrapWrite`] writes the C default valueless line,
 //! [`PutLogLine::AllWrites`] writes the value/old/outcome audit line.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 /// Which client writes the put log records. Selected by the write hook
 /// from gateway configuration; see the module docs for the per-mode line
 /// format.
@@ -187,14 +189,14 @@ impl PutLog {
         let line = match line {
             // C default build (`#ifndef WITH_CAPUTLOG`, gateVc.cc:240):
             // timestamp, user@host, PV — no value, no old, no token.
-            PutLogLine::TrapWrite => format!("{timestamp} {user}@{host} {pv}\n"),
+            PutLogLine::TrapWrite => format!("{timestamp} {user}@{host} {pv}"),
             // Opt-in fail-loud audit line: value, cached old=, outcome.
             PutLogLine::AllWrites {
                 value,
                 old,
                 outcome,
             } => format!(
-                "{} {}@{} {} {} old={} {}\n",
+                "{} {}@{} {} {} old={} {}",
                 timestamp,
                 user,
                 host,
@@ -204,6 +206,14 @@ impl PutLog {
                 outcome.as_str()
             ),
         };
+
+        // THE write point. Every record — both line shapes, and any shape
+        // added later — is framed here and nowhere else: the escape and the
+        // single terminating newline are applied to the assembled record, so
+        // no field can carry the line ending and no future field can be
+        // added "raw". `user`, `host`, `pv`, `value` and `old` are all
+        // attacker-reachable off the CA wire; see the fn docs.
+        let line = format!("{}\n", epics_base_rs::runtime::log::single_line(&line));
 
         let mut guard = self.file.lock().await;
         if guard.is_none() {
@@ -267,6 +277,120 @@ impl PutLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B1: no field a CA peer controls can forge a putlog record.
+    ///
+    /// Every one of `user`, `host`, `pv`, `value` and `old` comes off the
+    /// wire, and a CA `CLIENT_NAME`/`HOST_NAME` may legally contain a
+    /// newline — the server checks only NUL-termination and a 511-byte cap
+    /// (`epics-ca-rs/src/server/tcp.rs:2416`), and C is byte-identical
+    /// (`camessage.c:824-825`). A verified cap-token's `claims.sub` reaches
+    /// the same field, so this is not gated on forging an identity.
+    ///
+    /// Boundary sweep over the fields, not a story about one of them: each
+    /// field in turn carries a full forged record, in each line shape.
+    #[tokio::test]
+    async fn no_wire_field_can_forge_a_second_putlog_record() {
+        // A payload that would BE a plausible record if it got its own line.
+        const FORGE: &str = "x\nApr 09 09:00:00 root@localhost CRITICAL:PV 0 old=1 OK";
+
+        for scope in ["trapwrite", "allwrites"] {
+            for field in ["user", "host", "pv", "value", "old"] {
+                let temp = std::env::temp_dir().join(format!(
+                    "putlog_forge_{}_{scope}_{field}.log",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&temp);
+                let log = PutLog::new(temp.clone());
+
+                let pick = |name: &str, clean: &'static str| -> String {
+                    if name == field {
+                        FORGE.to_string()
+                    } else {
+                        clean.to_string()
+                    }
+                };
+                let (u, h, pv) = (
+                    pick("user", "alice"),
+                    pick("host", "opi-1"),
+                    pick("pv", "TEMP"),
+                );
+                let (v, o) = (pick("value", "25.0"), pick("old", "24.8"));
+                let line = match scope {
+                    "trapwrite" => PutLogLine::TrapWrite,
+                    _ => PutLogLine::AllWrites {
+                        value: &v,
+                        old: &o,
+                        outcome: PutOutcome::Denied,
+                    },
+                };
+                // TrapWrite has no value/old field to attack; skip those pairs.
+                if scope == "trapwrite" && (field == "value" || field == "old") {
+                    continue;
+                }
+                log.log(&u, &h, &pv, line).await.unwrap();
+
+                let content = std::fs::read_to_string(&temp).unwrap();
+                assert_eq!(
+                    content.matches('\n').count(),
+                    1,
+                    "{scope}/{field}: one put must write exactly one line, got {content:?}"
+                );
+                assert!(
+                    content.ends_with('\n'),
+                    "{scope}/{field}: the record must still be newline-terminated"
+                );
+                // The forged text is still THERE — this escapes framing, it
+                // does not censor evidence.
+                assert!(
+                    content.contains("CRITICAL:PV"),
+                    "{scope}/{field}: the injected text must survive, escaped"
+                );
+                assert!(
+                    content.contains("\\x0a"),
+                    "{scope}/{field}: the newline must appear as an escape"
+                );
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+    }
+
+    /// The record cannot bypass the framing: neither line shape may carry
+    /// its own terminator, because the single write point adds exactly one.
+    #[test]
+    fn neither_line_shape_carries_its_own_terminator() {
+        let src = include_str!("putlog.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let owner = concat!("runtime::log::single", "_line");
+        let owners: Vec<usize> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(owner))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "putlog.rs: framing must have exactly ONE owner (found {owners:?})"
+        );
+        for (n, l) in prod.lines().enumerate() {
+            // The framing owner is the one line allowed to add a newline.
+            if l.contains(owner) {
+                continue;
+            }
+            if l.contains("format!(") || l.trim().starts_with('"') {
+                assert!(
+                    !l.contains(concat!("\\", "n\"")),
+                    "putlog.rs:{}: a line shape must not embed its own newline; \
+                     the write point appends exactly one",
+                    n + 1
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn log_to_temp_file() {

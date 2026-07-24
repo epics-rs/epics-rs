@@ -20,17 +20,89 @@ type_complexity = "allow"
 
 [features]
 default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
+# The QSRV *serving* path on its own: the whole `qsrv` module (BridgeProvider,
+# GroupChannel/GroupMonitor, QsrvPvStore) with no PVA client behind it. This is
+# the feature `#[cfg]` actually gates the module on, and it is the selection
+# `scripts/rtems-check.sh` builds for `armv7-rtems-eabihf`.
+#
+# It exists because `qsrv = [... "pvalink" ...]` is unsatisfiable on that
+# target: pvalink needs `epics_pva_rs::client_native`, a 23,881-line tree that
+# does not compile for RTEMS (47 errors — doc/qsrv-rtems-design.md §0 probe D).
+# Deleting the implication instead would silently drop pvalink from every host
+# build that asks for `qsrv`; naming the reduced set keeps `qsrv` a strict
+# superset, so every existing host selection resolves exactly as before.
+#
+# Named rather than expressed as an absence (`--features qsrv` minus something)
+# so the target's configuration is a testable thing rather than a gap: a build
+# with no features at all compiles `error`/`convert`/`lib.rs` and nothing else,
+# which is a green that proves nothing.
+qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
+# Host-selectable RTEMS execution model — passthrough to
+# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` and `epics-pva-rs`
+# declare it. Routes the `runtime::task` seam to the std-thread background
+# executor on a hosted target, which is what compiles `rtems-pva-ioc`'s real
+# entry point off RTEMS so it can be linted and tested here. OFF by default.
+#
+# It is NOT what selects the executor on the target: `armv7-rtems-eabihf`
+# reaches the same backend through `target_os = "rtems"`, so
+# `scripts/rtems-check.sh` does not pass this feature. Declaring it here buys
+# the *host* half — and with it the `rtems-exec-gate` census below, which is
+# the price of the feature and the reason it landed as its own stage
+# (doc/qsrv-rtems-design.md §6.3, §7 stage 4).
+#
+# The two client crates are in this list, and forwarding to `epics-base-rs`
+# alone was a defect. Cargo unifies features per *package*, so
+# `epics-base-rs/rtems-exec-model` moved `runtime::task::spawn` onto the
+# reactor-free background executor while `epics-ca-rs` and `epics-pva-rs`
+# still compiled — and selected — their reactor-backed UDP SEARCH transports:
+# exactly the split that panicked `rtems-pva-ioc` at boot with "there is no
+# reactor running" (`doc/calink-rtems-design.md` §10.10 item 2). Each client
+# crate now asserts the agreement in its own `lib.rs`, so this line cannot
+# regress silently — it would fail to compile.
+#
+# `?/` on both: neither is a hard dependency (`epics-pva-rs` arrives with
+# `qsrv-core`, `epics-ca-rs` with `qsrv`/`ca-gateway`), and a plain `/` would
+# turn this feature into one that pulls them in. `rtems-pva-ioc` requires
+# `qsrv-core` + `pvalink`, so both are present in the build that produces it.
+rtems-exec-model = [
+    "epics-base-rs/rtems-exec-model",
+    "epics-ca-rs?/rtems-exec-model",
+    "epics-pva-rs?/rtems-exec-model",
+]
+# The RTEMS bring-up measurement rig for `rtems-pva-ioc` (the family twin of
+# `epics-ca-rs/bringup-probes` — doc/calink-rtems-design.md §11.7 item 3): the
+# stage-5 pvalink probe records (doc/pvalink-rtems-design.md §12), the §8 QSRV
+# load-probe group (doc/qsrv-rtems-design.md §9.14: victim `RTEMS:PVA:V0` plus
+# the 20-member `RTEMS:PVA:BIG`), the `stage5-probe` reporter thread and the
+# compiled-in SLIRP name-server default. OFF by default — the default binary
+# is a clean IOC with no probe records, no probe thread and no link fields at
+# all. The bring-up box's build scripts add this flag to get exactly the
+# measured stage-5/§8 image back. NOT forwarded to `epics-ca-rs`: each target
+# binary's rig rides its own crate's feature.
+#
+# It IS forwarded to `epics-pva-rs`, because that is not a second binary's rig
+# but this one's client half: the `PVA_DIAL_POOL` whose `MAX_DIAL_WORKERS`
+# bound §9.11 asks to be measured on target lives there, and its probe
+# accessor has to be compiled by the same flag that compiles the reporter
+# thread which prints it.
+bringup-probes = ["epics-pva-rs?/bringup-probes"]
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is
 # present (`epics_ca_rs::calink`, no feature). pvxs likewise ties pvalink
 # to QSRV2 (`iochooks.cpp:461-496`).
+#
+# `epics-ca-rs` is needed by exactly one item — `run_ca_pva_qsrv_ioc`, the host
+# dual-protocol runner — which is why it is here and not in `qsrv-core`.
+# The `epics-pva-rs/*` entries restore what `default-features = false` on the
+# dependency drops; see the note over the dependency itself.
 qsrv = [
+    "qsrv-core",
     "pvalink",
-    "dep:epics-pva-rs",
     "dep:epics-ca-rs",
-    "dep:serde",
-    "dep:serde_json",
+    "epics-pva-rs/client",
+    "epics-pva-rs/tls",
+    "epics-pva-rs/pkcs12",
 ]
 # QSRV daemon binary (qsrv-rs)
 qsrv-bin = ["qsrv", "dep:clap", "dep:tracing-subscriber"]
@@ -51,13 +123,19 @@ ca-gateway-tls = [
 # PVA links for record INP/OUT (pvalink lset). Enabled by default via
 # `qsrv` above; can still be selected on its own for a pvalink-only
 # build with no QSRV server.
-pvalink = ["dep:epics-pva-rs"]
+pvalink = ["dep:epics-pva-rs", "epics-pva-rs/client"]
 # NOTE: CA links (`calink`) used to be a bridge feature here. The
 # CA-link resolver now lives in `epics-ca-rs` (always-on, no feature):
 # `epics_ca_rs::calink`. Any build with `epics-ca-rs` resolves CA
 # links — see that crate's `calink` module.
 # PVA-to-PVA proxy — mirrors C++ pva2pva/p2pApp.
-pva-gateway = ["dep:epics-pva-rs", "dep:regex"]
+pva-gateway = [
+    "dep:epics-pva-rs",
+    "dep:regex",
+    "epics-pva-rs/client",
+    "epics-pva-rs/tls",
+    "epics-pva-rs/pkcs12",
+]
 # PVA gateway daemon binary (pva-gateway-rs). serde/serde_json parse the
 # pva2pva-compatible JSON config file (gwmain.cpp schema) the binary loads.
 pva-gateway-bin = [
@@ -72,7 +150,13 @@ all-bridges = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin", "pvalink", "p
 # Dual-protocol IOC: serves the same PV database over both CA and PVA
 # from a single process. Drops in for sites whose tooling mix is
 # transitioning to PVA.
-dual-ioc = ["dep:epics-pva-rs", "dep:epics-ca-rs"]
+dual-ioc = [
+    "dep:epics-pva-rs",
+    "dep:epics-ca-rs",
+    "epics-pva-rs/client",
+    "epics-pva-rs/tls",
+    "epics-pva-rs/pkcs12",
+]
 dual-ioc-bin = ["dual-ioc", "dep:clap", "dep:tracing-subscriber"]
 # Dual-protocol gateway: single binary that runs the CA gateway and
 # the PVA gateway side by side as independent supervisors. Useful for
@@ -89,8 +173,12 @@ dual-gateway-bin = [
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# The RTEMS boot shim for `rtems-pva-ioc`. Empty on every non-RTEMS target, so
+# this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
+# one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
+# the IOC's `main`. Same reasoning as `epics-ca-rs`.
+epics-rtems-boot = { workspace = true }
 async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
 # Refcounted byte buffer for the raw-frame fan-out path (F-G12).
 bytes = "1"
 thiserror = "2"
@@ -99,7 +187,40 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Feature-gated optional dependencies
-epics-pva-rs = { workspace = true, optional = true }
+#
+# `epics-pva-rs` is spelled out (path + version) rather than inherited with
+# `workspace = true` because cargo REJECTS the combination it would otherwise
+# need: "`default-features = false` cannot override workspace's
+# `default-features`". Inheriting turns `tls` on, which puts `rustls` -> `ring`
+# in the graph, and `ring`'s build script runs `cc` for the target:
+# `failed to find tool "arm-rtems6-gcc"`. That is the same trap
+# `scripts/rtems-check.sh` documents for `epics-pva-rs` itself, reached here
+# through the workspace table — `--no-default-features` on the *bridge* does
+# not travel down a dependency edge. Setting `default-features = false` in the
+# workspace table instead was rejected: it changes the resolved feature set for
+# every other member in one edit.
+#
+# The dropped defaults (`client`, `tls`, `pkcs12`) are restored above by every
+# host-facing feature that pulls this dependency — `qsrv`, `pvalink`,
+# `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
+# `qsrv-core`, the RTEMS selection, gets the reduced set.
+epics-pva-rs = { path = "../epics-pva-rs", version = "0.24.0", optional = true, default-features = false }
+# `epics-ca-rs` stays inherited, but NOT because its defaults are empty — they
+# stopped being empty at `274a734b`, which introduced the `client-core`/`client`
+# split and made `default = ["client"]`. The reason is narrower and is a fact
+# about the graph rather than about the feature list: no feature this crate can
+# select on the target pulls `epics-ca-rs` at all. `dep:epics-ca-rs` is reached
+# only through `qsrv`, `ca-gateway`, `dual-ioc` and `experimental-rust-tls`, and
+# the RTEMS selection (`scripts/rtems-check.sh`: `qsrv-core,pvalink`) carries
+# none of them — measured with `cargo tree -p epics-bridge-rs
+# --no-default-features --features qsrv-core,pvalink`, which does not name it.
+# So `default-features = false` here would change nothing the target compiles,
+# while costing the second hand-written `version = "0.24.0"` that the
+# `epics-pva-rs` entry above had to accept for a real reason.
+#
+# If a target feature ever does pull it, this entry needs the same treatment
+# `epics-pva-rs` got — `client` is a real default to drop now, and the target's
+# selection is `client-core`.
 epics-ca-rs = { workspace = true, optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
@@ -108,6 +229,41 @@ arc-swap = "1"
 regex = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
+
+# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# `net`, `signal`, and `process` features — the ones that pull `mio`,
+# `signal-hook-registry`, and `socket2`, none of which build for
+# armv7-rtems-eabihf. Measured: with everything else at the zero-error state
+# and only this dependency left unsplit, the target build produces 58 errors —
+# 31 in `mio` (`file not found for module `selector``, `... `waker``,
+# `unresolved import `crate::sys::IoSourceState``), the rest in `socket2`
+# (`unresolved import `libc::SOCK_RAW``) and `signal-hook-registry`.
+#
+# Declared per-target rather than in shared `[dependencies]` because Cargo
+# UNIONS a dependency's features across all matching tables, so a shared `full`
+# would re-add exactly what the RTEMS table drops. Same split, same retained
+# set, and the same reason as `epics-base-rs` and `epics-pva-rs`.
+#
+# `macros` is load-bearing here, not cargo-culted: the four `select!` sites in
+# `qsrv` (`monitor.rs`, `pva_adapter.rs` x3) are `tokio::select!`, and `sync` is
+# what keeps every mpsc channel and lock in the serving path legal on the
+# target — `park_on`'s contract names `tokio::sync` primitives as the ones a
+# future may await under it.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_os = "rtems")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 
 [[bin]]
 name = "ca-gateway-rs"
@@ -134,6 +290,53 @@ name = "dual-gateway-rs"
 path = "src/bin/dual_gateway_rs.rs"
 required-features = ["dual-gateway-bin"]
 
+# The RTEMS PVA+QSRV IOC entry point — the workspace's one target PVA binary.
+# It lives here rather than in `epics-pva-rs`, where it started, because
+# mounting the QSRV group source needs `epics-bridge-rs` and `epics-pva-rs`
+# cannot depend on the bridge without a cyclic package dependency (measured;
+# doc/qsrv-rtems-design.md §9.7).
+#
+# `required-features` IS correct here, unlike on `epics-ca-rs`'s `rtems-ca-ioc`
+# — but for a reason worth stating, because the manifest comment this binary
+# arrived with claimed the opposite. That comment warned that a
+# `required-features` gate makes cargo silently *skip* the target, turning the
+# RTEMS gate into a vacuous pass. Measured on this toolchain, that is true only
+# for the plural forms (`--bins`, `--all-targets`); an explicit `--bin NAME`
+# with the feature unmet is a hard error:
+#
+#   $ cargo check -p epics-bridge-rs --no-default-features --bin qsrv-rs
+#   error: target `qsrv-rs` in package `epics-bridge-rs` requires the features: `qsrv-bin`
+#
+# `scripts/rtems-check.sh` builds it by explicit `--bin`, so an unfeatured
+# invocation fails loudly rather than passing vacuously. The gate additionally
+# passes `qsrv-core` per-bin, so the covered configuration is the real one.
+#
+# The gate is `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
+# pulls `qsrv-bin` host machinery this target never runs, but `pvalink` — the
+# pva:// record-link resolver — is mounted on the target as of design stage 4.
+# `pvalink` pulls `epics-pva-rs/client` (its UDP transport cfg-gated out so it
+# compiles for the triple) without `tls`/`pkcs12`, because the `epics-pva-rs`
+# dependency is `default-features = false`. Both features are `required-features`
+# so `scripts/rtems-check.sh`'s explicit `--bin rtems-pva-ioc` hard-fails if the
+# per-bin selection ever drops one, rather than silently skipping the target.
+[[bin]]
+name = "rtems-pva-ioc"
+path = "src/bin/rtems-pva-ioc.rs"
+required-features = ["qsrv-core", "pvalink"]
+
+# `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
+# `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
+# table is evaluated against the HOST, so a `cfg(target_os = "rtems")` one
+# would never match.
+[build-dependencies]
+epics-rtems-boot = { workspace = true }
+
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and four copies of a
+# 300-line audit is how four copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 serial_test = "3"
 tempfile = "3"

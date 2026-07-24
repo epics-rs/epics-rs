@@ -22,6 +22,8 @@
 //! source x {signed, unsigned} RVAL, plus the in-range control that cannot tell
 //! the two rules apart.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -62,7 +64,7 @@ async fn process(db: &PvDatabase, name: &str) {
 
 async fn rval(db: &PvDatabase, rec: &str) -> EpicsValue {
     process(db, rec).await;
-    db.get_pv(&format!("{rec}.RVAL")).await.unwrap()
+    db.get_pv(&format!("{rec}.RVAL")).unwrap()
 }
 
 /// An INTEGER source into a SIGNED RVAL. `3735928559` (0xdeadbeef) does not fit

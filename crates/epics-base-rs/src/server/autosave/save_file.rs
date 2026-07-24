@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::path::Path;
 
 use crate::types::EpicsValue;
@@ -75,25 +77,38 @@ pub async fn write_save_file_with_mode(
     // before fsync; POSIX is silent on whether sync_all on a RDONLY
     // fd flushes data, and on some FS (older NFS, FUSE) it's a
     // no-op — silently dropping the write across a power loss.
+    //
+    // The whole sequence runs in ONE `runtime::fs::blocking` closure rather
+    // than four awaits: the ordering above is the durability guarantee, and
+    // keeping it in one closure keeps it readable as a sequence and costs one
+    // hop through the blocking pool instead of four. It also has to leave
+    // `tokio::fs` behind — that is a blocking call dressed as an async one and
+    // it panics on any thread that is not a tokio runtime thread, which is
+    // every callback thread under `rtems-exec-model`.
     let tmp_path = path.with_extension("tmp");
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
-            .await?;
-        file.write_all(content.as_bytes()).await?;
-        file.sync_all().await?;
-    }
-    tokio::fs::rename(&tmp_path, path).await?;
-    // Sync parent directory to make the rename durable across power loss
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
+    let final_path = path.to_path_buf();
+    let parent = path.parent().map(|p| p.to_path_buf());
+    crate::runtime::fs::blocking(move || {
+        use std::io::Write as _;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
         }
-    }
+        std::fs::rename(&tmp_path, &final_path)?;
+        // Sync parent directory to make the rename durable across power loss
+        if let Some(parent) = parent
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }
@@ -101,16 +116,18 @@ pub async fn write_save_file_with_mode(
 /// Read a .sav file and validate `<END>` marker.
 /// Returns None for corrupt files (no END marker).
 pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<Vec<SaveEntry>>> {
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            e.into()
-        } else {
-            AutosaveError::CorruptSaveFile {
-                path: path.display().to_string(),
-                message: e.to_string(),
+    let content = crate::runtime::fs::read_to_string(path)
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                e.into()
+            } else {
+                AutosaveError::CorruptSaveFile {
+                    path: path.display().to_string(),
+                    message: e.to_string(),
+                }
             }
-        }
-    })?;
+        })?;
 
     if !has_end_marker(&content) {
         return Ok(None);
@@ -122,7 +139,7 @@ pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<Vec<SaveEntry>
 
 /// Quick check if a .sav file has a valid `<END>` marker.
 pub async fn validate_save_file(path: &Path) -> AutosaveResult<bool> {
-    let content = tokio::fs::read_to_string(path).await?;
+    let content = crate::runtime::fs::read_to_string(path).await?;
     Ok(has_end_marker(&content))
 }
 
@@ -543,7 +560,7 @@ mod tests {
             .await
             .unwrap();
 
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let content = crate::runtime::fs::read_to_string(&path).await.unwrap();
         assert!(
             content.starts_with("# save/restore"),
             "C-compat file must carry the save/restore banner, got: {content}"
@@ -574,7 +591,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let content = crate::runtime::fs::read_to_string(&path).await.unwrap();
         assert!(content.starts_with("# autosave-rs"));
     }
 }

@@ -1,3 +1,24 @@
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the feature-ON suite.
+
+// The beacon monitor is a UDP listener on the CA beacon port, fed by the
+// repeater. `client-core` has no UDP client socket at all (the target's
+// search reaches servers over `EPICS_CA_NAME_SERVERS`, §4.1), so there are
+// no beacons to monitor and the module is not compiled. What it buys — a
+// faster rescan after a server restart than the search retry cadence alone —
+// is an optimisation over a transport that does not exist there.
+//
+// `ca_beacon_monitor` is `feature = "client"` AND `tokio_backend`, emitted as
+// one name by `build.rs` because it is one fact — "this build has a UDP beacon
+// listener" — and the fifteen sites below would otherwise each restate a
+// two-term conjunction. The second term is not redundant: the monitor's socket
+// (`AsyncUdpV4::bind_ephemeral_same_port`) and its repeater registration
+// (`repeater::try_register`, a `tokio::net::UdpSocket`) both need a reactor,
+// and `run_beacon_monitor` is started through `runtime::task::spawn`, which on
+// `exec_backend` lands it on a callback-pool worker that has none. A hosted
+// `--features rtems-exec-model` build had `feature = "client"` on and panicked
+// on both of those sockets at `rtems-ca-ioc` boot, measured — two of the three
+// panics in `doc/calink-rtems-design.md` §10.10 item 2.
+#[cfg(ca_beacon_monitor)]
 mod beacon_monitor;
 mod circuit_breaker;
 mod search;
@@ -9,6 +30,13 @@ mod types;
 
 pub use sync_group::{SyncGroup, SyncGroupResults, SyncGroupStat, SyncGroupStatus};
 
+/// BRING-UP PROBE: the CA dial pool's `(workers, attempts)`, for
+/// `rtems-ca-ioc`'s console reporter. `transport` is private, and a bin target
+/// is a separate crate, so the rig's one accessor is re-exported here rather
+/// than the module being opened up for it.
+#[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]
+pub use transport::dial_pool_probe;
+
 pub use circuit_breaker::{BreakerConfig, BreakerState};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,8 +47,12 @@ use std::time::Duration;
 use epics_base_rs::runtime::sync::{broadcast, mpsc, oneshot};
 use parking_lot::Mutex;
 
-use crate::channel::{AccessRights, ChannelInfo};
+// `channel` is `pub(crate)`, but `CaChannel::info` and `CaClient::cainfo`
+// hand both of these back across the crate boundary. Re-exported here, beside
+// the methods that return them, so a caller can name what they were given.
+pub use crate::channel::{AccessRights, ChannelInfo};
 use crate::protocol::*;
+#[cfg(ca_beacon_monitor)]
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
@@ -385,7 +417,7 @@ use types::*;
 
 // Public re-exports for the CA-130 exception-handler API. Mirror the
 // pattern already used for DiagnosticsSnapshot.
-pub use types::{CaException, CaExceptionHandler, CaExceptionKind};
+pub use types::{CaException, CaExceptionHandler, CaExceptionKind, CaOp, ExceptionSite};
 
 /// CA client with persistent channels and auto-reconnection.
 pub struct CaClient {
@@ -435,20 +467,28 @@ pub struct CaClient {
     /// [`CaClient::set_user_name`] / [`CaClient::set_host_name`] mutate it
     /// and notify already-connected circuits out of band.
     client_identity: types::ClientIdentitySlot,
-    _coordinator: tokio::task::JoinHandle<()>,
-    _search_task: tokio::task::JoinHandle<()>,
-    _transport_task: tokio::task::JoinHandle<()>,
-    _beacon_task: tokio::task::JoinHandle<()>,
+    // The spawned client background tasks. Typed as the `runtime::task`
+    // seam handle (not a bare `tokio::JoinHandle`) because they are spawned
+    // through `runtime::task::spawn`; under the hosted default this alias IS
+    // `tokio::task::JoinHandle`, and under the `rtems-exec-model` backend it
+    // is the executor's `JoinFuture`, so the field type follows the seam.
+    _coordinator: epics_base_rs::runtime::task::TaskHandle<()>,
+    _search_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    _transport_task: epics_base_rs::runtime::task::TaskHandle<()>,
+    #[cfg(ca_beacon_monitor)]
+    _beacon_task: epics_base_rs::runtime::task::TaskHandle<()>,
     /// Discovery backends retained for their lifetime. mDNS's
     /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
     /// runs only while the backend is alive — dropping it kills live
     /// discovery. Held here so post-startup IOCs keep being found.
+    #[cfg(feature = "client")]
     _discovery_backends: Vec<Box<dyn crate::discovery::Backend>>,
     /// Per-backend forwarder tasks: drain each backend's
     /// `subscribe()` stream and feed `DiscoveryEvent`s into the
     /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
     /// drop so they don't outlive the client.
-    _discovery_forwarders: Vec<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "client")]
+    _discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>>,
 }
 
 /// Internal coordinator requests from CaChannel / public API
@@ -513,6 +553,7 @@ enum CoordRequest {
     /// libca's split between `udpiiu::beaconAnomalyNotify` (which
     /// only wakes searches) and `tcpRecvWatchdog::beaconAnomalyNotify`
     /// (which only flips a per-circuit flag).
+    #[cfg(ca_beacon_monitor)]
     ForceRescanServer {
         server_addr: SocketAddr,
         kind: beacon_monitor::BeaconAnomalyKind,
@@ -528,6 +569,7 @@ enum CoordRequest {
     /// which case the watchdog is irrelevant, or we do (we just
     /// pruned the BHE) and the next healthy beacon will refresh it
     /// naturally.
+    #[cfg(ca_beacon_monitor)]
     BeaconArrival {
         server_addr: SocketAddr,
         anomaly: bool,
@@ -585,6 +627,7 @@ pub struct CaClientConfig {
     /// merges the addresses returned by every active backend into
     /// its `EPICS_CA_ADDR_LIST` at startup. Falls back to the
     /// `EPICS_CA_DISCOVERY` env var when `None`.
+    #[cfg(feature = "client")]
     pub discovery: Option<crate::discovery::DiscoveryConfig>,
 
     /// Pre-built discovery backends to consult in addition to whatever
@@ -593,6 +636,7 @@ pub struct CaClientConfig {
     /// ...) without having to extend `DiscoveryConfig`. Each backend's
     /// `discover()` is called once at startup; addresses are deduped
     /// against `EPICS_CA_ADDR_LIST` and `discovery`-provided sources.
+    #[cfg(feature = "client")]
     pub extra_backends: Vec<Box<dyn crate::discovery::Backend>>,
 }
 
@@ -627,6 +671,13 @@ impl CaClient {
     /// Create a client with explicit configuration. Currently the only
     /// knob is `tls`; future fields will follow the same pattern.
     pub async fn new_with_config(config: CaClientConfig) -> CaResult<Self> {
+        // Every field of this struct belongs to a feature (`client`'s
+        // discovery pair, `experimental-rust-tls`'s two), so in the
+        // `client-core` build with TLS off it has none left. Destructured
+        // rather than ignored: a field added unconditionally later fails to
+        // compile here until someone states which configuration reads it.
+        #[cfg(not(any(feature = "client", feature = "experimental-rust-tls")))]
+        let CaClientConfig {} = config;
         #[cfg(feature = "experimental-rust-tls")]
         if config.tls.is_some() {
             tracing::warn!(
@@ -650,9 +701,15 @@ impl CaClient {
         // the registration helper and the beacon monitor's 1 s retry loop both
         // take this value, so a misconfigured port is diagnosed once — not on
         // every attempt.
+        //
+        // Both are the beacon path, so both belong to the full `client`: the
+        // repeater exists to fan beacons out to every client on the host, and
+        // `client-core` binds no UDP socket to receive them on.
+        #[cfg(ca_beacon_monitor)]
         let repeater_port = crate::protocol::repeater_port();
 
         // Run repeater registration in background — don't block client startup.
+        #[cfg(ca_beacon_monitor)]
         epics_base_rs::runtime::task::spawn(async move {
             repeater::ensure_repeater(repeater_port).await
         });
@@ -663,18 +720,37 @@ impl CaClient {
         // after IOC migration. Pre-fix `parse_addr_list()` returned
         // bare `Vec<SocketAddr>` resolved exactly once at startup,
         // permanently pinning the client to the first-resolved IPs.
+        // `mut` only for the discovery merge below, which `client-core` does
+        // not have — stated as two bindings rather than one binding and a
+        // silenced lint.
+        // `EPICS_CA_ADDR_LIST` names UDP SEARCH destinations, so it is parsed
+        // only where there is a UDP SEARCH socket to send from — see
+        // `search::SearchTransport` and the engine selection below.
+        #[cfg(all(feature = "client", tokio_backend))]
         let mut addr_list = parse_addr_list_with_hostnames()?;
+        #[cfg(all(not(feature = "client"), tokio_backend))]
+        let addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
         // EPICS_CA_DISCOVERY env var. Custom `extra_backends` are then
         // appended. Results are merged with addr_list (deduped by
         // SocketAddr).
+        #[cfg(feature = "client")]
         let discovery_cfg = config.discovery.clone().or_else(crate::discovery::from_env);
+        #[cfg(feature = "client")]
         let mut backends: Vec<Box<dyn crate::discovery::Backend>> = match discovery_cfg {
             Some(cfg) => crate::discovery::build_backends(cfg),
             None => Vec::new(),
         };
+        #[cfg(feature = "client")]
         backends.extend(config.extra_backends);
+        // The one-shot scan merges into `addr_list`, which is the UDP SEARCH
+        // destination list and so exists only on `tokio_backend`. The
+        // `subscribe()` wiring below is *not* gated with it: its deltas go to
+        // the search engine, which absorbs them on either transport
+        // (`SearchTransport::add_address` logs and drops them once, through
+        // `log_dropped_udp_mutation`, when no UDP socket is bound).
+        #[cfg(all(feature = "client", tokio_backend))]
         if !backends.is_empty() {
             let mut discovered: Vec<SocketAddr> = Vec::new();
             for b in &backends {
@@ -741,6 +817,28 @@ impl CaClient {
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
         let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
+        // Which search engine this client gets is a property of the *task
+        // backend*, not of its configuration and not of the target. A build
+        // whose `runtime::task::spawn` lands on the tokio runtime binds the
+        // per-NIC UDP SEARCH bundle and *additionally* uses any
+        // `EPICS_CA_NAME_SERVERS` circuits; on `exec_backend` the engine runs
+        // on a callback-pool worker with no reactor, so there is no UDP SEARCH
+        // transport compiled in at all (`search::SearchTransport` has one
+        // variant there) and this selects C's documented TCP-only
+        // name-resolution mode explicitly — the entry point stage C1 built for
+        // exactly this call site (`doc/calink-rtems-design.md` §4.5, §6 stage
+        // C5).
+        //
+        // `exec_backend` is the RTEMS target *and* a host
+        // `--features rtems-exec-model` build. It used to be spelled
+        // `target_os = "rtems"` here, which let the hosted exec-model build
+        // take the UDP arm and panic on the bind (§10.10 item 2).
+        //
+        // The refusal is the point of selecting it here: with no UDP socket and
+        // no name server the engine could reach nothing, so an IOC booted
+        // without `EPICS_CA_NAME_SERVERS` fails *here*, at client construction,
+        // instead of presenting as every `ca://` link timing out forever.
+        #[cfg(tokio_backend)]
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
@@ -748,6 +846,15 @@ impl CaClient {
             search_resp_tx,
             search_attempts.clone(),
         ));
+        #[cfg(exec_backend)]
+        let search_task = {
+            epics_base_rs::runtime::task::spawn(search::name_servers_only_search_engine(
+                nameserver_addrs,
+                search_rx,
+                search_resp_tx,
+                search_attempts.clone(),
+            )?)
+        };
 
         // Wire each discovery backend's live-update stream into the
         // search engine. `discover()` above was a one-shot scan;
@@ -756,7 +863,10 @@ impl CaClient {
         // never discovered. The `backends` Vec — and the `ServiceDaemon`
         // an `MdnsBackend` owns — is retained on `CaClient` so the
         // browse keeps running for the client's lifetime.
-        let mut discovery_forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        #[cfg(feature = "client")]
+        let mut discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>> =
+            Vec::new();
+        #[cfg(feature = "client")]
         for backend in &backends {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
@@ -858,6 +968,7 @@ impl CaClient {
         let diagnostics = Arc::new(CaDiagnostics::default());
         let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
+        #[cfg(ca_beacon_monitor)]
         let (beacon_ctrl_tx, beacon_ctrl_rx) =
             mpsc::unbounded_channel::<beacon_monitor::BeaconControl>();
 
@@ -874,9 +985,11 @@ impl CaClient {
             diagnostics.clone(),
             exception_slot.clone(),
             search_attempts.clone(),
+            #[cfg(ca_beacon_monitor)]
             beacon_ctrl_tx,
         ));
 
+        #[cfg(ca_beacon_monitor)]
         let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
             beacon_ctrl_rx,
@@ -899,8 +1012,11 @@ impl CaClient {
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
+            #[cfg(ca_beacon_monitor)]
             _beacon_task: beacon_task,
+            #[cfg(feature = "client")]
             _discovery_backends: backends,
+            #[cfg(feature = "client")]
             _discovery_forwarders: discovery_forwarders,
         })
     }
@@ -996,8 +1112,11 @@ impl CaClient {
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Shutdown { reply: tx });
-        // Wait briefly for the clear commands to be sent
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        // Wait briefly for the clear commands to be sent. Through the
+        // `runtime::task` seam: on the RTEMS target there is no tokio timer
+        // to drive `tokio::time::timeout`, and shutdown would panic instead
+        // of draining.
+        let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
     }
 
     /// Create a persistent channel. Returns immediately (starts searching in background).
@@ -1309,18 +1428,22 @@ impl CaClient {
 /// `ClearChannel`, rather than discovering it via TCP RST + their
 /// own watchdog.
 ///
-/// We approximate the same outcome despite tokio's sync `Drop`:
-///   * If a runtime is reachable, spawn a detached cleanup task that
-///     sends `CoordRequest::Shutdown` (the coordinator's handler at
-///     line ~2160 emits `ClearChannel` for every operational channel
-///     before returning) and awaits the reply with a 2-s ceiling.
-///     Once the reply lands, abort the four top-level tasks. Aborts
-///     cascade through the `connections` HashMap → `ServerConnection`
-///     Drop → per-circuit read/write tasks.
-///   * If no runtime is reachable (Drop on a non-tokio thread, or
-///     after the runtime has begun shutting down), abort the four
-///     handles directly. No graceful drain — same fallback as before
-///     this elaboration.
+/// We approximate the same outcome despite the sync `Drop`, spawning a
+/// detached cleanup task through the `runtime::task` spawn seam that
+/// sends `CoordRequest::Shutdown` (the coordinator's handler at line
+/// ~2160 emits `ClearChannel` for every operational channel before
+/// returning) and awaits the reply with a 2-s ceiling. Once the reply
+/// lands, abort the four top-level tasks. Aborts cascade through the
+/// `connections` HashMap → `ServerConnection` Drop → per-circuit
+/// read/write tasks.
+///
+/// The spawn goes through `epics_base_rs::runtime::task::spawn` like the
+/// client's other 17 production tasks, not a bare `tokio::spawn` behind a
+/// `Handle::try_current()` guard: under the RTEMS exec backend the guard
+/// would return `Err` and silently skip the whole cleanup, so the
+/// bounded coordinator shutdown would never run on target. The seam
+/// dispatches onto the callback-band executor there, so the drain runs on
+/// both backends (design doc §5.1, §6 Stage C3).
 ///
 /// Residual differences from libca that this can't bridge in a sync
 /// `Drop` body:
@@ -1350,36 +1473,37 @@ impl Drop for CaClient {
         let coord_abort = self._coordinator.abort_handle();
         let search_abort = self._search_task.abort_handle();
         let transport_abort = self._transport_task.abort_handle();
+        #[cfg(ca_beacon_monitor)]
         let beacon_abort = self._beacon_task.abort_handle();
 
         // Discovery forwarders hold a `search_tx` clone — abort them
         // so they don't outlive the client. The `_discovery_backends`
         // Vec drops with `self`, tearing down any `ServiceDaemon`.
+        #[cfg(feature = "client")]
         for fwd in &self._discovery_forwarders {
             fwd.abort();
         }
 
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                let (tx, rx) = oneshot::channel();
-                if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
-                    // Bounded so a wedged coordinator doesn't keep
-                    // the cleanup task alive indefinitely.
-                    let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
-                }
-                coord_abort.abort();
-                transport_abort.abort();
-                search_abort.abort();
-                beacon_abort.abort();
-            });
-        } else {
-            // No runtime to drive the graceful sequence — fall back
-            // to immediate abort to at least guarantee no task leak.
-            self._coordinator.abort();
-            self._transport_task.abort();
-            self._search_task.abort();
-            self._beacon_task.abort();
-        }
+        // Spawn the graceful drain through the `runtime::task` seam so it
+        // runs on the RTEMS exec backend too — a bare `tokio::spawn`
+        // behind a `Handle::try_current()` guard silently skipped it on
+        // target (design doc §5.1).
+        epics_base_rs::runtime::task::spawn(async move {
+            let (tx, rx) = oneshot::channel();
+            if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
+                // Bounded so a wedged coordinator doesn't keep
+                // the cleanup task alive indefinitely. The bound goes
+                // through the same seam as the `spawn` above: this future
+                // is polled on the RTEMS exec backend, where `tokio::time`
+                // has no timer and panics the band worker.
+                let _ = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), rx).await;
+            }
+            coord_abort.abort();
+            transport_abort.abort();
+            search_abort.abort();
+            #[cfg(ca_beacon_monitor)]
+            beacon_abort.abort();
+        });
     }
 }
 
@@ -1637,7 +1761,7 @@ impl CaChannel {
             cid: self.cid,
             reply: reply_tx,
         });
-        tokio::time::timeout(timeout, reply_rx)
+        epics_base_rs::runtime::task::timeout(timeout, reply_rx)
             .await
             .map_err(|_| CaError::ChannelNotFound(self.pv_name.to_string()))?
             .map_err(|_| CaError::Shutdown)
@@ -2200,14 +2324,14 @@ impl CaChannel {
         // Phase 2: scalar plain reads are decoded in the read loop, so
         // the hot path avoids allocating/copying one payload Vec per PV.
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::task::Instant::now() + timeout;
         for p in pending {
             let Pending {
                 index,
                 reply_rx,
                 kind,
             } = p;
-            let result = tokio::time::timeout_at(deadline, reply_rx).await;
+            let result = epics_base_rs::runtime::task::timeout_at(deadline, reply_rx).await;
             let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
                 Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
                 Ok(Ok(Err(e))) => Err(e),
@@ -2386,7 +2510,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         // Always remove the registry entry when control returns —
         // covers the timeout path (response would never arrive) and
         // the success path (already removed by read_loop, the
@@ -2510,7 +2634,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(30), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(Duration::from_secs(30), reply_rx).await;
         self.in_flight.reads.remove(&ioid);
         let reply = result
             .map_err(|_| CaError::Timeout)?
@@ -2551,7 +2675,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2578,7 +2702,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2635,7 +2759,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(timeout, reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2687,7 +2811,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2735,7 +2859,7 @@ impl CaChannel {
             return Err(e);
         }
 
-        let result = tokio::time::timeout(put_timeout(), reply_rx).await;
+        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
         self.in_flight.writes.remove(&ioid);
         result
             .map_err(|_| CaError::Timeout)?
@@ -2919,8 +3043,9 @@ impl CaChannel {
     ///
     /// The receiver is bounded (16); slow consumers see
     /// `RecvError::Lagged` and should re-subscribe after polling
-    /// the current state via [`Self::access_rights`] /
-    /// [`Self::is_connected`].
+    /// the current state via [`Self::info`] — its `access_rights` field
+    /// carries the current rights, and its `Err(CaError::Disconnected)` IS
+    /// the disconnected state.
     pub fn connection_events(&self) -> broadcast::Receiver<ConnectionEvent> {
         self.conn_tx.subscribe()
     }
@@ -2978,10 +3103,10 @@ impl CaChannel {
     /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
     /// not in the tool.
     ///
-    /// The lookup is [`crate::hostname::ip_addr_to_a`] on a blocking thread:
-    /// this is an `async fn` a caller awaits, so it can wait for the resolver
-    /// exactly as C's `cainfo` does, and no other channel's progress is behind
-    /// it.
+    /// The lookup is [`types::peer_resolved_name`] — `hostname::ip_addr_to_a`
+    /// on a blocking thread: this is an `async fn` a caller awaits, so it can
+    /// wait for the resolver exactly as C's `cainfo` does, and no other
+    /// channel's progress is behind it.
     ///
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
@@ -2989,14 +3114,7 @@ impl CaChannel {
     pub async fn host_name(&self) -> CaResult<String> {
         let info = self.info().await?;
         let addr = info.server_addr;
-        Ok(
-            tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
-                .await
-                // A join failure is a runtime shutdown, not a channel error, and
-                // C's `ipAddrToA` has a well-defined answer for "no name": the
-                // dotted IP. Give that rather than failing a connected channel.
-                .unwrap_or_else(|_| addr.to_string()),
-        )
+        Ok(types::peer_resolved_name(addr).await)
     }
 
     /// Server's CA minor protocol version, parsed from the
@@ -3206,7 +3324,8 @@ impl Drop for MonitorHandle {
 #[must_use = "dropping the EventWatcher immediately stops the watcher task; \
               bind it to a variable to keep watching"]
 pub struct EventWatcher {
-    handle: tokio::task::JoinHandle<()>,
+    // Spawned via `runtime::task::spawn`; seam handle (see `ServerConnection`).
+    handle: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
 impl EventWatcher {
@@ -3250,7 +3369,7 @@ async fn run_coordinator(
     diag: Arc<CaDiagnostics>,
     exception_slot: types::CaExceptionSlot,
     search_attempts: types::SearchAttempts,
-    beacon_ctrl_tx: mpsc::UnboundedSender<beacon_monitor::BeaconControl>,
+    #[cfg(ca_beacon_monitor)] beacon_ctrl_tx: mpsc::UnboundedSender<beacon_monitor::BeaconControl>,
 ) {
     let mut channels: HashMap<u32, ChannelInner> = HashMap::new();
     let mut pending_wait_connected: HashMap<u32, Vec<oneshot::Sender<()>>> = HashMap::new();
@@ -3593,6 +3712,7 @@ async fn run_coordinator(
                         let _ = reply.send(());
                         return; // Exit coordinator loop
                     }
+                    #[cfg(ca_beacon_monitor)]
                     CoordRequest::ForceRescanServer { server_addr, kind } => {
                         // FirstSighting is a per-client bookkeeping
                         // event (our beacon map was empty for this
@@ -3664,6 +3784,7 @@ async fn run_coordinator(
                             }
                         }
                     }
+                    #[cfg(ca_beacon_monitor)]
                     CoordRequest::BeaconArrival { server_addr, anomaly } => {
                         // Pure transport-watchdog signal. The
                         // routing decision (exact match vs.
@@ -4095,7 +4216,7 @@ async fn run_coordinator(
                         } else {
                             format!(
                                 "host={host} ctx={message}",
-                                host = crate::hostname::cached_name(server_addr)
+                                host = types::peer_display_name(server_addr)
                             )
                         };
                         types::dispatch_exception(
@@ -4282,6 +4403,7 @@ async fn run_coordinator(
                         // during TCP handshake; cleared on TcpClosed.
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
+                    #[cfg(feature = "client")]
                     TransportEvent::ServerConnected { server_addr } => {
                         // C hands the peer address to `ipAddrToAsciiEngine` in
                         // the `tcpiiu` constructor, so the name is resolved
@@ -4298,6 +4420,7 @@ async fn run_coordinator(
                         // its `online_notify_task` ramp-up would log a
                         // short-period anomaly cascade against its stale
                         // steady-state estimate.
+                        #[cfg(ca_beacon_monitor)]
                         let _ = beacon_ctrl_tx.send(
                             beacon_monitor::BeaconControl::ResetServer { server_addr },
                         );
@@ -4641,6 +4764,7 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
 ///
 /// The returned `Vec` is what the coordinator forwards to the
 /// transport manager — one `BeaconArrivalNotify` per element.
+#[cfg(ca_beacon_monitor)]
 fn beacon_arrival_targets<I>(channel_states: I, beacon_addr: SocketAddr) -> Vec<SocketAddr>
 where
     I: IntoIterator<Item = (ChannelState, Option<SocketAddr>)>,
@@ -4714,6 +4838,12 @@ fn remove_server_channel(
     }
 }
 
+/// UDP-only, and gated with the transport that uses it: the addresses it
+/// resolves are `EPICS_CA_ADDR_LIST` SEARCH destinations, and the RTEMS target
+/// binds no UDP socket to send to them (`search::SearchTransport`).
+/// `EPICS_CA_NAME_SERVERS` entries go through `parse_nameserver_list`, which is
+/// live on every target.
+#[cfg(tokio_backend)]
 fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
     // Try direct IP parse first (fast path)
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
@@ -4743,6 +4873,9 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
 /// re-resolve. `hostname == Some(name)` means the entry started life
 /// as a DNS name and a reconnection path may call `resolve_host`
 /// again to refresh `sock`.
+/// UDP-only; see [`resolve_host`] for why this is not compiled for the RTEMS
+/// target.
+#[cfg(tokio_backend)]
 #[derive(Debug, Clone)]
 pub(crate) struct AddrEntry {
     pub sock: SocketAddr,
@@ -4750,6 +4883,7 @@ pub(crate) struct AddrEntry {
     pub port: u16,
 }
 
+#[cfg(tokio_backend)]
 impl AddrEntry {
     pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
         Self {
@@ -4787,6 +4921,7 @@ impl AddrEntry {
 /// instead of permanently pinning the client to the first-resolved
 /// IP. Closes the long-standing upstream-tracking item for
 /// epics-base#488.
+#[cfg(tokio_backend)]
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
     let default_port = epics_base_rs::runtime::net::ca_server_port();
@@ -4854,6 +4989,7 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
 /// Rust-only limited-broadcast safety net. Extracted from
 /// `parse_addr_list_with_hostnames` so the bcast list can be injected
 /// in unit tests (real-NIC enumeration is environment-dependent).
+#[cfg(tokio_backend)]
 fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], server_port: u16) {
     for bcast in bcasts {
         let sock = SocketAddr::V4(SocketAddrV4::new(*bcast, server_port));
@@ -5096,7 +5232,9 @@ mod ignore_servers_tests {
     }
 }
 
-#[cfg(test)]
+// `tokio_backend`: `append_auto_addr_entries` and `AddrEntry` are the UDP
+// SEARCH destination surface, compiled out on `exec_backend`.
+#[cfg(all(test, tokio_backend))]
 mod auto_addr_list_tests {
     use super::*;
 
@@ -5182,7 +5320,9 @@ mod auto_addr_list_tests {
     }
 }
 
-#[cfg(test)]
+// `tokio_backend`: `AddrEntry` is the UDP SEARCH destination type, compiled
+// out on `exec_backend`.
+#[cfg(all(test, tokio_backend))]
 mod addr_entry_tests {
     use super::*;
 
@@ -5420,7 +5560,7 @@ pub(crate) fn epics_rs_client_ignore() -> Vec<Ipv4Addr> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, ca_beacon_monitor))]
 mod beacon_arrival_routing_tests {
     use super::*;
 
@@ -5736,6 +5876,26 @@ mod event_watcher_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Wait for a condition driven by *another* executor.
+    ///
+    /// These tests run on a `current_thread` tokio runtime but the watcher
+    /// task runs on whatever backend the `runtime::task` seam selects — a
+    /// tokio worker by default, a background-executor band worker under
+    /// `rtems-exec-model`. `yield_now()` only reschedules on *this*
+    /// runtime, so it establishes no happens-before edge with the other
+    /// executor: spinning on it is a race, not a wait. Poll with a real
+    /// time budget instead, which is a correct wait on either backend.
+    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{label} (waited 2s)");
+    }
 
     /// Dropping an `EventWatcher` must abort the spawned watcher task
     /// (a bare `JoinHandle` would only detach, leaking the task). The
@@ -5753,26 +5913,19 @@ mod event_watcher_tests {
         });
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
-        tokio::task::yield_now().await;
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "watcher task should have started"
-        );
+        wait_for("watcher task should have started", || {
+            ran.load(Ordering::SeqCst)
+        })
+        .await;
         assert!(
             !abort_handle.is_finished(),
             "task still running before drop"
         );
         drop(watcher);
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::drop must abort the watcher task"
-        );
+        wait_for("EventWatcher::drop must abort the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 
     /// `EventWatcher::abort()` is an explicit, named teardown that
@@ -5787,16 +5940,10 @@ mod event_watcher_tests {
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         watcher.abort();
-        for _ in 0..100 {
-            if abort_handle.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            abort_handle.is_finished(),
-            "EventWatcher::abort must stop the watcher task"
-        );
+        wait_for("EventWatcher::abort must stop the watcher task", || {
+            abort_handle.is_finished()
+        })
+        .await;
     }
 }
 

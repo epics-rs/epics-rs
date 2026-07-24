@@ -12,6 +12,8 @@
 //! UDF/INVALID because the process-decision gate special-cased PROC and omitted
 //! UDF, so a UDF put stored the field but drove no process cycle.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

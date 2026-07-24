@@ -3,6 +3,8 @@
 //! event-record routing, and UDF-on-NaN.
 #![allow(clippy::all)]
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -88,10 +90,10 @@ async fn dfanout_specified_is_one_based() {
         .unwrap();
 
     // SELN=1 drives OUTA only.
-    let a = db.get_record("OUT_A").await.unwrap();
-    let b = db.get_record("OUT_B").await.unwrap();
-    let a_val = a.read().await.record.val();
-    let b_val = b.read().await.record.val();
+    let a = db.get_record("OUT_A").unwrap();
+    let b = db.get_record("OUT_B").unwrap();
+    let a_val = a.read().record.val();
+    let b_val = b.read().record.val();
     assert_eq!(
         a_val,
         Some(EpicsValue::Double(7.0)),
@@ -118,21 +120,15 @@ async fn dfanout_specified_out_of_range_raises_invalid() {
     // (`dbPutString`). dfanout never clears UDF in `process()`, and its
     // `checkAlarms` would otherwise raise INVALID/UDF first — softIoc gives
     // STAT=UDF for the undefined record and STAT=SOFT for this one.
-    db.get_record("DF_BAD")
-        .await
-        .unwrap()
-        .write()
-        .await
-        .common
-        .udf = 0;
+    db.get_record("DF_BAD").unwrap().write().common.udf = 0;
 
     let mut visited = HashSet::new();
     db.process_record_with_links("DF_BAD", &mut visited, 0)
         .await
         .unwrap();
 
-    let rec = db.get_record("DF_BAD").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("DF_BAD").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -171,22 +167,20 @@ async fn event_scan_routes_by_event_number() {
         .unwrap();
     // Configure SCAN=Event and EVNT.
     {
-        let r = db.get_record("REC5").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("REC5").unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = "5".to_string();
     }
     {
-        let r = db.get_record("REC7").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("REC7").unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = "7".to_string();
     }
     // Register the Event scan-index entries.
-    db.update_scan_index("REC5", ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
-    db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
+    db.update_scan_index("REC5", ScanType::Passive, ScanType::Event, 0, 0);
+    db.update_scan_index("REC7", ScanType::Passive, ScanType::Event, 0, 0);
 
     // Post event 5 — only REC5 should process. We detect processing via
     // the record's timestamp moving off its never-processed value, which
@@ -195,10 +189,10 @@ async fn event_scan_routes_by_event_number() {
     db.post_event_named("5").await;
 
     let unprocessed = epics_base_rs::runtime::general_time::epics_epoch();
-    let r5 = db.get_record("REC5").await.unwrap();
-    let r7 = db.get_record("REC7").await.unwrap();
-    let t5 = r5.read().await.common.time;
-    let t7 = r7.read().await.common.time;
+    let r5 = db.get_record("REC5").unwrap();
+    let r7 = db.get_record("REC7").unwrap();
+    let t5 = r5.read().common.time;
+    let t7 = r7.read().common.time;
     assert_ne!(t5, unprocessed, "REC5 (EVNT=5) must process on event 5");
     assert_eq!(t7, unprocessed, "REC7 (EVNT=7) must NOT process on event 5");
 }
@@ -218,8 +212,8 @@ async fn udf_stays_true_on_nan_value() {
 
     db.process_record("NAN_REC").await.unwrap();
 
-    let rec = db.get_record("NAN_REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("NAN_REC").unwrap();
+    let inst = rec.read();
     assert!(
         inst.common.udf != 0,
         "UDF must stay true when VAL is NaN (C aiRecord.c:285)"
@@ -240,9 +234,9 @@ async fn udf_cleared_on_defined_value() {
         .await
         .unwrap();
     db.process_record("OK_REC").await.unwrap();
-    let rec = db.get_record("OK_REC").await.unwrap();
+    let rec = db.get_record("OK_REC").unwrap();
     assert!(
-        rec.read().await.common.udf == 0,
+        rec.read().common.udf == 0,
         "UDF must clear when VAL is a defined value"
     );
 }
@@ -268,8 +262,8 @@ async fn fanout_lnk_skips_non_passive_target() {
         .await
         .unwrap();
     {
-        let r = db.get_record("PERIODIC_TGT").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("PERIODIC_TGT").unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Sec1;
     }
 
@@ -429,15 +423,15 @@ async fn sseq_lnkn_dispatched_exactly_once_per_cycle() {
     );
 
     // Value delivered correctly by the single owner.
-    let tgt_a = db.get_record("SSEQ_TGT_A").await.unwrap();
+    let tgt_a = db.get_record("SSEQ_TGT_A").unwrap();
     assert_eq!(
-        tgt_a.read().await.record.get_field("VAL"),
+        tgt_a.read().record.get_field("VAL"),
         Some(EpicsValue::Double(11.0)),
         "sseq LNK1 must deliver DO1 to its target"
     );
-    let tgt_b = db.get_record("SSEQ_TGT_B").await.unwrap();
+    let tgt_b = db.get_record("SSEQ_TGT_B").unwrap();
     assert_eq!(
-        tgt_b.read().await.record.get_field("VAL"),
+        tgt_b.read().record.get_field("VAL"),
         Some(EpicsValue::Double(22.0)),
         "sseq LNK2 must deliver DO2 to its target"
     );

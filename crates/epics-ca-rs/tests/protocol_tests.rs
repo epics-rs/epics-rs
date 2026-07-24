@@ -1,10 +1,16 @@
 //! Integration tests for epics-ca-rs: protocol encoding/decoding and server API.
 
+// Used only by the async `CaServer` tests below, which are gated off under
+// `rtems-exec-model`; the pure wire-format tests need only `protocol::*`.
+#[cfg(not(feature = "rtems-exec-model"))]
 use std::collections::HashMap;
 
+#[cfg(not(feature = "rtems-exec-model"))]
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::protocol::*;
+#[cfg(not(feature = "rtems-exec-model"))]
 use epics_ca_rs::server::CaServer;
+#[cfg(not(feature = "rtems-exec-model"))]
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------
@@ -202,6 +208,8 @@ fn header_set_payload_count_boundary_at_0xffff() {
 // CaServer builder pattern — basic construction with simple PVs
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_builder_with_simple_pvs() {
     let server = CaServer::builder()
@@ -234,6 +242,8 @@ async fn server_builder_with_simple_pvs() {
 // CaServer get/put with different value types
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_double() {
     let server = CaServer::builder()
@@ -247,6 +257,8 @@ async fn server_put_and_get_double() {
     assert_eq!(server.get("SRV:D").await.unwrap(), EpicsValue::Double(99.9));
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_string() {
     let server = CaServer::builder()
@@ -266,6 +278,8 @@ async fn server_put_and_get_string() {
     );
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_short() {
     let server = CaServer::builder()
@@ -279,6 +293,8 @@ async fn server_put_and_get_short() {
     assert_eq!(server.get("SRV:I").await.unwrap(), EpicsValue::Short(-123));
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_enum() {
     let server = CaServer::builder()
@@ -292,6 +308,8 @@ async fn server_put_and_get_enum() {
     assert_eq!(server.get("SRV:E").await.unwrap(), EpicsValue::Enum(5));
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_float() {
     let server = CaServer::builder()
@@ -305,6 +323,8 @@ async fn server_put_and_get_float() {
     assert_eq!(server.get("SRV:F").await.unwrap(), EpicsValue::Float(2.5));
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_long() {
     let server = CaServer::builder()
@@ -324,6 +344,8 @@ async fn server_put_and_get_long() {
     );
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_and_get_char() {
     let server = CaServer::builder()
@@ -341,6 +363,8 @@ async fn server_put_and_get_char() {
 // CaServer get nonexistent PV returns error
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_get_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
@@ -363,6 +387,8 @@ async fn server_get_nonexistent_pv_returns_error() {
 /// these counters were declared and exposed via `casr` but never
 /// updated by the read/flush hot path — operators saw `bytes in=0,
 /// out=0` no matter how much traffic flowed.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_stats_bytes_in_out_track_real_traffic() {
@@ -427,6 +453,8 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
 /// declared and printed by `casr` but never incremented. Asserts
 /// that `subscriptions_opened_total` and `subscriptions_closed_total`
 /// both increment for a normal monitor lifecycle.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
@@ -486,6 +514,8 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     );
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
@@ -503,6 +533,8 @@ async fn server_put_nonexistent_pv_returns_error() {
 // CaServer add_pv at runtime
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_add_pv_at_runtime() {
     let server = CaServer::builder().port(0).build().await.unwrap();
@@ -527,6 +559,8 @@ async fn server_add_pv_at_runtime() {
 // CaServer with multiple PVs of different types
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_multiple_pv_types_coexist() {
     let server = CaServer::builder()
@@ -561,6 +595,8 @@ async fn server_multiple_pv_types_coexist() {
 // CaServer with db_string — load records from EPICS .db text
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_builder_db_string_ai_record() {
     let db_text = r#"
@@ -581,6 +617,8 @@ record(ai, "TEMP:READING") {
     assert_eq!(val, EpicsValue::Double(25.0));
 }
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_builder_db_string_with_macros() {
     let db_text = r#"
@@ -606,6 +644,8 @@ record(ai, "$(PREFIX):SETPOINT") {
 // Record field access via "PV.FIELD" syntax
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_record_field_access_dot_syntax() {
     let db_text = r#"
@@ -645,6 +685,8 @@ record(ai, "SENSOR:TEMP") {
 // Server with multiple record types
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_multiple_record_types() {
     let db_text = r#"
@@ -700,6 +742,8 @@ record(stringout, "SO:VAL") {
 // Put to a record field via CaServer::put
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_put_to_record() {
     let db_text = r#"
@@ -737,6 +781,8 @@ record(ao, "CTRL:SP") {
 // Mixed: builder PVs + db_string records
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_mixed_simple_pvs_and_records() {
     let db_text = r#"
@@ -768,6 +814,8 @@ record(ai, "REC:AI") {
 // Server builder with custom port
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_builder_custom_port() {
     // This just verifies the builder accepts port() without error.
@@ -789,6 +837,8 @@ async fn server_builder_custom_port() {
 // Server database() accessor
 // ---------------------------------------------------------------------------
 
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn server_database_accessor() {
     let server = CaServer::builder()
@@ -812,6 +862,8 @@ async fn server_database_accessor() {
 /// difference was masked in practice, but a diagnostic / probe client
 /// that puts a marker payload (e.g. RTT measurement, transparent-
 /// proxy detection) saw a stripped reply — a wire-level divergence.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_echo_round_trips_request_header_and_payload() {
@@ -930,6 +982,8 @@ async fn server_echo_round_trips_request_header_and_payload() {
 /// then disconnects (matches C `logBadId`); the valid-SID +
 /// bad-sub_id case is covered by
 /// `server_event_cancel_bad_subid_on_valid_sid_replies_eca_badmonid`.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() {
@@ -1054,6 +1108,8 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
 /// unknown commands and force one reply per frame indefinitely. This
 /// test verifies the server now drops the TCP connection after the
 /// error reply.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_unknown_tcp_command_replies_error_and_disconnects() {
@@ -1158,6 +1214,8 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
 /// connection. Without this gate an ancient peer could complete
 /// VERSION and proceed to CREATE_CHAN with a wire format the modern
 /// server no longer fully supports.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_tcp_version_below_minimum_drops_connection() {
@@ -1225,6 +1283,8 @@ async fn server_tcp_version_below_minimum_drops_connection() {
 /// `RSRV_ERROR` which tears the connection down. Pre-fix Rust sent
 /// the error reply but kept the connection open, letting a peer
 /// flood the server with bad-type WRITE_NOTIFYs.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_write_notify_bad_type_replies_error_and_disconnects() {
@@ -1399,6 +1459,8 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 ///   C. READ_NOTIFY,     CLASS_NAME, count 0  -> count 1, 40-byte body
 /// B and C pin that the reorder preserves ordinary class-name reads and
 /// the notify autosize path.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
@@ -1620,6 +1682,8 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
 ///   C. READ_NOTIFY,     "OK"           -> count 1, postsize 40 (full slot)
 /// B pins that a near-full string is not over-trimmed; C pins that the
 /// notify path keeps the C `read_reply` 40-byte slot.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_deprecated_read_string_shortens_to_nul_length() {
@@ -1819,6 +1883,8 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
 /// the prior SEARCH is still in `current_buf`. Every cid must be
 /// answered exactly once; pre-fix a re-parse duplicates a cid's
 /// SEARCH reply.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
@@ -1985,6 +2051,8 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
 /// the notify path too, an extra wire frame before EOF that rsrv
 /// never produces. Test asserts the silent-close behaviour: no
 /// wire frame, just connection drop.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_read_notify_bad_type_closes_silently() {
@@ -2118,6 +2186,8 @@ async fn server_read_notify_bad_type_closes_silently() {
 /// preserved. libca client treats this as ECHO (`cac.cpp:72-73`).
 /// Pre-fix Rust silently no-op-ed; this regression test ensures the
 /// echo reply now arrives with the expected fields.
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_read_sync_echoes_request_header() {
@@ -2202,6 +2272,8 @@ async fn server_read_sync_echoes_request_header() {
 /// duplicate initial value). `NativeTypeChanged` is reserved for a genuine
 /// transition from a known prior type (an IOC redefining the record, or a
 /// reconnect to a differently-typed record).
+// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
+#[cfg(not(feature = "rtems-exec-model"))]
 #[tokio::test]
 async fn first_connect_does_not_emit_native_type_changed() {
     use std::time::Duration;

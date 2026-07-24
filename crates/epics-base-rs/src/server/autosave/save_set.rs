@@ -181,7 +181,7 @@ impl SaveSet {
         let mut save_entries = Vec::with_capacity(pv_names.len());
 
         for pv in &pv_names {
-            match db.get_pv(pv).await {
+            match db.get_pv(pv) {
                 Ok(val) => {
                     // Encode the value in the configured format so
                     // the `.sav` file matches the header banner the
@@ -230,7 +230,7 @@ impl SaveSet {
                 if self.config.backup.enable_savb {
                     let savb_path = self.config.save_path.with_extension("savB");
                     if !savb_path.exists() {
-                        let _ = tokio::fs::copy(&self.config.save_path, &savb_path).await;
+                        let _ = crate::runtime::fs::copy(&self.config.save_path, &savb_path).await;
                     }
                 }
 
@@ -349,7 +349,7 @@ pub async fn restore_from_entries_with_mode(
         }
 
         // Get current value to determine type
-        let current = match db.get_pv(&entry.pv_name).await {
+        let current = match db.get_pv(&entry.pv_name) {
             Ok(v) => v,
             Err(_) => {
                 result.not_found.push(entry.pv_name.clone());

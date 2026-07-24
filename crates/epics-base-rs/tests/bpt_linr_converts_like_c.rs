@@ -32,6 +32,8 @@
 //! dbgf T:A.STAT  DBF_STRING:  "SOFT"
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -58,8 +60,8 @@ record(ai, "AI:BPT") {{
         .await
         .unwrap();
 
-    let rec = db.get_record("AI:BPT").await.unwrap();
-    let mut inst = rec.write().await;
+    let rec = db.get_record("AI:BPT").unwrap();
+    let mut inst = rec.write();
     inst.record
         .put_field("RVAL", EpicsValue::Long(rval))
         .unwrap();

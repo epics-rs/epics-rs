@@ -26,6 +26,8 @@
 //! The full link-shape table is `tests/array_nord_at_init.rs`; this file keeps
 //! the NELM boundary (NELM==1 vs NELM>1) per kind, with no record processed.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -73,11 +75,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn nord(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD"))
-        .await
-        .unwrap()
-        .to_f64()
-        .unwrap()
+    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 /// `aai` is the one kind whose dset leaves the seed alone: its single element IS
@@ -87,7 +85,7 @@ async fn nelm1_seeds_nord1_on_aai_and_serves_one_element() {
     let db = build().await;
     assert_eq!(nord(&db, "N1:AAI").await, 1.0, "devAaiSoft keeps the seed");
     assert_eq!(
-        db.get_pv("N1:AAI").await.unwrap(),
+        db.get_pv("N1:AAI").unwrap(),
         EpicsValue::DoubleArray(vec![0.0]),
         "a NELM=1 aai serves its single element before first process"
     );
@@ -106,7 +104,7 @@ async fn nelm1_keeps_nord_zero_on_waveform_and_aao() {
             "{rec}: the soft dset's init zeroes the NELM=1 seed"
         );
         assert_eq!(
-            db.get_pv(rec).await.unwrap(),
+            db.get_pv(rec).unwrap(),
             EpicsValue::DoubleArray(vec![]),
             "{rec}: NORD=0 serves a zero-length array"
         );
@@ -119,7 +117,7 @@ async fn nelm_above_one_keeps_nord_zero() {
     for rec in ["N8:WF", "N8:AAI", "N8:AAO"] {
         assert_eq!(nord(&db, rec).await, 0.0, "{rec}: NELM>1 must keep NORD=0");
         assert_eq!(
-            db.get_pv(rec).await.unwrap(),
+            db.get_pv(rec).unwrap(),
             EpicsValue::DoubleArray(vec![]),
             "{rec}: NORD=0 serves a zero-length array"
         );

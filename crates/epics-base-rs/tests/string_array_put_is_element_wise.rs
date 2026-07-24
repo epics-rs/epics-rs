@@ -37,6 +37,8 @@
 //! caput -a WD 3 1.5 2.5 3.5 -> WD = 1.5 2.5 3.5 NORD = 3
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
@@ -61,11 +63,7 @@ fn strings(items: &[&str]) -> EpicsValue {
 }
 
 async fn nord(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD"))
-        .await
-        .unwrap()
-        .to_f64()
-        .unwrap()
+    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 /// The finding's exact case: `caput -a WV 3 7 8 9` on a `FTVL=LONG` waveform.
@@ -78,7 +76,7 @@ async fn ca_string_array_put_writes_every_element() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("WV").await.unwrap(),
+        db.get_pv("WV").unwrap(),
         EpicsValue::LongArray(vec![7, 8, 9]),
         "a DBR_STRING array put must convert element by element, not collapse"
     );
@@ -95,7 +93,7 @@ async fn ca_string_array_put_to_a_double_waveform() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("WD").await.unwrap(),
+        db.get_pv("WD").unwrap(),
         EpicsValue::DoubleArray(vec![1.5, 2.5, 3.5])
     );
     assert_eq!(nord(&db, "WD").await, 3.0);
@@ -112,7 +110,7 @@ async fn per_element_conversion_matches_the_scalar_string_rules() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("WV").await.unwrap(),
+        db.get_pv("WV").unwrap(),
         EpicsValue::LongArray(vec![7, -3]),
         "epicsParseInt32 keeps the leading integer — it does not round"
     );
@@ -121,7 +119,7 @@ async fn per_element_conversion_matches_the_scalar_string_rules() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("WV").await.unwrap(),
+        db.get_pv("WV").unwrap(),
         EpicsValue::LongArray(vec![16, 12]),
         "dbConvertBase is 0, so a 0x-prefixed element is hex"
     );

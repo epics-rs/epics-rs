@@ -4,8 +4,9 @@
 //! (conn.cpp:169-188) and uses it for all subsequent sends; old pvAccess
 //! accepts it from either peer at any time. The Rust server's read loop is
 //! the single owner of that latch: on SET_BYTE_ORDER it updates both its
-//! local outbound `order` and the shared cell read by the heartbeat, so the
-//! next outbound frame (here, the echo response) adopts the new order.
+//! local outbound `order` (used by its own synchronous replies and its
+//! heartbeat arm) and the shared cell the monitor subscriber tasks read, so
+//! the next outbound frame (here, the echo response) adopts the new order.
 //!
 //! Drives a real server over raw TCP: reads its initial SET_BYTE_ORDER
 //! (Little), sends a mid-stream SET_BYTE_ORDER(Big) followed by an
@@ -17,12 +18,13 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::mpsc;
 
 use epics_pva_rs::proto::{ByteOrder, ControlCommand, PvaHeader};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
@@ -52,7 +54,7 @@ impl ChannelSource for EmptySource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
         None
     }
 }

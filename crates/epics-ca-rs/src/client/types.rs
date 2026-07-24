@@ -270,6 +270,51 @@ pub enum ExceptionSite {
     NullFile,
 }
 
+/// The peer's display name — C `tcpiiu::getHostName` (`hostNameCache.cpp`),
+/// which every exception context and `cainfo`'s `Host:` line prints.
+///
+/// One owner for the whole client, so "how a peer is named" has a single
+/// spelling regardless of which half of the crate is compiled. With the
+/// reverse-DNS cache absent (`client-core`, where `hostname` is not built —
+/// `getnameinfo` has no newlib backing) this returns exactly what C returns
+/// for an address with no PTR record: the dotted address with its port
+/// (`ipAddrToA`, `osiSock.c:129`). A caller can therefore never tell the two
+/// configurations apart by the *shape* of what it gets back.
+pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
+    #[cfg(feature = "client")]
+    {
+        crate::hostname::cached_name(addr)
+    }
+    #[cfg(not(feature = "client"))]
+    {
+        addr.to_string()
+    }
+}
+
+/// The blocking half of [`peer_display_name`] — C `ipAddrToA` proper, which
+/// waits for the resolver instead of reading the cache
+/// (`CaChannel::host_name`, libca `ca_host_name`).
+///
+/// Also the one place `tokio::task::spawn_blocking` is reached from the
+/// client, which is why the `client-core` arm is not merely "no DNS": there
+/// is no tokio runtime on the RTEMS target to hand a blocking pool task to,
+/// so that call must not exist there at all.
+pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
+    #[cfg(feature = "client")]
+    {
+        tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
+            .await
+            // A join failure is a runtime shutdown, not a channel error, and
+            // C's `ipAddrToA` has a well-defined answer for "no name": the
+            // dotted IP. Give that rather than failing a connected channel.
+            .unwrap_or_else(|_| addr.to_string())
+    }
+    #[cfg(not(feature = "client"))]
+    {
+        addr.to_string()
+    }
+}
+
 /// libca `oldChannelNotify::writeException` (`oldChannelNotify.cpp:158-159`) —
 /// the site a server-rejected **plain** `CA_PROTO_WRITE` reaches, since
 /// `cac::writeExcep` (`cac.cpp:1049-1061`) looks the channel up and there is no
@@ -313,7 +358,7 @@ pub(crate) const LIBCA_MULTIPLY_DEFINED_SITE: ExceptionSite = ExceptionSite::At(
 pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
-        message: crate::hostname::cached_name(server_addr),
+        message: peer_display_name(server_addr),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_DISCONN),
@@ -336,7 +381,7 @@ pub(crate) fn circuit_disconnect_exception(server_addr: SocketAddr) -> CaExcepti
 pub(crate) fn unresponsive_circuit_exception(server_addr: SocketAddr) -> CaException {
     CaException {
         kind: CaExceptionKind::ServerError,
-        message: crate::hostname::cached_name(server_addr),
+        message: peer_display_name(server_addr),
         server_addr: Some(server_addr),
         pv_name: None,
         status: Some(crate::protocol::ECA_UNRESPTMO),
@@ -1083,6 +1128,12 @@ pub(crate) enum SearchRequest {
     /// isn't present. Already-pending searches against the removed
     /// address run to their natural retry; only future search rounds
     /// stop targeting it.
+    ///
+    /// `client` only: a `DiscoveryEvent::Removed` is the sole producer —
+    /// there is no `CaClient::remove_address` counterpart to
+    /// [`CaClient::add_address`], because libca has no
+    /// `removeAddrFromChannelAccessAddressList` either.
+    #[cfg(feature = "client")]
     RemoveAddress(SocketAddr),
     /// Replace the entire working address list. Mirrors libca
     /// `configureChannelAccessAddressList` (iocinf.cpp:166). Use
@@ -1188,6 +1239,7 @@ pub(crate) enum TransportCommand {
     /// a beacon is a per-server UDP signal, but the watchdog it
     /// pets lives on each circuit, so the notify fans out to every
     /// priority circuit for `server_addr` (see `process_command`).
+    #[cfg(ca_beacon_monitor)]
     BeaconArrivalNotify {
         server_addr: SocketAddr,
         anomaly: bool,
@@ -1291,6 +1343,10 @@ pub(crate) enum TransportEvent {
     /// misclassify the server's `online_notify_task` ramp-up as a
     /// short-period anomaly cascade after reconnect. Emitted exactly once
     /// per circuit, before any other event for that circuit.
+    ///
+    /// `client` only: its single consumer is the beacon EMA reset, and
+    /// `client-core` has no beacon monitor to reset.
+    #[cfg(feature = "client")]
     ServerConnected {
         server_addr: SocketAddr,
     },

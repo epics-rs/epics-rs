@@ -92,10 +92,88 @@ impl NotifyWaitSet {
     }
 
     /// True once every chain member has left (the completion has fired).
-    /// Used by the put entry to decide synchronous (return `None`) vs
-    /// async-pending (return the receiver) completion.
+    /// Used by the put entry to decide synchronous ([`ProcessCompletion::Sync`])
+    /// vs async-pending ([`ProcessCompletion::Async`]) completion.
     pub fn completed(&self) -> bool {
         self.pending.load(Ordering::Acquire) == 0
+    }
+}
+
+/// The completion outcome of an externally-initiated record process cycle —
+/// the value a caller learns after driving the synchronous head of a
+/// `dbPutNotify` / CA `WRITE_NOTIFY`.
+///
+/// This is the contract the **RTEMS CA driver** consumes: the CA thread drives
+/// the synchronous head of a put (C `dbProcessNotify`, `rsrv/camessage.c`
+/// `write_notify_action`) to completion — on RTEMS via `park_on` — then
+/// `match`es this value to decide whether to reply inline or return now and let
+/// background infrastructure deliver the completion later. The caller learns
+/// sync-vs-async as a typed value, not by inferring it from `Option::is_some`.
+///
+/// # C parity (`dbNotify.c`)
+///
+/// The C `processNotify` state machine forks a put-notify exactly here:
+///
+/// * **[`Self::Sync`]** — the record was neither active (`pact`) nor selected
+///   for processing, so `processNotifyCommon` runs `callDone`
+///   (`dbNotify.c:270`), which fires `doneCallback` INLINE on the calling
+///   thread (`dbNotify.c:182`). Our fully-synchronous chain drains the
+///   [`NotifyWaitSet`] before the put entry returns.
+/// * **[`Self::Async`]** — the record was `pact` (`notifyRestartInProgress`,
+///   `dbNotify.c:225-231`) or processed into an async device
+///   (`notifyProcessInProgress`, `dbNotify.c:252-263`). Completion is deferred
+///   to `dbNotifyCompletion` (`dbNotify.c:445-475`), which fires the user
+///   callback via `callbackRequest` (`:466`/`:470`) when the tracked waitList
+///   empties. Our [`NotifyWaitSet::leave`]-to-zero fires the `handle` oneshot
+///   at that same moment.
+///
+/// # Invariant (by construction)
+///
+/// Exactly one of {`Sync` returned, the `Async` handle fires exactly once} per
+/// initiated cycle. The single owner of the fire is [`NotifyWaitSet`]: its
+/// `leave`-to-zero `take`s the oneshot sender and sends once, so the handle can
+/// never fire twice; and `Sync` is returned only when the wait-set already
+/// drained, so no handle is outstanding to fire. There is no parallel
+/// signalling path — the oneshot is the sole completion channel.
+#[derive(Debug)]
+pub enum ProcessCompletion {
+    /// The cycle settled within the calling thread — the caller replies inline.
+    Sync,
+    /// The cycle went async; `handle` fires exactly once when the tracked
+    /// FLNK/OUT chain settles (C `dbNotifyCompletion`).
+    Async(crate::runtime::sync::oneshot::Receiver<()>),
+}
+
+impl ProcessCompletion {
+    /// Build the outcome from the wait-set's internal signal. `None` — the
+    /// wait-set drained synchronously, or the completion receiver lives
+    /// elsewhere (a deferred-restart replay carries only the sender) — is
+    /// [`Self::Sync`]; `Some(rx)` is [`Self::Async`].
+    pub(crate) fn from_signal(rx: Option<crate::runtime::sync::oneshot::Receiver<()>>) -> Self {
+        match rx {
+            Some(rx) => Self::Async(rx),
+            None => Self::Sync,
+        }
+    }
+
+    /// The completion handle if this cycle went async, else `None`. The CA
+    /// `WRITE_NOTIFY` dispatch uses this to choose inline reply (`None`) vs a
+    /// spawned completion task (`Some(rx)`).
+    pub fn into_handle(self) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        match self {
+            Self::Sync => None,
+            Self::Async(rx) => Some(rx),
+        }
+    }
+
+    /// True if the cycle went async (a completion handle is outstanding).
+    pub fn is_async(&self) -> bool {
+        matches!(self, Self::Async(_))
+    }
+
+    /// True if the cycle completed synchronously (no handle to await).
+    pub fn is_sync(&self) -> bool {
+        matches!(self, Self::Sync)
     }
 }
 
@@ -791,9 +869,57 @@ pub(crate) fn value_as_dbr_string(value: &EpicsValue) -> Option<PvString> {
     }
 }
 
+/// The `dbCommon` link fields, each with the C link-field type its text is
+/// parsed under (`dbStaticLib.c:2380-2391`): `INP`/`TSEL`/`SDIS` are
+/// `DBF_INLINK`, `OUT` is `DBF_OUTLINK`, `FLNK` is `DBF_FWDLINK`.
+///
+/// These five — and only these five — have a parse cache on
+/// [`RecordInstance`], which is what lets a one-shot init decision (C
+/// `dbInitLink` setting `DBLINK_FLAG_INITIALIZED`) be committed for them.
+/// The list has one owner because it is read from three places that must not
+/// drift: the per-field parse in `put_common_field`, the database's
+/// `record_link_fields` enumeration, and the `initialize_link_locality`
+/// commit. `FLNK` missing from just one of them is exactly how an external
+/// forward link went un-opened at init.
+pub const COMMON_LINK_FIELDS: [(&str, super::link::LinkFieldType); 5] = [
+    ("INP", super::link::LinkFieldType::In),
+    ("OUT", super::link::LinkFieldType::Out),
+    ("TSEL", super::link::LinkFieldType::In),
+    ("SDIS", super::link::LinkFieldType::In),
+    ("FLNK", super::link::LinkFieldType::Fwd),
+];
+
 impl RecordInstance {
     pub fn new(name: String, record: impl Record) -> Self {
         Self::new_boxed(name, Box::new(record))
+    }
+
+    /// The raw text of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// other field name.
+    pub fn common_link_text(&self, field: &str) -> Option<&str> {
+        Some(match field {
+            "INP" => self.common.inp.as_str(),
+            "OUT" => self.common.out.as_str(),
+            "TSEL" => self.common.tsel.as_str(),
+            "SDIS" => self.common.sdis.as_str(),
+            "FLNK" => self.common.flnk.as_str(),
+            _ => return None,
+        })
+    }
+
+    /// The parse cache of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// other field name. The only mutable handle on the cache outside
+    /// `put_common_field`, so the iocInit locality commit cannot reach a slot
+    /// that has no matching raw text.
+    pub fn common_link_cache_mut(&mut self, field: &str) -> Option<&mut ParsedLink> {
+        Some(match field {
+            "INP" => &mut self.parsed_inp,
+            "OUT" => &mut self.parsed_out,
+            "TSEL" => &mut self.parsed_tsel,
+            "SDIS" => &mut self.parsed_sdis,
+            "FLNK" => &mut self.parsed_flnk,
+            _ => return None,
+        })
     }
 
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
@@ -1041,7 +1167,7 @@ impl RecordInstance {
         }
     }
 
-    /// Like [`notify_field_written`] but skips the invalidation when
+    /// Like [`Self::notify_field_written`] but skips the invalidation when
     /// the put did not actually change the field's value. Mirrors
     /// epics-base `faac1df1` — `DBE_PROPERTY` events fire only on
     /// real changes, not on idempotent writes (the C path compares
@@ -1051,7 +1177,7 @@ impl RecordInstance {
     /// `prev` is the value captured BEFORE the put. Callers that
     /// don't need the change-detection (e.g. internal writers that
     /// know the field is non-metadata) can keep using
-    /// [`notify_field_written`].
+    /// [`Self::notify_field_written`].
     // must post EventMask::PROPERTY to all field subscribers when metadata changes
     pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
@@ -1129,7 +1255,7 @@ impl RecordInstance {
     ///
     /// 1. the dbCommon `SPC_NOMOD` set below — common fields, so no record's
     ///    `field_list` declares them;
-    /// 2. the record type's **declaration**, resolved by [`Self::field_desc`] —
+    /// 2. the record type's **declaration**, resolved by `Self::field_desc` —
     ///    the vendored `.dbd` whenever one exists, and only for a record type
     ///    that has no `.dbd` at all (`motor`, `optics`, `scaler`, `std`) the
     ///    record's own hand-written table, which for those Tier 3 types
@@ -1807,7 +1933,7 @@ impl RecordInstance {
     /// MARK for a channel it has not read yet (QSRV resolves a group's member
     /// masks once, at monitor start, rather than per event).
     ///
-    /// Same two gates, same owner as [`Self::assign_property_support`]: an
+    /// Same two gates, same owner as `Self::assign_property_support`: an
     /// unknown field supplies nothing.
     pub fn property_support_for_field(&self, field: &str) -> PropertySupport {
         let Some(value) = self.client_field_value(field) else {
@@ -2307,7 +2433,7 @@ impl RecordInstance {
     /// Returns what scan index changes are needed.
     ///
     /// A `DBF_MENU` common field's string is converted by C's runtime
-    /// converter, `dbConvert.c::putStringMenu` — see [`MenuBound::DbPut`].
+    /// converter, `dbConvert.c::putStringMenu` — see `MenuBound::DbPut`.
     pub fn put_common_field(
         &mut self,
         name: &str,
@@ -2484,7 +2610,7 @@ impl RecordInstance {
 
     /// Set a common field value from the `.db` loader, which in C is a
     /// different converter with a different out-of-menu bound
-    /// (`dbStaticRun.c::dbPutStringNum`; see [`MenuBound::DbLoad`]). It is what
+    /// (`dbStaticRun.c::dbPutStringNum`; see `MenuBound::DbLoad`). It is what
     /// lets `field(SSCN,"65535")` — the menuScan "use SCAN" sentinel, out of
     /// the menu's 0-9 range — load, while `caput REC.SSCN 65535` is refused at
     /// runtime exactly as C refuses it.

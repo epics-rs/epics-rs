@@ -10,6 +10,14 @@
 //! pvxs equivalent: tests run against a live IOC; we run against
 //! `PvDatabase::add_record` since epics-base-rs gives us a
 //! Rust-native record system without a separate `iocInit`.
+//!
+//! `qsrv-core` and not `qsrv`: this file reaches only `epics_bridge_rs::qsrv`,
+//! which is what `qsrv-core` selects, and never the `PvaClient` that `qsrv`
+//! additionally restores. Naming the wider feature would gate the file out of
+//! the target's own selection for no reason.
+#![cfg(feature = "qsrv-core")]
+
+// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 
@@ -532,8 +540,8 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
     let mut mon = ch.create_monitor().await.expect("monitor");
     mon.start().await.expect("start");
     {
-        let rec = db.get_record("TEST:filt_wf").await.expect("rec");
-        rec.write().await.notify_field("VAL", EventMask::VALUE);
+        let rec = db.get_record("TEST:filt_wf").expect("rec");
+        rec.write().notify_field("VAL", EventMask::VALUE);
     }
     let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
         .await
@@ -703,8 +711,8 @@ async fn channel_with_field_suffix_binds_to_field() {
     ch.put(&put).await.expect("put EGU");
 
     let egu_after = {
-        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:fld_ai").expect("rec exists");
+        let inst = rec.read();
         inst.snapshot_for_field("EGU").map(|s| s.value)
     };
     assert!(
@@ -713,8 +721,8 @@ async fn channel_with_field_suffix_binds_to_field() {
     );
 
     let val_after = {
-        let rec = db.get_record("TEST:fld_ai").await.expect("rec exists");
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:fld_ai").expect("rec exists");
+        let inst = rec.read();
         inst.snapshot_for_field("VAL").map(|s| s.value)
     };
     assert!(
@@ -942,8 +950,8 @@ async fn monitor_stop_disables_backing_subscription() {
     );
 
     async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
-        let rec = db.get_record("TEST:gate_ai").await.expect("rec");
-        rec.write().await.notify_field("VAL", mask);
+        let rec = db.get_record("TEST:gate_ai").expect("rec");
+        rec.write().notify_field("VAL", mask);
     }
 
     // Active (post-START): a VALUE post is delivered.
@@ -1267,8 +1275,8 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
     .await
     .unwrap();
     {
-        let rec = db.get_record("TEST:lstr").await.expect("record");
-        rec.write().await.set_info("Q:form", "String");
+        let rec = db.get_record("TEST:lstr").expect("record");
+        rec.write().set_info("Q:form", "String");
     }
     db.put_pv("TEST:lstr", EpicsValue::CharArray(b"abc\0".to_vec()))
         .await
@@ -1317,8 +1325,8 @@ async fn r17_31_qform_string_char_waveform_serves_long_string() {
         other => panic!("expected updated string, got {other:?}"),
     }
     let nord = {
-        let rec = db.get_record("TEST:lstr").await.expect("record");
-        let inst = rec.read().await;
+        let rec = db.get_record("TEST:lstr").expect("record");
+        let inst = rec.read();
         inst.resolve_field("NORD").expect("NORD")
     };
     assert_eq!(

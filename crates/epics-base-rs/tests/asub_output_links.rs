@@ -20,6 +20,8 @@
 //! The port stored OUTA..OUTU and never wrote them: a subroutine's results
 //! reached VALA..VALU (and their CA monitors) but no downstream record.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -49,8 +51,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> Option<f64> {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).and_then(|v| v.to_f64())
 }
 
@@ -147,8 +149,8 @@ async fn r9_78_failed_do_sub_pushes_nothing() {
 async fn r9_78_failed_input_fetch_pushes_nothing() {
     let db = asub_db(0).await;
     {
-        let inst = db.get_record("ASUB").await.unwrap();
-        let mut g = inst.write().await;
+        let inst = db.get_record("ASUB").unwrap();
+        let mut g = inst.write();
         g.record
             .put_field("INPA", EpicsValue::String("NOSUCHREC".into()))
             .unwrap();

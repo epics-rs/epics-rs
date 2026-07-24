@@ -36,6 +36,8 @@
 //! HG.MDEL  DBF_SHORT      HG.MCNT  DBF_SHORT
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -63,7 +65,6 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
     db.get_pv(pv)
-        .await
         .unwrap_or_else(|e| panic!("{pv} must be served: {e:?}"))
 }
 

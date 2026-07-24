@@ -8,6 +8,8 @@
 //!   pvxlist's listen window, its stdout must contain the Rust
 //!   server's `<ip>:<port>` advertisement.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};

@@ -15,6 +15,8 @@
 //! `c_parse::put_string` Long row, which stores the value and range-checks it
 //! exactly as C's `epicsParseInt32` does.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -31,15 +33,15 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 
 /// (stat, sevr) after the last put/process cycle.
 async fn alarm(db: &PvDatabase) -> (u16, AlarmSeverity) {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 

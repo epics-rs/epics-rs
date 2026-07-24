@@ -24,6 +24,8 @@
 //! - external target, metadata count > 1    → array buffer
 //! - external target, no metadata (C failed dbCaGetNelements) → scalar
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -102,11 +104,24 @@ struct CountingLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for CountingLset {
-    async fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &str) -> bool {
         self.element_count.is_some()
     }
-    async fn get_value(&self, _name: &str) -> Option<EpicsValue> {
+    /// The subject of these tests is which BUFFER the record hands the OUT
+    /// put (`&oval` vs `oav`), driven by the cached element count. Admit
+    /// every write so the buffer choice is observable: the separate
+    /// connection gate C applies before staging
+    /// (`dbCaPutLinkCallback`, `dbCa.c:558-561`) is covered by
+    /// `out_link_failure_alarm.rs`, and folding it in here would make the
+    /// no-metadata case assert nothing at all.
+    fn put_admission(&self, _name: &str) -> epics_base_rs::server::database::PutAdmission {
+        epics_base_rs::server::database::PutAdmission::Connected
+    }
+    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
         None
+    }
+    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        self.get_cached_value(name)
     }
     async fn put_value(
         &self,
@@ -117,7 +132,7 @@ impl LinkSet for CountingLset {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    async fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
         self.element_count.map(|n| LinkMetadata {
             element_count: Some(n),
             ..Default::default()
@@ -149,6 +164,10 @@ fn invalid_ivov_record(dopt: i16, nelm: u32, out: &str) -> AcalcoutRecord {
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
     db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    // An external OUT put is staged on the link-put queue and the record
+    // returns (C `dbCaPutLink`, `dbCa.c:622-624`); `dbCaSync`
+    // (`dbCa.c:1191-1194`) is the barrier that makes it observable.
+    db.sync_external_link_puts().await;
 }
 
 /// Scalar local target, DOPT=Use OCAL: effective nelm 1 → `&pcalc->oval`

@@ -16,6 +16,8 @@
 //!   - record type with NO SoftRaw dset in C (longin/longout): the DTYP must
 //!     fall back to the VAL-direct soft path, not drop the value.
 
+// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -106,10 +108,8 @@ async fn ioc() -> Arc<PvDatabase> {
 
 async fn field(db: &PvDatabase, name: &str, f: &str) -> EpicsValue {
     db.get_record(name)
-        .await
         .unwrap_or_else(|| panic!("{name} missing"))
         .read()
-        .await
         .record
         .get_field(f)
         .unwrap_or_else(|| panic!("{name}.{f} missing"))

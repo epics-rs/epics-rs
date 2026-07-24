@@ -89,6 +89,8 @@
 //! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
 //! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
 
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1030,17 +1032,14 @@ mod tests {
         stats.refresh(&cache, &db, 0, 0).await;
 
         assert_eq!(
-            db.get_pv("g:clientEventCount").await.unwrap(),
+            db.get_pv("g:clientEventCount").unwrap(),
             EpicsValue::Long(2)
         );
-        assert_eq!(
-            db.get_pv("g:postEventCount").await.unwrap(),
-            EpicsValue::Long(1)
-        );
-        assert_eq!(db.get_pv("g:loopCount").await.unwrap(), EpicsValue::Long(3));
+        assert_eq!(db.get_pv("g:postEventCount").unwrap(), EpicsValue::Long(1));
+        assert_eq!(db.get_pv("g:loopCount").unwrap(), EpicsValue::Long(3));
         // `fd` should have been posted with a plausible value on any
         // supported platform. It is a C gateStat PV → DBR_DOUBLE.
-        if let Ok(EpicsValue::Double(fd)) = db.get_pv("g:fd").await {
+        if let Ok(EpicsValue::Double(fd)) = db.get_pv("g:fd") {
             assert!(fd >= 0.0);
         }
 
@@ -1048,11 +1047,11 @@ mod tests {
         // the post_event_count / loop_count counters driven above. On the
         // first refresh the previous-count baseline is 0, so the deltas
         // are 1 and 3 over a tiny but positive elapsed → strictly > 0.
-        match db.get_pv("g:clientPostRate").await.unwrap() {
+        match db.get_pv("g:clientPostRate").unwrap() {
             EpicsValue::Double(r) => assert!(r > 0.0, "clientPostRate should be > 0, got {r}"),
             other => panic!("clientPostRate must be DBR_DOUBLE, got {other:?}"),
         }
-        match db.get_pv("g:loopRate").await.unwrap() {
+        match db.get_pv("g:loopRate").unwrap() {
             EpicsValue::Double(r) => assert!(r > 0.0, "loopRate should be > 0, got {r}"),
             other => panic!("loopRate must be DBR_DOUBLE, got {other:?}"),
         }
@@ -1062,7 +1061,7 @@ mod tests {
         // covered by `refresh_server_rates_track_installed_ca_server_counters`.
         for name in ["g:serverEventRate", "g:serverPostRate"] {
             assert_eq!(
-                db.get_pv(name).await.unwrap(),
+                db.get_pv(name).unwrap(),
                 EpicsValue::Double(0.0),
                 "{name} is 0.0 when no downstream CaServer stats handle is installed"
             );
@@ -1072,7 +1071,7 @@ mod tests {
         // way DBR_DOUBLE and never negative (the -1.0 error sentinel was
         // replaced by leave-at-last, like the fd PV).
         for name in ["g:cpuFract", "g:load"] {
-            match db.get_pv(name).await.unwrap() {
+            match db.get_pv(name).unwrap() {
                 EpicsValue::Double(v) => {
                     assert!(v >= 0.0, "{name} must be >= 0.0, got {v}")
                 }
@@ -1110,14 +1109,14 @@ mod tests {
 
         // First refresh: previous baseline 0, deltas 40 / 50 over a tiny
         // but positive elapsed → strictly > 0. DBR_DOUBLE per STAT_DOUBLE.
-        let first_event = match db.get_pv("g:serverEventRate").await.unwrap() {
+        let first_event = match db.get_pv("g:serverEventRate").unwrap() {
             EpicsValue::Double(r) => {
                 assert!(r > 0.0, "serverEventRate should be > 0, got {r}");
                 r
             }
             other => panic!("serverEventRate must be DBR_DOUBLE, got {other:?}"),
         };
-        match db.get_pv("g:serverPostRate").await.unwrap() {
+        match db.get_pv("g:serverPostRate").unwrap() {
             EpicsValue::Double(r) => {
                 assert!(r > 0.0, "serverPostRate should be > 0, got {r}");
                 // posted (50) >= processed (40) over the same interval.
@@ -1132,12 +1131,12 @@ mod tests {
         // Second refresh with no new events → delta 0 → both rates 0.0.
         stats.refresh(&cache, &db, 0, 0).await;
         assert_eq!(
-            db.get_pv("g:serverEventRate").await.unwrap(),
+            db.get_pv("g:serverEventRate").unwrap(),
             EpicsValue::Double(0.0),
             "no new processed events → serverEventRate decays to 0"
         );
         assert_eq!(
-            db.get_pv("g:serverPostRate").await.unwrap(),
+            db.get_pv("g:serverPostRate").unwrap(),
             EpicsValue::Double(0.0),
             "no new posted events → serverPostRate decays to 0"
         );
@@ -1221,14 +1220,8 @@ mod tests {
 
         // pvtotal = all cached PVs (3); vctotal = only the 2 with a
         // downstream client. Both served as DBR_DOUBLE (C STAT_DOUBLE).
-        assert_eq!(
-            db.get_pv("g:pvtotal").await.unwrap(),
-            EpicsValue::Double(3.0)
-        );
-        assert_eq!(
-            db.get_pv("g:vctotal").await.unwrap(),
-            EpicsValue::Double(2.0)
-        );
+        assert_eq!(db.get_pv("g:pvtotal").unwrap(), EpicsValue::Double(3.0));
+        assert_eq!(db.get_pv("g:vctotal").unwrap(), EpicsValue::Double(2.0));
     }
 
     /// the `disconnected` alias must report the Disconnect-state
@@ -1265,20 +1258,14 @@ mod tests {
         // disconnected = Disconnect-state count (2), distinct from dead (1).
         // C-name aliases are served as DBR_DOUBLE (C STAT_DOUBLE).
         assert_eq!(
-            db.get_pv("g:disconnected").await.unwrap(),
+            db.get_pv("g:disconnected").unwrap(),
             EpicsValue::Double(2.0)
         );
-        assert_eq!(db.get_pv("g:dead").await.unwrap(), EpicsValue::Double(1.0));
+        assert_eq!(db.get_pv("g:dead").unwrap(), EpicsValue::Double(1.0));
         // unconnected = connecting(1) + dead(1) + disconnect(2) = 4.
-        assert_eq!(
-            db.get_pv("g:unconnected").await.unwrap(),
-            EpicsValue::Double(4.0)
-        );
+        assert_eq!(db.get_pv("g:unconnected").unwrap(), EpicsValue::Double(4.0));
         // connected = active(1) + inactive(1) = 2 (unchanged by this fix).
-        assert_eq!(
-            db.get_pv("g:connected").await.unwrap(),
-            EpicsValue::Double(2.0)
-        );
+        assert_eq!(db.get_pv("g:connected").unwrap(), EpicsValue::Double(2.0));
     }
 
     /// every C-name compat-alias stat PV must be served as
@@ -1317,7 +1304,7 @@ mod tests {
             "g:serverPostRate",
         ] {
             assert!(
-                matches!(db.get_pv(name).await.unwrap(), EpicsValue::Double(_)),
+                matches!(db.get_pv(name).unwrap(), EpicsValue::Double(_)),
                 "{name} must be DBR_DOUBLE to match C gateStat"
             );
         }
@@ -1330,7 +1317,7 @@ mod tests {
             "g:clientEventCount",
         ] {
             assert!(
-                matches!(db.get_pv(name).await.unwrap(), EpicsValue::Long(_)),
+                matches!(db.get_pv(name).unwrap(), EpicsValue::Long(_)),
                 "{name} is Rust-native and must stay DBR_LONG"
             );
         }

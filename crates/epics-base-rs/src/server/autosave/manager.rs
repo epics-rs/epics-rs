@@ -4,7 +4,8 @@ use std::sync::Arc;
 use crate::server::database::PvDatabase;
 use crate::types::EpicsValue;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+
+use crate::runtime::task::TaskHandle;
 
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
@@ -99,8 +100,8 @@ impl AutosaveManager {
     }
 
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
-    pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> TaskHandle<()> {
+        crate::runtime::task::spawn(async move {
             let mut handles = Vec::new();
 
             for (set, lock) in &self.sets {
@@ -112,8 +113,8 @@ impl AutosaveManager {
 
                 let handle = match set.config().strategy.clone() {
                     SaveStrategy::Periodic { interval } => {
-                        tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(interval);
+                        crate::runtime::task::spawn(async move {
+                            let mut ticker = crate::runtime::task::interval(interval);
                             ticker.tick().await; // first tick is immediate, skip it
                             loop {
                                 tokio::select! {
@@ -138,15 +139,15 @@ impl AutosaveManager {
                         mode,
                         poll_interval,
                     } => {
-                        tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(poll_interval);
+                        crate::runtime::task::spawn(async move {
+                            let mut ticker = crate::runtime::task::interval(poll_interval);
                             let mut last_value: Option<String> = None;
                             let mut armed = true; // For NonZero: armed when last was 0
 
                             loop {
                                 tokio::select! {
                                     _ = ticker.tick() => {
-                                        let current = db.get_pv(&trigger_pv).await.ok();
+                                        let current = db.get_pv(&trigger_pv).ok();
                                         let current_str = current.as_ref().map(|v| v.to_string());
 
                                         let should_save = match mode {
@@ -203,8 +204,8 @@ impl AutosaveManager {
                     SaveStrategy::OnChange {
                         min_interval,
                         float_epsilon,
-                    } => tokio::spawn(async move {
-                        let mut ticker = tokio::time::interval(min_interval);
+                    } => crate::runtime::task::spawn(async move {
+                        let mut ticker = crate::runtime::task::interval(min_interval);
                         let mut last_snapshot: HashMap<String, String> = HashMap::new();
 
                         loop {
@@ -215,7 +216,7 @@ impl AutosaveManager {
                                     let mut changed = false;
 
                                     for pv in &pv_names {
-                                        if let Ok(val) = db.get_pv(pv).await {
+                                        if let Ok(val) = db.get_pv(pv) {
                                             let val_str = save_file::value_to_save_str(&val);
                                             if let Some(old_str) = last_snapshot.get(pv) {
                                                 if !values_equal_str(old_str, &val_str, float_epsilon) {
@@ -364,7 +365,7 @@ async fn update_status_pvs(
         .await;
 
     // Heartbeat
-    if let Ok(current) = db.get_pv(&format!("{prefix}SR_heartbeat")).await {
+    if let Ok(current) = db.get_pv(&format!("{prefix}SR_heartbeat")) {
         if let Some(v) = current.to_f64() {
             let _ = db
                 .put_pv_no_process(

@@ -3,14 +3,29 @@
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// (1 live-upstream monitor test gated out feature-ON below; §4.2, stage 3.)
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
+use epics_pva_rs::client::PvaClient;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use super::config::{LinkDirection, ProcMode, PvaLinkConfig, SevrMode};
 use super::link::{PvaLink, PvaLinkResult};
+
+/// Operation timeout of the IOC-wide pvalink client.
+///
+/// The value every link used to build its own client with, kept explicit
+/// so it does not silently follow `PvaClientBuilder`'s default. pvalink
+/// exposes **no** per-link timeout option (neither does pvxs's
+/// `pvaLinkConfig`), so one client-level timeout is the whole surface; a
+/// per-link timeout, if one is ever added, must be passed to the
+/// per-operation call instead of forking the shared client.
+const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Registry cache key.
 ///
@@ -76,16 +91,28 @@ pub struct ChannelDiag {
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
 /// `(pv_name, pipeline, queue_size, direction)` tuples.
-#[derive(Default)]
 pub struct PvaLinkRegistry {
+    /// The ONE [`PvaClient`] every link opened through this registry
+    /// runs on — the single owner pvxs calls
+    /// `linkGlobal->provider_remote`, built once in `linkGlobal_t::alloc()`
+    /// (`pvxs/ioc/pvalink.h:107`, `pvalink.cpp:51-63`).
+    ///
+    /// The registry, not the link, owns it because the registry is what
+    /// constructs links: [`PvaLink::open`] takes a client and never builds
+    /// one, so "a link owns a client" is not a representable state. All
+    /// links therefore share one `ConnectionPool` (keyed on `SocketAddr`)
+    /// and one search engine — two links to the same upstream IOC cost one
+    /// TCP connection, not two, whatever their `pvRequest` (`Q`, pipeline)
+    /// or direction.
+    client: PvaClient,
     map: RwLock<HashMap<RegistryKey, Arc<PvaLink>>>,
     /// In-flight open dedup. The original
     /// `get_or_open` used a textbook DCL — read-lock → open →
     /// write-lock → DCL drop loser. Two concurrent first-callers
-    /// both reached `PvaLink::open` (which spawns a monitor task
-    /// and a `PvaClient`); the loser's resources cleaned up via
-    /// Drop, but two upstream search/connect round-trips and two
-    /// monitor-task spawns were spent for one user-visible result.
+    /// both reached `PvaLink::open` (which spawns a monitor task);
+    /// the loser's resources cleaned up via Drop, but two upstream
+    /// search/connect round-trips and two monitor-task spawns were
+    /// spent for one user-visible result.
     /// This map carries an `Arc<Notify>` per in-flight open; the
     /// second caller awaits and then reads the cached entry.
     pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
@@ -109,9 +136,39 @@ fn key_of(config: &PvaLinkConfig) -> RegistryKey {
     )
 }
 
+impl Default for PvaLinkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PvaLinkRegistry {
+    /// A registry owning a freshly built IOC-wide client.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_client(PvaClient::builder().timeout(PVALINK_CLIENT_TIMEOUT).build())
+    }
+
+    /// A registry running every link on `client`.
+    ///
+    /// The injection seam for the IOC-wide client, matching pvxs building
+    /// `linkGlobal->provider_remote` from the IOC server's client config
+    /// (`pvxs/ioc/pvalink.cpp:60`) rather than from bare defaults. Tests
+    /// use it to pin the whole registry at one `PvaServer` address.
+    pub fn with_client(client: PvaClient) -> Self {
+        Self {
+            client,
+            map: RwLock::new(HashMap::new()),
+            pending: RwLock::new(HashMap::new()),
+            channel_records: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// STAGE-5 PROBE: the IOC-wide client, so a target image with no shell
+    /// can print `PvaClient::report()` on its console — the only way to
+    /// observe "one upstream connection regardless of link count" from the
+    /// guest side.
+    pub fn client(&self) -> &PvaClient {
+        &self.client
     }
 
     /// Record that `record`'s link attached to the channel identified by
@@ -163,6 +220,29 @@ impl PvaLinkRegistry {
             pipeline,
             queue_size,
             LinkDirection::Inp,
+        );
+        self.map.read().get(&key).cloned()
+    }
+
+    /// Exact OUT lookup — the write-direction twin of [`Self::try_get_inp`].
+    ///
+    /// The registry keys on direction, so an OUT link's shared channel owner
+    /// is a *different* entry from the INP one for the same PV. A caller
+    /// asking "is the write path up?" must therefore look here: the INP
+    /// lookup answers `None` for a perfectly healthy OUT-only channel.
+    /// An OUT channel tracks its connection through its own liveness monitor
+    /// (`PvaLink::open`'s OUT arm), which is what `is_connected()` reads.
+    pub fn try_get_out(
+        &self,
+        pv_name: &str,
+        pipeline: bool,
+        queue_size: usize,
+    ) -> Option<Arc<PvaLink>> {
+        let key: RegistryKey = (
+            pv_name.to_string(),
+            pipeline,
+            queue_size,
+            LinkDirection::Out,
         );
         self.map.read().get(&key).cloned()
     }
@@ -280,7 +360,7 @@ impl PvaLinkRegistry {
             armed: true,
         };
 
-        let result = PvaLink::open(config).await;
+        let result = PvaLink::open(config, self.client.clone()).await;
         let link = Arc::new(result?);
         // Publish to the cache before releasing the pending slot so
         // waiters that wake up see the cached entry immediately.
@@ -637,5 +717,106 @@ mod tests {
             "a different pvRequest (pipeline) is a different channel owner"
         );
         assert_eq!(reg.len(), 2, "two distinct channel owners cached");
+    }
+
+    /// Stage 0 gate (`doc/pvalink-rtems-design.md` §5): the registry owns
+    /// ONE [`PvaClient`] for the whole IOC, so links that are deliberately
+    /// *distinct* still cost the upstream IOC exactly **one** TCP
+    /// connection.
+    ///
+    /// Two INP links to the same `pv_name` with different `queue_size` are
+    /// different `pvRequest`s — pvxs `channels_key_t = (channelName,
+    /// pvRequest)` (`pvxs/ioc/pvalink.h:115-120`) — hence distinct
+    /// `RegistryKey`s and distinct `PvaLink`s, each with its own monitor
+    /// subscription. What they must NOT have is distinct transports: both
+    /// resolve through the one client's `ConnectionPool`, which is keyed on
+    /// `SocketAddr`, so the server sees a single peer.
+    ///
+    /// Pre-fix, `PvaLink::open` built a `PvaClient` per link
+    /// (`link.rs:297`), giving each link its own pool — the server saw
+    /// TWO peers. On the RTEMS target that doubling is the resource
+    /// ceiling, not a cosmetic cost (design §2.4, §4.3).
+    ///
+    /// The client is pinned at the test server's address, so this
+    /// exercises the connection pool without any UDP search.
+    // Drives two live pvalink monitor subscriptions to a real upstream server;
+    // the link's monitor task now spawns onto the reactor-less callback pool
+    // under `rtems-exec-model`, where the client's `tokio::net` transport
+    // cannot run. Reactor-dependent — gated out feature-ON
+    // (doc/pvalink-rtems-design.md §4.2, stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stage0_distinct_link_variants_share_one_upstream_connection() {
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let initial = PvField::Structure(PvStructure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), PvField::Scalar(ScalarValue::Double(1.0)))],
+        });
+        let pv = SharedPV::build_mailbox();
+        pv.open(desc, initial).unwrap();
+        let source = SharedSource::new();
+        source.add("STAGE0:SHARED:PV", pv.clone());
+        let server = PvaServer::isolated(Arc::new(source)).expect("test PVA server must start");
+        let addr = server.tcp_addr();
+
+        // The single IOC-wide client — pvxs `linkGlobal->provider_remote`.
+        let reg = PvaLinkRegistry::with_client(
+            PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(3))
+                .build(),
+        );
+
+        let cfg_q1 = PvaLinkConfig {
+            monitor: true,
+            queue_size: 1,
+            ..PvaLinkConfig::defaults_for("STAGE0:SHARED:PV", LinkDirection::Inp)
+        };
+        let cfg_q8 = PvaLinkConfig {
+            monitor: true,
+            queue_size: 8,
+            ..PvaLinkConfig::defaults_for("STAGE0:SHARED:PV", LinkDirection::Inp)
+        };
+
+        let link_q1 = reg.get_or_open(cfg_q1).await.expect("open the Q=1 link");
+        let link_q8 = reg.get_or_open(cfg_q8).await.expect("open the Q=8 link");
+
+        assert!(
+            !Arc::ptr_eq(&link_q1, &link_q8),
+            "a different queueSize is a different pvRequest — the two links \
+             must stay distinct registry entries, or this gate would be \
+             asserting nothing"
+        );
+        assert_eq!(reg.len(), 2, "two distinct channel owners cached");
+
+        // The peer count only means something once both monitors have
+        // actually reached the server; each proves liveness by delivering
+        // its first event.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline
+            && !(link_q1.is_connected() && link_q8.is_connected())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            link_q1.is_connected() && link_q8.is_connected(),
+            "both monitor subscriptions must connect before the connection \
+             count is meaningful (Q=1 connected: {}, Q=8 connected: {})",
+            link_q1.is_connected(),
+            link_q8.is_connected()
+        );
+
+        assert_eq!(
+            server.report().peer_count,
+            1,
+            "two distinct pvalink channels sharing the IOC-wide client must \
+             cost the upstream IOC exactly ONE TCP connection"
+        );
     }
 }

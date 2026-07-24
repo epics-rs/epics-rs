@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::path::PathBuf;
 
 use epics_base_rs::server::autosave::error::AutosaveError;

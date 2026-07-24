@@ -35,7 +35,7 @@ pub struct SwaitRecord {
     /// return status, stored on every compile (`swaitRecord.c:304` at init,
     /// `:561` in `special(SPC_CALC)`) and posted `DBE_VALUE` (`:309`, `:566`).
     /// 0 when the CALC compiled, -1 when it did not; the same
-    /// [`calc_compile`]-owned status calcout/scalcout/acalcout store.
+    /// `calc_compile`-owned status calcout/scalcout/acalcout store.
     pub clcv: i32,
     /// INIT ("Initialized?", `swaitRecord.dbd:42`, `DBF_SHORT`, `SPC_NOMOD`).
     /// C `swaitRecord.c:330` and `:374` set `pwait->init = TRUE` in
@@ -373,20 +373,19 @@ impl SwaitRecord {
         let token = link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
-        sched.schedule_record_init(async move {
-            // Let `add_record` finish registering this record before the init
-            // post (this task may be spawned from `set_async_context`).
-            tokio::task::yield_now().await;
+        // The parking key; `rec_name` itself moves into the future below.
+        let init_key = rec_name.clone();
+        sched.schedule_record_init(&init_key, async move {
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(links.len());
             for (i, link) in links.iter().enumerate() {
-                let status = classify_swait_pv(&handle, link).await;
+                let status = classify_swait_pv(&handle, link);
                 fields.push((
                     SWAIT_PV_STATUS_FIELDS[i].to_string(),
                     EpicsValue::Enum(status as u16),
                 ));
             }
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&rec_name, fields).await;
+                let _ = handle.post_fields(&rec_name, fields);
             }
         });
     }

@@ -296,7 +296,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// Canonical device-support init sequence — the single owner of the
 /// "attach device support to a record" contract.
 ///
-/// Both build paths ([`crate::server::ioc_app::wire_device_support`]
+/// Both build paths (`crate::server::ioc_app::wire_device_support`
 /// and [`crate::server::ioc_builder::IocBuilder::build`]) MUST call
 /// this so a driver author can write one correct `init()`.
 ///

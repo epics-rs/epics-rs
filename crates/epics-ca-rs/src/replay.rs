@@ -26,13 +26,14 @@
 //! {"ts":1714200002.000,"ev":"client_disconnect","peer":"10.0.0.6:54311"}
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// One recorded event. `Beacon` carries enough state to reconstruct
 /// connection topology; `Connect` / `Disconnect` capture per-client
@@ -143,33 +144,61 @@ impl RecordedEvent {
 }
 
 /// Append-only on-disk recorder. Cheap to clone (Arc inside).
+///
+/// The handle is a plain [`std::fs::File`] behind a [`std::sync::Mutex`],
+/// written through [`epics_base_rs::runtime::fs`]. It used to be a
+/// `tokio::fs::File` behind a `tokio::sync::Mutex`, which cannot work
+/// everywhere this recorder is driven from: `tokio::fs` is a blocking
+/// `std::fs` call handed to tokio's `spawn_blocking` pool, so it requires an
+/// entered tokio runtime and panics without one — and the blocking CA server
+/// runs its per-client work on plain `std::thread`s via `park_on`, with no
+/// runtime entered.
+///
+/// The lock is now taken *inside* the blocking closure rather than held
+/// across an await. That keeps the invariant unchanged — one record in, one
+/// line out, never interleaved — because two concurrent `record` calls still
+/// serialise on the same mutex; they now do it on the worker instead of on
+/// the caller's task.
 #[derive(Clone)]
 pub struct EventRecorder {
-    file: Arc<Mutex<tokio::fs::File>>,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 impl EventRecorder {
     pub async fn create(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        let path = path.as_ref().to_path_buf();
+        let f = epics_base_rs::runtime::fs::blocking(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        })
+        .await?;
         Ok(Self {
             file: Arc::new(Mutex::new(f)),
         })
     }
 
     pub async fn record(&self, ev: &RecordedEvent) {
-        let line = ev.to_json();
-        let mut f = self.file.lock().await;
-        let _ = f.write_all(line.as_bytes()).await;
-        let _ = f.write_all(b"\n").await;
+        let mut line = ev.to_json().into_bytes();
+        line.push(b'\n');
+        let file = self.file.clone();
+        let _ = epics_base_rs::runtime::fs::blocking(move || {
+            use std::io::Write as _;
+            let mut f = file.lock().unwrap_or_else(|e| e.into_inner());
+            f.write_all(&line)
+        })
+        .await;
     }
 
     pub async fn flush(&self) {
-        let mut f = self.file.lock().await;
-        let _ = f.flush().await;
+        let file = self.file.clone();
+        let _ = epics_base_rs::runtime::fs::blocking(move || {
+            use std::io::Write as _;
+            let mut f = file.lock().unwrap_or_else(|e| e.into_inner());
+            f.flush()
+        })
+        .await;
     }
 }
 
@@ -182,21 +211,21 @@ pub async fn replay(
     paced: bool,
     mut sink: impl FnMut(&RecordedEvent),
 ) -> std::io::Result<usize> {
-    let f = tokio::fs::File::open(path).await?;
-    let mut reader = BufReader::new(f);
-    let mut line = String::new();
+    // Read the whole recording through the filesystem seam, then parse in
+    // memory. The previous shape streamed it with `tokio::fs` + `BufReader`,
+    // which needs an entered tokio runtime; the seam does not. `sink` is a
+    // borrowed `FnMut`, so it cannot be moved into the blocking closure —
+    // which is why the read is one hop and the loop stays out here. A
+    // recording is a JSON-Lines diagnostic artefact the caller replays in
+    // full, so holding it is bounded by the file the caller chose to open.
+    let text = epics_base_rs::runtime::fs::read_to_string(path).await?;
     let mut count = 0usize;
     let mut prior_ts: Option<f64> = None;
     let start = std::time::Instant::now();
     let start_ts: Option<f64> = None;
     let mut start_ts = start_ts;
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
-        }
-        let Some(ev) = RecordedEvent::from_json(&line) else {
+    for line in text.lines() {
+        let Some(ev) = RecordedEvent::from_json(line) else {
             continue;
         };
         if paced {

@@ -9,6 +9,8 @@
 
 The post-v0.13.0 strategy is to *deepen* on tier-1 desktop/server operating systems rather than *broaden* across embedded RTOSs. The current project strength remains a Cargo-native path to complete simulated EPICS IOCs; the roadmap moves that stack toward production Linux operation. Production targets are Linux (vanilla and PREEMPT_RT); macOS and Windows are first-class developer targets. RTEMS, VxWorks, and bare-metal microcontroller targets are out of scope; pvxs already serves those well, and epics-rs and pvxs are positioned as complementary rather than competing.
 
+> **RTEMS 6 caveat on that recommendation.** pvxs as shipped does not work on RTEMS 6 until the RTEMS-5-era `kqueue` avoidance at its `src/evhelper.cpp:183` is removed; with that line present libevent falls back to its `poll` backend, which never blocks on this BSP, and the IOC burns a core instead of serving. Remove the line and it serves normally — measurement and root cause in `doc/rtems-scope-b-session-handoff.md` §5.3.
+
 Rationale:
 
 - Rust toolchain on RTEMS is tier-3, out-of-tree, and not production-ready. Waiting on tier-2 promotion is an external blocker we cannot drive.
@@ -23,7 +25,7 @@ Rationale:
 | 1 (production) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (vanilla and PREEMPT_RT) | CI target, performance baseline tracked, all features |
 | 2 (developer) | `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` | CI target, all features, no RT/perf guarantees |
 | 3 (community) | Other Linux architectures, FreeBSD | Best-effort, no CI |
-| Out of scope | RTEMS, VxWorks, no_std/embedded | Use pvxs |
+| Out of scope | RTEMS, VxWorks, no_std/embedded | Use pvxs — on RTEMS 6 see the caveat under [Positioning](#positioning) |
 
 Tier-2 targets receive all features and bug fixes; the tier distinction is about performance and real-time guarantees, not feature parity. macOS and Windows users get every cross-platform improvement (buffer tuning, allocation reduction, raw-frame forwarding, runtime tuning, `tokio-console`, OpenTelemetry tracing) automatically. Linux-only capabilities (PREEMPT_RT, io_uring, AF_XDP, eBPF probes, systemd, cgroups v2) are compile-time gated via `#[cfg(target_os = "linux")]` and feature flags, so they have zero footprint on tier-2 builds.
 
@@ -142,7 +144,7 @@ Deepen Linux-native operational integration. Items below are mostly additive; ca
 2. **Opt-in over rewrite.** Where a kernel feature requires a recent Linux version (PREEMPT_RT, io_uring multi-shot, AF_XDP), gate behind a feature flag. The default build runs on tier-1 and tier-2 unchanged.
 3. **Tier-1 first.** Every change is validated on Linux. macOS and Windows are kept green via CI but do not gate Linux work.
 4. **No abstraction layers we don't need.** We deliberately do not add a runtime trait or proto/transport split solely to preserve RTOS optionality. If a refactor has standalone value (testing speed, fuzzing surface, modularity), that is the justification — not future portability.
-5. **Honest tier policy.** Out-of-scope targets stay out of scope. Users requesting RTEMS support are directed to pvxs; this is documented in README.
+5. **Honest tier policy.** Out-of-scope targets stay out of scope. Users requesting RTEMS support are directed to pvxs; this is documented in README. Tell them the one thing that otherwise costs a day: on RTEMS 6 pvxs as shipped does not work until the RTEMS `kqueue` avoidance at its `src/evhelper.cpp:183` is removed (`doc/rtems-scope-b-session-handoff.md` §5.3).
 
 ## Non-goals
 

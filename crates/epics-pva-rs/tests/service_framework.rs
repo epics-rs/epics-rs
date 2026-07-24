@@ -2,6 +2,8 @@
 //! an in-process server with a service that exposes two RPC
 //! methods, then drives them via `PvaClient::pvrpc`.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -440,7 +442,10 @@ impl ChannelSource for FailAtDataSource {
     async fn is_writable(&self, _: &str) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }
@@ -508,7 +513,10 @@ impl ChannelSource for PanicSource {
     async fn is_writable(&self, _: &str) -> bool {
         true
     }
-    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+    async fn subscribe(
+        &self,
+        _: &str,
+    ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 }

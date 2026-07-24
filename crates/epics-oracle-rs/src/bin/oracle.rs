@@ -63,7 +63,7 @@ enum Phase {
 )]
 struct Args {
     /// The expanded dbd that supplies the denominator.
-    #[arg(long, default_value = CTools::DEFAULT_DBD)]
+    #[arg(long, default_value_os_t = CTools::dbd_path())]
     dbd: PathBuf,
 
     /// Which probes to run.

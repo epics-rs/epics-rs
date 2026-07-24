@@ -15,6 +15,8 @@
 //! two different orders — one boot succeeding, the next failing with "opcuaItem
 //! record ... is not loaded yet".
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -131,9 +133,9 @@ async fn pini_records_returns_load_order() {
         db.add_record(name, Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let rec = db.get_record(name).await.unwrap();
+        let rec = db.get_record(name).unwrap();
         // r6: `pini` is the `menuPini` index (i16), not a bool. YES = 1.
-        rec.write().await.common.pini = PiniMode::Yes.to_u16() as i16;
+        rec.write().common.pini = PiniMode::Yes.to_u16() as i16;
     }
 
     assert_eq!(

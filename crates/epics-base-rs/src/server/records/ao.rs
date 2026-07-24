@@ -463,7 +463,7 @@ impl Record for AoRecord {
 
     /// Apply a raw device readback to this output record: store the raw value
     /// into `RVAL` and compute the engineering `VAL` via the `raw → eng`
-    /// inverse convert ([`AoRecord::convert_readback`]). Returns `true` so the
+    /// inverse convert (`AoRecord::convert_readback`). Returns `true` so the
     /// asyn store path treats `VAL` as final and skips the framework's forward
     /// convert (paired with `skip_convert` for the process-time readback). C
     /// `processAo`/`initAo` readback: `pr->rval = value; <raw→eng>; pr->val =

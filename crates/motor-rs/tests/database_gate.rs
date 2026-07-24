@@ -57,12 +57,12 @@ async fn non_pp_put_stores_without_processing() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("M1.VELO").await.unwrap(),
+        db.get_pv("M1.VELO").unwrap(),
         EpicsValue::Double(2.0),
         "the store itself lands without a process pass"
     );
     assert_eq!(
-        db.get_pv("M1.STUP").await.unwrap(),
+        db.get_pv("M1.STUP").unwrap(),
         EpicsValue::Short(0),
         "no process pass -> no implicit GET_INFO, STUP stays OFF"
     );
@@ -90,7 +90,7 @@ async fn sync_zero_release_processes_with_implicit_get_info() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("M1.STUP").await.unwrap(),
+        db.get_pv("M1.STUP").unwrap(),
         EpicsValue::Short(2),
         "pp(TRUE) pass ends at the chain end: implicit GET_INFO, STUP BUSY"
     );
@@ -118,7 +118,7 @@ async fn user_limit_put_processes_with_implicit_get_info() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("M1.STUP").await.unwrap(),
+        db.get_pv("M1.STUP").unwrap(),
         EpicsValue::Short(2),
         "pp(TRUE) limit put processes and fires the implicit GET_INFO"
     );
@@ -260,8 +260,8 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
 
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
-    if let Some(arc) = db.get_record("M1").await {
-        let mut inst = arc.write().await;
+    if let Some(arc) = db.get_record("M1") {
+        let mut inst = arc.write();
         inst.common.dtyp = "simMotor".to_string();
         inst.device = Some(Box::new(dev));
     }
@@ -302,12 +302,12 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("M1.DMOV").await.unwrap(),
+        db.get_pv("M1.DMOV").unwrap(),
         EpicsValue::Short(1),
         "retry completion finalizes the motion"
     );
     assert_eq!(
-        db.get_pv("M1.MIP").await.unwrap(),
+        db.get_pv("M1.MIP").unwrap(),
         EpicsValue::Short(0),
         "MIP collapses to DONE after the retry converges"
     );
@@ -416,8 +416,8 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
 
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
-    if let Some(arc) = db.get_record("M1").await {
-        let mut inst = arc.write().await;
+    if let Some(arc) = db.get_record("M1") {
+        let mut inst = arc.write();
         inst.common.dtyp = "simMotor".to_string();
         inst.device = Some(Box::new(dev));
     }
@@ -441,12 +441,12 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         "the anchor must not redefine the controller position"
     );
     assert_eq!(
-        db.get_pv("M1.VAL").await.unwrap(),
+        db.get_pv("M1.VAL").unwrap(),
         EpicsValue::Double(1.0),
         "the anchor must not sync the parked target away"
     );
     assert_eq!(
-        db.get_pv("M1.DVAL").await.unwrap(),
+        db.get_pv("M1.DVAL").unwrap(),
         EpicsValue::Double(1.0),
         "the anchor must not sync the parked dial target away"
     );
@@ -475,9 +475,9 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     db.process_record_readback("M1", &mut visited, 0)
         .await
         .unwrap();
-    assert_eq!(db.get_pv("M1.DMOV").await.unwrap(), EpicsValue::Short(1));
-    assert_eq!(db.get_pv("M1.MIP").await.unwrap(), EpicsValue::Short(0));
-    assert_eq!(db.get_pv("M1.RBV").await.unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(db.get_pv("M1.DMOV").unwrap(), EpicsValue::Short(1));
+    assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::Short(0));
+    assert_eq!(db.get_pv("M1.RBV").unwrap(), EpicsValue::Double(1.0));
     assert_eq!(
         loads.load(Ordering::SeqCst),
         0,

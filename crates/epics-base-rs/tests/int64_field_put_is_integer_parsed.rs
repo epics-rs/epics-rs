@@ -15,6 +15,8 @@
 //! same trailing-text tolerance the dbCommon parse gate keeps. Only an
 //! out-of-integer-range magnitude is refused.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::int64in::Int64inRecord;
@@ -31,8 +33,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) -> Result<(), String> {
 
 /// The raw stored field value (not the CA-served projection).
 async fn stored(db: &PvDatabase, field: &str) -> EpicsValue {
-    let rec = db.get_record("REC").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("REC").unwrap();
+    let inst = rec.read();
     inst.record.get_field(field).unwrap()
 }
 

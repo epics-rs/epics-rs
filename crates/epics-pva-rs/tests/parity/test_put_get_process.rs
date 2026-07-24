@@ -15,12 +15,14 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(11): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
 use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
 use epics_pva_rs::PvaError;
@@ -108,7 +110,7 @@ impl ChannelSource for DoublingSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
@@ -541,7 +543,7 @@ impl DenySource {
     fn new() -> Self {
         // READ-only ASG: every peer reads, none writes.
         let cfg = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf parse");
-        let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let cell = epics_base_rs::server::access_security::new_acf_cell(Some(cfg));
         let resolver: AsgAslResolver =
             Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         Self {
@@ -595,7 +597,7 @@ impl ChannelSource for DenySource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
     fn process(&self, _: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
@@ -780,7 +782,7 @@ impl ChannelSource for TwoFieldSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }
@@ -983,7 +985,7 @@ impl ChannelSource for EnumSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }

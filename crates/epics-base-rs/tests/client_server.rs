@@ -15,6 +15,8 @@
 //! in independently).
 #![cfg(feature = "ca-server-tls-test")]
 
+// RTEMS-EXEC-MODEL-ALLOW(10): not built by default - this file is behind the `ca-server-tls-test` feature.
+
 use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +35,7 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
         db.add_pv(name, val).await.unwrap();
     }
 
-    let acf = Arc::new(tokio::sync::RwLock::new(None));
+    let acf = epics_base_rs::server::access_security::new_acf_cell(None);
 
     // Bind TCP on port 0 — the listener is accepting from here on, and
     // the chosen port is known without a start-up handshake.

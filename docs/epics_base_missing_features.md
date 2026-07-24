@@ -141,7 +141,7 @@
 
 ### 의도적 제외 사항 (Out-of-Scope)
 C++ `epics-base`에는 존재하지만 러스트 생태계의 특성상 **의도적으로 구현하지 않기로 한(By-Design)** 항목들입니다.
-- **RTEMS 및 VxWorks 운영체제 지원**: `epics-rs`는 Linux(및 PREEMPT_RT), macOS, Windows 등 Tier-1/2 호스트 OS에 집중하며, 임베디드 실시간 OS 지원은 아예 스코프에서 제외되었습니다. (해당 용도는 C++ `pvxs` 권장)
+- **RTEMS 및 VxWorks 운영체제 지원**: `epics-rs`는 Linux(및 PREEMPT_RT), macOS, Windows 등 Tier-1/2 호스트 OS에 집중하며, 임베디드 실시간 OS 지원은 아예 스코프에서 제외되었습니다. (해당 용도는 C++ `pvxs` 권장) 단, RTEMS 6에서는 pvxs도 배포 상태 그대로는 동작하지 않습니다 — `src/evhelper.cpp:183`의 RTEMS-5 시절 `kqueue` 회피 코드를 제거해야 정상 서비스됩니다 (측정 및 원인: `doc/rtems-scope-b-session-handoff.md` §5.3).
 - **C/C++ 호환 OSI (Operating System Independent) 레이어**: `epics-base`처럼 자체 OS 추상화 레이어를 만들지 않고, 전적으로 러스트의 `tokio` 생태계 및 표준 라이브러리에 의존합니다.
 - **서브 마이크로초(Sub-microsecond) 단위의 Hard-RT**: 리눅스 PREEMPT_RT 기반의 1ms 미만 지터(Jitter) 억제에 집중하며, 마이크로컨트롤러 수준의 펌웨어형 실시간성은 지원하지 않습니다.
 

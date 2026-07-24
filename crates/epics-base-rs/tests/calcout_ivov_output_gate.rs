@@ -10,6 +10,8 @@
 //! spurious OVAL monitor on a non-output cycle (D3). The fix gates the OVAL
 //! write on the record's `cached_should_output`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -38,8 +40,8 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_NOOUT").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CO_NOOUT").unwrap();
+    let inst = rec.read();
 
     // Precondition: this is genuinely an INVALID, non-output cycle.
     assert_eq!(
@@ -82,8 +84,8 @@ async fn calcout_ivov_applied_on_output_cycle() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_OUT").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CO_OUT").unwrap();
+    let inst = rec.read();
 
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
     assert!(inst.record.should_output(), "Every_Time always outputs");

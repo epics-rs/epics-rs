@@ -19,6 +19,9 @@
 //! [`crate::client_native::ops_v2::op_monitor_handle`] for the loop that
 //! re-issues INIT/START on each new server conn.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -406,6 +409,10 @@ impl ConnectionPool {
                 max_message_size: *self.max_message_size.lock(),
             };
             let connect_result = match tls {
+                // Without the `tls` feature `TlsClientConfig` is uninhabited,
+                // so this arm cannot be reached — and is not compiled. The
+                // `None` arm below is then already exhaustive.
+                #[cfg(feature = "tls")]
                 Some(cfg) => {
                     ServerConn::connect_tls(
                         addr,
@@ -417,6 +424,8 @@ impl ConnectionPool {
                     )
                     .await
                 }
+                #[cfg(not(feature = "tls"))]
+                Some(cfg) => match *cfg {},
                 None => ServerConn::connect(addr, user, host, conn_config).await,
             };
             let fresh = connect_result?;
@@ -754,7 +763,7 @@ impl Channel {
             }
         };
         if let Some(d) = wait {
-            tokio::time::sleep(d).await;
+            epics_base_rs::runtime::task::sleep(d).await;
         }
 
         // Re-check after acquiring the lock.
@@ -1047,7 +1056,7 @@ impl Channel {
         let waiter = server.register_cid_waiter(self.cid);
         server.send(req).await?;
 
-        let frame = tokio::time::timeout(self.op_timeout, waiter)
+        let frame = epics_base_rs::runtime::task::timeout(self.op_timeout, waiter)
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(|_| PvaError::Protocol("create_channel response cancelled".into()))?;
@@ -1251,6 +1260,11 @@ mod tests {
     /// which guards the same invariant for the `Reconnect` reason at the
     /// engine layer; this guards the `Initial` reason at the
     /// `ensure_active` layer where the cap actually lived.
+    // Drives a search that never resolves and asserts the op-timeout owner
+    // fires; the search engine's spawned tick `interval` now runs on the
+    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(epics_env)]
     async fn initial_search_failure_is_owned_by_op_timeout_not_200ms() {

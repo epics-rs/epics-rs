@@ -10,14 +10,15 @@ repository.workspace = true
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
+# No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
+# is a dependency of whichever package owns one, and `rtems-pva-ioc` moved to
+# `epics-bridge-rs` (doc/qsrv-rtems-design.md §9.7).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 serde_json = "1.0"
 thiserror = "2"
-socket2 = "0.5"
 hostname = "0.4"
 tokio-util = { version = "0.7", default-features = false }
 # Refcounted byte buffer used by the raw-frame monitor forwarding path
@@ -26,16 +27,28 @@ tokio-util = { version = "0.7", default-features = false }
 bytes = "1"
 parking_lot = "0.12"
 dashmap = "6"
-if-addrs = "0.13"
 # `FutureExt::catch_unwind` — converts a panic in a user-supplied source
 # handler into an error reply rather than letting it skip the exec
 # reply (PVXS-SR-21). Already a workspace dep (epics-ca-rs, ad-core-rs).
 futures-util = "0.3"
 
-# TLS for `pvas://` (opt-in via `EPICS_PVAS_TLS_KEYCHAIN`).
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rustls-pemfile = "2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# TLS for `pvas://` (opt-in at runtime via `EPICS_PVAS_TLS_KEYCHAIN`, and at
+# compile time via the `tls` feature — ON by default, so a hosted build is
+# unchanged).
+#
+# These three are the reason `cargo tree -p epics-pva-rs -e normal -i ring`
+# resolved at all: `ring` drags `getrandom 0.2`, which `compile_error!`s on
+# `armv7-rtems-eabihf`. They are optional so an RTEMS server build can drop
+# the whole TLS stack (design doc §8.2; TLS on RTEMS proper — swapping ring
+# for aws-lc-rs or a RustCrypto provider — is a separate, later problem).
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+], optional = true }
 # PKCS#12 (`.p12`/`.pfx`) keychain parsing — pvxs `PKCS12_parse` parity.
 # Pure-Rust; opt-in via the `pkcs12` feature so PEM-only deployments
 # can drop the extra dependency. Enabled by default.
@@ -69,17 +82,56 @@ rc-sha1 = { package = "sha1", version = "0.11", optional = true }
 rc-hmac = { package = "hmac", version = "0.13", optional = true }
 # X.509 identity extraction from the verified TLS peer chain — pvxs
 # `SSLContext::fill_credentials` parity (CN → ACF account, root CA CN →
-# authority). Same crate/version `epics-ca-rs` already depends on.
-x509-parser = "0.16"
+# authority). Same crate/version `epics-ca-rs` already depends on. Used only
+# by `auth::tls`, so it rides the `tls` feature; the credential type it
+# produces (`auth::x509::X509Credentials`) is plain data and stays compiled
+# either way.
+x509-parser = { version = "0.16", optional = true }
 
 [features]
-default = ["pkcs12"]
+default = ["tls", "pkcs12", "client"]
+# The native PVA client — `client_native` (connection pool, UDP search
+# engine, per-operation tasks) plus the `client` re-export module,
+# `PvaServer::client_config()`, and the `pv*` command-line binaries. ON by
+# default. Turning it off leaves a server-only build (design doc §9 phase 6,
+# scope decision: a PVA *gateway* on RTEMS is out of scope, so the client is
+# gate-out territory). The wire decoder the server needs is NOT part of this
+# feature — it is the always-compiled `crate::decode`.
+client = []
+# Host-selectable RTEMS execution model — passthrough to
+# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` declares it.
+# Routes the `runtime::task` seam to the std-thread background executor on a
+# hosted target, which is what compiles `rtems-pva-ioc`'s real entry point
+# off RTEMS so it can be linted and tested here. OFF by default.
+rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
+# The RTEMS bring-up measurement rig's client-side instrumentation — the twin
+# of `epics-ca-rs/bringup-probes`, and forwarded from
+# `epics-bridge-rs/bringup-probes` so `rtems-pva-ioc`'s probe image can read
+# it. Compiles a dial-attempt counter and `client_native::dial_pool_probe()`,
+# which is how `doc/pvalink-rtems-design.md` §9.11's `MAX_DIAL_WORKERS` bound
+# is read on a target with no shell and no reachable `caget`. OFF by default:
+# a default build compiles neither the counter nor the accessor.
+bringup-probes = []
+# TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
+# drops rustls/tokio-rustls/rustls-pemfile/x509-parser — and with them `ring`
+# and `getrandom 0.2`, the crate that does not build for RTEMS. With the
+# feature off, `auth::TlsServerConfig`/`TlsClientConfig` become uninhabited
+# placeholder types: the `tls` fields on `ServerConfig` / `PvaClientBuilder`
+# still exist and still compile, but are provably `None` because no value of
+# the config type can be constructed. See `auth::mod`.
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:x509-parser"]
 # PKCS#12 keychain support in `auth::tls`. When disabled, the keychain
 # loader falls back to PEM-only and rejects DER/PKCS#12 inputs.
 # Covers both the classic PBE path (`p12`) and the PBES2/AES path
 # (stable `pkcs5`/`der`/`spki`), so any PKCS#12 written by OpenSSL 1.x
 # or 3.x loads with the feature on.
+#
+# Implies `tls`: the whole PKCS#12 loader lives inside `auth::tls`, and a
+# keychain with no TLS stack to install it into is meaningless. This also
+# closes the SECOND `getrandom 0.2` path — `p12` depends on it directly, not
+# only through `ring`.
 pkcs12 = [
+    "tls",
     "dep:p12",
     "dep:sha1",
     "dep:pkcs5",
@@ -89,6 +141,43 @@ pkcs12 = [
     "dep:rc-sha1",
     "dep:rc-hmac",
 ]
+
+# ── Host network stack (everything except RTEMS) ────────────────────────
+#
+# `socket2` and `if-addrs` are §8.1 hard blockers on `armv7-rtems-eabihf`:
+# socket2 fails with 20 errors (newlib has no `msghdr`/`recvmsg`/`IovLen`,
+# no `ip_mreqn`, no `SOCK_RAW`) and if-addrs with 2 (no `getifaddrs`/
+# `ifaddrs`). Both are reached only from the tokio async I/O layer —
+# `server_native::{tcp,udp}` and `client_native` — which RTEMS does not use:
+# it gets a blocking thread-per-client driver instead (§4, §9 phase 6
+# item 7). So they are host-only deps, the same gate `epics-base-rs`
+# applied to its own copies (§8.1.1). NOT solved for RTEMS — see §8.1 for
+# what an RTEMS interface enumerator / raw-libc sockopt subset would take.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
+socket2 = "0.5"
+if-addrs = "0.13"
+tokio = { version = "1", features = ["full"] }
+
+# RTEMS gets tokio without `net`/`signal`/`process`: `net` pulls mio
+# (29 errors — no epoll/kqueue selector, and mio dropped its poll backend
+# deliberately) and `signal` pulls signal-hook-registry (4 errors — no
+# `sa_sigaction`/`SA_RESTART`). Declared per-target rather than in the
+# shared table because Cargo *unions* a dependency's features across every
+# matching table: a shared `full` would silently re-add the features this
+# drops. Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio
+# API surface the always-compiled code uses still type-checks.
+[target.'cfg(target_os = "rtems")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "macros",
+    "io-util",
+    "io-std",
+    "fs",
+    "parking_lot",
+] }
 
 # POSIX getgrouplist / getpwuid / getgrgid for posix_groups() — pvxs
 # osdGetRoles parity. The auth::plain::posix_groups() path is
@@ -100,30 +189,76 @@ libc = "0.2"
 # Windows (client_native::udp), mirroring pvxs os/WIN32/osdSockExt.cpp.
 # socket2 does not expose WSARecvMsg (a Winsock extension fn), so this
 # raw FFI is required.
+#
+# `Win32_Security_Cryptography` is for `ProcessPrng`, the server-GUID entropy
+# source (`server_native::search_engine::random_guid`). Windows has no
+# std-only entropy API, and the GUID must come from a source that can *report
+# failure* — the alternative is the time+PID fallback this dependency replaced.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    "Win32_Security_Cryptography",
     "Win32_System_IO",
 ] }
 
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and three copies of a
+# 300-line audit is how three copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"
 
+# The `pv*` command-line tools ARE the native client, so they carry
+# `required-features = ["client"]` — with the feature off there is no client
+# for them to drive and cargo skips them. (Unlike a target that exists to be
+# a compile gate, skipping these cannot mask anything: the phase-6 RTEMS gate
+# is `--lib`.) `mshim-rs` is the exception — it is a UDP shim built on
+# `server_native::udp` and needs no client.
 [[bin]]
 name = "pvget-rs"
 path = "src/bin/pvget-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvput-rs"
 path = "src/bin/pvput-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvmonitor-rs"
 path = "src/bin/pvmonitor-rs.rs"
+required-features = ["client"]
 
 [[bin]]
 name = "pvinfo-rs"
 path = "src/bin/pvinfo-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvcall-rs"
+path = "src/bin/pvcall-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvlist-rs"
+path = "src/bin/pvlist-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "pvxvct-rs"
+path = "src/bin/pvxvct-rs.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "mshim-rs"
+path = "src/bin/mshim-rs.rs"
+
+# `rtems-pva-ioc` used to be declared here. It moved to `epics-bridge-rs` when
+# it grew a QSRV group source: the mount needs the bridge, and this package
+# cannot depend on the bridge without a cyclic package dependency (measured —
+# doc/qsrv-rtems-design.md §9.7). This package now produces no target binary.

@@ -19,6 +19,8 @@
 //! scalcout ODLY test does) so the assertion is deterministic and does not race
 //! the real timer (ODLY=100s makes the timer unfireable here).
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,13 +64,12 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         .await
         .unwrap();
     {
-        let r = db.get_record(name).await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record(name).unwrap();
+        let mut inst = r.write();
         inst.common.scan = ScanType::Event;
         inst.common.evnt = evnt.to_string();
     }
-    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0)
-        .await;
+    db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
 
 /// ODLY>0: the delaying cycle defers, the continuation drives OUT to OVAL and
@@ -96,8 +97,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     // OUT/OUTN route through RecordInstance::put_common_field (populating
     // parsed_out for output dispatch), not the record's put_field.
     {
-        let r = db.get_record("W_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W_TGT".into()))
             .unwrap();
     }
@@ -110,7 +111,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     // Give any erroneous spawned OEVT post time to land before asserting none.
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert_eq!(
-        db.get_pv("W_TGT").await.unwrap().to_f64(),
+        db.get_pv("W_TGT").unwrap().to_f64(),
         Some(0.0),
         "ODLY>0 delaying cycle must NOT write OUT (deferred to the watchdog)"
     );
@@ -134,7 +135,7 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W_TGT").await.unwrap().to_f64(),
+        db.get_pv("W_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation must drive OUT to OVAL=42 after the ODLY delay"
     );
@@ -170,8 +171,8 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     w.put_field("OEVT", EpicsValue::UShort(13)).unwrap();
     db.add_record("W3_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W3_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W3_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W3_TGT".into()))
             .unwrap();
     }
@@ -182,7 +183,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(0.0),
         "output deferred on the delaying cycle"
     );
@@ -195,7 +196,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(0.0),
         "PACT held: a foreign dbProcess during the ODLY delay must NOT fire the \
          deferred OUT early (it bails at the entry guard, as C does)"
@@ -219,7 +220,7 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        db.get_pv("W3_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the delay"
     );
@@ -259,8 +260,8 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     w.put_field("OEVT", EpicsValue::UShort(17)).unwrap();
     db.add_record("W4_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W4_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W4_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W4_TGT".into()))
             .unwrap();
     }
@@ -290,7 +291,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
     );
     // The OUTPUT is still deferred: target keeps its seed on the delaying cycle.
     assert_eq!(
-        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        db.get_pv("W4_TGT").unwrap().to_f64(),
         Some(0.0),
         "the OUT write stays deferred even though VAL posted at delay-start"
     );
@@ -303,7 +304,7 @@ async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        db.get_pv("W4_TGT").unwrap().to_f64(),
         Some(42.0),
         "continuation drives OUT to OVAL=42 after the delay"
     );
@@ -347,8 +348,8 @@ async fn swait_odly_defers_forward_link_to_continuation() {
     w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
     db.add_record("W5_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W5_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W5_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
             .unwrap();
     }
@@ -399,8 +400,8 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     w.put_field("OEVT", EpicsValue::UShort(11)).unwrap();
     db.add_record("W2_ODLY", Box::new(w)).await.unwrap();
     {
-        let r = db.get_record("W2_ODLY").await.unwrap();
-        let mut inst = r.write().await;
+        let r = db.get_record("W2_ODLY").unwrap();
+        let mut inst = r.write();
         inst.put_common_field("OUT", EpicsValue::String("W2_TGT".into()))
             .unwrap();
     }
@@ -417,7 +418,7 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
-        db.get_pv("W2_TGT").await.unwrap().to_f64(),
+        db.get_pv("W2_TGT").unwrap().to_f64(),
         Some(7.0),
         "ODLY=0: OUT written to OVAL=7 on the same cycle"
     );

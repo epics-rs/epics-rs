@@ -5,6 +5,8 @@
 //! record-link resolver reads cached monitor values without a blocking
 //! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -55,6 +57,14 @@ pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
 /// `ca://...` (or bare ` CA`-modified) link via the registered
 /// [`epics_base_rs::server::database::LinkSet`]. The CA-link
 /// counterpart of `dbpvxr`.
+///
+/// `FLNK` is included, and must be: C `dbcar` walks
+/// `pdbRecordType->link_ind[j]` — every link field of the record type, with
+/// no `dbfType` filter — and prints each one whose `plink->type` is
+/// `CA_LINK` (`dbCaTest.c:88-136`). An `FLNK="ca://OTHER.PROC"` is such a
+/// link (`dbLink.c:118-136` reaches `dbCaAddLink` for `DBF_FWDLINK` too), so
+/// hiding it here would under-report exactly the links `dbcar` exists to
+/// show.
 pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
     CommandDef::new(
         "dbcaxr",
@@ -74,14 +84,7 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                 resolver.link_count()
             ));
             if let Some(rec) = target {
-                let db = ctx.db().clone();
-                let handle = ctx.runtime_handle().clone();
-                let rec_clone = rec.clone();
-                let links = std::thread::spawn(move || {
-                    handle.block_on(async move { db.record_link_fields(&rec_clone).await })
-                })
-                .join()
-                .unwrap_or_default();
+                let links = ctx.db().record_link_fields(&rec);
                 if links.is_empty() {
                     ctx.println(&format!(
                         "  '{rec}': no link fields found (or record missing)"
@@ -91,24 +94,23 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
                     for (field, raw, parsed) in links {
                         if let epics_base_rs::server::record::ParsedLink::Ca(ca) = parsed {
                             let name = ca.pv;
-                            // The lset is async; this iocsh command is sync, so
-                            // its state is read through the same off-runtime
-                            // thread the record-field lookup above uses.
+                            // Only `get_value` is async now (it may open the
+                            // link); the cached accessors are plain `fn` and
+                            // are read inline. The off-runtime thread stays
+                            // for the one remaining blocking call.
                             let r = resolver.clone();
                             let n = name.clone();
                             let h = ctx.runtime_handle().clone();
-                            let (connected, value, alarm, ts) = std::thread::spawn(move || {
+                            let connected = <CaLinkResolver as LinkSet>::is_connected(&r, &n);
+                            let alarm = <CaLinkResolver as LinkSet>::alarm_severity(&r, &n);
+                            let ts = <CaLinkResolver as LinkSet>::time_stamp(&r, &n);
+                            let value = std::thread::spawn(move || {
                                 h.block_on(async move {
-                                    (
-                                        <CaLinkResolver as LinkSet>::is_connected(&r, &n).await,
-                                        <CaLinkResolver as LinkSet>::get_value(&r, &n).await,
-                                        <CaLinkResolver as LinkSet>::alarm_severity(&r, &n).await,
-                                        <CaLinkResolver as LinkSet>::time_stamp(&r, &n).await,
-                                    )
+                                    <CaLinkResolver as LinkSet>::get_value(&r, &n).await
                                 })
                             })
                             .join()
-                            .unwrap_or((false, None, None, None));
+                            .unwrap_or(None);
                             ctx.println(&format!(
                                 "    {field}={raw:?}  ca://{name}  connected={connected}"
                             ));
@@ -145,7 +147,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> CaLinkResolver {
-        CaLinkResolver::new(tokio::runtime::Handle::current())
+        CaLinkResolver::new()
     }
 
     #[tokio::test(flavor = "multi_thread")]

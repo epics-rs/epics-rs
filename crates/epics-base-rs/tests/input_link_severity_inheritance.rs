@@ -28,6 +28,8 @@
 //! folded a record's OWN committed severity back into its pending alarm, which
 //! `recGblResetAlarms` then re-committed: a self-sustaining latch.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -53,8 +55,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn alarm(db: &PvDatabase, rec: &str) -> (u16, AlarmSeverity) {
-    let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let r = db.get_record(rec).unwrap();
+    let inst = r.read();
     (inst.common.stat, inst.common.sevr)
 }
 

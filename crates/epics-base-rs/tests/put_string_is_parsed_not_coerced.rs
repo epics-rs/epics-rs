@@ -46,6 +46,8 @@
 //! The cases are the invariant BOUNDARIES of the row — at-limit, just-over,
 //! just-under, unparseable, empty — not a narrative.
 
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -75,7 +77,7 @@ async fn caput(db: &PvDatabase, rec: &str, field: &str, text: &str) -> Result<()
 }
 
 async fn read(db: &PvDatabase, pv: &str) -> EpicsValue {
-    db.get_pv(pv).await.unwrap()
+    db.get_pv(pv).unwrap()
 }
 
 /// A refused put must leave the field EXACTLY as it was. Accepting the put and

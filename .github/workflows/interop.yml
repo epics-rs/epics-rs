@@ -77,6 +77,18 @@ jobs:
       with:
         toolchain: 1.94.0
     - uses: taiki-e/install-action@nextest
+    # Cargo registry + target cache, same shape as every job in
+    # `rust.yml`. Placed after the toolchain step because the cache key
+    # includes the rustc version. The explicit `key` names the *feature
+    # resolution* this job builds — `cargo build --workspace --tests`
+    # with default features — so it can never restore into a job that
+    # resolves features differently. rust-cache also folds the job name
+    # in, so this stays a separate entry from `rust.yml`'s `checks` job
+    # even though both resolve default features: only this job's target
+    # dir holds the gated interop test binaries.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: default-features
 
     # ── EPICS reference build ──────────────────────────────────
     # Cache /opt/epics across runs. Cache key bumps when version

@@ -18,6 +18,8 @@
 //!   * `bo` HIGH: the momentary reset arms and (on the timer reprocess) drives
 //!     the simulated output back to 0.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -63,7 +65,7 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .unwrap();
 
     // Body ran: OROC limited OVAL from 0 toward 10 by 1 -> OVAL == 1.
-    let oval = db.get_pv("AOROC.OVAL").await.unwrap();
+    let oval = db.get_pv("AOROC.OVAL").unwrap();
     assert!(
         matches!(oval, EpicsValue::Double(v) if (v - 1.0).abs() < 1e-10),
         "ao body ran in SIMM mode: OROC limited OVAL to 1, got {oval:?}"
@@ -71,7 +73,7 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
 
     // The simulated write sent the OROC-limited OVAL (1), not the raw VAL (10),
     // to the SIOL target. Pre-fix wrote VAL=10 (body skipped).
-    let tgt = db.get_pv("AOROC_TGT").await.unwrap();
+    let tgt = db.get_pv("AOROC_TGT").unwrap();
     assert!(
         matches!(tgt, EpicsValue::Double(v) if (v - 1.0).abs() < 1e-10),
         "SIOL target received the OROC-limited OVAL=1, not the un-limited VAL=10, got {tgt:?}"
@@ -109,7 +111,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         .await
         .unwrap();
 
-    let tgt = db.get_pv("BOHI_TGT").await.unwrap();
+    let tgt = db.get_pv("BOHI_TGT").unwrap();
     assert!(
         matches!(tgt, EpicsValue::Double(v) if (v - 1.0).abs() < 1e-10),
         "SIOL target received the simulated bo output VAL=1, got {tgt:?}"
@@ -123,12 +125,12 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         .await
         .unwrap();
 
-    let val = db.get_pv("BOHI").await.unwrap();
+    let val = db.get_pv("BOHI").unwrap();
     assert!(
         matches!(val, EpicsValue::Enum(0) | EpicsValue::Short(0)),
         "bo HIGH momentary reset ran in SIMM mode: VAL back to 0, got {val:?}"
     );
-    let tgt = db.get_pv("BOHI_TGT").await.unwrap();
+    let tgt = db.get_pv("BOHI_TGT").unwrap();
     assert!(
         matches!(tgt, EpicsValue::Double(v) if v.abs() < 1e-10),
         "SIOL target driven back to 0 by the HIGH momentary reset in sim mode, got {tgt:?}"
@@ -166,14 +168,14 @@ async fn sim_output_sims_invalid_does_not_veto_siol_write() {
         .unwrap();
 
     // SIMM_ALARM makes the committed SEVR INVALID...
-    let sevr = db.get_pv("AOIV.SEVR").await.unwrap();
+    let sevr = db.get_pv("AOIV.SEVR").unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(3)),
         "SIMM_ALARM raised the committed SEVR to INVALID, got {sevr:?}"
     );
     // ...but the IVOA gate saw the record's own NoAlarm severity, so C writes
     // OVAL to SIOL. The veto must NOT have fired.
-    let tgt = db.get_pv("AOIV_TGT").await.unwrap();
+    let tgt = db.get_pv("AOIV_TGT").unwrap();
     assert!(
         matches!(tgt, EpicsValue::Double(v) if (v - 5.0).abs() < 1e-10),
         "SIMS=INVALID did NOT trigger the IVOA veto; OVAL=5 written to SIOL, got {tgt:?}"
@@ -221,17 +223,17 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
         .await
         .unwrap();
 
-    let sevr = db.get_pv("BOIV.SEVR").await.unwrap();
+    let sevr = db.get_pv("BOIV.SEVR").unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(3)),
         "record's own STATE_ALARM/INVALID, got {sevr:?}"
     );
-    let stat = db.get_pv("BOIV.STAT").await.unwrap();
+    let stat = db.get_pv("BOIV.STAT").unwrap();
     assert!(
         matches!(stat, EpicsValue::Short(STATE_ALARM)),
         "STAT is the record's STATE_ALARM (writeValue/SIMM_ALARM skipped under Don't_drive), got {stat:?}"
     );
-    let tgt = db.get_pv("BOIV_TGT").await.unwrap();
+    let tgt = db.get_pv("BOIV_TGT").unwrap();
     assert!(
         matches!(tgt, EpicsValue::Double(v) if (v + 99.0).abs() < 1e-10),
         "IVOA Don't_drive on a real INVALID alarm suppressed the SIOL write, got {tgt:?}"
@@ -281,12 +283,12 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
         .await
         .unwrap();
 
-    let sevr = db.get_pv("BOTIE.SEVR").await.unwrap();
+    let sevr = db.get_pv("BOTIE.SEVR").unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(1)),
         "tied MINOR severity, got {sevr:?}"
     );
-    let stat = db.get_pv("BOTIE.STAT").await.unwrap();
+    let stat = db.get_pv("BOTIE.STAT").unwrap();
     assert!(
         matches!(stat, EpicsValue::Short(STATE_ALARM)),
         "on a tie the record's STATE_ALARM owns STAT (SIMM raised after checkAlarms), got {stat:?}"

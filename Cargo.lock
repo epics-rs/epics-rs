@@ -994,17 +994,21 @@ version = "0.0.0"
 name = "epics-base-rs"
 version = "0.24.3"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bytes",
  "chrono",
  "clap",
  "criterion",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-macros-rs",
+ "epics-rtems-boot",
  "hostname",
  "if-addrs",
  "libc",
  "parking_lot",
+ "rtems-exec-gate",
  "rustyline",
  "serde_json",
  "serial_test",
@@ -1028,8 +1032,10 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+ "epics-rtems-boot",
  "parking_lot",
  "regex",
+ "rtems-exec-gate",
  "serde",
  "serde_json",
  "serial_test",
@@ -1054,6 +1060,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "epics-base-rs",
+ "epics-rtems-boot",
  "futures-util",
  "hickory-client",
  "hickory-proto",
@@ -1070,6 +1077,7 @@ dependencies = [
  "proptest",
  "rand_core 0.6.4",
  "rcgen",
+ "rtems-exec-gate",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
@@ -1086,6 +1094,24 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.59.0",
  "x509-parser",
+]
+
+[[package]]
+name = "epics-libcom-rs"
+version = "0.24.3"
+dependencies = [
+ "chrono",
+ "hostname",
+ "if-addrs",
+ "libc",
+ "parking_lot",
+ "rtems-exec-gate",
+ "serial_test",
+ "socket2 0.5.10",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1146,6 +1172,7 @@ dependencies = [
  "parking_lot",
  "pkcs5",
  "rcgen",
+ "rtems-exec-gate",
  "rustls 0.23.39",
  "rustls-pemfile",
  "serde_json",
@@ -1181,6 +1208,14 @@ dependencies = [
  "optics-rs",
  "scaler-rs",
  "std-rs",
+]
+
+[[package]]
+name = "epics-rtems-boot"
+version = "0.24.3"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -2034,9 +2069,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+version = "0.2.188"
+source = "git+https://github.com/physwkim/libc.git?rev=6f64e70d6a2a03b989380aaa719207236343f093#6f64e70d6a2a03b989380aaa719207236343f093"
 
 [[package]]
 name = "libm"
@@ -3200,6 +3234,22 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rt-probe"
+version = "0.24.3"
+dependencies = [
+ "clap",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "epics-pva-rs",
+ "libc",
+ "tokio",
+]
+
+[[package]]
+name = "rtems-exec-gate"
+version = "0.0.0"
 
 [[package]]
 name = "rumqttc"

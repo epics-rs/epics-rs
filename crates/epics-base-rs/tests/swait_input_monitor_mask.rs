@@ -22,6 +22,8 @@
 //! a field posts that field `DBE_VALUE | DBE_LOG` on its own, which is a
 //! different post from `monitor()`'s.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -38,8 +40,8 @@ const ALL: u16 = 0x07; // DBE_VALUE | DBE_LOG | DBE_ALARM
 /// Subscribe to `REC.A` with every event class, so the post's own mask decides
 /// what arrives.
 async fn subscribe_a(db: &PvDatabase, rec: &str) -> EventReader {
-    let inst = db.get_record(rec).await.unwrap();
-    let mut g = inst.write().await;
+    let inst = db.get_record(rec).unwrap();
+    let mut g = inst.write();
     g.add_subscriber("A", 1, DbFieldType::Double, ALL)
         .expect("A subscription must be accepted")
 }

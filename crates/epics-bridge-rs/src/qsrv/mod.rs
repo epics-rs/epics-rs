@@ -27,11 +27,12 @@
 pub mod channel;
 pub mod group;
 pub mod group_config;
+pub(crate) mod group_pump;
 pub mod iocsh;
 pub mod monitor;
 pub mod provider;
 pub(crate) mod put_status;
-#[cfg(feature = "qsrv")]
+#[cfg(feature = "qsrv-core")]
 pub mod pva_adapter;
 pub mod pvif;
 pub(crate) mod trap_write;
@@ -44,9 +45,15 @@ pub use provider::{
     AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
     Channel, ChannelProvider, ClientCreds, PvaMonitor, WriteGrant,
 };
-#[cfg(feature = "qsrv")]
+#[cfg(feature = "qsrv-core")]
 pub use pva_adapter::{
-    PvaPvHandle, QsrvPvStore, pvalink_link_set_install, register_pva_pv_global,
-    run_ca_pva_qsrv_ioc, take_registered_pva_pvs,
+    PvaPvHandle, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
+    register_pva_pv_global, take_registered_pva_pvs,
 };
+// The host dual-protocol runner: gated with its definition, and the predicate
+// must match it exactly — `qsrv` (not `qsrv-core`) because it needs
+// `epics-ca-rs`, and non-RTEMS because both servers it starts are RTEMS-gated
+// in their own crates. See the definition for the full reasoning.
+#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
+pub use pva_adapter::run_ca_pva_qsrv_ioc;
 pub use pvif::{FieldMapping, NtType};

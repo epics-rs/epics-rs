@@ -14,14 +14,16 @@
 //! `rpc`, `is_writable`, `get_introspection`). `list_pvs()` is the
 //! union of every source's PV list.
 
+// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::source::{
-    AccessChecked, ChannelInvalidator, ChannelSource, DynSource, OpError, RawMonitorEvent,
+    AccessChecked, ChannelInvalidator, ChannelSource, DynSource, MonitorStream, OpError,
+    RawMonitorEvent,
 };
 
 /// One entry in the registry.
@@ -450,7 +452,7 @@ impl ChannelSource for CompositeSource {
     /// the channel dispatches every later operation to the source that
     /// accepted it, instead of re-resolving the registry per operation.
     /// Selection uses `has_pv_checked` — the same credentialed find as
-    /// [`Self::resolve_checked`] — so the owner is chosen under the
+    /// `Self::resolve_checked` — so the owner is chosen under the
     /// downstream peer's identity. Descends through a nested composite
     /// to its leaf owner so the bound source is always terminal.
     ///
@@ -524,7 +526,7 @@ impl ChannelSource for CompositeSource {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -677,7 +679,7 @@ impl ChannelSource for CompositeSource {
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -690,7 +692,7 @@ impl ChannelSource for CompositeSource {
         &self,
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -709,7 +711,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -728,7 +730,7 @@ impl ChannelSource for CompositeSource {
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<crate::server_native::source::MonitorUpdate>>,
+        Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
     > + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
@@ -745,7 +747,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = checked.pv_name().to_string();
         let this = self.snapshot();
         async move {
@@ -826,7 +828,7 @@ impl ChannelSource for CompositeSource {
     fn subscribe_raw(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
         async move {
@@ -1107,7 +1109,7 @@ mod tests {
         fn subscribe(
             &self,
             _: &str,
-        ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
     }
@@ -1165,13 +1167,13 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
         }
 
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let resolver: epics_base_rs::server::access_security::AsgAslResolver =
             Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let inner1 = Arc::new(VersionedSrc {
@@ -1259,7 +1261,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1363,13 +1365,13 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
         }
 
-        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let resolver: epics_base_rs::server::access_security::AsgAslResolver =
             Arc::new(|_| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let inner_a = Arc::new(VersionedSrc {
@@ -1655,7 +1657,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1836,7 +1838,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
@@ -1963,7 +1965,7 @@ mod tests {
             fn subscribe(
                 &self,
                 _: &str,
-            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }

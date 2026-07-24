@@ -32,6 +32,8 @@
 //! record(ai,"A1"){}   (a type that DOES clear)               UDF 0  NO_ALARM NO_ALARM
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -52,8 +54,8 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn state(db: &PvDatabase, name: &str) -> (bool, AlarmSeverity, u16) {
-    let rec = db.get_record(name).await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record(name).unwrap();
+    let inst = rec.read();
     (inst.common.udf != 0, inst.common.sevr, inst.common.stat)
 }
 
@@ -87,8 +89,8 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
         .unwrap();
     {
         // an ai that has been read is defined
-        let rec = db.get_record("SRC").await.unwrap();
-        rec.write().await.common.udf = 0;
+        let rec = db.get_record("SRC").unwrap();
+        rec.write().common.udf = 0;
     }
     db.add_record("DF2", Box::new(DfanoutRecord::new(0.0)))
         .await
@@ -108,7 +110,7 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
         "DOL closed_loop defines the dfanout (softIoc: DF2)"
     );
     assert_eq!(
-        db.get_pv("DF2.VAL").await.unwrap().to_f64().unwrap(),
+        db.get_pv("DF2.VAL").unwrap().to_f64().unwrap(),
         7.0,
         "the DOL value lands in VAL"
     );

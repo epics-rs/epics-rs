@@ -13,6 +13,8 @@
 //! Boundaries: Never vs Every Time (the OUT target moves / does not move), and
 //! the unnamed-index catch-all.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -67,12 +69,12 @@ async fn scalcout_never_writes_nothing_to_out() {
     }
 
     assert_eq!(
-        db.get_pv("S:NEVER").await.unwrap().to_f64(),
+        db.get_pv("S:NEVER").unwrap().to_f64(),
         Some(7.0),
         "the calc still runs — only the OUT write is suppressed"
     );
     assert_eq!(
-        db.get_pv("T:NEVER").await.unwrap(),
+        db.get_pv("T:NEVER").unwrap(),
         EpicsValue::Double(0.0),
         "C `case scalcoutOOPT_Never: doOutput = 0` — the OUT target never moves"
     );
@@ -87,7 +89,7 @@ async fn scalcout_every_time_still_drives_out() {
     process(&db, "S:EVERY").await;
 
     assert_eq!(
-        db.get_pv("T:EVERY").await.unwrap(),
+        db.get_pv("T:EVERY").unwrap(),
         EpicsValue::Double(7.0),
         "OOPT=Every Time drives the OUT link"
     );
@@ -103,7 +105,7 @@ async fn acalcout_never_writes_nothing_to_out() {
     }
 
     assert_eq!(
-        db.get_pv("T:ANEVER").await.unwrap(),
+        db.get_pv("T:ANEVER").unwrap(),
         EpicsValue::Double(0.0),
         "C `aCalcoutRecord.c` Never: doOutput = 0"
     );
@@ -116,9 +118,9 @@ async fn acalcout_never_writes_nothing_to_out() {
 async fn an_unnamed_oopt_index_drives_no_output() {
     let db = build().await;
 
-    let rec = db.get_record("S:EVERY").await.unwrap();
+    let rec = db.get_record("S:EVERY").unwrap();
     {
-        let mut inst = rec.write().await;
+        let mut inst = rec.write();
         // Past the last menu choice (6 = Never) — C's switch has no case for it.
         inst.record
             .put_field_internal("OOPT", EpicsValue::Short(9))
@@ -127,7 +129,7 @@ async fn an_unnamed_oopt_index_drives_no_output() {
     process(&db, "S:EVERY").await;
 
     assert_eq!(
-        db.get_pv("T:EVERY").await.unwrap(),
+        db.get_pv("T:EVERY").unwrap(),
         EpicsValue::Double(0.0),
         "C initialises doOutput = 0 and only a matching case raises it"
     );

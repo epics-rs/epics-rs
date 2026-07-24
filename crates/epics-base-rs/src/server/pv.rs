@@ -1,10 +1,12 @@
+// RTEMS-EXEC-MODEL-ALLOW(22): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::runtime::sync::{Mutex, RwLock};
+use crate::runtime::sync::PriorityInheritanceMutex;
 
 use crate::error::CaError;
-use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome};
+use crate::server::event_queue::{EventReader, EventSink, EventUser, PostOutcome, TryRecvError};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, PropertySupport, Snapshot};
 use crate::types::{DbFieldType, EpicsValue, WallTime};
 
@@ -34,7 +36,7 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
 static DROPPED_MONITOR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the cumulative count of dropped monitor events. Intended for
-/// introspection / metrics; see [`DROPPED_MONITOR_EVENTS`] for the
+/// introspection / metrics; see `DROPPED_MONITOR_EVENTS` for the
 /// current wiring status.
 pub fn dropped_monitor_events() -> u64 {
     DROPPED_MONITOR_EVENTS.load(Ordering::Relaxed)
@@ -312,8 +314,38 @@ struct PostedMeta {
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
     pub name: String,
-    pub value: RwLock<EpicsValue>,
-    pub subscribers: Mutex<Vec<Subscriber>>,
+    /// The stored value. A synchronous `parking_lot::RwLock` (matching the
+    /// sibling `posted_meta` / `metadata` / hook locks): every access is a
+    /// single-expression read-or-write with no `.await` held across the
+    /// guard, so the value-read path (`get`, `snapshot`) is pure lock work
+    /// with no reactor dependency — the sans-io READ path. The write side
+    /// (`set` / `set_snapshot`) still `.await`s the monitor fan-out, but
+    /// drops this guard first.
+    pub value: parking_lot::RwLock<EpicsValue>,
+    /// Monitor fan-out list — **L7** of `doc/rtems-priority-locks-design.md`
+    /// §3.
+    ///
+    /// A BLOCKING mutex, not the async one: every emission path runs from a
+    /// record-processing thread with the record's advisory gate (L1) held, and
+    /// C's `db_post_events` likewise takes `evUser->lock` from inside
+    /// `dbScanLock` (`dbEvent.c::db_post_events`). Holding an async mutex here
+    /// would put a suspension point inside that window. Every critical section
+    /// below is bounded list work (`retain` / `push` / `sub.post`), with no
+    /// I/O and no `.await` inside it.
+    ///
+    /// Specifically a [`PriorityInheritanceMutex`] rather than a plain
+    /// `parking_lot::Mutex`, because `evUser->lock` is an `epicsMutex` and on
+    /// the RTEMS arm every `epicsMutex` is a `PTHREAD_PRIO_INHERIT` pthread
+    /// mutex (`os/posix/osdMutex.c:71-88`, compiled for RTEMS via
+    /// `os/RTEMS-posix/osdMutex.c:8`). It is taken from banded IOC threads on
+    /// both sides — the emitting record-processing thread and a `CAS-client`
+    /// thread running `remove_subscriber` — so a plain mutex here reintroduces
+    /// the inversion L1 was converted to remove. Off the PI targets this is
+    /// `parking_lot::Mutex`, i.e. exactly what it was.
+    ///
+    /// A leaf of the acquisition order (`record_lock.rs` module doc): no other
+    /// lock is taken while it is held.
+    pub subscribers: PriorityInheritanceMutex<Vec<Subscriber>>,
     /// Sticky metadata of the last full-snapshot write. `None` until a
     /// [`Self::set_snapshot`] lands; a value-only [`Self::set`] clears it
     /// back to `None` (a plain value write carries no explicit
@@ -360,8 +392,8 @@ impl ProcessVariable {
     pub fn new(name: String, initial: EpicsValue) -> Self {
         Self {
             name,
-            value: RwLock::new(initial),
-            subscribers: Mutex::new(Vec::new()),
+            value: parking_lot::RwLock::new(initial),
+            subscribers: PriorityInheritanceMutex::new(Vec::new()),
             metadata: parking_lot::RwLock::new(PvMetadata::default()),
             posted_meta: parking_lot::RwLock::new(None),
             write_hook: parking_lot::RwLock::new(None),
@@ -468,8 +500,11 @@ impl ProcessVariable {
     }
 
     /// Get the current value.
-    pub async fn get(&self) -> EpicsValue {
-        self.value.read().await.clone()
+    ///
+    /// Synchronous: a single-expression read-lock clone with no `.await`,
+    /// so the value-read path carries no reactor dependency (sans-io).
+    pub fn get(&self) -> EpicsValue {
+        self.value.read().clone()
     }
 
     /// Build a Snapshot for this bare PV.
@@ -480,14 +515,14 @@ impl ProcessVariable {
     /// wall-clock now, with `user_tag` = 0. Display / control / enum
     /// metadata is `None` *unless* a proxy installed it via
     /// [`Self::set_metadata`] (the CA / PVA gateway shadowing an
-    /// upstream IOC) — see [`Self::apply_metadata`]. Record-backed
+    /// upstream IOC) — see `Self::apply_metadata`. Record-backed
     /// channels build their snapshot via
     /// `RecordInstance::snapshot_for_field`, which carries the record's
     /// own alarm/metadata. The only path that injects a non-zero alarm
     /// onto a bare PV is [`Self::post_alarm`] (used by the gateway
     /// adapter to surface upstream disconnect).
-    pub async fn snapshot(&self) -> Snapshot {
-        let value = self.value.read().await.clone();
+    pub fn snapshot(&self) -> Snapshot {
+        let value = self.value.read().clone();
         // Serve the sticky metadata of the last full-snapshot write if
         // one landed (pvxs mailbox parity: a posted full Value stays the
         // current value, alarm/time included); otherwise the bare-PV
@@ -544,21 +579,40 @@ impl ProcessVariable {
                 self.apply_metadata(&mut snap);
                 Ok(snap)
             }
-            None => Ok(self.snapshot().await),
+            None => Ok(self.snapshot()),
+        }
+    }
+
+    /// Synchronous companion to [`Self::read_snapshot`] for the one-shot GET
+    /// path (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`).
+    ///
+    /// `Some(snapshot)` when NO read hook is installed — the sans-io GET that
+    /// every record-backed and cached PV takes: [`Self::snapshot`] of the
+    /// stored value, produced with no `.await` and no reactor dependency.
+    /// `None` when a gateway no-cache [`ReadHook`] IS installed, whose `hook()`
+    /// is a genuine upstream network GET; the caller must then take the async
+    /// [`Self::read_snapshot`] instead. This keeps the hook / no-hook decision
+    /// in one owner, in lockstep with `read_snapshot` — the only difference is
+    /// that the async fallible upstream fetch is surfaced to the caller as
+    /// `None` rather than performed here.
+    pub fn read_snapshot_local(&self) -> Option<Snapshot> {
+        match self.read_hook() {
+            Some(_) => None,
+            None => Some(self.snapshot()),
         }
     }
 
     /// Set a new value and notify all subscribers.
-    pub async fn set(&self, new_value: EpicsValue) {
+    pub fn set(&self, new_value: EpicsValue) {
         {
-            let mut val = self.value.write().await;
+            let mut val = self.value.write();
             *val = new_value.clone();
         }
         // A plain value write carries no explicit alarm/time — revert to
         // the bare-PV default so a stale full-snapshot's metadata does
         // not linger on a value the client never stamped.
         *self.posted_meta.write() = None;
-        self.notify_subscribers(new_value).await;
+        self.notify_subscribers(new_value);
     }
 
     /// Set value from a full snapshot (value + alarm + timestamp) and notify
@@ -566,9 +620,9 @@ impl ProcessVariable {
     /// the upstream alarm status/severity and IOC timestamp to downstream
     /// monitors. Mirrors `gateVcData::setEventData` + `vcPostEvent` in the
     /// C ca-gateway: the incoming `dbr_time_xxx` GDD carries all three fields.
-    pub async fn set_snapshot(&self, snapshot: Snapshot) {
+    pub fn set_snapshot(&self, snapshot: Snapshot) {
         {
-            let mut val = self.value.write().await;
+            let mut val = self.value.write();
             *val = snapshot.value.clone();
         }
         // Persist the posted alarm/time/userTag so a later GET reflects
@@ -578,7 +632,7 @@ impl ProcessVariable {
             timestamp: snapshot.timestamp,
             user_tag: snapshot.user_tag,
         });
-        self.notify_subscribers_from_snapshot(snapshot).await;
+        self.notify_subscribers_from_snapshot(snapshot);
     }
 
     /// Single delivery owner: emit `snapshot` to every live subscriber
@@ -593,9 +647,9 @@ impl ProcessVariable {
     /// class differs per caller, nothing else. The snapshot is built once
     /// by the caller (one timestamp per logical event) and cloned per
     /// subscriber.
-    async fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
+    fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         // Remove subscribers whose consumer has been dropped.
         subs.retain(|sub| !sub.is_closed());
         for sub in subs.iter() {
@@ -643,14 +697,13 @@ impl ProcessVariable {
     /// reconnect storms when the upstream is just briefly
     /// unreachable). Mirrors gatePvData::death's "alarm-post"
     /// alternative discussed in the C++ ca-gateway audit.
-    pub async fn post_alarm(&self, severity: u16, status: u16) {
+    pub fn post_alarm(&self, severity: u16, status: u16) {
         use crate::server::recgbl::EventMask;
-        let value = self.value.read().await.clone();
+        let value = self.value.read().clone();
         let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
-        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot)
-            .await;
+        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot);
     }
 
     /// Post a `DBE_PROPERTY` monitor event carrying the decoded upstream
@@ -675,17 +728,16 @@ impl ProcessVariable {
     pub async fn post_property(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
         self.apply_metadata(&mut snapshot);
-        self.deliver(EventMask::PROPERTY, snapshot).await;
+        self.deliver(EventMask::PROPERTY, snapshot);
     }
 
     /// Notify all subscribers of a new value.
-    async fn notify_subscribers(&self, value: EpicsValue) {
+    fn notify_subscribers(&self, value: EpicsValue) {
         use crate::server::recgbl::EventMask;
         let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
-        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot)
-            .await;
+        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot);
     }
 
     /// Notify all subscribers using a pre-built Snapshot (value + alarm +
@@ -693,7 +745,7 @@ impl ProcessVariable {
     /// and IOC timestamp without synthesising a new zero-alarm local-time
     /// snapshot. Installed shadow metadata fills any metadata field the
     /// gateway snapshot left absent (see [`Self::apply_metadata`]).
-    async fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
+    fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
         self.apply_metadata(&mut snapshot);
         // C gateway fires postEvent(VALUE|ALARM|LOG) for every
@@ -702,8 +754,7 @@ impl ProcessVariable {
         self.deliver(
             EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
             snapshot,
-        )
-        .await;
+        );
     }
 
     /// Add an in-process subscriber, attached to an event queue of its own.
@@ -714,14 +765,13 @@ impl ProcessVariable {
     /// queue, and flow control (a CA circuit concept) never engages on it.
     /// The CA server, whose subscriptions DO share one circuit-wide queue, uses
     /// [`Self::add_subscriber_on`].
-    pub async fn add_subscriber(
+    pub fn add_subscriber(
         &self,
         sid: u32,
         data_type: DbFieldType,
         mask: u16,
     ) -> Option<EventReader> {
         self.add_subscriber_on(&EventUser::new(), sid, data_type, mask)
-            .await
     }
 
     /// Add a subscriber whose events are queued on `user`'s event queue —
@@ -734,7 +784,7 @@ impl ProcessVariable {
     /// against a misbehaving client opening many MONITOR ops against one shared
     /// PV; the per-channel cap limits channels but not subscriber rows on a
     /// single PV). Operators override it via `EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`.
-    pub async fn add_subscriber_on(
+    pub fn add_subscriber_on(
         &self,
         user: &EventUser,
         sid: u32,
@@ -742,7 +792,7 @@ impl ProcessVariable {
         mask: u16,
     ) -> Option<EventReader> {
         let cap = max_subscribers_per_pv();
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         // Reap rows whose consumer is gone BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
         // already retain-filter on every emission, but a PV with
@@ -783,7 +833,7 @@ impl ProcessVariable {
     /// `SimplePv` monitor runs the SAME filter chain as a record-field
     /// monitor instead of the empty default `FilterChain` that
     /// `add_subscriber` installs. Update delivery
-    /// ([`Self::notify_subscribers`] / [`Self::post_alarm`]) already
+    /// (`Self::notify_subscribers` / [`Self::post_alarm`]) already
     /// applies `sub.filters`; this is the missing wiring that populates
     /// it.
     ///
@@ -792,7 +842,7 @@ impl ProcessVariable {
     /// isolated across subscribers. An empty chain is a no-op (keeps the
     /// default). No-op when no subscriber matches `sid` (e.g. it was
     /// reaped between add and attach).
-    pub async fn attach_filters_to_subscriber(
+    pub fn attach_filters_to_subscriber(
         &self,
         sid: u32,
         filters: crate::server::database::filters::FilterChain,
@@ -800,15 +850,15 @@ impl ProcessVariable {
         if filters.is_empty() {
             return;
         }
-        let mut subs = self.subscribers.lock().await;
+        let mut subs = self.subscribers.lock();
         if let Some(sub) = subs.iter_mut().find(|s| s.sid == sid) {
             sub.filters = filters;
         }
     }
 
     /// Remove a subscriber by subscription ID.
-    pub async fn remove_subscriber(&self, sid: u32) {
-        let mut subs = self.subscribers.lock().await;
+    pub fn remove_subscriber(&self, sid: u32) {
+        let mut subs = self.subscribers.lock();
         subs.retain(|s| s.sid != sid);
     }
 }
@@ -864,7 +914,7 @@ impl PvSubscription {
         // `data_type` is nominal for snapshot consumers: `deliver` ships
         // the full `Snapshot` and gates only on mask/filters, never on the
         // stored type — `DbSubscription` likewise registers as `Double`.
-        let reader = pv.add_subscriber(sid, DbFieldType::Double, mask).await?;
+        let reader = pv.add_subscriber(sid, DbFieldType::Double, mask)?;
         Some(Self { reader, pv, sid })
     }
 
@@ -876,6 +926,31 @@ impl PvSubscription {
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
         Some(self.reader.recv().await?.snapshot)
     }
+
+    /// Non-blocking [`Self::recv_snapshot`]. Delegates to
+    /// [`EventReader::try_recv`] (`event_queue.rs:570`) — same queue, same
+    /// EVENTS_OFF gate, no suspension.
+    ///
+    /// Lets a PVA monitor source that adapts this stream be polled from a
+    /// blocking drain loop with no reactor present
+    /// (`doc/rtems-runtime-portability-design.md` §9 phase 6).
+    pub fn try_recv_snapshot(&mut self) -> Result<Snapshot, TryRecvError> {
+        self.reader.try_recv().map(|e| e.snapshot)
+    }
+
+    /// Await the next change as the full [`MonitorEvent`] — snapshot plus the
+    /// per-event `DBE_*` mask. The mask-carrying counterpart of
+    /// [`recv_snapshot`](Self::recv_snapshot), matching
+    /// `DbSubscription::recv_event` so a consumer can treat a simple-PV and a
+    /// record subscription through one shape.
+    pub async fn recv_event(&mut self) -> Option<MonitorEvent> {
+        self.reader.recv().await
+    }
+
+    /// Non-blocking [`Self::recv_event`].
+    pub fn try_recv_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
+        self.reader.try_recv()
+    }
 }
 
 impl Drop for PvSubscription {
@@ -886,8 +961,8 @@ impl Drop for PvSubscription {
         // lock, so remove the slot off-thread. No current runtime means no
         // live subscription to clean up.
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                pv.remove_subscriber(sid).await;
+            crate::runtime::task::spawn(async move {
+                pv.remove_subscriber(sid);
             });
         }
     }
@@ -920,9 +995,9 @@ mod mask_gate_tests {
         let posted_time = WallTime::from_unix(1_600_000_000, 42);
         let mut snap = Snapshot::new(EpicsValue::Double(7.0), 3, 2, posted_time);
         snap.user_tag = 9;
-        pv.set_snapshot(snap).await;
+        pv.set_snapshot(snap);
 
-        let got = pv.snapshot().await;
+        let got = pv.snapshot();
         assert_eq!(got.value, EpicsValue::Double(7.0), "value persisted");
         assert_eq!(got.alarm.status, 3, "alarm.status persisted to GET");
         assert_eq!(got.alarm.severity, 2, "alarm.severity persisted to GET");
@@ -930,8 +1005,8 @@ mod mask_gate_tests {
         assert_eq!(got.timestamp, posted_time, "timestamp persisted to GET");
 
         // A plain value write reverts to the bare-PV default.
-        pv.set(EpicsValue::Double(8.0)).await;
-        let after = pv.snapshot().await;
+        pv.set(EpicsValue::Double(8.0));
+        let after = pv.snapshot();
         assert_eq!(after.value, EpicsValue::Double(8.0));
         assert_eq!(after.alarm.status, 0, "value set clears posted alarm");
         assert_eq!(after.alarm.severity, 0, "value set clears posted severity");
@@ -949,14 +1024,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_err(),
             "DBE_ALARM-only subscriber must not receive a value post"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_ok(),
             "DBE_ALARM subscriber must receive an alarm post"
@@ -970,14 +1044,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive an alarm post"
         );
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a value post"
@@ -1001,9 +1074,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_LOG)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive a set_snapshot post"
@@ -1016,9 +1088,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_ALARM-only subscriber must receive a set_snapshot post"
@@ -1031,9 +1102,8 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.set_snapshot(snapshot()).await;
+        pv.set_snapshot(snapshot());
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a set_snapshot post"
@@ -1046,11 +1116,10 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(rx.try_recv().is_ok(), "value post delivered to VALUE|ALARM");
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(rx.try_recv().is_ok(), "alarm post delivered to VALUE|ALARM");
     }
 
@@ -1063,14 +1132,13 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_LOG)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive a value post"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive an alarm post"
@@ -1086,15 +1154,14 @@ mod mask_gate_tests {
         let pv = pv();
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(1.0)).await;
+        pv.set(EpicsValue::Double(1.0));
         assert_eq!(
             rx.try_recv().expect("value event").mask,
             EventMask::VALUE | EventMask::LOG,
             "value post carries VALUE|LOG"
         );
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         assert_eq!(
             rx.try_recv().expect("alarm event").mask,
             EventMask::ALARM | EventMask::LOG,
@@ -1117,19 +1184,18 @@ mod mask_gate_tests {
         ));
         let mut reader = pv
             .add_subscriber(7, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
-            .await
             .expect("subscriber added");
         // Append VALUE|LOG posts until the ring space reaches the replace
         // threshold; from here every post overwrites the tail entry.
         let appended = event_que_size() - events_per_que();
         for i in 1..=appended {
-            pv.set(EpicsValue::Double(i as f64)).await;
+            pv.set(EpicsValue::Double(i as f64));
         }
         // Replaces the tail: its class (ALARM|LOG) must not be lost.
-        pv.post_alarm(2, 3).await;
+        pv.post_alarm(2, 3);
         // Replaces it again with a value post — both classes fold into the
         // survivor.
-        pv.set(EpicsValue::Double(99.0)).await;
+        pv.set(EpicsValue::Double(99.0));
 
         let mut last = None;
         while let Ok(event) = reader.try_recv() {
@@ -1175,7 +1241,7 @@ mod mask_gate_tests {
         let appended = event_que_size() - events_per_que();
         let burst = appended + 92;
         for i in 1..=burst {
-            pv.set(EpicsValue::Double(i as f64)).await;
+            pv.set(EpicsValue::Double(i as f64));
         }
         let mut seq = Vec::new();
         while let Ok(Some(snap)) =
@@ -1229,11 +1295,11 @@ mod metadata_tests {
     async fn set_metadata_serves_on_get_snapshot() {
         let pv = pv();
         assert!(
-            pv.snapshot().await.display.is_none(),
+            pv.snapshot().display.is_none(),
             "bare PV must carry no metadata before install"
         );
         pv.set_metadata(meta());
-        let snap = pv.snapshot().await;
+        let snap = pv.snapshot();
         let d = snap.display.expect("display installed");
         assert_eq!(d.units, "degC");
         assert_eq!(d.precision, 2);
@@ -1252,9 +1318,8 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
-        pv.set(EpicsValue::Double(2.0)).await;
+        pv.set(EpicsValue::Double(2.0));
         let ev = rx.try_recv().expect("value event delivered");
         assert_eq!(
             ev.snapshot.display.expect("metadata on value post").units,
@@ -1271,7 +1336,6 @@ mod metadata_tests {
         pv.set_metadata(meta()); // installed units = degC
         let mut rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
         let mut snap = Snapshot::new(
             EpicsValue::Double(3.0),
@@ -1283,7 +1347,7 @@ mod metadata_tests {
             units: "volts".into(),
             ..Default::default()
         });
-        pv.set_snapshot(snap).await;
+        pv.set_snapshot(snap);
         let ev = rx.try_recv().expect("snapshot delivered");
         assert_eq!(
             ev.snapshot.display.expect("caller display kept").units,
@@ -1301,11 +1365,9 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("subscriber added");
         let mut val_rx = pv
             .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
-            .await
             .expect("subscriber added");
         pv.post_property(Snapshot::new(
             EpicsValue::Double(1.0),
@@ -1346,7 +1408,6 @@ mod metadata_tests {
         pv.set_metadata(meta());
         let mut prop_rx = pv
             .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
-            .await
             .expect("subscriber added");
         // The upstream CTRL event timestamp: a fixed point in the past, so
         // it is unmistakably NOT a fresh wall clock minted by the post.
@@ -1394,7 +1455,7 @@ mod read_hook_tests {
     async fn read_snapshot_without_hook_equals_snapshot() {
         let pv = pv();
         let read = pv.read_snapshot().await.expect("no-hook read never errors");
-        let stored = pv.snapshot().await;
+        let stored = pv.snapshot();
         assert_eq!(read.value, stored.value);
         assert_eq!(read.value, EpicsValue::Double(1.0));
     }
@@ -1406,7 +1467,7 @@ mod read_hook_tests {
     async fn read_snapshot_fires_hook_for_fresh_value() {
         let pv = pv();
         // Stored shadow value is a sentinel the hook must override.
-        pv.set(EpicsValue::Double(999.0)).await;
+        pv.set(EpicsValue::Double(999.0));
         pv.set_read_hook(Arc::new(|| {
             Box::pin(async {
                 Ok(Snapshot::new(
@@ -1435,13 +1496,26 @@ mod read_hook_tests {
         assert!(matches!(err, CaError::Disconnected));
     }
 
-    /// The read hook is GET-path only: `snapshot` (monitor fan-out, the
-    /// initial monitor event, access-rights re-posts) keeps serving the
-    /// stored value even when a hook is installed.
-    #[tokio::test]
-    async fn snapshot_ignores_read_hook() {
+    /// No hook (every record-backed and cached PV): the sync companion
+    /// `read_snapshot_local` yields `Some(snapshot)`, byte-for-byte the same
+    /// value as `snapshot` / the async `read_snapshot` — the fully sans-io
+    /// GET path.
+    #[test]
+    fn read_snapshot_local_without_hook_is_some_and_matches_snapshot() {
         let pv = pv();
-        pv.set(EpicsValue::Double(7.0)).await;
+        let local = pv
+            .read_snapshot_local()
+            .expect("no hook ⇒ sync snapshot is Some");
+        assert_eq!(local.value, pv.snapshot().value);
+        assert_eq!(local.value, EpicsValue::Double(1.0));
+    }
+
+    /// A read hook installed (gateway no-cache): the sync companion returns
+    /// `None`, the signal that the caller must take the async upstream-GET
+    /// path — `read_snapshot_local` never fires the hook itself.
+    #[test]
+    fn read_snapshot_local_with_hook_is_none() {
+        let pv = pv();
         pv.set_read_hook(Arc::new(|| {
             Box::pin(async {
                 Ok(Snapshot::new(
@@ -1452,7 +1526,30 @@ mod read_hook_tests {
                 ))
             })
         }));
-        let snap = pv.snapshot().await;
+        assert!(
+            pv.read_snapshot_local().is_none(),
+            "a read hook ⇒ the sync path defers to the async upstream GET"
+        );
+    }
+
+    /// The read hook is GET-path only: `snapshot` (monitor fan-out, the
+    /// initial monitor event, access-rights re-posts) keeps serving the
+    /// stored value even when a hook is installed.
+    #[tokio::test]
+    async fn snapshot_ignores_read_hook() {
+        let pv = pv();
+        pv.set(EpicsValue::Double(7.0));
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(42.0),
+                    0,
+                    0,
+                    std::time::UNIX_EPOCH,
+                ))
+            })
+        }));
+        let snap = pv.snapshot();
         assert_eq!(
             snap.value,
             EpicsValue::Double(7.0),
@@ -1513,8 +1610,7 @@ mod read_hook_tests {
         // monitor post). Make it concrete and DIFFERENT from the upstream
         // GET so a graft-onto-shadow regression is observable.
         let shadow_time = UNIX_EPOCH + Duration::from_secs(1_000);
-        pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time))
-            .await;
+        pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time));
         // The fresh upstream GET reports a different value, alarm, and time.
         let upstream_time = WallTime::from_unix(2_000, 0);
         pv.set_read_hook(Arc::new(move || {

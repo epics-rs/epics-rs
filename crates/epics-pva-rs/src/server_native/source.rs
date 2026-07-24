@@ -3,9 +3,12 @@
 //! Uses our own [`crate::pvdata`] types, so only native types appear in the
 //! public surface.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::proto::{MessageType, Status};
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
@@ -95,7 +98,14 @@ pub struct ChannelContext {
     pub account: String,
     /// Auth method (`"anonymous"`, `"ca"`, `"x509"`).
     pub method: String,
-    /// Reverse-resolved host name. Empty when DNS lookup failed.
+    /// Host identity of the peer as the ACF `HAG(...)` gate matches it —
+    /// [`Self::peer`]'s address in numeric form, port stripped and
+    /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
+    ///
+    /// NOT reverse-resolved, and never taken from the wire: a client's
+    /// advertised `host` field is ignored by the CONNECTION_VALIDATION
+    /// parser, because this is the string host-scoped ACF rules are matched
+    /// against. See `ClientCredentials::host`.
     pub host: String,
     /// Certificate authority for the `x509` method: the root CA's
     /// subject CommonName. Empty for non-TLS methods. ACF
@@ -571,7 +581,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// True iff `name` should be answered to a SEARCH from `requester`.
     ///
     /// pvxs exposes the requester endpoint to a source's `onSearch` as
-    /// [`Search::source()`] — filled from `msg.replyDest` for UDP
+    /// `Search::source()` — filled from `msg.replyDest` for UDP
     /// (server.cpp:674-704) and from the established TCP peer for
     /// circuit search (serverchan.cpp:197-222) — so a source can scope
     /// advertisement by requester (claim a PV only for a local subnet,
@@ -1117,7 +1127,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send;
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send;
 
     /// Type-state-enforced MONITOR. Refuses `NoAccess` tokens; on
     /// any READ-class level delegates to the legacy ctx-less
@@ -1127,7 +1137,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let _ = ctx;
         async move {
             if !checked.allows_read() {
@@ -1153,7 +1163,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     fn subscribe_raw(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let _ = name;
         async { None }
     }
@@ -1164,7 +1174,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         &self,
         checked: AccessChecked,
         ctx: ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let _ = ctx;
         async move {
             if !checked.allows_read() {
@@ -1195,7 +1205,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let _ = opts;
         self.subscribe_checked(checked, ctx)
     }
@@ -1213,7 +1223,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<MonitorUpdate>>> + Send {
         async move {
             self.subscribe_checked_opts(checked, ctx, opts)
                 .await
@@ -1229,7 +1239,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         ctx: ChannelContext,
         opts: MonitorOptions,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let _ = opts;
         self.subscribe_raw_checked(checked, ctx)
     }
@@ -1682,16 +1692,290 @@ impl From<SourceRead> for MonitorUpdate {
 /// every cooked source without a `+trigger` graph so the
 /// [`ChannelSource::subscribe_checked_opts_marked`] item type is uniform
 /// while the source keeps producing bare `PvField`s on its own channel.
-pub fn plain_monitor_updates(mut rx: mpsc::Receiver<PvField>) -> mpsc::Receiver<MonitorUpdate> {
-    let (tx, out) = mpsc::channel(64);
-    tokio::spawn(async move {
-        while let Some(v) = rx.recv().await {
-            if tx.send(MonitorUpdate::from(v)).await.is_err() {
-                break;
+///
+/// Costs no task: [`MonitorStream::Mapped`] applies `MonitorUpdate::from`
+/// as the consumer pulls. Before the ring widening this spawned a copy
+/// loop purely because the trait pinned the return type to
+/// `mpsc::Receiver`.
+pub fn plain_monitor_updates(rx: MonitorStream<PvField>) -> MonitorStream<MonitorUpdate> {
+    rx.map_plain(MonitorUpdate::from)
+}
+
+// ── MonitorStream — the monitor transport the ChannelSource trait carries ───
+
+/// One PVA monitor update stream, whatever is actually producing it.
+///
+/// # Why this replaced `mpsc::Receiver<T>` in the trait
+///
+/// `ChannelSource`'s monitor methods used to return `mpsc::Receiver<T>`.
+/// That pinned the *transport*, not just the element type, so every source
+/// whose events arrive some other way had to spawn a task whose entire body
+/// was "read from my real stream, push into an mpsc". Six such tasks existed
+/// (two in `shared_pv`, one here, three in `server/native_source`), which put
+/// a db-backed MONITOR at 2–3 tasks instead of 1 — the RTEMS task-count
+/// problem in `doc/rtems-runtime-portability-design.md` §9 phase 6.
+///
+/// Widening the trait to this enum removes the reason those tasks existed:
+/// a source hands back whatever it actually has, and the consumer pulls.
+///
+/// # Cost
+///
+/// Allocation-free, per event *and* per subscription. Every variant holds its
+/// producer inline — `Mapped` too, because its inner is the non-recursive
+/// [`PlainMonitor`] rather than another `MonitorStream`, so no `Box` is needed
+/// — and transforms are `fn` pointers rather than boxed closures, so there is
+/// no per-event dispatch allocation either.
+///
+/// # Surface
+///
+/// Deliberately exactly the two operations the server performs — `recv().await`
+/// and [`try_recv`](Self::try_recv) (`tcp.rs` uses these and nothing else).
+/// `try_recv` is what lets the RTEMS operation thread drain every monitor
+/// without a reactor and park only when all are empty.
+pub enum MonitorStream<T> {
+    /// A source that pushes into a channel: the PVA gateway's fanout, the
+    /// service framework, and every test source. Unchanged behaviour — this
+    /// is what the trait used to return unconditionally.
+    Channel(mpsc::Receiver<T>),
+    /// A `SharedPV` monitor ring, consumed directly. Squash-to-tail
+    /// (pvxs `servermon.cpp:283-286`) lives in the ring itself, so serving it
+    /// through here preserves the exact queue semantics the bridge task
+    /// forwarded.
+    Ring(crate::server_native::shared_pv::MonitorRing<T>),
+    /// A database/PV subscription owned by this stream, with the source's
+    /// per-event transform applied on pull. Replaces the three
+    /// `server/native_source` bridge tasks.
+    Upstream(UpstreamMonitor<T>),
+    /// A `PvField` producer served through an infallible per-item map. Only
+    /// ever `PvField -> MonitorUpdate` ([`plain_monitor_updates`]).
+    ///
+    /// The inner producer is a [`PlainMonitor`], **not** another
+    /// `MonitorStream`. That is what makes a mapped-mapped stream
+    /// unrepresentable rather than merely unused: there is no variant to nest,
+    /// so `recv` needs no recursion and therefore no `Box::pin` per call — the
+    /// allocation this shape exists to avoid, since this is the default
+    /// monitor path for every source without a `+trigger` graph.
+    Mapped {
+        inner: PlainMonitor,
+        map: fn(PvField) -> T,
+    },
+}
+
+/// A `PvField` monitor producer with no map applied — the inner half of
+/// [`MonitorStream::Mapped`].
+///
+/// Deliberately a separate type rather than a reuse of `MonitorStream<PvField>`:
+/// it holds exactly the producing variants and no `Mapped`, so "a map is applied
+/// at most once" is a property of the type instead of a rule someone has to
+/// remember.
+///
+/// The name is public because it appears in a public enum variant, but the
+/// inner kind is private, so no caller outside this module can build one — and
+/// therefore cannot build a [`MonitorStream::Mapped`] either. The single
+/// construction site is `MonitorStream::map_plain`.
+pub struct PlainMonitor(PlainMonitorKind);
+
+enum PlainMonitorKind {
+    Channel(mpsc::Receiver<PvField>),
+    Ring(crate::server_native::shared_pv::MonitorRing<PvField>),
+    Upstream(UpstreamMonitor<PvField>),
+}
+
+impl PlainMonitor {
+    async fn recv(&mut self) -> Option<PvField> {
+        match &mut self.0 {
+            PlainMonitorKind::Channel(rx) => rx.recv().await,
+            PlainMonitorKind::Ring(ring) => ring.recv().await,
+            PlainMonitorKind::Upstream(up) => up.recv().await,
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<PvField, TryRecvError> {
+        match &mut self.0 {
+            PlainMonitorKind::Channel(rx) => rx.try_recv(),
+            PlainMonitorKind::Ring(ring) => ring.try_recv(),
+            PlainMonitorKind::Upstream(up) => up.try_recv(),
+        }
+    }
+}
+
+impl<T> MonitorStream<T> {
+    /// Await the next update. `None` = the producer is gone and everything it
+    /// queued has been delivered.
+    pub async fn recv(&mut self) -> Option<T> {
+        match self {
+            Self::Channel(rx) => rx.recv().await,
+            Self::Ring(ring) => ring.recv().await,
+            Self::Upstream(up) => up.recv().await,
+            Self::Mapped { inner, map } => inner.recv().await.map(*map),
+        }
+    }
+
+    /// Non-blocking [`Self::recv`]. `Empty` = nothing right now but the
+    /// producer is alive (park); `Disconnected` = terminal (tear down).
+    ///
+    /// Every variant bottoms out on a non-blocking primitive —
+    /// `mpsc::Receiver::try_recv`, `MonitorRing::try_recv`, or
+    /// `EventReader::try_recv` via the subscription — so a blocking drain
+    /// loop can service any source shape without entering async.
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        match self {
+            Self::Channel(rx) => rx.try_recv(),
+            Self::Ring(ring) => ring.try_recv(),
+            Self::Upstream(up) => up.try_recv(),
+            Self::Mapped { inner, map } => inner.try_recv().map(*map),
+        }
+    }
+}
+
+impl MonitorStream<PvField> {
+    /// Serve this `PvField` stream as a `U` stream through `map`. The `fn`
+    /// pointer (not a boxed closure) and the non-nesting [`PlainMonitor`] inner
+    /// keep the result allocation-free per event.
+    ///
+    /// The `Mapped` arm below is unreachable by construction, not by luck: the
+    /// only site that builds a `Mapped` is this function, and it always yields
+    /// `MonitorStream<U>` for the caller's `U` — the port's single use is
+    /// `U = MonitorUpdate`. A `MonitorStream<PvField>::Mapped` would require
+    /// `map_plain::<PvField>`, which nothing calls.
+    fn map_plain<U>(self, map: fn(PvField) -> U) -> MonitorStream<U> {
+        let inner = match self {
+            Self::Channel(rx) => PlainMonitor(PlainMonitorKind::Channel(rx)),
+            Self::Ring(ring) => PlainMonitor(PlainMonitorKind::Ring(ring)),
+            Self::Upstream(up) => PlainMonitor(PlainMonitorKind::Upstream(up)),
+            Self::Mapped {
+                inner,
+                map: identity,
+            } => {
+                // Collapsing rather than nesting keeps the "at most one map"
+                // property total: apply the existing map into a channel-free
+                // producer is impossible without a closure, so this arm simply
+                // cannot arise — see the doc comment above.
+                let _ = identity;
+                inner
+            }
+        };
+        MonitorStream::Mapped { inner, map }
+    }
+}
+
+/// A source that already produces `T` on a channel keeps working untouched —
+/// this is what turns the ~60 existing `Some(rx)` returns into `Some(rx.into())`.
+impl<T> From<mpsc::Receiver<T>> for MonitorStream<T> {
+    fn from(rx: mpsc::Receiver<T>) -> Self {
+        Self::Channel(rx)
+    }
+}
+
+/// A database or process-variable subscription serving a PVA monitor
+/// directly, with the source's per-event transform applied as the consumer
+/// pulls.
+///
+/// Owning the subscription here is what deletes the three
+/// `server/native_source` bridge tasks. It also preserves their two
+/// behaviours that a blind deletion would have dropped:
+///
+/// * **the empty-mask filter** — `map` returns `None` for an event that marks
+///   no leaf (C would have assigned none either), and both `recv` and
+///   `try_recv` skip to the next event rather than reporting it. `try_recv`
+///   must loop for the same reason `DbSubscription::try_next_event` does: a
+///   filtered event is not "nothing available".
+/// * **the initial seed** — `seed` is handed out once, ahead of the
+///   subscription, reproducing the `tx.send(initial)` the `PvSubscription`
+///   bridge performed before entering its loop.
+///
+/// Dropping this drops the subscription, whose own `Drop` unregisters the
+/// subscriber slot — exactly what dropping the bridge task's captured
+/// subscription did.
+pub struct UpstreamMonitor<T> {
+    upstream: UpstreamSub,
+    /// `None` = this event marks nothing and is skipped (the bridge's
+    /// `continue`). A plain `fn`, not a boxed closure: all three transforms
+    /// are pure functions of the event.
+    map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    /// Connect-time value delivered before the subscription's own events.
+    seed: Option<T>,
+}
+
+enum UpstreamSub {
+    Db(epics_base_rs::server::database::db_access::DbSubscription),
+    Pv(epics_base_rs::server::pv::PvSubscription),
+}
+
+/// `epics-base-rs`'s event queue defines its own `TryRecvError` mirror
+/// (`event_queue.rs:527-535`) rather than depending on tokio's in a
+/// signature. The orphan rule forbids a `From` impl here — both types are
+/// foreign — so the two-variant mapping is spelled once, at the single seam
+/// where an upstream subscription feeds a [`MonitorStream`].
+fn from_queue_err(e: epics_base_rs::server::event_queue::TryRecvError) -> TryRecvError {
+    match e {
+        epics_base_rs::server::event_queue::TryRecvError::Empty => TryRecvError::Empty,
+        epics_base_rs::server::event_queue::TryRecvError::Disconnected => {
+            TryRecvError::Disconnected
+        }
+    }
+}
+
+impl<T> UpstreamMonitor<T> {
+    /// Serve a PVA monitor straight off a record subscription.
+    pub fn from_db(
+        sub: epics_base_rs::server::database::db_access::DbSubscription,
+        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    ) -> Self {
+        Self {
+            upstream: UpstreamSub::Db(sub),
+            map,
+            seed: None,
+        }
+    }
+
+    /// Serve a PVA monitor straight off a `ProcessVariable` subscription.
+    pub fn from_pv(
+        sub: epics_base_rs::server::pv::PvSubscription,
+        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    ) -> Self {
+        Self {
+            upstream: UpstreamSub::Pv(sub),
+            map,
+            seed: None,
+        }
+    }
+
+    /// Deliver `value` once, before any subscription event.
+    pub fn with_seed(mut self, value: T) -> Self {
+        self.seed = Some(value);
+        self
+    }
+
+    async fn recv(&mut self) -> Option<T> {
+        if let Some(v) = self.seed.take() {
+            return Some(v);
+        }
+        loop {
+            let ev = match &mut self.upstream {
+                UpstreamSub::Db(s) => s.recv_event().await?,
+                UpstreamSub::Pv(s) => s.recv_event().await?,
+            };
+            if let Some(v) = (self.map)(ev) {
+                return Some(v);
             }
         }
-    });
-    out
+    }
+
+    fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        if let Some(v) = self.seed.take() {
+            return Ok(v);
+        }
+        loop {
+            let ev = match &mut self.upstream {
+                UpstreamSub::Db(s) => s.try_recv_event().map_err(from_queue_err)?,
+                UpstreamSub::Pv(s) => s.try_recv_event().map_err(from_queue_err)?,
+            };
+            if let Some(v) = (self.map)(ev) {
+                return Ok(v);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1745,7 +2029,7 @@ pub struct SubscriptionSeed<T> {
     pub initial: Option<SourceRead>,
     /// Post-seed update stream. By contract this MUST NOT repeat
     /// `initial`.
-    pub updates: mpsc::Receiver<T>,
+    pub updates: MonitorStream<T>,
     /// Optional per-op MONITOR START/STOP gate. When the source backs
     /// this op with real upstream subscriptions it can no longer serve
     /// while the client has the monitor *stopped* (QSRV's per-record
@@ -1964,7 +2248,7 @@ pub trait ChannelSourceObj: Send + Sync {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     >;
     /// Dyn forwarder for type-state MONITOR.
     fn subscribe_checked<'a>(
@@ -1972,13 +2256,13 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     >;
     fn subscribe_raw<'a>(
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     >;
     /// Dyn forwarder for type-state raw MONITOR.
     fn subscribe_raw_checked<'a>(
@@ -1986,7 +2270,7 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     >;
     /// dyn forwarder for MONITOR with event-affecting options
     /// (decoded `PvField` form; the stable entry point retained for API
@@ -1997,7 +2281,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     >;
     /// dyn forwarder for the cooked (`MonitorUpdate`) MONITOR
     /// with event-affecting options. The server's monitor dispatch uses this.
@@ -2007,7 +2291,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<MonitorUpdate>>> + Send + 'a>,
     >;
     /// dyn forwarder for raw MONITOR with event-affecting options.
     fn subscribe_raw_checked_opts<'a>(
@@ -2016,7 +2300,7 @@ pub trait ChannelSourceObj: Send + Sync {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     >;
     /// dyn forwarder for the single-seed cooked MONITOR. The server's
     /// monitor START dispatch uses this.
@@ -2290,7 +2574,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe(self, name))
     }
@@ -2299,7 +2583,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_checked(
             self, checked, ctx,
@@ -2309,7 +2593,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         &'a self,
         name: &'a str,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw(self, name))
     }
@@ -2318,7 +2602,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw_checked(
             self, checked, ctx,
@@ -2330,7 +2614,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_checked_opts(
             self, checked, ctx, opts,
@@ -2342,7 +2626,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<MonitorUpdate>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<MonitorUpdate>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_checked_opts_marked(
             self, checked, ctx, opts,
@@ -2354,7 +2638,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
         opts: MonitorOptions,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<mpsc::Receiver<RawMonitorEvent>>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     > {
         Box::pin(<Self as ChannelSource>::subscribe_raw_checked_opts(
             self, checked, ctx, opts,

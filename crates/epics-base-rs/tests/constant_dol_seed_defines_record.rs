@@ -26,6 +26,8 @@
 //! record(stringout,"SO3"){field(DOL,"1.50")} VAL="1.50"  UDF=0
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -44,20 +46,20 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let r = db.get_record(rec).unwrap();
+    let inst = r.read();
     inst.record.get_field(f).unwrap()
 }
 
 async fn udf(db: &PvDatabase, rec: &str) -> bool {
-    let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let r = db.get_record(rec).unwrap();
+    let inst = r.read();
     inst.common.udf != 0
 }
 
 async fn sevr(db: &PvDatabase, rec: &str) -> AlarmSeverity {
-    let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let r = db.get_record(rec).unwrap();
+    let inst = r.read();
     inst.common.sevr
 }
 

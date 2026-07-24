@@ -15,6 +15,14 @@
 //! drives a scripted PVA server that does.
 
 #![cfg(test)]
+// This file drives a live client ↔ scripted-server monitor over `tokio::net`.
+// Under `rtems-exec-model` the client's connection tasks route through the
+// callback pool, which has no tokio reactor, so the hosted TCP transport cannot
+// run — every test here is reactor-dependent in full. The blocking transport
+// that makes the client run on the pool for the target (`pva_blocking_client`,
+// stage 2) is a separate config the scripted-peer fixtures do not drive. Gated
+// out feature-ON as a whole file (doc/pvalink-rtems-design.md §4.2, stage 3).
+#![cfg(not(feature = "rtems-exec-model"))]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -242,13 +250,18 @@ async fn typed_monitor_delivers_the_update_carried_on_the_finish_frame() {
     let sink = seen.clone();
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_handle_from("FINISH:PV", addr, move |_desc, value| {
-            if let PvField::Structure(s) = value
-                && let Some(PvField::Scalar(ScalarValue::Double(v))) = s.get_field("value")
-            {
-                sink.lock().expect("sink").push(*v);
-            }
-        }),
+        client.pvmonitor_handle_from(
+            "FINISH:PV",
+            addr,
+            move |_desc, value| {
+                if let PvField::Structure(s) = value
+                    && let Some(PvField::Scalar(ScalarValue::Double(v))) = s.get_field("value")
+                {
+                    sink.lock().expect("sink").push(*v);
+                }
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("monitor setup timed out")
@@ -291,9 +304,13 @@ async fn raw_monitor_forwards_the_body_carried_on_the_finish_frame() {
     let sink = bodies.clone();
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_raw_frames_handle("FINISH:PV", move |_desc, body, _order| {
-            sink.lock().expect("sink").push(body.to_vec());
-        }),
+        client.pvmonitor_raw_frames_handle(
+            "FINISH:PV",
+            move |_desc, body, _order| {
+                sink.lock().expect("sink").push(body.to_vec());
+            },
+            |_| {},
+        ),
     )
     .await
     .expect("raw monitor setup timed out")

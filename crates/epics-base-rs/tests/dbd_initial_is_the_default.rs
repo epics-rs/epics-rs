@@ -31,6 +31,8 @@
 //! non-calc initial, to show the rule is the loader's and not a calc special
 //! case.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -57,7 +59,7 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn string_of(db: &PvDatabase, pv: &str) -> String {
-    match db.get_pv(pv).await.unwrap() {
+    match db.get_pv(pv).unwrap() {
         EpicsValue::String(s) => s.to_string(),
         other => panic!("{pv} reads as {other:?}"),
     }
@@ -65,8 +67,8 @@ async fn string_of(db: &PvDatabase, pv: &str) -> String {
 
 /// STAT/SEVR as a client sees them — the numeric codes a `caget` reads back.
 async fn alarm_of(db: &PvDatabase, rec: &str) -> (i64, i64) {
-    let stat = db.get_pv(&format!("{rec}.STAT")).await.unwrap();
-    let sevr = db.get_pv(&format!("{rec}.SEVR")).await.unwrap();
+    let stat = db.get_pv(&format!("{rec}.STAT")).unwrap();
+    let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap();
     (stat.to_f64().unwrap() as i64, sevr.to_f64().unwrap() as i64)
 }
 
@@ -88,7 +90,7 @@ async fn a_default_calc_record_computes_instead_of_alarming() {
 
     process(&db, "D:CALC").await;
 
-    assert_eq!(db.get_pv("D:CALC").await.unwrap().to_f64().unwrap(), 0.0);
+    assert_eq!(db.get_pv("D:CALC").unwrap().to_f64().unwrap(), 0.0);
     assert_eq!(
         alarm_of(&db, "D:CALC").await,
         (NO_ALARM, NO_ALARM),
@@ -166,7 +168,7 @@ record(calc, "D:EXPL") {
 
     assert_eq!(string_of(&db, "D:EXPL.CALC").await, "A+1");
     process(&db, "D:EXPL").await;
-    assert_eq!(db.get_pv("D:EXPL").await.unwrap().to_f64().unwrap(), 5.0);
+    assert_eq!(db.get_pv("D:EXPL").unwrap().to_f64().unwrap(), 5.0);
 }
 
 /// The rule belongs to the LOADER, not to the calc family: any field with an
@@ -177,12 +179,9 @@ record(calc, "D:EXPL") {
 async fn the_initial_is_applied_to_every_record_type_not_just_the_calc_family() {
     let db = build(r#"record(ai, "D:AI") {}"#).await;
 
-    assert_eq!(db.get_pv("D:AI.ASLO").await.unwrap().to_f64().unwrap(), 1.0);
-    assert_eq!(db.get_pv("D:AI.ESLO").await.unwrap().to_f64().unwrap(), 1.0);
-    assert_eq!(
-        db.get_pv("D:AI.SDLY").await.unwrap().to_f64().unwrap(),
-        -1.0
-    );
+    assert_eq!(db.get_pv("D:AI.ASLO").unwrap().to_f64().unwrap(), 1.0);
+    assert_eq!(db.get_pv("D:AI.ESLO").unwrap().to_f64().unwrap(), 1.0);
+    assert_eq!(db.get_pv("D:AI.SDLY").unwrap().to_f64().unwrap(), -1.0);
 }
 
 /// The single owner: the record FACTORY hands back the prototype already seeded,

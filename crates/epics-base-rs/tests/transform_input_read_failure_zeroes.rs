@@ -14,6 +14,8 @@
 //! disconnected INPx source re-drove its OUTx with the last good value where C
 //! drives 0.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -45,24 +47,25 @@ async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     let mut v = HashSet::new();
     db.process_record_with_links("TR", &mut v, 0).await.unwrap();
 
-    let inst = db.get_record("TR").await.unwrap();
-    let rec = inst.read().await;
-    assert_eq!(
-        rec.record.get_field("A"),
-        Some(EpicsValue::Double(0.0)),
-        "a configured INPA that fails to read zeroes channel A \
-         (transformRecord.c:537-541), it does not keep 42"
-    );
-    assert_eq!(
-        rec.record.get_field("B"),
-        Some(EpicsValue::Double(7.0)),
-        "channel B has no input link — C's `plink->type == CONSTANT` case is \
-         never read and never zeroed"
-    );
-    drop(rec);
+    let inst = db.get_record("TR").unwrap();
+    {
+        let rec = inst.read();
+        assert_eq!(
+            rec.record.get_field("A"),
+            Some(EpicsValue::Double(0.0)),
+            "a configured INPA that fails to read zeroes channel A \
+             (transformRecord.c:537-541), it does not keep 42"
+        );
+        assert_eq!(
+            rec.record.get_field("B"),
+            Some(EpicsValue::Double(7.0)),
+            "channel B has no input link — C's `plink->type == CONSTANT` case is \
+             never read and never zeroed"
+        );
+    }
 
     assert_eq!(
-        db.get_pv("TGT").await.unwrap().to_f64(),
+        db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUTA drives the zeroed channel: C outputs 0 for a dead INPx source"
     );

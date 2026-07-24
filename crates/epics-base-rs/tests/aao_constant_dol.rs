@@ -20,6 +20,8 @@
 //! Boundaries: constant array DOL vs constant scalar DOL vs real link DOL; and
 //! closed_loop vs supervisory (C returns before the load in supervisory).
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -67,23 +69,13 @@ async fn constant_array_dol_is_loaded_at_init() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("CL:ARRAY").await.unwrap(),
+        db.get_pv("CL:ARRAY").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
         "C `dbLoadLinkArray(&prec->dol, ...)` at init_record pass 1"
     );
-    assert_eq!(
-        db.get_pv("CL:ARRAY.NORD").await.unwrap().to_f64(),
-        Some(3.0)
-    );
+    assert_eq!(db.get_pv("CL:ARRAY.NORD").unwrap().to_f64(), Some(3.0));
     assert!(
-        db.get_record("CL:ARRAY")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .common
-            .udf
-            == 0,
+        db.get_record("CL:ARRAY").unwrap().read().common.udf == 0,
         "C `fetchValue`: on a successful load, nord = nReq and udf = FALSE"
     );
 }
@@ -95,13 +87,10 @@ async fn constant_scalar_dol_is_one_element() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("CL:SCALAR").await.unwrap(),
+        db.get_pv("CL:SCALAR").unwrap(),
         EpicsValue::DoubleArray(vec![7.5])
     );
-    assert_eq!(
-        db.get_pv("CL:SCALAR.NORD").await.unwrap().to_f64(),
-        Some(1.0)
-    );
+    assert_eq!(db.get_pv("CL:SCALAR.NORD").unwrap().to_f64(), Some(1.0));
 }
 
 /// Supervisory mode does not source VAL from DOL at all — C `fetchValue`
@@ -111,19 +100,12 @@ async fn supervisory_mode_ignores_the_constant_dol() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("SUP:CONST").await.unwrap(),
+        db.get_pv("SUP:CONST").unwrap(),
         EpicsValue::DoubleArray(vec![]),
         "supervisory: DOL is not a value source"
     );
     assert!(
-        db.get_record("SUP:CONST")
-            .await
-            .unwrap()
-            .read()
-            .await
-            .common
-            .udf
-            != 0,
+        db.get_record("SUP:CONST").unwrap().read().common.udf != 0,
         "nothing was loaded, so the record is still UNDEFINED"
     );
 }
@@ -139,7 +121,7 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("TGT").await.unwrap(),
+        db.get_pv("TGT").unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]),
         "the init-loaded constant is what gets written out"
     );
@@ -152,12 +134,12 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
         .await
         .unwrap();
     assert_eq!(
-        db.get_pv("CL:ARRAY").await.unwrap(),
+        db.get_pv("CL:ARRAY").unwrap(),
         EpicsValue::DoubleArray(vec![9.0, 9.0]),
         "C `!init && !isConst`: a constant DOL is NOT re-fetched per cycle"
     );
     assert_eq!(
-        db.get_pv("TGT").await.unwrap(),
+        db.get_pv("TGT").unwrap(),
         EpicsValue::DoubleArray(vec![9.0, 9.0])
     );
 }

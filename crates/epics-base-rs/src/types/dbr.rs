@@ -357,7 +357,7 @@ fn is_fanout_link_record(record_type: &str) -> bool {
 /// `dbr_size_n(TYPE, COUNT) = dbr_size[TYPE] + (COUNT-1)*dbr_value_size[TYPE]`.
 ///
 /// the metadata length is taken from
-/// [`crate::types::codec::dbr_meta_size`] — the single owner that the
+/// `crate::types::codec::dbr_meta_size` — the single owner that the
 /// serializers (`serialize_dbr` / `encode_dbr`) emit against — so the
 /// explicit-count pad/truncate and no-read-access frame paths size
 /// TIME / GR / CTRL bodies exactly as the encoder writes them. A

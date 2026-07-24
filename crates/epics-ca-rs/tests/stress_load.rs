@@ -10,6 +10,8 @@
 //!
 //! Skipped when softIoc is unavailable.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile (default-filter excludes it).
+
 mod common;
 
 use std::time::Duration;

@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;

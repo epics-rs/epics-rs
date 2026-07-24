@@ -15,6 +15,9 @@
 
 #![cfg(test)]
 
+// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,7 +26,7 @@ use std::time::Duration;
 use rustls::{RootCertStore, ServerConfig, ServerConnection};
 
 use tokio::process::{Child, Command as TokioCommand};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use epics_pva_rs::auth::TlsServerConfig;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -156,7 +159,7 @@ impl ChannelSource for TlsScalarSource {
     fn subscribe(
         &self,
         _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
 }

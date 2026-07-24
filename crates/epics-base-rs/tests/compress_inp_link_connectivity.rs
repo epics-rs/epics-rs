@@ -36,6 +36,8 @@
 //! INP="SRC" : SEVR=NO_ALARM STAT=NO_ALARM  NUSE=2  VAL=7 7   (two processes)
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -69,17 +71,13 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn alarm(db: &PvDatabase, rec: &str) -> (AlarmSeverity, u16) {
-    let inst = db.get_record(rec).await.unwrap();
-    let c = &inst.read().await.common;
+    let inst = db.get_record(rec).unwrap();
+    let c = &inst.read().common;
     (c.sevr, c.stat)
 }
 
 async fn nuse(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NUSE"))
-        .await
-        .unwrap()
-        .to_f64()
-        .unwrap()
+    db.get_pv(&format!("{rec}.NUSE")).unwrap().to_f64().unwrap()
 }
 
 /// An unset INP is not a connected link: LINK/INVALID, nothing ingested.
@@ -118,7 +116,7 @@ async fn constant_inp_is_not_connected_and_is_never_ingested() {
         "three processes on a constant INP must ingest nothing"
     );
     assert_eq!(
-        db.get_pv("C:CONST").await.unwrap(),
+        db.get_pv("C:CONST").unwrap(),
         EpicsValue::DoubleArray(vec![]),
         "C: VAL is DBF_DOUBLE[0] (empty)"
     );
@@ -140,7 +138,7 @@ async fn a_connected_db_link_ingests_and_stays_no_alarm() {
     );
     assert_eq!(nuse(&db, "C:LINK").await, 2.0);
     assert_eq!(
-        db.get_pv("C:LINK").await.unwrap(),
+        db.get_pv("C:LINK").unwrap(),
         EpicsValue::DoubleArray(vec![7.0, 7.0])
     );
 }
@@ -155,11 +153,11 @@ async fn inp_reads_back_the_link_text() {
     let db = build().await;
 
     assert_eq!(
-        db.get_pv("C:LINK.INP").await.unwrap(),
+        db.get_pv("C:LINK.INP").unwrap(),
         EpicsValue::String("SRC".into())
     );
     assert_eq!(
-        db.get_pv("C:CONST.INP").await.unwrap(),
+        db.get_pv("C:CONST.INP").unwrap(),
         EpicsValue::String("5".into())
     );
 }

@@ -22,6 +22,8 @@
 //! pipeline window. We don't yet wire them into the wire-level
 //! ackCount but the API is in place for callers to set them.
 
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -29,8 +31,9 @@ use std::sync::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
+use super::source::MonitorStream;
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
 use crate::server_native::source::{ChannelInvalidator, OpError};
 
@@ -147,15 +150,15 @@ pub type OnStartFn = Arc<dyn Fn(&SharedPV, bool) + Send + Sync>;
 
 // ── Per-subscriber bounded queue with squash-to-tail semantics ──────────────
 
-struct MonitorQueueInner {
-    items: VecDeque<PvField>,
+struct MonitorQueueInner<T> {
+    items: VecDeque<T>,
     limit: usize,
     /// True once the producer side (SharedPV) signals no more data.
     producer_done: bool,
 }
 
-struct MonitorQueueShared {
-    inner: Mutex<MonitorQueueInner>,
+struct MonitorQueueShared<T> {
+    inner: Mutex<MonitorQueueInner<T>>,
     notify: tokio::sync::Notify,
     /// Set in MonitorInbox::drop; post() checks this to decide whether to remove
     /// the outbox from the subscriber list.
@@ -177,16 +180,30 @@ struct MonitorQueueShared {
 /// endpoint drops" — is enforced structurally here and in `Drop`,
 /// so a transient clone used for lock-free delivery cannot close the
 /// subscriber's inbox.
-pub struct MonitorOutbox {
-    shared: Arc<MonitorQueueShared>,
+pub struct MonitorOutbox<T = PvField> {
+    shared: Arc<MonitorQueueShared<T>>,
 }
 
-/// Receiver half of a per-subscriber queue. Returned by `SharedPV::subscribe`.
-pub struct MonitorInbox {
-    shared: Arc<MonitorQueueShared>,
+/// Receiver half of a per-subscriber queue — the **monitor ring**.
+///
+/// Generic in the element type so the one primitive serves every monitor
+/// stream shape the `ChannelSource` trait carries (`PvField`,
+/// `MonitorUpdate`, `RawMonitorEvent`), instead of each source bridging its
+/// ring into an `mpsc` just to satisfy the trait's return type. Nothing in
+/// the queue was ever `PvField`-specific — append/squash-to-tail and the
+/// producer-closed flag are element-agnostic.
+///
+/// Returned by `SharedPV::subscribe` (as the [`MonitorInbox`] alias) and
+/// carried by [`MonitorStream::Ring`](super::source::MonitorStream).
+pub struct MonitorRing<T = PvField> {
+    shared: Arc<MonitorQueueShared<T>>,
 }
 
-fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
+/// The `PvField` ring — the shape `SharedPV` hands out. Kept as a named
+/// alias because that is the only element type a `SharedPV` ever queues.
+pub type MonitorInbox = MonitorRing<PvField>;
+
+fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
     let limit = limit.max(1);
     let shared = Arc::new(MonitorQueueShared {
         inner: Mutex::new(MonitorQueueInner {
@@ -209,15 +226,15 @@ fn make_monitor_queue(limit: usize) -> (MonitorOutbox, MonitorInbox) {
         MonitorOutbox {
             shared: Arc::clone(&shared),
         },
-        MonitorInbox { shared },
+        MonitorRing { shared },
     )
 }
 
-impl MonitorOutbox {
+impl<T> MonitorOutbox<T> {
     /// Post a value. `maybe=false`: full queue → squash tail (pvxs servermon.cpp:283-286).
     /// `maybe=true`: full queue → drop silently.
     /// Returns `false` when the receiver has been dropped (caller should remove this outbox).
-    fn post(&self, value: PvField, maybe: bool) -> bool {
+    fn post(&self, value: T, maybe: bool) -> bool {
         if self.shared.receiver_dropped.load(Ordering::Relaxed) {
             return false;
         }
@@ -245,7 +262,7 @@ impl MonitorOutbox {
     }
 }
 
-impl Clone for MonitorOutbox {
+impl<T> Clone for MonitorOutbox<T> {
     fn clone(&self) -> Self {
         // every live endpoint counts. A clone made for a
         // lock-free post is a producer endpoint until it drops.
@@ -256,7 +273,7 @@ impl Clone for MonitorOutbox {
     }
 }
 
-impl Drop for MonitorOutbox {
+impl<T> Drop for MonitorOutbox<T> {
     fn drop(&mut self) {
         // signal `producer_done` only when the *last* producer
         // endpoint for this queue drops. A transient clone (e.g. the
@@ -270,15 +287,15 @@ impl Drop for MonitorOutbox {
     }
 }
 
-impl Drop for MonitorInbox {
+impl<T> Drop for MonitorRing<T> {
     fn drop(&mut self) {
         self.shared.receiver_dropped.store(true, Ordering::Relaxed);
     }
 }
 
-impl MonitorInbox {
+impl<T> MonitorRing<T> {
     /// Async receive. Returns `None` when the producer closed and the queue is drained.
-    pub async fn recv(&mut self) -> Option<PvField> {
+    pub async fn recv(&mut self) -> Option<T> {
         loop {
             let notified = self.shared.notify.notified();
             tokio::pin!(notified);
@@ -297,6 +314,47 @@ impl MonitorInbox {
             }
             notified.await;
         }
+    }
+
+    /// Non-blocking [`Self::recv`] — the port of
+    /// [`EvQue::try_next`](epics_base_rs::server::event_queue) (`event_queue.rs:371`),
+    /// which is what `EventReader::try_recv` exposes on the CA side.
+    ///
+    /// Exists so a **blocking** per-connection drain loop can poll this ring
+    /// without entering async at all: the RTEMS backend has no reactor, so the
+    /// operation thread takes what is queued with this and only parks (via
+    /// `block_on_sync` → `park_on`) when everything is drained. The ring itself
+    /// is already runtime-agnostic — `Mutex<VecDeque>` plus a `tokio::sync::Notify`
+    /// that stores no reactor state — so this method is the last piece a
+    /// non-async consumer needed.
+    ///
+    /// **Drain-before-close, same as [`Self::recv`].** Items are inspected before
+    /// `producer_done`, so a closed producer whose queue still holds values keeps
+    /// yielding `Ok` and only reports `Disconnected` once empty. Reversing the two
+    /// would silently swallow the tail of a monitor whose PV just closed.
+    ///
+    /// Unlike [`Self::recv`] this does **not** arm the `Notify` first. Arming
+    /// exists to close the check/await race — register the waiter before
+    /// inspecting so a `notify_one()` landing in between is not lost. There is no
+    /// await here, so there is no race to close and no waiter to register;
+    /// `EvQue::try_next` likewise takes the lock and nothing else. The ordering
+    /// discipline that *does* carry over is the one above: one lock acquisition,
+    /// items examined before the closed flag.
+    ///
+    /// The error type is `tokio::sync::mpsc::error::TryRecvError` rather than a
+    /// private mirror so that a consumer polling this ring and a consumer polling
+    /// an mpsc-backed monitor stream read identically — the server's existing
+    /// drain idiom (`tcp.rs:2245`, `while let Ok(e) = rx.try_recv()`) works over
+    /// either without a conversion at the seam.
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        let mut inner = self.shared.inner.lock();
+        if let Some(v) = inner.items.pop_front() {
+            return Ok(v);
+        }
+        if inner.producer_done {
+            return Err(TryRecvError::Disconnected);
+        }
+        Err(TryRecvError::Empty)
     }
 }
 
@@ -433,7 +491,7 @@ impl SharedPV {
     /// server's current time when the client's PUT marked neither the
     /// timeStamp field nor any of its children (`sharedpv.cpp:113-121`).
     /// A client-supplied (marked) timeStamp is preserved. See
-    /// [`Self::fill_mailbox_timestamp`].
+    /// `Self::fill_mailbox_timestamp`.
     pub fn build_mailbox() -> Self {
         let pv = Self::new();
         pv.inner.lock().put_policy = PutPolicy::Mailbox;
@@ -459,7 +517,7 @@ impl SharedPV {
     }
 
     /// Declare the type and seed the initial value, transitioning the
-    /// PV from [`PvState::Closed`] to [`PvState::Open`].
+    /// PV from `PvState::Closed` to `PvState::Open`.
     ///
     /// Returns `Err` if the PV is already open. pvxs `sharedpv.cpp:357-358`
     /// throws `"close() first"` when `impl->current` is already set, so a
@@ -1423,30 +1481,21 @@ impl super::source::ChannelSource for SharedSource {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move {
             // pvxs servermon.cpp:66: default queue limit = 4.
             let inbox = pv.and_then(|p| p.subscribe(4))?;
-            // Bridge MonitorInbox → mpsc::Receiver so the ChannelSource trait
-            // signature stays stable; squash-to-tail semantics live in inbox.
-            let (tx, rx) = mpsc::channel::<PvField>(1);
-            tokio::spawn(async move {
-                let mut inbox = inbox;
-                while let Some(v) = inbox.recv().await {
-                    if tx.send(v).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(rx)
+            // The ring IS the stream: no bridge task, no second queue.
+            // Squash-to-tail semantics live in the ring itself.
+            Some(MonitorStream::Ring(inbox))
         }
     }
 
     /// Single-seed MONITOR: atomically capture the current value as the
     /// connect-time seed and register an **updates-only** subscriber via
     /// [`SharedPV::subscribe_seeded`], returning both as one
-    /// [`SubscriptionSeed`]. The default impl would subscribe (the
+    /// [`super::source::SubscriptionSeed`]. The default impl would subscribe (the
     /// prepend path) and ALSO seed via `get_value` — the double-seed
     /// PVA-RS closes; overriding here keeps the seed atomic with
     /// registration (no gap-duplicate) and updates-only.
@@ -1473,22 +1522,13 @@ impl super::source::ChannelSource for SharedSource {
         };
         async move {
             let (initial, inbox) = pv.and_then(|p| p.subscribe_seeded(queue_limit))?;
-            let (tx, rx) = mpsc::channel::<PvField>(1);
-            tokio::spawn(async move {
-                let mut inbox = inbox;
-                while let Some(v) = inbox.recv().await {
-                    if tx.send(v).await.is_err() {
-                        break;
-                    }
-                }
-            });
             Some(super::source::SubscriptionSeed {
                 // A SharedPV's stored Value is wholly assigned by `open()` /
                 // `post()`, so it declares no leaf subset — the server frames
                 // every leaf the request selected, as pvxs does for a
                 // fully-marked `Value`.
                 initial: initial.map(super::source::SourceRead::from),
-                updates: super::source::plain_monitor_updates(rx),
+                updates: super::source::plain_monitor_updates(MonitorStream::Ring(inbox)),
                 on_start: None,
             })
         }
@@ -1595,7 +1635,7 @@ impl super::source::ChannelSource for SharedSource {
     /// Override default no-op: route the channel-detach edge to the named
     /// `SharedPV` so it can fire `on_last_disconnect` on the last channel
     /// leaving (pvxs `sharedpv.cpp:278-296`). Mirror of
-    /// [`Self::notify_channel_open`].
+    /// [`super::source::ChannelSource::notify_channel_open`].
     fn notify_channel_close(&self, name: &str, _ctx: &super::source::ChannelContext) {
         let pv = self.pvs.lock().get(name).cloned();
         if let Some(p) = pv {
@@ -2227,6 +2267,124 @@ mod tests {
         // Queue is now empty — no more posts were made.
         let empty = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(empty.is_err(), "queue must be empty after squash drain");
+    }
+
+    // ── MonitorInbox::try_recv — one case per invariant boundary ────────────
+    //
+    // `try_recv` has exactly two boundaries, and every case below pins one
+    // side of one of them:
+    //
+    //   items.is_empty()   false → Ok(front)      true → consult producer_done
+    //   producer_done      false → Err(Empty)     true → Err(Disconnected)
+    //
+    // The (items non-empty, producer_done true) corner is the one that a
+    // "check closed first" implementation would get wrong, so it gets its own
+    // case rather than riding along inside a longer scenario.
+
+    /// Boundary `items.is_empty() == true`, `producer_done == false`:
+    /// nothing queued yet but the producer is alive → `Empty`, never
+    /// `Disconnected`. A drain loop must read this as "park", not "tear down".
+    #[test]
+    fn try_recv_empty_ring_is_empty_not_disconnected() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        // Drop the seed `open()` queued so the ring is genuinely empty.
+        assert!(rx.try_recv().is_ok(), "seed value is queued by open()");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// Boundary `items.is_empty() == false`: one queued value comes back
+    /// without awaiting, and the ring returns to `Empty` behind it.
+    #[test]
+    fn try_recv_one_item_yields_it_then_empty() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(11));
+
+        let got = rx.try_recv().expect("posted value");
+        assert_eq!(extract_int(&got), 11);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// Same squash-to-tail rule `recv` observes (pvxs `servermon.cpp:283-286`)
+    /// must hold on the non-blocking path: with `limit = 2`, posts 3 and 4
+    /// overwrite the tail, so a `try_recv` drain sees `[1, 4]` — not `[1, 2]`
+    /// (drop-newest) and not `[3, 4]` (drop-oldest).
+    #[test]
+    fn try_recv_sees_the_squashed_tail_not_the_dropped_value() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(2).expect("subscribe"); // queue limit = 2
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(1)); // [1]
+        pv.try_post(nt_scalar_int_value(2)); // [1, 2] — full
+        pv.try_post(nt_scalar_int_value(3)); // squash: [1, 3]
+        pv.try_post(nt_scalar_int_value(4)); // squash: [1, 4]
+
+        let drained: Vec<i32> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|v| extract_int(&v))
+            .collect();
+        assert_eq!(
+            drained,
+            vec![1, 4],
+            "squash-to-tail: oldest distinct entry plus the newest value"
+        );
+    }
+
+    /// The corner that ordering gets wrong: `producer_done == true` while
+    /// items remain. Drain-before-close means those items are still delivered;
+    /// only once the ring runs dry does the closure surface. Checking
+    /// `producer_done` first would swallow the tail of a monitor whose PV just
+    /// closed.
+    #[test]
+    fn try_recv_drains_queued_items_before_reporting_producer_done() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+
+        pv.try_post(nt_scalar_int_value(1));
+        pv.try_post(nt_scalar_int_value(2));
+        // `close()` clears `subscribers`, dropping the last `MonitorOutbox`
+        // endpoint → `producer_done = true` with two values still queued.
+        pv.close();
+
+        assert_eq!(extract_int(&rx.try_recv().expect("queued 1")), 1);
+        assert_eq!(extract_int(&rx.try_recv().expect("queued 2")), 2);
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Disconnected),
+            "closure surfaces only after the queue drained"
+        );
+    }
+
+    /// Boundary `items.is_empty() == true`, `producer_done == true`: the
+    /// terminal state. Distinct from `Empty` — a drain loop ends here instead
+    /// of parking forever on a ring nothing will ever post to. This is the
+    /// non-blocking twin of `recv()` returning `None`.
+    #[test]
+    fn try_recv_empty_ring_after_close_is_disconnected() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(4).expect("subscribe");
+        let _seed = rx.try_recv().expect("seed");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "alive and empty");
+
+        pv.close();
+
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+        // Terminal: repeated polls stay Disconnected, they do not flip back.
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     #[test]

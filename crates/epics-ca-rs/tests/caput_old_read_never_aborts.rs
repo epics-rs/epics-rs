@@ -19,6 +19,13 @@
 //! shape of rsrv's `no_read_access_event` (`camessage.c:450-480`), which the
 //! CA client surfaces as a failed get.
 
+// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
+// process. Those binaries are built with this feature too, so their
+// `CaClient` stack routes `spawn` to the background executor and then
+// reaches tokio I/O with no reactor. Inapplicable under the executor
+// backend; the RTEMS model has no async CLI client.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -204,7 +211,6 @@ async fn caput_writes_a_read_denied_pv_and_exits_zero() {
     // `exit(1)` skipped.
     let stored = db
         .get_pv("R921:WRITEONLY")
-        .await
         .expect("read the record back through the database");
     assert_eq!(
         stored,

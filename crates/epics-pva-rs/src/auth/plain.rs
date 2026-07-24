@@ -50,7 +50,7 @@ pub fn authnz_default_user() -> String {
 /// give up (keeping just `basegid`) on an invalid or decreasing count. A
 /// single grow-and-retry loses the Darwin case for any account in more
 /// groups than the initial guess, silently dropping its extra roles.
-#[cfg(unix)]
+#[cfg(local_account_db)]
 fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gid_t> {
     // Darwin binds the groups pointer as `*mut c_int`, Linux as
     // `*mut gid_t` (u32); use a raw `c_int` buffer and cast on the way
@@ -95,17 +95,17 @@ fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gi
 }
 
 /// Enumerate the current process's POSIX group names. Mirrors pvxs
-/// `osdGetRoles()` (osgroups.cpp:54). On non-POSIX targets returns an
-/// empty list. The `ca` auth method advertises these as the user's
-/// "roles" claim so server-side ACF rules of the form
+/// `osdGetRoles()` (osgroups.cpp:54). On targets with no local account
+/// database returns an empty list. The `ca` auth method advertises these as
+/// the user's "roles" claim so server-side ACF rules of the form
 /// `R member group:engineers` can match against the actual group
 /// membership of the requesting user.
 ///
-/// Calls `getgrouplist(3)` directly via `nix` — same data libca
+/// Calls `getgrouplist(3)` directly via `libc` — same data libca
 /// gathers on the C side. Result is sorted + deduped for stable
 /// matching.
 pub fn posix_groups() -> Vec<String> {
-    #[cfg(unix)]
+    #[cfg(local_account_db)]
     {
         use std::ffi::CStr;
         // Step 1: get this process's effective uid + login name.
@@ -161,8 +161,11 @@ pub fn posix_groups() -> Vec<String> {
         names.dedup();
         names
     }
-    #[cfg(not(unix))]
+    #[cfg(not(local_account_db))]
     {
+        // No local account database to enumerate — Windows, and every
+        // unix-family target without one (RTEMS, VxWorks). pvxs advertises no
+        // roles rather than inventing them.
         Vec::new()
     }
 }
@@ -188,7 +191,7 @@ pub fn posix_groups() -> Vec<String> {
 /// `getpwnam(account)` and uses the account's `pw_gid` (not the process
 /// `getgid()`).
 pub fn osd_get_roles(account: &str) -> Vec<String> {
-    #[cfg(unix)]
+    #[cfg(local_account_db)]
     {
         use std::ffi::{CStr, CString};
 
@@ -247,10 +250,17 @@ pub fn osd_get_roles(account: &str) -> Vec<String> {
         names.dedup();
         names
     }
-    #[cfg(not(unix))]
+    #[cfg(not(local_account_db))]
     {
         // No local group DB available (Windows LANMAN handled elsewhere;
         // RTEMS / vxWorks): pvxs reports the account as its only role.
+        //
+        // This arm is what RTEMS takes. Under the `cfg(not(unix))` it used to
+        // carry it was unreachable there — RTEMS is `target_family = "unix"` —
+        // so every accepted PVA connection ran the passwd/group path above and
+        // derived ACF roles from whatever a BSP's synthetic passwd entry
+        // happened to say. See `build.rs` for why the predicate is a named
+        // capability and not `not(target_os = "rtems")`.
         vec![account.to_string()]
     }
 }
@@ -268,6 +278,114 @@ pub fn authnz_default_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything before the first column-0 `#[cfg(test)]` — the same helper
+    /// `server_native::search_engine` uses, so a guard can scan production
+    /// source without matching the guard's own assertions.
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// **The mechanical defence for this file.** Modelled on
+    /// `server_native::search_engine`'s `rtems_selects_entropy_by_target_not_by_family`,
+    /// and it fails *today*, on Linux, with no cross toolchain — which is the
+    /// point. The acceptance ladder cannot catch this defect at all: a wrong
+    /// role set is an authorization decision, not an error.
+    ///
+    /// `cfg(unix)` was doing two jobs here — "libc is linked" (true on RTEMS)
+    /// and "there is a passwd/group database" (false on RTEMS). Every arm that
+    /// needs the second now names it. A future merge back to `cfg(unix)`, or a
+    /// new arm that reaches for `libc::getpw*` under the family predicate, must
+    /// fail here rather than on a board nobody can attach a debugger to.
+    #[test]
+    fn the_account_database_arms_select_on_the_capability_not_the_family() {
+        let prod = production_scope(include_str!("plain.rs"));
+        assert_eq!(
+            prod.matches("#[cfg(unix)]").count(),
+            0,
+            "a bare cfg(unix) arm captures RTEMS and VxWorks, which have libc \
+             but no passwd/group database — that is the defect"
+        );
+        assert_eq!(
+            prod.matches("#[cfg(not(unix))]").count(),
+            0,
+            "a cfg(not(unix)) arm is unreachable on RTEMS, so an RTEMS-intended \
+             fallback placed there never runs"
+        );
+        // Both halves of the capability must exist: the implementation and the
+        // no-database fallback. A count check rather than a mere `contains`, so
+        // deleting one arm and leaving the other cannot pass.
+        assert_eq!(prod.matches("#[cfg(local_account_db)]").count(), 3);
+        assert_eq!(prod.matches("#[cfg(not(local_account_db))]").count(), 2);
+    }
+
+    /// The capability is decided in one place, by allowlist. An exclusion list
+    /// would fix RTEMS and inherit the same defect on the next unix-family
+    /// target without an account database.
+    ///
+    /// # Scope: the predicate, not the file
+    ///
+    /// The excluded-target check reads `fn local_account_db`'s body alone.
+    /// It used to read the whole (comment-stripped) build script, which made
+    /// it assert something it does not mean: that *no rule anywhere* in the
+    /// script may name RTEMS. `build.rs` has since acquired a second, unrelated
+    /// rule — the `exec_backend` / `tokio_backend` task-backend decision, which
+    /// is `target_os == "rtems" || feature "rtems-exec-model"` and therefore
+    /// *must* name the target, exactly as `epics-base-rs`'s own `build.rs`
+    /// does. A whole-file scan rejected that correct rule.
+    ///
+    /// Narrowing it to the named predicate makes the guard stricter about the
+    /// thing it is for, not laxer: an exclusion-list `os != "rtems"` inside
+    /// `local_account_db` still fails, and now an exclusion list smuggled in
+    /// *around* the allowlist call would fail too, because the guard also pins
+    /// that `main` reaches the capability only through this function.
+    #[test]
+    fn the_capability_is_owned_by_an_allowlist_in_the_build_script() {
+        // Comment lines are stripped: the build script's own docs quote the
+        // rejected `not(target_os = "rtems")` predicate in order to explain why
+        // it is rejected. The guard is about what the code does.
+        let build_src = include_str!("../../build.rs");
+        let build: String = build_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(build.contains("cargo::rustc-check-cfg=cfg(local_account_db)"));
+        assert!(build.contains("    \"linux\","));
+        // `main` must not decide the capability itself — it asks the predicate.
+        assert!(
+            build.contains("if local_account_db(unix, &os) {"),
+            "the capability emission must go through `fn local_account_db`"
+        );
+
+        let decl = "fn local_account_db(unix: bool, os: &str) -> bool {";
+        let start = build
+            .find(decl)
+            .expect("the capability predicate must be a named function");
+        let body = &build[start + decl.len()..];
+        let body = &body[..body.find("\n}").expect("predicate body must close")];
+
+        // The decision must go through the allowlist...
+        assert!(
+            body.contains("LOCAL_ACCOUNT_DB_TARGETS.contains("),
+            "the capability must be decided by consulting the allowlist"
+        );
+        // ...and this is what separates an allowlist from an exclusion list:
+        // an exclusion list has to NAME the targets it excludes. An allowlist
+        // never mentions them, which is precisely why the next unix-family
+        // target without an account database is handled correctly by a rule
+        // nobody had to remember to update.
+        for excluded in ["rtems", "vxworks"] {
+            assert!(
+                !body.contains(&format!("{excluded:?}")),
+                "the predicate names {excluded}, so it is an exclusion list; \
+                 a target that is not on the allowlist must simply not be on it"
+            );
+        }
+    }
 
     #[test]
     fn user_falls_back() {
@@ -310,7 +428,7 @@ mod tests {
         assert_eq!(osd_get_roles(acct), vec![acct.to_string()]);
     }
 
-    #[cfg(unix)]
+    #[cfg(local_account_db)]
     #[test]
     fn posix_groups_includes_passwd_primary_group() {
         use std::ffi::CStr;
@@ -341,7 +459,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(local_account_db)]
     #[test]
     fn osd_get_roles_known_account_is_nonempty() {
         // `root` exists on every Unix host; its primary group maps to a

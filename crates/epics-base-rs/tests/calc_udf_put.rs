@@ -21,8 +21,11 @@
 //! UDF -1/255` → C=-1, port=1); this is verified against the C source, not the
 //! running oracle, per the panel's constraints.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::ProcessCompletion;
 use epics_base_rs::types::EpicsValue;
 
 // "A"/"S": default (empty CALC → fails every cycle, so a put byte survives).
@@ -46,15 +49,15 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 
 /// Read the record's raw `dbCommon.udf` byte (what CA serves, signed).
 async fn udf_byte(db: &PvDatabase, rec: &str) -> u8 {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.common.udf
 }
 
 /// A `caput <rec>.UDF <text>` — a string, as `caput` sends; UDF's `pp(TRUE)`
 /// drives a process, so await the returned notify before reading back.
 async fn caput_udf(db: &PvDatabase, rec: &str, text: &str) {
-    if let Some(rx) = db
+    if let ProcessCompletion::Async(rx) = db
         .put_record_field_from_ca(rec, "UDF", EpicsValue::String(text.into()))
         .await
         .unwrap()

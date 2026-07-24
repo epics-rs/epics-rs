@@ -1,11 +1,11 @@
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
-
-use epics_base_rs::runtime::sync::Mutex;
 
 use super::LongStringMode;
-use super::ca_server::ServerStats;
+use super::outbox::Outbox;
+use super::stats::ServerStats;
 use crate::protocol::*;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::pv::MonitorEvent;
@@ -30,11 +30,15 @@ use epics_base_rs::types::encode_dbr;
 // dbChannel.c:483-507), long-string record fields `EpicsValue::CharArray`
 // → scalar `EpicsValue::String` (C cvt_dbaddr).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_monitor_sender<W>(
+pub(crate) fn spawn_monitor_sender(
     sub_id: u32,
     data_type: u16,
     data_count: u32,
-    writer: Arc<Mutex<BufWriter<W>>>,
+    // The single per-connection wire outbox. This monitor producer pushes
+    // framed EVENT_ADD deliveries into it instead of reaching into a shared
+    // socket writer out-of-band — the connection loop is the sole writer
+    // owner. See `super::outbox`.
+    outbox: Outbox,
     mut reader: EventReader,
     denied: Arc<AtomicBool>,
     long_string_mode: LongStringMode,
@@ -44,10 +48,7 @@ pub(crate) fn spawn_monitor_sender<W>(
     // for THIS client: a pre-CA_V49 peer gets `ECA_16KARRAYCLIENT` rather than
     // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
     reply: super::tcp::ReplyContext,
-) -> tokio::task::JoinHandle<()>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
+) -> epics_base_rs::runtime::task::TaskHandle<()> {
     epics_base_rs::runtime::task::spawn(async move {
         loop {
             // C `event_read`: take this monitor's next queued entry, suspending
@@ -83,11 +84,10 @@ where
                 data_count,
                 sub_id,
                 &event,
-                &writer,
+                &outbox,
                 long_string_mode,
                 reply,
             )
-            .await
             .is_err()
             {
                 break;
@@ -103,12 +103,12 @@ where
     })
 }
 
-async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
+pub(crate) fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,
     event: &MonitorEvent,
-    writer: &Arc<Mutex<BufWriter<W>>>,
+    outbox: &Outbox,
     long_string_mode: LongStringMode,
     reply: super::tcp::ReplyContext,
 ) -> std::io::Result<()> {
@@ -179,92 +179,63 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
         .set_payload_size(padded.len(), element_count, client_minor)
         .is_err()
     {
-        let _ =
-            super::tcp::send_16k_array_client_err(writer, req_hdr, req_hdr.cid, client_minor).await;
+        let _ = super::tcp::send_16k_array_client_err(outbox, req_hdr, req_hdr.cid, client_minor);
         return Ok(());
     }
     hdr.data_type = data_type;
     hdr.cid = 1; // ECA_NORMAL status
     hdr.available = sub_id;
 
-    // Abort-safety: this runs inside a monitor task that
-    // `handle_client` may `task.abort()` (EVENT_CANCEL / CLEAR_CHANNEL
-    // / disconnect cleanup). `tokio::abort()` drops the task at the
-    // next await point. If the header and payload were written in two
-    // separate `write_all` awaits, an abort landing between them would
-    // leave an orphan header in the shared BufWriter, mis-framing every
-    // subsequent message the next lock holder ships. Build the whole
-    // CA_PROTO_EVENT_ADD frame as ONE contiguous buffer and issue a
-    // single `write_all`, so an abort can only land at a frame boundary
-    // (before or after the complete write), never mid-frame. The flush
-    // stays separate: an aborted flush merely leaves whole frames
-    // buffered, which the next lock holder flushes — harmless.
+    // Abort-safety: this runs inside a monitor task that `handle_client`
+    // may `task.abort()` (EVENT_CANCEL / CLEAR_CHANNEL / disconnect
+    // cleanup). Build the whole CA_PROTO_EVENT_ADD frame as ONE contiguous
+    // buffer and hand it to the outbox with a single synchronous
+    // `push`. Because `push` is a synchronous channel send with no await
+    // between building the frame and enqueuing it, an abort can only land
+    // at a frame boundary — never between the header and the payload — so
+    // the connection loop can never observe a partial frame. (Under the
+    // former shared `Arc<Mutex<BufWriter>>` this required a two-await
+    // split to be avoided; routing through the outbox removes the hazard
+    // structurally.)
     let hdr_bytes = hdr.to_bytes_extended();
     let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
     frame.extend_from_slice(&hdr_bytes);
     frame.extend_from_slice(&padded);
-    let mut w = writer.lock().await;
-    w.write_all(&frame).await?;
-    w.flush().await?;
+    outbox.push(frame);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use crate::server::outbox::{Outbox, OutboxDrain};
 
-    /// Mock `AsyncWrite` that records the length of every `poll_write`
-    /// batch it receives. Wrapped in a zero-capacity `BufWriter`, each
-    /// `write_all` is forwarded straight through (tokio's `BufWriter`
-    /// bypasses its buffer when the input is at least as large as the
-    /// buffer capacity), so the recorded batches map 1:1 to the
-    /// `write_all` calls `send_event` issues.
-    #[derive(Default)]
-    struct RecordingWriter {
-        /// One entry per `poll_write` batch — the bytes delivered.
-        batches: Vec<Vec<u8>>,
-    }
-
-    impl AsyncWrite for RecordingWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            self.batches.push(buf.to_vec());
-            Poll::Ready(Ok(buf.len()))
+    /// Collect every frame currently queued in the outbox, in push order.
+    /// Each `push` is one complete frame, so the returned vec maps 1:1 to
+    /// the frames a producer emitted — the socket-free equivalent of the
+    /// old "one `write_all` batch per frame" assertion.
+    fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(frame) = drain.try_next() {
+            frames.push(frame);
         }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
+        frames
     }
 
     /// Abort-safety regression: `send_event` must emit the CA_PROTO_EVENT_ADD
-    /// header and payload as ONE contiguous `write_all`. A split across two
-    /// `write_all` awaits would let a `task.abort()` land between them,
-    /// leaving an orphan header in the shared `BufWriter` and mis-framing
-    /// every subsequent message. A true abort-race is non-deterministic to
+    /// header and payload as ONE contiguous frame pushed with a single
+    /// `Outbox::push`. A split into two pushes would let a `task.abort()`
+    /// land between them, enqueuing an orphan header that mis-frames every
+    /// following message. A true abort-race is non-deterministic to
     /// schedule, so this asserts the structural property that makes the
-    /// race impossible: exactly one write batch, equal to the full frame.
+    /// race impossible: exactly one queued frame, equal to the full frame.
     #[tokio::test]
-    async fn send_event_writes_frame_in_single_write_all() {
+    async fn send_event_pushes_frame_in_single_push() {
         use epics_base_rs::server::pv::MonitorEvent;
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::{DBR_LONG, EpicsValue};
 
-        // Zero-capacity BufWriter: every write_all forwards directly to the
-        // RecordingWriter, so batch count == write_all count.
-        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(
-            0,
-            RecordingWriter::default(),
-        )));
+        let (outbox, mut drain): (Outbox, OutboxDrain) = crate::server::outbox::channel();
 
         let snapshot = Snapshot::new(
             EpicsValue::Long(42),
@@ -285,24 +256,22 @@ mod tests {
             0,
             7,
             &event,
-            &writer,
+            &outbox,
             LongStringMode::Plain,
             crate::server::tcp::ReplyContext {
                 req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),
                 client_minor: crate::protocol::CA_MINOR_VERSION,
             },
         )
-        .await
         .expect("send_event must succeed");
 
-        let guard = writer.lock().await;
-        let batches = &guard.get_ref().batches;
+        let batches = drain_frames(&mut drain);
 
-        // Exactly one write batch — header and payload are not split.
+        // Exactly one queued frame — header and payload are not split.
         assert_eq!(
             batches.len(),
             1,
-            "send_event must issue exactly one write_all (got {} batches: {:?})",
+            "send_event must push exactly one frame (got {} frames: {:?})",
             batches.len(),
             batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
         );
@@ -342,18 +311,22 @@ mod tests {
     /// loop rather than through a full TCP round-trip.
     mod subscription_event_counters {
         use super::*;
-        use crate::server::ca_server::ServerStats;
+        use crate::server::stats::ServerStats;
         use epics_base_rs::server::pv::ProcessVariable;
         use epics_base_rs::types::{DBR_DOUBLE, DbFieldType, EpicsValue};
         use std::time::Duration;
 
+        use crate::server::outbox::{Outbox, OutboxDrain};
+
         const DBE_VALUE: u16 = 1;
 
-        fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
-            Arc::new(Mutex::new(BufWriter::with_capacity(
-                0,
-                RecordingWriter::default(),
-            )))
+        /// A live outbox whose drain the caller keeps bound for the test's
+        /// duration, so the spawned monitor task's `push`es are accepted
+        /// (an already-dropped drain would silently discard them — still
+        /// correct for the counter assertions, but keeping the drain alive
+        /// models a live connection).
+        fn live_outbox() -> (Outbox, OutboxDrain) {
+            crate::server::outbox::channel()
         }
 
         /// Poll `counter` until it reaches `want`, driving the
@@ -384,14 +357,14 @@ mod tests {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
+            let (outbox, _drain) = live_outbox();
             let task = spawn_monitor_sender(
                 1,
                 DBR_DOUBLE,
                 0,
-                recording_writer(),
+                outbox,
                 reader,
                 Arc::new(AtomicBool::new(false)),
                 LongStringMode::Plain,
@@ -403,7 +376,7 @@ mod tests {
             );
 
             for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
-                pv.set(EpicsValue::Double(v)).await;
+                pv.set(EpicsValue::Double(v));
                 wait_for(&stats.subscription_events_processed, i as u64 + 1).await;
             }
 
@@ -430,14 +403,14 @@ mod tests {
             let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
             let reader = pv
                 .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
-                .await
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
+            let (outbox, _drain) = live_outbox();
             let task = spawn_monitor_sender(
                 1,
                 DBR_DOUBLE,
                 0,
-                recording_writer(),
+                outbox,
                 reader,
                 Arc::new(AtomicBool::new(true)), // read access denied
                 LongStringMode::Plain,
@@ -448,7 +421,7 @@ mod tests {
                 },
             );
 
-            pv.set(EpicsValue::Double(1.0)).await;
+            pv.set(EpicsValue::Double(1.0));
             wait_for(&stats.subscription_events_posted, 1).await;
             // Give the task ample opportunity to (wrongly) process it.
             for _ in 0..16 {

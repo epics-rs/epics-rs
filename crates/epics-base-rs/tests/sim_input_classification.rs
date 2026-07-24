@@ -7,6 +7,8 @@
 //! wrote VAL OUT to SIOL (direction inverted, simulation defeated). These tests
 //! pin the corrected input direction.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -43,13 +45,13 @@ async fn sim_waveform_reads_siol_array_into_val() {
         .unwrap();
 
     // VAL read inward from SIOL.
-    let val = db.get_pv("WFIN").await.unwrap();
+    let val = db.get_pv("WFIN").unwrap();
     assert!(
         matches!(val, EpicsValue::DoubleArray(ref a) if a.as_slice() == [10.0, 20.0, 30.0]),
         "simulated waveform read the SIOL array INTO VAL, got {val:?}"
     );
     // SIOL source untouched (the record read from it, did not write to it).
-    let src = db.get_pv("WFIN_SRC").await.unwrap();
+    let src = db.get_pv("WFIN_SRC").unwrap();
     assert!(
         matches!(src, EpicsValue::DoubleArray(ref a) if a.as_slice() == [10.0, 20.0, 30.0]),
         "SIOL source untouched (input direction, not VAL->SIOL write), got {src:?}"
@@ -86,24 +88,21 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
         .unwrap();
 
     // SIOL source untouched — the record read from it, not wrote to it.
-    let src = db.get_pv("HGIN_SRC").await.unwrap();
+    let src = db.get_pv("HGIN_SRC").unwrap();
     assert!(
         matches!(src, EpicsValue::Double(v) if (v - 42.0).abs() < 1e-10),
         "simulated histogram did NOT write VAL out to SIOL (input direction), got {src:?}"
     );
     // C `:385-386`: the SIOL scalar lands in SVAL, then in SGNL.
+    assert_eq!(db.get_pv("HGIN.SVAL").unwrap(), EpicsValue::Double(42.0));
     assert_eq!(
-        db.get_pv("HGIN.SVAL").await.unwrap(),
-        EpicsValue::Double(42.0)
-    );
-    assert_eq!(
-        db.get_pv("HGIN.SGNL").await.unwrap(),
+        db.get_pv("HGIN.SGNL").unwrap(),
         EpicsValue::Double(42.0),
         "C `prec->sgnl = prec->sval` (histogramRecord.c:385)"
     );
 
     // C `:219` `add_count(prec)`: 42.0 with WDTH=25 falls in bin 1.
-    let val = db.get_pv("HGIN").await.unwrap();
+    let val = db.get_pv("HGIN").unwrap();
     assert!(
         matches!(val, EpicsValue::ULongArray(ref a) if a.as_slice() == [0, 1, 0, 0]),
         "the simulated signal is binned exactly once, got {val:?}"
@@ -132,11 +131,11 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("HGF.SGNL").await.unwrap(),
+        db.get_pv("HGF.SGNL").unwrap(),
         EpicsValue::Double(0.0),
         "C gates `prec->sgnl = prec->sval` on status == 0 — a failed read assigns nothing"
     );
-    let val = db.get_pv("HGF").await.unwrap();
+    let val = db.get_pv("HGF").unwrap();
     assert!(
         matches!(val, EpicsValue::ULongArray(ref a) if a.as_slice() == [0, 0, 0, 0]),
         "add_count is gated on the same status == 0, got {val:?}"

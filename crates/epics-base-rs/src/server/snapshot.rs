@@ -218,7 +218,7 @@ pub struct Snapshot {
     pub value: EpicsValue,
     pub alarm: AlarmInfo,
     /// Wall-clock timestamp with full EPICS `nsec` precision on every platform.
-    /// Held as [`WallTime`] rather than [`SystemTime`] because the latter is
+    /// Held as [`WallTime`] rather than [`std::time::SystemTime`] because the latter is
     /// 100 ns-granular on Windows and truncated externally supplied `nsec`
     /// (wire decode, PVA PUT, `Q:time:tag` split). [`Snapshot::new`] still
     /// accepts a `SystemTime` (via `Into`), so "now"-style call sites are
@@ -279,7 +279,7 @@ impl Snapshot {
     /// Create a new snapshot with minimal metadata (no display/control/enum info).
     ///
     /// `timestamp` accepts anything convertible into [`WallTime`] — a plain
-    /// [`SystemTime`] (for "now"-style clock reads, which lose no precision the
+    /// [`std::time::SystemTime`] (for "now"-style clock reads, which lose no precision the
     /// OS clock already lacks) or a [`WallTime::from_unix`] built from an exact
     /// integer `(secs, nsec)` taken off the wire.
     pub fn new(

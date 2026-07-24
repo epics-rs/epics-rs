@@ -41,6 +41,8 @@
 //! `TSEL`/`SDIS`/`FLNK` — while a real DB link and an empty link still
 //! round-trip verbatim.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -61,12 +63,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn is_parked(db: &PvDatabase, rec: &str) -> bool {
-    db.get_record(rec)
-        .await
-        .unwrap()
-        .read()
-        .await
-        .is_processing()
+    db.get_record(rec).unwrap().read().is_processing()
 }
 
 /// The put-notify entry (`caput -c`). Returns `true` when the write completed
@@ -77,11 +74,11 @@ async fn put_notify(db: &PvDatabase, pv: &str, field: &str, value: &str) -> bool
         .put_record_field_from_ca(pv, field, EpicsValue::String(value.into()))
         .await
         .unwrap_or_else(|e| panic!("caput -c {pv}.{field} '{value}': {e:?}"));
-    rx.is_none()
+    rx.is_sync()
 }
 
 async fn readback(db: &PvDatabase, pv: &str, field: &str) -> String {
-    match db.get_pv(&format!("{pv}.{field}")).await.unwrap() {
+    match db.get_pv(&format!("{pv}.{field}")).unwrap() {
         EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("{pv}.{field} is not a string: {other:?}"),
     }

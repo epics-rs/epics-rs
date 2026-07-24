@@ -13,6 +13,8 @@
 //! — that way a CI host without pvxs installed isn't a hard
 //! failure but a host that *has* pvxs runs the real assertion.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+
 use super::interop_helpers::{pick_localhost_port, pvxs_arch, pvxs_lib_dir};
 
 use std::path::{Path, PathBuf};

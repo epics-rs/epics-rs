@@ -24,6 +24,14 @@
 //! EOF after emitting the bad frame — that is `bev.reset()` seen from the peer.
 
 #![cfg(test)]
+// This file drives a live client ↔ scripted-server monitor over `tokio::net`.
+// Under `rtems-exec-model` the client's connection tasks route through the
+// callback pool, which has no tokio reactor, so the hosted TCP transport cannot
+// run — every test here is reactor-dependent in full. The blocking transport
+// that makes the client run on the pool for the target (`pva_blocking_client`,
+// stage 2) is a separate config the scripted-peer fixtures do not drive. Gated
+// out feature-ON as a whole file (doc/pvalink-rtems-design.md §4.2, stage 3).
+#![cfg(not(feature = "rtems-exec-model"))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -263,7 +271,7 @@ async fn typed_monitor_decode_fault_closes_the_circuit() {
 
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_handle_from("BAD:PV", addr, move |_desc, _value| {}),
+        client.pvmonitor_handle_from("BAD:PV", addr, move |_desc, _value| {}, |_| {}),
     )
     .await
     .expect("monitor setup timed out")
@@ -292,7 +300,7 @@ async fn raw_monitor_invalid_frame_closes_the_circuit() {
 
     let handle = tokio::time::timeout(
         Duration::from_secs(5),
-        client.pvmonitor_raw_frames_handle("BAD:PV", move |_desc, _body, _order| {}),
+        client.pvmonitor_raw_frames_handle("BAD:PV", move |_desc, _body, _order| {}, |_| {}),
     )
     .await
     .expect("raw monitor setup timed out")

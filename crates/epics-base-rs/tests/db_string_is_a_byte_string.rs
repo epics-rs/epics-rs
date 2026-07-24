@@ -20,14 +20,16 @@
 //!     dbgf X1.VAL -> "h\xffz"     stored: h, 0xFF, z   (3 bytes)
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
 async fn val_bytes(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> Vec<u8> {
-    let inst = db.get_record(rec).await.unwrap_or_else(|| panic!("{rec}"));
-    let inst = inst.read().await;
+    let inst = db.get_record(rec).unwrap_or_else(|| panic!("{rec}"));
+    let inst = inst.read();
     match inst.record.get_field("VAL") {
         Some(EpicsValue::String(s)) => s.as_bytes().to_vec(),
         other => panic!("{rec}.VAL: {other:?}"),
@@ -94,8 +96,8 @@ async fn a_common_string_field_carries_bytes() {
         .await
         .unwrap();
 
-    let inst = db.get_record("D1").await.unwrap();
-    let desc = inst.read().await.common.desc.clone();
+    let inst = db.get_record("D1").unwrap();
+    let desc = inst.read().common.desc.clone();
     assert_eq!(
         desc.as_bytes(),
         [b'h', 0xFF, b'z'],

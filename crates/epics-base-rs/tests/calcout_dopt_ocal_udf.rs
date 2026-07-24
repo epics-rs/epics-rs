@@ -7,6 +7,8 @@
 //! the Rust udf was VAL-based only (`value_is_undefined` default), so OCAL→NaN
 //! drove NaN to the OUT link with NO_ALARM — a silent-wrong-value divergence.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -36,8 +38,8 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_OCAL_NAN").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CO_OCAL_NAN").unwrap();
+    let inst = rec.read();
 
     // VAL is finite, OVAL is NaN → C raises UDF_ALARM at INVALID severity.
     assert_eq!(
@@ -91,8 +93,8 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_NANVAL").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CO_NANVAL").unwrap();
+    let inst = rec.read();
 
     assert_eq!(
         inst.common.sevr,
@@ -127,8 +129,8 @@ async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
         .await
         .unwrap();
 
-    let rec = db.get_record("CO_BOTHFIN").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("CO_BOTHFIN").unwrap();
+    let inst = rec.read();
 
     assert_eq!(
         inst.common.sevr,

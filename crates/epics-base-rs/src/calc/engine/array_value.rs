@@ -226,7 +226,7 @@ impl ArrayStackValue {
     /// VARARG predicates fold over (`aCalcPerform.c:1114-1146`: `if (isDouble(ps))
     /// j = f(ps->d); else for (i=0; i<arraySize; i++) j = j OP f(ps->a[i]);`) —
     /// they read `arraySize`, not the window — and it is deliberately NOT
-    /// `as_f64`, which collapses an array to its a[0].
+    /// `as_f64`, which collapses an array to its `a[0]`.
     pub fn elements(&self) -> impl Iterator<Item = f64> + '_ {
         let (scalar, arr) = match self {
             ArrayStackValue::Double(v) => (Some(*v), [].as_slice()),

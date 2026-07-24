@@ -514,7 +514,7 @@ pub fn subscription_wire_count(
 
 /// C `comQueSend::insertRequestWithPayLoad`'s array bound
 /// (`comQueSend.cpp:352-364`) — the put path's equivalent of
-/// [`max_read_elements`], with three differences that are C's, not ours:
+/// `max_read_elements`, with three differences that are C's, not ours:
 /// ```text
 /// maxBytes = v49Ok ? 0xffffffff : MAX_TCP - sizeof(caHdr);
 /// maxElem  = (maxBytes - sizeof(dbr_double_t) - dbr_size[type])
@@ -585,7 +585,7 @@ fn scalar_string_put_len(payload: &[u8]) -> CaResult<usize> {
 ///
 /// The single owner of client put framing — C's `comQueSend::
 /// insertRequestWithPayLoad` (`comQueSend.cpp:318-383`). It decides the
-/// on-the-wire body length (see [`scalar_string_put_len`]), pads to the
+/// on-the-wire body length (see `scalar_string_put_len`), pads to the
 /// 8-byte message alignment C applies to every payload
 /// (`CA_MESSAGE_ALIGN`, `caProto.h:158`), and picks the 16- or 24-byte
 /// header form for the peer's protocol version.

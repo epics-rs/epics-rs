@@ -13,6 +13,8 @@
 //! Every expectation below is the output of a driver compiled from
 //! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -28,8 +30,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let inst = db.get_record(rec).await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let g = inst.read();
     g.record.get_field(f).unwrap()
 }
 
@@ -129,8 +131,8 @@ async fn r11_9_amask_is_reset_each_process_not_accumulated() {
 
     // Same record, an expression with no store at all.
     {
-        let inst = db.get_record("S4").await.unwrap();
-        let mut g = inst.write().await;
+        let inst = db.get_record("S4").unwrap();
+        let mut g = inst.write();
         g.record
             .put_field("CALC", EpicsValue::String("SUM(BB)".into()))
             .unwrap();

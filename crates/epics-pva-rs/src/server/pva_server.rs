@@ -2,6 +2,8 @@
 //!
 //! Built on top of the native runtime in [`crate::server_native`].
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,7 +11,6 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder;
 use epics_base_rs::server::record::Record;
-use epics_base_rs::server::scan::ScanScheduler;
 use epics_base_rs::server::{access_security, autosave, iocsh};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::watch;
@@ -71,7 +72,7 @@ impl PvaServerBuilder {
 
     pub async fn build(self) -> CaResult<PvaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = Arc::new(tokio::sync::RwLock::new(self.acf));
+        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
         Ok(PvaServer {
             db,
             port: self.port,
@@ -96,7 +97,7 @@ pub struct PvaServer {
     /// ChannelSource via `run_with_source` must install ACF
     /// themselves.
     ///
-    /// `RwLock`-wrapped so [`Self::reload_acf_from`] can
+    /// A lock-free snapshot cell, so [`Self::reload_acf_from`] can
     /// swap the policy at runtime (mirrors `CaServer::reload_acf`).
     /// All `PvDatabaseSource` ACF check sites pick the latest
     /// policy on their next read.
@@ -127,7 +128,7 @@ impl PvaServer {
         Self {
             db,
             port: Some(port),
-            acf: Arc::new(tokio::sync::RwLock::new(acf)),
+            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
@@ -136,13 +137,15 @@ impl PvaServer {
 
     /// Reload the Access Security policy from a `.acf` file. Mirrors
     /// `CaServer::reload_acf_from`. Parses the file off the async
-    /// runtime (blocking IO; small file) and then swaps the AcfCell
-    /// under a write guard so in-flight ACF checks finish under the
-    /// old policy and subsequent checks see the new one.
+    /// runtime (blocking IO; small file) and then publishes the new
+    /// policy into the AcfCell. An in-flight ACF check finishes under the
+    /// policy it started with — it holds that `Arc` for its whole body — and
+    /// subsequent checks see the new one. Unlike the `RwLock` this replaced,
+    /// the reload does not wait for in-flight checks to finish.
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
         let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
         let cfg = access_security::parse_acf(&content)?;
-        *self.acf.write().await = Some(cfg);
+        self.acf.store(Some(std::sync::Arc::new(cfg)));
         // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
@@ -159,7 +162,7 @@ impl PvaServer {
     /// server to unrestricted PUT/GET/MONITOR mode). Mirrors the
     /// negative form of `reload_acf_from`.
     pub async fn clear_acf(&self) {
-        *self.acf.write().await = None;
+        self.acf.store(None);
         self.acl_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -177,7 +180,7 @@ impl PvaServer {
     }
 
     pub async fn get(&self, name: &str) -> CaResult<EpicsValue> {
-        self.db.get_pv(name).await
+        self.db.get_pv(name)
     }
 
     /// Run with the default [`PvDatabaseSource`].
@@ -200,7 +203,7 @@ impl PvaServer {
     /// handle's `report()` names the TCP/UDP ports the kernel actually
     /// assigned, so a caller that must not guess a port (or probe one and
     /// re-bind it later — a PVA search-port collision is silent, see
-    /// [`crate::server_native::udp::bind_udp`]) can learn them the only way
+    /// `crate::server_native::udp::bind_udp`) can learn them the only way
     /// that is race-free. `epics-oracle-rs`'s differential harness boots its
     /// Rust PVA side through here.
     pub async fn run_reporting(
@@ -248,7 +251,10 @@ impl PvaServer {
             config.udp_port = if port == 0 { 0 } else { port + 1 };
         }
 
-        let scanner = ScanScheduler::new(self.db.clone());
+        // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
+        // is owned by the IOC core — `epics_base_rs::server::scan::
+        // ScanOwner`, started by `IocApplication::run` at the C `scanRun`
+        // point or by the IOC entry binary — never by a protocol server.
 
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             Some(mgr.clone().start(self.db.clone()))
@@ -265,23 +271,19 @@ impl PvaServer {
             None
         };
 
-        let result = tokio::select! {
-            res = crate::server_native::runtime::run_pva_server_reporting(
-                source,
-                config,
-                move |handle| {
-                    if let Some(tx) = report_tx {
-                        // Best-effort: a dropped receiver (no shell) just
-                        // means nobody is watching the report.
-                        let _ = tx.send(Some(handle));
-                    }
-                },
-            ) => res.map_err(|e| CaError::InvalidValue(e.to_string())),
-            _ = scanner.run() => {
-                eprintln!("Scan scheduler exited");
-                Ok(())
-            }
-        };
+        let result = crate::server_native::runtime::run_pva_server_reporting(
+            source,
+            config,
+            move |handle| {
+                if let Some(tx) = report_tx {
+                    // Best-effort: a dropped receiver (no shell) just
+                    // means nobody is watching the report.
+                    let _ = tx.send(Some(handle));
+                }
+            },
+        )
+        .await
+        .map_err(|e| CaError::InvalidValue(e.to_string()));
 
         if let Some(h) = autosave_handle {
             h.abort();

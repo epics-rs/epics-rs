@@ -11,6 +11,8 @@
 //! chain went async. A fully synchronous chain drains the wait-set inside
 //! processing and returns `Ok(None)`.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -45,14 +47,14 @@ async fn force_block_sync_record_returns_none_and_processes() {
         .await
         .expect("process must succeed");
     assert!(
-        completion.is_none(),
+        completion.is_sync(),
         "a synchronous forced process drains the put-notify wait-set inside \
          processing, so no completion receiver is handed back"
     );
 
     // Force processed unconditionally: the OUT link drove TGT0.VAL = 42.
-    let tgt = db.get_record("TGT0").await.unwrap();
-    let v = tgt.read().await.record.get_field("VAL");
+    let tgt = db.get_record("TGT0").unwrap();
+    let v = tgt.read().record.get_field("VAL");
     assert_eq!(
         v,
         Some(EpicsValue::Double(42.0)),
@@ -91,21 +93,21 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
         .await
         .expect("process must succeed");
     assert!(
-        completion.is_some(),
+        completion.is_async(),
         "a forced process of an async (ODLY-PACT) record must withhold \
          completion — the reply barrier holds until the delay finishes"
     );
 
     // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
-    let sc_rec = db.get_record("SC1").await.unwrap();
-    let dlya = sc_rec.read().await.record.get_field("DLYA");
+    let sc_rec = db.get_record("SC1").unwrap();
+    let dlya = sc_rec.read().record.get_field("DLYA");
     assert_eq!(
         dlya,
         Some(EpicsValue::Short(1)),
         "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
     );
-    let tgt = db.get_record("TGT1").await.unwrap();
-    let v = tgt.read().await.record.get_field("VAL");
+    let tgt = db.get_record("TGT1").unwrap();
+    let v = tgt.read().record.get_field("VAL");
     assert_eq!(
         v,
         Some(EpicsValue::Double(0.0)),

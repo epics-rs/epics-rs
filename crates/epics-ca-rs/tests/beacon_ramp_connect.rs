@@ -9,6 +9,13 @@
 //! 20 ms ramp and, with R6-23's libca anomaly bands installed, makes every
 //! other client of that server flag ShortPeriod beacon anomalies.
 
+// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
+// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
+// to the background executor, whose worker has no tokio reactor, so the
+// listener/transport tasks panic. The RTEMS model serves from
+// `BlockingCaServer` instead, so this path is inapplicable there.
+#![cfg(not(feature = "rtems-exec-model"))]
+
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 

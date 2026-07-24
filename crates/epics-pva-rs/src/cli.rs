@@ -96,7 +96,7 @@ impl TimeoutPolicy {
     }
 
     /// The operation timeout to hand the Duration-based client builder.
-    /// `Forever` maps to [`Self::FOREVER_SENTINEL`].
+    /// `Forever` maps to `Self::FOREVER_SENTINEL`.
     pub fn op_timeout(self) -> Duration {
         match self {
             TimeoutPolicy::Finite(d) => d,
@@ -194,6 +194,7 @@ pub fn version_information() -> &'static str {
 /// is the post-`expand()` SEARCH list — the auto-address-list broadcast
 /// fan-out folded in and the `AUTO_ADDR_LIST` flag cleared to `NO`
 /// (`config.cpp:640-643`) — exactly as the client will search.
+#[cfg(not(target_os = "rtems"))]
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
 }
@@ -205,6 +206,7 @@ pub fn print_effective_config() {
 /// `util.cpp:660-673`). A multicast entry additionally carries its
 /// `,ttl@iface` modifiers, exactly as pvxs `SockEndpoint::operator<<` prints
 /// them (`config.cpp:125-135`).
+#[cfg(not(target_os = "rtems"))]
 fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
     use std::fmt::Write;
     let mut s = ep.addr.to_string();
@@ -222,6 +224,10 @@ fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
 /// Render the `Effective config` block as a string (see
 /// [`print_effective_config`]). Split out so the verbose output is
 /// unit-testable without capturing process stdout.
+///
+/// Host-only: it renders the *post-`expand()`* config, and
+/// [`crate::config::env::Config`] does not exist on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 pub fn effective_config_string() -> String {
     use crate::config;
     use std::fmt::Write;
@@ -401,21 +407,25 @@ pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
     if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
         return Ok(v4);
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "rtems")))]
     {
         iface_name_to_ipv4(spec)
     }
-    #[cfg(not(unix))]
+    // RTEMS is `cfg(unix)`, but its newlib exposes no `getifaddrs`/
+    // `ifaddrs`/`freeifaddrs` (design doc §8.1), so a name cannot be
+    // resolved there. Same answer as any other non-getifaddrs host: say so
+    // and name the workaround, rather than guessing an address.
+    #[cfg(any(not(unix), target_os = "rtems"))]
     {
         Err(format!(
-            "interface-name override {spec:?} requires a Unix host; \
-             pass the interface's IPv4 address instead"
+            "interface-name override {spec:?} requires a host with \
+             getifaddrs(3); pass the interface's IPv4 address instead"
         ))
     }
 }
 
 /// Look up an interface's first IPv4 address by name via `getifaddrs`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "rtems")))]
 fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
     use std::ffi::CStr;
     use std::net::Ipv4Addr;

@@ -27,6 +27,8 @@
 //! DBF_STRING:         "Local PV"
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,8 +43,8 @@ const LINK_LOC: u16 = 2;
 const LINK_CONST: u16 = 3;
 
 async fn inav(db: &PvDatabase, rec: &str) -> u16 {
-    let inst = db.get_record(rec).await.unwrap();
-    let inst = inst.read().await;
+    let inst = db.get_record(rec).unwrap();
+    let inst = inst.read();
     match inst.record.get_field("INAV") {
         Some(EpicsValue::Enum(v)) => v,
         other => panic!("INAV: {other:?}"),

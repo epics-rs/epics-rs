@@ -16,13 +16,15 @@
 //!   connected `cainfo`; must never run on a task that other channels'
 //!   progress depends on, since an IP with no PTR record stalls for the
 //!   resolver's full timeout.
-//! * [`cached_name`] is libca's `hostNameCache` + the process-wide
+//! * `cached_name` is libca's `hostNameCache` + the process-wide
 //!   `ipAddrToAsciiEngine` singleton (`hostNameCache.cpp`,
 //!   `ipAddrToAsciiEngine.cpp`) — it NEVER blocks: it answers from the cache,
 //!   and on a miss it answers with the dotted IP and resolves in the
 //!   background so the next caller has the name. libca's own asynchronous
 //!   paths (`cac::defaultExcep` → `tcpiiu::getHostName`) print exactly that:
 //!   the dotted IP until the engine has answered, the name afterwards.
+
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;

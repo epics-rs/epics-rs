@@ -26,6 +26,8 @@
 //! window between cycles — which is exactly what a `caget .LA` is for. The port
 //! did not serve the fields at all: `caget TR.LA` failed.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -52,24 +54,24 @@ async fn r13_63_la_is_the_previous_posted_value_of_a() {
     db.add_record("TR", Box::new(t)).await.unwrap();
 
     // Never processed: both cells are at their DBD initial 0.
-    assert_eq!(db.get_pv("TR.LA").await.unwrap(), EpicsValue::Double(0.0));
+    assert_eq!(db.get_pv("TR.LA").unwrap(), EpicsValue::Double(0.0));
 
     // Cycle 1: A = 0+1 = 1. monitor() posts A and copies it into LA.
     process(&db, "TR").await;
-    assert_eq!(db.get_pv("TR.A").await.unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(db.get_pv("TR.A").unwrap(), EpicsValue::Double(1.0));
     assert_eq!(
-        db.get_pv("TR.LA").await.unwrap(),
+        db.get_pv("TR.LA").unwrap(),
         EpicsValue::Double(1.0),
         "after monitor() runs, `*pprev = *pnew` — LA == A"
     );
 
     // Cycle 2: A = 1+1 = 2, and LA follows it in the same cycle.
     process(&db, "TR").await;
-    assert_eq!(db.get_pv("TR.A").await.unwrap(), EpicsValue::Double(2.0));
-    assert_eq!(db.get_pv("TR.LA").await.unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("TR.A").unwrap(), EpicsValue::Double(2.0));
+    assert_eq!(db.get_pv("TR.LA").unwrap(), EpicsValue::Double(2.0));
 
     // The channels are independent cells: LP is P's, and P was never driven.
-    assert_eq!(db.get_pv("TR.LP").await.unwrap(), EpicsValue::Double(0.0));
+    assert_eq!(db.get_pv("TR.LP").unwrap(), EpicsValue::Double(0.0));
 }
 
 /// SPC_NOMOD: a client may not write LA (`transformRecord.dbd:507`).
@@ -84,5 +86,5 @@ async fn r13_63_la_is_read_only() {
         db.put_pv("TR2.LA", EpicsValue::Double(5.0)).await.is_err(),
         "special(SPC_NOMOD) refuses the put (S_db_noMod)"
     );
-    assert_eq!(db.get_pv("TR2.LA").await.unwrap(), EpicsValue::Double(0.0));
+    assert_eq!(db.get_pv("TR2.LA").unwrap(), EpicsValue::Double(0.0));
 }

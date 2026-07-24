@@ -31,6 +31,8 @@
 //! MCNT:      0   2   0   2      <- zeroed by the post on cycle 4
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -66,11 +68,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn mcnt(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.MCNT"))
-        .await
-        .unwrap()
-        .to_f64()
-        .unwrap()
+    db.get_pv(&format!("{rec}.MCNT")).unwrap().to_f64().unwrap()
 }
 
 /// The softIoc transcript, value for value: MCNT counts up to MDEL+1, the post
@@ -104,10 +102,9 @@ async fn mcnt_is_counts_since_the_last_posted_val() {
 #[tokio::test]
 async fn mdel_rate_limits_the_val_monitor() {
     let db = build().await;
-    let rec = db.get_record("HG").await.unwrap();
+    let rec = db.get_record("HG").unwrap();
     let mut val_rx = rec
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("VAL subscription accepted");
 
@@ -149,10 +146,9 @@ async fn the_default_mdel_of_zero_posts_every_process() {
         .unwrap()
         .0;
 
-    let rec = db.get_record("HG0").await.unwrap();
+    let rec = db.get_record("HG0").unwrap();
     let mut val_rx = rec
         .write()
-        .await
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("VAL subscription accepted");
 

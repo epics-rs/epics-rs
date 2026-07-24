@@ -29,7 +29,7 @@ fn truncate_bytes(s: PvString, max: usize) -> PvString {
 /// it on change with the same `DBE_VALUE | DBE_LOG` mask. `OVAL`/`OFLG`
 /// mirror C's post-`monitor()` tracker state for a `caget`.
 ///
-/// B<Deprecated> in upstream EPICS, but still part of the base record set.
+/// **Deprecated** in upstream EPICS, but still part of the base record set.
 pub struct PermissiveRecord {
     /// `VAL` — "Status" (`DBF_USHORT`, `pp(TRUE)`).
     pub val: u16,

@@ -72,7 +72,7 @@ Rust evidence:
 - `crates/epics-base-rs/src/server/record/link.rs:396` returns `ParsedLink::Ca(rest.to_string())` for `ca://...` before legacy link modifiers are stripped, so `ca://PV MS` is treated as PV name `PV MS`.
 - `crates/epics-base-rs/src/server/record/link.rs:460` strips bare `CA MS/NMS/MSI/MSS` modifiers but stores only `ParsedLink::Ca("PV")`; the selected severity policy is lost.
 - `crates/epics-base-rs/src/server/record/link.rs:758` tests currently assert that `REC.VAL CA MS` and `REC.VAL PP CA` both reduce to a bare `ParsedLink::Ca("REC.VAL")`.
-- `crates/epics-bridge-rs/src/calink/resolver.rs:367` returns `Some(sev)` for every nonzero remote severity.
+- `crates/epics-ca-rs/src/calink/resolver.rs:1048` returns `Some(sev)` for every nonzero remote severity. (The resolver relocated from `epics-bridge-rs` to `epics-ca-rs` in `4d7e3860`; the three `calink/resolver.rs` citations below are repointed to its current home and lines.)
 - `crates/epics-base-rs/src/server/database/processing.rs:620` assumes external link sets already applied link-level alarm policy and folds returned severity into the owning record.
 
 C EPICS reference:
@@ -95,7 +95,7 @@ Severity: medium functional parity gap.
 
 Rust evidence:
 
-- `crates/epics-bridge-rs/src/calink/resolver.rs:338` implements `LinkSet` for `CaLinkResolver`.
+- `crates/epics-ca-rs/src/calink/resolver.rs:950` implements `LinkSet` for `CaLinkResolver`.
 - That implementation provides `is_connected`, `get_value`, `put_value`, `alarm_severity`, `time_stamp`, and `link_names`, but no `link_metadata(...)`.
 - `crates/epics-base-rs/src/server/database/link_set.rs:169` defaults `link_metadata(...)` to `None`.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:1016` and `crates/epics-bridge-rs/src/pvalink/link.rs:673` do implement metadata for PVA links, so this is a CA-link-specific gap.
@@ -395,7 +395,7 @@ Rust evidence:
 - `crates/epics-base-rs/src/server/database/mod.rs:485` through `:493` builds the target set from `lset.link_names()` and returns `(0, 0)` when every registered link set returns an empty list.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:1046` through `:1051` implements `PvaLinkResolver::link_names()` as `Vec::new()`.
 - `crates/epics-bridge-rs/src/pvalink/registry.rs:68` through `:79` stores opened pvalinks in a keyed map, and `:259` through `:260` already exposes the count, but there is no name iteration hook.
-- `crates/epics-bridge-rs/src/calink/resolver.rs:381` through `:383` returns actual CA link names, so this gap is pvalink-specific.
+- `crates/epics-ca-rs/src/calink/resolver.rs:1076` through `:1078` returns actual CA link names, so this gap is pvalink-specific.
 
 Reference behavior:
 

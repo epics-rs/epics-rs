@@ -15,6 +15,8 @@
 //! `LNK0..LNKF` are `DBF_FWDLINK` (`dbScanFwdLink`), driving no value and
 //! raising no put alarm.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -31,8 +33,8 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
-    let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
     (inst.common.stat, inst.common.sevr)
 }
 
@@ -90,7 +92,7 @@ async fn r15_62_successful_seq_lnk_put_leaves_no_alarm() {
         "a seq whose puts all succeed commits no alarm"
     );
     assert_eq!(
-        db.get_pv("SEQ_DST").await.unwrap(),
+        db.get_pv("SEQ_DST").unwrap(),
         EpicsValue::Double(7.0),
         "the LNKn put still drives the target from the pre-commit stage"
     );
@@ -122,7 +124,7 @@ async fn r15_62_fanout_forward_links_still_raise_no_put_alarm() {
          put — no LINK_ALARM (dbDbScanFwdLink, dbDbLink.c:425-432)"
     );
     assert_eq!(
-        db.get_pv("FO_DST").await.unwrap(),
+        db.get_pv("FO_DST").unwrap(),
         EpicsValue::Double(0.0),
         "a fanout drives no value into its targets"
     );

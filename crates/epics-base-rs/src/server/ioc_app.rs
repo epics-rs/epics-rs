@@ -22,6 +22,8 @@
 //!     .await
 //! ```
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -627,6 +629,16 @@ impl IocApplication {
         // being built (R18-92).
         db.begin_load()
             .expect("a database created a line ago has not run iocInit");
+
+        // On RTEMS, bring up the background executor (callback pool, delayed
+        // timer, scanOnce worker) before any record processing can defer a
+        // tail — C parity: `callbackInit` runs early in `iocInit`
+        // (callback.c:286). Hosted builds drive tails on the tokio runtime and
+        // skip this; a spawn/sleep/interval on a path that never reaches here
+        // still lazy-inits the same executor on first use.
+        #[cfg(target_os = "rtems")]
+        crate::runtime::task::background_init();
+
         let handle = tokio::runtime::Handle::current();
 
         let Self {
@@ -683,7 +695,16 @@ impl IocApplication {
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
                 .name("iocsh-startup".into())
+                // The shell runs arbitrary registered commands, which reach
+                // record processing and device support — the same depth the
+                // callback bands get, so the same class they use.
+                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
+                    // C bands the thread that runs iocsh, and for the reason
+                    // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
+                    let _ = crate::runtime::task::enter_ioc_thread(
+                        crate::runtime::task::ThreadPriority::Iocsh,
+                    );
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in startup_commands {
                         shell.register(cmd);
@@ -880,7 +901,28 @@ impl IocApplication {
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
+        // C `dbInitLink`'s locality decision, committed once for the whole
+        // database now that every record has loaded: a `Db` link naming a
+        // record this IOC does not have becomes a `Ca` link
+        // (`dbLink.c:117-129` falling through `dbDbInitLink`'s
+        // `S_db_notFound`, `dbDbLink.c:94-96`). Runs BEFORE `setup_cp_links`
+        // for C's reason — `initPVLinks` initialises links before anything
+        // consumes them — and it is a one-shot: C guards re-entry with
+        // `DBLINK_FLAG_INITIALIZED` (`dbLink.c:95-101`), so a record added
+        // later at runtime does not un-convert a link already made external.
+        db.initialize_link_locality().await;
         db.setup_cp_links().await;
+        // Open the rest of the external links at init, as C does. Every
+        // non-local `PV_LINK` reaches `dbCaAddLink` from `dbInitLink`
+        // (`dbLink.c:118-130`) regardless of direction or CP/CPP policy, so a
+        // C IOC's first scan finds an already-connecting channel.
+        // `setup_cp_links` above covers only the CP/CPP subset; without this
+        // pass every other external `INP`/`OUT`/`DOL`/`TSEL`/`SDIS`/`INPA..`
+        // link pays one cold scan cycle to stage its own open. Runs here — the
+        // same init phase, after link parsing and before scan start — and
+        // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
+        // non-local CP holders is already visible to the enumeration.
+        db.setup_external_link_opens().await;
 
         // Phase 2b.5: wait for the CA links to local records to connect
         // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit
@@ -935,12 +977,11 @@ impl IocApplication {
         {
             // C `initialProcess()` (iocInit.c:653-657) — `piniProcess(menuPiniYES)`.
             db.pini_process(crate::server::record::PiniMode::Yes).await;
-            // Publish completion so any scan scheduler started by the
-            // protocol runner sees PINI as already done and its
-            // non-owner branch does not block. The scheduler's owner
-            // branch still re-runs the PINI burst; that is benign
-            // (PINI records simply recompute) and avoids touching
-            // `scan.rs`, which is outside this change's file scope.
+            // Publish completion: a later-started scan owner (or a
+            // non-owner scheduler) sees PINI as already done — the
+            // owner branch then skips its own PINI pass (exactly-once,
+            // as C's `initialProcess`) and non-owners run their hooks
+            // without blocking.
             db.mark_pini_done();
         }
         announce!(InitHookState::AfterInitialProcess);
@@ -980,6 +1021,17 @@ impl IocApplication {
         // `initHookAtIocRun` is announced. PINI=RUN records are processed
         // here and NOT in the PINI=YES pass above.
         db.pini_process(crate::server::record::PiniMode::Run).await;
+        // C `scanRun` (iocInit.c, iocRun: after the PINI=RUN hook, before
+        // `initHookAfterDatabaseRunning`): periodic scanning is owned by
+        // the IOC core, not by any protocol server — a PVA-only or
+        // server-less IOC scans all the same. The owner's PINI=YES pass
+        // is skipped (Phase 2b.6 already ran it and published
+        // completion); the `try_claim_scan_start` claim it takes keeps a
+        // protocol runner or embedded harness that starts another owner
+        // parked and harmless. Held across the runner handoff: when
+        // `run` returns (or its future is dropped), the drop stops every
+        // scan-%g thread.
+        let _scan_owner = crate::server::scan::ScanOwner::start(db.clone());
         announce!(InitHookState::AfterDatabaseRunning);
         announce!(InitHookState::AfterCaServerRunning);
 
@@ -1018,7 +1070,13 @@ impl IocApplication {
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             std::thread::Builder::new()
                 .name("iocsh-after-ioc-running".into())
+                // Same reasoning as "iocsh-startup" above.
+                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
                 .spawn(move || {
+                    // Same reasoning as "iocsh-startup" above.
+                    let _ = crate::runtime::task::enter_ioc_thread(
+                        crate::runtime::task::ThreadPriority::Iocsh,
+                    );
                     let shell = iocsh::IocShell::new(db1, h1);
                     for cmd in shell_cmds_clone {
                         shell.register(cmd);
@@ -1074,10 +1132,19 @@ impl IocApplication {
         // only sleeps on `pending()`).
         let runner_fut = protocol_runner(config);
         tokio::pin!(runner_fut);
+        // SIGINT/SIGTERM racing is host-only: `tokio::signal` needs the tokio
+        // `signal` feature (signal-hook-registry + mio), which is dropped for
+        // the RTEMS target. On RTEMS both arms are `pending()`, so `run` simply
+        // awaits the runner; process-signal shutdown is the RTEMS driver's
+        // concern (a later increment). RTEMS is `cfg(unix)` too, so the guard is
+        // `all(unix, not(target_os = "rtems"))`, not `unix` alone.
+        #[cfg(not(target_os = "rtems"))]
         let ctrl_c = async {
             let _ = tokio::signal::ctrl_c().await;
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "rtems")]
+        let ctrl_c = std::future::pending::<()>();
+        #[cfg(all(unix, not(target_os = "rtems")))]
         let sigterm = async {
             if let Ok(mut sig) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1087,7 +1154,7 @@ impl IocApplication {
                 std::future::pending::<()>().await;
             }
         };
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, not(target_os = "rtems"))))]
         let sigterm = std::future::pending::<()>();
 
         tokio::select! {
@@ -1116,8 +1183,8 @@ pub(crate) async fn wire_device_support(
     let names = db.all_record_names().await;
     let mut count = 0;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
-            let mut instance = rec_arc.write().await;
+        if let Some(rec_arc) = db.get_record(&name) {
+            let mut instance = rec_arc.write();
             let dtyp = instance.common.dtyp.clone();
             if !crate::server::device_support::is_soft_dtyp(&dtyp) {
                 let ctx = DeviceSupportContext {
@@ -1158,8 +1225,8 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
     }
     let names = db.all_record_names().await;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
-            let mut instance = rec_arc.write().await;
+        if let Some(rec_arc) = db.get_record(&name) {
+            let mut instance = rec_arc.write();
             // Both `sub` and `aSub` resolve their subroutine from SNAM via the
             // function registry at init (C `subRecord.c` / `aSubRecord.c`
             // `init_record` -> `registryFunctionFind`).
@@ -1211,11 +1278,11 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
 /// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
 /// `scanpiol` and `dbla` report from.
 async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
-    let Some(rec_arc) = db.get_record(name).await else {
+    let Some(rec_arc) = db.get_record(name) else {
         return;
     };
     let result = {
-        let mut inst = rec_arc.write().await;
+        let mut inst = rec_arc.write();
         if inst.common.scan != record::ScanType::IoIntr {
             return;
         }
@@ -1227,8 +1294,7 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
         phas,
     } = result
     {
-        db.update_scan_index(name, old_scan, new_scan, phas, phas)
-            .await;
+        db.update_scan_index(name, old_scan, new_scan, phas, phas);
     }
     eprintln!("scanAdd: I/O Intr not valid ({reason}), {name} set to Passive");
 }
@@ -1240,13 +1306,10 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
 /// the other.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     let all_names = db.all_record_names().await;
-    let io_intr_recs: Vec<(
-        String,
-        Arc<crate::runtime::sync::RwLock<record::RecordInstance>>,
-    )> = {
+    let io_intr_recs: Vec<(String, Arc<parking_lot::RwLock<record::RecordInstance>>)> = {
         let mut recs = Vec::new();
         for name in &all_names {
-            if let Some(arc) = db.get_record(name).await {
+            if let Some(arc) = db.get_record(name) {
                 recs.push((name.clone(), arc));
             }
         }
@@ -1260,7 +1323,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     // loop holds a record's write guard.
     let mut demote: Vec<(String, &'static str)> = Vec::new();
     for (name, rec_arc) in io_intr_recs {
-        let mut inst = rec_arc.write().await;
+        let mut inst = rec_arc.write();
         // Wire poll feedback when the record is on I/O Intr scan, OR when the
         // device drives processing from its own callback independently of the
         // SCAN menu (motorRecord statusCallback; asyn readback records, PRs
@@ -1293,7 +1356,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                     // Process if the device drives SCAN-independently,
                     // or the record is still on I/O Intr scan.
                     let process = independent || {
-                        let inst = rec_arc_clone.read().await;
+                        let inst = rec_arc_clone.read();
                         inst.common.scan == record::ScanType::IoIntr
                     };
                     if !process {
@@ -1336,8 +1399,8 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
     let names = db.all_record_names().await;
     let mut count = 0;
     for name in names {
-        if let Some(rec_arc) = db.get_record(&name).await {
-            let mut inst = rec_arc.write().await;
+        if let Some(rec_arc) = db.get_record(&name) {
+            let mut inst = rec_arc.write();
             if let Some(mut dev) = inst.device.take() {
                 if let Some(mut rx) = dev.property_post_receiver() {
                     let db_clone = db.clone();
@@ -1346,7 +1409,7 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
                         // Each message is the full setEnums field block; post
                         // it DBE_PROPERTY so clients re-read the choices.
                         while let Some(fields) = rx.recv().await {
-                            let _ = db_clone.post_property_fields(&rec_name, fields).await;
+                            let _ = db_clone.post_property_fields(&rec_name, fields);
                         }
                     });
                     count += 1;
@@ -1378,12 +1441,11 @@ mod io_intr_scan_add_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("NODEV").await.unwrap();
-            let mut inst = rec.write().await;
+            let rec = db.get_record("NODEV").unwrap();
+            let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
         }
-        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0)
-            .await;
+        db.update_scan_index("NODEV", ScanType::Passive, ScanType::IoIntr, 0, 0);
         assert_eq!(
             db.records_for_scan(ScanType::IoIntr).await,
             vec!["NODEV".to_string()],
@@ -1394,9 +1456,9 @@ mod io_intr_scan_add_tests {
         assert_eq!(wired, 0, "no device support ⇒ nothing to wire");
 
         // C: `precord->scan = menuScanPassive` — `caget NODEV.SCAN` reads Passive.
-        let rec = db.get_record("NODEV").await.unwrap();
+        let rec = db.get_record("NODEV").unwrap();
         assert_eq!(
-            rec.read().await.common.scan,
+            rec.read().common.scan,
             ScanType::Passive,
             "an unusable I/O Intr record must be demoted to Passive"
         );
@@ -1433,29 +1495,29 @@ mod io_intr_scan_add_tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("NOINTR").await.unwrap();
-            let mut inst = rec.write().await;
+            let rec = db.get_record("NOINTR").unwrap();
+            let mut inst = rec.write();
             inst.common.scan = ScanType::IoIntr;
             inst.device = Some(Box::new(NoIntrDevice));
         }
-        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0)
-            .await;
+        db.update_scan_index("NOINTR", ScanType::Passive, ScanType::IoIntr, 0, 0);
 
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0, "no interrupt source ⇒ nothing to wire");
 
-        let rec = db.get_record("NOINTR").await.unwrap();
-        let inst = rec.read().await;
-        assert_eq!(
-            inst.common.scan,
-            ScanType::Passive,
-            "device support with no interrupt source must demote SCAN to Passive"
-        );
-        assert!(
-            inst.device.is_some(),
-            "the demotion must not drop the record's device support"
-        );
-        drop(inst);
+        let rec = db.get_record("NOINTR").unwrap();
+        {
+            let inst = rec.read();
+            assert_eq!(
+                inst.common.scan,
+                ScanType::Passive,
+                "device support with no interrupt source must demote SCAN to Passive"
+            );
+            assert!(
+                inst.device.is_some(),
+                "the demotion must not drop the record's device support"
+            );
+        }
         assert!(db.records_for_scan(ScanType::IoIntr).await.is_empty());
     }
 
@@ -1469,8 +1531,8 @@ mod io_intr_scan_add_tests {
             .unwrap();
         let wired = setup_io_intr(db.clone()).await;
         assert_eq!(wired, 0);
-        let rec = db.get_record("PASV").await.unwrap();
-        assert_eq!(rec.read().await.common.scan, ScanType::Passive);
+        let rec = db.get_record("PASV").unwrap();
+        assert_eq!(rec.read().common.scan, ScanType::Passive);
     }
 }
 
@@ -1484,6 +1546,79 @@ mod tests {
     /// two tests announcing at once would observe each other's
     /// callbacks. The state machine here is small; a mutex is enough.
     static INIT_HOOK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn production_scope(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: every thread this module creates take its band **and** its OS
+    /// name through `enter_ioc_thread`. MUST NOT: an iocsh thread run at the
+    /// priority it inherited from `POSIX_Init`.
+    ///
+    /// Both threads here run iocsh command bodies — the startup script, and
+    /// the `afterIocRunning` queue (epics-base PR #558). In C that is one
+    /// thread, the shell, and base-on-RTEMS bands it explicitly:
+    /// `epicsThreadSetPriority(epicsThreadGetIdSelf(), epicsThreadPriorityIocsh)`
+    /// (`libcom/RTEMS/posix/rtems_init.c:1002`), under the comment *"Override
+    /// RTEMS Posix configuration, it gets started with posix prio 2"*. That is
+    /// the same inheritance defect the port has: RTEMS pthreads inherit their
+    /// creator's parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58`)
+    /// and the boot shim runs `POSIX_Init` at `RTEMS_MAXIMUM_PRIORITY - 1`, so
+    /// a thread that skips the prologue runs one level above idle.
+    ///
+    /// `Iocsh` = 91 is the top of the EPICS range — above `High`(90) and every
+    /// scan and callback band. That is C's choice and it is the right one for
+    /// both callers: `run` **awaits** each of these threads, so with an
+    /// inherited near-idle band the whole of iocInit sits behind every scan
+    /// thread and callback worker already running. The startup script is
+    /// bounded (it runs once and exits); the post-init queue is as bounded as
+    /// the command an operator would have typed at the C console, which C runs
+    /// at this same 91.
+    ///
+    /// Source inspection, because the defect is a call that is *absent*.
+    #[test]
+    fn iocsh_threads_take_the_iocsh_band() {
+        let prod = production_scope(include_str!("ioc_app.rs"));
+
+        assert_eq!(
+            prod.matches("enter_ioc_thread(").count(),
+            2,
+            "the startup-script thread and the afterIocRunning thread"
+        );
+        assert_eq!(
+            prod.matches("name_current_thread(").count(),
+            0,
+            "naming without banding leaves the thread one level above idle on \
+             the target; `enter_ioc_thread` is the whole prologue"
+        );
+        assert_eq!(
+            prod.matches("apply_to_current_thread(").count(),
+            0,
+            "banding without naming leaves an RTEMS-anonymous thread"
+        );
+        for name in ["iocsh-startup", "iocsh-after-ioc-running"] {
+            let at = prod
+                .find(&format!(".name(\"{name}\""))
+                .unwrap_or_else(|| panic!("the {name} thread moved; update this guard"));
+            let head = &prod[at..(at + 700).min(prod.len())];
+            assert!(
+                head.contains("enter_ioc_thread(") && head.contains("ThreadPriority::Iocsh"),
+                "{name} must enter its IOC thread role at `ThreadPriority::Iocsh` \
+                 (rtems_init.c:1002)"
+            );
+        }
+    }
+
+    /// `epicsThread.h:86` — the band the guard above pins is C's constant.
+    #[test]
+    fn the_iocsh_band_is_epics_thread_priority_iocsh() {
+        assert_eq!(crate::runtime::task::ThreadPriority::Iocsh.value(), 91);
+    }
 
     /// The `dbLoadGroup` startup command queues `(filename, macros)`
     /// pairs (NOT bound to any provider), with pvxs removal
@@ -1711,9 +1846,9 @@ mod tests {
             .unwrap();
         // Populate the record's info map — exactly what
         // IocBuilder/iocsh now do after loading info(...) directives.
-        let rec = db.get_record("AI:WITH:INFO").await.unwrap();
+        let rec = db.get_record("AI:WITH:INFO").unwrap();
         {
-            let mut inst = rec.write().await;
+            let mut inst = rec.write();
             inst.common.dtyp = "TestRecording".to_string();
             inst.set_info("asyn:READBACK", "1");
             inst.set_info("Q:group", "demo");
@@ -1772,8 +1907,8 @@ mod tests {
             db.add_record(name, Box::new(AiRecord::new(0.0)))
                 .await
                 .unwrap();
-            let rec = db.get_record(name).await.unwrap();
-            let mut inst = rec.write().await;
+            let rec = db.get_record(name).unwrap();
+            let mut inst = rec.write();
             inst.common.dtyp = "SeqDev".to_string();
             // `DeviceSupportContext` carries the links, not the record name;
             // echoing the name through INP is how the test observes which
@@ -1868,8 +2003,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
-            let mut inst = rec.write().await;
+            let rec = db.get_record("BO:RBK").unwrap();
+            let mut inst = rec.write();
             // Non-soft DTYP so the read stage is eligible to run.
             inst.common.dtyp = "TestReadback".to_string();
             inst.device = Some(Box::new(ReadbackDev {
@@ -1887,8 +2022,8 @@ mod tests {
                 .unwrap();
         }
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("BO:RBK").unwrap();
+            let inst = rec.read();
             assert_eq!(
                 inst.record.get_field("VAL"),
                 Some(EpicsValue::Enum(0)),
@@ -1904,8 +2039,8 @@ mod tests {
         // Put/scan cycle: a normal process still writes the setpoint to the
         // driver exactly once (device_callback == false).
         {
-            let rec = db.get_record("BO:RBK").await.unwrap();
-            let mut inst = rec.write().await;
+            let rec = db.get_record("BO:RBK").unwrap();
+            let mut inst = rec.write();
             inst.record.put_field("VAL", EpicsValue::Enum(1)).unwrap();
         }
         {

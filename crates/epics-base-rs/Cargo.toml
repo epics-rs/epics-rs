@@ -8,34 +8,98 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 bytes = "1"
 hostname = "0.4"
-socket2 = { version = "0.5", features = ["all"] }
 chrono = "0.4"
 parking_lot = "0.12"
+# Lock-free snapshot cells for the read-mostly database indices and the ACF
+# config cell — see `doc/rtems-priority-locks-design.md` §3/§5 step 3. Readers
+# take an `Arc` snapshot with no lock, so a low-priority reader can never hold
+# a high-priority scan thread off an index.
+arc-swap = "1"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }
-rustyline = "18"
-# Cross-platform interface enumeration (Linux/macOS/Windows). Used by
-# `epics_base_rs::net::iface_map` to expose ifindex/IP/broadcast/mcast caps.
-if-addrs = "0.13"
+# The libCom layer — `runtime` and `net` — split out under issue #55 and
+# re-exported from `lib.rs` at the original `epics_base_rs::{runtime, net}`
+# paths. Not optional: the record system is built on the task seam, the
+# priority bands and `errlog`, so there is no configuration of this crate that
+# does without it.
+epics-libcom-rs = { workspace = true }
+# `server::status_pv::target_status_pvs` reads descriptor and heap usage out of
+# RTEMS through this crate's `stats` module. A leaf: `epics-rtems-boot` depends
+# on nothing of ours, its build script no-ops off RTEMS, and on a host target
+# both readers return `None`, so this costs a host build nothing. The
+# alternative was writing the status set out twice, once in each IOC binary,
+# which is how two copies of a naming rule come to disagree.
+epics-rtems-boot = { workspace = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 
-# Linux-only: `SO_RXQ_OVFL` setsockopt + `recvmsg`/cmsg parsing for
-# UDP RX overflow detection (`net::async_udp_v4::recv_from_with_drop_count`).
-# Cargo `target.'cfg(target_os = "linux")'` only links libc on Linux —
-# macOS / Windows builds skip it entirely.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Host-only dependencies — gated out for the RTEMS target (armv7-rtems-eabihf).
+#
+# `rustyline` pulls `nix`, which does not build for RTEMS (no `sa_sigaction` in
+# the RTEMS libc). It backs only the *interactive* iocsh line editor
+# (`iocsh::Iocsh::run_repl_interactive`); the piped-stdin REPL covers
+# non-interactive use, and RTEMS iocsh wiring is a later increment.
+#
+# `socket2` + `if-addrs` back the async UDP net stack (`net::async_udp_v4` /
+# `net::iface_map`); the whole `net` module is gated out on RTEMS (S1 raw-libc
+# CA driver), so its deps go host-only too.
+#
+# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# `net`, `signal`, and `process` features — the ones that pull `mio`,
+# `signal-hook-registry`, and `socket2`, none of which build for
+# armv7-rtems-eabihf. Declared per-target rather than in shared `[dependencies]`
+# because Cargo UNIONS a dependency's features across all matching tables, so a
+# shared `full` would re-add the dropped features on RTEMS. The retained set
+# (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
+# always-compiled base code uses (Handle, block_in_place, select!, sync
+# primitives) compiling on RTEMS; those paths are unused there (the sans-io seam
+# routes to the background executor) but must still type-check for `--lib`.
+[target.'cfg(not(target_os = "rtems"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+rustyline = "18"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.13"
+
+[target.'cfg(target_os = "rtems")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+# Every unix: `runtime::time::thread_sleep_quantum` asks the OS for the clock
+# tick rate via `sysconf(_SC_CLK_TCK)` rather than restating it as a Rust
+# constant — on RTEMS that call resolves to the tick period configured in
+# `epics-rtems-boot`, so the C `#define` stays the single source of truth.
+#
+# Linux-only *uses* remain gated at their call sites (`SO_RXQ_OVFL` setsockopt
+# and `recvmsg`/cmsg parsing in `net::async_udp_v4`, `getifaddrs` in
+# `net::iface_map`, `SCHED_FIFO` in `runtime::task`, `PTHREAD_PRIO_INHERIT` in
+# `runtime::sync`); this gate governs only whether libc is linked at all.
+# Windows still skips it entirely.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Dev-only — `path` (no `version`) so `cargo publish` strips this
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.
 [dev-dependencies]
+# Dev-only, path-only (no `version`, so `cargo publish` strips the entry
+# entirely): the shared `rtems-exec-model` test-gating census, called by
+# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
+# crate that declares the feature has the same hole, and three copies of a
+# 300-line audit is how three copies of a rule come to disagree.
+rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
 tempfile = "3"
 serial_test = "3"
@@ -45,12 +109,37 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 
 [features]
+# Host-selectable RTEMS execution model. Routes the `runtime::task`
+# spawn/sleep/interval seam to the std-thread background executor
+# (callback pool + delayed timer + scanOnce worker) on a HOSTED target,
+# instead of the tokio runtime — the same runtime-free backend the RTEMS
+# build uses unconditionally. Intended for a Linux (e.g. PREEMPT_RT)
+# blocking-front-end deployment that runs the `std::net` CA server driver
+# and wants async record-processing completion driven on dedicated OS
+# threads with no tokio reactor. Compile-time backend switch (see
+# `build.rs`, which turns this into the `exec_backend` cfg). OFF by
+# default: the hosted default is byte-identical without it.
+# Forwards to the dev-dependency `epics-ca-rs` because that crate compiles
+# into this crate's own test graph: without the forward, `cargo test -p
+# epics-base-rs --features rtems-exec-model` builds the split state the
+# `HAS_TOKIO_REACTOR` const guard exists to refuse (base on the exec
+# backend, the ca dev-dep still on tokio), and the guard fails the build.
+# Forwards to `epics-libcom-rs` because that is where the seam itself now
+# lives; this crate's own `build.rs` derives the same cfg for `server::scan`
+# above the seam, and `lib.rs` pins the two together so a dropped forward is a
+# compile error rather than a split backend.
+rtems-exec-model = [
+    "epics-libcom-rs/rtems-exec-model",
+    "epics-ca-rs/rtems-exec-model",
+]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on
 # non-Linux. Off by default — only enable on systems running with
 # SCHED_FIFO / SCHED_RR where unbounded priority inversion is a risk.
-linux-rt = []
+# The mutex lives in `epics-libcom-rs`; this is the forward that keeps
+# `--features epics-base-rs/linux-rt` meaning what it always did.
+linux-rt = ["epics-libcom-rs/linux-rt"]
 # Test-only: enables the `client_server` integration test, whose
 # `run_tcp_listener` call must match `epics-ca-rs`'s TLS/cap-token
 # signature. `run_tcp_listener` has `#[cfg]`-gated `tls` /

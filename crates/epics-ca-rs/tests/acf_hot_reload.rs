@@ -1,6 +1,8 @@
 //! ACF hot reload test — server keeps running, ACF file is rewritten,
 //! reload_acf() picks up the change without restart.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_ca_rs::server::CaServer;
 use std::time::Duration;
 

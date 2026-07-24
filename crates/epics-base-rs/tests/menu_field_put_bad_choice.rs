@@ -20,6 +20,8 @@
 //! string became `to_f64().unwrap_or(0.0) as u16`, i.e. **menu index 0**. So
 //! `caput FAN.SELM Bogus` silently selected `All`.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -37,7 +39,7 @@ async fn fanout_db() -> PvDatabase {
 }
 
 async fn selm(db: &PvDatabase) -> i16 {
-    match db.get_pv("FAN.SELM").await.unwrap() {
+    match db.get_pv("FAN.SELM").unwrap() {
         EpicsValue::Short(v) => v,
         other => panic!("SELM read back as {other:?}"),
     }
@@ -138,7 +140,7 @@ async fn shared_menu_common_field_uses_the_same_converter() {
     db.put_record_field_from_ca("FAN", "PRIO", EpicsValue::String("HIGH".into()))
         .await
         .unwrap();
-    assert_eq!(db.get_pv("FAN.PRIO").await.unwrap(), EpicsValue::Short(2));
+    assert_eq!(db.get_pv("FAN.PRIO").unwrap(), EpicsValue::Short(2));
 
     for bad in ["High", "3", "Bogus"] {
         let err = db
@@ -149,6 +151,6 @@ async fn shared_menu_common_field_uses_the_same_converter() {
             matches!(err, CaError::BadChoice(_)),
             "{bad:?} must be S_db_badChoice; got {err:?}"
         );
-        assert_eq!(db.get_pv("FAN.PRIO").await.unwrap(), EpicsValue::Short(2));
+        assert_eq!(db.get_pv("FAN.PRIO").unwrap(), EpicsValue::Short(2));
     }
 }

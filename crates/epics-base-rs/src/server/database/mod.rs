@@ -1,22 +1,26 @@
-use std::future::Future;
+// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
 
 pub mod db_access;
 mod field_io;
 pub mod filters;
+mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
 mod record_lock;
 mod scan_index;
+mod snapshot;
 
 pub use link_set::{
-    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
+    DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
+    RemoteAlarm,
 };
 pub use processing::{AsyncDbHandle, AsyncToken};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
-use crate::runtime::sync::RwLock;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use snapshot::SnapshotCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -104,24 +108,19 @@ fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
 /// Unified entry in the PV database.
 pub enum PvEntry {
     Simple(Arc<ProcessVariable>),
-    Record(Arc<RwLock<RecordInstance>>),
+    Record(Arc<parking_lot::RwLock<RecordInstance>>),
 }
 
 /// Callback for resolving external PV names (CA/PVA links).
-/// Returns the current value of the external PV, or None if unavailable.
+/// Returns the *cached* value of the external PV, or `None` if unavailable.
 ///
-/// **Async**, for the same reason [`LinkSet`] is: an external link's value
-/// lives on a tokio runtime, and a sync closure could only reach it through a
-/// blocking bridge that panics on a current-thread runtime. The one caller
-/// ([`PvDatabase::resolve_external_pv`]) is already async.
-pub type ExternalPvResolver = Arc<
-    dyn for<'a> Fn(
-            &'a str,
-        )
-            -> std::pin::Pin<Box<dyn Future<Output = Option<EpicsValue>> + Send + 'a>>
-        + Send
-        + Sync,
->;
+/// **Sync**, for the same reason [`LinkSet::get_cached_value`] is: this runs
+/// on the record-processing thread with the record's L1 gate held, and C's
+/// `dbCaGetLink` likewise only reads `pca->pgetNative` under `pca->lock` —
+/// it never waits for the wire (`dbCa.c:448-535`). A resolver that cannot
+/// answer from cache must stage the open on its own executor and return
+/// `None` (C's `!pca->isConnected` arm, `dbCa.c:459-464`).
+pub type ExternalPvResolver = Arc<dyn Fn(&str) -> Option<EpicsValue> + Send + Sync>;
 
 /// Async hook invoked by [`PvDatabase::has_name`] when a name is not yet
 /// in the database. Used by the CA gateway and similar proxy components
@@ -211,7 +210,7 @@ pub type ExistenceGate = Arc<
 /// `get_record` first OR run the canonical-normalisation snippet
 /// at function entry. Direct `inner.records` access is reserved
 /// for the alias-management primitives listed above.
-/// One CP/CPP edge in the [`PvDatabaseInner::cp_links`] index: the record
+/// One CP/CPP edge in the `PvDatabaseInner::cp_links` index: the record
 /// to (re)process when the source record changes.
 ///
 /// `passive_only` distinguishes CPP from CP. C adds the `CA_DBPROCESS`
@@ -225,9 +224,66 @@ pub struct CpTarget {
     pub passive_only: bool,
 }
 
+/// The scan index — one independently locked bucket per [`ScanList`].
+///
+/// C's shape (`dbScan.c`): `scan_list` carries its own `epicsMutexId lock`
+/// (`:75`) and `scanList` / `addToList` / `deleteFromList` take only that
+/// one list's lock, so two periodic rates never wait on each other. The port
+/// used to hold a single `RwLock` over the whole `ScanList → bucket` map,
+/// which is coarser than C on the highest-contention path in the database.
+///
+/// There is no lock over the table itself, and that is structural rather than
+/// an optimisation: the set of scan lists is fixed by `menuScan`
+/// ([`ScanList::ALL`]), so the table is fully populated at construction and
+/// never mutated. A bucket is reached by [`ScanList::slot`], a total index —
+/// there is no absent-bucket case for a caller to handle, and therefore no
+/// path on which a lookup could take the wrong lock.
+///
+/// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b.
+struct ScanIndex {
+    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>>;
+        ScanList::COUNT],
+}
+
+impl ScanIndex {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| {
+                crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new())
+            }),
+        }
+    }
+
+    /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
+    fn bucket(
+        &self,
+        list: ScanList,
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>> {
+        &self.buckets[list.slot()]
+    }
+}
+
 struct PvDatabaseInner {
-    simple_pvs: RwLock<HashMap<String, Arc<ProcessVariable>>>,
-    records: RwLock<HashMap<String, Arc<RwLock<RecordInstance>>>>,
+    /// The simple-PV directory — C's `dbPvdLib.c` process-variable directory,
+    /// whose per-bucket `epicsMutexId lock` (`:30`, created `:119`) is taken
+    /// for both `dbPvdFind` (`:123-136`) and `dbPvdAdd` (`:150-162`). C has no
+    /// reader-writer primitive anywhere in the IOC
+    /// (`rg pthread_rwlock epics-base/modules/` → zero hits), so a PI mutex is
+    /// not a demotion against C — it *is* C's construction.
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8a.
+    ///
+    /// **Every reader MUST bind the lookup result in a statement of its own**
+    /// (`let pv = …lock().get(name).cloned();`) rather than reading the map in
+    /// an `if let` scrutinee. The guard is `!Send`, and an `if let` scrutinee
+    /// temporary lives to the end of the `if let` *body* — so the scrutinee
+    /// form keeps the guard alive across any `.await` the body makes and turns
+    /// the enclosing `async fn` into a `!Send` future at its `tokio::spawn`
+    /// site. The rule is uniform across all 17 read sites, not applied only to
+    /// the ones that await today, so a new `.await` in an existing body cannot
+    /// re-open it.
+    simple_pvs:
+        crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
+    records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
     /// Scan index: maps scan type → sorted set of
     /// `(PHAS, load_order, record_name)`.
     ///
@@ -241,19 +297,42 @@ struct PvDatabaseInner {
     /// C IOC built from the same `.db` file.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
-    scan_index: RwLock<HashMap<ScanList, BTreeSet<(i16, u64, String)>>>,
+    ///
+    /// **One lock per scan list, not one lock over the index.** C has one
+    /// `epicsMutexId lock` per `scan_list` (`dbScan.c:75`, created `:527`,
+    /// `:604`, `:908`) and never serialises two rates against each other. A
+    /// single map-wide lock would serialise the seven periodic threads (bands
+    /// 60–66) that C runs independently, on the one path where both ends of
+    /// the contention pair are banded — see
+    /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b. See
+    /// [`ScanIndex`].
+    scan_index: ScanIndex,
     /// Per-record load-order sequence number, assigned monotonically
     /// at `add_record`. Used as the secondary scan-index sort key so
     /// same-PHAS records preserve database load order. Survives a
     /// `remove_record` + re-`add_record` (the re-add gets a fresh,
     /// higher sequence — matching a fresh `.db` reload).
-    load_order: RwLock<HashMap<String, u64>>,
+    ///
+    /// Read-modify-write cell (`add_loaded_record` inserts, `remove_record`
+    /// removes), so it is a [`SnapshotCell`], not a bare `ArcSwap`: the
+    /// writer gate is what makes insert-then-publish atomic. Both writers
+    /// also hold [`Self::registration_mutex`] today, but the gate keeps the
+    /// RMW correct without depending on that — L46's type changes in step 4.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8c.
+    load_order: SnapshotCell<HashMap<String, u64>>,
     /// Monotonic counter feeding `load_order`.
     load_order_counter: std::sync::atomic::AtomicU64,
     /// CP/CPP link index: maps source_record → target edges to process when
     /// the source changes. Each edge carries the CP-vs-CPP distinction (see
     /// [`CpTarget`]).
-    cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
+    ///
+    /// Read-modify-write cell with **two writers that share no other gate**:
+    /// `register_cp_link` (`links.rs:2596`) takes no
+    /// [`Self::registration_mutex`], `remove_record` (`mod.rs:1533`) does. The
+    /// `RwLock`'s write exclusion was the only thing serialising them, so the
+    /// [`SnapshotCell`] writer gate here is required, not defensive.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8d.
+    cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
     /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
     /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP"`)
     /// → holder edges to process when that remote PV changes. The local
@@ -262,12 +341,17 @@ struct PvDatabaseInner {
     /// only trigger is the calink/pvalink CA monitor callback, which calls
     /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
     /// `dbCa.c:993-994` `eventCallback` adding `CA_DBPROCESS`.
-    external_cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
+    ///
+    /// Read-modify-write cell; sole writer `register_external_cp_link`
+    /// (`links.rs:2647`) merges into an existing edge list, so concurrent
+    /// registrations need the [`SnapshotCell`] writer gate.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8e.
+    external_cp_links: SnapshotCell<HashMap<String, Vec<CpTarget>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
     /// table so an alias resolves transparently to its target.
-    aliases: RwLock<HashMap<String, String>>,
+    aliases: parking_lot::RwLock<HashMap<String, String>>,
     /// Single gate that serializes
     /// every `add_pv` / `add_pv_with_hook` / `add_record` /
     /// `add_alias` / `remove_record` / `remove_simple_pv` /
@@ -283,29 +367,73 @@ struct PvDatabaseInner {
     /// peek atomic with the target-map insert, eliminates the
     /// scan-index race, and lets `remove_*` purge dangling aliases
     /// without a second pass.
-    registration_mutex: tokio::sync::Mutex<()>,
+    ///
+    /// `doc/rtems-priority-locks-design.md` §3 row L46. This gate is taken
+    /// **inside** the L1 record-gate window on the SCAN-put path
+    /// (`scan_index.rs:30`, reached from `field_io.rs`'s `update_scan_index`
+    /// calls), so it converts with L8a/L8b rather than after them — leaving it
+    /// async while the locks nested under it are blocking is the worst of both.
+    /// The acquisition-order MUST rule that governs the nesting is in
+    /// `record_lock.rs`'s module doc.
+    ///
+    /// **No holder may `.await` while holding it.** The guard is `!Send`, so
+    /// the compiler enforces this at every `tokio::spawn` site; the eight
+    /// holders were audited before the conversion and the only suspension
+    /// points any of them had were acquisitions of `simple_pvs` and
+    /// `scan_index`, both blocking now.
+    registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
     /// [`PvDatabase::schedule_record_init`] and [`PvDatabase::ioc_init`].
     init_phase: std::sync::Mutex<DbInitPhase>,
+    /// Record inits parked because the record they classify is not registered
+    /// yet — see [`PvDatabase::schedule_record_init`]. Keyed by record name and
+    /// released by [`PvDatabase::add_loaded_record`] the moment that name lands
+    /// in `records`, which is what makes "the init observes a registered
+    /// record" hold by construction rather than by scheduler timing.
+    record_init_waiting: std::sync::Mutex<HashMap<String, Vec<RecordInit>>>,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
     /// commands run with the database in its post-init state.
     after_ioc_running: std::sync::Mutex<Vec<String>>,
     /// Optional resolver for external PVs (ca://, pva:// links).
-    external_resolver: RwLock<Option<ExternalPvResolver>>,
+    ///
+    /// Whole-value replace: the only writer stores a complete new value
+    /// ([`PvDatabase::set_external_resolver`]), so an
+    /// [`ArcSwapOption`] store IS the mutation and no writer gate is
+    /// needed. Readers take the `Arc` with no lock at all — see
+    /// `doc/rtems-priority-locks-design.md` §3 row L8f.
+    external_resolver: ArcSwapOption<ExternalPvResolver>,
     /// Optional async resolver invoked on `has_name` misses (e.g. CA gateway).
-    search_resolver: RwLock<Option<SearchResolver>>,
+    ///
+    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8g).
+    search_resolver: ArcSwapOption<SearchResolver>,
     /// Optional per-request gate consulted before a *cached* simple PV is
     /// advertised as existing (e.g. CA gateway host/state admission). See
     /// [`ExistenceGate`]. `None` for a plain IOC (short-circuit unchanged).
-    existence_gate: RwLock<Option<ExistenceGate>>,
+    ///
+    /// Whole-value replace, as [`Self::external_resolver`] (§3 row L8h).
+    existence_gate: ArcSwapOption<ExistenceGate>,
     /// Per-scheme link sets — pluggable backends for `pva://` /
     /// `ca://` link resolution. Consulted before the legacy
     /// [`ExternalPvResolver`] in [`Self::resolve_external_pv`].
     /// Mirrors the C-EPICS lset abstraction.
-    link_sets: RwLock<link_set::LinkSetRegistry>,
+    ///
+    /// Read-modify-write cell (`register_link_set` inserts one scheme into
+    /// the existing registry), so it takes the [`SnapshotCell`] writer gate.
+    /// Every reader either resolves one scheme inside a single expression or
+    /// collects the lsets and drops the registry **before** awaiting — the
+    /// deliberate discipline documented at `links.rs:878-881` — so a coherent
+    /// snapshot is what the read paths already assumed.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8i.
+    link_sets: SnapshotCell<link_set::LinkSetRegistry>,
+    /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
+    /// Record processing stages a write here and returns; the queue's single
+    /// owner task performs the `ca://`/`pva://` network write off the
+    /// record's advisory write gate, exactly as `dbCaTask` does
+    /// (`dbCa.c:1158-1333`). See [`link_put_queue`].
+    link_puts: Arc<link_put_queue::LinkPutQueue>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -330,14 +458,26 @@ struct PvDatabaseInner {
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
     /// SUBL). Populated once at iocInit from the IocApp/IocBuilder registry;
     /// read-only thereafter.
-    subroutine_registry: RwLock<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    ///
+    /// Whole-registry replace ([`PvDatabase::install_subroutine_registry`]),
+    /// so an [`ArcSwap`] store IS the mutation and no writer gate is needed
+    /// (§3 row L8j). `OnceLock` was rejected: install is a `pub async fn` that
+    /// tests and a second `iocInit` may call again, and `OnceLock` would
+    /// silently drop the second registry instead of replacing it.
+    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
     /// Breakpoint tables by name (C `bptList`), shared by every db-load path so
     /// `ai`/`ao` records with `LINR >= 3` resolve their linearisation table. An
     /// `Arc` snapshot is installed on each record at creation; the master grows
     /// (copy-on-write via [`PvDatabase::add_breaktables`]) as `dbLoadRecords`
     /// loads more `breaktable(...)` definitions, so build-time and runtime
     /// loads share one registry.
-    breaktable_registry: RwLock<Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
+    ///
+    /// Read-modify-write cell (`add_breaktables` clones the registry, inserts
+    /// and republishes), so it takes the [`SnapshotCell`] writer gate. The
+    /// value was already `Arc`-shared, so the cell replaces the outer lock
+    /// with nothing at all on the read side.
+    /// `doc/rtems-priority-locks-design.md` §3 row L8k.
+    breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
 }
 
 /// Database of all process variables hosted by this server.
@@ -583,29 +723,31 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
-                simple_pvs: RwLock::new(HashMap::new()),
-                external_resolver: RwLock::new(None),
-                search_resolver: RwLock::new(None),
-                existence_gate: RwLock::new(None),
-                link_sets: RwLock::new(link_set::LinkSetRegistry::new()),
-                records: RwLock::new(HashMap::new()),
-                scan_index: RwLock::new(HashMap::new()),
-                load_order: RwLock::new(HashMap::new()),
+                simple_pvs: crate::runtime::sync::PriorityInheritanceMutex::new(HashMap::new()),
+                external_resolver: ArcSwapOption::empty(),
+                search_resolver: ArcSwapOption::empty(),
+                existence_gate: ArcSwapOption::empty(),
+                link_sets: SnapshotCell::new(link_set::LinkSetRegistry::new()),
+                link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
+                records: parking_lot::RwLock::new(HashMap::new()),
+                scan_index: ScanIndex::new(),
+                load_order: SnapshotCell::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
-                cp_links: RwLock::new(HashMap::new()),
-                external_cp_links: RwLock::new(HashMap::new()),
-                aliases: RwLock::new(HashMap::new()),
-                registration_mutex: tokio::sync::Mutex::new(()),
+                cp_links: SnapshotCell::new(HashMap::new()),
+                external_cp_links: SnapshotCell::new(HashMap::new()),
+                aliases: parking_lot::RwLock::new(HashMap::new()),
+                registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
+                record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
-                subroutine_registry: RwLock::new(HashMap::new()),
-                breaktable_registry: RwLock::new(Arc::new(
+                subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
+                breaktable_registry: SnapshotCell::new(
                     crate::server::cvt_bpt::BreakTableRegistry::new(),
-                )),
+                ),
             }),
         }
     }
@@ -638,20 +780,15 @@ impl PvDatabase {
         // holds this gate across its whole body (registry read + map insert),
         // so taking it here closes that TOCTOU window. No `add_breaktables`
         // caller already holds the gate, so this is reentrancy-safe.
-        let _gate = self.inner.registration_mutex.lock().await;
-        let snapshot = {
-            let mut guard = self.inner.breaktable_registry.write().await;
-            if tables.is_empty() {
-                return guard.clone();
-            }
-            let mut next = (**guard).clone();
+        let _gate = self.inner.registration_mutex.lock();
+        if tables.is_empty() {
+            return self.inner.breaktable_registry.load_full();
+        }
+        let snapshot = self.inner.breaktable_registry.update(|next| {
             for table in tables {
                 next.insert(table);
             }
-            let snapshot = Arc::new(next);
-            *guard = snapshot.clone();
-            snapshot
-        };
+        });
         // Re-install into existing records. Snapshot the instance handles
         // under a brief read, then release the map lock BEFORE taking any
         // per-record write lock — collect-then-act, keeping the invariant
@@ -660,10 +797,9 @@ impl PvDatabase {
         // takes the per-record lock then the records-map lock, so there is no
         // confirmed cycle; uniform order forecloses one. Same idiom as
         // `all_record_names`. (The registry write lock was released above.)
-        let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
+        let instances: Vec<_> = self.inner.records.read().values().cloned().collect();
         for inst in instances {
             inst.write()
-                .await
                 .record
                 .install_breaktable_registry(snapshot.clone());
         }
@@ -672,33 +808,28 @@ impl PvDatabase {
 
     /// Install the by-name subroutine registry, retained for runtime
     /// re-resolution (aSub LFLG=READ / SUBL). Called once at iocInit with the
-    /// IocApp/IocBuilder registry. See [`Self::find_subroutine_named`].
+    /// IocApp/IocBuilder registry. See `Self::find_subroutine_named`.
     pub async fn install_subroutine_registry(
         &self,
         registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
     ) {
-        *self.inner.subroutine_registry.write().await = registry;
+        self.inner.subroutine_registry.store(Arc::new(registry));
     }
 
     /// Look up a registered subroutine by name. The processing path uses this
     /// to re-resolve an aSub's subroutine when SNAM changes (C `fetch_values`
     /// `registryFunctionFind`). `None` when the name is not registered, which
     /// the caller treats as C's `S_db_BadSub` (skip running the subroutine).
-    pub(crate) async fn find_subroutine_named(
+    pub(crate) fn find_subroutine_named(
         &self,
         name: &str,
     ) -> Option<Arc<crate::server::record::SubroutineFn>> {
-        self.inner
-            .subroutine_registry
-            .read()
-            .await
-            .get(name)
-            .cloned()
+        self.inner.subroutine_registry.load().get(name).cloned()
     }
 
     /// Atomically claim the right to start the scan scheduler for this DB.
     /// Returns `true` on the first call, `false` on subsequent calls.
-    /// Used by `ScanScheduler::run_with_hooks` to prevent duplicate scan tasks
+    /// Used by `ScanScheduler::run` to prevent duplicate scan tasks
     /// when multiple protocol servers (CA + PVA) both try to start scanning.
     pub fn try_claim_scan_start(&self) -> bool {
         self.inner
@@ -719,6 +850,18 @@ impl PvDatabase {
             .pini_done
             .store(true, std::sync::atomic::Ordering::Release);
         self.inner.pini_notify.notify_waiters();
+    }
+
+    /// True once the PINI=YES pass has completed for this database —
+    /// published by [`Self::mark_pini_done`]. The scan owner reads this
+    /// to keep the pass exactly-once (C `initialProcess`, iocInit.c:653
+    /// runs once, inside iocBuild): when the IOC init path already ran
+    /// PINI, the owner skips its own pass instead of re-processing every
+    /// PINI record.
+    pub fn pini_done(&self) -> bool {
+        self.inner
+            .pini_done
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Wait until the scan owner has completed PINI processing.
@@ -749,24 +892,24 @@ impl PvDatabase {
     /// fails to find a name. Used by proxy/gateway implementations to
     /// lazily populate PVs on first search.
     pub async fn set_search_resolver(&self, resolver: SearchResolver) {
-        *self.inner.search_resolver.write().await = Some(resolver);
+        self.inner.search_resolver.store(Some(Arc::new(resolver)));
     }
 
     /// Remove the previously installed search resolver, if any.
     pub async fn clear_search_resolver(&self) {
-        *self.inner.search_resolver.write().await = None;
+        self.inner.search_resolver.store(None);
     }
 
     /// Install the per-request existence gate (see [`ExistenceGate`]).
     /// Replaces any previously installed gate. Used by the CA gateway so
     /// a cached shadow PV re-runs host/state admission per request.
     pub async fn set_existence_gate(&self, gate: ExistenceGate) {
-        *self.inner.existence_gate.write().await = Some(gate);
+        self.inner.existence_gate.store(Some(Arc::new(gate)));
     }
 
     /// Remove the previously installed existence gate, if any.
     pub async fn clear_existence_gate(&self) {
-        *self.inner.existence_gate.write().await = None;
+        self.inner.existence_gate.store(None);
     }
 
     /// True when a cached simple PV named `name` must be treated as
@@ -780,21 +923,22 @@ impl PvDatabase {
     /// "cached simple PV ⇒ exists" short-circuit is closed uniformly on
     /// both the create and search paths.
     async fn simple_pv_gate_denies(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
-        let gate = match self.inner.existence_gate.read().await.clone() {
-            Some(g) => g,
-            None => return false,
+        let Some(gate) = self.inner.existence_gate.load_full() else {
+            return false;
         };
+        let gate = (*gate).clone();
         // Strip the channel-filter suffix exactly as the lookups do
         // (CA-FR-8) so the gate sees the same record-path key the
         // simple-PV map and the gateway cache are keyed on.
         let record_path = filters::split_channel_name(name).record_path;
-        if !self
+        // Own statement: the `!Send` guard must be down before the gate's
+        // `.await` below (see the `simple_pvs` field doc).
+        let known = self
             .inner
             .simple_pvs
-            .read()
-            .await
-            .contains_key(record_path.as_str())
-        {
+            .lock()
+            .contains_key(record_path.as_str());
+        if !known {
             return false;
         }
         !gate(record_path, peer).await
@@ -803,7 +947,7 @@ impl PvDatabase {
     /// Set an external PV resolver for CA/PVA link resolution.
     /// The resolver is called synchronously from link reads.
     pub async fn set_external_resolver(&self, resolver: ExternalPvResolver) {
-        *self.inner.external_resolver.write().await = Some(resolver);
+        self.inner.external_resolver.store(Some(Arc::new(resolver)));
     }
 
     /// Register a [`LinkSet`] under `scheme` (e.g. `"pva"` /
@@ -812,18 +956,18 @@ impl PvDatabase {
     /// the legacy [`ExternalPvResolver`]. Subsequent calls for the
     /// same scheme replace the previous binding.
     pub async fn register_link_set(&self, scheme: &str, lset: link_set::DynLinkSet) {
-        self.inner.link_sets.write().await.register(scheme, lset);
+        self.inner.link_sets.update(|r| r.register(scheme, lset));
     }
 
     /// Look up the lset for `scheme`, if any.
     pub async fn link_set(&self, scheme: &str) -> Option<link_set::DynLinkSet> {
-        self.inner.link_sets.read().await.get(scheme)
+        self.inner.link_sets.load().get(scheme)
     }
 
     /// Snapshot of every registered scheme name. Stable order for
     /// `dbpvxr` dumps.
     pub async fn registered_link_schemes(&self) -> Vec<String> {
-        let mut s = self.inner.link_sets.read().await.schemes();
+        let mut s = self.inner.link_sets.load().schemes();
         s.sort();
         s
     }
@@ -831,7 +975,7 @@ impl PvDatabase {
     /// Wait for the CA links to local records to report
     /// `is_connected() == true`. Mirrors `dbCa: iocInit wait for local CA
     /// links to connect` (epics-base PR #768/#856). The working set is
-    /// exactly [`Self::external_link_targets`]: only the CA facility's
+    /// exactly `Self::external_link_targets`: only the CA facility's
     /// local-target links — `pva://` links and non-local CA links connect
     /// in the background and are never waited on (pvxs parity).
     ///
@@ -858,21 +1002,27 @@ impl PvDatabase {
         if total == 0 {
             return (0, 0);
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        // `std::time::Instant`, not `tokio::time::Instant`: the sleep below
+        // is the runtime seam, whose clock is std's on both backends. Reading
+        // the deadline off tokio's clock made the two disagree — under
+        // `start_paused` tokio's clock advances only when the runtime decides
+        // to, while the RTEMS backend's timer thread follows the real one, so
+        // the loop could sleep against one clock and expire against another.
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let mut connected = 0usize;
             for (lset, name) in &targets {
-                if lset.is_connected(name).await {
+                if lset.is_connected(name) {
                     connected += 1;
                 }
             }
             if connected == total {
                 return (connected, total);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return (connected, total);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -899,15 +1049,12 @@ impl PvDatabase {
         // Only the CA facility participates — look it up directly rather
         // than iterating every registered scheme. `has_name_no_resolve`
         // is the `dbChannelTest` twin (target is a local record).
-        let Some(ca_lset) = ({
-            let registry = self.inner.link_sets.read().await;
-            registry.get("ca")
-        }) else {
+        let Some(ca_lset) = self.inner.link_sets.load().get("ca") else {
             return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for n in ca_lset.link_names().await {
-            if self.has_name_no_resolve(&n).await {
+        for n in ca_lset.link_names() {
+            if self.has_name_no_resolve(&n) {
                 targets.push((ca_lset.clone(), n));
             }
         }
@@ -915,7 +1062,7 @@ impl PvDatabase {
     }
 
     /// Names of the waited-on CA links (local-target, per
-    /// [`Self::external_link_targets`]) that are opened but not yet
+    /// `Self::external_link_targets`) that are opened but not yet
     /// connected. iocInit calls this after
     /// [`Self::wait_for_external_links`] times out so the
     /// "M/N connected" diagnostic can name the `N-M` it proceeded
@@ -924,7 +1071,7 @@ impl PvDatabase {
     pub async fn unconnected_external_links(&self) -> Vec<String> {
         let mut names = Vec::new();
         for (lset, name) in self.external_link_targets().await {
-            if !lset.is_connected(&name).await {
+            if !lset.is_connected(&name) {
                 names.push(name);
             }
         }
@@ -939,16 +1086,26 @@ impl PvDatabase {
     /// list — works across record types as long as they expose link
     /// strings via [`Record::get_field`].
     ///
+    /// `parsed` is the **post-`dbInitLink`** view, not the bare parse: each
+    /// link is mapped through [`PvDatabase::db_init_link_locality`], so a
+    /// `Db` link naming a record this IOC does not have is reported as the
+    /// `Ca` link C's `dbDbInitLink` → `dbCaAddLink` fallthrough makes it
+    /// (`dbLink.c:117-129`, `dbDbLink.c:94-96`). Every consumer — the CP
+    /// setup, the init open pass, `dbcaxr`, the pvalink install scan — then
+    /// sees one consistent answer to "is this link local or external"
+    /// instead of each re-deriving it. `link_string` is still the verbatim
+    /// field text.
+    ///
     /// Returns an empty Vec when the record doesn't exist.
-    pub async fn record_link_fields(
+    pub fn record_link_fields(
         &self,
         record_name: &str,
     ) -> Vec<(String, String, crate::server::record::ParsedLink)> {
-        let rec = match self.get_record(record_name).await {
+        let rec = match self.get_record(record_name) {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let inst = rec.read().await;
+        let inst = rec.read();
         let mut out = Vec::new();
         // Each field is parsed for ITS OWN link-field type: C `dbPutFieldLink`
         // passes `pfldDes->field_type` to `dbParseLink` (`dbAccess.c:1094`),
@@ -980,10 +1137,18 @@ impl PvDatabase {
         // is the single owner of "which fields on a record are links",
         // shared by `setup_cp_links` (CA CP/CPP) and the pvalink install
         // scan (PVA CP/CPP).
-        push("INP", &inst.common.inp, LinkFieldType::In, &mut out);
-        push("OUT", &inst.common.out, LinkFieldType::Out, &mut out);
-        push("TSEL", &inst.common.tsel, LinkFieldType::In, &mut out);
-        push("SDIS", &inst.common.sdis, LinkFieldType::In, &mut out);
+        //
+        // The field list itself comes from `COMMON_LINK_FIELDS`, the one
+        // owner of "which `dbCommon` fields are links and under which C link
+        // type" — `FLNK` present here but absent from that list (or vice
+        // versa) is exactly the divergence that left external forward links
+        // un-opened at init.
+        for (field, ftype) in crate::server::record::record_instance::COMMON_LINK_FIELDS {
+            let Some(raw) = inst.common_link_text(field) else {
+                continue;
+            };
+            push(field, raw, ftype, &mut out);
+        }
         // Record-specific multi-input links (INPA..INPL for
         // calc/calcout/sel/sub) and the CP-capable input link fields
         // (DOL family, NVL, SELL, SGNL).
@@ -999,6 +1164,18 @@ impl PvDatabase {
                 push(field, &s.as_str_lossy(), LinkFieldType::In, &mut out);
             }
         }
+        // Apply C `dbInitLink`'s locality fallthrough once, here, so no
+        // consumer re-derives it. Done after dropping the record-instance
+        // guard: the locality query reads the database's record map, and
+        // this is the only place that would otherwise hold an instance lock
+        // across it.
+        drop(inst);
+        for entry in &mut out {
+            entry.2 = self.db_init_link_locality(std::mem::replace(
+                &mut entry.2,
+                crate::server::record::ParsedLink::None,
+            ));
+        }
         out
     }
 
@@ -1008,48 +1185,107 @@ impl PvDatabase {
     /// may be the bare PV name (in which case `pva://` is assumed
     /// when an lset is registered for that scheme) or a fully
     /// scheme-prefixed string.
-    pub(crate) async fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
+    ///
+    /// # Cached read, then a staged open — C `dbCaGetLink`
+    ///
+    /// This is the record-processing read, so it reads the lset's
+    /// monitor-fed cache ([`LinkSet::get_cached_value`]) and never the
+    /// network: C `dbCaGetLink` (`dbCa.c:448-535`) copies out of
+    /// `pca->pgetNative`, which the CA monitor callback keeps fresh on the
+    /// `dbCaTask`, and returns -1 while the link is down (`dbCa.c:459-464`).
+    ///
+    /// A miss stages the link's OPEN on the same work queue the OUT writes
+    /// use — C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:735-800`) — and returns
+    /// `None` for this cycle. C's open happens at record init rather than at
+    /// first read, but in both designs the connect runs on the link task and
+    /// the reading record takes LINK/INVALID until the cache is warm.
+    pub(crate) fn resolve_external_pv(&self, name: &str) -> Option<EpicsValue> {
         // Try lsets first. We accept both "scheme://body" and the
         // bare body (stored in ParsedLink::Pva/Ca after the
-        // dispatch in record/link.rs).
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            // No prefix — try every registered lset in turn. The
-            // first one with a value for `name` wins. Schemes are
-            // single-digit so this is cheap.
-            let registry = self.inner.link_sets.read().await;
-            let lsets: Vec<_> = registry
-                .schemes()
-                .iter()
-                .filter_map(|s| registry.get(s))
-                .collect();
-            drop(registry);
-            for lset in lsets {
-                if let Some(v) = lset.get_value(name).await {
-                    return Some(v);
-                }
-            }
-            // Fall through to legacy resolver.
-            let resolver = self.inner.external_resolver.read().await.clone();
-            return match resolver {
-                Some(r) => r(name).await,
-                None => None,
-            };
-        };
-        let lset = self.inner.link_sets.read().await.get(scheme);
-        if let Some(lset) = lset {
-            if let Some(v) = lset.get_value(body).await {
+        // dispatch in record/link.rs). `Any` tries every registered
+        // lset in turn; the first one with a cached value wins.
+        let (target, body) = Self::split_external_link_name(name);
+        for lset in link_put_queue::resolve_lsets(&self.inner, &target) {
+            if let Some(v) = lset.get_cached_value(body) {
                 return Some(v);
             }
         }
-        let resolver = self.inner.external_resolver.read().await.clone();
+        self.stage_external_link_open_by_name(name);
+        // Fall through to legacy resolver, which is addressed with the
+        // caller's string verbatim (scheme prefix and all).
+        let resolver = self
+            .inner
+            .external_resolver
+            .load_full()
+            .map(|r| (*r).clone());
         match resolver {
-            Some(r) => r(name).await,
+            Some(r) => r(name),
             None => None,
         }
+    }
+
+    /// Split an external link's boundary name
+    /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
+    /// work-queue target plus the name the lset is addressed with.
+    ///
+    /// Single owner of the `ca://` / `pva://` prefix convention: the
+    /// cache-miss stage in [`Self::resolve_external_pv`] and the iocInit
+    /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
+    /// the same [`link_put_queue::LinkKey`] from the same link, or the
+    /// queue's once-per-link open would fire twice under two spellings.
+    fn split_external_link_name(name: &str) -> (link_put_queue::LinkTarget, &str) {
+        if let Some(rest) = name.strip_prefix("pva://") {
+            (link_put_queue::LinkTarget::Scheme("pva".to_string()), rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            (link_put_queue::LinkTarget::Scheme("ca".to_string()), rest)
+        } else {
+            (link_put_queue::LinkTarget::Any, name)
+        }
+    }
+
+    /// Stage the open of the external link named `name` — the boundary
+    /// form of [`Self::stage_external_link_open`], which splits the
+    /// scheme prefix and applies the "an lset must exist" gate.
+    ///
+    /// The gate matters because the queue's open state is terminal: an
+    /// open staged while no lset is registered would be serviced against
+    /// an empty lset list and marked `Done`, burning the link's one and
+    /// only connect. Returns true when this call is the one that staged
+    /// it (false when already staged, or when no lset addresses it).
+    pub(crate) fn stage_external_link_open_by_name(&self, name: &str) -> bool {
+        let (target, body) = Self::split_external_link_name(name);
+        if link_put_queue::resolve_lsets(&self.inner, &target).is_empty() {
+            return false;
+        }
+        self.stage_external_link_open(target, body)
+    }
+
+    /// Single owner of the "this external link needs opening" transition —
+    /// C `dbCaAddLink`'s `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`).
+    ///
+    /// Every caller routes through here so the open runs on the link work
+    /// owner and nowhere else; no path may call
+    /// [`link_set::LinkSet::connect_link`] directly from a record-processing
+    /// thread. Cheap and idempotent: the queue drops a repeat stage for a
+    /// link it has already opened.
+    ///
+    /// Private to the `database` module, and reached only through
+    /// [`Self::stage_external_link_open_by_name`], so no caller can skip the
+    /// scheme split or the lset gate and mint a `LinkKey` of its own shape.
+    fn stage_external_link_open(&self, target: link_put_queue::LinkTarget, name: &str) -> bool {
+        self.inner
+            .link_puts
+            .ensure_owner(std::sync::Arc::downgrade(&self.inner));
+        self.inner.link_puts.stage_open(link_put_queue::LinkKey {
+            target,
+            name: name.to_string(),
+        })
+    }
+
+    /// Number of external-link opens the work owner has completed —
+    /// diagnostic twin of [`Self::external_link_puts_completed`].
+    pub fn external_link_opens_completed(&self) -> u64 {
+        self.inner.link_puts.opened_count()
     }
 
     /// Add a simple PV with an initial value.
@@ -1065,18 +1301,14 @@ impl PvDatabase {
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
-    /// Add a simple PV that already has a [`WriteHook`] installed.
+    /// Add a simple PV that already has a [`crate::server::pv::WriteHook`] installed.
     ///
     /// Equivalent to `add_pv` followed by `find_pv` + `set_write_hook`,
     /// but the PV is constructed with the hook in place so it is
@@ -1086,7 +1318,7 @@ impl PvDatabase {
     /// `WRITE_NOTIFY` between the two awaits and hit the local
     /// `pv.set()` fallback path before the hook landed.
     ///
-    /// Returns `Err` on duplicate name (see [`add_pv`]).
+    /// Returns `Err` on duplicate name (see [`Self::add_pv`]).
     pub async fn add_pv_with_hook(
         &self,
         name: &str,
@@ -1130,8 +1362,8 @@ impl PvDatabase {
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
@@ -1140,11 +1372,7 @@ impl PvDatabase {
         if let Some(read) = read_hook {
             pv.set_read_hook(read);
         }
-        self.inner
-            .simple_pvs
-            .write()
-            .await
-            .insert(name.to_string(), pv);
+        self.inner.simple_pvs.lock().insert(name.to_string(), pv);
         Ok(())
     }
 
@@ -1158,12 +1386,12 @@ impl PvDatabase {
     /// "already registered as an alias" even though its target is
     /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
         // cleanup needed for simple-PV removal.
-        self.inner.simple_pvs.write().await.remove(name)
+        self.inner.simple_pvs.lock().remove(name)
     }
 
     /// Enter the LOAD phase: records are being created and the database is not
@@ -1214,17 +1442,71 @@ impl PvDatabase {
     /// would do it has not been polled. Before any load, and once `iocInit` has
     /// run, it is spawned at once — which is what a runtime `special()` link
     /// re-point needs.
+    ///
+    /// # `record` is what the init classifies, and it must exist first
+    ///
+    /// A record's first classification is issued from `set_async_context`,
+    /// which [`Self::add_loaded_record`] calls *before* it inserts the record
+    /// into `records` — the handle has to exist for `run_init_passes` to use
+    /// it. So on the spawn-at-once paths the init would race its own record's
+    /// registration and could post fields for a record the database does not
+    /// have yet.
+    ///
+    /// This used to be papered over by starting each such future with a
+    /// `tokio::task::yield_now()`, on the assumption that yielding hands the
+    /// thread back to the in-progress `add_record`. That assumption holds only
+    /// on a current-thread runtime: on a multi-thread one the yield can return
+    /// before the insert lands, and under `rtems-exec-model` the init runs on
+    /// the background executor's own thread, where a yield is not a
+    /// synchronisation with `add_record` at all — it is nothing. The tests that
+    /// read a link-status field right after `add_record` therefore failed by
+    /// timing, with a different test failing per run.
+    ///
+    /// Now the ordering is a property of the data: an init naming a record that
+    /// is not registered is *parked* under that name, and the only thing that
+    /// can release it is the insert of that name. No yield, no window, and the
+    /// same code path on every backend.
     pub(crate) fn schedule_record_init(
         &self,
+        record: &str,
         init: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        if !self.inner.records.read().contains_key(record) {
+            self.inner
+                .record_init_waiting
+                .lock()
+                .unwrap()
+                .entry(record.to_string())
+                .or_default()
+                .push(Box::pin(init));
+            return;
+        }
+        self.dispatch_record_init(Box::pin(init));
+    }
+
+    /// Queue or spawn an init whose record is known to be registered.
+    fn dispatch_record_init(&self, init: RecordInit) {
         let mut phase = self.inner.init_phase.lock().unwrap();
         match &mut *phase {
-            DbInitPhase::Loading(queued) => queued.push(Box::pin(init)),
+            DbInitPhase::Loading(queued) => queued.push(init),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
-                tokio::spawn(init);
+                crate::runtime::task::spawn(init);
             }
+        }
+    }
+
+    /// Release every init parked for `record` — called by the one site that
+    /// registers the name, immediately after the insert that makes it real.
+    fn release_record_inits(&self, record: &str) {
+        let parked = self
+            .inner
+            .record_init_waiting
+            .lock()
+            .unwrap()
+            .remove(record);
+        for init in parked.into_iter().flatten() {
+            self.dispatch_record_init(init);
         }
     }
 
@@ -1286,7 +1568,7 @@ impl PvDatabase {
     /// Taking the loaded fields here is what makes C's ordering hold by
     /// construction: there is no window in which the init passes can observe a
     /// record whose `.db` fields have not landed, because the record is not
-    /// reachable until they have. [`RecordInstance::run_init_passes`] is
+    /// reachable until they have. `RecordInstance::run_init_passes` is
     /// crate-private for the same reason — the sink is the only caller.
     pub async fn add_loaded_record(
         &self,
@@ -1294,8 +1576,8 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        self.check_name_free(name).await?;
+        let _gate = self.inner.registration_mutex.lock();
+        self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
         // post out-of-band field updates / wire completion-driven re-entry
@@ -1317,7 +1599,7 @@ impl PvDatabase {
         // loaded so the common case pays no Arc clone. A record created before
         // its table is loaded is re-installed by `add_breaktables`.
         {
-            let snapshot = self.inner.breaktable_registry.read().await.clone();
+            let snapshot = self.inner.breaktable_registry.load_full();
             if !snapshot.is_empty() {
                 instance.record.install_breaktable_registry(snapshot);
             }
@@ -1364,11 +1646,14 @@ impl PvDatabase {
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner
-            .records
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(RwLock::new(instance)));
+        self.inner.records.write().insert(
+            name.to_string(),
+            Arc::new(parking_lot::RwLock::new(instance)),
+        );
+        // The record is reachable from this line on, so anything its
+        // `set_async_context` parked above may now run. This is the only
+        // release site because this is the only site that registers the name.
+        self.release_record_inits(name);
 
         // Assign a monotonic load-order sequence — the scan-index
         // secondary sort key, so same-PHAS records keep load order.
@@ -1376,19 +1661,15 @@ impl PvDatabase {
             .inner
             .load_order_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner
-            .load_order
-            .write()
-            .await
-            .insert(name.to_string(), seq);
+        self.inner.load_order.update(|m| {
+            m.insert(name.to_string(), seq);
+        });
 
         if let Some(list) = scan.scan_list() {
             self.inner
                 .scan_index
-                .write()
-                .await
-                .entry(list)
-                .or_default()
+                .bucket(list)
+                .lock()
                 .insert((phas, seq, name.to_string()));
         }
         Ok(())
@@ -1398,12 +1679,17 @@ impl PvDatabase {
     /// three namespaces. Caller MUST hold `registration_mutex` so the
     /// peek-then-insert sequence is atomic — without that, two tasks
     /// can both see the name as free and race the insert.
-    async fn check_name_free(&self, name: &str) -> CaResult<()> {
-        let kind = if self.inner.simple_pvs.read().await.contains_key(name) {
+    ///
+    /// Synchronous: all three namespaces are blocking locks now, so this peek
+    /// makes no suspension point inside the `registration_mutex` hold — which
+    /// is what lets that gate become a `PriorityInheritanceMutex` whose `!Send`
+    /// guard may not cross an `.await`.
+    fn check_name_free(&self, name: &str) -> CaResult<()> {
+        let kind = if self.inner.simple_pvs.lock().contains_key(name) {
             Some("simple PV")
-        } else if self.inner.records.read().await.contains_key(name) {
+        } else if self.inner.records.read().contains_key(name) {
             Some("record")
-        } else if self.inner.aliases.read().await.contains_key(name) {
+        } else if self.inner.aliases.read().contains_key(name) {
             Some("alias")
         } else {
             None
@@ -1429,14 +1715,14 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
-        let _gate = self.inner.registration_mutex.lock().await;
+        let _gate = self.inner.registration_mutex.lock();
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
-        let removed = self.inner.records.write().await.remove(name);
+        let removed = self.inner.records.write().remove(name);
         let Some(rec_arc) = removed else {
             return false;
         };
         let scan = {
-            let inst = rec_arc.read().await;
+            let inst = rec_arc.read();
             inst.common.scan
         };
 
@@ -1444,33 +1730,33 @@ impl PvDatabase {
         // name only — PHAS and load_order are not needed and may be
         // stale relative to the entry actually present.
         if let Some(list) = scan.scan_list() {
-            let mut idx = self.inner.scan_index.write().await;
-            if let Some(set) = idx.get_mut(&list) {
-                set.retain(|(_, _, n)| n != name);
-                if set.is_empty() {
-                    idx.remove(&list);
-                }
-            }
+            self.inner
+                .scan_index
+                .bucket(list)
+                .lock()
+                .retain(|(_, _, n)| n != name);
         }
 
         // 2b) Drop the load-order entry.
-        self.inner.load_order.write().await.remove(name);
+        self.inner.load_order.update(|m| {
+            m.remove(name);
+        });
 
         // 3) Drop from CP-link tables. Removed both as source (channel
         // change → trigger targets) and as target (other channels'
         // CP lists may still reference this name).
-        let mut cp = self.inner.cp_links.write().await;
-        cp.remove(name);
-        for targets in cp.values_mut() {
-            targets.retain(|t| t.record != name);
-        }
-        drop(cp);
+        self.inner.cp_links.update(|cp| {
+            cp.remove(name);
+            for targets in cp.values_mut() {
+                targets.retain(|t| t.record != name);
+            }
+        });
 
         // 4) Purge aliases that pointed AT the
         // removed record. Otherwise `find_pv("ALT")` returns None
         // (target gone) but `add_pv("ALT", ...)` still fails with
         // "already registered as an alias" — orphan blocks reuse.
-        let mut aliases = self.inner.aliases.write().await;
+        let mut aliases = self.inner.aliases.write();
         aliases.retain(|_alias, target| target != name);
 
         true
@@ -1491,17 +1777,23 @@ impl PvDatabase {
         let record_path = filters::split_channel_name(name).record_path;
         let (base, _field) = parse_pv_name(&record_path);
 
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(record_path.as_str()) {
-            return Some(PvEntry::Simple(pv.clone()));
+        let simple = self
+            .inner
+            .simple_pvs
+            .lock()
+            .get(record_path.as_str())
+            .cloned();
+        if let Some(pv) = simple {
+            return Some(PvEntry::Simple(pv));
         }
-        if let Some(rec) = self.inner.records.read().await.get(base) {
+        if let Some(rec) = self.inner.records.read().get(base) {
             return Some(PvEntry::Record(rec.clone()));
         }
         // Alias resolve (epics-base PR #336): the alternate name maps
         // to a canonical record name. Look up the real record after
         // translating the base.
-        if let Some(target) = self.inner.aliases.read().await.get(base).cloned() {
-            if let Some(rec) = self.inner.records.read().await.get(&target) {
+        if let Some(target) = self.inner.aliases.read().get(base).cloned() {
+            if let Some(rec) = self.inner.records.read().get(&target) {
                 return Some(PvEntry::Record(rec.clone()));
             }
         }
@@ -1521,25 +1813,24 @@ impl PvDatabase {
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock().await;
-        if !self.inner.records.read().await.contains_key(target) {
+        let _gate = self.inner.registration_mutex.lock();
+        if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
             )));
         }
-        self.check_name_free(alias).await?;
+        self.check_name_free(alias)?;
         self.inner
             .aliases
             .write()
-            .await
             .insert(alias.to_string(), target.to_string());
         Ok(())
     }
 
     /// Resolve an alias to its target record name, or `None` when the
     /// name is not an alias.
-    pub async fn resolve_alias(&self, name: &str) -> Option<String> {
-        self.inner.aliases.read().await.get(name).cloned()
+    pub fn resolve_alias(&self, name: &str) -> Option<String> {
+        self.inner.aliases.read().get(name).cloned()
     }
 
     /// Queue an iocsh command line for post-PINI execution.
@@ -1561,7 +1852,7 @@ impl PvDatabase {
     }
 
     /// Internal: synchronous existence check without resolver.
-    async fn has_name_no_resolve(&self, name: &str) -> bool {
+    fn has_name_no_resolve(&self, name: &str) -> bool {
         // strip the channel-filter suffix before lookup so a
         // filtered channel (`SP.{"arr":...}` / `REC.{"dbnd":{"d":0.5}}`)
         // resolves to its underlying PV at UDP-search time. This is the
@@ -1573,19 +1864,18 @@ impl PvDatabase {
         if self
             .inner
             .simple_pvs
-            .read()
-            .await
+            .lock()
             .contains_key(record_path.as_str())
         {
             return true;
         }
-        if self.inner.records.read().await.contains_key(base) {
+        if self.inner.records.read().contains_key(base) {
             return true;
         }
         // Alias entry exists and points to a live record
         // (epics-base PR #336).
-        if let Some(target) = self.inner.aliases.read().await.get(base) {
-            return self.inner.records.read().await.contains_key(target);
+        if let Some(target) = self.inner.aliases.read().get(base) {
+            return self.inner.records.read().contains_key(target);
         }
         false
     }
@@ -1622,7 +1912,7 @@ impl PvDatabase {
             return Some(entry);
         }
         // Try the search resolver
-        let resolver = self.inner.search_resolver.read().await.clone();
+        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
         if let Some(r) = resolver {
             if r(name.to_string(), peer).await {
                 return self.find_entry_no_resolve(name).await;
@@ -1646,7 +1936,7 @@ impl PvDatabase {
     /// responder passes the datagram source address so the gateway can
     /// apply host-scoped `.pvlist` admission.
     pub async fn has_name_from(&self, name: &str, peer: Option<std::net::SocketAddr>) -> bool {
-        if self.has_name_no_resolve(name).await {
+        if self.has_name_no_resolve(name) {
             // Same per-request gate as `find_entry_from`: a cached simple
             // PV the gateway's host/state admission denies must answer
             // does-not-exist at search time. Records/aliases bypass.
@@ -1655,10 +1945,10 @@ impl PvDatabase {
             }
             return true;
         }
-        let resolver = self.inner.search_resolver.read().await.clone();
+        let resolver = self.inner.search_resolver.load_full().map(|r| (*r).clone());
         if let Some(r) = resolver {
             if r(name.to_string(), peer).await {
-                return self.has_name_no_resolve(name).await;
+                return self.has_name_no_resolve(name);
             }
         }
         false
@@ -1666,10 +1956,7 @@ impl PvDatabase {
 
     /// Look up a simple PV by name (backward-compatible).
     pub async fn find_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        if let Some(pv) = self.inner.simple_pvs.read().await.get(name) {
-            return Some(pv.clone());
-        }
-        None
+        self.inner.simple_pvs.lock().get(name).cloned()
     }
 
     /// Get a record Arc by name. Alias-aware (epics-base PR #336):
@@ -1682,19 +1969,22 @@ impl PvDatabase {
     /// Use [`Self::get_record_no_resolve`] when the caller already
     /// holds a canonical name and wants to suppress the alias path
     /// (e.g. to detect alias collisions during builder wiring).
-    pub async fn get_record(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
-        if let Some(rec) = self.inner.records.read().await.get(name).cloned() {
+    pub fn get_record(&self, name: &str) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
+        if let Some(rec) = self.inner.records.read().get(name).cloned() {
             return Some(rec);
         }
-        let target = self.inner.aliases.read().await.get(name).cloned()?;
-        self.inner.records.read().await.get(&target).cloned()
+        let target = self.inner.aliases.read().get(name).cloned()?;
+        self.inner.records.read().get(&target).cloned()
     }
 
     /// Strict variant of [`Self::get_record`] — does NOT consult the
     /// alias table. Returns `Some` only when a canonical record with
     /// that exact name exists.
-    pub async fn get_record_no_resolve(&self, name: &str) -> Option<Arc<RwLock<RecordInstance>>> {
-        self.inner.records.read().await.get(name).cloned()
+    pub fn get_record_no_resolve(
+        &self,
+        name: &str,
+    ) -> Option<Arc<parking_lot::RwLock<RecordInstance>>> {
+        self.inner.records.read().get(name).cloned()
     }
 
     /// Every record name, in **database load order** — the single owner of
@@ -1724,10 +2014,22 @@ impl PvDatabase {
     /// exists; `add_record` is the only insertion path — would sort last by
     /// name rather than nondeterministically.
     pub async fn all_record_names(&self) -> Vec<String> {
-        // Lock order records → load_order, matching `add_record`/`remove_record`.
-        let records = self.inner.records.read().await;
-        let load_order = self.inner.load_order.read().await;
-        let mut names: Vec<String> = records.keys().cloned().collect();
+        // Lock order records → load_order (matching `add_record`/`remove_record`):
+        // the `records` map is a sync `parking_lot::RwLock` now, so its guard is
+        // `!Send` and MUST NOT be held across the async `load_order` read. Snapshot
+        // the keys under the records guard, release it (block close), then await
+        // load_order — neither lock is ever held while waiting on the other, so the
+        // records→load_order order is honoured without an AB-BA against add_record.
+        // The two reads are no longer one atomic snapshot: a record inserted between
+        // them is absent from `load_order` and sorts last by name via the
+        // `unwrap_or(u64::MAX)` fallback — the same degradation already defined for a
+        // sequence-less record, and every whole-database walk is racy against a
+        // concurrent add/remove regardless.
+        let mut names: Vec<String> = {
+            let records = self.inner.records.read();
+            records.keys().cloned().collect()
+        };
+        let load_order = self.inner.load_order.load();
         names.sort_by(|a, b| {
             let seq = |n: &String| load_order.get(n).copied().unwrap_or(u64::MAX);
             seq(a).cmp(&seq(b)).then_with(|| a.cmp(b))
@@ -1739,16 +2041,16 @@ impl PvDatabase {
     /// Mirrors the alias-half of base's `dbFirstRecord` iteration —
     /// `dbgrep` / `dbglob` / `dbsr` walk both record names and
     /// aliases when matching a glob.
-    pub async fn all_alias_names(&self) -> Vec<String> {
-        self.inner.aliases.read().await.keys().cloned().collect()
+    pub fn all_alias_names(&self) -> Vec<String> {
+        self.inner.aliases.read().keys().cloned().collect()
     }
 
     /// Return every alias that points at `canonical`. Sorted for
     /// stable output; empty when the record has no aliases. Used by
     /// `dbpr` to surface alias-form names so admins can see how
     /// clients may reach the record.
-    pub async fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
-        let aliases = self.inner.aliases.read().await;
+    pub fn aliases_for_record(&self, canonical: &str) -> Vec<String> {
+        let aliases = self.inner.aliases.read();
         let mut hits: Vec<String> = aliases
             .iter()
             .filter_map(|(alias, target)| {
@@ -1765,7 +2067,7 @@ impl PvDatabase {
 
     /// Get all simple PV names.
     pub async fn all_simple_pv_names(&self) -> Vec<String> {
-        self.inner.simple_pvs.read().await.keys().cloned().collect()
+        self.inner.simple_pvs.lock().keys().cloned().collect()
     }
 }
 
@@ -1949,13 +2251,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl link_set::LinkSet for DelayedConnectLset {
-        async fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &str) -> bool {
             tokio::time::Instant::now() >= self.connect_at
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
             None
         }
-        async fn link_names(&self) -> Vec<String> {
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn link_names(&self) -> Vec<String> {
             self.names.clone()
         }
     }
@@ -2119,8 +2424,8 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
-        let via_canonical = db.get_record("TARGET").await;
-        let via_alias = db.get_record("ALIAS").await;
+        let via_canonical = db.get_record("TARGET");
+        let via_alias = db.get_record("ALIAS");
         assert!(via_canonical.is_some());
         assert!(via_alias.is_some(), "get_record must resolve alias");
         // Both calls return the same Arc (pointer equality).
@@ -2146,8 +2451,8 @@ mod tests {
         rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
         db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
 
-        let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let arc = db.get_record("AI:BPT").unwrap();
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
@@ -2177,8 +2482,8 @@ mod tests {
         .unwrap();
         db.add_breaktables(vec![ramp]).await;
 
-        let arc = db.get_record("AI:BPT").await.unwrap();
-        let mut inst = arc.write().await;
+        let arc = db.get_record("AI:BPT").unwrap();
+        let mut inst = arc.write();
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
         inst.record.process().unwrap();
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
@@ -2197,9 +2502,9 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
-        assert!(db.get_record_no_resolve("TARGET").await.is_some());
+        assert!(db.get_record_no_resolve("TARGET").is_some());
         assert!(
-            db.get_record_no_resolve("ALIAS").await.is_none(),
+            db.get_record_no_resolve("ALIAS").is_none(),
             "get_record_no_resolve must not follow alias table"
         );
     }
@@ -2229,12 +2534,12 @@ mod tests {
         db.register_cp_link("SRC_ALIAS", "DST_ALIAS", false).await;
 
         // Lookup must succeed via the canonical source name.
-        let targets = db.get_cp_targets("SRC_REAL").await;
+        let targets = db.get_cp_targets("SRC_REAL");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].record, "DST_REAL");
         assert!(!targets[0].passive_only);
         // Alias-keyed lookup must NOT have been registered.
-        let alias_lookup = db.get_cp_targets("SRC_ALIAS").await;
+        let alias_lookup = db.get_cp_targets("SRC_ALIAS");
         assert!(alias_lookup.is_empty());
     }
 
@@ -2259,13 +2564,13 @@ mod tests {
 
         // Sorted, only TARGET's aliases.
         assert_eq!(
-            db.aliases_for_record("TARGET").await,
+            db.aliases_for_record("TARGET"),
             vec!["AA".to_string(), "ZZ".to_string()]
         );
         // OTHER's alone.
-        assert_eq!(db.aliases_for_record("OTHER").await, vec!["MM".to_string()]);
+        assert_eq!(db.aliases_for_record("OTHER"), vec!["MM".to_string()]);
         // Unknown record → empty, not None.
-        assert!(db.aliases_for_record("MISSING").await.is_empty());
+        assert!(db.aliases_for_record("MISSING").is_empty());
     }
 
     #[tokio::test]
@@ -2280,7 +2585,7 @@ mod tests {
         db.add_alias("ALIAS_A", "TARGET").await.unwrap();
         db.add_alias("ALIAS_B", "TARGET").await.unwrap();
 
-        let mut aliases = db.all_alias_names().await;
+        let mut aliases = db.all_alias_names();
         aliases.sort();
         assert_eq!(aliases, vec!["ALIAS_A".to_string(), "ALIAS_B".to_string()]);
         // Canonical names are NOT returned here.
@@ -2451,7 +2756,7 @@ mod tests {
         db.add_pv("ALT1", EpicsValue::Double(0.0)).await.unwrap();
         db.add_pv("ALT2", EpicsValue::Double(0.0)).await.unwrap();
         // The unrelated alias must survive.
-        assert_eq!(db.resolve_alias("KEEPER").await, Some("OTHER".to_string()));
+        assert_eq!(db.resolve_alias("KEEPER"), Some("OTHER".to_string()));
     }
 
     /// `add_alias` must reject collisions with
@@ -2578,11 +2883,11 @@ mod tests {
         // Device-support INP lives in `common.inp` (DBF_INLINK), the
         // exact storage a `field_list()` String scan cannot reach.
         {
-            let rec = db.get_record("AI").await.unwrap();
-            rec.write().await.common.inp = "pva://mini:current?proc=CP".to_string();
+            let rec = db.get_record("AI").unwrap();
+            rec.write().common.inp = "pva://mini:current?proc=CP".to_string();
         }
 
-        let links = db.record_link_fields("AI").await;
+        let links = db.record_link_fields("AI");
         let inp = links
             .iter()
             .find(|(f, _, _)| f == "INP")

@@ -20,6 +20,8 @@
 //! Pre-fix the port re-applied the constant on every process, so the caput was
 //! destroyed on the next scan and A read 0 before the first process.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::printf::PrintfRecord;
@@ -29,8 +31,8 @@ use epics_base_rs::types::EpicsValue;
 use std::collections::HashSet;
 
 async fn field(db: &PvDatabase, rec: &str, f: &str) -> EpicsValue {
-    let r = db.get_record(rec).await.unwrap();
-    let inst = r.read().await;
+    let r = db.get_record(rec).unwrap();
+    let inst = r.read();
     inst.record.get_field(f).unwrap()
 }
 

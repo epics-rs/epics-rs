@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use crate::error::{CaError, CaResult};
@@ -159,6 +161,33 @@ pub type InpResolver = std::sync::Arc<
         + Sync,
 >;
 
+/// The shared Access Security policy cell — one per server, cloned into every
+/// [`AccessGate`] built from it.
+///
+/// Lock-free by construction: a reader takes an `Arc` snapshot of the policy
+/// and an operator reload publishes a whole new one. This is
+/// `doc/rtems-priority-locks-design.md` §3 row **L9**, and it is the ACF cell
+/// `epics-pva-rs` and `epics-ca-rs` share. It used to be a
+/// `tokio::sync::RwLock` whose read guard was held across the *whole* check —
+/// including the async ASG resolve and every CALC `INP*` resolve — so a
+/// preempted low-priority `CAS-client` / `PVAS-conn` thread could hold an
+/// operator reload, and any higher-priority checker behind it, off for an
+/// unbounded, kernel-invisible time.
+///
+/// The observable check semantics are unchanged: an in-flight check still
+/// completes against the policy it started with, because it holds that `Arc`
+/// for its whole body. Only the writer changes — it publishes instead of
+/// waiting for in-flight readers.
+pub type AcfCell = std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>;
+
+/// Build a shared [`AcfCell`] holding `initial`. The single construction
+/// point, so no caller has to name `arc_swap` or get the `Arc` nesting right.
+pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
+    std::sync::Arc::new(arc_swap::ArcSwapOption::new(
+        initial.map(std::sync::Arc::new),
+    ))
+}
+
 #[derive(Clone)]
 enum AccessGateInner {
     /// ACF cell + resolver. The cell may hold `None` for "no
@@ -166,7 +195,7 @@ enum AccessGateInner {
     /// (level = `ReadWrite`) so legacy behaviour is preserved when
     /// the operator hasn't loaded an ACF file.
     Required {
-        acf: std::sync::Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+        acf: AcfCell,
         resolver: AsgAslResolver,
     },
     /// Always-permissive. Used by sources that have no security
@@ -181,10 +210,7 @@ impl AccessGate {
     /// counter; use [`Self::required_with_version`] to share the
     /// counter with the owning server (so its `reload_acf_from`
     /// can signal the same generation bump this gate observes).
-    pub fn required(
-        acf: std::sync::Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
-        resolver: AsgAslResolver,
-    ) -> Self {
+    pub fn required(acf: AcfCell, resolver: AsgAslResolver) -> Self {
         Self::required_with_version(
             acf,
             resolver,
@@ -198,7 +224,7 @@ impl AccessGate {
     /// `clear_acf` so monitor tasks holding the gate observe a
     /// version bump on their next event.
     pub fn required_with_version(
-        acf: std::sync::Arc<tokio::sync::RwLock<Option<AccessSecurityConfig>>>,
+        acf: AcfCell,
         resolver: AsgAslResolver,
         acl_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
@@ -314,10 +340,9 @@ impl AccessGate {
         let (level, rule_was_trap) = match &self.inner {
             AccessGateInner::Open => (AccessLevel::ReadWrite, false),
             AccessGateInner::Required { acf, resolver } => {
-                let guard = acf.read().await;
-                match *guard {
+                match acf.load_full() {
                     None => (AccessLevel::ReadWrite, false),
-                    Some(ref cfg) => {
+                    Some(cfg) => {
                         let (asg, asl) = resolver(pv_name.clone()).await;
                         // pre-resolve the ASG's INP* links up
                         // front — the resolver is async (it reads the
@@ -397,7 +422,7 @@ mod access_checked_tests {
 
     #[tokio::test]
     async fn required_gate_with_no_acf_attached_is_permissive() {
-        let cell = Arc::new(tokio::sync::RwLock::new(None));
+        let cell = crate::server::access_security::new_acf_cell(None);
         let resolver: AsgAslResolver =
             Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let gate = AccessGate::required(cell, resolver);
@@ -416,7 +441,7 @@ ASG(DEFAULT) {
 "#,
         )
         .unwrap();
-        let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let resolver: AsgAslResolver =
             Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
         let gate = AccessGate::required(cell, resolver);
@@ -1462,18 +1487,18 @@ fn skip_unknown_top_level_block(
 static AS_CHECK_CLIENT_IP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Read the [`AS_CHECK_CLIENT_IP`] mode.
+/// Read the `AS_CHECK_CLIENT_IP` mode.
 pub fn as_check_client_ip() -> bool {
     AS_CHECK_CLIENT_IP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Set the [`AS_CHECK_CLIENT_IP`] mode. C exposes this as an iocsh
+/// Set the `AS_CHECK_CLIENT_IP` mode. C exposes this as an iocsh
 /// *variable* (`var asCheckClientIP 1`, registered in
 /// `libComRegister.c:476`); this port has no iocsh variable mechanism, so
 /// the closest idiom is the `asCheckClientIP <0|1>` iocsh command that
 /// calls this.
 ///
-/// Ordering is C's: [`hag_members`] reads the flag when the ACF is
+/// Ordering is C's: `hag_members` reads the flag when the ACF is
 /// *parsed*, so — exactly as in C — it must be set **before** `asInit`,
 /// or the HAG entries are stored in the wrong form.
 pub fn set_as_check_client_ip(on: bool) {
@@ -2888,7 +2913,7 @@ ASG(LOCKED)    { }
         use std::sync::Arc;
         let cfg =
             parse_acf(r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
-        let cell = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
 

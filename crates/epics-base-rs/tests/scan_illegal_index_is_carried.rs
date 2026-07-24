@@ -35,6 +35,8 @@
 //! in `menu_common_field_scan_pini.rs`. `caput` sends a numeric put for an enum
 //! channel whose text matches no choice, which is the row measured above.)
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::ScanType;
 use epics_base_rs::types::EpicsValue;
@@ -55,7 +57,7 @@ async fn db_with_scanned_ai() -> PvDatabase {
 }
 
 async fn scan_index(db: &PvDatabase) -> u16 {
-    match db.get_pv("REC.SCAN").await.unwrap() {
+    match db.get_pv("REC.SCAN").unwrap() {
         EpicsValue::Enum(v) => v,
         other => panic!("SCAN is a DBF_MENU: {other:?}"),
     }
@@ -115,9 +117,9 @@ async fn the_top_of_the_enum_is_stored_and_is_not_passive() {
     assert_eq!(scan_index(&db).await, 65535);
     assert!(!scanned_anywhere(&db, "REC").await);
 
-    let rec = db.get_record("REC").await.unwrap();
+    let rec = db.get_record("REC").unwrap();
     assert_ne!(
-        rec.read().await.common.scan,
+        rec.read().common.scan,
         ScanType::Passive,
         "an illegal SCAN is not Passive: C's `dbPutField` scan==0 test \
          (dbAccess.c:1263) is literal, so the record is NOT put-processable"
@@ -152,14 +154,14 @@ async fn sscn_carries_an_illegal_index_and_only_65535_is_the_sentinel() {
     db.put_record_field_from_ca("REC", "SSCN", EpicsValue::Enum(10))
         .await
         .unwrap();
-    let EpicsValue::Enum(v) = db.get_pv("REC.SSCN").await.unwrap() else {
+    let EpicsValue::Enum(v) = db.get_pv("REC.SSCN").unwrap() else {
         panic!("SSCN is a DBF_MENU")
     };
     assert_eq!(v, 10);
 
-    let rec = db.get_record("REC").await.unwrap();
+    let rec = db.get_record("REC").unwrap();
     assert!(
-        !rec.read().await.common.sscn.is_unset(),
+        !rec.read().common.sscn.is_unset(),
         "recGbl's simulation helpers test `*psscn == USHRT_MAX` and nothing else"
     );
 }

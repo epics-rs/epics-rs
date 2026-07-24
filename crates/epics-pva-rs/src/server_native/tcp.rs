@@ -1,6 +1,6 @@
-//! TCP listener + per-connection handler.
+//! Per-connection handler.
 //!
-//! For each accepted client we spawn one task that:
+//! For each accepted client [`super::accept`] runs one task that:
 //!
 //! 1. Sends SET_BYTE_ORDER + CONNECTION_VALIDATION request
 //! 2. Reads client's CONNECTION_VALIDATION response (auth)
@@ -9,21 +9,32 @@
 //!    GET_FIELD / DESTROY_REQUEST / DESTROY_CHANNEL).
 //!
 //! Channel state is kept per-connection (a `HashMap<sid, ChannelState>`).
+//!
+//! This module owns no socket. The connection enters through
+//! `handle_connection_io`, whose reader and writer are
+//! `Box<dyn AsyncRead/AsyncWrite>` trait objects — which driver produced
+//! them (the host accept loop in [`super::accept`], or the blocking
+//! thread-per-client driver coming with RTEMS phase 6 item 7) is not
+//! visible from here.
+//!
+//! No socket type is named anywhere in this file's production scope, and
+//! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
+
+// RTEMS-EXEC-MODEL-ALLOW(94): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
+use crate::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
+use crate::peer_buf::try_extend;
 use crate::proto::{
     BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
     QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
@@ -34,8 +45,17 @@ use crate::pvdata::encode::{
 };
 use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 
-use super::runtime::PvaServerConfig;
+use super::config::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
+
+// The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
+// these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
+// every existing caller and doc link. `accept` owns the listener socket and is
+// host-only, so the re-exports carry its gate — this is the shim, not the
+// protocol, and gating it is what the comment written here at the split
+// already prescribed for the merge with `phase6/pva-rtems-dep-gate`.
+#[cfg(not(target_os = "rtems"))]
+pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
 // 3b641bed) so a value used as the wrong ID type fails loudly instead of
@@ -83,7 +103,7 @@ struct PipelineOptions {
     enabled: bool,
     /// The NEGOTIATED per-op queue limit — pvxs `MonitorOp::limit`
     /// (`servermon.cpp:66`), seeded from
-    /// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]
+    /// [`crate::server_native::config::PvaServerConfig::monitor_queue_limit`]
     /// and overridden by a valid (`>= 2`) `record._options.queueSize`
     /// whether or not pipeline is enabled (`op->limit = qSize` sits
     /// OUTSIDE the `if(op->pipeline)` block, `:533-543`).
@@ -547,7 +567,7 @@ fn parse_monitor_init_nack(
 ///
 /// `default_limit` is the limit a fresh `MonitorOp` starts with (pvxs
 /// `limit=4u`, `servermon.cpp:66`; here
-/// [`crate::server_native::runtime::PvaServerConfig::monitor_queue_limit`]).
+/// [`crate::server_native::config::PvaServerConfig::monitor_queue_limit`]).
 /// Every returned [`PipelineOptions`] names a resolved
 /// [`PipelineOptions::queue_size`], so no caller re-derives the depth.
 ///
@@ -780,7 +800,7 @@ impl std::fmt::Debug for ChannelState {
 /// Shared abort guard: when the last clone is dropped (HashMap removal,
 /// connection end, ...), the spawned task is aborted automatically.
 #[derive(Debug)]
-struct AbortOnDrop(tokio::task::AbortHandle);
+struct AbortOnDrop(epics_base_rs::runtime::task::TaskAbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -816,7 +836,7 @@ fn finish_exec_data_task(
     ch: &mut ChannelState,
     ioid: u32,
     subcmd: u8,
-    abort: tokio::task::AbortHandle,
+    abort: epics_base_rs::runtime::task::TaskAbortHandle,
 ) {
     if let Some(op_mut) = ch.ops.get_mut(&ioid) {
         if subcmd & QosFlags::DESTROY != 0 {
@@ -1384,9 +1404,24 @@ impl MonitorPipelineCredit<'_> {
         let Some(w) = self.window else {
             return;
         };
-        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            Some(cur.saturating_sub(1))
-        });
+        // Saturating decrement, spelled as the CAS loop `fetch_update` was
+        // compiling to anyway. Not the deprecation's suggested rename:
+        // `try_update` — and its infallible sibling `update` — are unstable
+        // (`atomic_try_update`, rust#135894), so on this workspace's pinned
+        // 1.94 toolchain neither is reachable. `fetch_sub` is not the answer
+        // either: it wraps to `u32::MAX` at zero, which would hand the emit
+        // gate four billion credits at exactly the moment the window is
+        // empty. Same shape `epics-ca-rs` uses to drain `pending_frames`
+        // (`client/transport.rs`), and for the same missing primitive.
+        let mut cur = w.load(Ordering::Relaxed);
+        while let Err(observed) = w.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            cur = observed;
+        }
         // LOW fires when consuming this credit drained the
         // window to `<= low` (pvxs `onLowMark`).
         // `cross_watermark` checks-and-marks the above→below crossing AND
@@ -1484,31 +1519,58 @@ impl Drop for WatermarkWithdrawOnDrop {
     }
 }
 
-/// Drive a per-op MONITOR gate ([`crate::server_native::source::
+/// Drives a per-op MONITOR gate ([`crate::server_native::source::
 /// MonitorGate`], supplied by the source on its `SubscriptionSeed`) from
-/// this op's executing-state watch. Applies the current state
-/// immediately on spawn — so a STOP that fired before this driver started
-/// is not missed — then re-applies on every edge [`MonitorStartControl`]
-/// publishes, coalescing to the latest executing state (idempotent
-/// `set_active`, so net state always matches `executing`). Runs in its own
-/// task so the hot monitor update loop is untouched; ends when the op tears
-/// down and drops the watch sender (the backing subscriptions are then
-/// removed with the aborted monitor — STOP=disable, teardown=remove).
-fn spawn_monitor_gate_driver(
-    gate: crate::server_native::source::MonitorGate,
-    mut exec_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    tokio::spawn(async move {
-        let mut cur = *exec_rx.borrow_and_update();
-        gate.set_active(cur).await;
-        while exec_rx.changed().await.is_ok() {
-            let desired = *exec_rx.borrow_and_update();
-            if desired != cur {
-                cur = desired;
-                gate.set_active(desired).await;
-            }
+/// this op's executing state.
+///
+/// This used to be a task of its own, watching the same
+/// `tokio::sync::watch` the subscriber loop already watches. It is now
+/// owned by that loop: the loop reads the executing state once per
+/// iteration and wakes on every edge (its `exec_rx.changed()` arm), so it
+/// is already at the exact observation points the driver task duplicated —
+/// the extra task bought a second observer, not a second observation.
+///
+/// Semantics carried over unchanged:
+///
+/// * The **first** application is unconditional (`applied: None`), which is
+///   what made a STOP that fired before the driver started not get missed.
+///   It is issued where the spawn used to be, before the loop is entered.
+/// * Every later application is edge-only, coalescing to the latest
+///   executing state — `set_active` is idempotent, so the net gate state
+///   always matches `executing`.
+/// * No gate (`None`) is the common case — only a QSRV db/group monitor
+///   supplies one — and costs one `Option` check per iteration.
+///
+/// Lifetime: ends with the subscriber. Teardown then removes the backing
+/// subscriptions along with the op (STOP=disable, teardown=remove), so no
+/// final edge is owed after the loop exits — the driver task did not apply
+/// one either; it simply ended when the watch sender dropped.
+struct MonitorGateDriver {
+    gate: Option<crate::server_native::source::MonitorGate>,
+    /// Last state handed to the gate; `None` until the unconditional first
+    /// application, which is what distinguishes "not yet applied" from
+    /// "applied, and it was Idle".
+    applied: Option<bool>,
+}
+
+impl MonitorGateDriver {
+    fn new(gate: Option<crate::server_native::source::MonitorGate>) -> Self {
+        Self {
+            gate,
+            applied: None,
         }
-    });
+    }
+
+    async fn apply(&mut self, executing: bool) {
+        let Some(gate) = &self.gate else {
+            return;
+        };
+        if self.applied == Some(executing) {
+            return;
+        }
+        self.applied = Some(executing);
+        gate.set_active(executing).await;
+    }
 }
 
 /// single owner of one MONITOR op's Executing<->Idle edge.
@@ -1848,14 +1910,17 @@ struct MonitorSubscriberArgs {
 ///
 /// Executing state is read from the op's `monitor_exec` watch (set by
 /// [`MonitorStartControl`] on every START/STOP edge). Teardown: the returned
-/// `JoinHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
+/// `TaskHandle` is wrapped in the op's `monitor_abort` `AbortOnDrop`; dropping
 /// the `OpState` (DESTROY / channel destroy / disconnect — including
 /// DESTROY-before-START and never-START) aborts the task, dropping `rx` and the
 /// source subscription handle, releasing the upstream. The `MonitorFinishGuard`
 /// installed as the first task statement reports terminal removal on every exit.
 fn spawn_monitor_subscriber(
     args: MonitorSubscriberArgs,
-) -> (tokio::task::JoinHandle<()>, Arc<MonitorStartControl>) {
+) -> (
+    epics_base_rs::runtime::task::TaskHandle<()>,
+    Arc<MonitorStartControl>,
+) {
     let MonitorSubscriberArgs {
         sid,
         ioid,
@@ -1887,9 +1952,10 @@ fn spawn_monitor_subscriber(
     };
 
     // Per-op executing-state watch. `MonitorStartControl` publishes each
-    // Executing<->Idle edge here; the subscriber loop reads it as its emit gate
-    // and (when the source supplies one) the `MonitorGate` driver reads it too.
-    // Starts `false` (Idle) — the first MONITOR START flips it to `true`.
+    // Executing<->Idle edge here and the subscriber loop is its ONLY reader:
+    // the loop uses it both as its emit gate and — via `MonitorGateDriver` —
+    // to drive the source's optional `MonitorGate`. Starts `false` (Idle);
+    // the first MONITOR START flips it to `true`.
     let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
     let start_ctl = Arc::new(MonitorStartControl::new(
         src.clone(),
@@ -1911,11 +1977,12 @@ fn spawn_monitor_subscriber(
         ioid,
         op_id: monitor_op_id,
     };
-    // One receiver clone drives the emit-gate loop; the original drives the
-    // optional `MonitorGate` (QSRV suspend/enable) driver on the decoded path.
-    let loop_exec_rx = monitor_exec_rx.clone();
+    // A single receiver, moved into the subscriber task. The second clone
+    // this used to make belonged to the `MonitorGate` driver task, which the
+    // loop now owns directly.
+    let loop_exec_rx = monitor_exec_rx;
 
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _fin_guard = MonitorFinishGuard {
             tx: mon_fin_tx,
             fin: mon_fin,
@@ -2148,9 +2215,17 @@ fn spawn_monitor_subscriber(
             updates: mut rx,
             on_start: seed_on_start,
         } = seed;
-        if let Some(gate) = seed_on_start {
-            spawn_monitor_gate_driver(gate, monitor_exec_rx);
-        }
+        // Owned by this loop rather than a task of its own; the
+        // unconditional first application happens here, where the spawn
+        // used to be, so a STOP that fired before the subscription opened
+        // is still not missed. `borrow` (not `borrow_and_update`) leaves the
+        // loop's own seen-state alone, so an edge landing between here and
+        // the first iteration is still delivered to `exec_rx.changed()`.
+        let mut gate_driver = MonitorGateDriver::new(seed_on_start);
+        // Bound to a local so the watch `Ref` is dropped before the await —
+        // it is not `Send`, and this future is spawned.
+        let executing_now = *exec_rx.borrow();
+        gate_driver.apply(executing_now).await;
         let mut queue_over_high = false;
         let wm_levels = wm_levels_init;
         let credit = MonitorPipelineCredit {
@@ -2211,6 +2286,12 @@ fn spawn_monitor_subscriber(
         let mut source_open = true;
         loop {
             let executing = *exec_rx.borrow_and_update();
+            // Apply this op's gate from the state we just read. The
+            // `exec_rx.changed()` arm below wakes the loop on every edge, so
+            // this reaches the source's suspend/resume as promptly as the
+            // driver task did — including while the loop is parked waiting
+            // for an update that a suspended upstream will never send.
+            gate_driver.apply(executing).await;
             // The terminal FINISH is Executing-gated, exactly like every DATA
             // frame: pvxs holds both the backlog and the finish until the client
             // is Executing (servermon.cpp:82,142-154). Break — and so send the
@@ -2383,365 +2464,72 @@ impl OpKind {
     }
 }
 
-/// Run the TCP listener forever. Backwards-compat wrapper that
-/// drops per-peer stats — equivalent to calling
-/// [`run_tcp_server_with_peers`] with an empty registry the caller
-/// can never read.
-pub async fn run_tcp_server(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-) -> PvaResult<()> {
-    run_tcp_server_with_peers(
-        source,
-        bind_addr,
-        config,
-        crate::server_native::peers::PeerRegistry::new(),
-    )
-    .await
-}
+// `ClientCredentials` moved to [`super::config`] with `PvaServerConfig`, whose
+// `auth_complete` hook names it in its public signature — the config cannot be
+// target-neutral while the type in its own signature is not. It is identity
+// data, not socket code. Re-exported so `server_native::tcp::ClientCredentials`
+// keeps resolving for every existing caller.
+pub use super::config::ClientCredentials;
 
-/// Run the TCP listener with an externally-shared
-/// [`PeerRegistry`](crate::server_native::PeerRegistry). lets [`crate::server_native::PvaServer::report`]
-/// observe per-connection stats.
-pub async fn run_tcp_server_with_peers(
-    source: DynSource,
-    bind_addr: SocketAddr,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-) -> PvaResult<()> {
-    let listener = TcpListener::bind(bind_addr).await.map_err(PvaError::Io)?;
-    // Standalone single-listener path (not driven by `PvaServer`): create
-    // and wire the channel invalidator here so a source served this way —
-    // e.g. a PVA gateway — still force-disconnects downstream channels on an
-    // operator `:drop`/`:flush`. `PvaServer`'s multi-listener path creates it
-    // once in `run_pva_server` and shares the one handle across every TCP/UDP
-    // listener; here there is a single listener, so a local handle suffices.
-    let channel_invalidator = ChannelInvalidator::new();
-    source.set_channel_invalidator(channel_invalidator.clone());
-    run_tcp_server_on_listener(source, listener, config, peers, channel_invalidator).await
-}
-
-/// Variant that takes a pre-bound [`TcpListener`]. Lets
-/// [`crate::server_native::PvaServer::start`] perform the bind
-/// synchronously (so the bound port is observable to callers) and
-/// then hand the listener to the spawned accept task. Eliminates
-/// the bind-race window that existed when the spawn-and-bind happened
-/// inside the spawned task — concurrent isolated tests can no longer
-/// have their picked-then-dropped ephemeral ports stolen by a peer.
-pub async fn run_tcp_server_on_listener(
-    source: DynSource,
-    listener: TcpListener,
-    config: PvaServerConfig,
-    peers: Arc<crate::server_native::peers::PeerRegistry>,
-    // Server-wide channel invalidator. Each accepted connection holds a
-    // receiver; a source publishes the PV name(s) of any channel that must
-    // be force-disconnected out of band (PVA gateway operator `:drop`/`:flush`).
-    // See [`ChannelSource::set_channel_invalidator`].
-    channel_invalidator: ChannelInvalidator,
-) -> PvaResult<()> {
-    let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
-    debug!(?bind_addr, "TCP listener up");
-    let active = Arc::new(AtomicUsize::new(0));
-
-    let tls_acceptor = config
-        .tls
-        .as_ref()
-        .map(|cfg| tokio_rustls::TlsAcceptor::from(cfg.config.clone()));
-
-    // track per-connection tasks in a JoinSet so they're
-    // aborted as a unit when this accept-loop future is dropped (e.g.
-    // PvaServer::stop() → tcp_handle.abort()). Without this, every
-    // per-conn task ran detached and lingered until its internal
-    // idle_timeout (~45s). The select! arm on `conn_tasks.join_next()`
-    // also reaps completed tasks so the set doesn't accumulate
-    // finished JoinHandles.
-    let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-    loop {
-        let accept_result = tokio::select! {
-            biased;
-            res = listener.accept() => res,
-            // Drain finished connection tasks. Returns None when the
-            // set is empty — that branch resolves immediately, but
-            // `biased` makes the listener arm preferred so we never
-            // starve incoming accepts.
-            Some(_) = conn_tasks.join_next() => continue,
-        };
-        match accept_result {
-            Ok((stream, peer)) => {
-                // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
-                // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
-                // TCP accept callback registers a `ServerConn` with no
-                // ignore-list check (serverconn.cpp:461-467). Applying it
-                // to TCP accepts here turned a discovery filter into a
-                // transport ACL, blocking direct clients that reach the
-                // endpoint via a name server / cached beacon / static
-                // address. The UDP path keeps the filter (`filter_inbound`).
-                let cur = active.fetch_add(1, Ordering::SeqCst);
-                if cur >= config.max_connections {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    warn!(
-                        ?peer,
-                        "rejecting connection: max_connections={}", config.max_connections
-                    );
-                    drop(stream);
-                    continue;
-                }
-                let src = source.clone();
-                let cfg = config.clone();
-                let active_dec = active.clone();
-                let acceptor = tls_acceptor.clone();
-                let peers_for_task = peers.clone();
-                let conn_invalidator = channel_invalidator.clone();
-                conn_tasks.spawn(async move {
-                    stream.set_nodelay(true).ok();
-                    // Enable OS-level TCP keepalive so half-open connections
-                    // (NAT timeout, dead client) are detected within ~30s
-                    // even when the protocol-level Echo path can't fire
-                    // (e.g. peer hasn't initialized control plane yet).
-                    // Defence-in-depth on top of the heartbeat ECHO timer:
-                    // pvxs itself does NOT set SO_KEEPALIVE — it relies on
-                    // libevent's `bufferevent_set_timeouts` for inactivity
-                    // detection. We add OS keepalive (CA-libca style) so a
-                    // pre-handshake half-open peer still gets reaped even
-                    // before the application timer arms.
-                    {
-                        let sock = socket2::SockRef::from(&stream);
-                        let keepalive = socket2::TcpKeepalive::new()
-                            .with_time(std::time::Duration::from_secs(15))
-                            .with_interval(std::time::Duration::from_secs(5));
-                        let _ = sock.set_keepalive(true);
-                        let _ = sock.set_tcp_keepalive(&keepalive);
-                    }
-
-                    // TLS-NAMESERVER: peek the first byte to dispatch
-                    // TLS vs plain PVA on a single port.
-                    //
-                    // TLS ClientHello record type = 0x16 — the TLS
-                    // client sends this IMMEDIATELY after TCP connect
-                    // (client-initiates). Plain PVA clients NEVER send
-                    // a first byte; the server sends SET_BYTE_ORDER first.
-                    //
-                    // Dispatch rule (pvxs uses separate listeners per
-                    // protocol via serverconn.h:193 `isTLS`; we unify):
-                    //   peek Ok(1) && byte == 0x16 → TLS path
-                    //   peek timeout (≤ 100 ms)    → plain PVA path
-                    //   peek Ok(1) && byte != 0x16  → plain PVA path
-                    //   peek Ok(0) / IO error       → drop (peer gone)
-                    //
-                    // 100 ms is enough for ClientHello to arrive (sent
-                    // immediately by TLS stack) while adding negligible
-                    // latency to plain PVA connections.
-                    const PEEK_WINDOW: Duration = Duration::from_millis(100);
-                    let is_tls_client = match acceptor.as_ref() {
-                        None => false,
-                        Some(_) => {
-                            let mut b = [0u8; 1];
-                            match tokio::time::timeout(PEEK_WINDOW, stream.peek(&mut b)).await {
-                                Ok(Ok(1)) => b[0] == 0x16,
-                                Ok(Ok(_)) => {
-                                    debug!(?peer, "peer closed before first byte");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "first-byte peek error: {e}");
-                                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-                                // Timeout → plain PVA client (server initiates).
-                                Err(_) => false,
-                            }
-                        }
-                    };
-
-                    // Anti-downgrade: when the operator requires TLS
-                    // (`disable_plaintext`), refuse a non-TLS peer before it
-                    // can reach the plain code path. pvxs enforces the
-                    // refusal on the CLIENT (it drops a plaintext SEARCH
-                    // reply, client.cpp:944); the Rust server unifies TLS +
-                    // plaintext on each listener via the peek above, so the
-                    // equivalent server-side guarantee lives here. Gated on
-                    // `acceptor.is_some()` so a misconfigured server with no
-                    // TLS identity does not refuse every connection (a server
-                    // cannot be TLS-only without TLS). A TLS ClientHello
-                    // (`is_tls_client`) is served normally below.
-                    if cfg.disable_plaintext && acceptor.is_some() && !is_tls_client {
-                        debug!(
-                            ?peer,
-                            "refusing plaintext connection: disable_plaintext set (TLS required)"
-                        );
-                        active_dec.fetch_sub(1, Ordering::SeqCst);
-                        return;
-                    }
-
-                    // register this connection in the peer registry
-                    // so PvaServer::report() can surface it. Deferred to
-                    // here (post-peek) so the `tls` flag reflects the
-                    // actual protocol, not the server config.
-                    let peer_entry = crate::server_native::peers::PeerEntry::new(is_tls_client);
-                    peers_for_task.insert(peer, peer_entry.clone());
-
-                    let result = match (acceptor, is_tls_client) {
-                        // cap the TLS handshake — a peer
-                        // that completes TCP but stalls during ClientHello
-                        // would otherwise hold a `max_connections` slot
-                        // until OS keepalive reaps it (~30s).
-                        (Some(a), true) => {
-                            match tokio::time::timeout(cfg.tls_handshake_timeout, a.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    // derive the peer's x509 identity from
-                                    // the *verified* certificate chain before
-                                    // splitting the stream. rustls only
-                                    // exposes `peer_certificates()` on the
-                                    // whole `TlsStream`, and the chain has
-                                    // already passed `WebPkiClientVerifier`,
-                                    // so this is the cryptographically-checked
-                                    // identity (pvxs `fill_credentials`).
-                                    //
-                                    // use trust_roots so that `authority`
-                                    // is populated even when the peer sends a
-                                    // partial chain (leaf-only or leaf+CA),
-                                    // matching pvxs SSL_get0_verified_chain.
-                                    let x509_id = {
-                                        let (_, conn) = tls_stream.get_ref();
-                                        let roots =
-                                            cfg.tls.as_ref().map(|t| t.trust_roots.as_ref());
-                                        conn.peer_certificates().and_then(|chain| match roots {
-                                            Some(r) => {
-                                                crate::auth::x509_credentials_from_chain_with_roots(
-                                                    chain, r,
-                                                )
-                                            }
-                                            None => crate::auth::x509_credentials_from_chain(chain),
-                                        })
-                                    };
-                                    let (r, w) = tokio::io::split(tls_stream);
-                                    handle_connection_io(
-                                        src,
-                                        Box::new(r),
-                                        Box::new(w),
-                                        peer,
-                                        cfg,
-                                        ConnInit {
-                                            peer_entry: peer_entry.clone(),
-                                            x509_identity: x509_id,
-                                            channel_invalidator: conn_invalidator,
-                                        },
-                                    )
-                                    .await
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(?peer, "TLS handshake failed: {e}");
-                                    Err(PvaError::Io(e))
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        ?peer,
-                                        timeout = ?cfg.tls_handshake_timeout,
-                                        "TLS handshake timed out"
-                                    );
-                                    Err(PvaError::Protocol("TLS handshake timeout".into()))
-                                }
-                            }
-                        }
-                        _ => {
-                            // Plain PVA: no TLS configured, or client sent
-                            // non-TLS bytes (name-server, plain pvxs peer).
-                            let (r, w) = stream.into_split();
-                            handle_connection_io(
-                                src,
-                                Box::new(r),
-                                Box::new(w),
-                                peer,
-                                cfg,
-                                ConnInit {
-                                    peer_entry: peer_entry.clone(),
-                                    x509_identity: None,
-                                    channel_invalidator: conn_invalidator,
-                                },
-                            )
-                            .await
-                        }
-                    };
-                    if let Err(e) = result {
-                        debug!(?peer, "connection ended: {e}");
-                    }
-                    active_dec.fetch_sub(1, Ordering::SeqCst);
-                    // drop the per-peer entry whether the
-                    // connection ended cleanly or via I/O error.
-                    peers_for_task.remove(peer);
-                });
-            }
-            Err(e) => {
-                error!("accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+// The credential *record* is target-neutral and lives beside the config;
+// building one from a CONNECTION_VALIDATION reply or a verified TLS chain is
+// this module's job, so the constructors stay here.
+impl ClientCredentials {
+    /// The ACF host identity for a connection: its peer address, numeric.
+    ///
+    /// Byte-for-byte what QSRV does (`ioc/credentials.cpp:27-29`):
+    ///
+    /// ```cpp
+    /// SockAddr addr(clientCredentials.peer);
+    /// addr.setPort(0);
+    /// host = std::string(SB()<<addr.map6to4());
+    /// ```
+    ///
+    /// `setPort(0)` is why only the IP is taken, and `map6to4` is why an
+    /// IPv4-mapped IPv6 peer renders as its IPv4 form — so a client reaching a
+    /// dual-stack listener matches the same HAG entry it would over IPv4.
+    /// [`Ipv6Addr::to_ipv4_mapped`] is the exact counterpart (`to_ipv4` is
+    /// not: it also maps IPv4-*compatible* addresses, turning `::1` into
+    /// `0.0.0.1`).
+    ///
+    /// Numeric, not reverse-DNS, and deliberately: a reverse lookup is a
+    /// second network operation that can fail, and its failure path lands
+    /// back in the sentinel/empty-string behaviour this whole change exists
+    /// to remove. On a target with no resolver that failure is the *expected*
+    /// branch, not the exceptional one. Numeric is also what upstream
+    /// compares — QSRV never consults `asCheckClientIP`, so its PVA host is
+    /// always the numeric peer.
+    fn acf_host_from_peer(peer: std::net::SocketAddr) -> String {
+        match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => v6.to_string(),
+            },
         }
     }
-}
 
-/// Identity used for per-connection authorisation.
-///
-/// Mirrors pvxs `server::ClientCredentials` (serverconn.cpp:73-234).
-/// Two population paths feed it:
-///
-/// - **`ca` / `anonymous`** — parsed off the CONNECTION_VALIDATION reply
-///   (`parse_client_credentials`).
-/// - **`x509`** — derived from the *verified* TLS peer certificate chain
-///   after the handshake (pvxs `SSLContext::fill_credentials`). The TLS
-///   identity is authoritative: it overrides whatever the client claims
-///   in CONNECTION_VALIDATION, because the chain was cryptographically
-///   verified against the configured root CA.
-///
-/// The structured form is consumed by the server's ACF access gate
-/// (`AccessGate::check`) and lands in `tracing` for audit.
-#[derive(Debug, Clone)]
-pub struct ClientCredentials {
-    /// Selected auth method ("anonymous" / "ca" / "x509" / ...).
-    pub method: String,
-    /// Account name (e.g., the `ca` auth's `user` field, or the x509
-    /// leaf cert subject CommonName). Empty when the auth method does
-    /// not carry one.
-    pub account: String,
-    /// Host name claim from the `ca` auth, when present. Informational
-    /// only — never trust it for access decisions over the network
-    /// hostname / mTLS-verified peer.
-    pub host: String,
-    /// Certificate authority for the `x509` method: the root CA's
-    /// subject CommonName (pvxs `PeerCredentials::authority`). Empty for
-    /// non-TLS methods. ACF `RULE(... ){ AUTHORITY("...") }` scopes
-    /// match against this.
-    pub authority: String,
-    /// Group / role memberships of [`Self::account`], re-derived
-    /// SERVER-SIDE from the local passwd/group DB by
-    /// [`Self::with_server_roles`] (pvxs `ClientCredentials::roles()` →
-    /// `osdGetRoles`, serverconn.cpp:33-37). ACF rules of the form
-    /// `R member group:operators` match against this set.
+    /// Derive every server-side identity field from server-side truth:
+    /// [`Self::roles`] from [`Self::account`] against the local passwd/group
+    /// DB (pvxs `ClientCredentials::roles` → `osdGetRoles`), and
+    /// [`Self::host`] from the connection's peer address (QSRV
+    /// `ioc/credentials.cpp:27-29`).
     ///
-    /// SECURITY: this is NEVER populated from the wire. A client
-    /// advertises a `groups`/`roles` field in CONNECTION_VALIDATION, but
-    /// trusting it would let `account="nobody", roles=["admin"]` satisfy
-    /// any group-gated rule — an ACL bypass. Every constructor funnels
-    /// through `with_server_roles`, so a wire value can never reach here.
-    pub roles: Vec<String>,
-}
-
-impl ClientCredentials {
-    /// Re-derive [`Self::roles`] server-side from [`Self::account`]
-    /// against the local passwd/group DB (pvxs `ClientCredentials::roles`
-    /// → `osdGetRoles`). The single funnel every constructor / parse path
-    /// passes through, so `roles` is server-derived by construction and a
-    /// wire-advertised value can never reach the ACF gate.
-    fn with_server_roles(mut self) -> Self {
+    /// The single funnel every constructor and parse path passes through, so
+    /// both fields are server-derived **by construction** and a
+    /// wire-advertised value can never reach the ACF gate. `host` used to be
+    /// copied verbatim off the CONNECTION_VALIDATION body, three lines above
+    /// the comment explaining why `roles` must not be; taking the peer here —
+    /// rather than overwriting the wire value afterwards — is what makes the
+    /// wire value unable to reach the field at all, instead of merely
+    /// corrected after the fact.
+    fn with_server_derived(mut self, peer: std::net::SocketAddr) -> Self {
         self.roles = crate::auth::osd_get_roles(&self.account);
+        self.host = Self::acf_host_from_peer(peer);
         self
     }
 
-    fn anonymous() -> Self {
+    fn anonymous(peer: std::net::SocketAddr) -> Self {
         Self {
             method: "anonymous".into(),
             account: "anonymous".into(),
@@ -2749,14 +2537,14 @@ impl ClientCredentials {
             authority: String::new(),
             roles: Vec::new(),
         }
-        .with_server_roles()
+        .with_server_derived(peer)
     }
 
     /// Build `x509` credentials from a verified TLS peer chain.
     /// Mirrors pvxs `SSLContext::fill_credentials`: the leaf cert's
     /// subject CommonName becomes the `account` and the root CA's
     /// subject CommonName becomes the `authority`.
-    fn x509(creds: crate::auth::X509Credentials) -> Self {
+    fn x509(creds: crate::auth::X509Credentials, peer: std::net::SocketAddr) -> Self {
         Self {
             method: "x509".into(),
             account: creds.account,
@@ -2764,7 +2552,7 @@ impl ClientCredentials {
             authority: creds.authority,
             roles: Vec::new(),
         }
-        .with_server_roles()
+        .with_server_derived(peer)
     }
 
     /// Format a one-line debug label for tracing / diagnostics.
@@ -2848,7 +2636,7 @@ async fn process_connection_validation(
         // a decode fault here is still fatal —
         // log + propagate. Pre-fix swallowed; pvxs
         // `serverconn.cpp:211-216` calls `bev.reset()`.
-        match parse_client_credentials(frame, decode_cache)? {
+        match parse_client_credentials(frame, decode_cache, peer)? {
             Some(claimed) => debug!(
                 ?peer,
                 x509_account = %cred.account,
@@ -2877,7 +2665,7 @@ async fn process_connection_validation(
         // anonymous handshake (empty/"anonymous" method) returns Ok(None) and
         // keeps whatever credential is already in force — anonymous on a fresh
         // connection, the committed identity on a re-auth.
-        let candidate = parse_client_credentials(frame, decode_cache)?;
+        let candidate = parse_client_credentials(frame, decode_cache, peer)?;
         // The method that would take effect: the claim's method when the client
         // sent one, otherwise the credential already in force (so an anonymous
         // re-handshake stays advertised against the live method, never resetting
@@ -2960,9 +2748,12 @@ async fn process_connection_validation(
     Ok(())
 }
 
+/// `peer` is taken because the ACF host identity is derived from it, never
+/// from the body being parsed — see `with_server_derived`.
 fn parse_client_credentials(
     frame: &Frame,
     decode_cache: &mut TypeCache,
+    peer: std::net::SocketAddr,
 ) -> PvaResult<Option<ClientCredentials>> {
     // Inbound application payloads are decoded with the frame's own header
     // byte order (pvxs latches `peerBE` per received message,
@@ -3038,14 +2829,21 @@ fn parse_client_credentials(
                     ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
                         creds.account = v.as_str_lossy().into_owned();
                     }
-                    ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.host = v.as_str_lossy().into_owned();
-                    }
-                    // A `groups`/`roles` field MAY be advertised here, but the
-                    // server MUST NOT trust it (ACL bypass — see the `roles`
-                    // field doc). pvxs reads only `user`/`host` off the wire
-                    // and re-derives roles via `osdGetRoles`. We ignore it and
-                    // re-derive in `with_server_roles` before returning.
+                    // NOTE the absence of a `host` arm, and do not add one.
+                    // A client MAY advertise `host`, and pvxs has no field to
+                    // put it in: `server::ClientCredentials`
+                    // (`src/pvxs/srvcommon.h:36-56`) carries peer, iface,
+                    // method, account, raw and roles() and no host at all.
+                    // QSRV derives the ACF host from the socket instead
+                    // (`ioc/credentials.cpp:27-29`). We used to copy the wire
+                    // string straight into the field the HAG gate matches,
+                    // which let a client pick its own host identity — so the
+                    // field is now written only by `with_server_derived`, from
+                    // the peer, and this parser cannot reach it.
+                    //
+                    // Same rule, same reason, as the `groups`/`roles` field a
+                    // client MAY also advertise: trusting it would be an ACL
+                    // bypass. Both are ignored here and derived below.
                     _ => {}
                 }
             }
@@ -3068,17 +2866,19 @@ fn parse_client_credentials(
         return Ok(None);
     }
     // Roles are re-derived server-side from `account` (pvxs
-    // `ClientCredentials::roles()`); any wire-advertised `groups`/`roles`
+    // `ClientCredentials::roles()`) and the host from the peer socket (QSRV
+    // `ioc/credentials.cpp:27-29`); any wire-advertised `groups`/`roles`/`host`
     // was ignored above.
-    Ok(Some(creds.with_server_roles()))
+    Ok(Some(creds.with_server_derived(peer)))
 }
 
 /// Type-erased read/write halves so the same handler works for plain TCP
 /// and TLS-wrapped streams.
 type SrvRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
-/// Per-connection write side. Producers (main read loop, heartbeat,
-/// monitor subscribers) push fully-framed PVA messages into the
+/// Per-connection write side. Producers (the main read loop — including
+/// its heartbeat arm — and the monitor subscribers) push fully-framed
+/// PVA messages into the
 /// channel; a single dedicated writer task drains it in arrival order.
 /// Replaces `Arc<Mutex<SrvWrite>>` so a slow client cannot block other
 /// producers waiting for the lock. The channel is *bounded* —
@@ -3180,23 +2980,23 @@ type CcTx = mpsc::Sender<CreateChannelCompletion>;
 /// split stream to [`handle_connection_io`]: the peer's report entry, the
 /// verified mTLS identity (if any), and the server-wide channel-invalidation
 /// sender. Bundled to keep the IO handler's argument count within budget.
-struct ConnInit {
-    peer_entry: Arc<crate::server_native::peers::PeerEntry>,
+pub(super) struct ConnInit {
+    pub(super) peer_entry: Arc<crate::server_native::peers::PeerEntry>,
     /// x509 identity from the verified TLS peer chain, when this connection
     /// arrived over mutually-authenticated TLS. `None` for plain TCP or TLS
     /// without a client cert. When present it is the authoritative identity
     /// and overrides the CONNECTION_VALIDATION claim — mirrors pvxs
     /// `SSLContext::fill_credentials`.
-    x509_identity: Option<crate::auth::X509Credentials>,
+    pub(super) x509_identity: Option<crate::auth::X509Credentials>,
     /// Server-wide channel invalidator (see
     /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
     /// published PV name force-disconnects every channel this connection
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
-    channel_invalidator: ChannelInvalidator,
+    pub(super) channel_invalidator: ChannelInvalidator,
 }
 
-async fn handle_connection_io(
+pub(super) async fn handle_connection_io(
     source: DynSource,
     mut reader: SrvRead,
     mut writer_raw: SrvWrite,
@@ -3223,7 +3023,7 @@ async fn handle_connection_io(
     //    on a non-blocking socket; without a guard the writer task
     //    would hang and back-pressure both the heartbeat and the
     //    read-side dispatcher (since both push into the same mpsc).
-    //    We wrap `write_all` in `tokio::time::timeout(send_timeout)`
+    //    We wrap `write_all` in `runtime::task::timeout(send_timeout)`
     //    so a stalled write breaks the task, closes the mpsc, and
     //    fails fast. Mirrors the parallel guard in `epics-ca-rs`'s
     //    server-side dispatch wrap (the CA G1 audit fix).
@@ -3231,9 +3031,11 @@ async fn handle_connection_io(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(config.write_queue_depth);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
-    let writer_task = tokio::spawn(async move {
+    let writer_task = epics_base_rs::runtime::task::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            match tokio::time::timeout(send_tmo, writer_raw.write_all(&frame)).await {
+            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&frame))
+                .await
+            {
                 Ok(Ok(())) => {
                     // bytes_out counter for PvaServer::report().
                     peer_entry_writer.touch_tx(frame.len());
@@ -3253,17 +3055,39 @@ async fn handle_connection_io(
             }
         }
     });
-    // abort the writer + heartbeat tasks the moment the read
-    // loop returns. Without this, both linger up to `idle_timeout`
-    // (default 45s) emitting ECHOes into a channel nobody is reading
-    // and holding the writer half of the (now-disconnected) socket.
+    // abort the writer task the moment the read loop returns.
+    // Without this it lingers up to `idle_timeout` (default 45s) holding
+    // the writer half of the (now-disconnected) socket.
     // pvxs uses libevent-driven cleanup that shuts everything in one
-    // pass; we rely on tokio JoinHandle::abort() via AbortOnDrop.
+    // pass; we rely on the spawn seam's handle `abort()` via AbortOnDrop.
+    // The heartbeat needs no such guard: it is a deadline arm of this
+    // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
 
-    // Track per-connection liveness for the idle-timeout watchdog and the
-    // server-side echo heartbeat task.
-    let last_rx = Arc::new(AtomicU64::new(now_nanos()));
+    // Per-connection liveness for the idle-timeout watchdog. A plain local,
+    // not an `Arc<AtomicU64>`: the read loop both stamps it (on every frame)
+    // and reads it (in the heartbeat arm), so there is no second owner to
+    // share it with.
+    let mut last_rx = now_nanos();
+
+    // Server-side echo heartbeat as a deadline arm of the read loop rather
+    // than a per-connection task: send ECHO_REQUEST every 15 s, and stop
+    // beating once the peer has been silent for `idle_timeout`.
+    //
+    // `Interval::tick` is cancel-safe — losing the race in `select!` consumes
+    // no tick — so holding the interval across iterations reproduces the
+    // task's fixed 15 s cadence exactly, including tokio's default `Burst`
+    // catch-up if a long dispatch delays a tick.
+    let mut hb_tick = epics_base_rs::runtime::task::interval(Duration::from_secs(15));
+    // `interval` yields its first tick immediately; the task consumed it the
+    // same way, so the first beat lands 15 s in.
+    hb_tick.tick().await;
+    // Latched when the idle watchdog fires or the writer channel closes —
+    // the two conditions that used to `break` the task's loop. Note this
+    // stops the *heartbeat*, not the connection: the task ending never tore
+    // the connection down either (its `JoinHandle` was only ever aborted),
+    // so the existing "closing" wording overstates what happens.
+    let mut hb_stopped = false;
 
     // Outbound byte order as a shared, mutable per-connection cell, seeded
     // from the configured wire order. The read loop latches a new value if
@@ -3271,44 +3095,11 @@ async fn handle_connection_io(
     // conn.cpp:169-188 `sendBE`; old pvAccess accepts it from either peer
     // at any time). `true` = Big. Single writer (the read loop, which also
     // keeps an in-sync local `order` for the synchronous dispatch path it
-    // owns); one reader (the heartbeat task).
+    // owns); the readers are the spawned MONITOR subscriber tasks, which
+    // stamp each frame with the current order via their `order_now()`.
     let out_order = Arc::new(std::sync::atomic::AtomicBool::new(
         config.wire_byte_order.is_big(),
     ));
-
-    // Spawn server-side heartbeat: send ECHO_REQUEST every 15 s; close if
-    // we've been idle for `idle_timeout`.
-    let last_rx_hb = last_rx.clone();
-    let tx_hb = tx.clone();
-    let out_order_hb = out_order.clone();
-    let hb_handle = tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(15));
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let last = last_rx_hb.load(Ordering::SeqCst);
-            let elapsed = now_nanos().saturating_sub(last);
-            if Duration::from_nanos(elapsed) > idle_timeout {
-                warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
-                break;
-            }
-            // Read the current outbound order — the peer may have
-            // re-negotiated it via a mid-stream SET_BYTE_ORDER
-            // (pvxs conn.cpp:169-188).
-            let order_hb = if out_order_hb.load(Ordering::Relaxed) {
-                ByteOrder::Big
-            } else {
-                ByteOrder::Little
-            };
-            let h = PvaHeader::control(true, order_hb, ControlCommand::EchoRequest.code(), 0);
-            let mut buf = Vec::with_capacity(8);
-            h.write_into(&mut buf);
-            if tx_hb.send(buf).await.is_err() {
-                break;
-            }
-        }
-    });
-    let _hb_guard = AbortOnDrop(hb_handle.abort_handle());
 
     // Outbound order owner: this read loop. Mutable so a mid-stream
     // SET_BYTE_ORDER from the peer re-latches it (pvxs conn.cpp:169-188);
@@ -3375,8 +3166,8 @@ async fn handle_connection_io(
     // Fed into the server's ACF `AccessGate::check` for every op.
     let x509_locked = x509_identity.is_some();
     let mut cred = match x509_identity {
-        Some(id) => ClientCredentials::x509(id),
-        None => ClientCredentials::anonymous(),
+        Some(id) => ClientCredentials::x509(id, peer),
+        None => ClientCredentials::anonymous(peer),
     };
     // Per-connection emit-side TypeStore. Only consulted when
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
@@ -3655,6 +3446,29 @@ async fn handle_connection_io(
                 }
                 continue;
             }
+            _ = hb_tick.tick(), if !hb_stopped => {
+                // Server-side echo heartbeat, formerly its own per-connection
+                // task. Same cadence, same frame, same two stop conditions —
+                // only the owner changed, from a task reading `last_rx` and
+                // `out_order` through shared cells to this loop reading its
+                // own `last_rx` and `order` directly.
+                let elapsed = now_nanos().saturating_sub(last_rx);
+                if Duration::from_nanos(elapsed) > idle_timeout {
+                    warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
+                    hb_stopped = true;
+                    continue;
+                }
+                let h = PvaHeader::control(true, order, ControlCommand::EchoRequest.code(), 0);
+                let mut buf = Vec::with_capacity(8);
+                h.write_into(&mut buf);
+                if tx.send(buf).await.is_err() {
+                    // Writer gone. The loop-top `tx.is_closed()` check
+                    // unwinds the connection on the next iteration; stop
+                    // beating so this arm cannot spin in the meantime.
+                    hb_stopped = true;
+                }
+                continue;
+            }
             frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
                 frame_result?
             }
@@ -3662,7 +3476,7 @@ async fn handle_connection_io(
         // bytes_in counter (header + payload). Drives
         // PvaServer::report() throughput diagnostics.
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
-        last_rx.store(now_nanos(), Ordering::SeqCst);
+        last_rx = now_nanos();
         if frame.header.flags.is_control() {
             // A peer may re-negotiate the connection byte order mid-stream
             // with another SET_BYTE_ORDER control frame. pvxs latches
@@ -3720,12 +3534,12 @@ async fn handle_connection_io(
             seg_order = frame.order();
             seg_buf.clear();
         }
-        // Cap reassembly when an opt-in `max_message_size` is set.
-        // read_frame already enforces it per-frame; without this an
-        // adversary streams SegFirst → SegMiddle … forever, growing
-        // seg_buf without bound. `None` = unbounded (pvxs
-        // parity), so this guard only fires for hardened deployments
-        // that opted into a ceiling.
+        // Cap reassembly on the *accumulated* size. read_frame enforces
+        // `max_message_size` per frame; without this an adversary streams
+        // SegFirst → SegMiddle … forever, every segment individually legal,
+        // and seg_buf grows without bound. The server's default is a ceiling
+        // (`config::DEFAULT_MAX_MESSAGE_SIZE`); `None` is the explicit opt-out
+        // to pvxs's uncapped RX, and only then does this guard stand down.
         if let Some(cap) = max_msg_size {
             if seg_buf.len().saturating_add(frame.payload.len()) > cap {
                 return Err(PvaError::Protocol(format!(
@@ -3735,7 +3549,7 @@ async fn handle_connection_io(
                 )));
             }
         }
-        seg_buf.extend_from_slice(&frame.payload);
+        try_extend(&mut seg_buf, &frame.payload, "the segment-reassembly buffer")?;
         if raw_seg != 0 && raw_seg != HeaderFlags::SEGMENT_LAST {
             // SegFirst (with following segments) or SegMiddle: keep
             // accumulating, do not dispatch yet.
@@ -4601,7 +4415,7 @@ async fn handle_put_get(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -4947,7 +4761,7 @@ async fn handle_process(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -5316,7 +5130,7 @@ async fn handle_channel_array(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
@@ -5430,13 +5244,14 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             rx_buf.drain(..n);
             return Ok(frame);
         }
-        // Peek the header length once we have 8 bytes — if an opt-in
-        // `max_msg_size` is set and the peer claimed more, drop the
-        // connection before growing rx_buf any further.
-        // `None` = unbounded (pvxs parity, which keeps no RX cap).
-        // Even unbounded, the read stays incremental (4 KiB chunks)
-        // and `op_timeout`-deadlined, so a stalled or oversized peer
-        // is bounded by the deadline rather than the cap.
+        // Peek the header length once we have 8 bytes — if `max_msg_size` is
+        // set and the peer claimed more, refuse before growing rx_buf any
+        // further, so the IOC never spends the memory or the bandwidth on a
+        // message it has already decided to reject. `None` is the explicit
+        // opt-out to pvxs's uncapped RX. Even unbounded, the read stays
+        // incremental (4 KiB chunks), `op_timeout`-deadlined, and now
+        // fallible (`peer_buf::try_extend`), so a stalled, oversized, or
+        // heap-exhausting peer costs this connection and no other.
         if let Some(cap) = max_msg_size {
             if rx_buf.len() >= PvaHeader::SIZE {
                 if let Ok(hdr) = PvaHeader::decode(&mut std::io::Cursor::new(&rx_buf[..])) {
@@ -5450,7 +5265,9 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         let mut chunk = [0u8; 4096];
-        let n = match tokio::time::timeout(op_timeout, reader.read(&mut chunk)).await {
+        let n = match epics_base_rs::runtime::task::timeout(op_timeout, reader.read(&mut chunk))
+            .await
+        {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(PvaError::Io(e)),
             Err(_) => return Err(PvaError::Timeout),
@@ -5458,7 +5275,7 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         if n == 0 {
             return Err(PvaError::Protocol("client closed".into()));
         }
-        rx_buf.extend_from_slice(&chunk[..n]);
+        try_extend(rx_buf, &chunk[..n], "the connection receive buffer")?;
     }
 }
 
@@ -5605,7 +5422,7 @@ async fn handle_create_channel(
         // resolution and the open callback agree.
         let open_cred = cred.clone();
         let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             for (cid, sid, nm) in batch {
                 let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
                     // Bind the owner that accepted this channel so every
@@ -6120,7 +5937,7 @@ async fn handle_tcp_search(
     frame.header.write_into(&mut raw);
     raw.extend_from_slice(&frame.payload);
 
-    let Some(req) = super::udp::parse_search_request(&raw) else {
+    let Some(req) = super::search::parse_search_request(&raw) else {
         // The command framing already classified this frame as a SEARCH,
         // so `parse_search_request` returning `None` here means the body
         // failed to decode (truncated, bad size prefix, missing channel
@@ -6162,12 +5979,12 @@ async fn handle_tcp_search(
     // requested transport). pvxs fills `Search::source` from the TCP peer
     // (serverchan.cpp:197-222), so a source can still scope advertisement
     // by the established peer endpoint via `searchable_from`.
-    let matched = super::udp::matched_cids_for_requester(source, &req, peer).await;
+    let matched = super::search::matched_cids_for_requester(source, &req, peer).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.
     if !matched.is_empty() || req.must_reply {
-        let response = super::udp::build_search_response_proto(
+        let response = super::search::build_search_response_proto(
             config.guid,
             req.seq,
             advertised_port,
@@ -6928,7 +6745,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let mut exec_fin_guard = ExecFinishGuard {
@@ -7078,7 +6895,7 @@ async fn handle_op(
                     success: false,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let join = tokio::spawn(async move {
+                let join = epics_base_rs::runtime::task::spawn(async move {
                     let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
@@ -7227,7 +7044,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7594,7 +7411,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = tokio::spawn(async move {
+            let join = epics_base_rs::runtime::task::spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7822,7 +7639,7 @@ async fn handle_get_field(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = tokio::spawn(async move {
+    let join = epics_base_rs::runtime::task::spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
         let _exec_fin_guard = ExecFinishGuard {
@@ -8325,11 +8142,136 @@ fn fixed_out_order(order: ByteOrder) -> Arc<std::sync::atomic::AtomicBool> {
     Arc::new(std::sync::atomic::AtomicBool::new(order.is_big()))
 }
 
+/// The peer every credentials-constructing test is reached from. A
+/// documentation range (RFC 5737 TEST-NET-3), deliberately NOT the loopback
+/// or any name a wire `host` string in these tests uses, so a wire value
+/// leaking into `ClientCredentials::host` is visible rather than
+/// coincidentally equal. Defined at module level so every `#[cfg(test)]`
+/// sub-module reaches it via `super::*`. Nothing binds it.
+#[cfg(test)]
+const TEST_PEER: std::net::SocketAddr = std::net::SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+    44321,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_native::decode::{OpResponse, decode_op_response, try_parse_frame};
+    use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+    use crate::server_native::MonitorStream;
+
+    /// Every task this file spawns for a *connection* — the writer, the MONITOR
+    /// subscriber, the CREATE_CHANNEL resolver, and the seven data-phase
+    /// execs — goes through `runtime::task::spawn`, not `tokio::spawn`
+    /// (RTEMS phase 6 item 5, stage 2). A bare `tokio::spawn` panics on a
+    /// thread with no tokio runtime, which is exactly the thread the blocking
+    /// driver will run a connection on — and it panics at *runtime*, on the
+    /// target, not here. So pin it as source inspection: production scope
+    /// must contain no `tokio::spawn` at all.
+    ///
+    /// Scope is this file, and after the accept loop moved to
+    /// [`super::super::accept`] (item 7 stage A) that is exactly the
+    /// connection scope the name claims. The rule is not *relaxed* for the
+    /// accept module — `accept.rs` carries the same zero-bare-`tokio::spawn`
+    /// assertion in its own tests, because its per-connection task is a
+    /// `JoinSet` method (`conn_tasks.spawn`), not this literal. What
+    /// `accept.rs` is additionally allowed, and this file is not, is the
+    /// non-spawn tokio surface a host socket driver needs: `TcpListener`, the
+    /// two TLS handshake deadlines, the accept-error backoff. Those are item
+    /// 7's to replace wholesale with a blocking driver, so pinning them here
+    /// would pin the wrong thing.
+    #[test]
+    fn connection_scope_spawns_go_through_the_runtime_seam() {
+        let src = include_str!("tcp.rs");
+        // Production scope ends at the first column-0 `#[cfg(test)]`.
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // Fail closed: an earlier `#[cfg(test)]` helper must not shrink the
+        // slice past the connection handler and make this pass vacuously.
+        assert!(
+            prod.contains("async fn handle_connection_io"),
+            "production slice no longer covers the connection handler"
+        );
+        // Written split so this assertion cannot match its own source text.
+        let literal = concat!("tokio", "::spawn(");
+        let hits = prod.matches(literal).count();
+        assert_eq!(
+            hits, 0,
+            "production scope must spawn through `runtime::task::spawn`; \
+             found {hits} bare `{literal}`"
+        );
+    }
+
+    /// A1, structural: `ClientCredentials::host` is the string the ACF
+    /// `HAG(...)` gate matches, and this file is the only place in the
+    /// workspace that writes it. Pin the two properties that make a wire
+    /// value *unable* to reach it, rather than merely corrected afterwards:
+    ///
+    /// 1. Production scope holds exactly ONE write, and it is the funnel's
+    ///    `self.host = Self::acf_host_from_peer(peer)`.
+    /// 2. `parse_client_credentials` — the one function that reads the
+    ///    CONNECTION_VALIDATION body — has no `("host", ...)` decode arm and
+    ///    hands back credentials only through `with_server_derived`.
+    ///
+    /// Mutation-provable: re-add the deleted `("host", …)` arm, or make the
+    /// parser return `Ok(Some(creds))` un-funnelled, and this fails.
+    /// Comment lines are stripped first so the NOTE explaining the absent arm
+    /// does not satisfy the check it documents.
+    #[test]
+    fn the_acf_host_is_written_only_by_the_peer_funnel() {
+        let src = include_str!("tcp.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            prod.contains("fn parse_client_credentials"),
+            "production slice no longer covers the credentials parser"
+        );
+        let code = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prod_code = code(prod);
+        let writes: Vec<&str> = prod_code
+            .lines()
+            .filter(|l| l.contains(".host =") || l.contains(".host="))
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["        self.host = Self::acf_host_from_peer(peer);"],
+            "the ACF host must be written only by `with_server_derived`"
+        );
+
+        let start = prod
+            .find("fn parse_client_credentials")
+            .expect("checked above");
+        let end = prod[start..]
+            .find("\n/// Type-erased read/write halves")
+            .expect("parser is followed by the SrvRead/SrvWrite aliases")
+            + start;
+        let parser = code(&prod[start..end]);
+        assert!(
+            !parser.contains("\"host\""),
+            "the CONNECTION_VALIDATION parser must have no `host` decode arm"
+        );
+        let returns: Vec<&str> = parser
+            .lines()
+            .filter(|l| l.contains("Ok(Some("))
+            .map(|l| l.trim())
+            .collect();
+        assert_eq!(
+            returns,
+            vec!["Ok(Some(creds.with_server_derived(peer)))"],
+            "every credential the parser hands back must pass the funnel"
+        );
+    }
 
     /// a throwaway MONITOR-completion sender for `handle_op`
     /// calls in tests that do not exercise the read-loop owner's removal
@@ -8427,7 +8369,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_watermark(
@@ -9976,7 +9921,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -9984,7 +9929,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             // INIT: valid Int descriptor, then a truncated (2-byte) i32
             // value — a present-but-malformed pvRequest body.
@@ -10071,7 +10016,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -10079,7 +10024,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             // INIT: valid Int descriptor, then NOTHING — the value body
             // the descriptor requires is absent (descriptor-only frame).
@@ -10165,7 +10110,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -10173,7 +10118,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT: empty `structure {}` descriptor, no value body.
         let req_desc = FieldDesc::Structure {
@@ -10260,7 +10205,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -10268,7 +10213,7 @@ mod tests {
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
+            let cred = ClientCredentials::anonymous(TEST_PEER);
 
             let mut payload = Vec::new();
             payload.put_u32(sid, order);
@@ -10923,7 +10868,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -10932,7 +10877,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (subcmd 0x08, no pipeline bit) with an unparseable
         // `pipeline` value → pipeline disabled, one Warn logRemote.
@@ -11033,7 +10978,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11042,7 +10987,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // pipeline=true, a valid queueSize, and an ARRAY ackAny — `Int32A` is
         // Kind::Integer but stores as an array, and `copyOut` has no scalar arm
@@ -11126,7 +11071,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11135,7 +11080,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // Pipeline MONITOR INIT: subcmd 0x88 (INIT | pipeline), a valid
         // pipeline pvRequest, and the trailing u32 initial-nack rider the
@@ -11376,7 +11321,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11385,7 +11330,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT with pipeline=true, queueSize=2 and an explicit
         // initial nack rider of 2 (subcmd 0x88 sets the 0x80 pipeline bit,
@@ -11544,7 +11489,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -11656,7 +11601,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT with queueSize 8 — large enough to hold the seed + 3 posts
         // with no squash.
@@ -11729,7 +11674,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -11797,7 +11742,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11850,7 +11795,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11908,7 +11853,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12009,7 +11954,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12073,7 +12018,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12120,7 +12065,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12237,7 +12182,7 @@ mod tests {
     struct RawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
     }
 
     #[cfg(test)]
@@ -12260,13 +12205,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12287,7 +12232,7 @@ mod tests {
         let source: DynSource = Arc::new(RawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         channels.insert(
@@ -12299,7 +12244,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12320,7 +12265,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12388,7 +12333,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -12452,7 +12397,7 @@ mod tests {
     struct FlipRawSeedSource {
         intro: FieldDesc,
         seed: PvField,
-        raw_rx: std::sync::Mutex<Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>>>,
+        raw_rx: std::sync::Mutex<Option<MonitorStream<crate::server_native::RawMonitorEvent>>>,
         gate: epics_base_rs::server::access_security::AccessGate,
     }
 
@@ -12479,13 +12424,13 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_raw(
             &self,
             _name: &str,
-        ) -> Option<mpsc::Receiver<crate::server_native::RawMonitorEvent>> {
+        ) -> Option<MonitorStream<crate::server_native::RawMonitorEvent>> {
             self.raw_rx.lock().unwrap().take()
         }
     }
@@ -12505,7 +12450,7 @@ mod tests {
 
         // Permissive at subscribe: the anonymous peer may READ.
         let permissive = parse_acf("ASG(DEFAULT) {\n    RULE(1, READ)\n}\n").expect("acf");
-        let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(permissive)));
+        let cell = epics_base_rs::server::access_security::new_acf_cell(Some(permissive));
         let version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let resolver: AsgAslResolver =
             std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
@@ -12515,7 +12460,7 @@ mod tests {
         let source: DynSource = Arc::new(FlipRawSeedSource {
             intro: intro.clone(),
             seed: three_field_value(0, 0, 0),
-            raw_rx: std::sync::Mutex::new(Some(raw_rx)),
+            raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
             gate,
         });
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -12528,7 +12473,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12536,7 +12481,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12563,7 +12508,7 @@ mod tests {
              }\n",
         )
         .expect("acf");
-        *cell.write().await = Some(deny);
+        cell.store(Some(std::sync::Arc::new(deny)));
         version.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -12626,7 +12571,7 @@ mod tests {
                  }\n",
             )
             .expect("acf parse");
-            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
             let resolver: AsgAslResolver =
                 std::sync::Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
             Self {
@@ -12658,9 +12603,9 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(4);
-            Some(rx)
+            Some(rx.into())
         }
     }
 
@@ -12695,7 +12640,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12703,7 +12648,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12790,7 +12735,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12799,7 +12744,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT with pipeline=true, queueSize=2, but subcmd 0x08:
         // the 0x80 bit is CLEAR, so NO initial-nack rider follows the
@@ -12916,7 +12861,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -12929,7 +12874,7 @@ mod tests {
         );
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT, pipeline OFF, queueSize=2.
         let req_val = make_pipeline_request(
@@ -13017,7 +12962,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -13026,7 +12971,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (pipeline, queueSize=4 so an ACK is well-formed).
         let req_val = make_pipeline_request(
@@ -13206,7 +13151,7 @@ mod tests {
                 introspection: None,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13232,7 +13177,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // ACK frame (subcmd 0x80) with NO u32 ack-count payload.
         let mut payload = Vec::new();
@@ -13285,7 +13230,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13338,7 +13283,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13400,9 +13345,9 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -13482,7 +13427,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13526,7 +13471,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0xC4 = ACK(0x80)|START(0x04)|start(0x40), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13602,7 +13547,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0x84 = ACK(0x80)|STOP(0x04, no start bit), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13677,7 +13622,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // subcmd 0xC4 with a 3-credit ACK count.
         let mut payload = Vec::new();
@@ -13774,7 +13719,7 @@ mod tests {
     /// probe-reply), and with `MustReply` it likewise carries the CID.
     #[tokio::test]
     async fn tcp_search_does_not_gate_on_advertised_protocol() {
-        use crate::client_native::decode::{decode_search_response, try_parse_frame};
+        use crate::decode::{decode_search_response, try_parse_frame};
         use crate::server_native::{SharedPV, SharedSource};
 
         let order = ByteOrder::Little;
@@ -13929,7 +13874,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -13974,7 +13919,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             }
         };
@@ -14062,7 +14007,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14102,6 +14047,15 @@ mod tests {
         );
     }
 
+    // Reactor-dependent, and specifically tokio-shaped: it stands a task up
+    // with a bare `tokio::spawn` so it can hand `AbortOnDrop` a raw
+    // `tokio::task::AbortHandle`, and it reads the outcome through tokio's
+    // `JoinError::is_cancelled`. Under `rtems-exec-model` the `runtime::task`
+    // seam's `TaskAbortHandle` is a *different* type with a different join
+    // error, so the fixture does not even typecheck there — and the production
+    // sites it stands in for (`finish_exec_data_task`, `monitor_abort`) take
+    // their handle from the seam and do compile on both backends.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn cancel_request_pauses_monitor_without_aborting() {
         // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
@@ -14162,7 +14116,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14227,6 +14181,11 @@ mod tests {
     /// accepted (`serverget.cpp:511-514`). Regression for the pre-fix
     /// handler that only paused monitors and left GET/PUT/RPC/PROCESS
     /// `Executing`, still able to emit a stale reply and blocking re-EXEC.
+    // Same reason as `cancel_request_pauses_monitor_without_aborting` above:
+    // a bare `tokio::spawn` handle into `AbortOnDrop` plus a tokio
+    // `JoinError::is_cancelled` readout, neither of which exists on the
+    // executor backend.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task() {
         let order = ByteOrder::Little;
@@ -14262,7 +14221,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14349,7 +14308,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -14961,7 +14920,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15019,7 +14978,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15074,7 +15033,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, inbound_order);
@@ -15139,7 +15098,10 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+            async fn subscribe(
+                &self,
+                _name: &str,
+            ) -> Option<crate::server_native::MonitorStream<PvField>> {
                 None
             }
             fn notify_channel_close(
@@ -15168,7 +15130,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15269,7 +15231,7 @@ mod tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn notify_channel_open(
@@ -15631,7 +15593,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -15704,7 +15666,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15783,7 +15745,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15792,7 +15754,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT: sid + ioid + subcmd=0x08 + pvRequest(type + value).
         // Use an empty Structure pvRequest (full mask).
@@ -15916,7 +15878,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -15925,7 +15887,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
@@ -16038,7 +16000,7 @@ mod tests {
         let source: DynSource = Arc::new(shared);
 
         let config = PvaServerConfig::default();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // A channel carrying one already-INIT'd GET op.
         let make_channels = || {
@@ -16061,7 +16023,7 @@ mod tests {
                     introspection: Some(intro.clone()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops,
                 },
             );
@@ -16219,7 +16181,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16228,7 +16190,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // The "empty pvRequest" structure (no `field` child) → wildcard
         // mask. Its only role here is to be a real descriptor the client can
@@ -16322,7 +16284,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16622,7 +16584,7 @@ mod tests {
             async fn is_writable(&self, _: &str) -> bool {
                 true
             }
-            async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -16715,7 +16677,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16724,7 +16686,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT.
         let req_desc = FieldDesc::Structure {
@@ -16846,7 +16808,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -16855,7 +16817,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT_GET INIT (subcmd 0x08).
         let req_desc = FieldDesc::Structure {
@@ -17091,7 +17053,7 @@ mod tests {
                  }\n",
             )
             .expect("acf parse");
-            let cell = std::sync::Arc::new(tokio::sync::RwLock::new(Some(acf)));
+            let cell = epics_base_rs::server::access_security::new_acf_cell(Some(acf));
             // Resolve every PV to ASG DEFAULT, ASL 1 — so the
             // ASL-1-scoped WRITE rule applies.
             let resolver: AsgAslResolver =
@@ -17134,7 +17096,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
         fn process(
@@ -17173,7 +17135,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -17191,6 +17153,95 @@ mod tests {
             authority: authority.into(),
             roles: Vec::new(),
         }
+    }
+
+    /// A1: the ACF host identity must come from the socket, never the wire.
+    ///
+    /// A crafted `ca` client sends `host` naming a machine an operator's
+    /// `HAG(...)` trusts. A2 is the same defect through `asCheckClientIP=1`,
+    /// where `hag_members` (`access_security.rs:1499-1529`) stores either a
+    /// dotted quad or the literal `unresolved:<name>` sentinel a failed
+    /// load-time DNS lookup leaves behind — so both of those are typeable
+    /// too, and the sentinel turns a *failed* lookup into a password. All
+    /// three shapes are covered below. Pre-fix the string was copied
+    /// verbatim into `ClientCredentials::host`
+    /// (`tcp.rs:2768`), which is the value `compute_rules` matches HAG
+    /// members against, so a client could grant itself any host-scoped rule.
+    ///
+    /// pvxs cannot express this: `server::ClientCredentials`
+    /// (`src/pvxs/srvcommon.h:36-56`) has no host field, and QSRV derives it
+    /// from the socket (`ioc/credentials.cpp:27-29`).
+    ///
+    /// Fails today on Linux with no network: it is a pure decode.
+    #[test]
+    fn parse_client_credentials_never_takes_the_acf_host_from_the_wire() {
+        let order = ByteOrder::Little;
+        let account = "pvxs_nobody_zz";
+        // Both shapes an attacker would pick: a trusted-looking name, and
+        // the sentinel a failed HAG lookup leaves behind (A2).
+        for forged in ["trusted-console.lab", "unresolved:lab-pc1", "192.0.2.7"] {
+            let mut payload = Vec::new();
+            payload.put_u32(0x10000, order); // buffer_size
+            payload.put_u16(1, order); // intro_size
+            payload.put_u16(0, order); // qos
+            encode_string_into("ca", order, &mut payload);
+            payload.put_u8(0xFD);
+            payload.put_u16(1, order);
+            payload.put_u8(0x80);
+            payload.put_u8(0x00);
+            payload.put_u8(2); // n_fields
+            payload.put_u8(0x04);
+            payload.extend_from_slice(b"user");
+            payload.put_u8(0x60); // string
+            payload.put_u8(0x04);
+            payload.extend_from_slice(b"host");
+            payload.put_u8(0x60); // string
+            encode_string_into(account, order, &mut payload);
+            encode_string_into(forged, order, &mut payload);
+
+            let header = PvaHeader::application(
+                false,
+                order,
+                Command::ConnectionValidation.code(),
+                payload.len() as u32,
+            );
+            let frame = Frame { header, payload };
+
+            let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
+                .expect("decode must succeed")
+                .expect("ca with a user field yields Some");
+
+            assert_ne!(
+                creds.host, forged,
+                "the wire `host` reached the field the HAG gate matches"
+            );
+            assert_eq!(
+                creds.host, "198.51.100.7",
+                "host must be the numeric peer (QSRV credentials.cpp:27-29)"
+            );
+        }
+    }
+
+    /// The peer-derivation itself, on the boundaries QSRV's `map6to4` covers.
+    #[test]
+    fn acf_host_from_peer_matches_qsrv_map6to4() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 5075);
+        assert_eq!(ClientCredentials::acf_host_from_peer(v4), "10.0.0.3");
+
+        // IPv4-mapped IPv6 renders as its IPv4 form, so a dual-stack peer
+        // matches the same HAG entry it would over IPv4.
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(10, 0, 0, 3).to_ipv6_mapped()),
+            5075,
+        );
+        assert_eq!(ClientCredentials::acf_host_from_peer(mapped), "10.0.0.3");
+
+        // A genuine IPv6 peer keeps its own form; `to_ipv4` (as opposed to
+        // `to_ipv4_mapped`) would have rendered ::1 as "0.0.0.1".
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5075);
+        assert_eq!(ClientCredentials::acf_host_from_peer(v6), "::1");
     }
 
     /// Security regression: the server MUST NOT trust wire-advertised
@@ -17245,7 +17296,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("ca with a user field yields Some");
 
@@ -17289,8 +17340,8 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let parsed =
-            parse_client_credentials(&frame, &mut TypeCache::new()).expect("decode must succeed");
+        let parsed = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
+            .expect("decode must succeed");
         assert!(
             parsed.is_none(),
             "ca + null auth must yield the anonymous fallback (None), \
@@ -17333,7 +17384,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("non-anonymous method yields Some");
         assert_eq!(
@@ -17371,7 +17422,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("mixed-case `Ca` is not the exact `ca` fallback → Some");
         assert_eq!(
@@ -17409,7 +17460,7 @@ mod tests {
         );
         let frame = Frame { header, payload };
 
-        let creds = parse_client_credentials(&frame, &mut TypeCache::new())
+        let creds = parse_client_credentials(&frame, &mut TypeCache::new(), TEST_PEER)
             .expect("decode must succeed")
             .expect("capitalized `Anonymous` is not the exact fold → Some");
         assert_eq!(
@@ -17565,7 +17616,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -17685,7 +17736,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18067,7 +18118,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18254,7 +18305,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18393,7 +18444,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -18408,7 +18459,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18453,7 +18504,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18466,7 +18517,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18520,7 +18571,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18534,7 +18585,7 @@ mod tests {
         let inbound_body = frame.payload.len();
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         handle_get_field(
             &frame,
             &tx,
@@ -18625,7 +18676,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -18679,7 +18730,7 @@ mod tests {
     /// and fabricated a Variant type tree.
     #[tokio::test]
     async fn get_field_none_introspection_replies_error_no_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::server_native::SharedSource;
         use std::sync::Arc;
 
@@ -18701,7 +18752,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18714,7 +18765,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18750,7 +18801,7 @@ mod tests {
     /// error-path fix).
     #[tokio::test]
     async fn get_field_slow_path_returns_source_descriptor() {
-        use crate::client_native::decode::{decode_get_field_response, try_parse_frame};
+        use crate::decode::{decode_get_field_response, try_parse_frame};
         use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
         use crate::server_native::SharedSource;
         use crate::server_native::shared_pv::SharedPV;
@@ -18785,7 +18836,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18798,7 +18849,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18866,7 +18917,7 @@ mod tests {
             async fn is_writable(&self, _name: &str) -> bool {
                 false
             }
-            async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -18891,7 +18942,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -18905,7 +18956,7 @@ mod tests {
             synth_frame(Command::GetField, order, payload)
         };
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
         let frame1 = build();
@@ -19245,11 +19296,11 @@ mod tests {
         async fn is_writable(&self, _n: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
             // Sender dropped immediately → receiver closed → the subscriber
             // loop sees end-of-stream and the task ends (source close).
             let (_tx, rx) = mpsc::channel(1);
-            Some(rx)
+            Some(rx.into())
         }
         fn notify_monitor_start(
             &self,
@@ -19315,7 +19366,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -19352,8 +19403,24 @@ mod tests {
             }
         });
 
-        let (exec_tx, exec_rx) = tokio::sync::watch::channel(false);
-        spawn_monitor_gate_driver(gate, exec_rx);
+        let (exec_tx, mut exec_rx) = tokio::sync::watch::channel(false);
+        // Stand-in for the subscriber loop, reduced to the two things that
+        // matter here: it reads the executing state and applies the gate once
+        // per iteration, and it wakes on every watch edge. The production
+        // loop does exactly this (`let executing = *exec_rx.borrow_and_update()`
+        // then `gate_driver.apply(executing).await`, with an
+        // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
+        // covers the same path end to end through a real MONITOR.
+        let mut gate_driver = MonitorGateDriver::new(Some(gate));
+        tokio::spawn(async move {
+            loop {
+                let executing = *exec_rx.borrow_and_update();
+                gate_driver.apply(executing).await;
+                if exec_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
         let ctl = MonitorStartControl::new(src.clone(), "dut".into(), bfr12_anon_ctx(), exec_tx);
 
         async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
@@ -19385,6 +19452,138 @@ mod tests {
             *starts.lock(),
             vec![true, false, true],
             "notify_monitor_start fires the same edges (only real edges, no initial apply)"
+        );
+    }
+
+    /// A source that hands the subscriber a gate plus an updates stream
+    /// that never produces — so the subscriber loop parks in `rx.recv()`.
+    #[derive(Clone)]
+    struct GatedQuietSource {
+        intro: FieldDesc,
+        gate_log: Arc<parking_lot::Mutex<Vec<bool>>>,
+        /// Keeps the updates channel open; dropping it would end the loop.
+        _keepalive: Arc<mpsc::Sender<crate::server_native::MonitorUpdate>>,
+        keep: Arc<parking_lot::Mutex<Option<mpsc::Receiver<crate::server_native::MonitorUpdate>>>>,
+    }
+    impl crate::server_native::source::ChannelSource for GatedQuietSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            None
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            None
+        }
+        async fn subscribe_seeded(
+            &self,
+            _checked: crate::server_native::source::AccessChecked,
+            _ctx: crate::server_native::source::ChannelContext,
+            _opts: crate::server_native::MonitorOptions,
+        ) -> Option<
+            crate::server_native::source::SubscriptionSeed<crate::server_native::MonitorUpdate>,
+        > {
+            let log = self.gate_log.clone();
+            Some(crate::server_native::source::SubscriptionSeed {
+                initial: None,
+                updates: self.keep.lock().take()?.into(),
+                on_start: Some(crate::server_native::source::MonitorGate::new(
+                    move |active| {
+                        let log = log.clone();
+                        async move {
+                            log.lock().push(active);
+                        }
+                    },
+                )),
+            })
+        }
+    }
+
+    /// The gate driver is no longer a task of its own, so a START/STOP edge
+    /// now reaches the source only if the subscriber loop observes it. The
+    /// case that would expose a missed observation is precisely the one
+    /// where nothing else can wake the loop: a monitor with no updates
+    /// flowing, parked in `rx.recv()`. Drive INIT -> START -> STOP against
+    /// such a monitor and require the gate to see the initial Idle plus both
+    /// edges.
+    ///
+    /// Revert-verify: drop the per-iteration `gate_driver.apply(executing)`
+    /// (keeping only the pre-loop application) and the log stalls at
+    /// `[false]`.
+    #[tokio::test]
+    async fn bfr12_gate_reaches_a_parked_monitor() {
+        let intro = three_field_intro();
+        let gate_log = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        let (keep_tx, keep_rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(4);
+        let src: DynSource = Arc::new(GatedQuietSource {
+            intro: intro.clone(),
+            gate_log: gate_log.clone(),
+            _keepalive: Arc::new(keep_tx),
+            keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
+        });
+
+        let (wire_tx, _wire_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let (_join, start_ctl) = spawn_monitor_subscriber(MonitorSubscriberArgs {
+            sid: 1,
+            ioid: 2,
+            pv_name: "dut".into(),
+            intro: intro.clone(),
+            mask: BitSet::with_capacity(intro.total_bits()),
+            tx: ChannelTx::new(
+                wire_tx,
+                crate::server_native::peers::ChannelStat::new("dut".into()),
+            ),
+            src: src.clone(),
+            queue_depth: 4,
+            high_watermark: 0,
+            mon_ctx: bfr12_anon_ctx(),
+            window: None,
+            window_notify: None,
+            filters: Arc::new(Default::default()),
+            monitor_options: Default::default(),
+            wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            monitor_op_id: 7,
+            wm_levels: None,
+            mon_fin_tx,
+            out_order: fixed_out_order(ByteOrder::Little),
+        });
+
+        async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
+            for _ in 0..400 {
+                if log.lock().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("gate log never reached {n} entries: {:?}", log.lock());
+        }
+
+        // Initial Idle, applied where the driver used to be spawned. Wait for
+        // it before the first edge so the watch cannot coalesce the two.
+        wait_len(&gate_log, 1).await;
+        start_ctl.set(true); // START: resume the upstream
+        wait_len(&gate_log, 2).await;
+        start_ctl.set(false); // STOP: suspend it again, loop still parked
+        wait_len(&gate_log, 3).await;
+
+        assert_eq!(
+            *gate_log.lock(),
+            vec![false, true, false],
+            "a parked monitor must still relay initial Idle and both edges to \
+             its source gate"
         );
     }
 
@@ -19521,7 +19720,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -19531,7 +19730,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // MONITOR INIT (subcmd 0x08): empty pvRequest → full monitor.
         let req_val = PvField::Structure(PvStructure {
@@ -19680,7 +19879,7 @@ mod tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -19697,7 +19896,7 @@ mod tests {
                 introspection: intro,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -19748,7 +19947,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // GET INIT (subcmd 0x08) — succeeds via ch.introspection.
         let mut init_payload = Vec::new();
@@ -19827,7 +20026,7 @@ mod tests {
                     introspection: Some(three_field_intro()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(),
+                    open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
                 },
             );
@@ -19861,7 +20060,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // INIT a fresh GET on channel sid=2 reusing ioid=5.
         let mut init_payload = Vec::new();
@@ -19942,7 +20141,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         // PUT INIT (subcmd 0x08).
         let mut init_payload = Vec::new();
@@ -20026,7 +20225,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let mut init_payload = Vec::new();
         init_payload.put_u32(sid, order);
@@ -20157,7 +20356,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous();
+        let mut cred = ClientCredentials::anonymous(TEST_PEER);
         // One connection-scope inbound decode cache shared across both
         // validation frames, mirroring the read loop's single `rx_type_cache`.
         let mut decode_cache = TypeCache::new();
@@ -20295,7 +20494,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous();
+        let mut cred = ClientCredentials::anonymous(TEST_PEER);
         let mut decode_cache = TypeCache::new();
 
         // Initial handshake: identity becomes alice/ca.
@@ -20456,7 +20655,7 @@ mod autoexec_tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
             },
         );
@@ -20465,7 +20664,7 @@ mod autoexec_tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let req_desc = pv_request.descriptor();
         let mut init_payload = Vec::new();
@@ -20635,7 +20834,10 @@ mod r14_tests {
         async fn is_writable(&self, _name: &str) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }
@@ -20650,7 +20852,7 @@ mod r14_tests {
         let source: DynSource = std::sync::Arc::new(SlowGetSource);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
 
         let intro = FieldDesc::Variant;
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -20668,7 +20870,7 @@ mod r14_tests {
                 introspection: Some(intro),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -20825,7 +21027,7 @@ mod bfr15_tests {
         async fn is_writable(&self, _: &str) -> bool {
             true
         }
-        async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        async fn subscribe(&self, _: &str) -> Option<crate::server_native::MonitorStream<PvField>> {
             None
         }
     }
@@ -20853,7 +21055,7 @@ mod bfr15_tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -20868,6 +21070,9 @@ mod bfr15_tests {
         synth_frame(Command::Get, order, payload)
     }
 
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn put_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let intro = nt_scalar_desc();
         let mut payload = Vec::new();
@@ -20880,6 +21085,9 @@ mod bfr15_tests {
         synth_frame(Command::Put, order, payload)
     }
 
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn destroy_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -20889,6 +21097,9 @@ mod bfr15_tests {
 
     /// Poll `counter` until it reaches `want`, panicking after ~1 s. Used to
     /// wait for a spawned task to enter its (blocking) source call.
+    // Used only by the three reactor-dependent tests gated below, so it
+    // carries the same predicate — otherwise it is dead code feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn wait_for(counter: &AtomicUsize, want: usize) {
         for _ in 0..200 {
             if counter.load(Ordering::SeqCst) >= want {
@@ -20926,6 +21137,14 @@ mod bfr15_tests {
     /// (a) `Executing` boundary on GET: a second GET EXEC arriving while the
     /// first source read is in flight is ignored — it neither starts a second
     /// source read nor aborts the first.
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -20945,7 +21164,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21008,6 +21227,14 @@ mod bfr15_tests {
     /// (b) `Executing` boundary on PUT: a second PUT EXEC arriving while the
     /// first write is in flight is ignored — neither a second write starts nor
     /// the first is aborted.
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -21030,7 +21257,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21091,6 +21318,14 @@ mod bfr15_tests {
     /// removing the op drops its `AbortOnDrop` guard, cancelling the spawned
     /// read. (The `Executing` gate suppresses only an implicit re-EXEC, never
     /// an explicit teardown.)
+    // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
+    // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
+    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `cbMedium` executor worker, which has no tokio reactor — the fixture
+    // panics with "there is no reactor running" before the assertion is
+    // reached. The production path under test is backend-neutral; only the
+    // way the fixture blocks is not.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
         let order = ByteOrder::Little;
@@ -21110,7 +21345,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21166,7 +21401,7 @@ mod bfr15_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous();
+        let cred = ClientCredentials::anonymous(TEST_PEER);
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21297,7 +21532,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -21378,7 +21613,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(),
+                open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
             },
         );
@@ -21397,6 +21632,100 @@ mod bfr15_tests {
         assert!(
             !channels[&sid].ops.contains_key(&ioid),
             "GET_FIELD one-shot is removed on every terminal reply, even an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inbound_message_cap_tests {
+    //! The inbound size cap: what `read_frame` does with a header that
+    //! announces more than the configured ceiling, and what the default
+    //! ceiling is when nobody configures one.
+    use super::*;
+    use crate::server_native::config::DEFAULT_MAX_MESSAGE_SIZE;
+
+    /// An 8-byte client→server application header announcing `payload_length`
+    /// and nothing else. The body is never sent: the point of the cap is that
+    /// the server refuses before it would allocate for one.
+    fn header_announcing(payload_length: u32) -> Vec<u8> {
+        let h = PvaHeader::application(
+            false, // client direction — a server's inbound frame
+            ByteOrder::Little,
+            Command::Get.code(),
+            payload_length,
+        );
+        let mut out = Vec::new();
+        h.write_into(&mut out);
+        assert_eq!(out.len(), PvaHeader::SIZE);
+        out
+    }
+
+    #[tokio::test]
+    async fn the_default_ceiling_refuses_an_oversized_header_without_reading_a_body() {
+        let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(
+            &mut reader,
+            &mut rx_buf,
+            Duration::from_secs(1),
+            Some(DEFAULT_MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect_err("an over-cap header must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds max_message_size"),
+            "refusal must name the cap it broke: {msg}"
+        );
+        // Only the header was ever buffered — the refusal happened before the
+        // body could be read, which is the whole reason the cap is checked on
+        // the header rather than after reassembly.
+        assert_eq!(rx_buf.len(), PvaHeader::SIZE);
+    }
+
+    /// The comparison is `>`, not `>=`: a message exactly at the ceiling is
+    /// admitted. An off-by-one here would refuse the largest legal message.
+    #[tokio::test]
+    async fn a_message_exactly_at_the_ceiling_is_admitted() {
+        let cap = 16usize;
+        let mut wire = header_announcing(cap as u32);
+        wire.extend_from_slice(&[0u8; 16]);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let frame = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+            .await
+            .expect("a message exactly at the cap must be admitted");
+        assert_eq!(frame.payload.len(), cap);
+    }
+
+    #[tokio::test]
+    async fn one_byte_over_the_ceiling_is_refused() {
+        let cap = 16usize;
+        let wire = header_announcing(cap as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+            .await
+            .expect_err("one byte over the cap must be refused");
+        assert!(err.to_string().contains("exceeds max_message_size"));
+    }
+
+    /// `None` is still expressible and still means unbounded — the same
+    /// header the default ceiling refuses is accepted for buffering when the
+    /// deployment opted out.
+    #[tokio::test]
+    async fn an_explicit_none_still_means_unbounded() {
+        let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut rx_buf = Vec::new();
+        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), None)
+            .await
+            .expect_err("the stream ends after the header, so this cannot succeed");
+        // The refusal must be the *stream ending*, not the cap.
+        assert!(
+            err.to_string().contains("client closed"),
+            "an unbounded reader must not refuse on size: {err}"
         );
     }
 }

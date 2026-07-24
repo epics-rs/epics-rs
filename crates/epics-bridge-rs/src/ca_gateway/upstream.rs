@@ -37,6 +37,11 @@
 //! events arrive). On terminal failure the entry transitions to the
 //! `Disconnect` state, which the cleanup tick eventually evicts.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - `cached_old_for_audit_boundaries` runs and
+// passes in the feature-ON suite (it touches the cache only, never the upstream
+// client). The other twelve take gate (3); see the comment on
+// `manager_construct`.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +49,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
+use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::server::snapshot::DbrClass;
@@ -52,14 +58,13 @@ use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
 use epics_ca_rs::protocol::DBE_PROPERTY;
 use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 
 use crate::error::{BridgeError, BridgeResult};
 
 use super::access::AccessConfig;
 use super::cache::{PvCache, PvState};
 use super::putlog::{PutLog, PutLogLine, PutLogScope, PutOutcome};
-use super::pvlist::PvList;
+use super::pvlist::{PolicyHost, PvList};
 use super::server::CacheMode;
 use super::stats::Stats;
 
@@ -163,7 +168,7 @@ struct UpstreamSubscription {
     /// no-cache PV with no current monitor interest — GETs are still
     /// served via the shadow PV's read hook (fresh upstream fetch), no
     /// persistent subscription needed.
-    task: Option<JoinHandle<()>>,
+    task: Option<TaskHandle<()>>,
     /// The property-monitor-forwarding task — the distinct upstream
     /// `DBE_PROPERTY` subscription that refreshes the shadow PV's
     /// display/control/enum metadata and fans `DBE_PROPERTY` events out
@@ -175,7 +180,7 @@ struct UpstreamSubscription {
     /// [`UpstreamManager::release_prop_monitor`]). `None` otherwise.
     /// Mirrors C ca-gateway's separate `pv->propMonitor()`
     /// (`gatePv.cc:1705`, `:1749-1752`).
-    prop_task: Option<JoinHandle<()>>,
+    prop_task: Option<TaskHandle<()>>,
     /// Whether the connect-time DBR_CTRL metadata seed actually landed.
     /// When `false` (the 500 ms seed timed out or errored), a
     /// [`Self::prop_task`] spawned later (the no-cache lazy path in
@@ -598,7 +603,9 @@ impl UpstreamManager {
             _ => EpicsValue::Double(0.0),
         };
         let initial_value =
-            match tokio::time::timeout(Duration::from_millis(500), channel.get()).await {
+            match epics_base_rs::runtime::task::timeout(Duration::from_millis(500), channel.get())
+                .await
+            {
                 Ok(Ok((_dbf, v))) => v,
                 Ok(Err(e)) => {
                     tracing::info!(
@@ -742,7 +749,7 @@ impl UpstreamManager {
             // metadata too fast to time out.
             false
         } else {
-            match tokio::time::timeout(
+            match epics_base_rs::runtime::task::timeout(
                 self.metadata_seed_timeout,
                 channel.get_with_metadata(DbrClass::Ctrl),
             )
@@ -915,7 +922,7 @@ impl UpstreamManager {
         served_name: &str,
         channel: Arc<CaChannel>,
         initial_monitor: Option<MonitorHandle>,
-    ) -> JoinHandle<()> {
+    ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let stats_for_task = self.write_env.stats.clone();
@@ -928,7 +935,7 @@ impl UpstreamManager {
         // alarm post by `served_name` — the same key the shadow PV and
         // cache were registered under above.
         let name = served_name.to_string();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // Seed the first iteration with the monitor the caller
@@ -964,7 +971,7 @@ impl UpstreamManager {
                             if cache_clone.read().await.get(&name).is_none() {
                                 return;
                             }
-                            tokio::time::sleep(backoff).await;
+                            epics_base_rs::runtime::task::sleep(backoff).await;
                             backoff = std::cmp::min(backoff * 2, max_backoff);
                             continue;
                         }
@@ -1056,20 +1063,18 @@ impl UpstreamManager {
                 // correct EPICS status for a link-disconnect alarm;
                 // upstream disconnect is visible to downstream monitors
                 // both via severity and via the correct status code.
-                let _ = db_clone
-                    .post_alarm(
-                        &name,
-                        3,
-                        epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                    )
-                    .await;
+                let _ = db_clone.post_alarm(
+                    &name,
+                    3,
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                );
 
                 // Back off, then loop: the top of the loop re-subscribes
                 // (the single subscribe site). Bail out if the cache
                 // entry has been evicted (nobody cares anymore). The
                 // CaChannel itself drives reconnect under the hood; this
                 // loop merely re-arms the monitor stream once it is back.
-                tokio::time::sleep(backoff).await;
+                epics_base_rs::runtime::task::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
                 if cache_clone.read().await.get(&name).is_none() {
                     return;
@@ -1120,11 +1125,11 @@ impl UpstreamManager {
         served_name: &str,
         channel: Arc<CaChannel>,
         seed_succeeded: bool,
-    ) -> JoinHandle<()> {
+    ) -> TaskHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
         let name = served_name.to_string();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // The very first event of the FIRST subscription is the
@@ -1158,7 +1163,7 @@ impl UpstreamManager {
                         if cache_clone.read().await.get(&name).is_none() {
                             return;
                         }
-                        tokio::time::sleep(backoff).await;
+                        epics_base_rs::runtime::task::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
                     }
@@ -1198,7 +1203,7 @@ impl UpstreamManager {
                 // Subscription closed (upstream disconnect). Back off, then
                 // the top of the loop re-subscribes. Bail if the cache entry
                 // was evicted (nobody cares anymore).
-                tokio::time::sleep(backoff).await;
+                epics_base_rs::runtime::task::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
                 if cache_clone.read().await.get(&name).is_none() {
                     return;
@@ -1600,12 +1605,34 @@ fn build_write_hook(
             // ECA status differs from "ACL deny" and operators can
             // distinguish in audits. `load_full` is wait-free.
             let pvlist = env.pvlist.load_full();
-            if pvlist.is_host_denied(&pv_name, &ctx.host) {
+            // The identity is the SOCKET, never `ctx.host` — that field is
+            // the name the client claims in CA `HOST_NAME`, so using it here
+            // let a client pick which DENY row applied to its own writes,
+            // and disagreed with the search/create path
+            // (`server.rs`) which has always used the peer address. C pins
+            // this to the socket too, with `getClientHostName` commented out
+            // (`gateServer.cc:1523-1530`). `PolicyHost` is constructible
+            // only from a peer, so the two points cannot drift apart again.
+            //
+            // An unparseable peer is DENY: a blacklist cannot be shown not
+            // to apply to a peer we cannot establish.
+            let Some(policy_host) = PolicyHost::from_peer_str(&ctx.peer) else {
+                tracing::warn!(
+                    peer = %ctx.peer, pv = %pv_name,
+                    "pvlist DENY FROM: peer address unparseable, refusing the put"
+                );
+                env.stats.record_readonly_reject();
+                log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
+                return Err(CaError::PutDisabled(format!(
+                    "{pv_name} (peer address unavailable for pvlist evaluation)"
+                )));
+            };
+            if pvlist.is_host_denied(&pv_name, &policy_host) {
                 env.stats.record_readonly_reject();
                 log_denial(&env, &ctx, &pv_name, &value_str, &old_str).await;
                 return Err(CaError::PutDisabled(format!(
                     "{pv_name} (host {} denied by pvlist)",
-                    ctx.host
+                    policy_host.as_str()
                 )));
             }
 
@@ -1868,7 +1895,13 @@ fn format_value_for_audit(v: &EpicsValue, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the eight gated tests below host a real async CA server, so the
+    // import carries their predicate — otherwise it is unused feature-ON.
+    #[cfg(not(feature = "rtems-exec-model"))]
     use epics_ca_rs::server::CaServer;
+    // Same predicate as the import above: every `#[serial(epics_env)]` test in
+    // this module is one of the gated ones.
+    #[cfg(not(feature = "rtems-exec-model"))]
     use serial_test::serial;
 
     #[test]
@@ -2047,6 +2080,7 @@ mod tests {
     ///
     /// The caller must bind the returned guard for the test duration — the
     /// port is dead only while the socket lives.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn dead_upstream() -> (std::net::UdpSocket, u16) {
         let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("own a dead CA port");
         let port = sock.local_addr().unwrap().port();
@@ -2056,6 +2090,7 @@ mod tests {
     /// Point the ambient `EPICS_CA_*` env at `127.0.0.1:port` so the
     /// `UpstreamManager`'s internal env-driven `CaClient::new()` connects
     /// to the test server. Callers must be `#[serial(epics_env)]`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn pin_env(port: u16) {
         // SAFETY: env-touching tests are serialized via
         // `#[serial(epics_env)]`; no other thread reads/writes these
@@ -2070,6 +2105,7 @@ mod tests {
     /// Build an `UpstreamManager` whose internal `CaClient::new()` reads
     /// the ambient `EPICS_CA_*` env — call [`pin_env`] first so the client
     /// is pinned to the test server.
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn pinned_manager(db: Arc<PvDatabase>) -> UpstreamManager {
         pinned_manager_full(db, Arc::new(RwLock::new(PvCache::new())), CacheMode::Cached).await
     }
@@ -2077,6 +2113,7 @@ mod tests {
     /// Like [`pinned_manager`] but with a caller-supplied cache (so a test
     /// can inspect per-PV state) and an explicit cache mode (so a test can
     /// exercise the no-cache GET-forward + lazy-monitor paths).
+    #[cfg(not(feature = "rtems-exec-model"))]
     async fn pinned_manager_full(
         db: Arc<PvDatabase>,
         cache: Arc<RwLock<PvCache>>,
@@ -2105,6 +2142,16 @@ mod tests {
         .expect("manager builds")
     }
 
+    // `UpstreamManager::new` constructs the gateway's upstream `CaClient`.
+    // Under this feature that client's search engine is name-servers-only
+    // (`epics-ca-rs` `search::SearchTransport` has no `Udp` variant on the
+    // exec backend, because a future spawned through the `runtime::task`
+    // seam runs on a callback-pool worker with no tokio reactor), and a
+    // name-servers-only engine with an empty `EPICS_CA_NAME_SERVERS` is
+    // refused at construction — it could reach no server at all. The
+    // gateway is a hosted daemon that is never built in the exec model, so
+    // the configuration these tests use is not one it has to satisfy.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test]
     async fn manager_construct() {
         let cache = Arc::new(RwLock::new(PvCache::new()));
@@ -2141,6 +2188,10 @@ mod tests {
     /// `UpstreamManagerConfig` and reaches `CaClient::new_with_config`.
     /// We do not connect to a real IOC here — the assertion is that
     /// the TLS-configured construction path compiles and runs.
+    // Same reason as `manager_construct`: the manager builds a
+    // name-servers-only upstream `CaClient` with no name server under this
+    // feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[cfg(feature = "ca-gateway-tls")]
     #[tokio::test]
     async fn manager_construct_with_upstream_tls() {
@@ -2346,6 +2397,13 @@ ASG(NewGroup) {
     /// Re-applying the same identity reports no change (idempotent), so a
     /// caller can gate a downstream access-rights re-notification on a real
     /// transition.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_2026_111_reload_updates_live_acl_on_admitted_pv() {
@@ -2403,6 +2461,13 @@ ASG(NewGroup) {
     /// non-empty downstream `units` proves the first-event recovery seeded
     /// it. Reverting `first_event_seen = !seed_succeeded` to `= false`
     /// leaves units empty and fails this test.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_gw23_seed_miss_first_prop_event_seeds_metadata() {
@@ -2459,7 +2524,6 @@ ASG(NewGroup) {
             let pv = db.find_pv(name).await.expect("shadow registered");
             let immediate = pv
                 .snapshot()
-                .await
                 .display
                 .map(|d| d.units.to_string())
                 .unwrap_or_default();
@@ -2478,7 +2542,7 @@ ASG(NewGroup) {
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Some(pv) = db.find_pv(name).await {
-                if let Some(d) = pv.snapshot().await.display {
+                if let Some(d) = pv.snapshot().display {
                     let u = d.units.to_string();
                     if !u.is_empty() {
                         units = u;
@@ -2505,6 +2569,13 @@ ASG(NewGroup) {
     /// Registration is now gated on a live upstream connection, so this
     /// test hosts a real `CaServer` serving the *real* name; the served
     /// (alias) name is what the shadow PV must be keyed by.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_fr2_alias_registers_shadow_pv_under_served_name() {
@@ -2557,6 +2628,13 @@ ASG(NewGroup) {
     /// a plain (non-alias) ALLOW match passes served == real,
     /// so the shadow PV is keyed by the same name — the pre-FR-2 behavior
     /// for non-alias names is preserved exactly.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_fr2_non_alias_keys_shadow_pv_by_same_name() {
@@ -2592,6 +2670,9 @@ ASG(NewGroup) {
     /// pattern. Mirrors C ca-gateway `gatePvData::death →
     /// pverDoesNotExistHere` (gatePv.cc:622): exists-here is reported only
     /// after the upstream connects, not on a bare pattern match.
+    // Same reason as `manager_construct`: the manager builds a name-servers-only
+    // upstream `CaClient` with no name server under this feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_r64_dead_upstream_not_registered() {
@@ -2630,6 +2711,13 @@ ASG(NewGroup) {
     /// sentinel — proving the GET path forwards and the monitor path does
     /// not. Mirrors C `-no_cache` forwarding the read to the IOC
     /// (gateVc.cc:1361-1369).
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_no_cache_get_forwards_to_upstream() {
@@ -2662,7 +2750,7 @@ ASG(NewGroup) {
         let pv = db.find_pv(name).await.expect("shadow PV registered");
         // Make the stored shadow value a sentinel the fresh fetch must
         // override — proving the GET goes upstream, not to the cache.
-        pv.set(EpicsValue::Double(SENTINEL)).await;
+        pv.set(EpicsValue::Double(SENTINEL));
 
         let read = pv.read_snapshot().await.expect("no-cache GET forwards");
         assert_eq!(
@@ -2673,7 +2761,7 @@ ASG(NewGroup) {
         // The monitor/stored path still serves the sentinel — the read
         // hook is GET-path only.
         assert_eq!(
-            pv.snapshot().await.value,
+            pv.snapshot().value,
             EpicsValue::Double(SENTINEL),
             "snapshot (monitor path) must still serve the stored shadow value"
         );
@@ -2684,6 +2772,13 @@ ASG(NewGroup) {
     /// Cached mode regression: NO read hook is installed, so a GET serves
     /// the stored shadow value even when the upstream differs — the
     /// no-cache forwarding is opt-in and does not leak into cached mode.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_cached_get_serves_shadow_value() {
@@ -2708,7 +2803,7 @@ ASG(NewGroup) {
             .expect("ensure_subscribed connects to the hosted upstream");
 
         let pv = db.find_pv(name).await.expect("shadow PV registered");
-        pv.set(EpicsValue::Double(SENTINEL)).await;
+        pv.set(EpicsValue::Double(SENTINEL));
 
         let read = pv.read_snapshot().await.expect("cached GET never errors");
         assert_eq!(
@@ -2725,6 +2820,13 @@ ASG(NewGroup) {
     /// spawns one; `release_monitor` (last downstream monitor) aborts it.
     /// Mirrors C no-cache `getCB` creating the monitor only on
     /// `needPosting()` (gatePv.cc:1737-1753).
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_no_cache_monitor_is_lazy() {
@@ -2806,6 +2908,13 @@ ASG(NewGroup) {
     /// `ensure_subscribed`) and `ensure_monitor`/`release_monitor` are
     /// no-ops — the persistent monitor must outlive any single downstream
     /// subscriber.
+    // Stands up an in-process async `CaServer`, whose accept/search
+    // loops reach the network through the `runtime::task` seam. Under
+    // this feature that seam is the std-thread executor, which starts no
+    // tokio reactor, so the server's first `tokio::net` call panics on a
+    // `cbMedium` worker and the upstream never connects. Same reason as
+    // `epics-ca-rs`'s `two_priorities_open_two_circuits`.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br24_cached_monitor_eager_ensure_release_noop() {
@@ -2870,6 +2979,9 @@ ASG(NewGroup) {
     /// the search miss is reported well under the old 1 s constant —
     /// proving the configured value flows into `wait_connected` (one
     /// connect-timeout owner shared with the cache reaper).
+    // Same reason as `manager_construct`: the manager builds a name-servers-only
+    // upstream `CaClient` with no name server under this feature.
+    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread")]
     #[serial(epics_env)]
     async fn br_2026_22_lazy_connect_honors_configured_timeout() {

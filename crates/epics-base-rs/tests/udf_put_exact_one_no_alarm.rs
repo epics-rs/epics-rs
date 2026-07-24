@@ -14,6 +14,8 @@
 //! `rec_gbl_check_udf` tested `udf != 0` (truthy) for every record. Verified
 //! against the C source (not the running oracle) per the panel's constraints.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::bo::BoRecord;
@@ -36,8 +38,8 @@ async fn caput(db: &PvDatabase, field: &str, text: &str) {
 
 /// `(SEVR, STAT, udf byte)` after the put.
 async fn state(db: &PvDatabase) -> (AlarmSeverity, u16, u8) {
-    let inst = db.get_record("REC").await.unwrap();
-    let g = inst.read().await;
+    let inst = db.get_record("REC").unwrap();
+    let g = inst.read();
     (g.common.sevr, g.common.stat, g.common.udf)
 }
 

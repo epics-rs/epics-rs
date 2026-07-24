@@ -44,6 +44,8 @@
 //! runs the IOC anyway, leaving the record with a link that never reads or
 //! writes. The port refuses the load — the dead link is the illegal state.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -174,8 +176,8 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         .await
         .unwrap();
 
-    let rec = database.get_record("AI:RT").await.unwrap();
-    let mut inst = rec.write().await;
+    let rec = database.get_record("AI:RT").unwrap();
+    let mut inst = rec.write();
     let err = inst
         .put_common_field("INP", EpicsValue::String("5".into()))
         .expect_err("an INST_IO device support cannot take a constant INP, at load OR at runtime");

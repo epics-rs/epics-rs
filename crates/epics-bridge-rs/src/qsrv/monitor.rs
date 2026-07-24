@@ -11,6 +11,8 @@
 //! Tracks overflow events via a counter, corresponding to C++ BaseMonitor's
 //! `inoverflow` flag and overflow BitSet.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -483,8 +485,8 @@ mod tests {
         // VALUE|ALARM subscription should NOT see this (mask
         // mismatch); the PROPERTY subscription must.
         {
-            let rec = db.get_record("MON_PROPERTY").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let rec = db.get_record("MON_PROPERTY").expect("rec exists");
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 
@@ -582,8 +584,8 @@ mod tests {
 
         // A PROPERTY-only post (metadata change) carries the current VAL.
         {
-            let rec = db.get_record("WF_ARR").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let rec = db.get_record("WF_ARR").expect("rec exists");
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::PROPERTY);
         }
 
@@ -638,8 +640,8 @@ mod tests {
         mon.start().await.expect("start ok");
 
         {
-            let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let rec = db.get_record("MON_MARK").expect("rec exists");
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }
 
@@ -660,8 +662,8 @@ mod tests {
         // A DBE_ALARM post promotes to VALUE|ALARM (`singlesource.cpp:90-92`)
         // and so additionally marks `alarm` — still no display/control.
         {
-            let rec = db.get_record("MON_MARK").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let rec = db.get_record("MON_MARK").expect("rec exists");
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::ALARM);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
@@ -704,8 +706,8 @@ mod tests {
         let mut mon = BridgeMonitor::new(db.clone(), "MON_ENUM".into(), "VAL".into(), NtType::Enum);
         mon.start().await.expect("start ok");
         {
-            let rec = db.get_record("MON_ENUM").await.expect("rec exists");
-            let mut instance = rec.write().await;
+            let rec = db.get_record("MON_ENUM").expect("rec exists");
+            let mut instance = rec.write();
             instance.notify_field("VAL", EventMask::VALUE);
         }
         let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())

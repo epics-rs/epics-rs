@@ -1,6 +1,8 @@
 //! Helpers shared across the `caget` / `caput` / `cainfo` / `camonitor`
 //! command-line binaries.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
@@ -243,7 +245,7 @@ const ALARM_STRING_UNKNOWN: &str = "??";
 
 /// C `tool_lib.h:28-30` `stat_to_str` — the single owner of the CA tools'
 /// alarm-status rendering (`caget -a`, `camonitor`, `caput -l` all print
-/// through it). An index past the table yields [`ALARM_STRING_UNKNOWN`].
+/// through it). An index past the table yields `"??"` (`ALARM_STRING_UNKNOWN`).
 ///
 /// The `stat_to_str` / `stat_to_str_unsigned` macro pair differs only in
 /// C's `(stat) >= 0` lower bound, which is vacuous for the port's unsigned
@@ -527,7 +529,7 @@ pub struct ValueFormat {
     /// The value is C's `unsigned long`, so a negative `-#` arrives here
     /// sign-extended (huge) and clamps to the native count — "all elements",
     /// but still "requested" for [`CountPrefix`]. Built only by
-    /// [`crate::copt::CTool::req_elems_int`] / `req_elems_ulong`.
+    /// [`crate::copt::Scan::req_elems_int`] / [`crate::copt::Scan::req_elems_ulong`].
     pub req_elems: u64,
     /// `-F <ofs>` flag: replacement field separator. Defaults to a
     /// single space.
@@ -912,8 +914,8 @@ const C_DEFAULT_PRECISION: usize = 6;
 /// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
 /// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
 ///
-/// Non-finite limits fall through to [`format_non_finite`], the same escape
-/// [`format_float`] takes.
+/// Non-finite limits fall through to `format_non_finite`, the same escape
+/// `format_float` takes.
 pub fn format_c_g(x: f64) -> String {
     if !x.is_finite() {
         return format_non_finite(x);

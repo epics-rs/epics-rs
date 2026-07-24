@@ -39,6 +39,8 @@
 //! field's own `dbPut` post and the next scan is ten seconds away. NORD is the
 //! only thing the subscriber hears — which is exactly why losing it matters.
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -65,8 +67,8 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 }
 
 async fn nord_sub(db: &PvDatabase, rec: &str) -> EventReader {
-    let r = db.get_record(rec).await.unwrap();
-    let mut inst = r.write().await;
+    let r = db.get_record(rec).unwrap();
+    let mut inst = r.write();
     inst.add_subscriber("NORD", 1, DbFieldType::Long, EventMask::VALUE.bits())
         .unwrap_or_else(|| panic!("{rec}.NORD subscription accepted"))
 }

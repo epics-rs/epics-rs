@@ -26,6 +26,8 @@
 //!     cleared it on the first cycle merely because VAL (still its initial 0)
 //!     was not NaN.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::swait::SwaitRecord;
@@ -40,12 +42,12 @@ async fn process(db: &PvDatabase, name: &str) {
 }
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {
-    db.get_record(name).await.unwrap().read().await.common.udf != 0
+    db.get_record(name).unwrap().read().common.udf != 0
 }
 
 async fn alarm(db: &PvDatabase, name: &str) -> (AlarmSeverity, u16) {
-    let g = db.get_record(name).await.unwrap();
-    let g = g.read().await;
+    let g = db.get_record(name).unwrap();
+    let g = g.read();
     (g.common.sevr, g.common.stat)
 }
 
@@ -62,14 +64,7 @@ async fn r11_c13_a_nan_result_clears_udf_and_raises_no_alarm() {
 
     process(&db, "W").await;
 
-    let val = db
-        .get_record("W")
-        .await
-        .unwrap()
-        .read()
-        .await
-        .record
-        .get_field("VAL");
+    let val = db.get_record("W").unwrap().read().record.get_field("VAL");
     match val {
         Some(EpicsValue::Double(v)) => assert!(v.is_nan(), "0/0 leaves VAL NaN"),
         other => panic!("VAL: {other:?}"),

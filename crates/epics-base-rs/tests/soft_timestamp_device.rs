@@ -6,6 +6,8 @@
 //! before `is_soft_dtyp` stopped classifying "Soft Timestamp" as a soft
 //! channel).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -13,8 +15,8 @@ use epics_base_rs::types::EpicsValue;
 
 /// Read a record's `VAL` field after a process cycle.
 async fn read_val(db: &epics_base_rs::server::database::PvDatabase, name: &str) -> EpicsValue {
-    let rec = db.get_record(name).await.expect("record exists");
-    let inst = rec.read().await;
+    let rec = db.get_record(name).expect("record exists");
+    let inst = rec.read();
     inst.record.get_field("VAL").expect("VAL field present")
 }
 

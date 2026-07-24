@@ -8,7 +8,11 @@
 //! not set, matching pvxs's `Config::server()` behavior.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
+// Only the interface-enumeration surface is v4-specific, and that is
+// host-only — see [`Config`].
+#[cfg(not(target_os = "rtems"))]
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
@@ -73,7 +77,7 @@ pub fn expand_dollar_vars(input: &str) -> String {
 /// process environment when `name` isn't already set, OR replaces the
 /// existing value when `replace_existing` is true. Returns the number of
 /// variables that were actually written. Keys are written verbatim with
-/// no validation — caller is responsible for using real EPICS_PVA[S]_*
+/// no validation — caller is responsible for using real `EPICS_PVA[S]_*`
 /// names.
 pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool) -> usize {
     let mut applied = 0usize;
@@ -313,6 +317,13 @@ impl From<SocketAddr> for Endpoint {
 /// `SockEndpoint` ctor, `config.cpp:76-79`, but the address itself is a
 /// valid spec). Errs when the name has no IPv4 address so the caller can
 /// fall back (best-effort) rather than silently mis-route.
+///
+/// Host-only: interface enumeration goes through `if-addrs`, which newlib
+/// cannot build (no `getifaddrs`/`ifaddrs` — design doc §8.1). Every caller
+/// is in the host-only async I/O layer, so RTEMS has no user for it; an
+/// RTEMS interface enumerator (libbsd `getifaddrs` or an ioctl walk) is
+/// owed when the blocking PVA driver lands (§9 phase 6 item 7).
+#[cfg(not(target_os = "rtems"))]
 pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
     if let Ok(v4) = spec.parse::<Ipv4Addr>() {
         return Ok(v4);
@@ -539,7 +550,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 
 /// The single owner of every PVA timeout/period env double, reproducing
 /// pvxs `parse_timeout` (`config.cpp:211-227`): parse with `parseTo<double>`
-/// ([`parse_double_pvxs`]), then REJECT a value that is non-finite, negative,
+/// (`parse_double_pvxs`), then REJECT a value that is non-finite, negative,
 /// or above `double(time_t::max)` — logging and leaving the destination at
 /// its default rather than saturating it. (This is deliberately unlike
 /// `epics-ca-rs`'s `envGetDoubleConfigParam`, which is epics-base's clamp
@@ -551,7 +562,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 /// `EPICS_PVA_CONN_TMO=1e300` passed the filter and aborted every client
 /// and server at startup. The range gate here makes that unrepresentable —
 /// a value that survives is always convertible to a `Duration`, including
-/// after the 4/3 `tmoScale` its owners apply ([`TIMEOUT_SECS_MAX`]).
+/// after the 4/3 `tmoScale` its owners apply (`TIMEOUT_SECS_MAX`).
 ///
 /// Zero is rejected here rather than passed through as pvxs does, because
 /// every caller's default is what pvxs's `enforceTimeout` (`config.cpp:373-391`)
@@ -657,7 +668,7 @@ pub fn server_broadcast_port() -> u16 {
 /// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
 /// bare name-server token to `host:0`. The server bind port keeps zero —
 /// see [`pvas_server_port`]. An explicit `host:0` in a name-server list is
-/// likewise normalized to this effective port by [`resolve_token_addr`]
+/// likewise normalized to this effective port by `resolve_token_addr`
 /// (pvxs `split_addr_into` `config.cpp:167-168`), so both the bare token and
 /// `host:0` resolve to `5075`.
 pub fn server_port() -> u16 {
@@ -1086,7 +1097,7 @@ fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
 /// Empty = bind to 0.0.0.0 (default behaviour). DNS hostnames resolve
 /// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
-/// [`resolve_intf_addr_list`].
+/// `resolve_intf_addr_list`.
 pub fn list_intf_addresses() -> Vec<IpAddr> {
     std::env::var("EPICS_PVA_INTF_ADDR_LIST")
         .ok()
@@ -1321,6 +1332,9 @@ pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
 /// Discover per-NIC IPv4 broadcast addresses. Used to fan SEARCH
 /// requests / BEACONs across all subnets the host is attached to.
 /// Skips loopback and interfaces without a broadcast address.
+///
+/// Host-only for the same reason as [`resolve_iface_v4`].
+#[cfg(not(target_os = "rtems"))]
 pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
@@ -1359,6 +1373,9 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
 ///   least one listed interface is a real (non-loopback) NIC — so a
 ///   loopback-only list (`127.0.0.1`) yields an empty set and no
 ///   broadcast traffic leaves the host.
+///
+/// Host-only for the same reason as [`resolve_iface_v4`].
+#[cfg(not(target_os = "rtems"))]
 pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
     if interfaces.is_empty() || interfaces.iter().any(|ip| ip.is_unspecified()) {
         return list_broadcast_addresses(port);
@@ -1415,7 +1432,7 @@ fn enforce_timeout(tmo: &mut f64) {
 /// bound echo to range [1, 15]".
 ///
 /// SINGLE OWNER of "effective TCP timeout → echo period". Both the
-/// env-derived [`crate::client_native::heartbeat_interval`] and the
+/// env-derived [`crate::client_native::server_conn::heartbeat_interval`] and the
 /// per-connection heartbeat task (which uses the builder-supplied
 /// `tcp_timeout`) derive their cadence here, so a connection cannot echo on
 /// a different clock than the API says it does.
@@ -1456,6 +1473,10 @@ pub fn effective_tcp_timeout_secs(configured: f64) -> f64 {
 /// Wrap interface IPs as modifier-less [`Endpoint`]s (port 0 — a bind
 /// interface carries no destination port). Bridges the `Vec<IpAddr>`
 /// interface parsers to [`Config`]'s endpoint-typed `interfaces` field.
+///
+/// This and the next two helpers exist only for [`Config::expand`], so
+/// they carry the same host-only gate it does.
+#[cfg(not(target_os = "rtems"))]
 fn intf_endpoints(ips: Vec<IpAddr>) -> Vec<Endpoint> {
     ips.into_iter()
         .map(|ip| Endpoint::from(SocketAddr::new(ip, 0)))
@@ -1467,6 +1488,7 @@ fn intf_endpoints(ips: Vec<IpAddr>) -> Vec<Endpoint> {
 /// `if(ep.addr.port()==0) ep.addr.setPort(defaultPort)`). Applied inside
 /// [`Config::expand`] so `addr` and `addr:udp_port` do not survive dedup
 /// as two distinct effective targets.
+#[cfg(not(target_os = "rtems"))]
 fn set_default_port(eps: &mut [Endpoint], port: u16) {
     for e in eps.iter_mut() {
         if e.addr.port() == 0 {
@@ -1477,6 +1499,7 @@ fn set_default_port(eps: &mut [Endpoint], port: u16) {
 
 /// Drop duplicate `(ip, port)` ignore entries, preserving first-seen
 /// order (pvxs `removeDups(ignoreAddrs)`, `config.cpp:525`).
+#[cfg(not(target_os = "rtems"))]
 fn dedup_ignore_addrs(addrs: &mut Vec<(IpAddr, u16)>) {
     let mut seen = std::collections::HashSet::new();
     addrs.retain(|x| seen.insert(*x));
@@ -1495,6 +1518,20 @@ fn dedup_ignore_addrs(addrs: &mut Vec<(IpAddr, u16)>) {
 /// pvxs `Config::expand()` (`config.cpp:485-529` server, `:624-651`
 /// client). The post-`expand()` value is what an effective-config
 /// readback (`pvinfo -D`, `operator<<`) should render.
+///
+/// **Host-only, and the one §8.1 blocker in this crate that a target gate
+/// does not actually solve.** [`Config::expand`] fans the auto-address /
+/// auto-beacon broadcasts out per NIC, which needs live interface
+/// enumeration — `if-addrs`, which newlib cannot build. Skipping the
+/// fan-out on RTEMS would leave a server that silently never beacons to
+/// its subnet, so the type is absent there rather than quietly wrong. Its
+/// only users today are the host-only async I/O layer and the `pv*` CLI
+/// verbose readback, so nothing on RTEMS is missing a facility it could
+/// otherwise use. Closing this for real means an RTEMS interface
+/// enumerator (libbsd `getifaddrs` via a `-sys` binding, or an ioctl walk
+/// against BSP headers) behind [`list_broadcast_addresses_on`] — owed
+/// with the blocking PVA driver, design doc §8.1 / §9 phase 6 item 7.
+#[cfg(not(target_os = "rtems"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// `EPICS_PVA_BROADCAST_PORT` — UDP SEARCH / beacon port (pvxs
@@ -1529,10 +1566,11 @@ pub struct Config {
     /// any port from that IP).
     pub ignore_addrs: Vec<(IpAddr, u16)>,
     /// Effective (`4/3`-scaled) TCP idle timeout, seconds. `expand()`
-    /// clamps it to the pvxs bounds via [`enforce_timeout`].
+    /// clamps it to the pvxs bounds via `enforce_timeout`.
     pub tcp_timeout: f64,
 }
 
+#[cfg(not(target_os = "rtems"))]
 impl Config {
     /// Seed a client-role config from the `EPICS_PVA_*` environment.
     /// Mirrors `client::Config::fromEnv` (`config.cpp:552-599`): each

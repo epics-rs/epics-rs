@@ -18,6 +18,8 @@
 //! and `DTYP` fell through to the numeric arm and received OVAL. The class is
 //! now settled at target resolution (`OutTarget::puts_as_string`).
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -63,7 +65,7 @@ async fn r15_64_menu_target_receives_the_osv_label() {
 
     process(&db, "SC").await;
 
-    let prio = db.get_record("TGT").await.unwrap().read().await.common.prio;
+    let prio = db.get_record("TGT").unwrap().read().common.prio;
     assert_eq!(
         prio, 2,
         "a DBF_MENU target takes DBR_STRING from OSV — the label \"HIGH\" \
@@ -84,7 +86,7 @@ async fn r15_64_numeric_target_still_receives_oval() {
     process(&db, "SC").await;
 
     assert_eq!(
-        db.get_pv("TGT").await.unwrap(),
+        db.get_pv("TGT").unwrap(),
         EpicsValue::Double(7.0),
         "a DBF_DOUBLE target still takes OVAL"
     );

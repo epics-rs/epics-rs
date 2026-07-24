@@ -48,7 +48,7 @@ pub struct CompressRecord {
     /// `OUSE` (old number used) — C `prec->ouse`, `special(SPC_NOMOD)`
     /// (compressRecord.dbd.pod:481-484). The latch behind C `monitor()`'s
     /// "post NUSE only when it changed" rule (compressRecord.c:104-108); see
-    /// [`Self::monitor`]. Readable, never client-writable.
+    /// `Self::monitor`. Readable, never client-writable.
     pub ouse: i32,
     /// `PBUF` (partial buffer) — epics-base 7.0.8.
     /// `0 = NO` (default): VAL is read by clients as the whole NSAM
@@ -567,7 +567,7 @@ impl Record for CompressRecord {
     /// ```
     ///
     /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
-    /// ([`COMPRESS_SPC_RESET_FIELDS`]) reset the buffer, not RES alone. The
+    /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone. The
     /// `monitor()` half is [`Record::monitor_side_effect_fields`].
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {

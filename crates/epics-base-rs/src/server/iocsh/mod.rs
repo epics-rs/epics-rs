@@ -1,3 +1,5 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+
 mod access_commands;
 mod commands;
 mod core_commands;
@@ -323,20 +325,26 @@ impl IocShell {
     /// setup when not interactive"). Avoids `epics> ` prompt noise in
     /// the captured stderr stream when an operator pipes a script in.
     pub fn run_repl(&self) -> Result<(), String> {
-        use std::io::IsTerminal;
-        // C `epicsReadline.c:48` — `IOCSH_HISTEDIT_DISABLE` set (to anything
-        // non-empty) means "do not use readline or equivalent", so the line
-        // editor is never started and lines come straight off stdin.
-        let histedit_disabled = crate::runtime::env_table::IOCSH_HISTEDIT_DISABLE
-            .get()
-            .is_some();
-        if std::io::stdin().is_terminal() && !histedit_disabled {
-            self.run_repl_interactive()
-        } else {
-            self.run_repl_piped()
+        // The interactive rustyline editor is host-only (rustyline pulls `nix`,
+        // which does not build for RTEMS). On RTEMS the piped-stdin REPL is the
+        // only path until the RTEMS iocsh wiring lands (a later increment).
+        #[cfg(not(target_os = "rtems"))]
+        {
+            use std::io::IsTerminal;
+            // C `epicsReadline.c:48` — `IOCSH_HISTEDIT_DISABLE` set (to anything
+            // non-empty) means "do not use readline or equivalent", so the line
+            // editor is never started and lines come straight off stdin.
+            let histedit_disabled = crate::runtime::env_table::IOCSH_HISTEDIT_DISABLE
+                .get()
+                .is_some();
+            if std::io::stdin().is_terminal() && !histedit_disabled {
+                return self.run_repl_interactive();
+            }
         }
+        self.run_repl_piped()
     }
 
+    #[cfg(not(target_os = "rtems"))]
     fn run_repl_interactive(&self) -> Result<(), String> {
         // C `gnuReadline.c:49-54`:
         //     long i = 50;                                 /* the table default */
@@ -517,6 +525,10 @@ impl IocShell {
 /// REPL should emit ANSI color sequences. Honours `NO_COLOR` env var
 /// (https://no-color.org) and `EPICS_RS_IOCSH_NO_COLOR=1` opt-out;
 /// otherwise on by default in the interactive (TTY) path.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn use_ansi_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -534,6 +546,10 @@ fn use_ansi_color() -> bool {
 ///
 /// `IOCSH_PS1` carries them by default (`ANSI_GREEN("epics> ")`), and rustyline
 /// needs the *visible* text separately to compute the cursor column.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -557,6 +573,10 @@ fn strip_ansi(s: &str) -> String {
 
 /// Format an error string with optional ANSI bold-red prefix.
 /// Plain `Error: <msg>` when color is off — preserves grep-ability.
+///
+/// Host-only: used only by the rustyline interactive editor, which is gated out
+/// on RTEMS.
+#[cfg(not(target_os = "rtems"))]
 fn format_error(msg: &str, color: bool) -> String {
     if color {
         format!("\x1b[1;31mError:\x1b[0m {msg}")

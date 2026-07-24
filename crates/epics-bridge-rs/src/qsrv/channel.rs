@@ -2,6 +2,8 @@
 //!
 //! Corresponds to C++ QSRV's `PDBSinglePV` / `PDBSingleChannel`.
 
+// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -415,10 +417,10 @@ pub(super) fn resolve_record_field(record_path: &str) -> (&str, String, bool) {
 pub(super) async fn resolve_db_channel(db: &PvDatabase, name: &str) -> Result<(), String> {
     let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
     let (record_name, field, string_view) = resolve_record_field(&parsed.record_path);
-    let Some(rec) = db.get_record(record_name).await else {
+    let Some(rec) = db.get_record(record_name) else {
         return Err(format!("Invalid PV: {name}"));
     };
-    let instance = rec.read().await;
+    let instance = rec.read();
     if string_view {
         // `$` is `S_dbLib_fieldNotFound` on anything but a `DBF_STRING` or
         // link field (`dbChannel.c:486-505`), which aborts channel creation.
@@ -588,10 +590,9 @@ impl BridgeChannel {
 
         let rec = db
             .get_record(record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         // Resolve the bound field's actual value once (record field →
         // common field → virtual field). This is the single source of
         // truth for both the served DBF type and (below) the NT shape,
@@ -830,7 +831,9 @@ impl BridgeChannel {
                             .put_record_field_from_ca(&self.record_name, &self.field, value)
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                        if let Some(rx) = notify_rx {
+                        if let epics_base_rs::server::record::ProcessCompletion::Async(rx) =
+                            notify_rx
+                        {
                             let _ = rx.await;
                         }
                     } else {
@@ -873,7 +876,9 @@ impl BridgeChannel {
                             .process_record_with_notify(&self.record_name)
                             .await
                             .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                        if let Some(rx) = notify_rx {
+                        if let epics_base_rs::server::record::ProcessCompletion::Async(rx) =
+                            notify_rx
+                        {
                             let _ = rx.await;
                         }
                     } else {
@@ -922,10 +927,9 @@ impl Channel for BridgeChannel {
         let rec = self
             .db
             .get_record(&self.record_name)
-            .await
             .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
-        let instance = rec.read().await;
+        let instance = rec.read();
         let mut snapshot =
             instance
                 .snapshot_for_field(&self.field)
@@ -1767,8 +1771,8 @@ mod tests {
 
         // The barrier held until processing finished: the OUT link drove
         // TGT0.VAL = 42 before the PUT returned.
-        let tgt = db.get_record("TGT0").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let tgt = db.get_record("TGT0").unwrap();
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -1831,15 +1835,15 @@ mod tests {
         );
 
         // The barrier is genuinely async-pending: DLYA armed, OUT still deferred.
-        let sc_rec = db.get_record("SC1").await.unwrap();
-        let dlya = sc_rec.read().await.record.get_field("DLYA");
+        let sc_rec = db.get_record("SC1").unwrap();
+        let dlya = sc_rec.read().record.get_field("DLYA");
         assert_eq!(
             dlya,
             Some(EpicsValue::Short(1)),
             "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
         );
-        let tgt = db.get_record("TGT1").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let tgt = db.get_record("TGT1").unwrap();
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(0.0)),
@@ -1900,8 +1904,8 @@ mod tests {
             "Force+block put must release with Ok once the ODLY delay completes, got {outcome:?}"
         );
         // Released only after the deferred OUT actually fired.
-        let tgt = db.get_record("TGT2").await.unwrap();
-        let v = tgt.read().await.record.get_field("VAL");
+        let tgt = db.get_record("TGT2").unwrap();
+        let v = tgt.read().record.get_field("VAL");
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -1956,13 +1960,7 @@ mod tests {
         );
 
         // DISP=1 → "Unable to put value: Field Disabled: S_db_putDisabled"
-        db.get_record("PS:ai")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .common
-            .disp = 1;
+        db.get_record("PS:ai").unwrap().write().common.disp = 1;
         let ch = BridgeChannel::new(db.clone(), "PS:ai").await.unwrap();
         let err = ch.put(&put).await.expect_err("DISP=1 must reject the put");
         assert_eq!(

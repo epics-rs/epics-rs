@@ -6,10 +6,13 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
+// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the feature-ON suite.
+
+use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ValueDescMismatch, value_matches_descriptor,
@@ -190,14 +193,23 @@ fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> Cl
 pub struct QsrvPvStore {
     provider: Arc<BridgeProvider>,
     /// Native PVA PVs (e.g., NTNDArray from NDPluginPva).
-    pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    ///
+    /// [`parking_lot::RwLock`], matching [`PvaPvHandle`]'s own interior
+    /// state (`latest`, `subscribers`): every critical section here is a
+    /// name→handle `contains_key` / `get(..).cloned()` / `insert` with no
+    /// I/O in it, so the async lock this used to be bought nothing and cost
+    /// a PI-invisible wait on the serve path (doc/qsrv-rtems-design.md §5,
+    /// L-B). The guard is `!Send`, and every source method below returns
+    /// `impl Future<..> + Send`, so holding one across an `.await` is a
+    /// compile error rather than a review finding.
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
 }
 
 impl QsrvPvStore {
     pub fn new(provider: Arc<BridgeProvider>) -> Self {
         Self {
             provider,
-            pva_pvs: Arc::new(RwLock::new(HashMap::new())),
+            pva_pvs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -212,11 +224,10 @@ impl QsrvPvStore {
     /// carries its canonical descriptor (set at [`PvaPvHandle::new`]),
     /// which gates every producer [`PvaPvHandle::post`] — so a registered
     /// PV only ever serves descriptor-valid values, by construction.
-    pub async fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
-        self.pva_pvs
-            .write()
-            .await
-            .insert(pv_name.to_string(), handle);
+    /// Synchronous: the whole body is one `parking_lot` write guard over a
+    /// `HashMap::insert`, with nothing to await.
+    pub fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
+        self.pva_pvs.write().insert(pv_name.to_string(), handle);
     }
 
     /// Legacy ctx-less channel path — used only by the default
@@ -283,11 +294,11 @@ enum OpenedMonitor {
 /// `getScalarValue`) and leaves `value.choices` to the property set.
 async fn read_marks(
     provider: &Arc<BridgeProvider>,
-    pva_pvs: &Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: &Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
     name: &str,
     value: &PvField,
 ) -> Option<Vec<String>> {
-    if pva_pvs.read().await.contains_key(name) {
+    if pva_pvs.read().contains_key(name) {
         return None;
     }
     let paths = match provider.servable_group(name).await {
@@ -324,7 +335,7 @@ async fn read_marks(
 /// exact same native-PVA / channel / DBE / queue-depth resolution.
 async fn open_monitor(
     provider: Arc<BridgeProvider>,
-    pva_pvs: Arc<RwLock<HashMap<String, PvaPvHandle>>>,
+    pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
     checked: epics_pva_rs::server_native::source::AccessChecked,
     ctx: epics_pva_rs::server_native::source::ChannelContext,
     opts: epics_pva_rs::server_native::MonitorOptions,
@@ -333,7 +344,7 @@ async fn open_monitor(
         return None;
     }
     let name = checked.pv_name().to_string();
-    if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
+    if let Some(handle) = pva_pvs.read().get(&name).cloned() {
         // Frames arrive only through `PvaPvHandle::post`, which validates
         // against the canonical descriptor before fanout (pvxs
         // `SharedPV::post`), so the monitor stream can never carry a
@@ -400,7 +411,7 @@ fn spawn_db_monitor_updates(
     mut monitor: super::group::AnyMonitor,
 ) -> mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate> {
     let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
-    tokio::spawn(async move {
+    epics_base_rs::runtime::task::spawn(async move {
         loop {
             // Park on poll() but stay responsive to downstream teardown.
             // An all-const / quiet monitor now *parks* in poll() (it no
@@ -485,7 +496,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let Some(PvField::Structure(req)) = pv_request else {
                 return Ok(());
             };
-            if pva_pvs.read().await.contains_key(&name) || provider.is_servable_group(&name).await {
+            // Split from the `||` this used to be: an `if` condition keeps
+            // its temporaries alive to the end of the condition, so a sync
+            // guard on the left would still be live across the
+            // `is_servable_group` await on the right.
+            if pva_pvs.read().contains_key(&name) {
+                return Ok(());
+            }
+            if provider.is_servable_group(&name).await {
                 return Ok(());
             }
             // R10-37: this hook IS pvxs's `onSubscribe` DBE read, so it owns
@@ -522,7 +540,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // — they are always readable. The snapshot is descriptor-valid
             // by construction (every write went through
             // `PvaPvHandle::post`), so serve it directly.
-            if let Some(handle) = pva_pvs.read().await.get(&name).cloned()
+            if let Some(handle) = pva_pvs.read().get(&name).cloned()
                 && let Some(value) = handle.current_value()
             {
                 return Some(value);
@@ -783,7 +801,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return Err(OpError::failed(format!(
                     "PROCESS not supported for native PVA PV '{name}' (no processing chain)"
                 )));
@@ -812,7 +830,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
@@ -831,10 +849,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             )
             .await?
             {
-                OpenedMonitor::Native(rx) => Some(rx),
+                OpenedMonitor::Native(rx) => Some(rx.into()),
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
-                    tokio::spawn(async move {
+                    epics_base_rs::runtime::task::spawn(async move {
                         loop {
                             // See `spawn_db_monitor_updates`: park on poll()
                             // but tear down on downstream drop so a quiet /
@@ -855,7 +873,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         }
                         monitor.stop().await;
                     });
-                    Some(rx)
+                    Some(rx.into())
                 }
             }
         }
@@ -878,16 +896,16 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> impl std::future::Future<
-        Output = Option<mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>>,
+        Output = Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>>,
     > + Send {
         let provider = self.provider.clone();
         let pva_pvs = self.pva_pvs.clone();
         async move {
             match open_monitor(provider, pva_pvs, checked, ctx, opts).await? {
-                OpenedMonitor::Native(rx) => {
-                    Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
-                }
-                OpenedMonitor::Db(monitor) => Some(spawn_db_monitor_updates(monitor)),
+                OpenedMonitor::Native(rx) => Some(
+                    epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
+                ),
+                OpenedMonitor::Db(monitor) => Some(spawn_db_monitor_updates(monitor).into()),
             }
         }
     }
@@ -929,7 +947,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     let initial = self.read_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
-                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
+                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx.into()),
                         on_start: None,
                     })
                 }
@@ -984,7 +1002,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         });
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
-                        updates,
+                        updates: updates.into(),
                         on_start: Some(gate),
                     })
                 }
@@ -997,7 +1015,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             let mut names = provider.channel_list().await;
-            for key in pva_pvs.read().await.keys() {
+            for key in pva_pvs.read().keys() {
                 if !names.contains(key) {
                     names.push(key.clone());
                 }
@@ -1012,7 +1030,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         let name = name.to_string();
         async move {
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return true;
             }
             provider.channel_find(&name).await
@@ -1030,7 +1048,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // pva_pvs — the BridgeProvider has no record for them, so
             // self.channel() would return None and the descriptor
             // would be lost. Probe the PVA registry first.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
                 // Prefer the canonical descriptor supplied at registration
                 // (wire-faithful for `UnionArray` and other types that
                 // `PvField::descriptor` cannot losslessly reconstruct).
@@ -1050,7 +1068,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned()
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned()
                 && let Some(value) = handle.current_value()
             {
                 return Some(value);
@@ -1105,7 +1123,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // PVA-plugin PVs (NTNDArray cache from NDPluginPva) as
             // read-only — they're produced server-side, not driven by
             // downstream PUTs.
-            if pva_pvs.read().await.contains_key(&name) {
+            if pva_pvs.read().contains_key(&name) {
                 return false;
             }
             provider.is_writable(&name).await
@@ -1115,7 +1133,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     fn subscribe(
         &self,
         name: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+    ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
@@ -1123,14 +1141,14 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // list; `add_subscriber` appends a tx (reaping any already-
             // dropped receivers) so the plugin's `post()` fans out into
             // the PVA server.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
-                return Some(handle.add_subscriber());
+            if let Some(handle) = pva_pvs.read().get(&name_owned).cloned() {
+                return Some(handle.add_subscriber().into());
             }
             let channel = self.channel(&name_owned).await?;
             let mut monitor = channel.create_monitor().await.ok()?;
             monitor.start().await.ok()?;
             let (tx, rx) = mpsc::channel::<PvField>(64);
-            tokio::spawn(async move {
+            epics_base_rs::runtime::task::spawn(async move {
                 // Legacy ctx-less path: plain values, marked set dropped
                 // (the marked-aware cooked entry is `subscribe_checked_opts_marked`).
                 loop {
@@ -1149,7 +1167,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 }
                 monitor.stop().await;
             });
-            Some(rx)
+            Some(rx.into())
         }
     }
 }
@@ -1262,6 +1280,105 @@ fn qsrv2_enabled() -> bool {
     decision.enabled
 }
 
+// ---------------------------------------------------------------------------
+// The QSRV mount — the one construction path for a served QSRV source
+// ---------------------------------------------------------------------------
+
+/// A built QSRV mount: the `ChannelSource` a PVA server answers QSRV
+/// channels from, plus the QSRV2 enable decision that produced it.
+///
+/// The decision is carried out of [`build_qsrv_mount`] rather than
+/// recomputed by the caller because the caller has more to gate on it than
+/// serving does — the host runner also gates the QSRV iocsh command set on
+/// it (pvxs registers those only inside `if(enableQ)`,
+/// iochooks.cpp:492-496).
+pub struct QsrvMount {
+    /// The source to hand to the PVA server (`Arc<QsrvPvStore>` **is** a
+    /// `DynSource`: the blanket `ChannelSourceObj` impl at
+    /// `server_native/source.rs:2361` supplies object safety, so there is no
+    /// adapter and no boxing here).
+    pub store: Arc<QsrvPvStore>,
+    /// The cached pvxs `enable2()` decision (iochooks.cpp:401-448).
+    pub enabled: bool,
+}
+
+/// Build the served QSRV mount: apply the QSRV2 enable decision, construct
+/// the provider, install the IOC-wide ACF on it, and finalize the group set
+/// — in the order C runs the equivalent hooks.
+///
+/// **This is the single owner of that sequence.** Both entry points that can
+/// serve QSRV go through it: the host dual-protocol runner
+/// ([`run_ca_pva_qsrv_ioc`]) and the RTEMS target IOC, which has no iocsh, no
+/// `IocApplication` and no CA server and so could not reach the runner. Two
+/// hand-rolled copies of "decide, build, load groups, wrap" is how the two
+/// would come to disagree about whether `PVXS_QSRV_ENABLE` is honoured or
+/// about whether groups are finalized before the first GET — the two
+/// properties that are invisible until a client asks.
+///
+/// The ordering constraint from C (`ioc/iochooks.cpp:343-366`:
+/// `processGroups()` at `initHookAfterInitDatabase`, `addGroupSrc()` at
+/// `initHookAfterIocBuilt`) is **structural here, not a rule to remember**:
+/// the group set is finalized before the [`QsrvPvStore`] that exposes it
+/// exists, so a caller cannot add the source to a server before the groups
+/// are built. What the caller still owns is the other half — bind and start
+/// accepting only after `add_source`.
+///
+/// `acf` is the IOC-wide access-security configuration, or `None`. Passing
+/// `None` leaves the provider on `AllowAllAccess`; passing the same config
+/// the CA server got is what keeps the two protocols on one policy, which
+/// is the documented configuration trap on the host side.
+///
+/// `group_files` carries `dbLoadGroup` requests the caller obtained by some
+/// route other than the iocsh command — which on the RTEMS target is the
+/// only route there is, because the target has no iocsh and therefore
+/// nothing ever pushes onto the base startup queue
+/// [`take_group_load_requests`](epics_base_rs::server::ioc_app::take_group_load_requests)
+/// drains. The target's command line *is* its st.cmd, so a `.json`
+/// argument becomes a `GroupLoadRequest` here and reaches exactly the same
+/// loader the host's `dbLoadGroup` feeds. The host runner passes an empty
+/// slice: its files are already on that queue. Keeping this a parameter of
+/// the one owner — rather than letting the target apply group files to the
+/// provider itself — is what preserves the ordering guarantee below; a
+/// caller that loaded groups on its own would necessarily do it after the
+/// store already existed.
+pub async fn build_qsrv_mount(
+    db: &Arc<epics_base_rs::server::database::PvDatabase>,
+    acf: Option<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    group_files: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
+) -> QsrvMount {
+    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
+    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before standing
+    // up the database/group sources. When disabled, the source is still
+    // mounted and the PVA server still serves native PVA PVs, but the
+    // BridgeProvider answers "absent" for every DB/group channel — matching a
+    // pvxs IOC where enable2() returned false.
+    let enabled = qsrv2_enabled();
+
+    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
+
+    // Install the IOC-wide ACF on the QSRV bridge so PVA single-record /
+    // group operations enforce the same policy the CA server does. Without
+    // this, an IOC launched with an ACF would protect CA but leave the PVA
+    // QSRV path on `AllowAllAccess`.
+    if let Some(acf_cfg) = acf {
+        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
+        provider.set_access_control(acf);
+        tracing::info!("qsrv: ACF installed on BridgeProvider");
+    }
+
+    // ── QSRV group loading (pvxs `processGroups()` parity) ──
+    // Gated on the QSRV2 enable decision, matching pvxs only adding the group
+    // source when `enable2()` is true.
+    if enabled {
+        load_qsrv_groups(&provider, db, group_files).await;
+    }
+
+    QsrvMount {
+        store: Arc::new(QsrvPvStore::new(provider)),
+        enabled,
+    }
+}
+
 /// Async link-set installer for
 /// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
 ///
@@ -1299,8 +1416,7 @@ pub async fn pvalink_link_set_install(
     }
     #[cfg(feature = "pvalink")]
     {
-        let resolver =
-            crate::pvalink::install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let resolver = crate::pvalink::install_pvalink_resolver(&db).await;
         crate::pvalink::register_pvalink_commands(resolver)
     }
     #[cfg(not(feature = "pvalink"))]
@@ -1324,6 +1440,26 @@ pub async fn pvalink_link_set_install(
 ///     .run_with_script_and_runner("st.cmd", run_ca_pva_qsrv_ioc)
 ///     .await
 /// ```
+///
+/// Host-only, and it needs the full `qsrv` selection.
+///
+/// Two independent requirements, so two clauses, and both are load-bearing:
+///
+/// * `not(target_os = "rtems")` — both servers this starts are themselves
+///   RTEMS-gated in their own crates. `epics_ca_rs::server::CaServer` and
+///   `epics_pva_rs::server::PvaServer` are each behind
+///   `cfg(not(target_os = "rtems"))`, because the target runs the blocking
+///   thread-per-client drivers instead of the async reactor front ends. This
+///   function was the last caller that had not followed.
+/// * `feature = "qsrv"` — `epics-ca-rs` is a dependency of `qsrv`, not of
+///   `qsrv-core`. Gating on the target alone would compile this body in a
+///   host `--features qsrv-core` build, where the crate is not linked at all
+///   (E0433 on `epics_ca_rs`). A feature whose validity depended on which
+///   target you pointed it at would be exactly the dual meaning the
+///   `qsrv-core` split exists to avoid.
+///
+/// The target's equivalent entry point is `epics-pva-rs`'s `rtems-pva-ioc`.
+#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
 ) -> epics_base_rs::error::CaResult<()> {
@@ -1338,49 +1474,29 @@ pub async fn run_ca_pva_qsrv_ioc(
     // here honoured neither.
     let pva_port: u16 = epics_pva_rs::config::env::pvas_server_port();
 
-    // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
-    // Honor PVXS_QSRV_ENABLE / EPICS_IOC_IGNORE_SERVERS=qsrv2 before
-    // standing up the database/group sources and pvalink. When disabled,
-    // the PVA server still runs and serves native PVA PVs (NDPluginPva),
-    // but the BridgeProvider answers "absent" for every DB/group channel
-    // — matching a pvxs IOC where enable2() returned false.
-    let qsrv2_on = qsrv2_enabled();
-
     // ── QSRV bridge ──
-    let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), qsrv2_on));
-
-    // install the IOC-wide ACF on the QSRV bridge so PVA
-    // single-record / group operations enforce the same policy as
-    // the CA server (which gets `config.acf` via
-    // `CaServer::from_parts` below). Without this, an IOC launched
-    // with `config.acf = Some(...)` would protect CA but leave the
-    // PVA QSRV path on `AllowAllAccess` — the documented
+    // The enable gate, the provider, the ACF install and the
+    // `processGroups()`-equivalent group load all live in `build_qsrv_mount`
+    // — the one owner shared with the RTEMS target IOC, so the two entry
+    // points cannot disagree about whether `PVXS_QSRV_ENABLE` was honoured
+    // or whether groups were finalized before the first client GET. The ACF
+    // is the same `config.acf` the CA server gets via `CaServer::from_parts`
+    // below; handing the PVA side a different one is the documented
     // configuration trap.
-    if let Some(acf_cfg) = config.acf.clone() {
-        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
-        provider.set_access_control(acf);
-        tracing::info!("qsrv: ACF installed on BridgeProvider");
-    }
-
-    // ── QSRV group loading (pvxs `processGroups()` parity) ──
-    // The runner is the single owner that builds the served provider's
-    // group set, from BOTH pvxs group sources, BEFORE the PVA server
-    // accepts any connection — the epics-rs iocRun-handoff equivalent of
-    // pvxs running `processGroups()` at `initHookAfterInitDatabase`
-    // (iochooks.cpp:343-345). Gated on the QSRV2 enable decision, matching
-    // pvxs only adding the group source when `enable2()` is true.
-    if qsrv2_on {
-        load_qsrv_groups(&provider, &db).await;
-    }
-
-    let store = Arc::new(QsrvPvStore::new(provider));
+    let QsrvMount {
+        store,
+        enabled: qsrv2_on,
+        // Empty `group_files`: this runner's `dbLoadGroup` requests already sit
+        // on the base startup queue, put there by the iocsh command during
+        // st.cmd. The parameter exists for the target IOC, which has no iocsh.
+    } = build_qsrv_mount(&db, config.acf.clone(), &[]).await;
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
     // Handles were stored in the global registry during st.cmd execution.
     let pva_pvs = take_registered_pva_pvs();
     for (pv_name, handle) in pva_pvs {
         tracing::info!(pv = %pv_name, "registering native PVA PV");
-        store.register_pva_pv(&pv_name, handle).await;
+        store.register_pva_pv(&pv_name, handle);
     }
 
     // ── External links (`calink` + `pvalink`) ──
@@ -1468,7 +1584,13 @@ pub async fn run_ca_pva_qsrv_ioc(
 ///  1. DB `info(Q:group, ...)` records (`loadConfigFromDb`) — every record
 ///     carrying the tag contributes its group definition.
 ///  2. Queued `dbLoadGroup` files (`loadConfigFiles`) — drained from the
-///     base startup queue ([`take_group_load_requests`]) in st.cmd order.
+///     base startup queue ([`take_group_load_requests`]) in st.cmd order,
+///     followed by `extra` (the caller-supplied requests described on
+///     [`build_qsrv_mount`]). On the host exactly the first list is
+///     populated; on the RTEMS target, which has no iocsh to run the
+///     command, exactly the second is. They are the same request type
+///     applied by the same loader, so a group file behaves identically
+///     whichever route it arrived by.
 ///  3. `process_groups()` — validate/resolve trigger references
 ///     (`resolveTriggerReferences` / `createGroups`).
 ///
@@ -1479,13 +1601,14 @@ pub async fn run_ca_pva_qsrv_ioc(
 async fn load_qsrv_groups(
     provider: &Arc<BridgeProvider>,
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
+    extra: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) {
     use epics_base_rs::server::ioc_app::take_group_load_requests;
 
     // 1. DB info(Q:group) records (pvxs loadConfigFromDb).
     for name in db.all_record_names().await {
-        let json = match db.get_record(&name).await {
-            Some(rec) => rec.read().await.get_info("Q:group").map(str::to_string),
+        let json = match db.get_record(&name) {
+            Some(rec) => rec.read().get_info("Q:group").map(str::to_string),
             None => None,
         };
         if let Some(json) = json {
@@ -1495,8 +1618,12 @@ async fn load_qsrv_groups(
         }
     }
 
-    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order.
-    for req in take_group_load_requests() {
+    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order,
+    //    then the caller's own requests. Exactly one of the two lists is
+    //    non-empty in practice — the queue on a host with an iocsh, `extra`
+    //    on the target without one — so the concatenation order is not a
+    //    behaviour choice, it just keeps one loop over one request type.
+    for req in take_group_load_requests().iter().chain(extra) {
         match super::iocsh::apply_group_file(provider, &req.filename, &req.macros) {
             Ok(total) => {
                 tracing::info!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
@@ -1603,7 +1730,7 @@ mod tests {
         handle
             .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
             .expect("descriptor-less post accepted");
-        store.register_pva_pv("NATIVE:PV", handle).await;
+        store.register_pva_pv("NATIVE:PV", handle);
         assert!(
             store.has_pv("NATIVE:PV").await,
             "native PVA PV stays served even when QSRV2 DB serving is off"
@@ -1660,7 +1787,7 @@ mod tests {
         handle
             .post(value)
             .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:UARR", handle).await;
+        store.register_pva_pv("TEST:UARR", handle);
 
         let got = store.get_introspection("TEST:UARR").await.unwrap();
         assert_eq!(got, canonical, "supplied descriptor must round-trip");
@@ -1686,7 +1813,7 @@ mod tests {
         })]);
         let handle = PvaPvHandle::new(None);
         handle.post(value).expect("descriptor-less post accepted");
-        store.register_pva_pv("TEST:UARR_LOSSY", handle).await;
+        store.register_pva_pv("TEST:UARR_LOSSY", handle);
 
         let got = store.get_introspection("TEST:UARR_LOSSY").await.unwrap();
         assert_eq!(
@@ -1736,7 +1863,7 @@ mod tests {
             PvField::Structure(s)
         };
         handle.post(good.clone()).expect("good post accepted");
-        store.register_pva_pv("TEST:NTS", handle.clone()).await;
+        store.register_pva_pv("TEST:NTS", handle.clone());
 
         assert_eq!(
             store.get_value("TEST:NTS").await,
@@ -1873,7 +2000,7 @@ mod tests {
             .post(bad)
             .expect_err("descriptor-mismatched first post must be rejected");
 
-        store.register_pva_pv("TEST:NTS:EMPTY", handle).await;
+        store.register_pva_pv("TEST:NTS:EMPTY", handle);
         assert_eq!(
             store.get_value("TEST:NTS:EMPTY").await,
             None,
@@ -2025,6 +2152,13 @@ mod tests {
     /// the loop on the doc claim that wire-faithful round-tripping
     /// now works — the previous unit tests only validated the
     /// `ChannelSource` contract.
+    ///
+    /// The only test in this module that needs a PVA *client*
+    /// (`PvaServer::client_config` is behind `epics-pva-rs/client`), so it is
+    /// the only one gated on the full `qsrv` selection rather than
+    /// `qsrv-core`. Everything else here drives the `ChannelSource` surface
+    /// directly and runs in either.
+    #[cfg(feature = "qsrv")]
     #[tokio::test]
     async fn pva_server_serves_canonical_union_array_descriptor_over_wire() {
         use std::time::Duration;
@@ -2053,7 +2187,7 @@ mod tests {
         handle
             .post(value)
             .expect("value matches canonical descriptor");
-        store.register_pva_pv("TEST:WIRE:UARR", handle).await;
+        store.register_pva_pv("TEST:WIRE:UARR", handle);
 
         let server =
             PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");
@@ -2131,8 +2265,8 @@ mod tests {
 
         // Sanity: VAL starts at 0.0.
         let val0 = {
-            let rec = db.get_record("TEST:proc").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("TEST:proc").unwrap();
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(matches!(val0, Some(EpicsValue::Double(v)) if v == 0.0));
@@ -2150,8 +2284,8 @@ mod tests {
         // process=true with no record._options in the value resolves
         // to Force, not silently degraded to Passive.
         let val1 = {
-            let rec = db.get_record("TEST:proc").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("TEST:proc").unwrap();
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2275,8 +2409,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let before = {
-            let rec = db.get_record("TEST:proc_call").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("TEST:proc_call").unwrap();
+            let inst = rec.read();
             inst.common.time
         };
         // Sleep briefly so the post-process timestamp can be strictly
@@ -2288,8 +2422,8 @@ mod tests {
             .await
             .expect("PROCESS must run");
         let after = {
-            let rec = db.get_record("TEST:proc_call").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("TEST:proc_call").unwrap();
+            let inst = rec.read();
             inst.common.time
         };
         assert!(
@@ -2343,8 +2477,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let b_time = |db: Arc<PvDatabase>| async move {
-            let rec = db.get_record("FLNK:b").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("FLNK:b").unwrap();
+            let inst = rec.read();
             inst.common.time
         };
 
@@ -2519,8 +2653,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec_name: &'static str| async move {
-            let rec = db.get_record(rec_name).await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record(rec_name).unwrap();
+            let inst = rec.read();
             inst.common.time
         };
 
@@ -2576,8 +2710,8 @@ mod tests {
 
         // The values must land regardless of the process option.
         let a_val = {
-            let rec = db.get_record("MRR10:a").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("MRR10:a").unwrap();
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2706,8 +2840,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let rec_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let r = db.get_record(rec).await.unwrap();
-            r.read().await.common.time
+            let r = db.get_record(rec).unwrap();
+            r.read().common.time
         };
 
         for (group_pv, rec) in [("B119:na", "B119:rna"), ("B119:at", "B119:rat")] {
@@ -2771,8 +2905,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let rec = db.get_record(rec).await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record(rec).unwrap();
+            let inst = rec.read();
             inst.common.time
         };
         let a_before = member_time(db.clone(), "BR120:a").await;
@@ -2818,8 +2952,8 @@ mod tests {
             .expect("partial group PUT must succeed");
 
         let a_val = {
-            let rec = db.get_record("BR120:a").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("BR120:a").unwrap();
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2835,8 +2969,8 @@ mod tests {
         // Pre-fix the merge made b present, so every member was written
         // and processed; post-fix b is unmarked and must be untouched.
         let b_val = {
-            let rec = db.get_record("BR120:b").await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record("BR120:b").unwrap();
+            let inst = rec.read();
             inst.snapshot_for_field("VAL").map(|s| s.value)
         };
         assert!(
@@ -2883,8 +3017,8 @@ mod tests {
         let store = QsrvPvStore::new(provider);
 
         let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
-            let rec = db.get_record(rec).await.unwrap();
-            let inst = rec.read().await;
+            let rec = db.get_record(rec).unwrap();
+            let inst = rec.read();
             inst.common.time
         };
         let a_before = member_time(db.clone(), "BR120E:a").await;
@@ -2967,8 +3101,8 @@ mod tests {
 
         // A record carrying info(Q:group) — pvxs `loadConfigFromDb` source.
         {
-            let rec = db.get_record("GRP:infoval").await.unwrap();
-            rec.write().await.set_info(
+            let rec = db.get_record("GRP:infoval").unwrap();
+            rec.write().set_info(
                 "Q:group",
                 r#"{ "INFO:grp": { "+id": "epics:nt/NTScalar:1.0",
                      "value": { "+channel": "VAL", "+type": "plain" } } }"#,
@@ -2998,7 +3132,11 @@ mod tests {
 
         // Runner single-owner build into the SERVED provider, before serving.
         let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), true));
-        load_qsrv_groups(&provider, &db).await;
+        // `&[]`: this case drives the base startup queue (the real
+        // `dbLoadGroup` command ran above), which is the host route. The
+        // caller-supplied list is the target's route and is exercised by
+        // `rtems-pva-ioc`'s own tests.
+        load_qsrv_groups(&provider, &db, &[]).await;
         let store = Arc::new(QsrvPvStore::new(provider));
 
         // Both pvxs group sources are served by the same store/provider.

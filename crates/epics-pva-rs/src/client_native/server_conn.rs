@@ -19,6 +19,8 @@
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,9 +30,16 @@ use std::time::Duration;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+// NOT `use tokio::net::TcpStream`. An unconditional import is resolved whether
+// or not anything reaches the item, so on `armv7-rtems-eabihf` — where
+// `tokio::net` does not exist — one import line was an E0432 that poisoned this
+// whole module, and rustc then suppressed every downstream error in code naming
+// its items. That is what made `ops_v2.rs` report zero errors for the target
+// without that zero meaning anything (`doc/pvalink-rtems-design.md` §1.2, §6
+// item 1). Both remaining uses sit inside `cfg` blocks that the target does not
+// compile, so they name the type by full path and the module resolves cleanly.
+use epics_base_rs::runtime::task::{interval, timeout};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -201,11 +210,288 @@ struct ChanStat {
 // the new connection's TCP-level connect can race with the OS-level
 // release of the old port, surfacing as ConnectionRefused.
 
-/// Type-erased read half. We accept either a plain TCP read half or a
-/// TLS read half through the same code path.
-type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+/// Type-erased read half. We accept a plain TCP read half, a TLS read half, or
+/// a blocking pump's adapter through the same code path.
+pub(crate) type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 /// Type-erased write half.
-type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+pub(crate) type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+/// The EPICS priority a client connection's two pump threads run at.
+///
+/// pvxs gives its client reactor thread `epicsThreadPriorityCAServerLow-2`
+/// (`pvxs/src/client.cpp`, the same `PVXTCP` band the server's acceptor takes),
+/// and the server driver in this crate takes 18 for exactly that reason. A
+/// client pump does the same job — move bytes between a socket and a frame
+/// pipeline — so it takes the same number rather than a new one: splitting how
+/// work is scheduled *internally* must not change how it is scheduled relative
+/// to everything else.
+///
+/// Passed to `drive_socket_blocking` for **both** pumps. That primitive takes a
+/// reader and a writer band separately because libca derives two for a CA
+/// circuit (`tcpiiu.cpp:677-682`); pvxs derives one, and passing it twice is
+/// how this side states that its two pumps are one band by intent rather than
+/// by an API that could not express the difference.
+const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    epics_base_rs::runtime::task::ThreadPriority::Custom(18);
+
+/// Every TCP dial this client makes, on a bounded set of permanent threads.
+///
+/// One pool for the process rather than one per `PvaClient`: `pvalink` builds a
+/// client per link (`pvalink/registry.rs` keys on the link, not the IOC), so a
+/// per-client pool would multiply the bound by the link count — the count this
+/// exists to bound. The pool is per *role* instead, which is what the band
+/// requires: workers enter `PVA_CLIENT_PRIORITY`, the band of the pumps they
+/// precede, and the CA client's dials cannot share threads with them.
+///
+/// `"PVAC-dial"` and not `"PVAC-connect {target}"`: a reused worker cannot be
+/// named for one target. A thread dump therefore still says *how many* dials
+/// are stuck but no longer *which server* is not answering — the trade for
+/// bounding the count. The target remains in the caller's own error and in the
+/// `debug!` the connection path emits.
+static PVA_DIAL_POOL: epics_base_rs::runtime::blocking_io::DialPool =
+    epics_base_rs::runtime::blocking_io::DialPool::new("PVAC-dial", PVA_CLIENT_PRIORITY);
+
+/// The most concurrent PVA circuits this process serves with blocking pumps —
+/// a bound on thread *creations*, so a client that redials the same server
+/// reuses its two pump threads rather than leaking 2 × 176 B per reconnect on
+/// RTEMS. Past the bound a circuit's pumps are refused (`EAGAIN`), which the
+/// caller sees as a failed connect. Generous: a PVA client legitimately holds a
+/// circuit per distinct server.
+const PVA_CIRCUIT_POOL_CAPACITY: usize = 64;
+
+/// The pumps for every PVA circuit, borrowed from a bounded set of permanent
+/// threads. pvxs runs one reactor band for both directions, so both roles take
+/// `PVA_CLIENT_PRIORITY`; per band, so it is a separate pool from the CA
+/// client's.
+static PVA_CIRCUIT_POOL: std::sync::LazyLock<epics_base_rs::runtime::worker_pool::WorkerPool<2>> =
+    std::sync::LazyLock::new(|| {
+        epics_base_rs::runtime::worker_pool::WorkerPool::new(
+            "PVAC",
+            epics_base_rs::runtime::blocking_io::circuit_roster(
+                PVA_CLIENT_PRIORITY,
+                PVA_CLIENT_PRIORITY,
+            ),
+            PVA_CIRCUIT_POOL_CAPACITY,
+        )
+    });
+
+/// BRING-UP PROBE: dial attempts submitted to [`PVA_DIAL_POOL`] since boot.
+///
+/// The denominator of the on-target bound measurement. `worker_count()` alone
+/// cannot distinguish "bounded" from "never dialled twice", so the rig needs
+/// the attempt count next to it — and `ns_task`'s own per-attempt diagnostic
+/// is a `debug!`, which the target's console subscriber (INFO) drops.
+#[cfg(feature = "bringup-probes")]
+static PVA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the PVA
+/// client's dial pool.
+///
+/// Behind `bringup-probes` with the rest of the measurement rig
+/// (`doc/pvalink-rtems-design.md` §12): a default image compiles neither the
+/// counter nor this accessor.
+#[cfg(feature = "bringup-probes")]
+pub fn dial_pool_probe() -> (usize, usize) {
+    (
+        PVA_DIAL_POOL.worker_count(),
+        PVA_DIAL_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Dial `target` and drive it with two blocking pump threads.
+///
+/// Compiled on every target, not only the ones that select it: the RTEMS build
+/// is not the only caller — [`ServerConn::connect_blocking`] is public, and a
+/// host test that wants both transports in one binary needs this to exist
+/// unconditionally. Nothing here names `tokio::net`, so it costs the target
+/// nothing to keep it always-on.
+///
+/// The two bounds are deliberately different values and must not be collapsed
+/// into one; see [`dial_pva`] for what each one is.
+///
+/// # Why the connect gets a thread
+///
+/// The connect is a *blocking* syscall bounded by `connect_timeout`, and every
+/// caller of this function is a task — `ns_task` and the channel pool through
+/// [`dial_pva`], and [`ServerConn::connect_blocking`] directly. On the exec
+/// backend a task runs on a cooperative callback-band worker shared with every
+/// other future on its band, so running the connect inline parks the band for
+/// the whole bound. Measured exactly there (gdb all-thread dump, host-linux
+/// `rtems-pva-ioc`): the single `cbMedium` worker sat in `poll(timeout=39999)`
+/// under `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a name
+/// server that did not answer starved every future on Medium for ~40 s per
+/// attempt (the executor failure class of `doc/qsrv-rtems-design.md` §9.15.1).
+///
+/// So the connect takes a dial thread — the CA client's `dial_blocking` shape
+/// (`epics-ca-rs/src/client/transport.rs`) — at the same band as the two pumps
+/// it precedes, and the caller parks on a oneshot instead: the receiver
+/// registers the task's waker, the send from the dial thread wakes it, and the
+/// band worker is released for the whole dial.
+///
+/// # Why the thread is borrowed and not created
+///
+/// The dial thread comes from [`PVA_DIAL_POOL`], a permanent set of at most
+/// `MAX_DIAL_WORKERS` workers, and is returned to it when the connect resolves.
+/// It used to be created per attempt and left to exit. That is unbounded in
+/// thread *creations*, and creations are the cost on RTEMS: every
+/// `std::thread` leaks 128 B there permanently (its TLS key is freed before the
+/// key's destructor runs). A search engine whose name server is down redials
+/// roughly every 10 s for as long as the IOC runs, so per-attempt creation
+/// leaked with no ceiling — a leak the bound now removes by construction rather
+/// than caps at runtime. See `runtime::blocking_io::DialPool`.
+///
+/// A worker is still the **single finalizer** for the socket it opens: a
+/// receiver dropped by an aborted caller only makes the send fail, and the
+/// fresh socket is dropped — and closed — right there, before the worker takes
+/// its next request.
+///
+/// # Why the thread's connect is plain-blocking, and where the bound lives
+///
+/// The thread issues `TcpStream::connect`, **not** `connect_timeout`: the
+/// plain blocking connect is the CA client's proven on-target dial, C parity
+/// with `tcpiiu.cpp`'s blocking `::connect()`, and a thread that owns its
+/// blocking needs no poll machinery. (An earlier measurement blamed
+/// `connect_timeout` for aborting on the RTEMS target; that RST was forged
+/// by the QEMU rig's SLIRP hub port, not sent by the guest, and the claim is
+/// withdrawn — `doc/pvalink-rtems-design.md` §6 item 4. The same target
+/// dials out and connects once the rig is fixed.)
+///
+/// The application-level bound (`connect_timeout`, pvxs `operationTimeout`)
+/// therefore moves to the awaiting side: `runtime::task::timeout` around the
+/// oneshot — the timer mechanism the exec backend already runs everywhere on
+/// target — fails the *dial* at the deadline while the thread keeps blocking
+/// under the OS's own connect ladder — 75 s on the RTEMS target this dial is
+/// written for (libbsd `TCPTV_KEEP_INIT`, `75 * hz`, measured), ~130 s on a
+/// Linux host (`tcp_syn_retries`). A
+/// timed-out dial's worker stays inside the connect until that OS bound, still
+/// the socket's single finalizer: if the connect completes after the caller
+/// gave up, the failed send drops the fresh socket. The occupancy is bounded
+/// (`MAX_DIAL_WORKERS` for the whole process, and past that dials queue and
+/// still fail at their own bound) and only occurs on a blackholed peer — a
+/// refused or reachable peer resolves the connect promptly.
+async fn dial_blocking(
+    target: SocketAddr,
+    connect_timeout: Duration,
+    write_deadline: Duration,
+) -> PvaResult<(DynRead, DynWrite)> {
+    use epics_base_rs::runtime::blocking_io::{PumpConfig, drive_socket_blocking};
+
+    // Plain blocking `connect` on a pooled worker; the application bound is
+    // applied by the awaiting side below. See "Why the thread's connect is
+    // plain-blocking" above.
+    #[cfg(feature = "bringup-probes")]
+    PVA_DIAL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dialed_rx = PVA_DIAL_POOL.dial(target).map_err(PvaError::Io)?;
+    let stream = match timeout(connect_timeout, dialed_rx).await {
+        // The pvxs `operationTimeout` bound: the dial fails now; the worker
+        // finishes under the OS connect ladder and closes whatever it opens.
+        Err(_) => return Err(PvaError::Timeout),
+        Ok(Ok(Ok(s))) => s,
+        Ok(Ok(Err(e))) => {
+            return Err(match e.kind() {
+                std::io::ErrorKind::TimedOut => PvaError::Timeout,
+                _ => PvaError::Io(e),
+            });
+        }
+        // The thread ended without sending: it panicked.
+        Ok(Err(_)) => {
+            return Err(PvaError::Io(std::io::Error::other(
+                "circuit dial thread ended without a result",
+            )));
+        }
+    };
+    // `read_timeout` keeps `PumpConfig`'s effectively-infinite default, and
+    // that is load-bearing rather than a default taken for lack of a better
+    // value. `reader_pump` ends the connection when its `SO_RCVTIMEO` expires,
+    // so any finite value here is an idle-disconnect bound — and an idle PVA
+    // circuit is *supposed* to be silent between echoes (15 s by default,
+    // `heartbeat_interval`), with `tcp_timeout` (40 s) the only thing entitled
+    // to call it dead. Handing the pump a per-operation deadline instead makes
+    // every connection quieter than one operation self-destruct. What ends a
+    // parked reader here is `ReaderPumpGuard`'s `shutdown`, driven by the
+    // cancellation token the heartbeat already fires — the same mechanism the
+    // server driver relies on for the same reason.
+    let (reader, writer) = drive_socket_blocking(
+        &PVA_CIRCUIT_POOL,
+        stream,
+        &target.to_string(),
+        &PumpConfig {
+            send_timeout: write_deadline,
+            ..PumpConfig::default()
+        },
+    )
+    .map_err(PvaError::Io)?;
+    Ok((Box::new(reader), Box::new(writer)))
+}
+
+/// Dial `target` and return the connection's two byte halves.
+///
+/// **This is the client's one TCP dial.** [`ServerConn::connect`] and the
+/// name-server connection in `search_engine` both come through it, so there is
+/// one place where "how does this client get bytes onto a socket" is decided
+/// and one place a new transport would have to be added.
+///
+/// Two implementations, selected at compile time and never at runtime:
+///
+/// * `tokio_backend` — `tokio::net::TcpStream`, split into its two owned
+///   halves. What shipped before this seam existed, unchanged.
+/// * `exec_backend` or `--cfg pva_blocking_client` —
+///   `runtime::blocking_io`'s two blocking pump threads over one
+///   `Arc<TcpStream>`.
+///
+/// The arm is chosen by the *backend*, not by the target. `exec_backend` is
+/// `target_os = "rtems"` **or** `--features rtems-exec-model` (`build.rs`), and
+/// what both share is that a future started through `runtime::task::spawn`
+/// runs with no tokio reactor entered — on RTEMS because there is none and
+/// `tokio::net` does not compile for the triple, on a host exec-model build
+/// because the future lands on a callback-pool worker the runtime was never
+/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
+/// reactor running") even though the process has a runtime elsewhere. Gating
+/// this seam on `target_os = "rtems"` named the target where the fact it needs
+/// is the backend, which is why `rtems-pva-ioc` still panicked on its first
+/// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
+/// item 2).
+///
+/// The returned halves are the same `DynRead`/`DynWrite` the TLS path produces,
+/// which is the whole reason the client needed no protocol change to gain a
+/// second transport: `ServerConn::run_handshake_and_spawn` cannot tell them
+/// apart.
+///
+/// # The two bounds
+///
+/// * `connect_timeout` — how long the TCP connect itself may take. Both
+///   transports honour it; it is the client's per-operation deadline
+///   (`ConnConfig::op_timeout`, pvxs `operationTimeout`).
+/// * `write_deadline` — how long **one whole frame** may take to reach the
+///   wire. It exists only on the blocking side, because only there is a write
+///   a parked thread that something has to be entitled to reclaim
+///   (`blocking_io::write_frame_deadline`); the hosted writer task has no such
+///   bound and needs none. Callers pass the connection's own liveness bound —
+///   `ConnConfig::tcp_timeout` — so the pump can never end a circuit the
+///   protocol would still consider alive. Recorded as a deviation in
+///   `doc/pvalink-rtems-design.md` §9.
+pub(crate) async fn dial_pva(
+    target: SocketAddr,
+    connect_timeout: Duration,
+    write_deadline: Duration,
+) -> PvaResult<(DynRead, DynWrite)> {
+    #[cfg(not(any(exec_backend, pva_blocking_client)))]
+    {
+        // The hosted transport has no per-frame write bound to apply.
+        let _ = write_deadline;
+        let stream = timeout(connect_timeout, tokio::net::TcpStream::connect(target))
+            .await
+            .map_err(|_| PvaError::Timeout)?
+            .map_err(PvaError::Io)?;
+        stream.set_nodelay(true).ok();
+        let (reader, writer) = stream.into_split();
+        Ok((Box::new(reader), Box::new(writer)))
+    }
+    #[cfg(any(exec_backend, pva_blocking_client))]
+    {
+        dial_blocking(target, connect_timeout, write_deadline).await
+    }
+}
 
 impl ServerConn {
     /// Open a plain TCP connection, run the handshake, and start
@@ -220,19 +506,48 @@ impl ServerConn {
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
-            .await
-            .map_err(|_| PvaError::Timeout)?
-            .map_err(PvaError::Io)?;
-        stream.set_nodelay(true).ok();
-        let (reader, writer) = stream.into_split();
-        let reader: DynRead = Box::new(reader);
-        let writer: DynWrite = Box::new(writer);
+        let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
         Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
     }
 
+    /// Open a plain TCP connection driven by **two blocking threads** instead of
+    /// the tokio reactor, run the handshake, and start background tasks.
+    ///
+    /// The third constructor, beside [`connect`](Self::connect) and
+    /// [`connect_tls`](Self::connect_tls), and the one an RTEMS target uses:
+    /// there is no tokio reactor there, and `tokio::net` does not compile for
+    /// the triple at all.
+    ///
+    /// It is *not* a second protocol. It hands
+    /// [`run_handshake_and_spawn`](Self::run_handshake_and_spawn) the same
+    /// `DynRead`/`DynWrite` the other two do, built from
+    /// `runtime::blocking_io`'s adapters, so the handshake, the reader task's
+    /// frame loop, the writer task, the heartbeat and every operation state
+    /// machine are the same code reached by the same path. The two pump threads
+    /// are owned by the adapters, so they retire when the reader and writer
+    /// tasks let go of them — the same lifecycle the hosted socket halves have.
+    ///
+    /// [`connect`](Self::connect) already selects this transport on RTEMS and
+    /// under `--cfg pva_blocking_client`. This entry point exists for a caller
+    /// that wants it explicitly, and for tests that want both transports in one
+    /// binary.
+    pub async fn connect_blocking(
+        target: SocketAddr,
+        user: &str,
+        host: &str,
+        conn: ConnConfig,
+    ) -> PvaResult<Arc<Self>> {
+        let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
+        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
+    }
+
     /// Open a TLS-wrapped connection (`pvas://`).
+    ///
+    /// The only client entry point that names a rustls type, so it is the
+    /// only one gated on the `tls` feature; the `Option<Arc<TlsClientConfig>>`
+    /// plumbing that reaches it compiles either way (see [`crate::auth`]).
+    #[cfg(feature = "tls")]
     pub async fn connect_tls(
         target: SocketAddr,
         server_name: &str,
@@ -241,7 +556,7 @@ impl ServerConn {
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
-        let stream = timeout(conn.op_timeout, TcpStream::connect(target))
+        let stream = timeout(conn.op_timeout, tokio::net::TcpStream::connect(target))
             .await
             .map_err(|_| PvaError::Timeout)?
             .map_err(PvaError::Io)?;
@@ -347,7 +662,7 @@ impl ServerConn {
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
         let bytes_tx_writer = bytes_tx.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut batch = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
@@ -388,7 +703,7 @@ impl ServerConn {
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let out_order_reader = out_order.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
             // client-side segmented-message reassembly. Mirror
@@ -420,7 +735,13 @@ impl ServerConn {
                             break;
                         }
                         Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
+                            if let Err(e) = crate::peer_buf::try_extend(
+                                &mut buf, &chunk[..n], "the connection receive buffer"
+                            ) {
+                                warn!(error = %e, "PVA client reader: closing");
+                                cancel_reader.cancel();
+                                return;
+                            }
                             last_rx_reader.store(now_nanos(), Ordering::SeqCst);
                             // count bytes read off the socket.
                             bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
@@ -559,7 +880,15 @@ impl ServerConn {
                                         return;
                                     }
                                 }
-                                seg_buf.extend_from_slice(&frame.payload);
+                                if let Err(e) = crate::peer_buf::try_extend(
+                                    &mut seg_buf,
+                                    &frame.payload,
+                                    "the segment-reassembly buffer",
+                                ) {
+                                    warn!(error = %e, "PVA client reader: closing");
+                                    cancel_reader.cancel();
+                                    return;
+                                }
                                 if raw_seg != 0
                                     && raw_seg
                                         != crate::proto::HeaderFlags::SEGMENT_LAST
@@ -634,7 +963,7 @@ impl ServerConn {
         let last_rx_hb = last_rx_nanos.clone();
         let writer_tx_hb = writer_tx.clone();
         let out_order_hb = out_order.clone();
-        tokio::spawn(async move {
+        epics_base_rs::runtime::task::spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
             // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
             let hb_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
@@ -1086,7 +1415,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
         if n == 0 {
             return Err(PvaError::Protocol("server closed during handshake".into()));
         }
-        rx_buf.extend_from_slice(&chunk[..n]);
+        crate::peer_buf::try_extend(rx_buf, &chunk[..n], "the connection receive buffer")?;
     }
 }
 
@@ -2737,5 +3066,594 @@ mod tests {
             conn.is_alive(),
             "application-echo heartbeat must keep the pvxs-shaped link alive"
         );
+    }
+
+    /// [`ServerConn::connect_blocking`] completes the same handshake as
+    /// [`ServerConn::connect`], on an ordinary host build.
+    ///
+    /// This is deliberately **not** covered by the `--cfg pva_blocking_client`
+    /// suite run, which proves a different thing: that run rebuilds the crate
+    /// with `dial_pva` selecting the blocking transport, so what it exercises is
+    /// `connect`. Nothing in it ever calls this constructor, and a `--cfg` no
+    /// manifest can set is not something a default build can be argued from. So
+    /// the third constructor is asserted here, where the crate is compiled
+    /// exactly as it ships, and the assertion is that the two transports are
+    /// interchangeable at runtime rather than one replacing the other at build
+    /// time.
+    ///
+    /// `#[tokio::test]` — the default `CurrentThread` flavor, on purpose. The
+    /// two pump threads must be able to park while the runtime's only thread
+    /// drives the handshake future, which is the property
+    /// `runtime::task::spawn_dedicated_thread` establishes by declining to
+    /// inherit a current-thread ambient handle. Run this on a `multi_thread`
+    /// flavor and it passes either way, testing nothing.
+    #[tokio::test]
+    async fn connect_blocking_completes_the_same_handshake_as_connect() {
+        use crate::proto::encode_size_into;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let order = ByteOrder::Little;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // SET_BYTE_ORDER + CONNECTION_VALIDATION.
+            let mut hs = Vec::new();
+            PvaHeader::control(true, order, ControlCommand::SetByteOrder.code(), 0)
+                .write_into(&mut hs);
+            let mut payload = Vec::new();
+            payload.put_u32(0x10000, order);
+            payload.put_u16(32_767, order);
+            encode_size_into(1, order, &mut payload);
+            encode_string_into("anonymous", order, &mut payload);
+            PvaHeader::application(
+                true,
+                order,
+                Command::ConnectionValidation.code(),
+                payload.len() as u32,
+            )
+            .write_into(&mut hs);
+            hs.extend_from_slice(&payload);
+            let _ = sock.write_all(&hs).await;
+
+            // Drain the client's CONNECTION_VALIDATION reply, then validate.
+            let mut drain = [0u8; 512];
+            let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut drain)).await;
+            let mut ok = Vec::new();
+            PvaHeader::application(true, order, Command::ConnectionValidated.code(), 1)
+                .write_into(&mut ok);
+            ok.push(0xFF);
+            let _ = sock.write_all(&ok).await;
+
+            // Hold the circuit open past the assertions below, silent. With a
+            // finite pump read timeout this is what tore the connection down.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let conn = ServerConn::connect_blocking(
+            addr,
+            "testuser",
+            "testhost",
+            ConnConfig {
+                op_timeout: Duration::from_secs(2),
+                tcp_timeout: Duration::from_secs(30),
+                max_message_size: None,
+            },
+        )
+        .await
+        .expect("blocking handshake must succeed");
+
+        assert!(
+            conn.is_alive(),
+            "connection must be alive after the blocking handshake"
+        );
+
+        // An idle circuit stays up. The reader pump's `SO_RCVTIMEO` ends the
+        // connection when it expires, so this is what fails if it is ever given
+        // a per-operation deadline (`op_timeout` above is 2 s) instead of
+        // `PumpConfig`'s effectively-infinite default. `tcp_timeout` is 30 s, so
+        // the heartbeat has no opinion yet either.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            conn.is_alive(),
+            "an idle blocking circuit must outlive op_timeout: the reader pump's \
+             receive timeout is not an idle-disconnect bound"
+        );
+    }
+
+    /// The dial seam must never occupy a callback-band worker.
+    ///
+    /// Measured (gdb all-thread dump of the host-linux `rtems-pva-ioc`): the
+    /// single `cbMedium` worker sat in `poll(timeout=39999)` under
+    /// `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a
+    /// synchronous dial to a SYN-blackholed name server held the band for
+    /// ~40 s per attempt, starving everything scheduled on Medium (the same
+    /// executor failure class as `doc/qsrv-rtems-design.md` §9.15.1: one
+    /// occupant on a band = broad delivery starvation).
+    ///
+    /// Exec-backend-only: the callback band being pinned is the exec
+    /// executor's. The `--cfg pva_blocking_client` tokio build shares the
+    /// same `dial_blocking` code path, so this coverage carries to it.
+    /// Linux-only for the same reason as `epics-ca-rs`'s
+    /// `connect_deadline_tests`: the blackhole below relies on Linux
+    /// answering an accept-queue-overflowing SYN with silence
+    /// (`tcp_abort_on_overflow = 0`, the default); macOS/BSD answer it with
+    /// an RST and the dial resolves immediately.
+    #[cfg(all(exec_backend, target_os = "linux"))]
+    mod dial_band_tests {
+        use super::*;
+        use epics_base_rs::runtime::blocking_io::MAX_DIAL_WORKERS;
+        use std::future::Future;
+
+        /// A local address whose SYNs the kernel drops: a listening socket
+        /// with a full accept queue (the `epics-ca-rs`
+        /// `connect_deadline_tests::syn_blackhole` mechanism). Linux
+        /// (`tcp_abort_on_overflow = 0`, the default) answers an overflowing
+        /// SYN with silence, so the connecting peer sits in SYN-SENT and
+        /// retries — a deterministic unanswered dial with no route off the
+        /// box and no firewall.
+        ///
+        /// Saturation is *verified*, not assumed: a handshake completing
+        /// through the SYN queue lands in the accept queue a beat after the
+        /// filler's `connect()` returns, so a dial racing right behind a
+        /// single unverified filler can still be admitted (observed: the
+        /// late-dial test's connection beat the filler into the queue). The
+        /// probe loop below keeps adding established fillers until a fresh
+        /// nonblocking connect is still unanswered 300 ms in — on loopback a
+        /// queued handshake completes in microseconds and a dropped SYN's
+        /// first retransmit is at ~1 s, so an unanswered probe proves the
+        /// queue is full. Closing the probe in SYN-SENT aborts the attempt
+        /// (no further retransmits), so it cannot steal a slot later.
+        ///
+        /// Returns the blackhole address, the listener, and the fillers
+        /// occupying the queue; the caller keeps them alive (and never
+        /// accepts) for as long as the blackhole must hold.
+        fn syn_blackhole() -> (SocketAddr, socket2::Socket, Vec<std::net::TcpStream>) {
+            use socket2::{Domain, Socket, Type};
+
+            let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+            sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+                .expect("bind");
+            // Backlog 0 → the kernel rounds to a 1-slot accept queue.
+            sock.listen(0).expect("listen");
+            let addr: SocketAddr = sock.local_addr().expect("local_addr").as_socket().unwrap();
+
+            let mut fillers = Vec::new();
+            loop {
+                let probe = Socket::new(Domain::IPV4, Type::STREAM, None).expect("probe");
+                probe.set_nonblocking(true).expect("probe nonblocking");
+                match probe.connect(&addr.into()) {
+                    Ok(()) => {}
+                    Err(e)
+                        if e.raw_os_error() == Some(libc::EINPROGRESS)
+                            || e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("probe connect: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                if probe.peer_addr().is_ok() {
+                    // Admitted: the queue had room. Keep it as a filler.
+                    probe.set_nonblocking(false).expect("filler blocking");
+                    fillers.push(probe.into());
+                } else {
+                    // Still SYN-SENT after 300 ms: the queue is full.
+                    return (addr, sock, fillers);
+                }
+            }
+        }
+
+        /// The invariant, pinned where it was measured broken: while a dial
+        /// toward an unanswering server is in flight, other work spawned on
+        /// the same callback band still runs. Pre-fix, `dial_blocking`'s
+        /// synchronous `connect_timeout` parked the band's single worker for
+        /// the whole bound and the canary starved.
+        #[test]
+        fn stalled_dial_releases_the_callback_band() {
+            let (addr, _listener, _fillers) = syn_blackhole();
+
+            // The dial, spawned exactly as `ns_task` is: `runtime::task::spawn`
+            // → the default (Medium) callback band and its single worker.
+            let (dial_tx, _dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = dial_tx.send(
+                    dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            // Let the band worker take the dial task and enter the connect.
+            std::thread::sleep(Duration::from_millis(300));
+
+            // Canary on the same band, behind the stalled dial.
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(());
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                "a stalled dial must not occupy the callback band: the canary \
+                 spawned behind it did not run within 2 s, so the band's \
+                 single worker is parked inside the dial"
+            );
+        }
+
+        /// Boundary: a dial that completes only after SYN retransmission is
+        /// still usable. The accept queue is drained ~2 s in, the client's
+        /// next SYN retry (Linux RTO ladder: ~1 s, ~3 s, …) completes the
+        /// handshake, and the returned write half carries bytes.
+        #[test]
+        fn dial_completing_after_syn_retry_is_usable() {
+            let (addr, listener, fillers) = syn_blackhole();
+            let started = std::time::Instant::now();
+
+            let (bytes_tx, bytes_rx) = std::sync::mpsc::channel();
+            let acceptor = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                // Drain the fillers (queued first, FIFO): frees the accept
+                // queue so the dial's retried SYN completes. The next accept
+                // after them is the late dial.
+                for _ in 0..fillers.len() {
+                    let _ = listener.accept().expect("drain a filler");
+                }
+                drop(fillers);
+                let (ours, _) = listener.accept().expect("accept the late dial");
+                let ours: std::net::TcpStream = ours.into();
+                ours.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                use std::io::Read;
+                let mut buf = [0u8; 9];
+                (&ours).read_exact(&mut buf).expect("read the dialed bytes");
+                let _ = bytes_tx.send(buf);
+            });
+
+            // Write through the returned half, then hand BOTH halves to the
+            // test: dropping the reader adapter shuts the socket down, so
+            // the halves must outlive the acceptor's read.
+            let (dial_tx, dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let res =
+                    match dial_pva(addr, Duration::from_secs(15), Duration::from_secs(15)).await {
+                        Ok((reader, mut writer)) => writer
+                            .write_all(b"late-dial")
+                            .await
+                            .map(|()| (reader, writer))
+                            .map_err(PvaError::Io),
+                        Err(e) => Err(e),
+                    };
+                let _ = dial_tx.send(res);
+            });
+
+            let _halves = dial_rx
+                .recv_timeout(Duration::from_secs(12))
+                .expect("dial must resolve before its 15 s bound")
+                .expect("a dial completing after SYN retry must succeed");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1900),
+                "the dial resolved in {:?}, i.e. before the accept queue was \
+                 drained — the blackhole did not hold and the test proved \
+                 nothing about a late-completing dial",
+                started.elapsed()
+            );
+            let got = bytes_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the late-dialed connection must carry bytes");
+            assert_eq!(&got, b"late-dial");
+            acceptor.join().expect("acceptor thread");
+        }
+
+        /// Boundary: a target that answers with RST (nothing listening)
+        /// fails the dial promptly — the off-band hop must not turn a fast
+        /// refusal into a slow one.
+        #[test]
+        fn dial_to_closed_target_fails_fast() {
+            // Bind, take the addr, drop: nothing listens → RST.
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = l.local_addr().expect("addr");
+            drop(l);
+
+            let started = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("an RST-refused dial must resolve promptly");
+            assert!(
+                res.is_err(),
+                "nothing listens at {addr}: the dial must fail"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "the refusal took {:?}; the off-band hop must not delay it",
+                started.elapsed()
+            );
+        }
+
+        /// Every thread this client creates for a dial, whatever shape the
+        /// dial seam has.
+        ///
+        /// Both prefixes on purpose: `"PVAC-connect <target>"` is the
+        /// per-attempt thread the pool replaced and `"PVAC-dial <n>"` is a
+        /// pool worker, so a count taken through this function is comparable
+        /// across the change and the bound below is asserted against the old
+        /// shape as well as the new one. (`comm` is truncated to 15 bytes, so
+        /// both are matched on their stable prefix.)
+        fn dial_threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("task dir")
+                .filter(|e| {
+                    let Ok(e) = e else { return false };
+                    std::fs::read_to_string(e.path().join("comm"))
+                        .is_ok_and(|c| c.starts_with("PVAC-connect") || c.starts_with("PVAC-dial"))
+                })
+                .count()
+        }
+
+        /// The bound the dial seam owes the target: **N failed dials must not
+        /// cost N threads.**
+        ///
+        /// Every `std::thread` leaks 128 B permanently on RTEMS — its TLS key
+        /// is freed before the key's destructor runs — so the cost that
+        /// matters is thread *creations*, not threads alive. A search engine
+        /// whose name server is unreachable redials roughly every 10 s for as
+        /// long as the IOC runs, which under a per-attempt dial thread is a
+        /// leak with no ceiling.
+        ///
+        /// The dials here are sequential — each is awaited to its failure
+        /// before the next is issued, exactly the redial loop's shape — and
+        /// they are aimed at a blackhole so that the threads serving them are
+        /// still alive to be counted: a refusal would retire the old
+        /// per-attempt thread before this test could see it and prove nothing.
+        ///
+        /// Fails on the per-attempt shape (12 live `PVAC-connect` threads, one
+        /// per attempt, each pinned under the OS connect ladder); passes on the
+        /// pool (at most `MAX_DIAL_WORKERS`, and past the first four every
+        /// further dial queues and still fails at its own bound).
+        #[test]
+        fn sequential_failed_dials_do_not_grow_the_dial_thread_count() {
+            // Long enough to outgrow the bound it asserts, whatever the bound
+            // is set to.
+            const DIALS: usize = MAX_DIAL_WORKERS * 3;
+
+            let (addr, _listener, _fillers) = syn_blackhole();
+            let before = dial_threads();
+
+            for i in 0..DIALS {
+                let (tx, rx) = std::sync::mpsc::channel();
+                epics_base_rs::runtime::task::spawn(async move {
+                    let _ = tx.send(
+                        dial_pva(addr, Duration::from_millis(200), Duration::from_secs(10))
+                            .await
+                            .map(|_| ()),
+                    );
+                });
+                let res = rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|e| panic!("dial {i} must resolve at its bound: {e}"));
+                assert!(
+                    matches!(res, Err(PvaError::Timeout)),
+                    "dial {i} toward a blackhole must fail with Timeout, got {res:?}"
+                );
+            }
+
+            let after = dial_threads();
+            assert!(
+                after <= before + MAX_DIAL_WORKERS,
+                "{DIALS} sequential failed dials created {} dial threads \
+                 (from {before} to {after}); the dial seam must borrow from a \
+                 bounded set of at most {MAX_DIAL_WORKERS} permanent workers, \
+                 not create one per attempt — on RTEMS each creation leaks \
+                 128 B that is never returned",
+                after - before
+            );
+        }
+
+        /// Boundary: a caller that goes away mid-dial leaks nothing.
+        ///
+        /// An abandoned dial leaves the pool in one of exactly two states, and
+        /// **both are correct** — which is why this test branches rather than
+        /// assuming one of them:
+        ///
+        /// * the worker was already inside its `connect`, so a socket exists
+        ///   and the worker must be its single finalizer — its send to the
+        ///   dropped receiver fails and the fresh socket is dropped, and
+        ///   closed, before it takes its next request;
+        /// * the worker only reached the request *after* the caller had gone,
+        ///   saw `Sender::is_closed()` and skipped the connect, so no socket
+        ///   was ever opened.
+        ///
+        /// The first was asserted unconditionally until the CA twin of this
+        /// test hung on it in 2 of 4 loaded runs: between the single `poll`
+        /// and the `drop` there is a `/proc` scan, milliseconds of window for
+        /// the worker not to have popped the request yet, and the blocking
+        /// `accept` then waited forever for a connection that was correctly
+        /// never made. The race was never observed here — ~14 loaded runs of
+        /// this suite all took the first branch — but the sequence is
+        /// identical, so the hazard is closed in both rather than left to
+        /// timing.
+        ///
+        /// The worker itself deliberately does **not** retire; that is the
+        /// bound. So the tail asserts the stronger property unconditionally:
+        /// the same worker goes on to serve the next dial.
+        #[test]
+        fn dropped_dial_future_leaks_no_socket_and_returns_its_worker() {
+            let (addr, listener, fillers) = syn_blackhole();
+            let mut fut = Box::pin(dial_pva(
+                addr,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // The first poll spawns the dial thread and parks on the oneshot.
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "a dial toward a blackhole must be pending, not resolved on \
+                 the caller's thread"
+            );
+            assert_eq!(
+                dial_threads(),
+                1,
+                "the first poll must have handed the connect to a dedicated \
+                 dial thread"
+            );
+
+            // The caller goes away mid-dial.
+            drop(fut);
+
+            // Un-blackhole: drain the fillers so that, if the worker did enter
+            // its connect, the abandoned dial's SYN retry (~1 s, ~3 s)
+            // completes.
+            for _ in 0..fillers.len() {
+                let _ = listener.accept().expect("drain a filler");
+            }
+            drop(fillers);
+
+            // `accept` honours `SO_RCVTIMEO` on Linux, so this is the branch
+            // discriminator: a connection means the worker was mid-connect,
+            // and `WouldBlock` past the SYN ladder's first two retries means
+            // it skipped. Either way nothing may be left open.
+            listener
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .expect("accept timeout");
+            match listener.accept() {
+                Ok((ours, _)) => {
+                    // Single finalizer: the worker closed the socket it
+                    // opened, so the accepted side reads EOF, not a half-open
+                    // connection.
+                    let ours: std::net::TcpStream = ours.into();
+                    ours.set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("read timeout");
+                    use std::io::Read;
+                    let mut buf = [0u8; 1];
+                    let n = (&ours).read(&mut buf).expect("read on the abandoned dial");
+                    assert_eq!(
+                        n, 0,
+                        "the worker was inside its connect, so it owns the \
+                         socket it opened and must close it once its receiver \
+                         is gone"
+                    );
+                }
+                Err(e) if epics_base_rs::runtime::blocking_io::is_socket_timeout(e.kind()) => {
+                    // The worker reached the request after the caller had gone
+                    // and skipped the connect: no socket was opened, so there
+                    // is none to finalise.
+                }
+                Err(e) => panic!("accept on the abandoned dial: {e}"),
+            }
+
+            // …and it is back in service rather than retired: the next dial
+            // is served without a second thread being created.
+            let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let live_addr = live.local_addr().expect("addr");
+            let acceptor = std::thread::spawn(move || live.accept().expect("accept").0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(live_addr, Duration::from_secs(5), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            rx.recv_timeout(Duration::from_secs(6))
+                .expect("the next dial must resolve")
+                .expect("a dial to a live listener must succeed");
+            assert_eq!(
+                dial_threads(),
+                1,
+                "the worker that finalised the abandoned socket must serve the \
+                 next dial, not be replaced by a fresh thread"
+            );
+            drop(acceptor.join().expect("acceptor"));
+        }
+
+        /// Boundary: the application-level bound (pvxs `operationTimeout`)
+        /// still applies with the plain-blocking connect — it is enforced by
+        /// the awaiting side's `timeout`, not by the (target-broken)
+        /// `connect_timeout` poll path, so a blackholed dial fails the
+        /// caller at the deadline even while the dial thread is still
+        /// blocking under the OS connect ladder.
+        #[test]
+        fn dial_times_out_at_the_application_bound() {
+            let (addr, _listener, _fillers) = syn_blackhole();
+
+            let started = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let _ = tx.send(
+                    dial_pva(addr, Duration::from_millis(500), Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                );
+            });
+            let res = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the dial must resolve at its application bound");
+            assert!(
+                matches!(res, Err(PvaError::Timeout)),
+                "a blackholed dial must fail with Timeout at the application \
+                 bound, got {res:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "the bound took {:?}; it must fire at ~500 ms, not wait out \
+                 the OS connect ladder",
+                started.elapsed()
+            );
+        }
+
+        /// A dial against a live listener that answers succeeds and the
+        /// returned halves carry bytes — the plain-blocking connect path,
+        /// end to end. (SYN-ACK latency proper cannot be injected on
+        /// loopback without privileges; delayed *completion* is covered by
+        /// `dial_completing_after_syn_retry_is_usable`.)
+        #[test]
+        fn dial_to_live_listener_succeeds() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let (bytes_tx, bytes_rx) = std::sync::mpsc::channel();
+            let acceptor = std::thread::spawn(move || {
+                let (ours, _) = listener.accept().expect("accept the dial");
+                ours.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                use std::io::Read;
+                let mut buf = [0u8; 4];
+                (&ours).read_exact(&mut buf).expect("read the dialed bytes");
+                let _ = bytes_tx.send(buf);
+            });
+
+            let (dial_tx, dial_rx) = std::sync::mpsc::channel();
+            epics_base_rs::runtime::task::spawn(async move {
+                let res =
+                    match dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10)).await {
+                        Ok((reader, mut writer)) => writer
+                            .write_all(b"live")
+                            .await
+                            .map(|()| (reader, writer))
+                            .map_err(PvaError::Io),
+                        Err(e) => Err(e),
+                    };
+                let _ = dial_tx.send(res);
+            });
+
+            let _halves = dial_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("dial must resolve")
+                .expect("a dial to a live listener must succeed");
+            let got = bytes_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the dialed connection must carry bytes");
+            assert_eq!(&got, b"live");
+            acceptor.join().expect("acceptor thread");
+        }
     }
 }

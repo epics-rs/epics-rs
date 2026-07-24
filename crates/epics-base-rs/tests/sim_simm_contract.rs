@@ -25,6 +25,8 @@
 //! `NotSimulated` before SIMM was even read whenever SIML and SIOL were both
 //! empty, so the idiom was a complete no-op on every record type.
 
+// RTEMS-EXEC-MODEL-ALLOW(15): checked - these run and pass in the feature-ON suite.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -56,15 +58,15 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
         .await
         .unwrap();
 
-    let val = db.get_pv("SIMCONST").await.unwrap();
+    let val = db.get_pv("SIMCONST").unwrap();
     assert_eq!(
         val,
         EpicsValue::Long(42),
         "C `val = sval` on the status-0 constant SIOL read; got {val:?}"
     );
 
-    let rec = db.get_record("SIMCONST").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SIMCONST").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Major,
@@ -99,13 +101,13 @@ async fn simm_no_with_unset_links_does_not_simulate() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("SIMOFF").await.unwrap(),
+        db.get_pv("SIMOFF").unwrap(),
         EpicsValue::Long(7),
         "SIMM=NO must not copy SVAL into VAL"
     );
-    let rec = db.get_record("SIMOFF").await.unwrap();
+    let rec = db.get_record("SIMOFF").unwrap();
     assert_ne!(
-        rec.read().await.common.stat,
+        rec.read().common.stat,
         epics_base_rs::server::recgbl::alarm_status::SIMM_ALARM,
         "SIMM=NO raises no SIMM_ALARM"
     );
@@ -160,8 +162,8 @@ async fn simm_transition_swaps_scan_with_sscn() {
     // SIMM NO -> YES: scan and sscn trade places.
     db.put_pv("SWAP.SIMM", EpicsValue::Short(1)).await.unwrap();
     {
-        let rec = db.get_record("SWAP").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("SWAP").unwrap();
+        let inst = rec.read();
         assert_eq!(
             inst.common.scan,
             ScanType::Passive,
@@ -182,8 +184,8 @@ async fn simm_transition_swaps_scan_with_sscn() {
     // SIMM YES -> NO: swapped back.
     db.put_pv("SWAP.SIMM", EpicsValue::Short(0)).await.unwrap();
     {
-        let rec = db.get_record("SWAP").await.unwrap();
-        let inst = rec.read().await;
+        let rec = db.get_record("SWAP").unwrap();
+        let inst = rec.read();
         assert_eq!(inst.common.scan, ScanType::Sec1);
         assert_eq!(
             inst.get_common_field("SSCN"),
@@ -214,8 +216,8 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
         .await
         .unwrap();
 
-    let rec = db.get_record("NOSSCN").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("NOSSCN").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.scan, ScanType::Sec1);
     assert_eq!(
         inst.get_common_field("SSCN"),
@@ -248,8 +250,8 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
 
     db.put_pv("BUSY.SIMM", EpicsValue::Short(1)).await.unwrap();
 
-    let rec = db.get_record("BUSY").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("BUSY").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.scan,
         ScanType::Sec1,
@@ -303,8 +305,8 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
         .await
         .unwrap();
 
-    let rec = db.get_record("SIMLFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SIMLFAIL").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::LINK_ALARM,
@@ -332,8 +334,8 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
         .await
         .unwrap();
 
-    let rec = db.get_record("BUSYFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("BUSYFAIL").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::LINK_ALARM);
     assert_eq!(
         inst.common.sevr,
@@ -383,8 +385,8 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
         .await
         .unwrap();
 
-    let rec = db.get_record("SIOLFAIL").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SIOLFAIL").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.sevr,
         AlarmSeverity::Invalid,
@@ -419,8 +421,8 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
         .await
         .unwrap();
 
-    let rec = db.get_record("SIOLTIE").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("SIOLTIE").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
     assert_eq!(
         inst.common.stat,
@@ -478,12 +480,12 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("RAWIN").await.unwrap(),
+        db.get_pv("RAWIN").unwrap(),
         EpicsValue::Long(7),
         "C's default arm performs NO device substitution — SVAL must not reach VAL"
     );
-    let rec = db.get_record("RAWIN").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("RAWIN").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::SOFT_ALARM,
@@ -515,12 +517,12 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("SINK").await.unwrap(),
+        db.get_pv("SINK").unwrap(),
         EpicsValue::Long(0),
         "the default arm returns before the SIOL redirect — SIOL must not be written"
     );
-    let rec = db.get_record("RAWOUT").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("RAWOUT").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
@@ -544,9 +546,9 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
         .await
         .unwrap();
 
-    assert_eq!(db.get_pv("BSINK").await.unwrap(), EpicsValue::Long(0));
-    let rec = db.get_record("BRAW").await.unwrap();
-    let inst = rec.read().await;
+    assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
+    let rec = db.get_record("BRAW").unwrap();
+    let inst = rec.read();
     assert_eq!(inst.common.stat, alarm_status::SOFT_ALARM);
     assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
 }
@@ -570,8 +572,8 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
         .await
         .unwrap();
 
-    let rec = db.get_record("AIRAW").await.unwrap();
-    let inst = rec.read().await;
+    let rec = db.get_record("AIRAW").unwrap();
+    let inst = rec.read();
     assert_eq!(
         inst.common.stat,
         alarm_status::SIMM_ALARM,
@@ -624,18 +626,19 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
         .await
         .unwrap();
 
-    let inst = db.get_record("E5BUSY").await.unwrap();
-    let inst = inst.read().await;
-    assert_eq!(
-        inst.common.stat,
-        alarm_status::LINK_ALARM,
-        "dbGetLink -> setLinkAlarm on the failed SIML read"
-    );
-    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
-    drop(inst);
+    let inst = db.get_record("E5BUSY").unwrap();
+    {
+        let inst = inst.read();
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::LINK_ALARM,
+            "dbGetLink -> setLinkAlarm on the failed SIML read"
+        );
+        assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    }
 
     assert_eq!(
-        db.get_pv("E5TGT").await.unwrap(),
+        db.get_pv("E5TGT").unwrap(),
         EpicsValue::Long(0),
         "busyRecord.c:399-401 returns before write_busy — the OUT target keeps its value"
     );
@@ -664,7 +667,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
         .unwrap();
 
     assert_eq!(
-        db.get_pv("E5STGT").await.unwrap(),
+        db.get_pv("E5STGT").unwrap(),
         EpicsValue::Long(0),
         "the `if (status) return status` precedes the `dbPutLink(&prec->siol, ...)`"
     );

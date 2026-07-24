@@ -48,14 +48,21 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
+// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass feature-ON under
+// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
+// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
+// that combo when touching this module.
+
 use std::sync::Arc;
 
 use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, AsgAslResolver};
 use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue};
 use epics_pva_rs::server::native_source::AcfCell;
-use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
-use tokio::sync::{RwLock, mpsc};
+use epics_pva_rs::server_native::source::{
+    AccessChecked, ChannelContext, ChannelSource, MonitorStream, OpError,
+};
+use tokio::sync::mpsc;
 
 use super::source::GatewayChannelSource;
 
@@ -135,7 +142,7 @@ impl ControlSource {
     /// proxied namespace uses, NOT a host/account allow-list. Without
     /// this the writable surface stays closed (every RPC denied).
     pub fn with_control_acf(mut self, cfg: AccessSecurityConfig) -> Self {
-        let acf: AcfCell = Arc::new(RwLock::new(Some(cfg)));
+        let acf: AcfCell = epics_base_rs::server::access_security::new_acf_cell(Some(cfg));
         self.control_gate = Some(AccessGate::required(acf, Self::control_asg_resolver()));
         self
     }
@@ -627,7 +634,7 @@ impl ChannelSource for ControlSource {
             .map_err(OpError::failed)
     }
 
-    async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<PvField>> {
+    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
         // Control PVs are RPC targets — a monitor against one would
         // never see an event. Only diagnostic PVs get a live channel.
         if !self.is_diag(name) {
@@ -644,8 +651,9 @@ impl ChannelSource for ControlSource {
         let (tx, rx) = mpsc::channel::<PvField>(4);
         let me = self.clone();
         let pv_name = name.to_string();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        epics_base_rs::runtime::task::spawn(async move {
+            let mut tick =
+                epics_base_rs::runtime::task::interval(std::time::Duration::from_secs(1));
             tick.tick().await; // skip the immediate fire — server emits
             // initial via get_value.
             let mut last: Option<PvField> = None;
@@ -666,7 +674,7 @@ impl ChannelSource for ControlSource {
                 }
             }
         });
-        Some(rx)
+        Some(MonitorStream::Channel(rx))
     }
 }
 

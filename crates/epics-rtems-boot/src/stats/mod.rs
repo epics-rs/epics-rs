@@ -1,40 +1,57 @@
-//! Descriptor and heap usage, read out of RTEMS itself.
+//! Descriptor and heap usage, read out of the OS the IOC is running on.
 //!
-//! These are the two IOC-statistics values on this target that Rust cannot
-//! reach: `std` exposes neither, and both live behind RTEMS internals
-//! (`rtems_libio_iops`, `RTEMS_Malloc_Heap`) rather than behind POSIX. The C
-//! that reads them is `csrc/rtems_stats.c`, ported from devIocStats'
-//! `os/RTEMS/osdFdUsage.c` and `osdMemUsage.c`; this module is the safe wrapper
-//! and the *only* thing above it that needs to know a C boundary exists.
+//! These are the two IOC-statistics values a target build cannot get from
+//! `std`, and each OS keeps them somewhere different. This module is the
+//! *funnel*: the types, and one pair of readers that every consumer calls. The
+//! per-OS reading lives in a `backend` module selected below — RTEMS' is the C
+//! in `csrc/rtems_stats.c`, ported from devIocStats' `os/RTEMS/osdFdUsage.c`
+//! and `osdMemUsage.c`, and the fallback reports no reading at all.
+//!
+//! # Why the OS fork is a module and not a `#[cfg]` arm
+//!
+//! [`fd_usage`] and [`mem_usage`] carry no `#[cfg]` of their own, and the
+//! `the_os_fork_happens_only_at_the_backend_selection` test below keeps it that
+//! way. The alternative — a `#[cfg]` pair inside each reader — costs one new
+//! arm per function per OS, and every consumer that wanted the same value would
+//! reproduce the same fork at its own call site. That is the shape devIocStats
+//! avoids too: one record set, one OSD file per OS.
+//!
+//! So a second OS is a new file plus one `mod` line here. It is not a change to
+//! any consumer, and it cannot become one: consumers see `Option`, which
+//! already means "this build has no reading".
 //!
 //! # `None` means unavailable, not zero
 //!
-//! Both readers return [`Option`], and both return [`None`] on every build that
-//! is not a linked RTEMS image. That distinction is load-bearing rather than
-//! decorative: **zero free descriptors and zero free heap are both real
-//! readings** on this target, and they are precisely the readings an operator
-//! most needs to believe. devIocStats cannot express the difference — its
-//! record graph substitutes a sentinel (`FD_FREE`'s `CALC` is `B>0?B-A:C` with
-//! `C = 1000`, `iocStats/iocAdmin/Db/ioc.template:118-123`), so an IOC whose
-//! descriptor support is missing publishes "1000 free" rather than "unknown".
-//! An `Option` says the thing the sentinel cannot.
+//! Both readers return [`Option`], and both return [`None`] on any build whose
+//! OS has no backend. See `unsupported.rs` for why that distinction is
+//! load-bearing rather than decorative.
 //!
 //! # Cost
 //!
-//! [`fd_usage`] walks the descriptor table, so it is O(`CONFIGURE_MAXIMUM_
-//! FILE_DESCRIPTORS`) — 150 entries on this BSP. [`mem_usage`] walks the heap
-//! under the allocator's lock; upstream's own header comment says gathering
-//! heap statistics "could be expensive" and warns against running it too
-//! often. Neither is on any serving path; both are called once per tick by the
-//! status pusher, whose interval is one second.
+//! [`fd_usage`] walks the descriptor table, so it is O(descriptor-table size) —
+//! 150 entries on the RTEMS BSP. [`mem_usage`] walks the heap under the
+//! allocator's lock; devIocStats' own header comment says gathering heap
+//! statistics "could be expensive" and warns against running it too often.
+//! Neither is on any serving path; both are called once per tick by the status
+//! pusher, whose interval is one second.
+
+// The one place this module knows what OS it is on. Exactly one arm is live in
+// any build, so everything below is written once.
+#[cfg(all(target_os = "rtems", rtems_boot_linked))]
+#[path = "rtems.rs"]
+mod backend;
+#[cfg(not(all(target_os = "rtems", rtems_boot_linked)))]
+#[path = "unsupported.rs"]
+mod backend;
 
 /// Open file descriptors and the ceiling they are counted against.
 ///
-/// `max` is `rtems_libio_number_iops`, i.e. `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`
-/// from `csrc/rtems_config.c`. Measured on the bring-up box, this is the limit
-/// the IOC hits *first*: at 142 concurrent CA connections the 143rd was refused
-/// by the libbsd socket zone, which is sized from this cap — ahead of the heap
-/// ceiling, which had room for roughly ten more connections at that moment.
+/// On RTEMS `max` is `rtems_libio_number_iops`, i.e.
+/// `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` from `csrc/rtems_config.c`. Measured on
+/// the bring-up box, this is the limit the IOC hits *first*: at 142 concurrent
+/// CA connections the 143rd was refused by the libbsd socket zone, which is
+/// sized from this cap — ahead of the heap ceiling, which had room for roughly
+/// ten more connections at that moment.
 ///
 /// The cap of 150 is base's own score-arm value, run on a target where base
 /// itself compiles the POSIX arm and runs 64 — a deviation in which arm's
@@ -84,7 +101,7 @@ pub struct MemUsage {
 impl MemUsage {
     /// Free plus allocated.
     ///
-    /// Derived here rather than in the C, because it is arithmetic on two
+    /// Derived here rather than in a backend, because it is arithmetic on two
     /// measurements rather than a third measurement. devIocStats computes the
     /// same sum (`osdMemUsage.c:73`) and its own header comment flags that this
     /// is *not* the true total the allocator was given — the difference is
@@ -94,63 +111,21 @@ impl MemUsage {
     }
 }
 
-/// Read descriptor usage, or [`None`] on a build with no RTEMS boot shim.
+/// Read descriptor usage, or [`None`] on a build whose OS has no backend.
 pub fn fd_usage() -> Option<FdUsage> {
-    #[cfg(all(target_os = "rtems", rtems_boot_linked))]
-    {
-        let mut used = 0u32;
-        let mut max = 0u32;
-        // SAFETY: both pointers are to live locals of the right type, which is
-        // the whole contract — the C's only failure mode is a null argument.
-        let rc = unsafe { ffi::epics_rtems_boot_fd_usage(&mut used, &mut max) };
-        return (rc == 0).then_some(FdUsage { used, max });
-    }
-    #[cfg(not(all(target_os = "rtems", rtems_boot_linked)))]
-    None
+    backend::fd_usage()
 }
 
-/// Read heap usage, or [`None`] on a build with no RTEMS boot shim.
+/// Read heap usage, or [`None`] on a build whose OS has no backend.
 pub fn mem_usage() -> Option<MemUsage> {
-    #[cfg(all(target_os = "rtems", rtems_boot_linked))]
-    {
-        let mut free = 0u64;
-        let mut used = 0u64;
-        let mut largest_free = 0u64;
-        // SAFETY: as above — three pointers to live locals of the right type.
-        let rc =
-            unsafe { ffi::epics_rtems_boot_mem_usage(&mut free, &mut used, &mut largest_free) };
-        return (rc == 0).then_some(MemUsage {
-            free,
-            used,
-            largest_free,
-        });
-    }
-    #[cfg(not(all(target_os = "rtems", rtems_boot_linked)))]
-    None
-}
-
-/// The declarations, on the one configuration where `csrc/rtems_stats.c` was
-/// compiled. Naming them anywhere else would leave undefined symbols in an
-/// image that is supposed to type-check without a toolchain.
-#[cfg(all(target_os = "rtems", rtems_boot_linked))]
-mod ffi {
-    use core::ffi::c_int;
-
-    unsafe extern "C" {
-        pub fn epics_rtems_boot_fd_usage(used: *mut u32, max: *mut u32) -> c_int;
-        pub fn epics_rtems_boot_mem_usage(
-            free_total: *mut u64,
-            used_total: *mut u64,
-            free_largest: *mut u64,
-        ) -> c_int;
-    }
+    backend::mem_usage()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The host has no boot shim, so both readers must say so rather than
+    /// The host has no backend, so both readers must say so rather than
     /// inventing a reading. A host build that reported `0` free descriptors
     /// would look like an exhausted IOC.
     #[test]
@@ -220,29 +195,52 @@ mod tests {
         );
     }
 
-    /// The C is compiled on exactly one configuration, and the `extern` block
-    /// must not outrun it — a declaration on a wider cfg leaves an undefined
-    /// symbol in the toolchain-free portability build.
+    /// The funnel's whole claim is that the OS fork happens once, at the
+    /// `backend` selection, and nowhere else. A `#[cfg]` anywhere else in this
+    /// file is a second fork — which is how the two readers come to disagree
+    /// about which OS they are on, and how a consumer learns to fork too.
+    ///
+    /// Counted rather than pattern-matched, so the assertion cannot be
+    /// satisfied by a `#[cfg]` that merely *looks* like a backend selection.
     #[test]
-    fn the_extern_block_is_scoped_to_the_configuration_that_compiles_the_c() {
-        let src = include_str!("stats.rs");
-        let cfg = concat!("#[cfg(all(target_os = \"rtems\", ", "rtems_boot_linked))]");
-        let before_extern = src
-            .split_once("mod ffi {")
-            .expect("the ffi module is still here")
+    fn the_os_fork_happens_only_at_the_backend_selection() {
+        let src = include_str!("mod.rs");
+        // Only the funnel is in scope: the tests legitimately sit behind
+        // `#[cfg(test)]`, which is the split point.
+        let funnel = src
+            .split_once("#[cfg(test)]")
+            .expect("the test module is still here")
             .0;
+        assert_eq!(
+            funnel.matches("#[cfg(").count(),
+            funnel.matches("mod backend;").count(),
+            "every `#[cfg]` in the funnel must be a backend selection"
+        );
+    }
+
+    /// The C is compiled on exactly one configuration, and the backend that
+    /// declares its symbols must not outrun it — a declaration on a wider cfg
+    /// leaves an undefined symbol in the toolchain-free portability build.
+    ///
+    /// Asserted on the `mod` line rather than inside `rtems.rs`, because that
+    /// is now where the gate is: gating the whole file at its declaration is
+    /// what makes it impossible to add an `extern` to it on a wider cfg.
+    #[test]
+    fn the_rtems_backend_is_scoped_to_the_configuration_that_compiles_the_c() {
+        let src = include_str!("mod.rs");
+        let cfg = concat!("#[cfg(all(target_os = \"rtems\", ", "rtems_boot_linked))]");
         assert!(
-            before_extern.trim_end().ends_with(cfg),
-            "the ffi declarations must sit directly under the linked-image cfg"
+            src.contains(&format!("{cfg}\n#[path = \"rtems.rs\"]\nmod backend;")),
+            "the RTEMS backend must sit directly under the linked-image cfg"
         );
     }
 
     /// The shim must stay in the build script's file list and its change list;
-    /// dropping either leaves the `extern` block above pointing at nothing, or
-    /// leaves a stale object behind after an edit.
+    /// dropping either leaves the RTEMS backend pointing at nothing, or leaves
+    /// a stale object behind after an edit.
     #[test]
     fn the_build_script_compiles_and_watches_the_shim() {
-        let build = include_str!("../build.rs");
+        let build = include_str!("../../build.rs");
         assert!(build.contains(".file(\"csrc/rtems_stats.c\")"));
         assert!(build.contains("cargo::rerun-if-changed=csrc/rtems_stats.c"));
     }
@@ -259,7 +257,7 @@ mod tests {
     /// assertion below failed exactly that way on its first run.
     #[test]
     fn the_shim_uses_the_rtems_6_atomic_flag_accessor() {
-        let code = include_str!("../csrc/rtems_stats.c")
+        let code = include_str!("../../csrc/rtems_stats.c")
             .split_once("#include <stddef.h>")
             .expect("the shim still starts its code with the includes")
             .1;

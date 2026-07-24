@@ -18,27 +18,30 @@ chrono = "0.4"
 # defaults from the host name, exactly as C's `iocshRegisterCommon` does.
 hostname = "0.4"
 
-# tokio: the hosted build uses the full runtime; the RTEMS build drops the
-# `net`, `signal`, and `process` features — the ones that pull `mio`,
+# tokio: the hosted build uses the full runtime; the RTEMS/VxWorks build drops
+# the `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2`, none of which build for
-# armv7-rtems-eabihf. Declared per-target rather than in shared `[dependencies]`
-# because Cargo UNIONS a dependency's features across all matching tables, so a
-# shared `full` would re-add the dropped features on RTEMS. The retained set
+# armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
+# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
+# features across all matching tables, so a shared `full` would re-add the
+# dropped features on either embedded target. The retained set
 # (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API the
 # always-compiled code uses (Handle, block_in_place, select!, sync primitives)
-# compiling on RTEMS; those paths are unused there (the seam routes to the
-# background executor) but must still type-check for `--lib`.
-[target.'cfg(not(target_os = "rtems"))'.dependencies]
+# compiling there; those paths are unused (the seam routes to the background
+# executor) but must still type-check for `--lib`.
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 # `socket2` + `if-addrs` back the async UDP stack (`net::async_udp_v4` /
 # `net::iface_map`). Host-only for the same reason the whole socket half of
-# `net` is: they do not build for armv7-rtems-eabihf, and the RTEMS CA server
-# uses the separate S1 raw-libc socket driver instead. The module gate in
-# `net/mod.rs` matches this table.
+# `net` is: they do not build for armv7-rtems-eabihf or the `*-wrs-vxworks*`
+# triples, and the embedded CA server uses the separate S1 raw-libc socket
+# driver instead. The module gate in `net/mod.rs` matches this table
+# (`epics_embedded_target`, the `build.rs`-emitted cfg `Cargo.toml` target
+# tables cannot express directly).
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 
-[target.'cfg(target_os = "rtems")'.dependencies]
+[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",

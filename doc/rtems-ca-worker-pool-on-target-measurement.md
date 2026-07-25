@@ -25,6 +25,11 @@ Instrument: [`doc/rtems-ca-pool-probe.patch`](rtems-ca-pool-probe.patch) —
   column, exactly as [the priority
   measurement](rtems-priority-on-target-measurement.md) established.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ## 1. Thread census — the pooled workers, their names and their bands
 
 302 `PRIOPROBE` lines over the run. **Every one** reads

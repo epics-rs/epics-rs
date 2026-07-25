@@ -10,6 +10,11 @@ re-learn that raising the cap buys nine connections. Every number below was
 either read out of a source file named here, or measured on the bring-up box
 during the scope-B session. Nothing is estimated.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ---
 
 ## 1. The deviation — and what shape it actually is

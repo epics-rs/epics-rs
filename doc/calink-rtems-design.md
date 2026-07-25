@@ -22,6 +22,14 @@ Every number here was produced by running the command quoted next to it on
 this tree at `8c305c37`. Where a claim could not be measured it says so and
 lands in §7, not in the body.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands. The one
+exception is §12.3, which cites the two boot tests by path: those files were
+renamed too, and a path that does not resolve points nowhere, so it carries
+the current names.
+
 ---
 
 ## 0. The reframing, and the numbers that produce it

@@ -16,6 +16,11 @@ through a JSON target spec instead of the builtin `armv7-rtems-eabihf` triple,
 and — the part that matters most for a *temporary* deviation — the exact
 condition under which this whole apparatus is deleted.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ---
 
 ## 1. The deviation — and what shape it actually is

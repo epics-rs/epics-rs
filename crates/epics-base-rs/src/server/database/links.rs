@@ -3673,7 +3673,7 @@ mod external_link_pv_name_tests {
     /// a link set holds one entry per PV, so two records reading one
     /// upstream PV are one entry, and an OUT link counts exactly like an IN
     /// link. iocInit's own console counts are per link FIELD and therefore
-    /// disagree by construction — `rtems-ca-ioc`'s banner used to compare a
+    /// disagree by construction — `realtime-ca-ioc`'s banner used to compare a
     /// registry count against nothing at all and print `0`.
     #[epics_macros_rs::epics_test]
     async fn declared_external_pvs_are_deduped_direction_agnostic_and_sorted() {

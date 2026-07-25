@@ -1,4 +1,4 @@
-//! `rtems-ca-ioc` must complete its whole init path on the host under
+//! `realtime-ca-ioc` must complete its whole init path on the host under
 //! `--features rtems-exec-model` without a panic.
 //!
 //! # Why a process test and not a unit test
@@ -12,7 +12,7 @@
 //! entered on *that* thread. A `#[tokio::test]` therefore has a reactor
 //! available on the test's own thread and never reproduces it.
 //!
-//! Only the real binary does: `rtems-ca-ioc` starts no tokio runtime at all,
+//! Only the real binary does: `realtime-ca-ioc` starts no tokio runtime at all,
 //! so the client tasks it spawns are the exact configuration the target has.
 //! Booting it as a child process is the only way to assert on the whole init
 //! path — database load, calink resolver install, CA client start, first
@@ -30,16 +30,16 @@
 #[cfg(not(feature = "rtems-exec-model"))]
 #[test]
 fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
-    // The other arm of the same entry point. `rtems-ca-ioc` does not start a
+    // The other arm of the same entry point. `realtime-ca-ioc` does not start a
     // tokio runtime — that is the whole point of it — so a build whose
     // `runtime::task` seam routes to tokio has nothing for its tasks to run
     // on. It says so and exits rather than booting into a hang.
     use std::process::{Command, Stdio};
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rtems-ca-ioc"))
+    let out = Command::new(env!("CARGO_BIN_EXE_realtime-ca-ioc"))
         .stdin(Stdio::null())
         .output()
-        .expect("spawn rtems-ca-ioc");
+        .expect("spawn realtime-ca-ioc");
     assert!(!out.status.success(), "expected a refusal exit status");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -119,7 +119,7 @@ mod exec_model {
         let log_err = log.try_clone().expect("clone the console log handle");
 
         let port = free_ca_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_rtems-ca-ioc"))
+        let child = Command::new(env!("CARGO_BIN_EXE_realtime-ca-ioc"))
             .arg(&db)
             // The exec backend's search engine is name-servers-only — it binds no
             // UDP socket — and it refuses an empty list at construction, because
@@ -138,7 +138,7 @@ mod exec_model {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()
-            .expect("spawn rtems-ca-ioc");
+            .expect("spawn realtime-ca-ioc");
         let mut child = Killed(child);
 
         let read_log = || {
@@ -158,15 +158,15 @@ mod exec_model {
         while !console.contains("calink resolver installed") {
             assert!(
                 !console.contains("panic"),
-                "rtems-ca-ioc panicked during init:\n{console}"
+                "realtime-ca-ioc panicked during init:\n{console}"
             );
             assert!(
                 child.0.try_wait().expect("poll the child").is_none(),
-                "rtems-ca-ioc exited during init:\n{console}"
+                "realtime-ca-ioc exited during init:\n{console}"
             );
             assert!(
                 Instant::now() < deadline,
-                "rtems-ca-ioc did not finish init within {INIT_BUDGET:?}:\n{console}"
+                "realtime-ca-ioc did not finish init within {INIT_BUDGET:?}:\n{console}"
             );
             std::thread::sleep(Duration::from_millis(50));
             console = read_log();
@@ -181,15 +181,15 @@ mod exec_model {
         while !console.contains("TCP connect failed") {
             assert!(
                 !console.contains("panic"),
-                "rtems-ca-ioc panicked after init:\n{console}"
+                "realtime-ca-ioc panicked after init:\n{console}"
             );
             assert!(
                 child.0.try_wait().expect("poll the child").is_none(),
-                "rtems-ca-ioc exited after init:\n{console}"
+                "realtime-ca-ioc exited after init:\n{console}"
             );
             assert!(
                 Instant::now() < deadline,
-                "rtems-ca-ioc never attempted the name-server dial within \
+                "realtime-ca-ioc never attempted the name-server dial within \
                  {DIAL_BUDGET:?}:\n{console}"
             );
             std::thread::sleep(Duration::from_millis(50));
@@ -198,11 +198,11 @@ mod exec_model {
 
         assert!(
             !console.contains("panic"),
-            "rtems-ca-ioc panicked after init:\n{console}"
+            "realtime-ca-ioc panicked after init:\n{console}"
         );
         assert!(
             child.0.try_wait().expect("poll the child").is_none(),
-            "rtems-ca-ioc exited after init:\n{console}"
+            "realtime-ca-ioc exited after init:\n{console}"
         );
 
         // Phase 3 — the measurement rig is a build-time choice

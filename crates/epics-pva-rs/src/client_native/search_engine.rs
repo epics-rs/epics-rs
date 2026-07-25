@@ -45,7 +45,7 @@ use std::time::Duration;
 //
 // Gating this on `not(target_os = "rtems")` named the first fact and missed
 // the second, so a hosted `rtems-exec-model` build compiled the UDP transport
-// in, selected it, and panicked in `bind_ephemeral_udp` at `rtems-pva-ioc`'s
+// in, selected it, and panicked in `bind_ephemeral_udp` at `realtime-pva-ioc`'s
 // first search (`doc/calink-rtems-design.md` §10.10 item 2, measured).
 // `tokio_backend` is the predicate that means "a reactor exists" and is the
 // one the whole `AsyncUdpV4`/`UdpSocket` surface below carries, so "no UDP in

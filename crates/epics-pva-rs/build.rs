@@ -1,7 +1,7 @@
 //! Names the one capability `auth::plain` needs and `cfg(unix)` cannot express.
 //!
 //! This script used to also call `epics_rtems_boot::contract::emit_link_args()`
-//! for `rtems-pva-ioc`. That binary now lives in `epics-bridge-rs`
+//! for `realtime-pva-ioc`. That binary now lives in `epics-bridge-rs`
 //! (doc/qsrv-rtems-design.md §9.7), and link arguments are emitted by the
 //! package that owns the binary, so the call moved with it. This package
 //! produces no RTEMS binary, so emitting them here would have decorated a link
@@ -100,7 +100,7 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
 // the target when the fact it needs is the *backend*; a host build with
 // `--features rtems-exec-model` compiled the UDP transport in and panicked on
-// it at `rtems-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
+// it at `realtime-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
 // §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
 // exists", so the transport takes that one and `SearchTransport` has the
 // single `NameServersOnly` variant on `exec_backend` — the target's shape,

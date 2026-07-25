@@ -1458,7 +1458,7 @@ pub async fn pvalink_link_set_install(
 ///   target you pointed it at would be exactly the dual meaning the
 ///   `qsrv-core` split exists to avoid.
 ///
-/// The target's equivalent entry point is `epics-pva-rs`'s `rtems-pva-ioc`.
+/// The target's equivalent entry point is `epics-pva-rs`'s `realtime-pva-ioc`.
 #[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,
@@ -3135,7 +3135,7 @@ mod tests {
         // `&[]`: this case drives the base startup queue (the real
         // `dbLoadGroup` command ran above), which is the host route. The
         // caller-supplied list is the target's route and is exercised by
-        // `rtems-pva-ioc`'s own tests.
+        // `realtime-pva-ioc`'s own tests.
         load_qsrv_groups(&provider, &db, &[]).await;
         let store = Arc::new(QsrvPvStore::new(provider));
 

@@ -60,7 +60,7 @@ mod seam_guard {
     /// MEASURED on the stage-5 target image: `link.rs`'s monitor re-subscribe
     /// backoff called `tokio::time::sleep` on the callback pool, panicking the
     /// `cbMedium` worker with *"there is no reactor running"*. The whole
-    /// pvalink module runs on the target (it is what `rtems-pva-ioc` mounts),
+    /// pvalink module runs on the target (it is what `realtime-pva-ioc` mounts),
     /// so the scope here is every file, with no host-only exception.
     #[test]
     fn pvalink_scope_timers_go_through_the_runtime_seam() {

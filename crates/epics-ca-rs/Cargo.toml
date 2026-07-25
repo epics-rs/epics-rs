@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
-# The RTEMS boot shim for `rtems-ca-ioc`. Empty on every non-RTEMS target, so
+# The RTEMS boot shim for `realtime-ca-ioc`. Empty on every non-RTEMS target, so
 # this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
 # one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
 # the IOC's `main`. (The design's reason for gating it — that a host build
@@ -137,7 +137,7 @@ client = ["client-core"]
 # is byte-identical without it. See `crates/epics-base-rs/build.rs`.
 rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # The RTEMS bring-up measurement rig (doc/calink-rtems-design.md §6 stage C6,
-# gated by §11.7 item 3): the 14 C6 probe records in `rtems-ca-ioc`'s built-in
+# gated by §11.7 item 3): the 14 C6 probe records in `realtime-ca-ioc`'s built-in
 # database, its two probe threads (the tick task and the `c6-probe` reporter),
 # and the compiled-in SLIRP search topology. OFF by default — the default
 # binary is a clean IOC with no probe records, no probe threads and no link
@@ -291,13 +291,13 @@ path = "src/bin/ca-admin-rs.rs"
 
 # The RTEMS CA IOC entry point (design doc §9.5). Deliberately NOT given
 # `required-features`: it must be built by a bare `cargo check --bin
-# rtems-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
+# realtime-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
 # would make cargo silently *skip* the target instead, turning the RTEMS
 # gate into a vacuous pass. Under the hosted default backend it compiles and
 # is linted, but refuses to run (see the module docs).
 [[bin]]
-name = "rtems-ca-ioc"
-path = "src/bin/rtems-ca-ioc.rs"
+name = "realtime-ca-ioc"
+path = "src/bin/realtime-ca-ioc.rs"
 
 [[bin]]
 name = "ca-soak"

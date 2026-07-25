@@ -1,4 +1,4 @@
-//! `rtems-ca-ioc` — the RTEMS CA IOC entry point (design doc §9.5).
+//! `realtime-ca-ioc` — the RTEMS CA IOC entry point (design doc §9.5).
 //!
 //! A runnable `main` that brings up a complete CA IOC on the **RTEMS execution
 //! model** and nothing else: no tokio runtime is ever created, no async
@@ -70,7 +70,7 @@
 use std::process::ExitCode;
 
 /// The built-in database, kept **outside** `mod ioc` deliberately, mirroring
-/// `rtems-pva-ioc`'s `demo_db` and for its reason: it is data, not RTEMS
+/// `realtime-pva-ioc`'s `demo_db` and for its reason: it is data, not RTEMS
 /// code, and the part the *default* host selection can check for real — with
 /// no feature flag, so a typo below cannot reach a reader as a silent "no
 /// such PV" on a serial console with no shell to ask. The `test` arm is what
@@ -95,7 +95,7 @@ mod demo_db {
     pub const DEMO_DB: &str = concat!(
         "record(ao, \"RTEMS:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
         "record(longout, \"RTEMS:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
-        "record(stringout, \"RTEMS:MSG\") { field(VAL, \"rtems-ca-ioc\") }\n",
+        "record(stringout, \"RTEMS:MSG\") { field(VAL, \"realtime-ca-ioc\") }\n",
     );
 
     /// C6 PROBE (doc/calink-rtems-design.md §6 stage C6, topology A): the 14
@@ -264,7 +264,7 @@ mod ioc {
     /// Both calls go through `epics_rtems_boot::stats`, which owns the per-OS
     /// backend. This used to be an `extern "C"` block plus a
     /// `#[cfg(target_os = …)]` / `#[cfg(not(…))]` pair right here, duplicated
-    /// in `rtems-pva-ioc` — so a second OS meant editing two binaries to say
+    /// in `realtime-pva-ioc` — so a second OS meant editing two binaries to say
     /// the same thing twice, and the two copies had already drifted.
     #[cfg(feature = "bringup-probes")]
     fn c6_task_and_stack_report(tag: &str) {
@@ -402,7 +402,7 @@ mod ioc {
         //
         // Defaults, not overrides: a variable that is already set stays as
         // set. On the target that is the same thing (nothing can set one);
-        // on a host it is what lets `tests/rtems_ca_ioc_boots.rs` point the
+        // on a host it is what lets `tests/realtime_ca_ioc_boots.rs` point the
         // dial at its own closed port instead of the image's SLIRP address.
         //
         // Set before `install_calink_resolver`, because the client the
@@ -457,7 +457,7 @@ mod ioc {
         let db = match load_database(&db_files) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("rtems-ca-ioc: iocInit failed: {e}");
+                eprintln!("realtime-ca-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -505,7 +505,7 @@ mod ioc {
         //      set's lazy open and is a documented no-op when no lset is
         //      installed, so running these first would silently warm nothing.
         //
-        //      `rtems-pva-ioc` needs no equivalent: `install_pvalink_resolver`
+        //      `realtime-pva-ioc` needs no equivalent: `install_pvalink_resolver`
         //      walks the whole database itself and pre-registers every
         //      `pva://` link. `install_calink_resolver` registers the link set
         //      and scans nothing — C's `dbCaLinkInit` does not scan either —
@@ -543,7 +543,7 @@ mod ioc {
                 // Not "cannot bind": `BlockingCaServer::bind` also calls
                 // `local_addr`, and on RTEMS that is the call that fails.
                 // The inner error says which.
-                eprintln!("rtems-ca-ioc: cannot start the CA TCP server on port {port}: {e}");
+                eprintln!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -551,7 +551,7 @@ mod ioc {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
-                    "rtems-ca-ioc: cannot start the CA UDP search responder on port {port}: {e}"
+                    "realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: {e}"
                 );
                 return ExitCode::FAILURE;
             }
@@ -568,7 +568,7 @@ mod ioc {
         //      would be one more `StatusPv`. This binary starts no PVA server
         //      (step (3) is the CA front-end and nothing else), so publishing
         //      it would publish a constant zero — a number that reads like
-        //      "no PVA clients" when it means "no PVA server". `rtems-pva-ioc`
+        //      "no PVA clients" when it means "no PVA server". `realtime-pva-ioc`
         //      is the entry point that owns a `BlockingPvaServer`, and it
         //      publishes it there.
         //
@@ -595,7 +595,7 @@ mod ioc {
             }),
         ]);
         if let Err(e) = serve_status_pvs(db_for_status, status) {
-            eprintln!("rtems-ca-ioc: cannot register the status PVs: {e}");
+            eprintln!("realtime-ca-ioc: cannot register the status PVs: {e}");
             return ExitCode::FAILURE;
         }
 
@@ -616,7 +616,7 @@ mod ioc {
         {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("rtems-ca-ioc: cannot start the CA accept thread: {e}");
+                eprintln!("realtime-ca-ioc: cannot start the CA accept thread: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -629,13 +629,13 @@ mod ioc {
         {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("rtems-ca-ioc: cannot start the CA name-search thread: {e}");
+                eprintln!("realtime-ca-ioc: cannot start the CA name-search thread: {e}");
                 return ExitCode::FAILURE;
             }
         };
 
         println!(
-            "rtems-ca-ioc: serving {} records on CA port {port} (TCP + UDP search), \
+            "realtime-ca-ioc: serving {} records on CA port {port} (TCP + UDP search), \
              RTEMS execution model, no tokio runtime",
             names.len()
         );
@@ -676,7 +676,7 @@ mod ioc {
         }
         let link_count = resolver.link_count();
         println!(
-            "rtems-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
+            "realtime-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
              link{} registered ({}); ` CA`-modified and ca://... INP/OUT resolve over \
              EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
              on this target)",
@@ -689,7 +689,7 @@ mod ioc {
             },
         );
         for name in &names {
-            println!("rtems-ca-ioc: {name}");
+            println!("realtime-ca-ioc: {name}");
         }
 
         // ---- C6 PROBE: the two measurement threads ----
@@ -792,11 +792,11 @@ mod ioc {
         match udp_thread.join() {
             Ok(Ok(())) => ExitCode::SUCCESS,
             Ok(Err(e)) => {
-                eprintln!("rtems-ca-ioc: name-search responder failed: {e}");
+                eprintln!("realtime-ca-ioc: name-search responder failed: {e}");
                 ExitCode::FAILURE
             }
             Err(_) => {
-                eprintln!("rtems-ca-ioc: name-search thread panicked");
+                eprintln!("realtime-ca-ioc: name-search thread panicked");
                 ExitCode::FAILURE
             }
         }
@@ -819,7 +819,7 @@ fn main() -> ExitCode {
 )))]
 fn main() -> ExitCode {
     eprintln!(
-        "rtems-ca-ioc: built with the tokio task backend, which this entry point \
+        "realtime-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
          Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host with \
          `--features rtems-exec-model`."
@@ -841,7 +841,7 @@ mod tests {
     /// forbidden literals so they cannot self-match.)
     #[test]
     fn entry_point_never_starts_a_runtime() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         // Assembled with `concat!` so the forbidden literals never appear
         // contiguously here — otherwise this test body would match itself.
         let forbidden = [
@@ -874,7 +874,7 @@ mod tests {
     /// rule, which is the thing that function exists to prevent.
     #[test]
     fn the_entry_point_publishes_its_status() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -909,7 +909,7 @@ mod tests {
 
     /// The calink resolver is mounted, and the banner reports it.
     ///
-    /// The CA counterpart of `rtems-pva-ioc`'s
+    /// The CA counterpart of `realtime-pva-ioc`'s
     /// `the_pvalink_resolver_is_mounted_and_the_banner_reports_it`, and it
     /// exists for the same reason: a regression that dropped the
     /// `install_calink_resolver` call would leave an IOC that still boots,
@@ -920,7 +920,7 @@ mod tests {
     /// many links it registered, so it is checked too.
     #[test]
     fn the_calink_resolver_is_mounted_and_the_banner_reports_it() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -958,7 +958,7 @@ mod tests {
     /// scan. The IOC boots and serves in all three cases.
     #[test]
     fn iocinit_link_phases_run_after_the_mount() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -998,7 +998,7 @@ mod tests {
     /// above exists to remove.
     #[test]
     fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1058,7 +1058,7 @@ mod tests {
     /// pass both parse tests and ship the rig in the default image.
     #[test]
     fn the_probe_db_loads_only_behind_the_feature() {
-        let src = include_str!("rtems-ca-ioc.rs");
+        let src = include_str!("realtime-ca-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,

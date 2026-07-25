@@ -13,7 +13,7 @@
 # script is here rather than another paragraph:
 #
 #   * The written form was `-p <crate> --lib`, and `--lib` never compiles
-#     `src/bin/*.rs`. The one binary anyone boots on the target — rtems-ca-ioc
+#     `src/bin/*.rs`. The one binary anyone boots on the target — realtime-ca-ioc
 #     — was outside the gate for the whole branch, and a build break
 #     (E0433, a missing `StackSizeClass` import from b594b18a) survived every
 #     "RTEMS check green" report until the bring-up box tried to boot it.
@@ -132,7 +132,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
 #
 # `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
-# `rtems-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
+# `realtime-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
 # `calink` drives a live `CaClient`. `client-core`, not `client`: the split is
 # stated in `crates/epics-ca-rs/Cargo.toml` and it is the circuit, the search
 # engine, subscriptions and the resolver WITHOUT the beacon monitor / repeater
@@ -146,8 +146,8 @@ declare -A CRATE_FEATURES=(
 
 # Binaries built for the target, as `crate:bin` pairs.
 BINS=(
-    epics-ca-rs:rtems-ca-ioc
-    # `rtems-pva-ioc` is an `epics-bridge-rs` binary, not an `epics-pva-rs` one.
+    epics-ca-rs:realtime-ca-ioc
+    # `realtime-pva-ioc` is an `epics-bridge-rs` binary, not an `epics-pva-rs` one.
     # It moved when it grew a QSRV group source: the mount needs the bridge, and
     # `epics-pva-rs` cannot depend on the bridge without a cyclic package
     # dependency, which cargo rejects outright (measured — see
@@ -164,7 +164,7 @@ BINS=(
     #          features: `qsrv-bin`
     # So a future edit that drops the feature selection fails loudly rather than
     # passing vacuously.
-    epics-bridge-rs:rtems-pva-ioc
+    epics-bridge-rs:realtime-pva-ioc
 )
 
 # Binaries in the crates above that are deliberately NOT built for the target.
@@ -175,7 +175,7 @@ BINS=(
 # "rtems" in its own source text. A binary gated in `Cargo.toml`
 # (`required-features`), gated by a feature predicate, or gated by nothing at
 # all was invisible to it and would land outside the gate exactly as
-# `rtems-ca-ioc` did. Requiring every binary to be classified one way or the
+# `realtime-ca-ioc` did. Requiring every binary to be classified one way or the
 # other removes the way to be absent: a new `src/bin/*.rs` fails this script
 # until someone states which side it is on.
 #
@@ -208,7 +208,7 @@ HOST_ONLY=(
     # `--features qsrv-core`. `qsrv-rs` additionally needs `clap`,
     # `tracing-subscriber` and `run_ca_pva_qsrv_ioc` — the last of which is
     # `#[cfg(all(feature = "qsrv", not(target_os = "rtems")))]`. The crate's
-    # SIXTH binary, `rtems-pva-ioc`, is the target's QSRV mount and is in BINS
+    # SIXTH binary, `realtime-pva-ioc`, is the target's QSRV mount and is in BINS
     # above, not here.
     #
     # Spelled with underscores because the census computes its pairs from
@@ -338,7 +338,7 @@ for config in "${CONFIGS[@]}"; do
         # for the same reason: `COMMON` carries `--no-default-features`, so a
         # binary whose crate needs a feature to expose the modules it uses would
         # otherwise be built in a configuration nobody ships. For
-        # `epics-bridge-rs:rtems-pva-ioc` the feature is also `required-features`,
+        # `epics-bridge-rs:realtime-pva-ioc` the feature is also `required-features`,
         # so omitting it here does not quietly build the wrong thing — it fails
         # the run outright, which is the direction this gate wants to fail in.
         #
@@ -405,7 +405,7 @@ fi
 # single `NameServersOnly` variant, so "no UDP socket" is a fact about the type
 # rather than a runtime branch, and the three UDP-config spawn entry points
 # construct `NameServersOnly` through `env_transport`/`config_transport`. This is
-# what lets the `epics-bridge-rs:rtems-pva-ioc --features qsrv-core,pvalink` bin
+# what lets the `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink` bin
 # above pull `epics-pva-rs/client` and still compile for the target.
 #
 # The count stays pinned even at zero: a probe that regressed the client back
@@ -448,7 +448,7 @@ fi
 # The CA client had the same RATCHET, and no longer needs one.
 #
 # `doc/calink-rtems-design.md` §6 stage C5 mounts the `ca://` record-link
-# resolver in `rtems-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
+# resolver in `realtime-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
 # the target — `calink` drives a live `CaClient` (§2.1). While that was work in
 # progress the selection was MEASURED rather than built, exactly as the PVA one
 # above still is, because a gate red for unstarted work reports nothing:
@@ -485,7 +485,7 @@ fi
 # STRICTER, not looser: `CRATE_FEATURES[epics-ca-rs]="client-core"` above makes
 # the crate loop build this exact selection as a hard pass/fail — in BOTH the
 # portability and the image configuration, where the probe only ever ran the
-# first — and the binary loop then links `rtems-ca-ioc` on top of it. A count
+# first — and the binary loop then links `realtime-ca-ioc` on top of it. A count
 # pinned at 0 and a build that must succeed are the same assertion; keeping
 # both would mean a second check that can only ever fail after the first
 # already did, which is the decoration this script's own census comment warns

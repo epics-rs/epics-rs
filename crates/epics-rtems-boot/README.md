@@ -54,12 +54,12 @@ toolchain present.
 # CA IOC
 RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
-    -p epics-ca-rs --bin rtems-ca-ioc --no-default-features --features client-core
+    -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
 
 # PVA (QSRV) IOC
 RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
-    -p epics-bridge-rs --bin rtems-pva-ioc --no-default-features --features qsrv-core,pvalink
+    -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
 ```
 
 The feature selections are deliberate, not defaults — `scripts/rtems-check.sh`

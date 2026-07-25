@@ -34,7 +34,7 @@
 //! The census in particular was reproduced per consumer before this: each of
 //! the two target IOC binaries carried its own `extern "C"` block *and* its own
 //! `#[cfg(target_os = …)]` / `#[cfg(not(…))]` wrapper around every call, so
-//! `rtems-pva-ioc` had drifted to declaring two of the three functions and
+//! `realtime-pva-ioc` had drifted to declaring two of the three functions and
 //! calling neither [`fd_census`] nor anything in its place. Two copies of a
 //! per-OS rule is how they come to disagree.
 //!

@@ -168,7 +168,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # and nothing else — the `qsrv` module is behind `qsrv-core` — so a featureless
 # build would type-check none of the production lines this gate covers.
 # `qsrv-core,pvalink` and not `qsrv`: the latter implies `qsrv-bin` machinery no
-# target runs. `epics-ca-rs` selects `client-core` because `rtems-ca-ioc` mounts
+# target runs. `epics-ca-rs` selects `client-core` because `realtime-ca-ioc` mounts
 # the `ca://` resolver, and `client-core` rather than `client` is the circuit,
 # search engine, subscriptions and resolver WITHOUT the beacon/repeater/
 # discovery stack a record link never reaches.
@@ -185,14 +185,14 @@ declare -A CRATE_FEATURES=(
 # (`ca.vxe`/`pvaioc.vxe`), and a rename would touch every doc and rig path for
 # no compilation benefit. Revisit is a naming decision, not this gate's.
 BINS=(
-    epics-ca-rs:rtems-ca-ioc
+    epics-ca-rs:realtime-ca-ioc
     # An `epics-bridge-rs` binary, not an `epics-pva-rs` one — it moved when it
     # grew a QSRV group source, and `epics-pva-rs` cannot depend on the bridge
     # without a cyclic package dependency. It carries
     # `required-features = ["qsrv-core", "pvalink"]`, supplied below from
     # CRATE_FEATURES; an explicit `--bin NAME` with those unmet is a hard error
     # rather than a silent skip, so dropping the selection fails loudly.
-    epics-bridge-rs:rtems-pva-ioc
+    epics-bridge-rs:realtime-pva-ioc
 )
 
 # Binaries in the crates above that are deliberately NOT built for the target.

@@ -40,7 +40,7 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # Host-selectable RTEMS execution model — passthrough to
 # `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` and `epics-pva-rs`
 # declare it. Routes the `runtime::task` seam to the std-thread background
-# executor on a hosted target, which is what compiles `rtems-pva-ioc`'s real
+# executor on a hosted target, which is what compiles `realtime-pva-ioc`'s real
 # entry point off RTEMS so it can be linted and tested here. OFF by default.
 #
 # It is NOT what selects the executor on the target: `armv7-rtems-eabihf`
@@ -55,21 +55,21 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # `epics-base-rs/rtems-exec-model` moved `runtime::task::spawn` onto the
 # reactor-free background executor while `epics-ca-rs` and `epics-pva-rs`
 # still compiled — and selected — their reactor-backed UDP SEARCH transports:
-# exactly the split that panicked `rtems-pva-ioc` at boot with "there is no
+# exactly the split that panicked `realtime-pva-ioc` at boot with "there is no
 # reactor running" (`doc/calink-rtems-design.md` §10.10 item 2). Each client
 # crate now asserts the agreement in its own `lib.rs`, so this line cannot
 # regress silently — it would fail to compile.
 #
 # `?/` on both: neither is a hard dependency (`epics-pva-rs` arrives with
 # `qsrv-core`, `epics-ca-rs` with `qsrv`/`ca-gateway`), and a plain `/` would
-# turn this feature into one that pulls them in. `rtems-pva-ioc` requires
+# turn this feature into one that pulls them in. `realtime-pva-ioc` requires
 # `qsrv-core` + `pvalink`, so both are present in the build that produces it.
 rtems-exec-model = [
     "epics-base-rs/rtems-exec-model",
     "epics-ca-rs?/rtems-exec-model",
     "epics-pva-rs?/rtems-exec-model",
 ]
-# The RTEMS bring-up measurement rig for `rtems-pva-ioc` (the family twin of
+# The RTEMS bring-up measurement rig for `realtime-pva-ioc` (the family twin of
 # `epics-ca-rs/bringup-probes` — doc/calink-rtems-design.md §11.7 item 3): the
 # stage-5 pvalink probe records (doc/pvalink-rtems-design.md §12), the §8 QSRV
 # load-probe group (doc/qsrv-rtems-design.md §9.14: victim `RTEMS:PVA:V0` plus
@@ -173,7 +173,7 @@ dual-gateway-bin = [
 
 [dependencies]
 epics-base-rs = { workspace = true }
-# The RTEMS boot shim for `rtems-pva-ioc`. Empty on every non-RTEMS target, so
+# The RTEMS boot shim for `realtime-pva-ioc`. Empty on every non-RTEMS target, so
 # this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
 # one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
 # the IOC's `main`. Same reasoning as `epics-ca-rs`.
@@ -296,7 +296,7 @@ required-features = ["dual-gateway-bin"]
 # cannot depend on the bridge without a cyclic package dependency (measured;
 # doc/qsrv-rtems-design.md §9.7).
 #
-# `required-features` IS correct here, unlike on `epics-ca-rs`'s `rtems-ca-ioc`
+# `required-features` IS correct here, unlike on `epics-ca-rs`'s `realtime-ca-ioc`
 # — but for a reason worth stating, because the manifest comment this binary
 # arrived with claimed the opposite. That comment warned that a
 # `required-features` gate makes cargo silently *skip* the target, turning the
@@ -317,15 +317,15 @@ required-features = ["dual-gateway-bin"]
 # `pvalink` pulls `epics-pva-rs/client` (its UDP transport cfg-gated out so it
 # compiles for the triple) without `tls`/`pkcs12`, because the `epics-pva-rs`
 # dependency is `default-features = false`. Both features are `required-features`
-# so `scripts/rtems-check.sh`'s explicit `--bin rtems-pva-ioc` hard-fails if the
+# so `scripts/rtems-check.sh`'s explicit `--bin realtime-pva-ioc` hard-fails if the
 # per-bin selection ever drops one, rather than silently skipping the target.
 [[bin]]
-name = "rtems-pva-ioc"
-path = "src/bin/rtems-pva-ioc.rs"
+name = "realtime-pva-ioc"
+path = "src/bin/realtime-pva-ioc.rs"
 required-features = ["qsrv-core", "pvalink"]
 
 # `build.rs` calls `epics_rtems_boot::contract::emit_link_args()` for
-# `rtems-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
+# `realtime-pva-ioc`. Unconditional: a `[target.'cfg(...)'.build-dependencies]`
 # table is evaluated against the HOST, so a `cfg(target_os = "rtems")` one
 # would never match.
 [build-dependencies]

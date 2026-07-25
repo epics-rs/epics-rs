@@ -302,7 +302,7 @@ struct DialQueue {
 /// backend a task runs on a cooperative callback-band worker shared with every
 /// other future on its band, so connecting inline parks the band for the whole
 /// attempt — measured exactly there (gdb all-thread dump, host-linux
-/// `rtems-pva-ioc`): one unanswering name server starved every future on Medium
+/// `realtime-pva-ioc`): one unanswering name server starved every future on Medium
 /// for ~40 s per attempt. So the connect goes to a thread and the caller parks
 /// on a oneshot instead.
 ///

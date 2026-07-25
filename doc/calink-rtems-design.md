@@ -2638,9 +2638,9 @@ built in exactly that state.
 
 ### 12.3 The gate
 
-`rtems-ca-ioc` and `rtems-pva-ioc` are each booted as a child process over a
-temporary database (`epics-ca-rs/tests/rtems_ca_ioc_boots.rs`,
-`epics-bridge-rs/tests/rtems_pva_ioc_boots.rs`), watched to the resolver-install
+`realtime-ca-ioc` and `realtime-pva-ioc` are each booted as a child process over
+a temporary database (`epics-ca-rs/tests/realtime_ca_ioc_boots.rs`,
+`epics-bridge-rs/tests/realtime_pva_ioc_boots.rs`), watched to the resolver-install
 line and then to positive evidence that the client reached the seam — the CA
 IOC's refused name-server dial, the PVA IOC's STAGE-5 probe reporting a search
 in flight. The assertion is liveness *and* a clean console: a panic on a

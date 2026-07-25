@@ -177,10 +177,10 @@ Not everything widened, and the residue is not oversight:
 
 ### 2.4 The bins
 
-`rtems-ca-ioc` and `rtems-pva-ioc` gate their real entry points on
+`realtime-ca-ioc` and `realtime-pva-ioc` gate their real entry points on
 `any(target_os = "rtems", target_os = "vxworks", feature = "rtems-exec-model")`
 — the `exec_backend` predicate spelled out, because a binary crate has no
-build script emitting it. `crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs:110`
+build script emitting it. `crates/epics-bridge-rs/src/bin/realtime-pva-ioc.rs:110`
 carries the history of why the `any(...)` form is the right one.
 
 **The bins keep their `rtems-` names on a VxWorks image.** They are the target
@@ -357,6 +357,12 @@ source edits and `rtems-exec-model` absent** — the feature's absence is the
 point of the KEY rows: it proves the target selects the executor backend by
 target predicate, not by someone remembering a flag.
 
+The console transcripts below are reproduced as captured, so their banners
+still read `rtems-ca-ioc` / `rtems-pva-ioc`: the binaries were renamed to
+`realtime-ca-ioc` / `realtime-pva-ioc` after these runs, and a banner is a
+line the binary printed, not a claim about what it is called today. Prose and
+file names outside the fences use the current names.
+
 ### 5.1 Gate rows — 11/11 `EXIT=0`
 
 The script's whole matrix: six libs — `epics-libcom-rs`, `epics-base-rs`,
@@ -371,8 +377,8 @@ rather than `cfg(target_os = "rtems")`.
 Run under shape 2 of §1.2 — stock `nightly` plus the config-level libc patch,
 no `--locked`.
 
-Real links, feature absent: `rtems-ca-ioc.vxe` 116,440,216 B and
-`rtems-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present
+Real links, feature absent: `realtime-ca-ioc.vxe` 116,440,216 B and
+`realtime-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present
 at `0x224f90`. With `bringup-probes`: 118,207,216 B and 160,199,848 B.
 
 The probes build was the **first-ever compile of every `target_os = "vxworks"`
@@ -454,7 +460,7 @@ RTEMS:FD_CNT=5.0  FD_MAX=1000.0  FD_FREE=995.0
 the C-side spelling.
 
 The status-PV prefix is the compile-time constant `RTEMS` in
-`rtems-ca-ioc.rs`, so it reads `RTEMS:` on a VxWorks image. No runtime config
+`realtime-ca-ioc.rs`, so it reads `RTEMS:` on a VxWorks image. No runtime config
 surface; renaming it is the same decision as renaming the bins (§2.4).
 
 ---

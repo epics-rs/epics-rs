@@ -68,26 +68,39 @@ from another branch and is not present on this one.** It has not been filed.
 ### 1.2 Why the RTEMS fix does not transfer
 
 RTEMS solves its equivalent problem with a workspace `[patch.crates-io]` libc
-pin, which is why `rtems-check.sh` runs whole on a GitHub runner. That lever
-does not exist here: **`-Zbuild-std` compiles std against rust-src's own
-`library/Cargo.lock`, which a workspace patch never reaches.** The fix has to
-live in the toolchain.
+pin, which is why `rtems-check.sh` runs whole on a GitHub runner. That exact
+lever does not reach here — **a MANIFEST `[patch]` is not part of rust-src's
+`library/Cargo.lock`, which is what `-Zbuild-std` resolves std against — but a
+CONFIG-LEVEL one is**, measured both ways: the box's RTEMS bring-up carries the
+pin in `~/.cargo/config.toml` with the comment *"so `-Zbuild-std` also picks it
+up"*, and all eleven VxWorks rows go green on a **stock** nightly under
+`--config 'patch.crates-io.libc.path="…/libc-vx"'`. Either way the patched libc
+comes from outside this tree, which is what keeps the rows off CI.
 
-Hence the contract `scripts/vxworks-check.sh` implements:
+Hence the two operator shapes `scripts/vxworks-check.sh` implements, both
+first-class:
 
-* `VXWORKS_TOOLCHAIN` names a prepared nightly whose bundled rust-src carries
-  a patched libc. On the box this is the system nightly plus
-  `~/vx-bringup/libc-vx`, applied with
-  `--config 'patch.crates-io.libc.path=…'`.
-* Unset — the normal state on a dev machine and in CI — the binary census
-  still runs and still fails loudly, the target rows **skip behind a banner
-  `--quiet` cannot suppress**, and the summary says
+* `VXWORKS_TOOLCHAIN` alone, naming a prepared toolchain whose bundled
+  rust-src already carries the fixes.
+* `VXWORKS_TOOLCHAIN=nightly` plus `VXWORKS_CARGO_CONFIG` carrying the
+  config-level patch — the shape the box runs. It **drops `--locked`**, because
+  a path override must change resolution and `--locked` exists to refuse
+  exactly that (measured: `error: cannot update the lock file … because
+  --locked was passed`); the script prints one line saying the flag is gone and
+  that the rows therefore measure the patched resolution, and repeats it in the
+  green summary.
+* `VXWORKS_TOOLCHAIN` unset — the normal state on a dev machine and in CI — the
+  binary census still runs and still fails loudly, the target rows **skip behind
+  a banner `--quiet` cannot suppress**, and the summary says
   `TARGET ROWS SKIPPED: no VXWORKS_TOOLCHAIN`. Never a bare success.
 
 ### 1.3 Half this gate is un-CI-able by construction
 
-The Wind River SDK is proprietary and the patched toolchain is not a public
-artefact, so no runner can close this gate. The `vxworks-census` job in
+Both shapes above need a patched libc from outside this tree — a prepared
+toolchain, or a checkout to point `--config` at — and neither is a public
+artefact a runner can fetch; anything past `check` additionally needs the
+proprietary Wind River SDK. So no runner can close this gate. The
+`vxworks-census` job in
 `.github/workflows/rust.yml` therefore runs only the census rows — pure
 filesystem and `grep`, no toolchain step at all so the job cannot look like it
 compiled something — and the script logs `TARGET ROWS ARE BOX-ONLY` in its own
@@ -344,15 +357,19 @@ source edits and `rtems-exec-model` absent** — the feature's absence is the
 point of the KEY rows: it proves the target selects the executor backend by
 target predicate, not by someone remembering a flag.
 
-### 5.1 Gate rows — 10/10 `EXIT=0 err=0`
+### 5.1 Gate rows — 11/11 `EXIT=0`
 
-`epics-libcom-rs`, `epics-base-rs`, `epics-ca-rs` (`client-core`),
-`epics-pva-rs`, `epics-bridge-rs` (`qsrv-core,pvalink`) libs; both bins with
-and without `bringup-probes`; `epics-pva-rs --features client` at **0 target
-errors** — the same zero the RTEMS gate reports, for the same reason (UDP
-search gated out, so `SearchTransport` has its single `NameServersOnly`
-variant) but through `epics_embedded_target` rather than
-`cfg(target_os = "rtems")`.
+The script's whole matrix: six libs — `epics-libcom-rs`, `epics-base-rs`,
+`epics-ca-rs` (`client-core`), `epics-pva-rs`, `epics-rtems-boot`,
+`epics-bridge-rs` (`qsrv-core,pvalink`) — both bins with and without
+`bringup-probes`, and the ratchet row `epics-pva-rs --features client`, whose
+extracted count is **0 target errors**. That is the same zero the RTEMS gate
+reports, for the same reason (UDP search gated out, so `SearchTransport` has
+its single `NameServersOnly` variant) but through `epics_embedded_target`
+rather than `cfg(target_os = "rtems")`.
+
+Run under shape 2 of §1.2 — stock `nightly` plus the config-level libc patch,
+no `--locked`.
 
 Real links, feature absent: `rtems-ca-ioc.vxe` 116,440,216 B and
 `rtems-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present
@@ -416,7 +433,10 @@ fd 0–2 are the serial chardev of §6; fd 3 and fd 4 are CAS-TCP and CAS-UDP,
 the entire socket surface of a CA IOC serving three records. `max=1000` is
 `rtpIoTableSizeGet`, the RTP's own descriptor table — not
 `sysconf(_SC_OPEN_MAX)`, which is the POSIX limit rather than the table being
-walked. `STACKUSE` present, per-task size/current/high/margin from
+walked. Re-measured after the extern's return type was corrected to `size_t`:
+`max=1000`, **unchanged**. The width change is unobservable on a healthy guest
+by construction — it decides only what the `ERROR` return becomes — so compile
+plus boot plus an unchanged reading is the whole bar it can clear. `STACKUSE` present, per-task size/current/high/margin from
 `taskInfoGet`.
 
 Status PVs read over CA, matching the census printed beside them:

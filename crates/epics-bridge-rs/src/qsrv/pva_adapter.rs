@@ -1458,7 +1458,7 @@ pub async fn pvalink_link_set_install(
 ///   target you pointed it at would be exactly the dual meaning the
 ///   `qsrv-core` split exists to avoid.
 ///
-/// The target's equivalent entry point is `epics-pva-rs`'s `realtime-pva-ioc`.
+/// The target's equivalent entry point is `epics-bridge-rs`'s `realtime-pva-ioc`.
 #[cfg(all(feature = "qsrv", not(target_os = "rtems")))]
 pub async fn run_ca_pva_qsrv_ioc(
     config: epics_base_rs::server::ioc_app::IocRunConfig,

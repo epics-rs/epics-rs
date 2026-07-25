@@ -692,26 +692,32 @@ impl IocApplication {
             let b1 = bridge.clone();
 
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("iocsh-startup".into())
+            // Mandatory: the startup script is what loads this IOC's database.
+            // Booting on without it would serve an empty or half-loaded IOC.
+            // `try_spawn` rather than `spawn` because this *is* a fallible boot
+            // step — the error reaches `run`'s caller, which then never starts
+            // serving, so there is no need to abort the process.
+            crate::runtime::task::MandatoryThread::new(
+                "iocsh-startup",
+                // C bands the thread that runs iocsh, and for the reason
+                // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
+                crate::runtime::task::ThreadPriority::Iocsh,
                 // The shell runs arbitrary registered commands, which reach
                 // record processing and device support — the same depth the
                 // callback bands get, so the same class they use.
-                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
-                .spawn(move || {
-                    // C bands the thread that runs iocsh, and for the reason
-                    // this thread has too — see `iocsh_threads_take_the_iocsh_band`.
-                    let _ = crate::runtime::task::enter_ioc_thread(
-                        crate::runtime::task::ThreadPriority::Iocsh,
-                    );
-                    let shell = iocsh::IocShell::new(db1, b1);
-                    for cmd in startup_commands {
-                        shell.register(cmd);
-                    }
-                    let result = shell.execute_script(&script);
-                    let _ = tx.send(result);
-                })
-                .expect("failed to spawn startup thread");
+                crate::runtime::task::StackSizeClass::Big,
+            )
+            .try_spawn(move || {
+                let shell = iocsh::IocShell::new(db1, b1);
+                for cmd in startup_commands {
+                    shell.register(cmd);
+                }
+                let result = shell.execute_script(&script);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| {
+                CaError::InvalidValue(format!("could not start the iocsh-startup thread: {e}"))
+            })?;
 
             let result = rx
                 .await
@@ -1067,28 +1073,35 @@ impl IocApplication {
             let b1 = bridge.clone();
             let shell_cmds_clone = shell_commands.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("iocsh-after-ioc-running".into())
+            // Mandatory for the same reason as "iocsh-startup": the queue holds
+            // commands the startup script deferred to post-init, so skipping it
+            // hands the operator an IOC that is missing part of its own boot.
+            // Still inside `run`, so the failure propagates rather than aborts.
+            crate::runtime::task::MandatoryThread::new(
+                "iocsh-after-ioc-running",
                 // Same reasoning as "iocsh-startup" above.
-                .stack_size(crate::runtime::task::StackSizeClass::Big.bytes())
-                .spawn(move || {
-                    // Same reasoning as "iocsh-startup" above.
-                    let _ = crate::runtime::task::enter_ioc_thread(
-                        crate::runtime::task::ThreadPriority::Iocsh,
-                    );
-                    let shell = iocsh::IocShell::new(db1, b1);
-                    for cmd in shell_cmds_clone {
-                        shell.register(cmd);
+                crate::runtime::task::ThreadPriority::Iocsh,
+                // Same reasoning as "iocsh-startup" above.
+                crate::runtime::task::StackSizeClass::Big,
+            )
+            .try_spawn(move || {
+                let shell = iocsh::IocShell::new(db1, b1);
+                for cmd in shell_cmds_clone {
+                    shell.register(cmd);
+                }
+                let mut errs: Vec<String> = Vec::new();
+                for line in pending {
+                    if let Err(e) = shell.execute_line(&line) {
+                        errs.push(format!("{line}: {e}"));
                     }
-                    let mut errs: Vec<String> = Vec::new();
-                    for line in pending {
-                        if let Err(e) = shell.execute_line(&line) {
-                            errs.push(format!("{line}: {e}"));
-                        }
-                    }
-                    let _ = tx.send(errs);
-                })
-                .expect("failed to spawn afterIocRunning thread");
+                }
+                let _ = tx.send(errs);
+            })
+            .map_err(|e| {
+                CaError::InvalidValue(format!(
+                    "could not start the iocsh-after-ioc-running thread: {e}"
+                ))
+            })?;
             if let Ok(errs) = rx.await {
                 for e in errs {
                     eprintln!("afterIocRunning: {e}");
@@ -1580,12 +1593,19 @@ mod tests {
     /// at this same 91.
     ///
     /// Source inspection, because the defect is a call that is *absent*.
+    ///
+    /// The prologue itself moved into `runtime::task::MandatoryThread`, which
+    /// takes the band as a constructor argument and runs `enter_ioc_thread`
+    /// before the body — so what this module can still get wrong is *which*
+    /// band it declares, and whether it declares one at all. Both are checked
+    /// below; `thread_census.rs` is what forbids creating a thread here by any
+    /// other route.
     #[test]
     fn iocsh_threads_take_the_iocsh_band() {
         let prod = production_scope(include_str!("ioc_app.rs"));
 
         assert_eq!(
-            prod.matches("enter_ioc_thread(").count(),
+            prod.matches("MandatoryThread::new(").count(),
             2,
             "the startup-script thread and the afterIocRunning thread"
         );
@@ -1593,7 +1613,7 @@ mod tests {
             prod.matches("name_current_thread(").count(),
             0,
             "naming without banding leaves the thread one level above idle on \
-             the target; `enter_ioc_thread` is the whole prologue"
+             the target; the `MandatoryThread` prologue is the whole of it"
         );
         assert_eq!(
             prod.matches("apply_to_current_thread(").count(),
@@ -1602,12 +1622,12 @@ mod tests {
         );
         for name in ["iocsh-startup", "iocsh-after-ioc-running"] {
             let at = prod
-                .find(&format!(".name(\"{name}\""))
+                .find(&format!("\"{name}\","))
                 .unwrap_or_else(|| panic!("the {name} thread moved; update this guard"));
             let head = &prod[at..(at + 700).min(prod.len())];
             assert!(
-                head.contains("enter_ioc_thread(") && head.contains("ThreadPriority::Iocsh"),
-                "{name} must enter its IOC thread role at `ThreadPriority::Iocsh` \
+                head.contains("ThreadPriority::Iocsh"),
+                "{name} must be declared at `ThreadPriority::Iocsh` \
                  (rtems_init.c:1002)"
             );
         }

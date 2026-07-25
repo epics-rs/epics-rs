@@ -1782,6 +1782,123 @@ where
         })
 }
 
+/// A thread the IOC **cannot correctly run without** — the scan rates, the
+/// callback bands, the delayed-callback timer, the boot script.
+///
+/// # Invariant
+///
+/// **An IOC that fails to start a mandatory thread MUST NOT continue serving.**
+/// A thread-local panic is not that: on a `panic = "unwind"` target — and RTEMS
+/// and VxWorks both default to unwind — `Builder::spawn(..).expect(..)` kills
+/// only the thread that called it. Measured on a VxWorks 7 RTP on a 1 GB guest:
+/// `EAGAIN` from the periodic-scan spawn panicked the `scan-owner` thread, the
+/// stop guard it held unwound and stopped the rates that *had* started, and the
+/// process went on answering CA with zero periodic scanning — a half-IOC whose
+/// records simply never process.
+///
+/// C has no such state. `spawnPeriodic` (`dbScan.c:943-959`) calls
+/// `epicsThreadCreateOpt` and then `epicsEventWait(startStopEvent)`; the event
+/// is posted by `periodicTask` itself, so when the thread was never created
+/// nobody posts it and `iocInit` wedges. C never reaches "serving".
+///
+/// # Why there is no `Result` on [`spawn`](Self::spawn)
+///
+/// Because there is nothing a caller could do with one that satisfies the
+/// invariant. Every caller that is *not* inside a fallible boot step would have
+/// to re-derive "this must be fatal" locally, and that is precisely the `.expect`
+/// the type exists to remove. The one shape that *can* satisfy it without
+/// aborting — a caller still inside a boot step that returns its error to the
+/// owner that decides whether to serve — is [`try_spawn`](Self::try_spawn), and
+/// that obligation is stated on it.
+///
+/// Name, band and stack class are constructor parameters for the same reason
+/// they are on [`spawn_dedicated_thread`]: a caller cannot omit what it must
+/// pass, so the RTEMS thread census (2 MiB default stacks, OS-anonymous
+/// threads) is closed by signature rather than by a source sweep.
+pub struct MandatoryThread {
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+}
+
+impl MandatoryThread {
+    /// Declare a mandatory thread: its C thread name, the EPICS band it holds,
+    /// and the stack class the C IOC gives it.
+    pub fn new(name: impl Into<String>, priority: ThreadPriority, stack: StackSizeClass) -> Self {
+        Self {
+            name: name.into(),
+            priority,
+            stack,
+        }
+    }
+
+    /// Start it, or take the process down.
+    ///
+    /// For every caller with no error path back to whoever decides that this
+    /// IOC serves — a constructor returning `Self`, a `OnceLock` initialiser, a
+    /// future that parks forever. See the type docs for why this returns no
+    /// `Result`.
+    pub fn spawn<F>(self, f: F) -> std::thread::JoinHandle<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let name = self.name.clone();
+        match self.try_spawn(f) {
+            Ok(handle) => handle,
+            Err(e) => mandatory_thread_unavailable(&name, &e),
+        }
+    }
+
+    /// Start it, handing the failure to a caller that is **still inside a
+    /// fallible boot step**.
+    ///
+    /// The obligation this carries: the returned error MUST reach the owner
+    /// that decides whether the IOC serves, and that owner MUST refuse. It must
+    /// not be unwrapped, logged-and-ignored, or turned into a warning — any of
+    /// those re-opens exactly the half-IOC the type docs describe. Use
+    /// [`spawn`](Self::spawn) when no such path exists.
+    pub fn try_spawn<F>(self, f: F) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let priority = self.priority;
+        std::thread::Builder::new()
+            .name(self.name)
+            .stack_size(self.stack.bytes())
+            .spawn(move || {
+                let _ = enter_ioc_thread(priority);
+                f()
+            })
+    }
+}
+
+/// What the operator reads on the console when a mandatory thread could not be
+/// created. Split out from [`mandatory_thread_unavailable`] so the wording is
+/// testable without a process that aborts.
+fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String {
+    format!(
+        "FATAL: the IOC could not create its mandatory `{name}` thread: {err}. \
+         Continuing would leave this IOC answering clients while the work that \
+         thread owns never runs, so the process is aborting instead \
+         (C dbScan.c:943-959 wedges iocInit for the same reason)."
+    )
+}
+
+/// The single fatal exit for a mandatory thread that could not be created.
+///
+/// `eprintln!` and not `tracing`/`errlog`: on the RTEMS and VxWorks targets no
+/// subscriber is installed, so a `tracing` event at this point is discarded and
+/// the operator sees an IOC that simply went quiet. Only `eprintln!` and panic
+/// output reach the console there.
+///
+/// `abort` and not `exit`: unwinding would run every other thread's destructors
+/// against a half-built IOC, and the boot state that made the spawn fail is not
+/// one to tear down tidily.
+fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
+    eprintln!("{}", mandatory_thread_failure_message(name, err));
+    std::process::abort()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1795,40 +1912,16 @@ mod tests {
         }
     }
 
-    /// Every thread this crate creates states a stack size.
+    /// Every file in this crate that creates an OS thread, as (label, source).
     ///
-    /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
-    /// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
-    /// espidf and nuttx — not rtems). On the host that is lazily-committed
-    /// address space and costs nothing measurable; on the target it is carved
-    /// eagerly out of a fixed pool, which is why an unset stack size is the
-    /// first ceiling the IOC hits rather than a rounding error.
-    ///
-    /// `spawn_dedicated_thread` is enforced by its signature — the class is a
-    /// parameter, so a caller cannot omit it. This covers the threads that
-    /// still build a `std::thread::Builder` directly.
-    ///
-    /// It also bans the API that has no class to state:
-    /// `std::thread::spawn` cannot express a stack size at all, so a site
-    /// using it does not fail the `Builder` check above — it is invisible to
-    /// it. Same defect, different anchor. (The six bare `thread::spawn` sites
-    /// elsewhere in the workspace — `ca::repeater`, `ca::calink`,
-    /// `ca::server::ca_server`, `pva::server::pva_server` — all sit behind
-    /// `#[cfg(not(target_os = "rtems"))]` module gates and are therefore
-    /// distinct: they are not in the RTEMS closure at all. Every file listed
-    /// here is.)
-    ///
-    /// Fails today, on Linux, with no cross toolchain.
-    #[test]
-    fn every_thread_in_this_crate_states_a_stack_size() {
-        // The list is this crate's files only. `epics-base-rs`'s two
-        // thread-building files (`server/ioc_app.rs`, `server/scan.rs`) are
-        // swept by the same three assertions in that crate's own
-        // `tests/thread_census.rs`: `include_str!` must not cross a crate
-        // boundary — a path outside the package directory does not survive
-        // `cargo publish` — so the guard was split by subject, not weakened.
-        // (file label, source) — every production `Builder` site in the crate.
-        let files = [
+    /// This crate's files only. `epics-base-rs`'s two thread-creating files
+    /// (`server/ioc_app.rs`, `server/scan.rs`) are swept by the same assertions
+    /// in that crate's own `tests/thread_census.rs`: `include_str!` must not
+    /// cross a crate boundary — a path outside the package directory does not
+    /// survive `cargo publish` — so the guard was split by subject, not
+    /// weakened.
+    fn censused_files() -> [(&'static str, &'static str); 5] {
+        [
             ("runtime/task.rs", include_str!("task.rs")),
             (
                 "runtime/background/delayed_timer.rs",
@@ -1843,11 +1936,39 @@ mod tests {
                 include_str!("background/callback_executor.rs"),
             ),
             ("runtime/worker_pool.rs", include_str!("worker_pool.rs")),
-        ];
+        ]
+    }
 
+    /// Every thread this crate creates states a stack size.
+    ///
+    /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
+    /// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
+    /// espidf and nuttx — not rtems). On the host that is lazily-committed
+    /// address space and costs nothing measurable; on the target it is carved
+    /// eagerly out of a fixed pool, which is why an unset stack size is the
+    /// first ceiling the IOC hits rather than a rounding error.
+    ///
+    /// `spawn_dedicated_thread` and [`MandatoryThread`] are enforced by their
+    /// signatures — the class is a parameter, so a caller cannot omit it. This
+    /// covers the threads that still build a `std::thread::Builder` directly.
+    ///
+    /// It also bans the API that has no class to state:
+    /// `std::thread::spawn` cannot express a stack size at all, so a site
+    /// using it does not fail the `Builder` check above — it is invisible to
+    /// it. Same defect, different anchor. (The bare `thread::spawn` sites
+    /// elsewhere in the workspace — `ca::repeater`, `ca::calink`,
+    /// `ca::server::ca_server`, `pva::server::pva_server`, `bridge::pvalink` —
+    /// are distinct twice over: none is a mandatory IOC thread, and all but the
+    /// per-command link helpers sit behind `#[cfg(not(target_os = "rtems"))]`
+    /// module gates, so they are not in the RTEMS closure at all. Every file
+    /// listed here is.)
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_thread_in_this_crate_states_a_stack_size() {
         let mut unclassified = Vec::new();
         let mut checked = 0usize;
-        for (label, src) in files {
+        for (label, src) in censused_files() {
             let prod = production_scope(src);
             for (n, after) in prod.split("thread::Builder::new()").skip(1).enumerate() {
                 checked += 1;
@@ -1872,14 +1993,73 @@ mod tests {
             }
         }
 
+        // Five: `spawn_dedicated_thread`'s two `cfg` arms, `MandatoryThread`,
+        // the RT-policy probe, and `worker_pool`'s pooled worker. The floor was
+        // seven until the three background facilities moved onto
+        // `MandatoryThread`, which states the class in its constructor —
+        // `every_background_facility_thread_is_mandatory` is what keeps that
+        // move from being a hole rather than a hand-off.
         assert!(
-            checked >= 7,
+            checked >= 5,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
         assert!(
             unclassified.is_empty(),
             "these threads inherit std's 2 MiB default on RTEMS: {unclassified:?}"
+        );
+    }
+
+    /// The three background facilities create their threads through
+    /// [`MandatoryThread`], and nothing else.
+    ///
+    /// Each of them — the callback bands, `cbTimer`, `scanOnce` — is a thread
+    /// the IOC cannot correctly run without, and each is created from a
+    /// constructor reached through a `OnceLock` initialiser, so there is no
+    /// error path back to whoever decided this IOC serves. They used to resolve
+    /// the spawn `Result` with `.expect`, which on a `panic = "unwind"` target
+    /// (RTEMS and VxWorks both default to unwind) killed only the thread that
+    /// happened to touch the facility first and left the IOC serving without
+    /// the band, the timer or the `scanOnce` worker.
+    ///
+    /// The ban is the structural half: with no raw `Builder` and no bare
+    /// `thread::spawn` in these files, "mandatory" is not a property a new
+    /// thread here can forget to declare.
+    #[test]
+    fn every_background_facility_thread_is_mandatory() {
+        let bare = concat!("thread", "::spawn(");
+        let mut strays = Vec::new();
+        let mut owned = 0usize;
+        for (label, src) in censused_files() {
+            if !label.contains("/background/") {
+                continue;
+            }
+            for (n, line) in production_scope(src).lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if t.contains("MandatoryThread::new(") {
+                    owned += 1;
+                }
+                if t.contains("thread::Builder::new()") {
+                    strays.push(format!("{label}:{} (raw Builder)", n + 1));
+                }
+                if t.contains(bare) && !t.contains("Builder") {
+                    strays.push(format!("{label}:{} (bare spawn)", n + 1));
+                }
+            }
+        }
+        assert!(
+            strays.is_empty(),
+            "a facility thread created outside `MandatoryThread` resolves its \
+             own spawn failure, and the only resolution that keeps this IOC \
+             honest is not serving: {strays:?}"
+        );
+        assert!(
+            owned >= 3,
+            "expected the callback pool, `cbTimer` and `scanOnce`, found {owned} \
+             `MandatoryThread` sites — did a file move? update the census list"
         );
     }
 
@@ -2727,8 +2907,13 @@ mod tests {
             }
         }
 
+        // Three: `spawn_dedicated_thread`'s two `cfg` arms and
+        // `MandatoryThread::try_spawn`, all of which run the prologue for the
+        // caller. The floor was five until the three background facilities
+        // moved onto `MandatoryThread`, whose constructor takes the band —
+        // `every_background_facility_thread_is_mandatory` covers those files.
         assert!(
-            checked >= 5,
+            checked >= 3,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
@@ -2789,6 +2974,111 @@ mod tests {
         assert!(
             seen_definition,
             "the banding function moved out of this file list; update the guard"
+        );
+    }
+
+    /// The owner path: a mandatory thread that *can* be created runs its body
+    /// under the name and band it was declared with.
+    #[test]
+    fn a_mandatory_thread_runs_under_its_declared_name() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = MandatoryThread::new(
+            "cbTestOwner",
+            ThreadPriority::ScanLow,
+            StackSizeClass::Small,
+        )
+        .spawn(move || {
+            let _ = tx.send(
+                std::thread::current()
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            );
+        });
+        assert_eq!(rx.recv().expect("the body ran"), "cbTestOwner");
+        join.join().expect("the thread exited cleanly");
+    }
+
+    /// `try_spawn` is the same construction with the failure handed back, so a
+    /// caller inside a fallible boot step can refuse to serve.
+    #[test]
+    fn try_spawn_hands_back_a_handle_on_success() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join =
+            MandatoryThread::new("cbTestTry", ThreadPriority::ScanLow, StackSizeClass::Small)
+                .try_spawn(move || {
+                    let _ = tx.send(());
+                })
+                .expect("a thread is creatable in the test environment");
+        rx.recv().expect("the body ran");
+        join.join().expect("the thread exited cleanly");
+    }
+
+    /// The console line names the thread and what the OS said, so an operator
+    /// reading a target console can tell *which* thread the IOC died for.
+    ///
+    /// `EAGAIN` cannot be forced portably — the failure shape is the subject
+    /// here, not the syscall.
+    #[test]
+    fn the_fatal_message_names_the_thread_and_the_error() {
+        let msg = mandatory_thread_failure_message(
+            "scan-0.1",
+            &std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        );
+        assert!(msg.contains("scan-0.1"), "{msg}");
+        assert!(msg.contains("FATAL"), "{msg}");
+        assert!(
+            msg.contains(&std::io::Error::from(std::io::ErrorKind::WouldBlock).to_string()),
+            "{msg}"
+        );
+    }
+
+    /// The bypass regression: a mandatory thread that cannot be created must
+    /// take the **process** down, not the calling thread.
+    ///
+    /// The defect this closes was measured on a VxWorks 7 RTP: `EAGAIN` from
+    /// the periodic-scan spawn panicked the `scan-owner` thread, and because
+    /// both RTEMS and VxWorks default to `panic = "unwind"`, the process
+    /// survived and went on serving CA with no periodic scanning at all. A test
+    /// that only asserted "it panics" would have passed against that defect —
+    /// so this one re-executes itself and asserts the *process* died.
+    ///
+    /// Gated off the embedded targets: they have no process to spawn.
+    #[cfg(all(unix, not(target_os = "rtems"), not(target_os = "vxworks")))]
+    #[test]
+    fn a_mandatory_thread_that_cannot_be_created_aborts_the_process() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD: &str = "EPICS_RS_MANDATORY_THREAD_ABORT_CHILD";
+        const TEST: &str =
+            "runtime::task::tests::a_mandatory_thread_that_cannot_be_created_aborts_the_process";
+
+        if std::env::var_os(CHILD).is_some() {
+            mandatory_thread_unavailable(
+                "scan-0.1",
+                &std::io::Error::from(std::io::ErrorKind::WouldBlock),
+            );
+        }
+
+        let out =
+            std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("re-exec the test binary");
+
+        assert_eq!(
+            out.status.signal(),
+            Some(libc::SIGABRT),
+            "a mandatory thread's failure must abort the process, not unwind \
+             one thread — child exited {:?}, stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("scan-0.1"),
+            "the console must name the thread; got: {stderr}"
         );
     }
 

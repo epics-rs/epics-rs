@@ -32,7 +32,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use super::facility::{recover, run_facility_loop, run_isolated};
-use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
+use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A queued "process this record" tail. C stores `{prec, cb, usr}`
 /// (`dbScan.c:668-672`); the Rust port boxes a closure that already captures
@@ -194,28 +194,30 @@ impl ScanOnceQueue {
             wake: Condvar::new(),
         });
         let worker_inner = Arc::clone(&inner);
-        let worker = std::thread::Builder::new()
+        // Losing this thread stops every FLNK/scanOnce tail in the IOC while
+        // records still accept writes — the same silent half-IOC whether the
+        // loss happens later (`run_facility_loop`) or at creation
+        // (`MandatoryThread`).
+        let worker = MandatoryThread::new(
             // dbScan.c:783 — thread name "scanOnce".
-            .name("scanOnce".to_string())
+            "scanOnce",
+            // dbScan.c:776 — priority `epicsThreadPriorityScanLow + nPeriodic`.
+            // `nPeriodic` is the number of periodic scan rates (menuScan's
+            // seven periodic choices; `server::scan::PERIODIC_SCANS` here),
+            // so scanOnce preempts every periodic scan thread: 60 + 7 = 67.
+            // Measured on the C IOC on RTEMS 6: scanOnce OSIPRI 67
+            // (doc/upstream-rtems-bugs/measurement-c-thread-priority-on-rtems-6.md).
+            scan_once_priority(),
             // dbScan.c:777 — `opts.stackSize = epicsThreadStackBig`.
-            .stack_size(StackSizeClass::Big.bytes())
-            .spawn(move || {
-                // dbScan.c:776 — priority `epicsThreadPriorityScanLow + nPeriodic`.
-                // `nPeriodic` is the number of periodic scan rates (menuScan's
-                // seven periodic choices; `server::scan::PERIODIC_SCANS` here),
-                // so scanOnce preempts every periodic scan thread: 60 + 7 = 67.
-                // Measured on the C IOC on RTEMS 6: scanOnce OSIPRI 67
-                // (doc/upstream-rtems-bugs/measurement-c-thread-priority-on-rtems-6.md).
-                let _ = enter_ioc_thread(scan_once_priority());
-                // Losing this thread stops every FLNK/scanOnce tail in the
-                // IOC while records still accept writes.
-                run_facility_loop(
-                    FACILITY,
-                    || once_loop(&worker_inner),
-                    || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
-                );
-            })
-            .expect("failed to spawn scanOnce worker thread");
+            StackSizeClass::Big,
+        )
+        .spawn(move || {
+            run_facility_loop(
+                FACILITY,
+                || once_loop(&worker_inner),
+                || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+            );
+        });
         ScanOnceQueue {
             inner,
             worker: Some(worker),

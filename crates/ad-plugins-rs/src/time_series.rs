@@ -684,8 +684,8 @@ pub fn create_ts_port_runtime(
     // `NDPluginDriver`, so in C this loop runs on the plugin callback threads
     // built at `NDPluginDriver.cpp:1016` — band and stack from
     // `asynNDArrayDriver.cpp:876-879`, and a creation failure throws
-    // `epicsThread::unableToCreateThread` (`epicsThread.cpp:214-220`) out
-    // through the uncaught `NDPluginXXXConfigure` boundary.
+    // `epicsThread::unableToCreateThread` (`epicsThread.cpp:214-220`) rather
+    // than returning a status the plugin carries on from.
     let data_jh = MandatoryThread::new(
         format!("ts-data-{port_name}"),
         ThreadPriority::Medium,
@@ -707,12 +707,15 @@ mod tests {
     /// MUST: the `ts-data-*` thread be created through [`MandatoryThread`].
     ///
     /// `NDPluginTimeSeries` derives from `NDPluginDriver`, so in C this loop
-    /// runs on the callback threads built at `NDPluginDriver.cpp:1016` — and a
+    /// runs on the callback threads built at `NDPluginDriver.cpp:1016`, and a
     /// creation failure there throws `epicsThread::unableToCreateThread`
-    /// (`epicsThread.cpp:214-220`) out through an uncaught
-    /// `NDPluginXXXConfigure`, reaching `std::terminate`/`abort`. The `.expect`
-    /// this replaced only unwound the calling thread on a `panic = "unwind"`
-    /// target, leaving a plugin registered but never ingesting.
+    /// (`epicsThread.cpp:214-220`) rather than returning a status. Where C ends
+    /// up is not where we do, deliberately: iocsh catches what a command throws
+    /// (`iocsh.cpp:1274-1284`) and st.cmd continues by default
+    /// (`iocsh.cpp:1001`, `:1129`), so the C IOC keeps the plugin's port
+    /// registered with nothing ingesting behind it. The `.expect` this replaced
+    /// produced that same zombie by unwinding one thread on a
+    /// `panic = "unwind"` target.
     #[test]
     fn the_ts_data_thread_is_mandatory() {
         let src = include_str!("time_series.rs");

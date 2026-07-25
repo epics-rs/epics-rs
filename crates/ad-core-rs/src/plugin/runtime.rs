@@ -2365,16 +2365,22 @@ mod tests {
     /// [`MandatoryThread`], so that a thread the plugin cannot process without
     /// takes the process down rather than the caller's thread.
     ///
-    /// C parity, and the reason this is not the `errlog-and-continue` class:
+    /// The reason this is not the `errlog-and-continue` class:
     /// `NDPluginDriver::createCallbackThreads` builds its workers as
     /// `new epicsThread(...)` (`NDPluginDriver.cpp:1016`), whose constructor
     /// calls `epicsThreadCreateOpt` and `throw unableToCreateThread()` on
-    /// failure (`epicsThread.cpp:214-220`). Nothing on the path catches it —
-    /// `NDStdArraysConfigure` is `new NDPluginStdArrays(...)` with no handler
-    /// (`NDPluginStdArrays.cpp:354`) — so C reaches `std::terminate`/`abort`.
-    /// That is C's real behaviour for this thread, and `MandatoryThread::spawn`
-    /// is the same behaviour stated deliberately instead of as a `.expect` that
-    /// only unwinds one thread on a `panic = "unwind"` target.
+    /// failure (`epicsThread.cpp:214-220`) — a thrown failure, not a status
+    /// code the plugin inspects and carries on from.
+    ///
+    /// Where C ends up is **not** where we do, and the difference is
+    /// deliberate: iocsh catches whatever a command throws
+    /// (`iocsh.cpp:1274-1284`, `"C++ error: ..."`) and a startup script's
+    /// default `on error` is `Continue` (`iocsh.cpp:1001`, `:1129`), so C runs
+    /// the rest of st.cmd with the plugin's port registered and its worker
+    /// threads absent — arrays queue to it and are never processed, silently,
+    /// for the life of the IOC. `MandatoryThread::spawn` refuses that state.
+    /// The `.expect` it replaced reached neither: on a `panic = "unwind"`
+    /// target it unwound one thread and left the same zombie plugin behind.
     ///
     /// Contrast the auxiliary AD threads, which genuinely do errlog-and-continue
     /// and have no site here: the sorting thread (`NDPluginDriver.cpp:1105-1114`,

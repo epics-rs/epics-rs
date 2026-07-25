@@ -23,6 +23,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 use asyn_rs::port_handle::PortHandle;
 
@@ -1748,23 +1749,30 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let initial_upstream = ndarray_port.to_string();
 
     // Spawn data processing thread
-    let data_jh = thread::Builder::new()
-        .name(format!("plugin-data-{port_name}"))
-        .spawn(move || {
-            plugin_data_loop(
-                shared,
-                array_rx,
-                param_rx,
-                plugin_params,
-                ndarray_params.array_counter,
-                data_enabled,
-                data_blocking,
-                sender_port_name,
-                initial_upstream,
-                wiring,
-            );
-        })
-        .expect("failed to spawn plugin data thread");
+    let data_jh = MandatoryThread::new(
+        format!("plugin-data-{port_name}"),
+        // `asynNDArrayDriver.cpp:878` — `if (priority <= 0) priority =
+        // epicsThreadPriorityMedium`, and that is what `NDPluginDriver` hands
+        // its callback threads (`NDPluginDriver.cpp:1016`).
+        ThreadPriority::Medium,
+        // `asynNDArrayDriver.cpp:876` — `if (stackSize <= 0) stackSize =
+        // epicsThreadGetStackSize(epicsThreadStackMedium)`.
+        StackSizeClass::Medium,
+    )
+    .spawn(move || {
+        plugin_data_loop(
+            shared,
+            array_rx,
+            param_rx,
+            plugin_params,
+            ndarray_params.array_counter,
+            data_enabled,
+            data_blocking,
+            sender_port_name,
+            initial_upstream,
+            wiring,
+        );
+    });
 
     let handle = PluginRuntimeHandle {
         port_runtime,
@@ -2293,23 +2301,30 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let sender_port_name = port_name.to_string();
     let initial_upstream = ndarray_port.to_string();
 
-    let data_jh = thread::Builder::new()
-        .name(format!("plugin-data-{port_name}"))
-        .spawn(move || {
-            plugin_data_loop(
-                shared,
-                array_rx,
-                param_rx,
-                plugin_params,
-                ndarray_params.array_counter,
-                data_enabled,
-                data_blocking,
-                sender_port_name,
-                initial_upstream,
-                wiring,
-            );
-        })
-        .expect("failed to spawn plugin data thread");
+    let data_jh = MandatoryThread::new(
+        format!("plugin-data-{port_name}"),
+        // `asynNDArrayDriver.cpp:878` — `if (priority <= 0) priority =
+        // epicsThreadPriorityMedium`, and that is what `NDPluginDriver` hands
+        // its callback threads (`NDPluginDriver.cpp:1016`).
+        ThreadPriority::Medium,
+        // `asynNDArrayDriver.cpp:876` — `if (stackSize <= 0) stackSize =
+        // epicsThreadGetStackSize(epicsThreadStackMedium)`.
+        StackSizeClass::Medium,
+    )
+    .spawn(move || {
+        plugin_data_loop(
+            shared,
+            array_rx,
+            param_rx,
+            plugin_params,
+            ndarray_params.array_counter,
+            data_enabled,
+            data_blocking,
+            sender_port_name,
+            initial_upstream,
+            wiring,
+        );
+    });
 
     let handle = PluginRuntimeHandle {
         port_runtime,
@@ -2329,6 +2344,55 @@ mod tests {
     use super::*;
     use crate::ndarray::{NDDataType, NDDimension};
     use crate::plugin::channel::ndarray_channel;
+
+    /// # Invariant
+    ///
+    /// MUST: every `plugin-data-*` thread be created through
+    /// [`MandatoryThread`], so that a thread the plugin cannot process without
+    /// takes the process down rather than the caller's thread.
+    ///
+    /// C parity, and the reason this is not the `errlog-and-continue` class:
+    /// `NDPluginDriver::createCallbackThreads` builds its workers as
+    /// `new epicsThread(...)` (`NDPluginDriver.cpp:1016`), whose constructor
+    /// calls `epicsThreadCreateOpt` and `throw unableToCreateThread()` on
+    /// failure (`epicsThread.cpp:214-220`). Nothing on the path catches it —
+    /// `NDStdArraysConfigure` is `new NDPluginStdArrays(...)` with no handler
+    /// (`NDPluginStdArrays.cpp:354`) — so C reaches `std::terminate`/`abort`.
+    /// That is C's real behaviour for this thread, and `MandatoryThread::spawn`
+    /// is the same behaviour stated deliberately instead of as a `.expect` that
+    /// only unwinds one thread on a `panic = "unwind"` target.
+    ///
+    /// Contrast the auxiliary AD threads, which genuinely do errlog-and-continue
+    /// and have no site here: the sorting thread (`NDPluginDriver.cpp:1105-1114`,
+    /// `asynPrint` + `return asynError`), the queued-array counter
+    /// (`asynNDArrayDriver.cpp:1013-1021`, `asynPrint` and no error at all) and
+    /// the HDF5 flush task (`NDFileHDF5.cpp:2423-2431`, `printf` + `return`).
+    ///
+    /// Source inspection, because the defect is a call that is *absent*.
+    #[test]
+    fn plugin_data_threads_are_mandatory() {
+        let prod = match include_str!("runtime.rs").find("\n#[cfg(test)]") {
+            Some(i) => &include_str!("runtime.rs")[..i],
+            None => include_str!("runtime.rs"),
+        };
+        assert_eq!(
+            prod.matches("MandatoryThread::new(").count(),
+            2,
+            "`create_plugin_runtime_multi_addr` and `create_plugin_runtime_with_output`"
+        );
+        let bare = concat!("thread", "::Builder::new()");
+        let strays: Vec<&str> = prod
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains(bare) || l.contains(concat!("thread", "::spawn(")))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a plugin data thread created outside `MandatoryThread` resolves its \
+             own spawn failure locally: {strays:?}"
+        );
+    }
 
     /// Passthrough processor: returns the input array as-is.
     struct PassthroughProcessor;

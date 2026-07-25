@@ -6,6 +6,9 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
+// Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
+// the runtime layer, and this crate already depends on it unconditionally.
+use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use parking_lot::Mutex;
 
 // ===== Stats-specific channel definitions =====
@@ -670,13 +673,20 @@ pub fn create_ts_port_runtime(
 
     let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
 
-    // Spawn data ingestion thread
-    let data_jh = std::thread::Builder::new()
-        .name(format!("ts-data-{port_name}"))
-        .spawn(move || {
-            ts_data_thread(shared, data_rx);
-        })
-        .expect("failed to spawn TS data thread");
+    // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
+    // `NDPluginDriver`, so in C this loop runs on the plugin callback threads
+    // built at `NDPluginDriver.cpp:1016` — band and stack from
+    // `asynNDArrayDriver.cpp:876-879`, and a creation failure throws
+    // `epicsThread::unableToCreateThread` (`epicsThread.cpp:214-220`) out
+    // through the uncaught `NDPluginXXXConfigure` boundary.
+    let data_jh = MandatoryThread::new(
+        format!("ts-data-{port_name}"),
+        ThreadPriority::Medium,
+        StackSizeClass::Medium,
+    )
+    .spawn(move || {
+        ts_data_thread(shared, data_rx);
+    });
 
     (runtime_handle, ts_params, actor_jh, data_jh)
 }
@@ -684,6 +694,41 @@ pub fn create_ts_port_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Invariant
+    ///
+    /// MUST: the `ts-data-*` thread be created through [`MandatoryThread`].
+    ///
+    /// `NDPluginTimeSeries` derives from `NDPluginDriver`, so in C this loop
+    /// runs on the callback threads built at `NDPluginDriver.cpp:1016` — and a
+    /// creation failure there throws `epicsThread::unableToCreateThread`
+    /// (`epicsThread.cpp:214-220`) out through an uncaught
+    /// `NDPluginXXXConfigure`, reaching `std::terminate`/`abort`. The `.expect`
+    /// this replaced only unwound the calling thread on a `panic = "unwind"`
+    /// target, leaving a plugin registered but never ingesting.
+    #[test]
+    fn the_ts_data_thread_is_mandatory() {
+        let src = include_str!("time_series.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert_eq!(prod.matches("MandatoryThread::new(").count(), 1);
+        let strays: Vec<&str> = prod
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| {
+                l.contains(concat!("thread", "::Builder::new()"))
+                    || l.contains(concat!("thread", "::spawn("))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a data thread created outside `MandatoryThread` resolves its own \
+             spawn failure locally: {strays:?}"
+        );
+    }
 
     #[test]
     fn test_one_shot() {

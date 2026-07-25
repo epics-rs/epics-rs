@@ -10,6 +10,11 @@ readme = "README.md"
 
 [dependencies]
 asyn-rs = { workspace = true }
+# Not optional, unlike `epics-base-rs` below: the plugin data threads are
+# created through `runtime::task::MandatoryThread`, and that is the same
+# whether or not this crate is built into an IOC. The runtime layer is the
+# bottom of the workspace, so this adds no cycle.
+epics-libcom-rs = { workspace = true }
 epics-base-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }

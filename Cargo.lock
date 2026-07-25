@@ -9,6 +9,7 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "futures-util",
  "parking_lot",
  "thiserror 2.0.18",

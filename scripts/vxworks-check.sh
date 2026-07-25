@@ -108,8 +108,13 @@ TARGET="x86_64-wrs-vxworks"
 TOOLCHAIN="${VXWORKS_TOOLCHAIN:-}"
 CARGO_CONFIG="${VXWORKS_CARGO_CONFIG:-}"
 
-# `-Zbuild-std` is required: there is no prebuilt std for this triple.
-COMMON=(+"$TOOLCHAIN" check --no-default-features -Zbuild-std=std,panic_abort --target "$TARGET")
+# `-Zbuild-std` is required: there is no prebuilt std for this triple. Its
+# argument is QUOTED because the comma in `std,panic_abort` is cargo's crate
+# separator, not bash's: unquoted inside an array literal it reads as a comma
+# where a space belongs, which is a real enough mistake that shellcheck flags
+# it (SC2054). Quoting states the intent at the site; a disable directive
+# would only silence the reader.
+COMMON=(+"$TOOLCHAIN" check --no-default-features "-Zbuild-std=std,panic_abort" --target "$TARGET")
 
 # `--locked` is load-bearing for the reason `rtems-check.sh` gives: this gate's
 # claim is "the dependency set IN THIS TREE compiles for the target", and

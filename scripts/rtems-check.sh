@@ -80,7 +80,12 @@ else
     _env="CARGO_TARGET_$(printf '%s' "$_stem" | tr '[:lower:]-' '[:upper:]_')_LINKER"
     export "$_env=arm-rtems6-gcc"
 fi
-# `-Zbuild-std` is required: there is no prebuilt std for this triple.
+# `-Zbuild-std` is required: there is no prebuilt std for this triple. Its
+# argument is QUOTED because the comma in `std,panic_abort` is cargo's crate
+# separator, not bash's: unquoted inside an array literal it reads as a comma
+# where a space belongs, which is a real enough mistake that shellcheck flags
+# it (SC2054). Quoting states the intent at the site; a disable directive
+# would only silence the reader.
 #
 # `--locked` is load-bearing, not hygiene. This gate's whole claim is "the
 # dependency set in this tree compiles for RTEMS", and without `--locked`
@@ -98,7 +103,7 @@ fi
 # still fire, byte for byte, as they do at 0.2.186. No published `libc`
 # satisfies the predicates; the one that does is the unmerged fork, and which
 # fork lands is not this script's decision.
-COMMON=(+nightly check --locked --no-default-features -Zbuild-std=std,panic_abort ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
+COMMON=(+nightly check --locked --no-default-features "-Zbuild-std=std,panic_abort" ${JSON_SPEC_FLAGS[@]+"${JSON_SPEC_FLAGS[@]}"} --target "$TARGET")
 
 # The crates that must compile for the target.
 #

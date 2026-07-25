@@ -1,0 +1,518 @@
+# VxWorks 7 port — target contract, cfg architecture, and what was measured on the box
+
+**Status:** ported, built, booted and served on target. The port spans three
+branches (§2.5); this file describes the whole of it, so parts of what it
+describes are forward references from this branch's point of view — each is
+marked where it appears.
+**Date:** 2026-07-25
+**Target:** `x86_64-wrs-vxworks` (tier 3), Wind River `wrsdk-vxworks7-qemu-1.17.0`,
+BSP `itl_generic_3_0_0_5`, RTP execution model
+**Executable truth:** `scripts/vxworks-check.sh` — the gate is the statement,
+this file is the explanation. Where the two disagree, the script is right.
+**Measurement provenance:** the bring-up box `coding-agent@192.168.2.128`
+(`gv100`), scratch tree `~/vx-phase1`. The box panel's raw capture lives in a
+session-local scratchpad and will not outlive the session, so every line this
+document relies on is **reproduced verbatim here** rather than linked.
+
+This is the VxWorks counterpart of `doc/rtems-runtime-portability-design.md`
+and its siblings. It exists because the RTEMS side has that documentation and
+the VxWorks side had none — the port was three branches of measured work with
+no single place that said what the target contract is, which arms compile, or
+what a reader should expect to see on a console.
+
+---
+
+## 1. Target and toolchain contract
+
+`x86_64-wrs-vxworks` is a **builtin** rustc triple, and that single fact
+deletes the largest piece of RTEMS machinery: its `has-thread-local` is
+already true, so there is no generated JSON spec, no `-Zjson-target-spec`, no
+`CARGO_TARGET_…_LINKER` stem plumbing, and no retirement trip-wire arming any
+of it. Contrast `doc/rtems-tls-spec-deviation.md`, which exists entirely to
+explain the apparatus VxWorks does not need. `TARGET` is a literal string.
+
+Tier 3 means no prebuilt std, so `-Zbuild-std=std,panic_abort` is required.
+That is where the difficulty is.
+
+### 1.1 Stock nightlies cannot build std for this target
+
+Two independent upstream `libc` problems, both hit on the way in:
+
+| problem | evidence |
+|---|---|
+| `pread`/`pwrite` removed from libc's vxworks module | Removed in **0.2.187** (2026-07-20) by PR **#5129**, collateral damage of deprecating kernel-mode `off64_t`; present ≤ 0.2.186. std still imports both (`library/std/src/sys/fd/unix.rs:32,406`), so std does not build. |
+| `killpg` referenced by std, declared for vxworks nowhere | `library/std/src/sys/process/unix/vxworks.rs:179` references it; libc declares it for vxworks in no version. |
+
+**Which nightly you are on decides which of the two you see**, because
+`-Zbuild-std` resolves libc from rust-src's own lock: the 2026-07-09 nightly
+pins 0.2.185 and shows only `killpg`, while a current one pins 0.2.188 and
+shows both. `killpg` reproduces with no VxWorks SDK present at all:
+
+```sh
+cargo +nightly check -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks
+```
+
+The fix for all three symbols has to be **always-failing shims taking `off_t`,
+never `extern` declarations**: `nm` over every SDK sysroot `.a`/`.so` and the
+prebuilt kernel finds **0 definitions** of any of them — they appear only in
+bundled Boost sources. The `.vxe` images linked with a hand `extern killpg`
+present only because nothing ever referenced it (`nm` shows it neither defined
+nor undefined). **A build succeeding is not evidence that a declared symbol
+resolves** — which is why §3.2 measures every extern with `nm` before writing
+it, rather than trusting a green link.
+
+The upstream filing kit, including the traces and that conclusion, is
+`doc/upstream-rust-targets/` — **a forward reference: that directory arrives
+from another branch and is not present on this one.** It has not been filed.
+
+### 1.2 Why the RTEMS fix does not transfer
+
+RTEMS solves its equivalent problem with a workspace `[patch.crates-io]` libc
+pin, which is why `rtems-check.sh` runs whole on a GitHub runner. That lever
+does not exist here: **`-Zbuild-std` compiles std against rust-src's own
+`library/Cargo.lock`, which a workspace patch never reaches.** The fix has to
+live in the toolchain.
+
+Hence the contract `scripts/vxworks-check.sh` implements:
+
+* `VXWORKS_TOOLCHAIN` names a prepared nightly whose bundled rust-src carries
+  a patched libc. On the box this is the system nightly plus
+  `~/vx-bringup/libc-vx`, applied with
+  `--config 'patch.crates-io.libc.path=…'`.
+* Unset — the normal state on a dev machine and in CI — the binary census
+  still runs and still fails loudly, the target rows **skip behind a banner
+  `--quiet` cannot suppress**, and the summary says
+  `TARGET ROWS SKIPPED: no VXWORKS_TOOLCHAIN`. Never a bare success.
+
+### 1.3 Half this gate is un-CI-able by construction
+
+The Wind River SDK is proprietary and the patched toolchain is not a public
+artefact, so no runner can close this gate. The `vxworks-census` job in
+`.github/workflows/rust.yml` therefore runs only the census rows — pure
+filesystem and `grep`, no toolchain step at all so the job cannot look like it
+compiled something — and the script logs `TARGET ROWS ARE BOX-ONLY` in its own
+output rather than leaving that fact in a CI comment.
+
+This is the single largest parity gap with `rtems-closure` and it is stated as
+a fact rather than papered over.
+
+---
+
+## 2. The cfg architecture
+
+### 2.1 `epics_embedded_target` — the capability, not the OS name
+
+The port's central move. Before it, the target-specific surface split on a
+**literal OS name**: `#[cfg(target_os = "rtems")]` selected the blocking
+driver, the `NameServersOnly` search transport and the no-UDP arms, and
+`#[cfg(not(target_os = "rtems"))]` selected the hosted tokio/UDP path. For
+`target_os = "vxworks"` every one of those predicates answers the wrong way —
+a VxWorks build would have taken the **hosted tokio path on a tier-3 target
+with no tokio**, which is a different and almost certainly red compilation
+surface.
+
+The fix is a build-script cfg naming the capability the arms actually depend
+on — emitted by **five** build scripts, one per package that needs it. From
+`crates/epics-libcom-rs/build.rs` (**forward reference: this shape arrives with
+the cfg-port branch**):
+
+```rust
+let embedded_target = matches!(target_os.as_str(), "rtems" | "vxworks");
+if embedded_target {
+    println!("cargo::rustc-cfg=epics_embedded_target");
+}
+```
+
+with the comment that carries the reason: *"no tokio reactor exists on either,
+so both the exec-model selection below and every dependency/socket-portability
+seam above `epics-libcom-rs` gate on this one capability cfg instead of
+repeating `any(target_os = "rtems", target_os = "vxworks")`."* 117 sites were
+reclassified onto it and 10 `Cargo.toml` target tables widened; a port-seam
+cross-check over the result reported **0 MISSED / 0 WRONG**.
+
+### 2.2 `exec_backend` versus `epics_embedded_target`
+
+Two cfgs, deliberately not one:
+
+* `epics_embedded_target` — a **pure target predicate**. RTEMS or VxWorks. No
+  feature can turn it on.
+* `exec_backend` — the std-thread background executor is selected. True on
+  `epics_embedded_target`, **or** on a hosted target with the
+  `rtems-exec-model` feature, which is a real product mechanism (a PREEMPT_RT
+  blocking front end wanting the runtime-free spawn/timer backend) and is also
+  how the target entry points get host-compiled, host-linted and host-tested.
+
+Collapsing them would make the host-selectable execution model imply
+target-only dependency and socket decisions.
+
+### 2.3 What deliberately stays `target_os = "rtems"`
+
+Not everything widened, and the residue is not oversight:
+
+* **`epics-rtems-boot`'s BSP boot glue and link contract.** `POSIX_Init`, the
+  `rtems_config.c`/`rtems_init.c` shim, the `_RTEMS_LIBC_*_LAYOUT` refusals
+  and the whole `rtems_boot_linked` apparatus are RTEMS-only by intent. Its
+  build script returns early for any other target OS, so a VxWorks build
+  compiles none of it. An RTP is loaded by `rtpSp`; there is no boot anchor to
+  gate.
+* **The RTEMS priority machinery.** `rtems_core_priority` and
+  `RTEMS_MAXIMUM_PRIORITY` encode an RTEMS kernel constant measured on the
+  RTEMS guest. VxWorks reaches the same POSIX number by its own route (§4) and
+  must not import that constant to do it.
+* **`libc::timespec` avoidance and the RTEMS newlib gaps.** Target-specific
+  bugs in an RTEMS toolchain, with no VxWorks analogue.
+
+### 2.4 The bins
+
+`rtems-ca-ioc` and `rtems-pva-ioc` gate their real entry points on
+`any(target_os = "rtems", target_os = "vxworks", feature = "rtems-exec-model")`
+— the `exec_backend` predicate spelled out, because a binary crate has no
+build script emitting it. `crates/epics-bridge-rs/src/bin/rtems-pva-ioc.rs:110`
+carries the history of why the `any(...)` form is the right one.
+
+**The bins keep their `rtems-` names on a VxWorks image.** They are the target
+IOCs regardless of which RTOS runs them, the box rig already stages them under
+different file names (`ca.vxe` / `pvaioc.vxe`), and a rename would touch every
+doc and rig path for no compilation benefit.
+
+### 2.5 Where the port lives
+
+| branch | what it carries |
+|---|---|
+| `cfg-port` | `epics_embedded_target`, the 117 reclassified sites, 10 widened target tables, VxWorks entropy arm, VxWorks `sched_param` via libc, `map_epics_priority_vxworks` |
+| `bin-hardening` | the bins' `any(...)` gates, the PVA `SO_SNDTIMEO` best-effort fix, peer-address logging |
+| `probes-parity` (this branch) | the stats funnel and its VxWorks backend, `scripts/vxworks-check.sh`, the CI census job, this file |
+
+Merged together on the box with **zero source edits** and `rtems-exec-model`
+absent. `runtime/task.rs` auto-merged clean: the cfg-port edits and this
+branch's one-line `register_task()` hook are disjoint regions.
+
+---
+
+## 3. The statistics funnel and the console census
+
+`crates/epics-rtems-boot/src/stats/` is one portable funnel over a per-OS
+backend: `mod.rs` holds the types and one entry point per reading with **zero
+`#[cfg]` of its own**, and `rtems.rs` / `vxworks.rs` / `unsupported.rs` are
+selected by a single `#[cfg]` + `#[path]` block. Consumers — the FD/MEM status
+PVs, both target IOCs' probe blocks — call one function and never fork per OS.
+
+It lives in `epics-rtems-boot` despite the crate name, and the crate's README
+records why: `rtems_boot_linked` is a cfg only that package's build script can
+emit, and `epics-libcom-rs` is deliberately the leaf a consumer takes *without*
+the boot shim. `epics-libcom-rs` therefore takes `epics-rtems-boot` under
+`[target.'cfg(target_os = "vxworks")'.dependencies]` — target-gated because on
+RTEMS that package emits an image link contract that propagates to every
+dependent binary, and on VxWorks it compiles no C and emits none.
+
+### 3.1 Three deliberate absences
+
+**No `vxworks_boot_linked`.** RTEMS needs `rtems_boot_linked` because its
+build script compiles C against a BSP and the cfg says it did. The VxWorks
+backend compiles no C of ours; every symbol it declares is one an RTP resolves
+from the C library it links unconditionally. `target_os = "vxworks"` alone is
+the whole selection, so a `vxworks_boot_linked` would be a configuration axis
+no build can be in. `CONFIGS=(portability)` in the gate is therefore permanent
+— a property of the port, not a gap awaiting work.
+
+**`MEM_FREE`, `MEM_MAX` and `MEM_BLK` are `NaN`, by decision.** `MEM_USED` is
+mimalloc's `current_commit` via `mi_process_info`, a real reading. The other
+three have no source that is not a fabrication:
+
+* `memPartInfoGet(memSysPartId, …)` — the shape devIocStats' vxWorks OSD uses
+  — is rejected twice over. VxWorks 7's libc allocator is mimalloc, so an
+  RTP's `malloc` does not come from the system partition at all, and
+  `memSysPartId` is measured ABSENT from every RTP library, so the partition
+  cannot even be named. Publishing the kernel partition's free bytes as this
+  IOC's heap would be a confident number about the wrong heap — worse than
+  `NaN`, because an operator would believe it.
+* `free` is derivable only by walking `mi_heap_visit_blocks` over the default
+  heap. Approximate, default-heap-only: rejected by the same rule.
+* `largest_free` has no source at all. mimalloc exposes no free-run metric and
+  its visitor reports allocated blocks only. `MEM_BLK` — the fragmentation
+  signal an allocation actually fails on — has no VxWorks analogue.
+
+This is why `MemUsage`'s **fields** are optional rather than the struct: a
+backend that can measure one of three must not have to throw it away or invent
+the other two, and an `Option<MemUsage>` over plain `u64` fields would give two
+ways to say "no reading", the second indistinguishable from an exhausted heap.
+
+**The task census is registry-scoped, and says so in-band.** Measured:
+`taskIdListGet` and `taskEach` are **kernel-mode only and ABSENT from every RTP
+library**. An RTP can describe a task it can name and cannot ask what tasks
+exist. So the list is built as the threads start —
+`runtime::task::enter_ioc_thread` calls `stats::register_task()`, which
+captures `taskIdSelf()` into a 192-entry registry, plus one explicit
+registration for `main`, which does not go through the prologue.
+
+`enter_ioc_thread` is the seam because it is already the single owner of the
+thread transition it rides on: every IOC thread passes through it to take its
+scheduling band, so *every thread that bands itself registers itself* adds a
+consequence to an invariant that already holds rather than a rule to remember
+at each spawn. A thread starting outside it is invisible to this census — and
+that limitation is **printed in the census output's own header**, not left in a
+comment, because a reader who took the block for the RTP's thread table would
+under-count and have no way to know.
+
+`TASK_DESC` is mirrored as `#[repr(C)]` and pinned by `offset_of!` const
+assertions (`td_priority` 68, `td_stack_size` 80, `td_stack_current` 88,
+`td_stack_high` 96, `td_stack_margin` 104, `td_name` 128, size 208). This is
+the one declaration where being wrong would not fail to link — a mis-declared
+function is a link error, a mis-declared struct links clean and publishes a
+plausible stack figure read out of the wrong eight bytes — so a drifting SDK
+must stop the build.
+
+### 3.2 Symbol provenance
+
+`taskIdSelf` is declared by the patched libc (`src/vxworks/mod.rs:2337`).
+`taskInfoGet`, `rtpIoTableSizeGet` and `mi_process_info` are this branch's own
+`extern "C"` declarations; libc declares none of them. Every one was measured
+DEFINED with `nm` over the SDK's RTP libraries before being declared, because
+on this target **a declaration that is never called links clean whether or not
+the symbol exists** — which is exactly how `killpg` got as far as it did.
+
+`rtpIoTableSizeGet`'s header prototype, read on the box:
+
+```
+vxsdk/sysroot/usr/h/public/ioLib.h:533
+    extern size_t   rtpIoTableSizeGet (RTP_ID rtpId);
+```
+
+`RTP_ID → OBJ_HANDLE → _Vx_OBJ_HANDLE → int` (`types/vxWindBase.h:31`,
+`types/vxWind.h:36,43`), so the `c_int` argument is right; the kernel-mode
+`struct wind_rtp *` typedef does not apply to an RTP. The **return** was
+declared `c_int` and is now `size_t`. The width decides the failure return, not
+exactness: `ERROR` is `-1`, and `-1` arriving as `size_t` is `SIZE_MAX`, which
+a cast would turn into a four-billion-descriptor walk bound. `u32::try_from`
+refuses it.
+
+---
+
+## 4. Priority model — the same formula, and *not* a deviation
+
+On RTEMS this workspace takes a **deliberate deviation** from what base does.
+Base compiles `os/posix/osdThread.c` on RTEMS 6 and applies the linear map
+`oss = epics*(max-min)/100 + min`, which on the bring-up guest puts the CA
+server band at core 24 — far above libbsd's network threads, with EPICS 63 the
+crossover above the interrupt server. Reproducing that would reproduce the
+hazard, so the RTEMS arm takes EPICS's *own* RTEMS answer
+(`RTEMS-score/osdThread.c:94-102`, `core = 199 - epics`) and inverts it into
+the POSIX space actually set:
+
+```text
+core = RTEMS_MAXIMUM_PRIORITY - posix   (measured, 255)
+core = 199 - epics                      (RTEMS-score/osdThread.c:94-102)
+⟹ posix = 56 + epics
+```
+
+**On VxWorks the identical POSIX value is not a deviation — it is base's own
+vxWorks map, reached by a different route.** EPICS base's vxWorks port
+computes the native priority directly
+(`modules/libcom/src/osi/os/vxWorks/osdThread.c:99-106`, checked at
+R7.0.10-142-g33f4d15ff):
+
+```c
+static int getOssPriorityValue(unsigned int osiPriority)
+{
+    if ( osiPriority > 99 ) { return 100; }
+    else { return ( 199 - (signed int) osiPriority ); }
+}
+```
+
+We set the POSIX value and let VxWorks's own POSIX layer invert it. Measured on
+the box: `posix = 56 + epics` landed **11 of 11 threads at
+`PriorityApplied::Realtime`, one scheduler call each**, and the observed native
+priority was `vx = 199 - epics` — exact agreement with the C above.
+
+`map_epics_priority_vxworks` restates the `56 + epics` arithmetic directly
+rather than calling the RTEMS map, on purpose: the RTEMS path goes through
+`RTEMS_MAXIMUM_PRIORITY`, a kernel constant VxWorks has no equivalent of, and a
+change to the RTEMS core-priority mechanism must not silently move the VxWorks
+value with it. The two happen to land on the same number; they do not share a
+derivation.
+
+Real-time priority defaults **ON** for `epics_embedded_target`, as on RTEMS:
+neither `RLIMIT_RTPRIO` nor `CAP_SYS_NICE` gates exist there and there is no
+desktop to wedge. `EPICS_RS_ALLOW_RT_PRIORITY=NO` still turns it off.
+
+---
+
+## 5. Measured on target
+
+Every row below ran on `gv100` against the three branches merged, **with no
+source edits and `rtems-exec-model` absent** — the feature's absence is the
+point of the KEY rows: it proves the target selects the executor backend by
+target predicate, not by someone remembering a flag.
+
+### 5.1 Gate rows — 10/10 `EXIT=0 err=0`
+
+`epics-libcom-rs`, `epics-base-rs`, `epics-ca-rs` (`client-core`),
+`epics-pva-rs`, `epics-bridge-rs` (`qsrv-core,pvalink`) libs; both bins with
+and without `bringup-probes`; `epics-pva-rs --features client` at **0 target
+errors** — the same zero the RTEMS gate reports, for the same reason (UDP
+search gated out, so `SearchTransport` has its single `NameServersOnly`
+variant) but through `epics_embedded_target` rather than
+`cfg(target_os = "rtems")`.
+
+Real links, feature absent: `rtems-ca-ioc.vxe` 116,440,216 B and
+`rtems-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present
+at `0x224f90`. With `bringup-probes`: 118,207,216 B and 160,199,848 B.
+
+The probes build was the **first-ever compile of every `target_os = "vxworks"`
+line in `stats/vxworks.rs`** — 0 errors, first try.
+
+### 5.2 CA — read and write round-trip
+
+```
+rtems-ca-ioc: serving 3 records on CA port 5064 (TCP + UDP search),
+RTEMS execution model, no tokio runtime
+```
+
+That banner is the proof of §2.1: `exec_backend` on `target_os = "vxworks"`
+with no feature. Records `RTEMS:AO` / `RTEMS:LO` / `RTEMS:MSG`; read
+`RTEMS:AO → 1.5` (DBR_DOUBLE); write `42.5 → WRITE_NOTIFY status=1
+(ECA_NORMAL)`, readback `42.5`.
+
+### 5.3 PVA — NTScalar over the wire
+
+```
+rtems-pva-ioc: serving 3 records on PVA TCP port 5075 (UDP search on 5076),
+GUID b1bc740ef1ea7bfaf4085362, RTEMS execution model, no tokio runtime
+```
+
+QSRV2 enabled. `pvxinfo RTEMS:PVA:AO` → struct `epics:nt/NTScalar:1.0`;
+`pvxget RTEMS:PVA:AO` → `value double = 1.5`, full NTScalar.
+
+### 5.4 The census blocks, verbatim
+
+```
+TASKDUMP begin tag=c6-6 count=19 capacity=192 dropped=0 source=registry
+TASKDUMP scope tag=c6-6 lists only threads that called
+runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task
+enumerator (taskIdListGet is kernel-only), so a std::thread spawned
+outside the runtime seam is invisible here
+```
+
+(the scope line is one physical `println!`, wrapped here.) `count=19` is
+`main` (`iCaprobe`) plus 18 IOC threads — cbLow/Medium/High,
+Timer, scanOnce, scan-owner, the seven periodic scan threads, CAC-dial 0,
+status-pv, CAS-TCP, CAS-UDP, c6-probe. `dropped=0`.
+
+The descriptor census, with the fields that were captured — `mode`, `rdev`,
+`so_type` and `peer` are emitted too and are elided here as `…` rather than
+guessed at:
+
+```
+FDCENSUS begin tag=c6-6
+FDCENSUS tag=c6-6 fd=0 kind=chardev …
+FDCENSUS tag=c6-6 fd=1 kind=chardev …
+FDCENSUS tag=c6-6 fd=2 kind=chardev …
+FDCENSUS tag=c6-6 fd=3 kind=tcp … listening=1 local=0.0.0.0:5064 …
+FDCENSUS tag=c6-6 fd=4 kind=udp  … local=0.0.0.0:5064 …
+FDCENSUS end tag=c6-6 open=5 max=1000
+```
+
+fd 0–2 are the serial chardev of §6; fd 3 and fd 4 are CAS-TCP and CAS-UDP,
+the entire socket surface of a CA IOC serving three records. `max=1000` is
+`rtpIoTableSizeGet`, the RTP's own descriptor table — not
+`sysconf(_SC_OPEN_MAX)`, which is the POSIX limit rather than the table being
+walked. `STACKUSE` present, per-task size/current/high/margin from
+`taskInfoGet`.
+
+Status PVs read over CA, matching the census printed beside them:
+
+```
+RTEMS:MEM_USED = 17022976.0
+RTEMS:MEM_FREE = nan
+RTEMS:MEM_MAX  = nan
+RTEMS:FD_CNT=5.0  FD_MAX=1000.0  FD_FREE=995.0
+```
+
+`MEM_USED` is `mi_process_info`'s `current_commit`; the two `nan`s are the
+§3.1 decision arriving at the operator, and the console's own MEM line
+(`MEM_FREE=-1 MEM_USED=16998400`, sampled moments earlier) is the same pair in
+the C-side spelling.
+
+The status-PV prefix is the compile-time constant `RTEMS` in
+`rtems-ca-ioc.rs`, so it reads `RTEMS:` on a VxWorks image. No runtime config
+surface; renaming it is the same decision as renaming the bins (§2.4).
+
+---
+
+## 6. Boot rig
+
+`cargo check` needs none of this. Booting does, and the path took several
+attempts, so the working form is recorded verbatim.
+
+```sh
+qemu-system-x86_64 -m 1024M -kernel $SDK/vxsdk/bsps/itl_generic_3_0_0_5/vxWorks \
+  -net nic -net "user,hostfwd=tcp:127.0.0.1:11534-:1534,hostfwd=tcp:127.0.0.1:15064-:5064,\
+hostfwd=tcp:127.0.0.1:15075-:5075,guestfwd=tcp:10.0.2.100:21-cmd:python3 /tmp/pybridge.py 2121,\
+guestfwd=tcp:10.0.2.100:60000-cmd:python3 /tmp/pybridge.py 60000, ...60001..60005 same..." \
+  -display none -monitor none \
+  -chardev socket,id=vcon,path=/tmp/vxcon.sock,server=on,wait=off -serial chardev:vcon \
+  -append "bootline:fs(0,0)host:vxWorks h=10.0.2.100 e=10.0.2.15 u=target pw=vxTarget o=gei0"
+
+# console:  nc -U /tmp/vxcon.sock < con.in > console.log &
+# ftpd:     python3 /tmp/ftpd2.py root 127.0.0.1   (bind 2121, masq 10.0.2.100, pasv 60000-60005)
+# launch:   echo 'rtpSp "/host.host/<bin>.vxe"' > con.in
+```
+
+Four constraints, each of which cost a debugging round:
+
+* **The FTP bridge must propagate EOF.** `rtpSpawn` loads the RTP through
+  netDrv's FTP client. An unprivileged bridge built on `cmd:nc` transfers every
+  byte — ftpd logs `RETR completed=1` with the full count — but never closes
+  the data socket, so netDrv never sees end-of-file, `rtpSpawn` blocks forever
+  and the kernel shell wedges in `rtpSp` with no `value=`. `nc -N` does not fix
+  it. The fix is a bridge that **exits the instant the host socket closes**
+  (`/tmp/pybridge.py` on the box); ftpd then logs a clean `session closed` and
+  the RTP runs.
+  This was diagnosed by discriminator, not by inspection: the known-good
+  milestone binary and an 882 KB trivial RTP wedge identically in the same
+  environment, which exonerates the IOC code, the image size and the NIC stack.
+* **Serial must be off-stdio.** `-serial stdio` collides with the `cmd:`
+  chardevs. Console goes to a unix-socket chardev with an `nc -U` bridge.
+* **Legacy `-net nic -net user`, with `o=gei0` in the bootline.** The bootline
+  device name has to match the onboard NIC the BSP enumerates.
+* **Two full IOCs contend on a 1 GB TCG guest.** Delete the CA IOC before
+  running `pvxget` against the PVA one.
+
+Only privileged-port availability distinguishes this from the earlier
+milestone: with a native ftpd on `:21` and `h=10.0.2.2` the image booted in
+seconds. The bridge above exists because the box has no `sudo`, no `authbind`,
+no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
+
+---
+
+## 7. Known opens
+
+* **E8 / E9 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
+  for this target; E9 needs a VxWorks SYN ladder; E10's dial numbers are now
+  unblocked, since the probe images link and run. None has been run on VxWorks.
+* **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
+  Not a formula difference: `StackSizeClass::bytes` is
+  `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as
+  C's `STACK_SIZE(f)` is, so a 64-bit target costs precisely 2× what
+  `armv7-rtems-eabihf` costs, class for class. The sizing **decision** is
+  deferred until `STACKUSE` high-water data is collected across a real
+  workload — the census that produces it now exists and has been run once, but
+  not under load.
+* **A 1-in-3 wall-abort with mutex `EINVAL`** is observed and not root-caused.
+* **`MEM_FREE`, `MEM_MAX`, `MEM_BLK` stay `NaN`** until either mimalloc grows a
+  public free-bytes accessor or a defensible source appears. §3.1 is the
+  standing rejection, not a TODO.
+* **Threads that call `name_current_thread()` alone are invisible to the task
+  census** — the iocsh script runners, which deliberately take no EPICS band
+  and so never reach `enter_ioc_thread`. Pre-existing, and stated in-band in
+  the census header.
+* **The upstream libc filing has not been sent.**
+* **There is no C counterpart to compare against, and there cannot be.** C base
+  supports VxWorks 6.6–6.9 — `configure/os/CONFIG.Common.vxWorksCommon`'s
+  `VX_GNU_VERSION` table stops at 6.9, so `VXWORKS_VERSION = 7` expands empty,
+  and no `configure/os/*vxWorks*` arch file is x86_64. rustc supports 7 only.
+  **So "parity" on this target means parity with the RTEMS port beside it** —
+  same classification rules, same census format, same scraper — and every
+  same-OS parity audit this workspace runs against `/home/stevek/work/epics-base`
+  is unavailable here. Where an answer had to come from base, it came from
+  base's *source* (the priority map in §4), not from a running C IOC.

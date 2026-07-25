@@ -35,7 +35,8 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
     });
 
     let driver = DrvAsynIPPort::new("R1859", &format!("127.0.0.1:{port}")).unwrap();
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
 
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();

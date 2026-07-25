@@ -2926,7 +2926,8 @@ mod tests {
             link_up: link_up.clone(),
             fail_first: 1,
         };
-        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
+        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
 
         // Drop the link. `Disconnect` is a lifecycle op, so this is the last
         // request the port ever sees — from here on there is NO queued
@@ -3170,7 +3171,8 @@ mod tests {
 
         let mut drv = multi_device_driver(true);
         drv.base.disable_addr(1);
-        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
+        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
 
         let started = Instant::now();
         let err = handle

@@ -38,7 +38,8 @@ impl PortDriver for BenchPort {
 // -- Helpers --
 
 fn make_sync_io(name: &str) -> SyncIOHandle {
-    let (handle, _jh) = create_port_runtime(BenchPort::new(name), RuntimeConfig::default());
+    let (handle, _jh) = create_port_runtime(BenchPort::new(name), RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
 }
 

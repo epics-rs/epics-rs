@@ -90,7 +90,8 @@ impl PortDriver for PlainDriver {
 /// `can call blocking only when running on the multi-threaded runtime`.
 #[test]
 fn submit_blocking_from_foreign_current_thread_runtime_succeeds() {
-    let (handle, _join) = create_port_runtime(PlainDriver::new("ctx_a"), RuntimeConfig::default());
+    let (handle, _join) = create_port_runtime(PlainDriver::new("ctx_a"), RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
 
     run_with_watchdog("ctx-a", move || {
@@ -168,7 +169,8 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
         got_error: got_error.clone(),
     };
 
-    let (handle, _join) = create_port_runtime(driver, RuntimeConfig::default());
+    let (handle, _join) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
     *self_handle.lock() = Some(port.clone());
 

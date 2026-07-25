@@ -21,7 +21,7 @@ use std::thread;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
@@ -1684,8 +1684,18 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let plugin_params = driver.plugin_params;
     let std_array_data_param = driver.std_array_data_param;
 
-    // Create port runtime (actor thread for param I/O)
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    // Create port runtime (actor thread for param I/O).
+    //
+    // Constructor-shaped, so a failure here is fatal and cannot be anything
+    // else: this function hands back the built plugin and has no error channel
+    // to its `*Configure` caller. C's equivalent — `asynPortDriver`'s
+    // constructor printing and `throw`ing on a failed `registerPort`
+    // (asynPortDriver.cpp:4036-4040) — is caught by iocsh
+    // (iocsh.cpp:1274-1284) and the script continues by default
+    // (iocsh.cpp:1001, :1129), leaving the C IOC serving without the port. We
+    // deviate on purpose: see `port_runtime_unavailable`.
+    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Clone port handle for the data thread to write params back
     let port_handle = port_runtime.port_handle().clone();
@@ -2245,7 +2255,11 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let plugin_params = driver.plugin_params;
     let std_array_data_param = driver.std_array_data_param;
 
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    // Fatal for the same reason as `create_plugin_runtime_multi_addr` above:
+    // a constructor-shaped creator has nowhere to report to, and the only
+    // alternative is a handle to a port that does not exist.
+    let (port_runtime, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     let port_handle = port_runtime.port_handle().clone();
 

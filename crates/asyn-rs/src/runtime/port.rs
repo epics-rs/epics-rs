@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interrupt::InterruptManager;
 use crate::port::PortDriver;
 use crate::port_actor::PortActor;
@@ -152,18 +153,45 @@ impl Drop for ConnectWaiter {
 /// - A `std::thread::JoinHandle` for the actor thread
 ///
 /// The driver is moved into the actor thread (exclusive ownership).
+///
+/// `Err` means the port does not exist: see [`create_port_runtime_boxed`].
 pub fn create_port_runtime<D: PortDriver>(
     driver: D,
     config: RuntimeConfig,
-) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
+) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
     create_port_runtime_boxed(Box::new(driver), config)
 }
 
 /// Create a port runtime from a boxed driver.
+///
+/// # Errors
+///
+/// The actor thread is this port: without it the port can accept a request but
+/// never run one. So a thread the OS refuses to create (`EAGAIN` under a
+/// process/thread-count or memory limit) is reported as an error and **no port
+/// exists** — the caller gets no handle to publish, and nothing about the port
+/// survives anywhere in the process.
+///
+/// C parity: `registerPort` → `registerDriver` creates the port thread at
+/// `asynManager.c:2081`, and on failure (:2082-2092) prints, unwinds every
+/// resource it had built for the port, and returns `asynError` **before**
+/// `ellAdd(&pasynBase->asynPortList, ...)` (:2095) — the port never enters the
+/// list. The unwind is this function's `Err` return: the `PortActor` (which
+/// owns the driver) is dropped along with the closure `Builder::spawn`
+/// rejected, and the one resource that is *not* local — the connect-exception
+/// callback registered with the shared [`crate::exception`] list — is removed
+/// by [`ConnectWaiter`]'s `Drop`.
+///
+/// A caller that can report the failure returns it, as
+/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1062-1069`: print,
+/// `ttyCleanup`, `return -1`) — the iocsh command fails and the IOC boots on
+/// without that port. A caller with no error channel — one shaped like a C++
+/// constructor, returning the built port by value — uses
+/// [`port_runtime_unavailable`] instead.
 pub fn create_port_runtime_boxed(
     mut driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
-) -> (PortRuntimeHandle, std::thread::JoinHandle<()>) {
+) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
     // The one site that binds a port to its trace configuration and exception
     // list. C does it inside `registerPort` — the sole path into the port list
     // — so no port can exist without them (asynManager.c:503, :611-637). Every
@@ -229,7 +257,7 @@ pub fn create_port_runtime_boxed(
     let connect_wait =
         connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
 
-    let join_handle = std::thread::Builder::new()
+    let join_handle = match std::thread::Builder::new()
         .name(format!("asyn-runtime-{port_name}"))
         .spawn(move || {
             let _ = event_tx_clone.send(RuntimeEvent::Started {
@@ -240,8 +268,21 @@ pub fn create_port_runtime_boxed(
                 port_name: name_clone,
             });
             let _ = completion_tx.send(());
-        })
-        .expect("failed to spawn port runtime thread");
+        }) {
+        Ok(jh) => jh,
+        Err(e) => {
+            // Loud at the point of failure, as C is: `printf(
+            // "asynCommon:registerDriver %s epicsThreadCreate failed \n",
+            // portName)` (asynManager.c:2083-2084). `eprintln!` rather than
+            // `tracing`, because the targets where thread creation actually
+            // fails (RTEMS/VxWorks IOCs) install no subscriber and the console
+            // is all there is.
+            eprintln!("asyn: port '{port_name}' runtime thread could not be created: {e}");
+            // Everything this function built for the port is dropped on the way
+            // out — C's :2085-2091 unwind — and the port is never published.
+            return Err(port_thread_unavailable(&port_name, &e));
+        }
+    };
 
     if let Some(waiter) = connect_wait {
         // A timeout is not a failure: C ignores `waitConnect`'s status here and
@@ -264,7 +305,50 @@ pub fn create_port_runtime_boxed(
         port_name,
     };
 
-    (handle, join_handle)
+    Ok((handle, join_handle))
+}
+
+/// The error a port whose runtime thread the OS refused to create reports.
+///
+/// C returns the bare `asynError` (`asynManager.c:2092`) and leaves the
+/// diagnostic to the `printf` above it; we carry the port name and the OS
+/// reason in the value as well, because a caller several frames up
+/// ([`crate::manager::PortManager::register_port`]) prints what it is handed
+/// and has no other way to say *which* port failed.
+fn port_thread_unavailable(port_name: &str, err: &std::io::Error) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("port '{port_name}': runtime thread could not be created: {err}"),
+    }
+}
+
+/// Abandon the process because a port could not be created.
+///
+/// For callers shaped like C++ constructors — a `create_*_runtime` that returns
+/// the built object and has no error channel to its `*Configure` caller.
+///
+/// This is a **deliberate deviation** from C, stated rather than inherited.
+/// C's constructor prints and `throw`s when `registerPort` fails
+/// (`asynPortDriver.cpp:4036-4040`), but iocsh catches every exception a
+/// command throws (`iocsh.cpp:1274-1284`, `"C++ error: ..."`) and a startup
+/// script's default `on error` is `Continue` (`iocsh.cpp:1001`, `:1129`) — so
+/// the C IOC prints, runs the rest of st.cmd, and goes on serving with the port
+/// missing and every record bound to it dead. That is the half-IOC this
+/// workspace refuses to build. There is no third option here: the caller's
+/// return type is the built port, so the failure is either the process or a
+/// handle to a port whose actor thread does not exist, silently swallowing
+/// every request for the life of the IOC.
+///
+/// Callers that *can* report the failure must return the error instead; see
+/// [`create_port_runtime_boxed`].
+pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
+    eprintln!(
+        "FATAL: the IOC could not create the runtime for asyn port '{port_name}': {err}. \
+         Continuing would leave records bound to a port whose actor thread does not \
+         exist — every request queued to it would wait forever — so the process is \
+         aborting instead."
+    );
+    std::process::abort()
 }
 
 #[cfg(test)]
@@ -297,7 +381,8 @@ mod tests {
 
     #[test]
     fn port_runtime_int32_roundtrip() {
-        let (handle, _jh) = create_port_runtime(TestPort::new("rt_test"), RuntimeConfig::default());
+        let (handle, _jh) = create_port_runtime(TestPort::new("rt_test"), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -312,7 +397,8 @@ mod tests {
         use crate::transport::RuntimeClient;
 
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_client"), RuntimeConfig::default());
+            create_port_runtime(TestPort::new("rt_client"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
 
         let client = handle.client();
 
@@ -355,7 +441,8 @@ mod tests {
     #[test]
     fn port_runtime_shutdown() {
         let (handle, jh) =
-            create_port_runtime(TestPort::new("rt_shutdown"), RuntimeConfig::default());
+            create_port_runtime(TestPort::new("rt_shutdown"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
 
         // Dropping the handle should cause the actor to stop
         drop(handle);
@@ -368,7 +455,8 @@ mod tests {
         let (handle, _jh) = create_port_runtime(
             TestPort::new("rt_explicit_shutdown"),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
 
         // Write a value first
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
@@ -382,7 +470,8 @@ mod tests {
         let (handle, _jh) = create_port_runtime(
             TestPort::new("rt_shutdown_handles"),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
 
         // Clone the handle (simulating other code holding a reference)
         let handle2 = handle.clone();
@@ -398,7 +487,8 @@ mod tests {
     #[test]
     fn port_runtime_event_subscription() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_events"), RuntimeConfig::default());
+            create_port_runtime(TestPort::new("rt_events"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
 
         let mut rx = handle.subscribe_events();
 
@@ -417,7 +507,98 @@ mod tests {
     #[test]
     fn port_runtime_port_name() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("named_port"), RuntimeConfig::default());
+            create_port_runtime(TestPort::new("named_port"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
         assert_eq!(handle.port_name(), "named_port");
+    }
+
+    /// The boundary this whole change exists for: the OS refuses the port's
+    /// actor thread, and afterwards **no name is claimed** — not in the manager,
+    /// not in the process registry every consumer resolves through.
+    ///
+    /// A real `EAGAIN` from `pthread_create`, not a stub: the child lowers
+    /// `RLIMIT_NPROC` to 1, which is the measured VxWorks failure (thread
+    /// creation refused under a resource limit) reproduced on the host. It has
+    /// to be a child process because the limit is process-wide — a test that
+    /// lowered it in-process would take every concurrently running test with
+    /// it under a shared-process runner.
+    ///
+    /// Root is not subject to `RLIMIT_NPROC` (`CAP_SYS_RESOURCE`), so the
+    /// parent says why it is not asserting rather than passing vacuously.
+    #[cfg(all(unix, not(target_os = "rtems"), not(target_os = "vxworks")))]
+    #[test]
+    fn a_port_whose_thread_cannot_be_created_is_not_registered() {
+        const CHILD: &str = "EPICS_RS_PORT_THREAD_EAGAIN_CHILD";
+        const TEST: &str =
+            "runtime::port::tests::a_port_whose_thread_cannot_be_created_is_not_registered";
+        const PORT: &str = "eagain_port";
+        const DONE: &str = "no-port-was-registered";
+
+        if std::env::var_os(CHILD).is_some() {
+            // Refuse every further thread this process asks for.
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) },
+                0,
+                "read the current process limit"
+            );
+            limit.rlim_cur = 1;
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) },
+                0,
+                "lower the process limit"
+            );
+
+            let manager = crate::manager::PortManager::new();
+            let err = manager
+                .register_port(TestPort::new(PORT))
+                .err()
+                .expect("thread creation is refused, so registration must fail");
+            assert!(
+                err.to_string().contains(PORT),
+                "the error names the port that failed, got: {err}"
+            );
+            assert!(
+                manager.find_port_handle(PORT).is_err(),
+                "the manager must not hold a handle for a port that was never created"
+            );
+            assert!(
+                crate::asyn_record::get_port(PORT).is_none(),
+                "the process registry must not hold a port that was never created"
+            );
+            println!("{DONE}");
+            return;
+        }
+
+        if unsafe { libc::geteuid() } == 0 {
+            println!(
+                "skipped: running as root, which bypasses RLIMIT_NPROC \
+                 (CAP_SYS_RESOURCE), so thread creation cannot be made to fail"
+            );
+            return;
+        }
+
+        let out =
+            std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains(DONE),
+            "child must reach the end of the boundary assertions.\n\
+             status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+        // The failure is loud where C's is (asynManager.c:2083).
+        assert!(
+            stderr.contains(PORT),
+            "the diagnostic on stderr must name the port, got:\n{stderr}"
+        );
     }
 }

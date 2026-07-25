@@ -5757,7 +5757,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             Transport(PortDriverBase::new("r11_48_dev", 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         let link = AsynLink {
             port_name: "r11_48_dev".into(),
             addr: 0,

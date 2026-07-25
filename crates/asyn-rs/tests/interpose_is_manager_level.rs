@@ -90,7 +90,8 @@ impl PortDriver for RawDeviceDriver {
 fn an_installed_eos_interpose_serves_a_driver_that_never_dispatches_it() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let driver = RawDeviceDriver::new("R1860R", b"ab\ncd\n", writes);
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     let handle = rt.port_handle().clone();
 
     handle
@@ -130,7 +131,8 @@ fn an_installed_eos_interpose_serves_a_driver_that_never_dispatches_it() {
 fn an_interpose_pushed_after_configure_serves_the_write_path() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let driver = RawDeviceDriver::new("R1860W", b"", writes.clone());
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     let handle = rt.port_handle().clone();
 
     handle

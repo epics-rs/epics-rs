@@ -5349,7 +5349,8 @@ mod tests {
         port: GpibSpyPort,
     ) -> (AsynRecord, crate::runtime::PortRuntimeHandle) {
         use crate::runtime::{RuntimeConfig, create_port_runtime};
-        let (rt, _jh) = create_port_runtime(port, RuntimeConfig::default());
+        let (rt, _jh) = create_port_runtime(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),
@@ -5486,7 +5487,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),
@@ -9162,7 +9164,8 @@ mod tests {
         let (vxi_rt, _vxi_jh) = create_port_runtime(
             DrvVxi11Port::configure(vxi_name, "192.0.2.1", 0, "", "gpib0", 0, true).unwrap(),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             vxi_name,
             vxi_rt.port_handle().clone(),
@@ -9182,7 +9185,8 @@ mod tests {
         let (p_rt, _p_jh) = create_port_runtime(
             DrvAsynPrologixPort::new(prologix_name, "192.0.2.1:1234", true).unwrap(),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             prologix_name,
             p_rt.port_handle().clone(),
@@ -9235,7 +9239,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),
@@ -9321,7 +9326,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             OptionSpy(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),
@@ -9374,7 +9380,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             OctetNoOption(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),
@@ -9564,7 +9571,8 @@ mod tests {
                 baud_text,
             ),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         std::mem::forget(jh);
         register_port(
             port_name,
@@ -9650,7 +9658,8 @@ mod tests {
         let (rt, jh) = create_port_runtime(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         std::mem::forget(jh);
         register_port(
             port_name,
@@ -9685,7 +9694,8 @@ mod tests {
             .create_param("FILLER", ParamType::Int32)
             .unwrap();
         base.params.create_param(param, ParamType::Int32).unwrap();
-        let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default());
+        let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
         std::mem::forget(jh);
         register_port(
             port_name,
@@ -9771,7 +9781,8 @@ mod tests {
             let mut drv = EosPort(base);
             drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
             drv.set_output_eos(&AsynUser::default(), b"\n").unwrap();
-            let (rt, jh) = create_port_runtime(drv, RuntimeConfig::default());
+            let (rt, jh) = create_port_runtime(drv, RuntimeConfig::default())
+                .expect("the port runtime thread must start");
             std::mem::forget(jh);
             register_port(
                 port_name,
@@ -9995,7 +10006,8 @@ mod tests {
                 reads: reads.clone(),
             },
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             name,
             rt.port_handle().clone(),
@@ -10407,7 +10419,8 @@ mod tests {
         let (rt, _jh) = create_port_runtime(
             OctetOnly(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         register_port(
             port_name,
             rt.port_handle().clone(),

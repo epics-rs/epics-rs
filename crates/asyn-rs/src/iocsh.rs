@@ -1434,28 +1434,11 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
                     }
                 };
 
-            // C parity: `registerPort` is what gives the port its trace
-            // configuration and exception list (asynManager.c:503, :611-637), so
-            // a port an st.cmd builds is traceable from the moment it exists.
-            // Here that binding is `create_port_runtime`'s, driven by the
-            // services in the config.
-            let config = RuntimeConfig {
-                services: services.clone(),
-                ..RuntimeConfig::default()
-            };
-            let (handle, _jh) = create_port_runtime(driver, config);
-            if let Err(e) = crate::asyn_record::register_port(
-                &port,
-                handle.port_handle().clone(),
-                services.trace().clone(),
-            ) {
-                ctx.println(&format!("drvAsynIPPortConfigure: {e}"));
-                handle.shutdown();
+            if publish_configured_port("drvAsynIPPortConfigure", &port, driver, &services, ctx)
+                .is_none()
+            {
                 return Ok(CommandOutcome::Continue);
             }
-            // The registry above holds a live `PortHandle` for this port, which is
-            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
-            drop(handle);
             ctx.println(&format!(
                 "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
             ));
@@ -1580,20 +1563,15 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             };
 
-            let config = RuntimeConfig {
-                services: services.clone(),
-                ..RuntimeConfig::default()
-            };
-            let (handle, _jh) = create_port_runtime(driver, config.clone());
-            if let Err(e) = crate::asyn_record::register_port(
+            let Some(handle) = publish_configured_port(
+                "drvAsynIPServerPortConfigure",
                 &port,
-                handle.port_handle().clone(),
-                services.trace().clone(),
-            ) {
-                ctx.println(&format!("drvAsynIPServerPortConfigure: {e}"));
-                handle.shutdown();
+                driver,
+                &services,
+                ctx,
+            ) else {
                 return Ok(CommandOutcome::Continue);
-            }
+            };
             // C binds the listening socket inside configure — `createServerSocket`
             // at drvAsynIPServerPort.c:605, before `registerPort` and regardless
             // of `noAutoConnect` (which governs the *child* ports' connect
@@ -1611,19 +1589,16 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
 
             for child in children {
                 let name = child.base().port_name.clone();
-                let (child_handle, _cjh) = create_port_runtime(child, config.clone());
-                if let Err(e) = crate::asyn_record::register_port(
+                // C traces and keeps going: a child that cannot be created costs
+                // that slot, not the server (:694-697). The helper has already
+                // printed and cleaned up whichever way it failed.
+                publish_configured_port(
+                    &format!("drvAsynIPServerPortConfigure: {name}"),
                     &name,
-                    child_handle.port_handle().clone(),
-                    services.trace().clone(),
-                ) {
-                    // C traces and keeps going: a child that cannot be created
-                    // costs that slot, not the server (:694-697).
-                    ctx.println(&format!("drvAsynIPServerPortConfigure: {name}: {e}"));
-                    child_handle.shutdown();
-                    continue;
-                }
-                drop(child_handle);
+                    child,
+                    &services,
+                    ctx,
+                );
             }
 
             ctx.println(&format!(
@@ -1685,28 +1660,11 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
                     }
                 };
 
-            // C parity: `registerPort` is what gives the port its trace
-            // configuration and exception list (asynManager.c:503, :611-637), so
-            // a port an st.cmd builds is traceable from the moment it exists.
-            // Here that binding is `create_port_runtime`'s, driven by the
-            // services in the config.
-            let config = RuntimeConfig {
-                services: services.clone(),
-                ..RuntimeConfig::default()
-            };
-            let (handle, _jh) = create_port_runtime(driver, config);
-            if let Err(e) = crate::asyn_record::register_port(
-                &port,
-                handle.port_handle().clone(),
-                services.trace().clone(),
-            ) {
-                ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                handle.shutdown();
+            if publish_configured_port("drvAsynSerialPortConfigure", &port, driver, &services, ctx)
+                .is_none()
+            {
                 return Ok(CommandOutcome::Continue);
             }
-            // The registry above holds a live `PortHandle` for this port, which is
-            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
-            drop(handle);
             ctx.println(&format!(
                 "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
             ));
@@ -1774,28 +1732,11 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
                 }
             };
 
-            // C parity: `registerPort` is what gives the port its trace
-            // configuration and exception list (asynManager.c:503, :611-637), so
-            // a port an st.cmd builds is traceable from the moment it exists.
-            // Here that binding is `create_port_runtime`'s, driven by the
-            // services in the config.
-            let config = RuntimeConfig {
-                services: services.clone(),
-                ..RuntimeConfig::default()
-            };
-            let (handle, _jh) = create_port_runtime(driver, config);
-            if let Err(e) = crate::asyn_record::register_port(
-                &port,
-                handle.port_handle().clone(),
-                services.trace().clone(),
-            ) {
-                ctx.println(&format!("prologixGPIBConfigure: {e}"));
-                handle.shutdown();
+            if publish_configured_port("prologixGPIBConfigure", &port, driver, &services, ctx)
+                .is_none()
+            {
                 return Ok(CommandOutcome::Continue);
             }
-            // The registry above holds a live `PortHandle` for this port, which is
-            // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
-            drop(handle);
             ctx.println(&format!(
                 "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
             ));
@@ -1806,21 +1747,40 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 
 /// The single path a `*Configure` shell command uses to turn a freshly built
 /// driver into a live, named, traceable port — C's `registerPort`, which is the
-/// sole entry into the port list (asynManager.c:503, :611-637). Returns `false`
-/// when the name is already taken, having already printed C's diagnostic and
-/// torn the half-built actor down; the caller then has nothing to clean up.
+/// sole entry into the port list (asynManager.c:503, :611-637). Binding the
+/// port to its trace configuration and exception list happens inside
+/// [`create_port_runtime`], driven by the services passed here, so a port an
+/// st.cmd builds is traceable from the moment it exists.
+///
+/// `None` means **no port was published**, for either reason C has: the runtime
+/// thread could not be created (asynManager.c:2082-2092), or the name is
+/// already taken. Both have already printed the diagnostic and torn down
+/// whatever was half-built, so the caller has nothing to clean up and only has
+/// to stop — C's `drvAsynIPPortConfigure: Can't register myself.` / `ttyCleanup`
+/// / `return -1` (drvAsynIPPort.c:1062-1069).
+///
+/// `Some` hands back the runtime handle for the callers that need it (the
+/// server port binds its listening socket through it). Callers that do not may
+/// drop it: the registry above holds a live `PortHandle`, and that is what
+/// keeps the actor alive.
 fn publish_configured_port<D: PortDriver>(
     command: &str,
     port: &str,
     driver: D,
     services: &PortServices,
     ctx: &CommandContext,
-) -> bool {
+) -> Option<PortRuntimeHandle> {
     let config = RuntimeConfig {
         services: services.clone(),
         ..RuntimeConfig::default()
     };
-    let (handle, _jh) = create_port_runtime(driver, config);
+    let (handle, _jh) = match create_port_runtime(driver, config) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.println(&format!("{command}: {e}"));
+            return None;
+        }
+    };
     if let Err(e) = crate::asyn_record::register_port(
         port,
         handle.port_handle().clone(),
@@ -1828,12 +1788,9 @@ fn publish_configured_port<D: PortDriver>(
     ) {
         ctx.println(&format!("{command}: {e}"));
         handle.shutdown();
-        return false;
+        return None;
     }
-    // The registry above holds a live `PortHandle` for this port, which is what
-    // keeps its actor alive; the `PortRuntimeHandle` may drop here.
-    drop(handle);
-    true
+    Some(handle)
 }
 
 /// Build the `drvAsynFTDIPortConfigure` iocsh command.
@@ -1890,7 +1847,9 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("drvAsynFTDIPortConfigure", &port, driver, &services, ctx) {
+            if publish_configured_port("drvAsynFTDIPortConfigure", &port, driver, &services, ctx)
+                .is_some()
+            {
                 ctx.println(&format!(
                     "drvAsynFTDIPortConfigure: FTDI port '{port}' created"
                 ));
@@ -1971,7 +1930,7 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("vxi11Configure", &port, driver, &services, ctx) {
+            if publish_configured_port("vxi11Configure", &port, driver, &services, ctx).is_some() {
                 ctx.println(&format!("vxi11Configure: VXI-11 port '{port}' -> {host}"));
             }
             Ok(CommandOutcome::Continue)
@@ -2041,7 +2000,7 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port("usbtmcConfigure", &port, driver, &services, ctx) {
+            if publish_configured_port("usbtmcConfigure", &port, driver, &services, ctx).is_some() {
                 ctx.println(&format!("usbtmcConfigure: USBTMC port '{port}' created"));
             }
             Ok(CommandOutcome::Continue)

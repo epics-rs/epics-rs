@@ -148,7 +148,18 @@ impl CommandHandler for MqttConfigHandler {
         let topic_map = driver.topic_map();
         let connected_param = driver.connected_param;
 
-        let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+        // A port whose actor thread the OS refused is not a port: fail the
+        // command before the registration below claims the name for it. Same
+        // end state as C by a different route — `MqttDriver` derives from
+        // `Autoparam::Driver` and so from `asynPortDriver` (drvMqtt.h:23,
+        // autoparamDriver.h:245) and `mqttDriverConfigure` builds it with a
+        // bare `new` (drvMqtt.cpp:736-739), so a failed `registerPort` throws
+        // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
+        // it (iocsh.cpp:1274-1284) and st.cmd continues with the port missing.
+        // The `?` is the same error channel the duplicate-name failure below
+        // already uses.
+        let (runtime_handle, _actor_jh) =
+            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime_handle.port_handle().clone();
 
         if let Err(e) =

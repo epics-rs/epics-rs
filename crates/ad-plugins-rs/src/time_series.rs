@@ -4,7 +4,7 @@ use std::time::Instant;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
 // Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
 // the runtime layer, and this crate already depends on it unconditionally.
@@ -671,7 +671,14 @@ pub fn create_ts_port_runtime(
         ts_timestamp: driver.params.ts_timestamp,
     };
 
-    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    // Constructor-shaped like the plugin runtimes in `ad-core-rs`: this
+    // function returns the built port and has no error channel to its
+    // `*Configure` caller, so the only alternative is a handle to a port that
+    // does not exist. C prints and throws here (asynPortDriver.cpp:4036-4040)
+    // and iocsh catches it (iocsh.cpp:1274-1284), leaving the C IOC serving
+    // without the port; we deviate on purpose — see `port_runtime_unavailable`.
+    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
     // `NDPluginDriver`, so in C this loop runs on the plugin callback threads

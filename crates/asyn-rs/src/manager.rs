@@ -107,7 +107,11 @@ impl PortManager {
         // manager whose `asynSetTrace*` commands are the ones bound to this IOC.
         config.services = self.services.clone();
 
-        let (handle, _jh) = create_port_runtime(driver, config);
+        // `?` is the whole registration contract on this path: a port whose
+        // actor thread the OS refused is not a port, so the name below is never
+        // claimed for it (C `registerDriver` returns `asynError` ahead of
+        // `ellAdd(&pasynBase->asynPortList,...)`, asynManager.c:2082-2095).
+        let (handle, _jh) = create_port_runtime(driver, config)?;
 
         // The process-registry insert is the atomic claim on the name —
         // it is the single place every consumer resolves a name through

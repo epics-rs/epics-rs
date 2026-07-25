@@ -80,6 +80,13 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
 /// Both `fd_usage` and `fd_census` bound their walk with this, so the count and
 /// the listing cannot cover different ranges — the same property the RTEMS
 /// backend gets from both reading `rtems_libio_number_iops`.
+///
+/// The `size_t` the header returns is narrowed through `try_from` rather than
+/// cast, which is what rejects a failure return: `ERROR` is `-1`, and a `-1`
+/// arriving as `size_t` is `SIZE_MAX`, so a cast would bound the walk at four
+/// billion descriptors while the conversion refuses it. Zero is refused for the
+/// same reason — a walk needs a bound, and "unknown" is the answer the funnel's
+/// `Option` exists to carry.
 fn io_table_size() -> Option<u32> {
     // SAFETY: `getpid` takes nothing and `rtpIoTableSizeGet` reads only the id
     // it is given; neither touches memory of ours.
@@ -587,17 +594,16 @@ mod ffi {
         /// Size of an RTP's file-descriptor table.
         ///
         /// DEFINED in `common/libc.a:ioLib.o` @0x9f0 (nm, defined-only scan
-        /// over the SDK sysroot RTP libraries).
+        /// over the SDK sysroot RTP libraries), and declared
+        /// `extern size_t rtpIoTableSizeGet(RTP_ID)` at `ioLib.h:533` — the
+        /// header this mirrors, read on the box rather than inferred.
         ///
-        /// The declared shape is robust to the two ways the SDK header could
-        /// differ from it, which is why it is safe to write without the header
-        /// in front of us. The parameter is `RTP_ID` if not `pid_t`, and both
-        /// are `_Vx_OBJ_HANDLE` — `c_int` — so the argument register is the
-        /// same either way. A `size_t` return rather than `int` would be read
-        /// here as its low 32 bits, which is exact for any table size an RTP
-        /// can have. UNCONFIRMED against the header text itself: no SDK on the
-        /// build host.
-        pub fn rtpIoTableSizeGet(rtp_id: c_int) -> c_int;
+        /// `RTP_ID` is `c_int` here: in RTP mode it resolves through
+        /// `_Vx_OBJ_HANDLE` to `int` (`types/vxWind.h:36,43`). The
+        /// struct-pointer spelling of `RTP_ID` that would make this a pointer
+        /// argument exists only in the kernel-mode headers, which an RTP does
+        /// not compile against.
+        pub fn rtpIoTableSizeGet(rtp_id: c_int) -> size_t;
 
         /// One task's descriptor. DEFINED in `common/libc.a:taskInfo.o`;
         /// prototype `STATUS taskInfoGet(TASK_ID tid, TASK_DESC *pTaskDesc)`,

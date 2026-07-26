@@ -12,27 +12,44 @@
 #
 # Three structural differences, none of them cosmetic:
 #
-#   * HALF THIS GATE CANNOT RUN IN CI. The RTEMS gate runs whole on a GitHub
-#     runner because its toolchain is a public `nightly` + `rust-src` and its
-#     libc fixes ride the workspace `[patch.crates-io]`. Here the libc fix has
-#     to come from OUTSIDE the tree, by one of the two shapes the contract
-#     below names, and neither is a public artefact a runner can fetch: a
-#     prepared toolchain, or a checkout of a patched libc named by a
-#     config-level patch. So the CI job runs the census and nothing else, and
-#     this gate reports two different things depending on whether it can see a
-#     toolchain. It never reports a bare success for the half it did not run.
+#   * THE LIBC FIX IS APPLIED AT CONFIG LEVEL, DERIVED FROM THE MANIFEST PIN.
+#     On RTEMS the workspace `[patch.crates-io]` alone makes the check rows
+#     green, because a stock libc still COMPILES for rtems (its defects there
+#     are runtime ABI defects). On VxWorks std itself does not compile against
+#     a stock libc (`pread`/`pwrite`/`killpg`, see the contract below), and a
+#     MANIFEST patch does NOT reach `-Zbuild-std` — build-std resolves std
+#     against rust-src's own `library/Cargo.lock`, which no manifest of ours
+#     is part of. A CONFIG-LEVEL patch — `~/.cargo/config.toml`, or `--config`
+#     on the command line — DOES. MEASURED both ways: the box's RTEMS bring-up
+#     has carried `[patch.crates-io] libc = { path = ".../libc-bringup" }` in
+#     `~/.cargo/config.toml` with the comment "so -Zbuild-std also picks it
+#     up"; all eleven rows here go green on a STOCK nightly under a config
+#     patch and std fails on `killpg` without one.
 #
-#     Note which `[patch]` reaches `-Zbuild-std`, because an earlier revision of
-#     this header got it wrong in a way that ruled out the operator path the
-#     box actually uses. A MANIFEST patch (this workspace's root `Cargo.toml`)
-#     does NOT reach it — build-std resolves std against rust-src's own
-#     `library/Cargo.lock`, which no manifest of ours is part of. A CONFIG-LEVEL
-#     patch — `~/.cargo/config.toml`, or `--config` on the command line — DOES.
-#     MEASURED both ways: the box's RTEMS bring-up has carried
-#     `[patch.crates-io] libc = { path = ".../libc-bringup" }` in
-#     `~/.cargo/config.toml` with the comment "so -Zbuild-std also picks it up",
-#     and on this target all eleven rows go green on a STOCK nightly under
-#     `--config 'patch.crates-io.libc.path="…/libc-vx"'`.
+#     Since the fixes live on the PUBLIC fork branch the manifest pins
+#     (`epics-rs-0.2`, the same branch the RTEMS fixes ride), this script
+#     derives the config-level patch FROM that pin — `scripts/libc-std-patch.sh`
+#     clones the pinned rev and hands back a checkout — and the whole gate
+#     runs anywhere `nightly` + `rust-src` exist, CI runners included. The
+#     manifest line stays the single source of truth; nothing here names a
+#     second libc source to drift from it.
+#
+#     THE MEASURED RULES (all on a pristine rust-src + fresh CARGO_HOME;
+#     the full story is the `libc-std-patch.sh` header): the patch reaches
+#     std only at version EQUALITY with rust-src's own libc pin — anything
+#     else is silently dropped from the std graph and std fails on `killpg`
+#     — so the helper relabels a clone of the pinned rev. `--locked` cannot
+#     ride along, because ANY config-added patch entry needs a bookkeeping
+#     write to the workspace lock, which the flag refuses; these rows run
+#     unlocked and this script snapshots and restores `Cargo.lock` around
+#     them instead. And the patch is an ALIAS entry
+#     (`libc-std.package="libc"`) precisely so the manifest's own entry
+#     keeps the WORKSPACE graph on the committed fork resolution — a bare
+#     same-key patch at the relabelled version measured as poisoning that
+#     graph over to a floating stock crates-io libc. The remaining
+#     trip-wire is CONTENT: a nightly whose std needs libc API the pinned
+#     content lacks fails these rows loudly, which is the signal to rebase
+#     the fork branch and bump the manifest rev.
 #
 #   * THERE IS NO SPEC-GENERATION MACHINERY. `x86_64-wrs-vxworks` is a builtin
 #     triple whose `has-thread-local` is already true (measured via
@@ -52,12 +69,13 @@
 #     property of the port, not a gap in this script.
 #
 # Usage:
-#   ./scripts/vxworks-check.sh          # census, then the target rows if able
+#   ./scripts/vxworks-check.sh          # census + target rows (stock nightly,
+#                                       # libc patch derived from the manifest)
 #   ./scripts/vxworks-check.sh --quiet  # only report failures (and the skip)
 #
 #   VXWORKS_TOOLCHAIN=vx-nightly ./scripts/vxworks-check.sh
 #   VXWORKS_TOOLCHAIN=nightly \
-#     VXWORKS_CARGO_CONFIG='patch.crates-io.libc.path="/path/to/libc-vx"' \
+#     VXWORKS_CARGO_CONFIG='patch.crates-io.libc.path="/path/to/libc-checkout"' \
 #     ./scripts/vxworks-check.sh
 
 set -euo pipefail
@@ -90,23 +108,40 @@ TARGET="x86_64-wrs-vxworks"
 # libc from rust-src's own lock: a 2026-07-09 nightly pins 0.2.185 and shows
 # only `killpg`; a current one pins 0.2.188 and shows both.
 #
-# TWO OPERATOR SHAPES, BOTH FIRST-CLASS. They differ in where the patched libc
-# comes from, not in what is measured:
+# THREE OPERATOR SHAPES. They differ in where the patched libc comes from,
+# not in what is measured:
 #
-#   1. VXWORKS_TOOLCHAIN names a self-contained prepared toolchain whose
+#   1. NOTHING SET — the default, and what CI runs. The stock `nightly` plus a
+#      config-level patch derived from the workspace manifest's
+#      `[patch.crates-io] libc` git+rev pin by `scripts/libc-std-patch.sh`
+#      (a clone of the pinned rev, version-relabelled for the toolchain — see
+#      the header). Requires only
+#      `rustup toolchain install nightly --component rust-src`.
+#   2. VXWORKS_TOOLCHAIN names a self-contained prepared toolchain whose
 #      bundled rust-src already carries the fixes. Nothing else to set.
-#   2. VXWORKS_TOOLCHAIN names a stock toolchain (`nightly`) and
-#      VXWORKS_CARGO_CONFIG carries a config-level patch pointing at a checkout
-#      of a patched libc. This works because a CONFIG-level `[patch]` reaches
-#      `-Zbuild-std` where a manifest one does not — see the header. This is
-#      the shape the bring-up box actually runs, and the shape the eleven
-#      measured green rows were taken under.
+#   3. VXWORKS_TOOLCHAIN names a stock toolchain (`nightly`) and
+#      VXWORKS_CARGO_CONFIG carries a config-level patch pointing at a LOCAL
+#      checkout of a patched libc — the shape for developing the libc fixes
+#      themselves before they are pushed anywhere, and the shape the original
+#      eleven green rows were measured under (then against `.../libc-vx`).
 #
-# VXWORKS_TOOLCHAIN unset is the normal state on a dev machine and in CI. It is
-# not an error and it is not a pass: the census rows below still run and still
-# fail loudly, and the summary says which half did not.
+# With no nightly toolchain installed at all, the census rows below still run
+# and still fail loudly, the target rows are skipped, and the summary says
+# which half did not run. That skip is not an error and it is not a pass.
 TOOLCHAIN="${VXWORKS_TOOLCHAIN:-}"
 CARGO_CONFIG="${VXWORKS_CARGO_CONFIG:-}"
+
+# Shape 1: default the toolchain to the stock nightly and mark the patch for
+# derivation. An EXPLICIT `VXWORKS_TOOLCHAIN=nightly` without a config is the
+# same shape — a stock nightly with a stock libc cannot go green, so deriving
+# is the only reading of it that measures anything.
+DERIVED_PATCH=0
+if [[ -z "$TOOLCHAIN" ]]; then
+    TOOLCHAIN=nightly
+fi
+if [[ "$TOOLCHAIN" == nightly && -z "$CARGO_CONFIG" ]]; then
+    DERIVED_PATCH=1
+fi
 
 # `-Zbuild-std` is required: there is no prebuilt std for this triple. Its
 # argument is QUOTED because the comma in `std,panic_abort` is cargo's crate
@@ -127,12 +162,24 @@ COMMON=(+"$TOOLCHAIN" check --no-default-features "-Zbuild-std=std,panic_abort" 
 # precisely to refuse a resolution change (`error: cannot update the lock file
 # ... because --locked was passed`). The two cannot both hold.
 #
-# So the flag is dropped for shape 2 and only for shape 2 — and never silently.
+# So the flag is dropped for shape 3 and only for shape 3 — and never silently.
 # What `--locked` was protecting is a real loss, so the notice says what the
 # rows now measure instead, in the same breath as saying the flag is gone. It
 # goes out with `echo`, not `log`, for the same reason the skip banner does:
 # `--quiet` must not be able to hide a weakened claim.
-if [[ -n "$CARGO_CONFIG" ]]; then
+#
+# The DERIVED patch (shape 1) also drops it, for a narrower measured reason:
+# adding ANY patch entry at config level needs a bookkeeping write to the
+# workspace lock, which `--locked` refuses outright. What shape 1 preserves
+# instead is everything the flag was protecting that CAN be preserved: the
+# workspace graph stays on the committed pin (the alias entry does not
+# supersede the manifest one), and the lock is snapshotted and restored so
+# the tree is left as found. It is prepared after the toolchain check
+# further down, because `libc-std-patch.sh` needs `rustc +$TOOLCHAIN` and
+# the skip banner must be able to fire first; the notice prints there.
+if [[ "$DERIVED_PATCH" == 1 ]]; then
+    : # patch appended after the toolchain check below
+elif [[ -n "$CARGO_CONFIG" ]]; then
     COMMON+=(--config "$CARGO_CONFIG")
     echo "vxworks-check: --locked DROPPED - config-level path patch active (VXWORKS_CARGO_CONFIG); the lock cannot pin a path override, so these rows measure the PATCHED resolution, not the committed one."
 else
@@ -287,8 +334,6 @@ if [[ ${#stale[@]} -gt 0 ]]; then
 fi
 
 log "VxWorks binary census: ${#present[@]} binaries, all classified."
-log_common
-
 # ---------------------------------------------------------------------------
 # The toolchain-gated half. Skipped LOUDLY when the contract is unmet.
 #
@@ -296,51 +341,60 @@ log_common
 # "only report failures", and a silent skip is the one outcome that would be
 # mistaken for a pass — which is the entire failure mode this banner exists to
 # prevent.
-if [[ -z "$TOOLCHAIN" ]]; then
+if ! cargo "+$TOOLCHAIN" --version >/dev/null 2>&1; then
+    # An EXPLICITLY named toolchain that is absent is an operator error; the
+    # defaulted `nightly` being absent is just a machine that cannot make the
+    # statement, and says so.
+    if [[ -n "${VXWORKS_TOOLCHAIN:-}" ]]; then
+        echo "error: VXWORKS_TOOLCHAIN=$TOOLCHAIN names no installed toolchain." >&2
+        echo "       cargo +$TOOLCHAIN --version failed." >&2
+        exit 1
+    fi
     echo
     echo "==========================================================================="
-    echo " VXWORKS TARGET ROWS SKIPPED - VXWORKS_TOOLCHAIN is not set"
+    echo " VXWORKS TARGET ROWS SKIPPED - no nightly toolchain is installed"
     echo "==========================================================================="
     echo " The census above ran and passed. NOTHING was compiled for $TARGET."
     echo
-    echo " This is the expected state on a dev machine and in CI, and it is not a"
-    echo " failure. It is also not a pass: no statement has been made about whether"
-    echo " this tree compiles for VxWorks."
+    echo " This is not a failure. It is also not a pass: no statement has been made"
+    echo " about whether this tree compiles for VxWorks."
     echo
-    echo " To run the target rows you need a libc carrying two upstream fixes:"
-    echo "     pread/pwrite restored to src/vxworks/  (removed upstream at 0.2.187)"
-    echo "     killpg declared for vxworks            (std references it, libc does not)"
+    echo " The rows need nothing machine-specific. The patched libc comes from the"
+    echo " public fork branch the workspace manifest pins, applied at config level"
+    echo " by this script (see the header for why a manifest patch is not enough):"
     echo
-    echo " A stock toolchain with a stock libc cannot satisfy that. Either shape"
-    echo " below supplies it, and they measure the same thing:"
+    echo "     rustup toolchain install nightly --component rust-src"
+    echo "     $0"
     echo
-    echo "   1. a prepared toolchain whose bundled rust-src carries the fixes:"
-    echo "        VXWORKS_TOOLCHAIN=<name> $0"
-    echo
-    echo "   2. a stock toolchain plus a CONFIG-LEVEL patch naming a checkout of"
-    echo "      a patched libc - this reaches -Zbuild-std where a manifest"
-    echo "      [patch] does not, and is the shape the bring-up box runs:"
-    echo "        VXWORKS_TOOLCHAIN=nightly \\"
-    echo "        VXWORKS_CARGO_CONFIG='patch.crates-io.libc.path=\"/path/to/libc-vx\"' \\"
-    echo "        $0"
-    echo "      (shape 2 drops --locked - a path override must change resolution,"
-    echo "      which is exactly what --locked refuses. The script says so when it"
-    echo "      happens.)"
+    echo " CI runs exactly that, so a tree that breaks these rows does not merge"
+    echo " silently; this skip only means YOUR machine made no statement about it."
     echo "==========================================================================="
     echo
-    echo "TARGET ROWS ARE BOX-ONLY (both shapes above need a patched libc from"
-    echo "outside this tree - a prepared toolchain or a checkout to point at - and"
-    echo "neither is a public artefact a runner can fetch, so no CI runner can close"
-    echo "this gate; it is closed on the bring-up box)."
-    echo "VxWorks gate: census PASSED. TARGET ROWS SKIPPED: no VXWORKS_TOOLCHAIN."
+    echo "VxWorks gate: census PASSED. TARGET ROWS SKIPPED: no nightly toolchain."
     exit 0
 fi
 
-if ! cargo "+$TOOLCHAIN" --version >/dev/null 2>&1; then
-    echo "error: VXWORKS_TOOLCHAIN=$TOOLCHAIN names no installed toolchain." >&2
-    echo "       cargo +$TOOLCHAIN --version failed." >&2
-    exit 1
+# Shape 1's patch, now that the toolchain is known to exist. Unlocked by
+# measured necessity (see the header), so the run must not leave the patch
+# bookkeeping behind in the tree: the committed lock is snapshotted here and
+# restored whatever happens after this point.
+if [[ "$DERIVED_PATCH" == 1 ]]; then
+    # Command substitution, not process substitution: under `set -e` a
+    # failing helper aborts the gate here. Fed through `< <(helper)` its
+    # exit status would be discarded and the rows would run with NO patch —
+    # measuring stock libc (or worse, an ambient config patch) while
+    # claiming the derived shape.
+    _cfg_lines=$(./scripts/libc-std-patch.sh "$TOOLCHAIN")
+    [[ -n "$_cfg_lines" ]] || { echo "vxworks-check: libc-std-patch.sh printed no patch lines" >&2; exit 1; }
+    while IFS= read -r _cfg_line; do
+        COMMON+=(--config "$_cfg_line")
+    done <<<"$_cfg_lines"
+    LOCK_SNAPSHOT=$(mktemp)
+    cp "$REPO_ROOT/Cargo.lock" "$LOCK_SNAPSHOT"
+    trap 'cp "$LOCK_SNAPSHOT" "$REPO_ROOT/Cargo.lock"; rm -f "$LOCK_SNAPSHOT"' EXIT
+    echo "vxworks-check: --locked DROPPED - a config-added libc patch needs a lock bookkeeping write, which --locked refuses (measured; scripts/libc-std-patch.sh). The workspace graph stays on the committed pin; -Zbuild-std sees the same content version-relabelled. Cargo.lock is snapshotted and restored on exit."
 fi
+log_common
 
 # The build configurations a VxWorks image can be in. There is exactly one, and
 # unlike the RTEMS gate's single-config history that is not a gap to be closed
@@ -469,12 +523,15 @@ log "so there is no image-closure cfg for a second one to name."
 log "PVA client (--features client): $VXWORKS_PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."
 # Repeated at the end, not only at the top: a green summary is what gets pasted
-# into a report, and it must carry the caveat that the resolution it measured
-# was not the committed one.
+# into a report, and it must say which resolution the rows measured — the
+# committed pin's content via the alias (shape 1), or an explicitly patched
+# one (shape 3).
 #
 # An `if` rather than `[[ ... ]] && echo`, because this is the script's last
 # command: under `set -e` a false `[[ ]]` there would short-circuit to a
 # non-zero exit and turn every unpatched green run red.
-if [[ -n "$CARGO_CONFIG" ]]; then
+if [[ "$DERIVED_PATCH" == 1 ]]; then
+    echo "Resolution: the manifest pin's libc CONTENT on both graphs - the workspace via the committed pin, -Zbuild-std via the version-relabelled alias (scripts/libc-std-patch.sh; --locked dropped, Cargo.lock restored)."
+elif [[ -n "$CARGO_CONFIG" ]]; then
     echo "Resolution: PATCHED via VXWORKS_CARGO_CONFIG, not the committed lock (--locked was dropped)."
 fi

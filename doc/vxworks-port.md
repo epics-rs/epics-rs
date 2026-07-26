@@ -74,40 +74,65 @@ lever does not reach here — **a MANIFEST `[patch]` is not part of rust-src's
 CONFIG-LEVEL one is**, measured both ways: the box's RTEMS bring-up carries the
 pin in `~/.cargo/config.toml` with the comment *"so `-Zbuild-std` also picks it
 up"*, and all eleven VxWorks rows go green on a **stock** nightly under
-`--config 'patch.crates-io.libc.path="…/libc-vx"'`. Either way the patched libc
-comes from outside this tree, which is what keeps the rows off CI.
+`--config 'patch.crates-io.libc.path="…/libc-vx"'` (the bring-up-era local
+checkout; its two commits now live on the fork branch below).
 
-Hence the two operator shapes `scripts/vxworks-check.sh` implements, both
-first-class:
+The VxWorks fixes were then pushed to the **same public fork branch the
+manifest already pins for RTEMS** (`physwkim/libc`, branch `epics-rs-0.2`),
+and `scripts/vxworks-check.sh` derives the config-level patch **from the
+manifest pin** — same URL, same rev. Hence the three operator shapes it
+implements:
 
+* Nothing set — **the default, and what CI runs**: stock `nightly` plus a
+  config-level patch prepared by `scripts/libc-std-patch.sh` — a clone of the
+  manifest pin's exact rev whose `version` field is relabelled to the one the
+  toolchain's own rust-src lock pins. The relabel is not cosmetic: a patch
+  whose version differs from that pin is **silently dropped from the std unit
+  graph** (measured four ways — git or path source, with or without
+  `--locked`, each ending in `warning: patch … was not used` and the `killpg`
+  build failure), while the same-version swap applies cleanly and leaves the
+  sysroot lock untouched. The helper emits the patch as an **alias entry**
+  (`patch.crates-io.libc-std`, `package = "libc"`) rather than a second
+  `libc` key, because a bare same-key patch at the relabelled version
+  supersedes the manifest pin and drops the WORKSPACE graph onto a floating
+  stock crates-io libc (measured — the lock got rewritten to the registry
+  release); under the alias the workspace keeps the committed fork
+  resolution and only the std graph, whose requirement the relabelled
+  version alone satisfies, takes the derived copy. Both graphs therefore
+  compile the same content: the manifest pin's exact rev. `--locked` is
+  dropped with a printed notice — any config-added patch entry needs a lock
+  bookkeeping write, which the flag refuses outright (measured) — and
+  `Cargo.lock` is snapshotted and restored on exit, so the tree is left as
+  found. The remaining trip-wire is content drift: a nightly whose std needs
+  libc API the pinned content lacks fails the gate loudly — the signal to
+  rebase the fork branch and bump the manifest rev.
 * `VXWORKS_TOOLCHAIN` alone, naming a prepared toolchain whose bundled
   rust-src already carries the fixes.
-* `VXWORKS_TOOLCHAIN=nightly` plus `VXWORKS_CARGO_CONFIG` carrying the
-  config-level patch — the shape the box runs. It **drops `--locked`**, because
-  a path override must change resolution and `--locked` exists to refuse
-  exactly that (measured: `error: cannot update the lock file … because
-  --locked was passed`); the script prints one line saying the flag is gone and
-  that the rows therefore measure the patched resolution, and repeats it in the
-  green summary.
-* `VXWORKS_TOOLCHAIN` unset — the normal state on a dev machine and in CI — the
-  binary census still runs and still fails loudly, the target rows **skip behind
-  a banner `--quiet` cannot suppress**, and the summary says
-  `TARGET ROWS SKIPPED: no VXWORKS_TOOLCHAIN`. Never a bare success.
+* `VXWORKS_TOOLCHAIN=nightly` plus `VXWORKS_CARGO_CONFIG` carrying an explicit
+  config-level patch — the shape for developing the libc fixes themselves
+  against a local checkout. It **drops `--locked`**, because a path override
+  must change resolution and `--locked` exists to refuse exactly that
+  (measured: `error: cannot update the lock file … because --locked was
+  passed`); the script prints one line saying the flag is gone and that the
+  rows therefore measure the patched resolution, and repeats it in the green
+  summary.
 
-### 1.3 Half this gate is un-CI-able by construction
+With no nightly toolchain installed at all, the binary census still runs and
+still fails loudly, the target rows **skip behind a banner `--quiet` cannot
+suppress**, and the summary says `TARGET ROWS SKIPPED: no nightly toolchain`.
+Never a bare success.
 
-Both shapes above need a patched libc from outside this tree — a prepared
-toolchain, or a checkout to point `--config` at — and neither is a public
-artefact a runner can fetch; anything past `check` additionally needs the
-proprietary Wind River SDK. So no runner can close this gate. The
-`vxworks-census` job in
-`.github/workflows/rust.yml` therefore runs only the census rows — pure
-filesystem and `grep`, no toolchain step at all so the job cannot look like it
-compiled something — and the script logs `TARGET ROWS ARE BOX-ONLY` in its own
-output rather than leaving that fact in a CI comment.
+### 1.3 What stays box-only: linking
 
-This is the single largest parity gap with `rtems-closure` and it is stated as
-a fact rather than papered over.
+Since the patched libc became a public fork branch, the `check` half of this
+gate runs anywhere `nightly` + `rust-src` exist — the `vxworks-census` job in
+`.github/workflows/rust.yml` installs exactly that and type-checks the whole
+VxWorks closure, the same job shape as `rtems-closure`. What no runner can do
+is anything past `check`: producing or booting a `.vxe` needs the proprietary
+Wind River SDK (`wr-cc`, the RTP crtbegin/libs, the QEMU BSP), so
+`scripts/embedded-image.sh vxworks …` and the boot rig of §5 stay on the
+bring-up box. Linking was never the check gate's claim, and the gap that
+remains is stated as a fact rather than papered over.
 
 ---
 
@@ -374,8 +399,9 @@ reports, for the same reason (UDP search gated out, so `SearchTransport` has
 its single `NameServersOnly` variant) but through `epics_embedded_target`
 rather than `cfg(target_os = "rtems")`.
 
-Run under shape 2 of §1.2 — stock `nightly` plus the config-level libc patch,
-no `--locked`.
+Run under shape 3 of §1.2 — stock `nightly` plus an explicit
+`VXWORKS_CARGO_CONFIG` patch pointing at the bring-up checkout (content now
+on the fork branch), no `--locked`.
 
 Real links, feature absent: `realtime-ca-ioc.vxe` 116,440,216 B and
 `realtime-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present

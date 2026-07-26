@@ -126,37 +126,43 @@ jobs:
     - name: Type-check the RTEMS closure
       run: ./scripts/rtems-check.sh
 
-  # The VxWorks 7 counterpart of `rtems-closure` — and deliberately a much
-  # smaller job, because full parity with it is IMPOSSIBLE, not merely absent.
-  #
-  # `rtems-closure` above type-checks the whole RTEMS closure on a runner
-  # because its toolchain is a public `nightly` + `rust-src` and its `libc`
-  # fixes are pinned in the workspace `[patch.crates-io]`. VxWorks has neither
-  # lever: the Wind River SDK is proprietary, and `-Zbuild-std` compiles std
+  # The VxWorks 7 counterpart of `rtems-closure`, and since the fork branch
+  # `epics-rs-0.2` made the patched libc public, a full one: the same job
+  # shape type-checks the whole VxWorks closure. `-Zbuild-std` compiles std
   # against rust-src's own `library/Cargo.lock`, which a workspace patch does
-  # not reach — so its `libc` fix has to live in a prepared toolchain that is
-  # not a public artefact either. The target rows are therefore structurally
-  # box-only (`coding-agent@192.168.2.128`), and the script says so in its own
-  # output rather than leaving this comment as the only place it is written
-  # down.
+  # not reach, so `vxworks-check.sh` derives a CONFIG-level patch from the
+  # manifest pin and passes it on its own command line; all this runner needs
+  # is the same public `nightly` + `rust-src` the RTEMS job installs. The
+  # linking half of the port still needs the proprietary Wind River SDK and
+  # stays on the bring-up box, but linking was never this gate's claim.
   #
-  # What DOES run here is the binary census, which needs no toolchain at all
-  # and catches the highest-value regression class — a new `src/bin/*.rs`
-  # landing classified as neither a target binary nor host-only, which is
-  # exactly how a target binary last fell outside a gate. `vxworks-check.sh`
-  # runs its census first and unconditionally, then prints the skip banner and
-  # exits 0, so this job is green-when-classified and red-when-not.
+  # The census half needs no toolchain and catches the highest-value
+  # regression class — a new `src/bin/*.rs` landing classified as neither a
+  # target binary nor host-only, which is exactly how a target binary last
+  # fell outside a gate. It runs first and unconditionally, so this job is
+  # red both when a binary is unclassified and when the closure stops
+  # compiling.
   #
-  # No toolchain step on purpose: the half of the script that runs here invokes
-  # no cargo, and installing a Rust toolchain it never uses would make the job
-  # look like it compiled something. A future census row that does need cargo
-  # must add the step in the same change.
+  # `nightly` is unpinned for the same trip-wire reason `rtems-closure` gives
+  # — with one extra tooth here: the std-side patch is a clone of the manifest
+  # pin relabelled to whatever libc version the nightly's rust-src lock
+  # demands (`scripts/libc-std-patch.sh`), so version drift is absorbed by
+  # construction; what still fails loudly is a nightly whose std needs libc
+  # API the pinned content lacks — the signal to rebase the fork branch.
   vxworks-census:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
-    - name: VxWorks binary census (target rows are box-only)
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        components: rust-src
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: vxworks-census
+    - name: Census, then type-check the VxWorks closure
       run: ./scripts/vxworks-check.sh
 
   # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback

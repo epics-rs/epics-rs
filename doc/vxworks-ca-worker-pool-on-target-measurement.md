@@ -702,3 +702,99 @@ hardcodes `comm == "qemu-system-arm"`, so `qemu-system-x86_64` guests are
 silently skipped and accumulate while the operator believes they were cleaned
 up. `stop-e8.sh` checks the comm it actually expects, per pidfile, and never
 uses `pkill`.
+
+---
+
+## 10. Follow-up round: the wall is a reservation ceiling
+
+Measured 2026-07-26/27, same rig, same box. UNFIXED 1 asked why `EAGAIN` lands
+at 47 concurrent on the `~958MB` guest when only 61,145,088 B of it — 6.1 % —
+was committed. The discriminator was a `StackSizeClass` A/B at fixed guest RAM:
+if the wall moves when the *declared* per-connection stack moves, reservation
+is a binding term, and the RTP's VM arena never has to be instrumented.
+
+Three arms, one guest size (`1024M`, `OS Memory Size: ~958MB`), one image each,
+differing only in `client_roster()`:
+
+| arm | `CAS-client` | `CAS-event` | declared per conn | wall | failure at the wall |
+|---|---|---|---|---|---|
+| A | Big 2,097,152 | Medium 1,048,576 | 3,145,728 | 47 | `EAGAIN` refusal, IOC survives |
+| B | Medium 1,048,576 | Medium 1,048,576 | 2,097,152 | 59 | `EAGAIN` refusal, 0 panics |
+| C | Small 524,288 | Small 524,288 | 1,048,576 | 80 | mutex `EINVAL`, RTP aborted |
+
+Each arm's class is confirmed from the target's own census, not from the source
+edit — `size=` moves and `high=` does not:
+
+```
+STACKUSE tag=c6-6  id=0x000300fa name=CAS-client 0 size=1048576 current=1536 high=12160 margin=1036416
+STACKUSE tag=c6-12 id=0x000600e3 name=CAS-client 7 size=524288  current=6096 high=13240 margin=511048
+```
+
+The high-water is invariant across all three arms: `CAS-client` 13,240 B,
+`CAS-event` 5,968 B. Changing the class changes what is reserved and nothing
+about what is touched, which is the point of the experiment.
+
+### 10.1 Which model survives
+
+Two candidate readings of the wall, each predicting the C arm from A and B:
+
+*Wall proportional to declared stack.* Totals at the wall would be constant.
+They are 147,849,216 / 123,731,968 / 83,886,080 B — a 76 % spread, and the
+model predicts the C arm walls at 147,849,216 / 1,048,576 = 141, which is
+`CAS_CLIENT_POOL_CAPACITY`. It would have refused with "worker pool at
+capacity". **Falsified**: the C arm walled at 80, with `EAGAIN`.
+
+*Each thread costs its declared stack plus a fixed overhead.* Fitting that
+overhead from arms A and B alone gives 1,004,885 B per thread and predicts the
+C arm at 79.2 connections. **Measured 80.** Taking the overhead as exactly
+1 MiB — a round number chosen a priori, no fitting — the totals at all three
+walls become:
+
+| arm | per conn incl. 2 × 1 MiB | wall | total reserved at the wall |
+|---|---|---|---|
+| A | 5,242,880 | 47 | 246,415,360 |
+| B | 4,194,304 | 59 | 247,463,936 |
+| C | 3,145,728 | 80 | 251,658,240 |
+
+246.4 / 247.5 / 251.7 MB: a 2.1 % spread across arms whose declared stacks
+differ threefold. **The wall is a reserved-address-space ceiling of ~248 MB on
+this guest, and each pool thread consumes its declared stack plus ~1 MiB.**
+That answers UNFIXED 1: `EAGAIN` at 47 is not committed-memory exhaustion at
+all — 47 × 5,242,880 = 246,415,360 B is the whole ceiling, reached while
+mimalloc had committed 61,145,088 B.
+
+The ceiling itself moves with guest RAM, which is why §4 saw the wall move.
+`1470MB` and `1982MB` both reached 141 (`CAS_CLIENT_POOL_CAPACITY`) without an
+`EAGAIN`, so their ceiling is only bounded below, at ≥ 141 × 5,242,880 =
+739,246,080 B. One exact point and one bound are consistent with a roughly
+fixed ~710–730 MB of non-arena reservation, but two points cannot establish
+that and it is not claimed.
+
+### 10.2 What the per-connection class should be
+
+Not what the arithmetic first suggests. At the Small arm, 2,097,152 B of the
+3,145,728 B per connection — **67 %** — is the fixed per-thread overhead, not
+declared stack. So the class is the minor lever and has sharply diminishing
+returns: Big→Medium on the client cut the declared stack 33 % and bought 26 %
+more connections; Medium→Small on both cut it a further 50 % and bought 36 %.
+The major lever is **threads per connection**, because the overhead is charged
+per thread: at Medium, one thread per connection instead of two would halve the
+per-connection cost exactly, doubling the wall — more than any class change
+achieved.
+
+On the class question as asked: Big is not justified by anything measured here.
+It costs 20 % of the wall on the small guest and its `CAS-client` high-water is
+13,240 B, identical to Medium's and to Small's. **Medium/Medium is what this
+evidence supports** — 79× headroom over the measured high-water, and the only
+one of the three arms that walled cleanly, refusing with `EAGAIN` and zero
+panics while the IOC kept serving.
+
+Small is **not** recommended on this evidence: 40× headroom, and its wall event
+took the whole RTP down (§10.4).
+
+The caveat that keeps this from being a shipping recommendation: 13,240 B was
+measured on `READ_NOTIFY` against a single `ao` record. CA command dispatch
+depth is workload-dependent, and a database with long `FLNK` chains or large
+array puts has not been measured on this target. What the evidence does
+establish is that **Big buys nothing measurable and costs a fifth of the
+connection wall**, and that the class is not where the leverage is.

@@ -798,3 +798,65 @@ depth is workload-dependent, and a database with long `FLNK` chains or large
 array puts has not been measured on this target. What the evidence does
 establish is that **Big buys nothing measurable and costs a fifth of the
 connection wall**, and that the class is not where the leverage is.
+
+---
+
+## 11. The 180× knee and the census truncation were one defect
+
+UNFIXED 2 (the connection-cost knee, §7.1) and UNFIXED 4 (the census
+truncating at `MAX_TASKS = 192`, §7.3) were filed as separate observations.
+They are the same root cause, fixed in `fix(vxworks-stats): grow the task
+registry instead of capping it at 192`.
+
+`TaskRegistry` in `crates/epics-rtems-boot/src/stats/vxworks.rs` held a fixed
+192-entry `ids` array. The count is not a coincidence: 19 baseline threads plus
+two per connection reaches 192 at
+
+```
+19 + 2 × (n + 5) = 192   →   n = 81.5
+```
+
+which is exactly where §7.1 bracketed the knee, `(80, 88]`, and where the
+single 402 s ramp showed its one spike, at n = 83.
+
+Once the array was full, `insert()` called `retain_live()` — one `taskInfoGet`
+kernel query per entry, holding the registry `Mutex` — on **every** subsequent
+registration, and reclaimed nothing, because at a saturated pool every task in
+it is still live. One sweep timed at 3.674 s, and `enter_ioc_thread` registers
+twice per CA connection (`CAS-client` and `CAS-event`), giving 2 × 3.68 s ≈
+7.36 s per connection against the 7.23–7.46 s §7.1 measured. The phase-split
+driver settles what §7.1 could not say:
+
+```
+[    0.3s] mem1536 UP n=  1 total=  6 total_s= 0.045 connect= 0.000 search= 0.027 create= 0.006 read= 0.011
+[   10.3s] mem1536 UP n=136 total=141 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.005 read= 0.004
+```
+
+`connect` is 0.000 on every line, at every count, so the cost was never in the
+accept path. It sat in `search` — the leased worker's path to its first read —
+because `enter_ioc_thread` registers before the worker reaches its socket.
+
+After the fix the registry grows, and `SWEEP_THRESHOLD_MIN` keeps only its
+second job: the point at which exited tasks are swept, re-armed to twice the
+live count so the sweep stays amortised against the threads that exist.
+
+Verified on target, both symptoms at once:
+
+```
+[   10.4s] mem1536 D1 client-side served = 136 ramp + 5 monitor = 141
+TASKDUMP begin tag=c6-66 count=301 capacity=unbounded dropped=0 source=registry
+```
+
+The 141-client ramp fell from **402 s to 10.4 s**, and the saturated census
+reports all 301 tasks — 19 baseline + 141 `CAS-client` + 141 `CAS-event` —
+with `dropped=0`, where it previously reported `count=192 dropped=109`.
+
+The RTEMS shim has the same symptom and **is not fixed**:
+`crates/epics-rtems-boot/csrc/rtems_stats.c:148` defines
+`EPICS_RTEMS_DUMP_MAX_TASKS 192` and sizes three static arrays by it. That
+capacity is filled inside `epics_rtems_dump_collect`, called from a
+`rtems_task_iterate` visitor, where allocating is not safe — so the same fix
+does not transfer, and the constraint is structural rather than an oversight.
+Nothing in the VxWorks path runs in that context: `register_task` is called
+from `enter_ioc_thread` at thread startup, and `snapshot` already allocates.
+Not verifiable from this rig either way; it is an `armv7-rtems-eabihf` item.

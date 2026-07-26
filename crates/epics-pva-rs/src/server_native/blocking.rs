@@ -158,7 +158,7 @@ use std::time::Duration;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io::{
-    DEFAULT_READ_CHUNK, is_socket_timeout, send_tick_for, spawn_reader_pump, spawn_writer_pump,
+    DEFAULT_READ_CHUNK, is_socket_timeout, spawn_reader_pump, spawn_writer_pump,
 };
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
@@ -493,17 +493,16 @@ pub(super) fn serve_connection_blocking(
         .set_read_timeout(Some(config.op_timeout))
         .map_err(PvaError::Io)?;
     let send_timeout = config.send_timeout;
-    // SO_SNDTIMEO, unlike SO_RCVTIMEO above, is NOT portable: VxWorks'
-    // libbsd socket stack does not implement it and returns ENOPROTOOPT
-    // (errno 42) on an otherwise-good accepted socket. Propagating that
-    // fatally closed every VxWorks PVA connection before the first byte
-    // (SET_BYTE_ORDER) went out (measured on target). Best-effort like
-    // `set_nodelay` above: applied on RTEMS, silently absent on VxWorks,
-    // where `handle_connection_io`'s `runtime::task::timeout(send_timeout)`
-    // wrapper around every `write_all` is the portable send-stall guard —
-    // this socket-level timeout is a redundant backstop here, not the only
-    // one.
-    let _ = stream.set_write_timeout(Some(send_tick_for(send_timeout)));
+    // No SO_SNDTIMEO. It is not portable — VxWorks' socket stack does not
+    // implement it and returns ENOPROTOOPT (errno 42) on an otherwise-good
+    // accepted socket, which closed every VxWorks PVA connection before the
+    // first byte (SET_BYTE_ORDER) went out when it was propagated fatally
+    // (measured on target). It is also no longer needed on any target:
+    // `blocking_io::write_frame_deadline` waits for writability against
+    // `send_timeout` itself, so the per-frame bound is the same here as it is
+    // for the blocking clients, and `handle_connection_io`'s
+    // `runtime::task::timeout(send_timeout)` around every `write_all` sits
+    // above it as a second, async-side bound rather than as the only one.
 
     // One socket, several handles: the SAME descriptor shared through an
     // `Arc` by both pump threads and the registry, which owns it from here
@@ -1933,9 +1932,6 @@ mod tests {
         // Far longer than this test may take, so only the wake can explain a
         // prompt exit.
         const DEADLINE: Duration = Duration::from_secs(30);
-        write_sock
-            .set_write_timeout(Some(send_tick_for(DEADLINE)))
-            .expect("SO_SNDTIMEO");
 
         let label = format!("PVA connection {peer}");
         // `_lease` is declared before `_guard`, so it drops last — after the

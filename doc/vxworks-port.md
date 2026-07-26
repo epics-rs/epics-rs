@@ -381,6 +381,9 @@ Real links, feature absent: `realtime-ca-ioc.vxe` 116,440,216 B and
 `realtime-pva-ioc.vxe` 158,996,752 B, both ELF x86-64 static RTP, `T main` present
 at `0x224f90`. With `bringup-probes`: 118,207,216 B and 160,199,848 B.
 
+Those are **dev** links, which is what the gate builds. Release, strip and LTO
+figures for both targets are in §5.5.
+
 The probes build was the **first-ever compile of every `target_os = "vxworks"`
 line in `stats/vxworks.rs`** — 0 errors, first try.
 
@@ -462,6 +465,124 @@ the C-side spelling.
 The status-PV prefix is the compile-time constant `RTEMS` in
 `realtime-ca-ioc.rs`, so it reads `RTEMS:` on a VxWorks image. No runtime config
 surface; renaming it is the same decision as renaming the bins (§2.4).
+
+### 5.5 Release image size: strip + LTO (measured)
+
+The §5.1 figures are **dev** images — the gate builds `check`/`dev`, so those
+are the numbers the rest of this file quotes. They are not what anyone ships.
+Measured 2026-07-25/26 on `gv100`, five rows per target, both binaries each.
+
+**Every row below is a CLI `--config` row. The repository defines no release
+profile overrides at all** — no `[profile.release]` `strip`, `lto` or
+`codegen-units` in any manifest. Adopting any of this is a pending decision,
+not something the tree does today, so a plain `cargo build --release` still
+produces the row-2 sizes.
+
+#### `x86_64-wrs-vxworks` (`.vxe`)
+
+| Row | CA bytes | Δ vs row3 (strip) | PVA bytes | Δ vs row3 | CA cold build¹ | CA MAXRSS |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 dev | 116,768,688 | — | 159,248,592 | — | 85.69 s | 1,034,284 KB |
+| 2 `--release` | 7,274,408 | — | 10,477,624 | — | 87.02 s | 1,072,120 KB |
+| 3 `+strip=symbols` | 5,287,328 | (baseline) | 7,851,744 | (baseline) | 85.80 s | 1,073,000 KB |
+| 4 `+lto=thin +cgu1` | **4,447,584** | **−839,744 (−15.9%)** | **6,418,080** | **−1,433,664 (−18.3%)** | 144.75 s (1.66×) | 1,071,716 KB |
+| 5 `+lto=fat +cgu1` | **4,287,696** | **−999,632 (−18.9%)** | **6,077,968** | **−1,773,776 (−22.6%)** | 163.49 s (1.88×) | 1,071,788 KB |
+
+fat beats thin: CA −159,888 B (−3.6%), PVA −340,112 B (−5.3%). dev→fat overall:
+CA **27.2×**, PVA **26.2×** smaller.
+
+(Row 1 differs by ~330 KB from §5.1's dev figures — a different build on a
+different day, not a discrepancy to reconcile. Rows are comparable to each
+other, which is what the matrix is for.)
+
+#### `armv7-rtems-eabihf` (ELF)
+
+| Row | CA bytes | Δ vs row3 (strip) | PVA bytes | Δ vs row3 | CA cold build¹ | CA MAXRSS |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 dev | 122,884,636 | — | 159,408,272 | — | 80.44 s | 1,025,556 KB |
+| 2 `--release` | 7,965,212 | — | 11,015,520 | — | 82.99 s | 1,147,632 KB |
+| 3 `+strip=symbols` | 5,452,848 | (baseline) | 7,676,976 | (baseline) | 84.44 s | 1,127,740 KB |
+| 4 `+lto=thin +cgu1` | 4,764,592 | −688,256 (−12.6%) | 6,517,680 | −1,159,296 (−15.1%) | 143.47 s (1.73×) | 924,340 KB |
+| 5 `+lto=fat +cgu1` | **4,604,848** | **−848,000 (−15.6%)** | **6,165,424** | **−1,511,552 (−19.7%)** | 168.17 s (2.03×) | 934,348 KB |
+
+fat beats thin: CA −159,744 B (−3.4%), PVA −352,256 B (−5.4%). dev→fat overall:
+CA **26.7×**, PVA **25.9×**.
+
+#### Cross-target summary
+
+`fat+cgu1` versus `strip`: **vxworks CA −18.9% / PVA −22.6%; RTEMS CA −15.6% /
+PVA −19.7%.** Both targets agree on every qualitative point — fat beats thin,
+LTO roughly doubles the cold build, no linker memory trouble, and the smallest
+image boots and round-trips with behaviour unchanged.
+
+#### Methodology
+
+¹ **Cold `CARGO_TARGET_DIR` per row** (`rm -rf` before each), so no row reuses
+another's artefacts. **The CA column is the comparable build-time number**: it
+is a full rebuild including `std` under `-Zbuild-std`. PVA times are *warm* —
+built after that row's CA — and load-sensitive on this shared box, where RTEMS
+guests and other work run concurrently; the vxworks release-PVA row came in at
+267 s, a load outlier. PVA build times are therefore not quoted as a column and
+should not be compared across rows.
+
+**Linker memory: no trouble at any row.** `/usr/bin/time` MAXRSS for every CA
+build — the tabulated column, fat LTO included — is **≈0.92–1.15 GB** across
+both targets, against 309 GB free. No `collect2`/`ld`/`cannot allocate`/OOM
+signature and no undefined-reference failure in any of the twenty builds.
+
+**Boot-verified on the smallest image of both targets** — row 5, `fat+cgu1` CA:
+
+* vxworks, 4,287,696 B, `rtpSp "/host.host/realtime-ca-ioc.vxe"`: boots at
+  `-m 2048` **and** `-m 1024`; banner `realtime-ca-ioc: serving 3 records on CA
+  port 5064`; all three record lines; `caget RTEMS:AO` 1.5 → `caput` 42.5 →
+  `WRITE_NOTIFY ECA_NORMAL` → readback 42.5 (and 7.25 at `-m 1024`); no scan
+  FATAL; `rtpShow` TASK CNT 17.
+* RTEMS, 4,604,848 B, fresh `qemu-system-arm -M xilinx-zynq-a9 -m 256M`,
+  hostfwd 15064: DHCP BOUND, same banner, three record lines, `caget` 1.5 →
+  `caput` 42.5 `ECA_NORMAL` → readback 42.5.
+
+#### Verbatim invocations
+
+VxWorks — common prefix for every row:
+
+```
+cargo +nightly build -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
+  --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"'
+```
+
+```
+# Row1 dev CA
+cargo +nightly build -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
+# Row1 dev PVA
+cargo +nightly build -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+# Row2 --release CA / PVA  (same as Row1 + --release, same -p/--bin/--features)
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' -p epics-ca-rs     --bin realtime-ca-ioc  --no-default-features --features client-core
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+# Row3 --release + strip CA / PVA  (Row2 + one extra --config, NO repo edits)
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' --config 'profile.release.strip="symbols"' -p epics-ca-rs     --bin realtime-ca-ioc  --no-default-features --features client-core
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' --config 'profile.release.strip="symbols"' -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+# Row4 thin+cgu1 CA
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' --config 'profile.release.strip="symbols"' --config 'profile.release.lto="thin"' --config profile.release.codegen-units=1 -p epics-ca-rs     --bin realtime-ca-ioc  --no-default-features --features client-core
+# Row4 thin+cgu1 PVA  (…same configs…) -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+# Row5 fat+cgu1 CA
+cargo +nightly build --release -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks --config 'patch.crates-io.libc.path="/home/coding-agent/vx-bringup/libc-vx"' --config 'profile.release.strip="symbols"' --config 'profile.release.lto="fat"'  --config profile.release.codegen-units=1 -p epics-ca-rs     --bin realtime-ca-ioc  --no-default-features --features client-core
+# Row5 fat+cgu1 PVA  (…same configs…) -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+```
+
+Per build: `source ~/vx-bringup/vxenv25.sh; export
+CARGO_TARGET_DIR=$HOME/vx-phase1-target; rm -rf $CARGO_TARGET_DIR`. All ten
+vxworks builds `Finished [optimized]`, EXIT=0.
+
+RTEMS — same five rows over the RTEMS route: toolchain env, `~/.cargo/config.toml`
+`[patch.crates-io]` `libc-bringup`, `cargo update -p libc --precise 0.2.188`, and
+the TLS spec of `doc/rtems-tls-spec-deviation.md`
+(`armv7-rtems-eabihf-tls.json`, `-Zjson-target-spec`, `arm-rtems6-gcc`).
+
+```
+# Row5 fat+cgu1 CA
+cargo +nightly build --target "$TGT" -Zbuild-std=std,panic_abort -Zjson-target-spec --release --config 'profile.release.strip="symbols"' --config 'profile.release.lto="fat"' --config profile.release.codegen-units=1 -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
+# Row5 fat+cgu1 PVA  (same configs) -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
+```
 
 ---
 

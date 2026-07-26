@@ -65,6 +65,9 @@ panel's own worktree, moved to branch `box-deploy` = `ad5d77bc`.
 Both builds exit 0, and `epics-libcom-rs v0.24.3` appears in the compile list of
 both, so the extracted crate is in both images.
 
+These are dev images; for measured release/strip/LTO sizes on this target (and
+on vxworks), see `doc/vxworks-port.md` §5.5.
+
 ## 4. Smoke results
 
 Captured before the binaries were renamed to `realtime-ca-ioc` /

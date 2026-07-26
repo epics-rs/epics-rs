@@ -37,10 +37,27 @@
 #            toolchain, or a stock nightly plus VXWORKS_CARGO_CONFIG carrying
 #            the config-level libc patch.
 #
-# No `--locked`: the gates own the "this tree's committed resolution
-# compiles" claim; an image build runs under whatever lock adjustment the
-# target's libc route needs on the build host (see the `[patch.crates-io]`
-# comment in the root manifest).
+# LIBC IN STD: unless VXWORKS_CARGO_CONFIG (or a prepared VXWORKS_TOOLCHAIN)
+# supplies one, BOTH arms pass config-level libc patch lines prepared by
+# `scripts/libc-std-patch.sh` from the workspace manifest's git+rev pin,
+# because a manifest `[patch]` does not reach `-Zbuild-std`, and a config
+# one reaches it only at the exact libc version rust-src's lock pins — the
+# helper clones the pinned rev, relabels its version to match, and emits an
+# ALIAS patch entry so the workspace graph keeps the committed pin while the
+# std graph takes the relabelled copy (all measured; see the helper's
+# header). On VxWorks std does not compile without it. On RTEMS std COMPILES
+# without it but carries the stock sockaddr/time layouts, so an image built
+# on a host with no ambient `~/.cargo/config.toml` patch would boot with a
+# std whose address structs disagree with libbsd — the crate-graph layout
+# asserts cannot see std's own libc copy. Deriving it here makes a
+# deployable image's std resolution independent of build-host ambient
+# config.
+#
+# No `--locked`: a config-added patch entry needs a lock bookkeeping write,
+# which `--locked` refuses outright (measured; helper header). When the
+# derived patch is in play `Cargo.lock` is snapshotted and restored on exit,
+# so the tree is left as found; the gates own the "this tree's committed
+# resolution compiles" claim.
 
 set -euo pipefail
 
@@ -68,6 +85,23 @@ ARGS=(build --profile "$PROFILE" --no-default-features
       "-Zbuild-std=std,panic_abort"
       -p "$CRATE" --bin "$BIN" --features "$FEATURES")
 
+# Append the derived libc patch (one `--config` per helper line) and arm the
+# Cargo.lock snapshot/restore trap — the config-added entry writes lock
+# bookkeeping (see the header's "No --locked" note).
+apply_derived_libc_patch() {
+    local _cfg_line _cfg_lines
+    # Command substitution so a failing helper aborts the build under
+    # `set -e` instead of silently building against stock libc.
+    _cfg_lines=$(./scripts/libc-std-patch.sh "$1")
+    [[ -n "$_cfg_lines" ]] || { echo "embedded-image: libc-std-patch.sh printed no patch lines" >&2; exit 1; }
+    while IFS= read -r _cfg_line; do
+        ARGS+=(--config "$_cfg_line")
+    done <<<"$_cfg_lines"
+    LOCK_SNAPSHOT=$(mktemp)
+    cp "$REPO_ROOT/Cargo.lock" "$LOCK_SNAPSHOT"
+    trap 'cp "$LOCK_SNAPSHOT" "$REPO_ROOT/Cargo.lock"; rm -f "$LOCK_SNAPSHOT"' EXIT
+}
+
 case "$OS" in
     rtems)
         TOOLCHAIN=nightly
@@ -83,12 +117,17 @@ case "$OS" in
         fi
         # Bootable, not portability-probe: see rtems-check.sh CONFIGS.
         export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg rtems_boot_linked"
+        apply_derived_libc_patch "$TOOLCHAIN"
         ;;
     vxworks)
         TOOLCHAIN="${VXWORKS_TOOLCHAIN:-nightly}"
         TARGET="x86_64-wrs-vxworks"
         if [[ -n "${VXWORKS_CARGO_CONFIG:-}" ]]; then
             ARGS+=(--config "$VXWORKS_CARGO_CONFIG")
+        elif [[ "$TOOLCHAIN" == nightly ]]; then
+            # A prepared VXWORKS_TOOLCHAIN bundles its own fixed rust-src and
+            # needs no patch; the stock nightly does.
+            apply_derived_libc_patch "$TOOLCHAIN"
         fi
         ;;
     *) usage ;;

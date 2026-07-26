@@ -575,6 +575,13 @@ signature and no undefined-reference failure in any of the twenty builds.
 
 #### Verbatim invocations
 
+These are the invocations the table's numbers were **measured** under, kept
+verbatim as the record; the `--config …libc.path="…/libc-vx"` in them is the
+bring-up-era local checkout whose commits now live on the fork branch
+`epics-rs-0.2` (§1.2). A reproduction today uses
+`scripts/embedded-image.sh vxworks <ca|pva>`, which derives that patch from
+the manifest pin.
+
 VxWorks — common prefix for every row:
 
 ```

@@ -2074,7 +2074,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "libc"
 version = "0.2.188"
-source = "git+https://github.com/physwkim/libc.git?rev=6f64e70d6a2a03b989380aaa719207236343f093#6f64e70d6a2a03b989380aaa719207236343f093"
+source = "git+https://github.com/physwkim/libc.git?rev=31d5776f9952aa349813d7fbef3addae1bf0a5ef#31d5776f9952aa349813d7fbef3addae1bf0a5ef"
 
 [[package]]
 name = "libm"

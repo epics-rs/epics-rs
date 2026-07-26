@@ -66,20 +66,39 @@ lto = "fat"
 codegen-units = 1
 
 
-# RTEMS 6 (armv7-rtems-eabihf) needs libc definitions that the published crate
-# does not yet carry: `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/`off_t`/
-# `rlim_t` widths, the BSD length byte on every socket address struct, and the
-# libbsd values of the socket/poll/getaddrinfo constants. `-Zbuild-std` compiles
-# `std` against this same crate, so a wrong `timespec` or `sockaddr_in` corrupts
-# std itself rather than only our code -- see the two build-refusing asserts in
-# `crates/epics-rtems-boot/src/lib.rs` (`_RTEMS_LIBC_TIME_LAYOUT`,
-# `_RTEMS_LIBC_SOCKET_LAYOUT`), which is why this is a patch and not a local
-# type definition. `scripts/rtems-check.sh` fails all six `image` targets
-# without it.
+# Both embedded targets need libc definitions that the published crate does
+# not yet carry, from the one fork branch `epics-rs-0.2`.
 #
-# Pinned by rev; the tag `epics-rs-rtems-0.2.188` on the same fork keeps that
-# commit reachable. The branch is upstream `libc-0.2` (8c6e6710) plus four
-# commits, split upstream as PRs `rtems-sockaddr-len` and `rtems-type-widths`.
-# Remove this patch once those land in a published 0.2 release.
+# RTEMS 6 (armv7-rtems-eabihf): `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/
+# `off_t`/`rlim_t` widths, the BSD length byte on every socket address struct,
+# and the libbsd values of the socket/poll/getaddrinfo constants.
+# `-Zbuild-std` compiles `std` against this same crate, so a wrong `timespec`
+# or `sockaddr_in` corrupts std itself rather than only our code -- see the two
+# build-refusing asserts in `crates/epics-rtems-boot/src/lib.rs`
+# (`_RTEMS_LIBC_TIME_LAYOUT`, `_RTEMS_LIBC_SOCKET_LAYOUT`), which is why this
+# is a patch and not a local type definition. `scripts/rtems-check.sh` fails
+# all six `image` targets without it.
+#
+# VxWorks 7 (x86_64-wrs-vxworks): `pread`/`pwrite` (removed upstream in
+# 0.2.187, rust-lang/libc#5129) and `killpg` -- std imports all three, and the
+# SDK defines none of them, so they are always-failing shims rather than
+# extern declarations -- plus `getentropy` over the platform's `randABytes`.
+# Without these std itself does not compile for the target; see
+# `doc/upstream-rust-targets/`.
+#
+# NOTE a manifest `[patch]` does NOT reach `-Zbuild-std`, which resolves std's
+# own libc from rust-src's lock; only a CONFIG-level patch does, and only at
+# the exact libc version that lock pins (both measured -- see
+# `scripts/libc-std-patch.sh`). The gates and `scripts/embedded-image.sh`
+# therefore derive a `--config` patch from this entry via that helper (a
+# clone of this rev, version-relabelled for the toolchain), keeping this
+# line the single source of truth for both resolutions.
+#
+# Pinned by rev; the branch is upstream `libc-0.2` (8c6e6710) plus the four
+# RTEMS commits (split upstream as PRs `rtems-sockaddr-len` and
+# `rtems-type-widths`) and the two VxWorks commits above. The retired
+# RTEMS-only pin 6f64e70d stays reachable via the tag `epics-rs-rtems-0.2.188`
+# and as an ancestor of `epics-rs-0.2`. Remove this patch once the fixes land
+# in a published 0.2 release.
 [patch.crates-io]
-libc = { git = "https://github.com/physwkim/libc.git", rev = "6f64e70d6a2a03b989380aaa719207236343f093" }
+libc = { git = "https://github.com/physwkim/libc.git", rev = "31d5776f9952aa349813d7fbef3addae1bf0a5ef" }

@@ -993,7 +993,9 @@ impl Default for PumpConfig {
 ///
 /// Both socket timeouts are set here rather than left to the caller, because
 /// getting `SO_SNDTIMEO` wrong silently disarms [`write_frame_deadline`]'s only
-/// way of regaining control.
+/// way of regaining control. They are not set the same way: `SO_RCVTIMEO` is
+/// fatal and `SO_SNDTIMEO` is best-effort, because one is portable across this
+/// workspace's targets and the other is not — see the call site.
 ///
 /// # The pool, and the two bands it carries
 ///
@@ -1015,8 +1017,24 @@ pub fn drive_socket_blocking(
     config: &PumpConfig,
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
+    // SO_RCVTIMEO, fatal: every target that runs this accepts it.
     stream.set_read_timeout(Some(config.read_timeout))?;
-    stream.set_write_timeout(Some(send_tick_for(config.send_timeout)))?;
+    // SO_SNDTIMEO, best-effort: it is NOT portable the way SO_RCVTIMEO is.
+    // VxWorks 7's socket stack does not implement it and returns ENOPROTOOPT
+    // (errno 42) on an otherwise-good connected socket — measured on target,
+    // where propagating it fatally aborted every CA client circuit the instant
+    // its dial succeeded (`circuit pump threads failed to start ... error=no
+    // protocol option (os error 42)`), so the IOC's `ca://` links never
+    // connected at all. `server_native/blocking.rs` made the same call for the
+    // PVA server's accepted sockets; this is that rule moved into the seam both
+    // blocking CLIENT drivers already share, so neither has to re-decide it.
+    //
+    // The cost is stated rather than hidden: on a target that refuses the
+    // option, [`write_frame_deadline`] loses the timeout tick it regains
+    // control on, so a peer that never reads parks the writer pump in `write`
+    // instead of tripping the deadline. That is a stall under backpressure; the
+    // fatal version was no connection at all.
+    let _ = stream.set_write_timeout(Some(send_tick_for(config.send_timeout)));
 
     // Borrow the circuit's two pump workers as one set, or refuse. Roster order
     // is [reader, writer], the order `acquire` returns them.

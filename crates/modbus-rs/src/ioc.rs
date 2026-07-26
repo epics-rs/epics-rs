@@ -1769,7 +1769,17 @@ impl CommandHandler for ModbusConfigHandler {
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
 
-        let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+        // A port whose actor thread the OS refused is not a port: fail the
+        // command before the registration below claims the name for it. Same
+        // end state as C by a different route — `drvModbusAsyn` is an
+        // `asynPortDriver` subclass (drvModbusAsyn.h:123) built with a bare
+        // `new` (drvModbusAsyn.cpp:3134), so a failed `registerPort` throws
+        // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
+        // it (iocsh.cpp:1274-1284) and st.cmd continues with the port missing.
+        // The `?` is the same error channel the duplicate-name failure below
+        // already uses.
+        let (runtime, _jh) =
+            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
         let port_handle = runtime.port_handle().clone();
         if let Err(e) =
             asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), self.trace.clone())
@@ -4479,7 +4489,8 @@ mod tests {
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
 
-        let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+        let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
         let handle = runtime.port_handle().clone();
         let poller = tokio::spawn(read_poller(
             handle.clone(),

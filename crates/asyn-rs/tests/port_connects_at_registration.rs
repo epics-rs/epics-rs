@@ -44,7 +44,8 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
         driver.base().auto_connect,
         "drvAsynIPPortConfigure leaves autoConnect on unless noAutoConnect is given"
     );
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
 
     // No I/O request is submitted anywhere in this test: registration itself must
     // have brought the port up, and waited for it (C waitConnect). This is the
@@ -93,7 +94,8 @@ fn a_no_auto_connect_port_stays_down_at_registration() {
 
     let mut driver = DrvAsynIPPort::new("R1861N", &format!("127.0.0.1:{port}")).unwrap();
     driver.base_mut().auto_connect = false;
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
 
     assert!(
         !rt.port_handle().is_connected_blocking().unwrap(),

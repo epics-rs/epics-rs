@@ -49,5 +49,5 @@ pub use axis::{
 };
 pub use config::{BackoffConfig, RuntimeConfig, SupervisionPolicy};
 pub use event::RuntimeEvent;
-pub use port::{PortRuntimeHandle, create_port_runtime};
+pub use port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 pub use supervisor::{SupervisionOutcome, supervise};

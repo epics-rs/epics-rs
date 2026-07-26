@@ -68,7 +68,8 @@ impl PortDriver for TestPort {
 /// Exactly what an out-of-tree `drvAsynXxxPortConfigure` does: create the port,
 /// publish it, return. The `PortRuntimeHandle` dies with the closure.
 fn configure_port_like_iocsh(name: &str) {
-    let (runtime, _join) = create_port_runtime(TestPort::new(name), RuntimeConfig::default());
+    let (runtime, _join) = create_port_runtime(TestPort::new(name), RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     register_port(
         name,
         runtime.port_handle().clone(),
@@ -107,7 +108,8 @@ fn explicit_shutdown_still_stops_a_registered_port() {
     let (runtime, _join) = create_port_runtime(
         TestPort::new("explicit_shutdown_reg"),
         RuntimeConfig::default(),
-    );
+    )
+    .expect("the port runtime thread must start");
     register_port(
         "explicit_shutdown_reg",
         runtime.port_handle().clone(),
@@ -135,7 +137,8 @@ fn explicit_shutdown_still_stops_a_registered_port() {
 #[test]
 fn unreachable_port_stops_its_actor_thread() {
     let (runtime, join) =
-        create_port_runtime(TestPort::new("unreachable"), RuntimeConfig::default());
+        create_port_runtime(TestPort::new("unreachable"), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
     // No registry entry, no surviving PortHandle clone.
     drop(runtime);
     with_watchdog("unreachable-join", move || {

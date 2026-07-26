@@ -107,7 +107,7 @@ pub fn create_point_detector(
     let det = PointDetector::new(port_name, mode)?;
     let params = det.params;
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default())?;
 
     Ok(PointDetectorRuntime {
         runtime_handle,

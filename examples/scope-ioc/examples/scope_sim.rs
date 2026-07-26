@@ -24,7 +24,8 @@ async fn main() {
     let indices = driver.param_indices();
 
     // 2. Create port runtime (driver moves into actor thread)
-    let (runtime_handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .expect("the port runtime thread must start");
     let port_handle = runtime_handle.port_handle().clone();
 
     // 3. Subscribe for interrupt notifications

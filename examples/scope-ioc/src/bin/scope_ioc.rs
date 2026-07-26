@@ -57,7 +57,8 @@ impl CommandHandler for ConfigHandler {
         let indices = driver.param_indices();
 
         // Create the port runtime (actor thread + PortHandle)
-        let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+        let (runtime_handle, _actor_jh) =
+            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();

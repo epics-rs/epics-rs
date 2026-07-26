@@ -4,8 +4,11 @@ use std::time::Instant;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
+// Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
+// the runtime layer, and this crate already depends on it unconditionally.
+use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use parking_lot::Mutex;
 
 // ===== Stats-specific channel definitions =====
@@ -668,15 +671,29 @@ pub fn create_ts_port_runtime(
         ts_timestamp: driver.params.ts_timestamp,
     };
 
-    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    // Constructor-shaped like the plugin runtimes in `ad-core-rs`: this
+    // function returns the built port and has no error channel to its
+    // `*Configure` caller, so the only alternative is a handle to a port that
+    // does not exist. C prints and throws here (asynPortDriver.cpp:4036-4040)
+    // and iocsh catches it (iocsh.cpp:1274-1284), leaving the C IOC serving
+    // without the port; we deviate on purpose — see `port_runtime_unavailable`.
+    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
-    // Spawn data ingestion thread
-    let data_jh = std::thread::Builder::new()
-        .name(format!("ts-data-{port_name}"))
-        .spawn(move || {
-            ts_data_thread(shared, data_rx);
-        })
-        .expect("failed to spawn TS data thread");
+    // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
+    // `NDPluginDriver`, so in C this loop runs on the plugin callback threads
+    // built at `NDPluginDriver.cpp:1016` — band and stack from
+    // `asynNDArrayDriver.cpp:876-879`, and a creation failure throws
+    // `epicsThread::unableToCreateThread` (`epicsThread.cpp:214-220`) rather
+    // than returning a status the plugin carries on from.
+    let data_jh = MandatoryThread::new(
+        format!("ts-data-{port_name}"),
+        ThreadPriority::Medium,
+        StackSizeClass::Medium,
+    )
+    .spawn(move || {
+        ts_data_thread(shared, data_rx);
+    });
 
     (runtime_handle, ts_params, actor_jh, data_jh)
 }
@@ -684,6 +701,44 @@ pub fn create_ts_port_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Invariant
+    ///
+    /// MUST: the `ts-data-*` thread be created through [`MandatoryThread`].
+    ///
+    /// `NDPluginTimeSeries` derives from `NDPluginDriver`, so in C this loop
+    /// runs on the callback threads built at `NDPluginDriver.cpp:1016`, and a
+    /// creation failure there throws `epicsThread::unableToCreateThread`
+    /// (`epicsThread.cpp:214-220`) rather than returning a status. Where C ends
+    /// up is not where we do, deliberately: iocsh catches what a command throws
+    /// (`iocsh.cpp:1274-1284`) and st.cmd continues by default
+    /// (`iocsh.cpp:1001`, `:1129`), so the C IOC keeps the plugin's port
+    /// registered with nothing ingesting behind it. The `.expect` this replaced
+    /// produced that same zombie by unwinding one thread on a
+    /// `panic = "unwind"` target.
+    #[test]
+    fn the_ts_data_thread_is_mandatory() {
+        let src = include_str!("time_series.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert_eq!(prod.matches("MandatoryThread::new(").count(), 1);
+        let strays: Vec<&str> = prod
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| {
+                l.contains(concat!("thread", "::Builder::new()"))
+                    || l.contains(concat!("thread", "::spawn("))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a data thread created outside `MandatoryThread` resolves its own \
+             spawn failure locally: {strays:?}"
+        );
+    }
 
     #[test]
     fn test_one_shot() {

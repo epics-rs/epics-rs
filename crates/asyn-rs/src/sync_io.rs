@@ -245,7 +245,8 @@ mod tests {
     use crate::runtime::PortRuntimeHandle;
 
     fn make_sync_io() -> (SyncIOHandle, PortRuntimeHandle) {
-        let (handle, _jh) = create_port_runtime(TestPort::new(), RuntimeConfig::default());
+        let (handle, _jh) = create_port_runtime(TestPort::new(), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
         let sio =
             SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
         (sio, handle)
@@ -313,7 +314,8 @@ mod tests {
                 PortFlags::default(),
             )),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
 
         assert_eq!(sio.drv_user_create("ANYTHING").unwrap(), 0);
@@ -397,7 +399,8 @@ mod tests {
         let (handle, _jh) = create_port_runtime(
             PartialThenTimeout(PortDriverBase::new("syncpartial", 1, PortFlags::default())),
             RuntimeConfig::default(),
-        );
+        )
+        .expect("the port runtime thread must start");
         let sio =
             SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
 

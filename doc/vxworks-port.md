@@ -673,9 +673,23 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
 
 ## 7. Known opens
 
-* **E8 / E9 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
-  for this target; E9 needs a VxWorks SYN ladder; E10's dial numbers are now
-  unblocked, since the probe images link and run. None has been run on VxWorks.
+* **E9 — DONE 2026-07-26**, in
+  [vxworks-circuit-wedge-on-target-measurement.md](vxworks-circuit-wedge-on-target-measurement.md).
+  The `CircuitDeathGuard` A/B was run on target and the fix confirmed: the
+  control image holds one descriptor (`peer=none(errno=57)`, the same local
+  port) across seven consecutive censuses of a 480 s link cut, the fix image
+  holds none. The redial ladder that had to be measured first is **75.0 s per
+  rung, 74900–75000 ms over eight rungs**, ~30 s of client backoff between
+  rungs — it coincides with the RTEMS `TCPTV_KEEP_INIT`, which was not knowable
+  in advance. The errno does not transfer (BSD numbering, and it varies between
+  `EHOSTUNREACH` 65 and `ETIMEDOUT` 60 across attempts of the same cut), nor
+  does the RTEMS census signature (`mode` stays `0140666` on a dead VxWorks
+  socket). Running it uncovered and fixed one shipped defect: `SO_SNDTIMEO` is
+  unimplemented here and `drive_socket_blocking` propagated its `ENOPROTOOPT`
+  fatally, so a CA client on this target established no circuits at all.
+* **E8 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
+  for this target; E10's dial numbers are now unblocked, since the probe images
+  link and run. Neither has been run on VxWorks.
 * **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
   Not a formula difference: `StackSizeClass::bytes` is
   `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as

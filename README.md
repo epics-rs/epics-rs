@@ -196,7 +196,7 @@ nightly toolchain with `rust-src` (plus `jq`), and `-Zbuild-std`:
 # bootable CA IOC image (needs arm-rtems6-gcc on PATH and a libbsd BSP)
 RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
-    -p epics-ca-rs --bin rtems-ca-ioc --no-default-features --features client-core
+    -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
 ```
 
 The custom target spec this workspace deviates on (`has-thread-local: true`,

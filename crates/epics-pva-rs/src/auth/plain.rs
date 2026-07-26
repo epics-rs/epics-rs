@@ -333,9 +333,10 @@ mod tests {
     /// it assert something it does not mean: that *no rule anywhere* in the
     /// script may name RTEMS. `build.rs` has since acquired a second, unrelated
     /// rule — the `exec_backend` / `tokio_backend` task-backend decision, which
-    /// is `target_os == "rtems" || feature "rtems-exec-model"` and therefore
-    /// *must* name the target, exactly as `epics-base-rs`'s own `build.rs`
-    /// does. A whole-file scan rejected that correct rule.
+    /// is `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) or
+    /// feature `"rtems-exec-model"`, and therefore *must* name the target,
+    /// exactly as `epics-base-rs`'s own `build.rs` does. A whole-file scan
+    /// rejected that correct rule.
     ///
     /// Narrowing it to the named predicate makes the guard stricter about the
     /// thing it is for, not laxer: an exclusion-list `os != "rtems"` inside

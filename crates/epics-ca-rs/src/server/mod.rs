@@ -4,16 +4,17 @@ pub mod access_token;
 pub mod addr_list;
 // The async server front-end — the `tokio::net` accept/beacon/introspection
 // stack and the `CaServer` orchestrator (which also drives `tokio::signal` and
-// the `discovery` stack) — is host-only; its deps do not build for RTEMS. The
-// RTEMS build serves CA through the `std::net` `blocking` driver plus the
-// runtime-agnostic shared logic in `tcp`/`udp`/`monitor`/`stats`. Gated out for
-// the RTEMS target (armv7-rtems-eabihf).
-#[cfg(not(target_os = "rtems"))]
+// the `discovery` stack) — is host-only; its deps do not build for RTEMS or
+// VxWorks. The embedded build serves CA through the `std::net` `blocking`
+// driver plus the runtime-agnostic shared logic in
+// `tcp`/`udp`/`monitor`/`stats`. Gated out for `epics_embedded_target`
+// (`armv7-rtems-eabihf`, the `*-wrs-vxworks*` triples).
+#[cfg(not(epics_embedded_target))]
 pub mod beacon;
 pub mod blocking;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod ca_server;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod introspection;
 pub mod ioc_app;
 pub mod iocsh;
@@ -21,13 +22,13 @@ pub mod monitor;
 pub mod outbox;
 pub mod rate_limit;
 pub(crate) mod recv;
-#[cfg(all(feature = "cap-tokens", not(target_os = "rtems")))]
+#[cfg(all(feature = "cap-tokens", not(epics_embedded_target)))]
 pub mod signed_beacon;
 pub mod stats;
 pub mod tcp;
 pub mod udp;
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
 /// Live-connection / byte / channel / subscription counters. Runtime-agnostic
 /// (pure atomics) and shared by the async server and the blocking driver's
@@ -36,11 +37,11 @@ pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 
 // `run_ca_ioc` (below) builds a `CaServer` — the async front-end — so both it
-// and these imports are host-only. The RTEMS IOC entry point is the blocking
-// server driver (`server::blocking`).
-#[cfg(not(target_os = "rtems"))]
+// and these imports are host-only. The embedded IOC entry point is the
+// blocking server driver (`server::blocking`).
+#[cfg(not(epics_embedded_target))]
 use epics_base_rs::error::CaResult;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
 /// Convert a `$`-channel snapshot value from `EpicsValue::String` to
@@ -136,7 +137,7 @@ pub(super) fn apply_long_string_mode(
 ///     .run(epics_ca_rs::server::run_ca_ioc)
 ///     .await
 /// ```
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
     let server = CaServer::from_parts(
         config.db,

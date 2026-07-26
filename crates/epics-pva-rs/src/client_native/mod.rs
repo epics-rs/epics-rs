@@ -23,18 +23,21 @@ pub mod channel;
 pub mod context;
 pub mod operation;
 pub mod ops_v2;
-// The UDP SEARCH modules are compiled out on the RTEMS target: newlib lacks the
-// `recvmsg`/`IP_PKTINFO` receive path and `local_addr()` readback a UDP search
-// needs, so the target resolves PVs over TCP name servers alone through
-// `search_engine`'s `SearchTransport::NameServersOnly` seam
-// (doc/pvalink-rtems-design.md §4.2). `search` is the legacy standalone search
-// path and `udp` is the client UDP manager — both are host-only surface (the
-// latter is used by the host-only `pvxvct-rs` tool and the search-engine tests).
-#[cfg(not(target_os = "rtems"))]
+// The UDP SEARCH modules are compiled out on every embedded target: RTEMS
+// newlib lacks the `recvmsg`/`IP_PKTINFO` receive path and `local_addr()`
+// readback a UDP search needs, and the same module gate excludes VxWorks too
+// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2`/`if-addrs` stack is
+// host-only for both), so an embedded build resolves PVs over TCP name
+// servers alone through `search_engine`'s `SearchTransport::NameServersOnly`
+// seam (doc/pvalink-rtems-design.md §4.2). `search` is the legacy standalone
+// search path and `udp` is the client UDP manager — both are host-only
+// surface (the latter is used by the host-only `pvxvct-rs` tool and the
+// search-engine tests).
+#[cfg(not(epics_embedded_target))]
 pub mod search;
 pub mod search_engine;
 pub mod server_conn;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod udp;
 
 pub use context::{AssertedIdentity, CacheAction, PvGetResult, PvaClient, PvaClientBuilder};
@@ -115,14 +118,15 @@ mod spawn_seam_guard {
     /// backoff). A task moved onto the callback pool takes its timer calls with
     /// it, so pinning where tasks *start* says nothing about what they wait on.
     ///
-    /// Scope is the files that compile for `armv7-rtems-eabihf`. `udp.rs` and
-    /// `search.rs` are `#[cfg(not(target_os = "rtems"))]` (see the module list
-    /// above) — they may use `tokio::time` freely, because no target build ever
-    /// contains them.
+    /// Scope is the files that compile for `armv7-rtems-eabihf` (and the
+    /// `*-wrs-vxworks*` triples). `udp.rs` and `search.rs` are
+    /// `#[cfg(not(epics_embedded_target))]` (see the module list above) —
+    /// they may use `tokio::time` freely, because no embedded-target build
+    /// ever contains them.
     #[test]
     fn client_scope_timers_go_through_the_runtime_seam() {
         // (file source, an anchor that must survive in the production slice).
-        // The RTEMS-compiled client files only.
+        // The embedded-target-compiled client files only.
         let files: &[(&str, &str)] = &[
             (include_str!("context.rs"), "impl PvaClient"),
             (

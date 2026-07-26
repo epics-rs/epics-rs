@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
-# The RTEMS boot shim for `rtems-ca-ioc`. Empty on every non-RTEMS target, so
+# The RTEMS boot shim for `realtime-ca-ioc`. Empty on every non-RTEMS target, so
 # this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
 # one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in
 # the IOC's `main`. (The design's reason for gating it — that a host build
@@ -51,34 +51,40 @@ opentelemetry_sdk = { version = "0.24", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
 tracing-opentelemetry = { version = "0.25", optional = true }
 
-# Host-only dependencies — gated out for the RTEMS target (armv7-rtems-eabihf).
+# Host-only dependencies — gated out for the embedded targets (RTEMS's
+# armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).
 #
 # The async CA front-end (`tokio::net` async server/client, the UDP net stack)
-# is host-only: its deps do not build for RTEMS, and the RTEMS CA server uses
-# the separate S1 `std::net` blocking driver (`server::blocking`), not these.
+# is host-only: its deps do not build for RTEMS or VxWorks, and the embedded
+# CA server uses the separate S1 `std::net` blocking driver
+# (`server::blocking`), not these.
 #
-# tokio: the hosted build uses the full runtime; the RTEMS build drops the
+# tokio: the hosted build uses the full runtime; the embedded build drops the
 # `net`, `signal`, and `process` features — the ones that pull `mio`,
 # `signal-hook-registry`, and `socket2` (0.6 transitively), none of which build
-# for armv7-rtems-eabihf. Declared per-target rather than in shared
-# `[dependencies]` because Cargo UNIONS a dependency's features across all
-# matching tables, so a shared `full` would re-add the dropped features on
-# RTEMS. The retained set (rt/rt-multi-thread/time/sync/macros/io/fs) keeps
-# every non-net tokio API the always-compiled shared code uses (Handle,
-# block_in_place, select!, sync primitives, tokio::io duplex/split) compiling
-# on RTEMS; those paths are unused there (the blocking driver drives via the
-# runtime::task seam) but must still type-check for `--lib`.
+# for armv7-rtems-eabihf or the `*-wrs-vxworks*` triples. Declared per-target
+# rather than in shared `[dependencies]` because Cargo UNIONS a dependency's
+# features across all matching tables, so a shared `full` would re-add the
+# dropped features on either embedded target. The retained set
+# (rt/rt-multi-thread/time/sync/macros/io/fs) keeps every non-net tokio API
+# the always-compiled shared code uses (Handle, block_in_place, select!, sync
+# primitives, tokio::io duplex/split) compiling there; those paths are unused
+# there (the blocking driver drives via the runtime::task seam) but must
+# still type-check for `--lib`.
 #
 # `socket2` (async TCP keepalive + UDP shared-port setup) and `if-addrs`
 # (interface enumeration for beacons / mDNS / addr-list) back only the async
 # front-end; the blocking driver sets socket options via raw `libc`. Both go
-# host-only.
-[target.'cfg(not(target_os = "rtems"))'.dependencies]
+# host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
+# this table via the `build.rs`-emitted `epics_embedded_target` cfg, which
+# `Cargo.toml` target tables cannot reference directly (only built-in `cfg()`
+# predicates), hence spelling the target-OS pair out here.
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 
-[target.'cfg(target_os = "rtems")'.dependencies]
+[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
@@ -137,7 +143,7 @@ client = ["client-core"]
 # is byte-identical without it. See `crates/epics-base-rs/build.rs`.
 rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # The RTEMS bring-up measurement rig (doc/calink-rtems-design.md §6 stage C6,
-# gated by §11.7 item 3): the 14 C6 probe records in `rtems-ca-ioc`'s built-in
+# gated by §11.7 item 3): the 14 C6 probe records in `realtime-ca-ioc`'s built-in
 # database, its two probe threads (the tick task and the `c6-probe` reporter),
 # and the compiled-in SLIRP search topology. OFF by default — the default
 # binary is a clean IOC with no probe records, no probe threads and no link
@@ -291,13 +297,13 @@ path = "src/bin/ca-admin-rs.rs"
 
 # The RTEMS CA IOC entry point (design doc §9.5). Deliberately NOT given
 # `required-features`: it must be built by a bare `cargo check --bin
-# rtems-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
+# realtime-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
 # would make cargo silently *skip* the target instead, turning the RTEMS
 # gate into a vacuous pass. Under the hosted default backend it compiles and
 # is linted, but refuses to run (see the module docs).
 [[bin]]
-name = "rtems-ca-ioc"
-path = "src/bin/rtems-ca-ioc.rs"
+name = "realtime-ca-ioc"
+path = "src/bin/realtime-ca-ioc.rs"
 
 [[bin]]
 name = "ca-soak"

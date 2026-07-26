@@ -9,12 +9,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 // The UDP SEARCH transport is compiled out wherever a spawned future has no
-// tokio reactor — `cfg(exec_backend)`, which is the RTEMS target *and* a host
-// `--features rtems-exec-model` build. Two facts, one gate:
+// tokio reactor — `cfg(exec_backend)`, which is either embedded target
+// (RTEMS or VxWorks) *and* a host `--features rtems-exec-model` build. Two
+// facts, one gate:
 //
-//   * On the target `AsyncUdpV4` does not exist at all (it is host-only in
+//   * On RTEMS `AsyncUdpV4` does not exist at all (it is host-only in
 //     `epics-base-rs`): newlib has no `recvmsg`/`IP_PKTINFO` receive path and
-//     cannot read a socket's `local_addr()` back.
+//     cannot read a socket's `local_addr()` back. It is gated out on VxWorks
+//     too — `tokio::net`/`socket2`/`if-addrs` do not build for either
+//     embedded target, so `AsyncUdpV4` stays one host-only module rather than
+//     splitting its absence into a separate reason per target.
 //   * On either backend-free build the engine runs on a callback-pool worker
 //     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
 //     "there is no reactor running" — even when the process has a runtime
@@ -27,7 +31,8 @@ use std::time::{Duration, Instant};
 // the predicate that means "a reactor exists" and is the one the whole UDP
 // surface below carries, so "this build binds no UDP socket" holds by
 // construction rather than by a runtime branch. The target's compiled surface
-// is unchanged: `target_os = "rtems"` implies `exec_backend`.
+// is unchanged: `epics_embedded_target` (RTEMS or VxWorks) implies
+// `exec_backend`.
 //
 // Either way the client resolves every PV over TCP name servers through
 // `SearchTransport::NameServersOnly` (design §4.2, §4.5).

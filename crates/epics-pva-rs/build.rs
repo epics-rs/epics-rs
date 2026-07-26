@@ -1,7 +1,7 @@
 //! Names the one capability `auth::plain` needs and `cfg(unix)` cannot express.
 //!
 //! This script used to also call `epics_rtems_boot::contract::emit_link_args()`
-//! for `rtems-pva-ioc`. That binary now lives in `epics-bridge-rs`
+//! for `realtime-pva-ioc`. That binary now lives in `epics-bridge-rs`
 //! (doc/qsrv-rtems-design.md §9.7), and link arguments are emitted by the
 //! package that owns the binary, so the call moved with it. This package
 //! produces no RTEMS binary, so emitting them here would have decorated a link
@@ -89,7 +89,8 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // `epics-base-rs`'s `build.rs` defines this rule and this script repeats it,
 // for this crate's own compilation:
 //
-//     exec_backend  ⟺  target_os == "rtems"  ||  feature "rtems-exec-model"
+//     exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
+//                   ||  feature "rtems-exec-model"
 //     tokio_backend ⟺  otherwise
 //
 // Why the PVA client needs it. Every client task is started through
@@ -100,7 +101,7 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
 // the target when the fact it needs is the *backend*; a host build with
 // `--features rtems-exec-model` compiled the UDP transport in and panicked on
-// it at `rtems-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
+// it at `realtime-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
 // §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
 // exists", so the transport takes that one and `SearchTransport` has the
 // single `NameServersOnly` variant on `exec_backend` — the target's shape,
@@ -131,17 +132,22 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(pva_blocking_client)");
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
+    println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
 
-    let rtems = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("rtems");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let embedded_target = matches!(os.as_str(), "rtems" | "vxworks");
+    if embedded_target {
+        println!("cargo::rustc-cfg=epics_embedded_target");
+    }
+
     let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
-    if rtems || host_exec_model {
+    if embedded_target || host_exec_model {
         println!("cargo::rustc-cfg=exec_backend");
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }
 
     let unix = std::env::var_os("CARGO_CFG_UNIX").is_some();
-    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if local_account_db(unix, &os) {
         println!("cargo::rustc-cfg=local_account_db");

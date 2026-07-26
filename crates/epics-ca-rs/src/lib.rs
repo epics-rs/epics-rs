@@ -32,12 +32,14 @@
 // `default = ["client"]` keeps every hosted consumer on the full set; an
 // RTEMS image selects `client-core` (`scripts/rtems-check.sh`).
 //
-// `discovery`, `repeater` and `hostname` stay gated on the TARGET, not on a
-// feature: each is host-only for a reason that is a fact about the platform
-// (`mdns-sd`/`hickory` do not build for RTEMS; `getnameinfo` has no newlib
-// backing), and each has a consumer outside the client — `discovery` backs
-// the CA server's mDNS/DNS announce, `repeater` backs `ca-repeater-rs`. What
-// the `client` feature owns is the client's *references* to them.
+// `discovery`, `repeater` and `hostname` stay gated on `epics_embedded_target`
+// (RTEMS or VxWorks), not on a feature: each is host-only for a reason that
+// is a fact about the platform (`mdns-sd`/`hickory` do not build for either;
+// `getnameinfo` has no newlib backing on RTEMS and is absent from `libc`'s
+// VxWorks module too), and each has a consumer outside the client —
+// `discovery` backs the CA server's mDNS/DNS announce, `repeater` backs
+// `ca-repeater-rs`. What the `client` feature owns is the client's
+// *references* to them.
 pub mod audit;
 /// CA links for record INP/OUT fields — resolves ` CA`-modified /
 /// `ca://` record link fields to a live CA client (monitor-backed
@@ -55,15 +57,15 @@ pub mod chaos;
 // CA client-tool option/format helpers. They name `client` items, so they
 // follow it; still host-only on top of that, because their consumers are the
 // host CLI binaries.
-#[cfg(all(feature = "client-core", not(target_os = "rtems")))]
+#[cfg(all(feature = "client-core", not(epics_embedded_target)))]
 pub mod cli;
 #[cfg(feature = "client-core")]
 pub mod client;
 // CA client-tool (`caget`/`caput`/`cainfo`) argument parsing; it references
 // `cli::IntStyle` and backs only the host client binaries.
-#[cfg(all(feature = "client-core", not(target_os = "rtems")))]
+#[cfg(all(feature = "client-core", not(epics_embedded_target)))]
 pub mod copt;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod discovery;
 pub mod estdlib;
 // Reverse-DNS (`getnameinfo` via `socket2::SockAddr`) for the CA client's
@@ -71,12 +73,12 @@ pub mod estdlib;
 // `peer_resolved_name`, so it follows the `client` feature as well as the
 // target: `client-core` names a peer by its dotted address, which is C's own
 // answer for an address with no PTR record.
-#[cfg(all(feature = "client", not(target_os = "rtems")))]
+#[cfg(all(feature = "client", not(epics_embedded_target)))]
 pub mod hostname;
 pub(crate) mod iocinf;
 pub mod observability;
 pub mod protocol;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod repeater;
 pub mod replay;
 pub mod server;

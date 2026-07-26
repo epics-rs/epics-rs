@@ -1,6 +1,6 @@
-//! `rtems-pva-ioc` — the RTEMS pvAccess IOC entry point.
+//! `realtime-pva-ioc` — the RTEMS pvAccess IOC entry point.
 //!
-//! The PVA counterpart of `epics-ca-rs`'s `rtems-ca-ioc`, and the second
+//! The PVA counterpart of `epics-ca-rs`'s `realtime-ca-ioc`, and the second
 //! binary in the workspace built for the target. A runnable `main` that brings
 //! up a complete PVA server on the **RTEMS execution model** and nothing else:
 //! no tokio runtime is ever created, no async front-end is touched, and every
@@ -107,15 +107,20 @@
 //! it stays compiled and linted in the default test set, but refuses to run
 //! rather than silently starting the runtime it exists to avoid.
 //!
-//! The predicate is `any(target_os = "rtems", feature = "rtems-exec-model")`,
-//! the same one `rtems-ca-ioc` carries. It was narrowed to `target_os =
-//! "rtems"` alone for one stage — `epics-bridge-rs` did not yet declare
-//! `rtems-exec-model`, and naming a feature the crate does not have is a
-//! dangling predicate: `unexpected_cfg` warnings and an arm no configuration
-//! can select. Stage 4 declared the feature *with* the `rtems-exec-gate`
-//! census it owes (§6.3) rather than dodging the bill by adding the name
-//! alone, so the `any(...)` form is back and the body below is host-compiled,
-//! host-linted and host-tested under `--features rtems-exec-model`.
+//! The predicate is `any(target_os = "rtems", target_os = "vxworks", feature
+//! = "rtems-exec-model")`, the same one `realtime-ca-ioc` carries. It was
+//! narrowed to `target_os = "rtems"` alone for one stage — `epics-bridge-rs`
+//! did not yet declare `rtems-exec-model`, and naming a feature the crate
+//! does not have is a dangling predicate: `unexpected_cfg` warnings and an
+//! arm no configuration can select. Stage 4 declared the feature *with* the
+//! `rtems-exec-gate` census it owes (§6.3) rather than dodging the bill by
+//! adding the name alone, so the `any(...)` form is back and the body below
+//! is host-compiled, host-linted and host-tested under `--features
+//! rtems-exec-model`. `target_os = "vxworks"` is bin-side plumbing only — the
+//! `exec_backend` cfg `epics-base-rs/build.rs` derives for the
+//! `runtime::task` seam still gates on `target_os = "rtems"` or the feature,
+//! so a VxWorks build also needs one of those until its own `exec_backend`
+//! predicate lands.
 //!
 //! Coverage today, in full: `scripts/rtems-check.sh` compiles it for the
 //! target in both configurations; the host feature-ON selection compiles it
@@ -136,7 +141,12 @@ use std::process::ExitCode;
 /// this file parse it and build the group for real; the `rtems` and
 /// `rtems-exec-model` arms are the production use. On a host non-test build
 /// with the feature off it is compiled away, so it is never dead code.
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model", test))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model",
+    test
+))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -164,7 +174,7 @@ mod demo_db {
         "  info(Q:group, {\"RTEMS:PVA:GRP\":",
         "{\"count\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":1}}})\n",
         "}\n",
-        "record(stringout, \"RTEMS:PVA:MSG\") { field(VAL, \"rtems-pva-ioc\")\n",
+        "record(stringout, \"RTEMS:PVA:MSG\") { field(VAL, \"realtime-pva-ioc\")\n",
         "  info(Q:group, {\"RTEMS:PVA:GRP\":",
         "{\"message\":{\"+channel\":\"VAL\",\"+type\":\"plain\",\"+putorder\":2}}})\n",
         "}\n",
@@ -258,7 +268,11 @@ mod demo_db {
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -287,7 +301,7 @@ mod ioc {
     ///
     /// This plays `$(IOCNAME)`'s role in devIocStats' templates — the whole
     /// name is `<prefix>:<upstream leaf>`, one colon, upstream's spelling on
-    /// the right. Deliberately the same value `rtems-ca-ioc` uses: the two
+    /// the right. Deliberately the same value `realtime-ca-ioc` uses: the two
     /// binaries are two front-ends for the same board, never both running, so
     /// an operator's screens should not have to know which one booted.
     const STATUS_PREFIX: &str = "RTEMS";
@@ -382,32 +396,16 @@ mod ioc {
     #[cfg(feature = "bringup-probes")]
     const STAGE5_NAME_SERVER: &str = "10.0.2.2:15076";
 
-    // STAGE-5 PROBE: the C task census and stack-usage report — see
-    // `csrc/rtems_stats.c`. Present only on a linked RTEMS image.
-    // (A `///` doc comment here is `unused_doc_comments`: rustdoc does not
-    // document extern blocks, and the target build is the only one that
-    // compiles this.)
-    #[cfg(all(target_os = "rtems", feature = "bringup-probes"))]
-    unsafe extern "C" {
-        fn epics_rtems_boot_dump_tasks(tag: *const std::ffi::c_char);
-        fn epics_rtems_boot_stack_report(tag: *const std::ffi::c_char);
-    }
-
     /// STAGE-5 PROBE: `rt top` + `rt stackuse`, from inside the image.
+    ///
+    /// Both calls go through `epics_rtems_boot::stats`, which owns the per-OS
+    /// backend — see the same function in `realtime-ca-ioc` for why the
+    /// `extern "C"` block and the `#[cfg(target_os = …)]` pair that used to sit
+    /// here are gone.
     #[cfg(feature = "bringup-probes")]
     fn stage5_task_and_stack_report(tag: &str) {
-        #[cfg(target_os = "rtems")]
-        {
-            let c = std::ffi::CString::new(tag).unwrap_or_default();
-            // SAFETY: both take a NUL-terminated tag and only read it; the
-            // C side does its own bounds-checked iteration.
-            unsafe {
-                epics_rtems_boot_dump_tasks(c.as_ptr());
-                epics_rtems_boot_stack_report(c.as_ptr());
-            }
-        }
-        #[cfg(not(target_os = "rtems"))]
-        let _ = tag;
+        epics_rtems_boot::stats::dump_tasks(tag);
+        epics_rtems_boot::stats::stack_report(tag);
     }
 
     /// STAGE-5 PROBE: one console report — the link registry, the ONE
@@ -460,10 +458,10 @@ mod ioc {
         // nothing next to an attempt count of 1.
         let (dial_workers, dial_attempts) =
             epics_pva_rs::client_native::server_conn::dial_pool_probe();
-        let (mem_free, mem_used) = match epics_rtems_boot::stats::mem_usage() {
-            Some(m) => (m.free as i64, m.used as i64),
-            None => (-1, -1),
-        };
+        // Each field carries its own -1 — see the same site in `realtime-ca-ioc`.
+        let mem = epics_rtems_boot::stats::mem_usage();
+        let mem_free = mem.free.map_or(-1, |v| v as i64);
+        let mem_used = mem.used.map_or(-1, |v| v as i64);
         println!(
             "STAGE5 seq={seq} dialpool workers={dial_workers} attempts={dial_attempts} \
              MEM_FREE={mem_free} MEM_USED={mem_used}",
@@ -484,6 +482,18 @@ mod ioc {
         //     absent from the image. Compiles to nothing on a host build.
         epics_rtems_boot::link_anchor();
 
+        // (0-reg) Announce this thread to the statistics funnel's thread
+        //     census. Every other IOC thread does this from
+        //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
+        //     not call — it is the one thread that keeps the band the OS
+        //     started it with — so it is also the one thread that has to
+        //     register itself. Without this the census would be missing the
+        //     thread that owns the database.
+        //
+        //     No `#[cfg]`: the funnel is portable and every backend but
+        //     VxWorks' takes this as a no-op.
+        epics_rtems_boot::stats::register_task();
+
         // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
         // `rtems_init.c:195` hands `main` a fixed one-element argv and
         // `POSIX_Init` calls `setenv` zero times, so on the target nothing
@@ -493,7 +503,7 @@ mod ioc {
         // the variable once at construction (`client_native/context.rs:171`).
         //
         // A default, not an override: an already-set variable stays as set,
-        // so a host harness (`tests/rtems_pva_ioc_boots.rs`) can point the
+        // so a host harness (`tests/realtime_pva_ioc_boots.rs`) can point the
         // dial somewhere it controls instead of the image's SLIRP address.
         //
         // SAFETY (edition 2024): this runs on the single init thread before
@@ -535,7 +545,7 @@ mod ioc {
         let db = match load_database(&db_files) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("rtems-pva-ioc: iocInit failed: {e}");
+                eprintln!("realtime-pva-ioc: iocInit failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -557,7 +567,7 @@ mod ioc {
             Ok(m) => m,
             Err(_) => {
                 eprintln!(
-                    "rtems-pva-ioc: the QSRV mount needs a plain thread with no runtime entered"
+                    "realtime-pva-ioc: the QSRV mount needs a plain thread with no runtime entered"
                 );
                 return ExitCode::FAILURE;
             }
@@ -623,7 +633,7 @@ mod ioc {
         if let Err(e) =
             composite.add_source("qsrvSingle", Arc::new(PvDatabaseSource::new(db.clone())), 0)
         {
-            eprintln!("rtems-pva-ioc: cannot register the single-record source: {e}");
+            eprintln!("realtime-pva-ioc: cannot register the single-record source: {e}");
             return ExitCode::FAILURE;
         }
         // Only when QSRV2 is enabled, matching pvxs calling `group_enable()`
@@ -631,7 +641,7 @@ mod ioc {
         // the IOC still serves every single record — it just answers no group.
         if mount.enabled {
             if let Err(e) = composite.add_source("qsrvGroup", mount.store.clone(), 1) {
-                eprintln!("rtems-pva-ioc: cannot register the QSRV group source: {e}");
+                eprintln!("realtime-pva-ioc: cannot register the QSRV group source: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -644,7 +654,7 @@ mod ioc {
                     // `local_addr`, and on RTEMS that is the call that fails
                     // (the libc `sockaddr` length byte). The inner error says which.
                     eprintln!(
-                        "rtems-pva-ioc: cannot start the PVA TCP server on port {tcp_port}: {e}"
+                        "realtime-pva-ioc: cannot start the PVA TCP server on port {tcp_port}: {e}"
                     );
                     return ExitCode::FAILURE;
                 }
@@ -666,24 +676,26 @@ mod ioc {
         //      The reported port is read back off the bound socket, never
         //      echoed from the config: with an ephemeral request the two differ,
         //      and a console line that says "UDP search on 0" is worse than none.
-        let (udp, search_status) =
-            match bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, udp_port)) {
-                Ok(s) => {
-                    let status = search_status(Some(s.local_addr()));
-                    (Some(s), status)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "rtems-pva-ioc: no UDP name-search responder on port {udp_port}: {e}\n\
-                         rtems-pva-ioc: the server is still serving on TCP {bound_tcp}; reach it \
+        let (udp, search_status) = match bind_udp_search(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            udp_port,
+        )) {
+            Ok(s) => {
+                let status = search_status(Some(s.local_addr()));
+                (Some(s), status)
+            }
+            Err(e) => {
+                eprintln!(
+                    "realtime-pva-ioc: no UDP name-search responder on port {udp_port}: {e}\n\
+                         realtime-pva-ioc: the server is still serving on TCP {bound_tcp}; reach it \
                          with EPICS_PVA_NAME_SERVERS=<host>:{bound_tcp}"
-                    );
-                    (None, search_status(None))
-                }
-            };
+                );
+                (None, search_status(None))
+            }
+        };
 
         // (3c) The status PVs. Same facility, same names and the same reason as
-        //      `rtems-ca-ioc`: on a target with no iocsh and no shell these are
+        //      `realtime-ca-ioc`: on a target with no iocsh and no shell these are
         //      the only way to ask the IOC how it is doing from anywhere but a
         //      write-only serial console. The descriptor, heap and uptime set
         //      is `target_status_pvs`, so both IOCs answer to one vocabulary.
@@ -703,7 +715,7 @@ mod ioc {
             }),
         );
         if let Err(e) = serve_status_pvs(db_for_status, status) {
-            eprintln!("rtems-pva-ioc: cannot register the status PVs: {e}");
+            eprintln!("realtime-pva-ioc: cannot register the status PVs: {e}");
             return ExitCode::FAILURE;
         }
 
@@ -714,7 +726,7 @@ mod ioc {
         names.sort();
 
         // Raw `Builder` rather than `spawn_dedicated_thread`, matching
-        // `rtems-ca-ioc`: `serve` and `serve_udp_search` each take their own
+        // `realtime-ca-ioc`: `serve` and `serve_udp_search` each take their own
         // thread to their own priority through `enter_ioc_thread`, so a
         // priority passed here would be set twice and the second one would win
         // anyway. The stack class is stated, which is what the guard wants.
@@ -728,7 +740,7 @@ mod ioc {
         {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("rtems-pva-ioc: cannot start the PVA accept thread: {e}");
+                eprintln!("realtime-pva-ioc: cannot start the PVA accept thread: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -742,7 +754,7 @@ mod ioc {
                 {
                     Ok(h) => Some(h),
                     Err(e) => {
-                        eprintln!("rtems-pva-ioc: cannot start the PVA name-search thread: {e}");
+                        eprintln!("realtime-pva-ioc: cannot start the PVA name-search thread: {e}");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -751,13 +763,13 @@ mod ioc {
         };
 
         println!(
-            "rtems-pva-ioc: serving {} records on PVA TCP port {bound_tcp} ({search_status}), \
+            "realtime-pva-ioc: serving {} records on PVA TCP port {bound_tcp} ({search_status}), \
              GUID {}, RTEMS execution model, no tokio runtime",
             names.len(),
             guid_hex(server.guid()),
         );
         println!(
-            "rtems-pva-ioc: QSRV2 {} — sources: qsrvSingle(0){}",
+            "realtime-pva-ioc: QSRV2 {} — sources: qsrvSingle(0){}",
             if mount.enabled { "ENABLED" } else { "disabled" },
             if mount.enabled {
                 ", qsrvGroup(1)"
@@ -774,13 +786,13 @@ mod ioc {
         // SEARCH transport is compiled out on this target (design §4.2), so a
         // link to a server reachable only by broadcast will not resolve.
         println!(
-            "rtems-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
+            "realtime-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
              link{} pre-registered; pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS \
              (TCP name servers; UDP search is compiled out on this target)",
             if link_count == 1 { "" } else { "s" },
         );
         for name in &names {
-            println!("rtems-pva-ioc: {name}");
+            println!("realtime-pva-ioc: {name}");
         }
 
         // STAGE-5 PROBE: the console reporter. One line group every 10 s, and
@@ -826,11 +838,11 @@ mod ioc {
         match udp_thread.map(|h| h.join()) {
             None | Some(Ok(Ok(()))) => ExitCode::SUCCESS,
             Some(Ok(Err(e))) => {
-                eprintln!("rtems-pva-ioc: name-search responder failed: {e}");
+                eprintln!("realtime-pva-ioc: name-search responder failed: {e}");
                 ExitCode::FAILURE
             }
             Some(Err(_)) => {
-                eprintln!("rtems-pva-ioc: name-search thread panicked");
+                eprintln!("realtime-pva-ioc: name-search thread panicked");
                 ExitCode::FAILURE
             }
         }
@@ -915,17 +927,25 @@ mod ioc {
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(target_os = "rtems", feature = "rtems-exec-model")))]
+#[cfg(not(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+)))]
 fn main() -> ExitCode {
     eprintln!(
-        "rtems-pva-ioc: built with the tokio task backend, which this entry point \
+        "realtime-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf`, or on a host select \
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host select \
          `--features rtems-exec-model`, which routes the `runtime::task` seam to \
          the same std-thread executor the target uses."
     );
@@ -938,7 +958,7 @@ mod tests {
     /// enter a tokio runtime, and must never reach for tokio's async
     /// net/timer/spawn machinery — none of which the RTEMS build can drive.
     /// `tokio::sync` (runtime-agnostic locks) IS allowed. Static guard over
-    /// this file's own source, in the same shape as `rtems-ca-ioc`'s: the
+    /// this file's own source, in the same shape as `realtime-ca-ioc`'s: the
     /// RTEMS `cargo check` cannot catch this on its own, because tokio's
     /// `rt`/`rt-multi-thread` features are retained on that target, so a
     /// runtime constructor still *compiles* there — only this guard rejects
@@ -946,7 +966,7 @@ mod tests {
     /// they cannot self-match.)
     #[test]
     fn entry_point_never_starts_a_runtime() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         // Assembled with `concat!` so the forbidden literals never appear
         // contiguously here — otherwise this test body would match itself.
         let forbidden = [
@@ -974,7 +994,7 @@ mod tests {
     /// what the measured ceiling is made of.
     #[test]
     fn every_thread_here_states_a_stack_size() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         assert!(
             !src.contains(concat!("thread", "::", "spawn(")),
             "use `thread::Builder` with an explicit `stack_size`, not the bare spawn"
@@ -996,7 +1016,7 @@ mod tests {
     /// nobody is reading a backtrace.
     #[test]
     fn a_udp_bind_failure_does_not_stop_the_server() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         // Delimited by brace balance from the call, not by the line that
         // happens to follow it: an earlier version of this guard split on the
         // exact `let udp = match …` spelling and stopped checking anything the
@@ -1047,7 +1067,7 @@ mod tests {
     /// prevent.
     #[test]
     fn the_entry_point_publishes_its_status() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1065,7 +1085,7 @@ mod tests {
         assert!(
             prod.contains(":PVA_CONN_CNT"),
             "the PVA connection count is gone — this is the one status value \
-             `rtems-ca-ioc` cannot publish, because it starts no PVA server"
+             `realtime-ca-ioc` cannot publish, because it starts no PVA server"
         );
     }
 
@@ -1077,7 +1097,7 @@ mod tests {
     /// above exists to remove.
     #[test]
     fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1098,7 +1118,7 @@ mod tests {
     /// all. There is no shell on the target to notice.
     #[test]
     fn the_group_source_is_mounted_at_the_pvxs_order() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n    #[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1143,7 +1163,7 @@ mod tests {
     /// pre-registered, so it is checked too.
     #[test]
     fn the_pvalink_resolver_is_mounted_and_the_banner_reports_it() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n    #[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1174,7 +1194,7 @@ mod tests {
     /// degrades silently on every consumer rather than failing.
     #[test]
     fn the_config_is_built_through_with_env() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n    #[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
@@ -1260,7 +1280,7 @@ mod tests {
 
     /// The default binary is IOC content only: no stage-5 link records, no
     /// QSRV load-probe group — and no link fields at all, the same link-free
-    /// default `rtems-ca-ioc` keeps (`doc/calink-rtems-design.md` §11.7
+    /// default `realtime-ca-ioc` keeps (`doc/calink-rtems-design.md` §11.7
     /// items 3 and 4).
     ///
     /// Runs in every host test pass (the probe rig moved to
@@ -1300,7 +1320,7 @@ mod tests {
     /// would pass every parse test and ship the rig in the default image.
     #[test]
     fn the_probe_dbs_load_only_behind_the_feature() {
-        let src = include_str!("rtems-pva-ioc.rs");
+        let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n#[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,

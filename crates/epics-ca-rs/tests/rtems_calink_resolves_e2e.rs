@@ -1,7 +1,7 @@
 //! A `ca://` record link RESOLVES end to end on the exec backend — value
 //! included.
 //!
-//! `rtems_ca_ioc_boots.rs` proves the whole init path runs and the
+//! `realtime_ca_ioc_boots.rs` proves the whole init path runs and the
 //! name-server dial is *attempted* (it points the client at a closed port
 //! and waits for the refusal). Nothing proved the other half: that under
 //! `--features rtems-exec-model` a `ca://UPSTREAM CP` input link actually
@@ -19,7 +19,7 @@
 //!   listening`, and an ephemeral port cannot collide with anything.
 //! * **Downstream**: a second database whose one record carries
 //!   `INP = ca://UPSTREAM:VAL CP`, with the calink resolver installed and
-//!   iocInit's three link phases run in `rtems-ca-ioc`'s exact order.
+//!   iocInit's three link phases run in `realtime-ca-ioc`'s exact order.
 //!
 //! `EPICS_CA_NAME_SERVERS` names the upstream server's TCP port and the UDP
 //! search path is configured off (`EPICS_CA_AUTO_ADDR_LIST=NO`, empty
@@ -89,7 +89,7 @@ const DOWNSTREAM_DB: &str = concat!(
 const RESOLVE_BUDGET: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
 
-/// Load a database exactly as `rtems-ca-ioc::load_database` does — driven by
+/// Load a database exactly as `realtime-ca-ioc::load_database` does — driven by
 /// `block_on_sync`, which parks this thread between polls; the build future
 /// awaits only in-process locks, so no reactor is involved.
 fn build_db(db: &str) -> Arc<PvDatabase> {
@@ -142,7 +142,7 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     }
 
     // Downstream: mount the resolver, then iocInit's link phases in
-    // `rtems-ca-ioc`'s order — locality first (a no-op for the `ca://`
+    // `realtime-ca-ioc`'s order — locality first (a no-op for the `ca://`
     // spelling, kept for order fidelity), then the CP warm-up that stages
     // this link's open, then the stage for everything else.
     let downstream = build_db(DOWNSTREAM_DB);

@@ -33,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use super::facility::{recover, run_facility_loop, run_isolated};
-use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
+use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
 /// user data; the Rust port boxes a `FnOnce` closure that already captures its
@@ -290,25 +290,27 @@ impl CallbackPool {
                     prio.name_prefix().to_string()
                 };
                 let pq = Arc::clone(pq);
-                let builder = std::thread::Builder::new()
-                    .name(name)
+                // A band with no worker is a band whose queued callbacks never
+                // run again — deferred record processing, delayed callbacks,
+                // monitor tails. There is no error path out of a constructor
+                // reached through a `OnceLock` initialiser, so the failure is
+                // fatal by `MandatoryThread` rather than a panic that would
+                // unwind on whichever thread happened to touch the pool first.
+                let handle = MandatoryThread::new(
+                    name,
+                    // callback.c:322 — `opts.priority = threadPriority[i]`,
+                    // applied best-effort to this OS thread.
+                    prio.os_priority(),
                     // callback.c:323 — `opts.stackSize = epicsThreadStackBig`.
-                    .stack_size(StackSizeClass::Big.bytes());
-                let handle = builder
-                    .spawn(move || {
-                        // callback.c:322 — `opts.priority = threadPriority[i]`,
-                        // applied best-effort to this OS thread.
-                        let _ = enter_ioc_thread(prio.os_priority());
-                        // A band with no worker left is a band whose queued
-                        // callbacks never run again — deferred record
-                        // processing, delayed callbacks, monitor tails.
-                        run_facility_loop(
-                            FACILITY,
-                            || worker_loop(&pq),
-                            || recover(FACILITY, pq.state.lock()).shutdown = true,
-                        );
-                    })
-                    .expect("failed to spawn callback worker thread");
+                    StackSizeClass::Big,
+                )
+                .spawn(move || {
+                    run_facility_loop(
+                        FACILITY,
+                        || worker_loop(&pq),
+                        || recover(FACILITY, pq.state.lock()).shutdown = true,
+                    );
+                });
                 workers.push(handle);
             }
         }

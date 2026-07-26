@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
 use super::facility::{recover, run_facility_loop, run_isolated};
-use crate::runtime::task::{ThreadPriority, enter_ioc_thread};
+use crate::runtime::task::{MandatoryThread, ThreadPriority};
 
 /// What this facility is called when it has to report something about itself.
 const FACILITY: &str = "delayed-callback timer";
@@ -229,37 +229,36 @@ impl DelayedTimer {
             sink,
         });
         let worker_inner = Arc::clone(&inner);
-        let worker = std::thread::Builder::new()
-            .name("cbTimer".to_string())
+        // Every timed facility in this runtime — `sleep`, `interval`, scan
+        // periods, `callbackRequestDelayed` — funnels through the loop below,
+        // on this one thread. Losing it stops all of them at once while the IOC
+        // goes on serving, so its loss is the one that must never be inferred
+        // from work that quietly stops happening — neither after start-up
+        // (`run_facility_loop`) nor at start-up (`MandatoryThread`).
+        let worker = MandatoryThread::new(
+            "cbTimer",
+            // callback.c:300 — the delayed-callback queue is allocated with
+            // `epicsTimerQueueAllocate(0, epicsThreadPriorityScanHigh)`. That
+            // puts the timer above the Low (59) and Medium (64) bands it feeds
+            // but just below High (71), matching C: a due deadline preempts
+            // ordinary callback work, and a High callback still preempts the
+            // timer. Best effort, and only when the RT switch is on
+            // (`runtime::task::RT_PRIORITY_ENV`).
+            ThreadPriority::ScanHigh,
             // C allocates the timer queue's thread with
             // `epicsThreadGetStackSize(epicsThreadStackMedium)`
             // (`libcom/src/timer/timerQueueActive.cpp:48`). This thread only
             // fires expirations onto the callback bands; the arbitrary work
             // runs on those, which are Big.
-            .stack_size(crate::runtime::task::StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                // callback.c:300 — the delayed-callback queue is allocated
-                // with `epicsTimerQueueAllocate(0, epicsThreadPriorityScanHigh)`.
-                // That puts the timer above the Low (59) and Medium (64)
-                // bands it feeds but just below High (71), matching C: a
-                // due deadline preempts ordinary callback work, and a High
-                // callback still preempts the timer.
-                // Best effort, and only when the RT switch is on
-                // (`runtime::task::RT_PRIORITY_ENV`).
-                let _ = enter_ioc_thread(ThreadPriority::ScanHigh);
-                // Every timed facility in this runtime — `sleep`, `interval`,
-                // scan periods, `callbackRequestDelayed` — funnels through the
-                // loop below, on this one thread. Losing it stops all of them
-                // at once while the IOC goes on serving, so its loss is the
-                // one that must never be inferred from work that quietly stops
-                // happening.
-                run_facility_loop(
-                    FACILITY,
-                    || timer_loop(&worker_inner),
-                    || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
-                );
-            })
-            .expect("failed to spawn delayed-callback timer thread");
+            crate::runtime::task::StackSizeClass::Medium,
+        )
+        .spawn(move || {
+            run_facility_loop(
+                FACILITY,
+                || timer_loop(&worker_inner),
+                || recover(FACILITY, worker_inner.state.lock()).shutdown = true,
+            );
+        });
         DelayedTimer {
             inner,
             worker: Some(worker),

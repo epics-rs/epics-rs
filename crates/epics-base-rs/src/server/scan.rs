@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::runtime::background::facility::{recover, run_isolated};
-use crate::runtime::task::{StackSizeClass, ThreadPriority, enter_ioc_thread};
+use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use crate::server::database::PvDatabase;
 use crate::server::record::ScanType;
 
@@ -142,8 +142,8 @@ impl TickDriver {
                 // Both `NotBlockable` variants name a thread this is not: a
                 // current-thread tokio runtime's own thread, or a
                 // background-facility worker. A periodic scan thread is
-                // neither — this module just spawned it with
-                // `std::thread::Builder` and it runs no facility loop.
+                // neither — this module just created it as a
+                // `MandatoryThread` and it runs no facility loop.
                 Err(e) => unreachable!("a periodic scan thread is blockable: {e}"),
             }
         }
@@ -254,20 +254,27 @@ impl ScanScheduler {
         });
         let guard = ScanStopGuard(Arc::clone(&stop));
         let driver = TickDriver::capture();
+        // Each rate is a [`MandatoryThread`]: C's `spawnPeriodic` waits on
+        // `startStopEvent`, which only `periodicTask` posts, so a rate that
+        // could not be created wedges `iocInit` and the C IOC never serves.
+        // The Rust equivalent of "never serves" is that the process dies here —
+        // a `.expect` would only have killed *this* thread on a `panic =
+        // "unwind"` target, dropping the guard below and leaving an IOC that
+        // answers CA with no periodic scanning at all.
         for (ind, &scan_type) in PERIODIC_SCANS.iter().enumerate() {
             if let Some(period) = scan_type.interval() {
                 let db = Arc::clone(&self.db);
                 let stop = Arc::clone(&stop);
                 let driver = driver.clone();
-                std::thread::Builder::new()
-                    .name(periodic_thread_name(period))
+                MandatoryThread::new(
+                    periodic_thread_name(period),
+                    periodic_priority(ind),
                     // dbScan.c:950 — `opts.stackSize = epicsThreadStackBig`.
-                    .stack_size(StackSizeClass::Big.bytes())
-                    .spawn(move || {
-                        let _ = enter_ioc_thread(periodic_priority(ind));
-                        periodic_loop(db, scan_type, period, stop, driver);
-                    })
-                    .expect("failed to spawn periodic scan thread");
+                    StackSizeClass::Big,
+                )
+                .spawn(move || {
+                    periodic_loop(db, scan_type, period, stop, driver);
+                });
             }
         }
 
@@ -295,7 +302,7 @@ impl ScanScheduler {
 ///   scans no matter which protocol runner it hands off to.
 /// * Entry-point binaries that assemble an IOC without `IocApplication`
 ///   (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
-///   `rtems-ca-ioc`, `rtems-pva-ioc`) start one themselves, right where
+///   `realtime-ca-ioc`, `realtime-pva-ioc`) start one themselves, right where
 ///   their hand-rolled iocInit sequence ends.
 ///
 /// Protocol servers must NOT start scanning — that was the defect this
@@ -347,37 +354,41 @@ impl ScanOwner {
         #[cfg(tokio_backend)]
         let handle = tokio::runtime::Handle::try_current()
             .expect("ScanOwner::start on the tokio backend must be called inside a tokio runtime");
-        let join = std::thread::Builder::new()
-            .name("scan-owner".to_string())
+        // Mandatory: this thread *is* "this IOC scans". `start` has no error
+        // path back to its callers (`IocApplication::run` and the entry-point
+        // binaries all take a `Self`), so a thread that cannot be created takes
+        // the process with it rather than leaving a scan-less IOC serving.
+        let join = MandatoryThread::new(
+            "scan-owner",
+            // Below every scan band: the owner only parks after the PINI
+            // pass; the ladder the `scan-%g` threads hold is the measured
+            // one (`periodic_priority`).
+            ThreadPriority::Low,
             // The owner thread runs the PINI pass's record processing on
             // its own stack (the `scan-%g` threads it spawns carry Big
             // stacks of their own, dbScan.c:950). Medium is the proven
             // shape from the interim per-binary owner thread, measured on
             // the RTEMS target.
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                // Below every scan band: the owner only parks after the
-                // PINI pass; the ladder the `scan-%g` threads hold is the
-                // measured one (`periodic_priority`).
-                let _ = enter_ioc_thread(ThreadPriority::Low);
-                let scheduler = ScanScheduler::new(db);
-                let owner = async move {
-                    tokio::select! {
-                        _ = scheduler.run() => {}
-                        _ = stop_rx => {}
-                    }
-                };
-                #[cfg(tokio_backend)]
-                handle.block_on(owner);
-                #[cfg(exec_backend)]
-                match crate::runtime::task::block_on_sync(owner) {
-                    Ok(()) => {}
-                    // Freshly spawned plain std thread: not a facility
-                    // worker, no runtime entered — always blockable.
-                    Err(e) => unreachable!("the scan-owner thread is a plain std thread: {e}"),
+            StackSizeClass::Medium,
+        )
+        .spawn(move || {
+            let scheduler = ScanScheduler::new(db);
+            let owner = async move {
+                tokio::select! {
+                    _ = scheduler.run() => {}
+                    _ = stop_rx => {}
                 }
-            })
-            .expect("failed to spawn the scan-owner thread");
+            };
+            #[cfg(tokio_backend)]
+            handle.block_on(owner);
+            #[cfg(exec_backend)]
+            match crate::runtime::task::block_on_sync(owner) {
+                Ok(()) => {}
+                // Freshly spawned plain std thread: not a facility
+                // worker, no runtime entered — always blockable.
+                Err(e) => unreachable!("the scan-owner thread is a plain std thread: {e}"),
+            }
+        });
         Self {
             stop: Some(stop_tx),
             join: Some(join),

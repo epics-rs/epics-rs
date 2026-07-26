@@ -2470,7 +2470,8 @@ mod tests {
         let _guard = PtyGuard { master, slave: -1 };
 
         let drv = DrvAsynSerialPort::new("pty_rt", &slave_name).unwrap();
-        let (runtime_handle, _jh) = create_port_runtime(drv, RuntimeConfig::default());
+        let (runtime_handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
         let ph = runtime_handle.port_handle();
 
         // Write via PortHandle

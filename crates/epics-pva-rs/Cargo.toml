@@ -11,7 +11,7 @@ repository.workspace = true
 epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
 # No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
-# is a dependency of whichever package owns one, and `rtems-pva-ioc` moved to
+# is a dependency of whichever package owns one, and `realtime-pva-ioc` moved to
 # `epics-bridge-rs` (doc/qsrv-rtems-design.md §9.7).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -101,12 +101,12 @@ client = []
 # Host-selectable RTEMS execution model — passthrough to
 # `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` declares it.
 # Routes the `runtime::task` seam to the std-thread background executor on a
-# hosted target, which is what compiles `rtems-pva-ioc`'s real entry point
+# hosted target, which is what compiles `realtime-pva-ioc`'s real entry point
 # off RTEMS so it can be linted and tested here. OFF by default.
 rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # The RTEMS bring-up measurement rig's client-side instrumentation — the twin
 # of `epics-ca-rs/bringup-probes`, and forwarded from
-# `epics-bridge-rs/bringup-probes` so `rtems-pva-ioc`'s probe image can read
+# `epics-bridge-rs/bringup-probes` so `realtime-pva-ioc`'s probe image can read
 # it. Compiles a dial-attempt counter and `client_native::dial_pool_probe()`,
 # which is how `doc/pvalink-rtems-design.md` §9.11's `MAX_DIAL_WORKERS` bound
 # is read on a target with no shell and no reachable `caget`. OFF by default:
@@ -142,31 +142,35 @@ pkcs12 = [
     "dep:rc-hmac",
 ]
 
-# ── Host network stack (everything except RTEMS) ────────────────────────
+# ── Host network stack (everything except the embedded targets) ─────────
 #
 # `socket2` and `if-addrs` are §8.1 hard blockers on `armv7-rtems-eabihf`:
 # socket2 fails with 20 errors (newlib has no `msghdr`/`recvmsg`/`IovLen`,
 # no `ip_mreqn`, no `SOCK_RAW`) and if-addrs with 2 (no `getifaddrs`/
-# `ifaddrs`). Both are reached only from the tokio async I/O layer —
-# `server_native::{tcp,udp}` and `client_native` — which RTEMS does not use:
-# it gets a blocking thread-per-client driver instead (§4, §9 phase 6
-# item 7). So they are host-only deps, the same gate `epics-base-rs`
-# applied to its own copies (§8.1.1). NOT solved for RTEMS — see §8.1 for
-# what an RTEMS interface enumerator / raw-libc sockopt subset would take.
-[target.'cfg(not(target_os = "rtems"))'.dependencies]
+# `ifaddrs`). Neither symbol exists in `libc`'s VxWorks module either
+# (confirmed by reading the pinned dependency's source), so the same split
+# applies to the `*-wrs-vxworks*` triples. Both are reached only from the
+# tokio async I/O layer — `server_native::{tcp,udp}` and `client_native` —
+# which neither embedded target uses: each gets a blocking thread-per-client
+# driver instead (§4, §9 phase 6 item 7). So they are host-only deps, the
+# same gate `epics-base-rs` applied to its own copies (§8.1.1). NOT solved
+# for either embedded target — see §8.1 for what an interface enumerator /
+# raw-libc sockopt subset would take.
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 socket2 = "0.5"
 if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
 
-# RTEMS gets tokio without `net`/`signal`/`process`: `net` pulls mio
-# (29 errors — no epoll/kqueue selector, and mio dropped its poll backend
-# deliberately) and `signal` pulls signal-hook-registry (4 errors — no
-# `sa_sigaction`/`SA_RESTART`). Declared per-target rather than in the
-# shared table because Cargo *unions* a dependency's features across every
-# matching table: a shared `full` would silently re-add the features this
-# drops. Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio
-# API surface the always-compiled code uses still type-checks.
-[target.'cfg(target_os = "rtems")'.dependencies]
+# RTEMS/VxWorks get tokio without `net`/`signal`/`process`: `net` pulls mio
+# (29 errors on RTEMS — no epoll/kqueue selector, and mio dropped its poll
+# backend deliberately) and `signal` pulls signal-hook-registry (4 errors on
+# RTEMS — no `sa_sigaction`/`SA_RESTART`); neither crate carries VxWorks
+# target support either. Declared per-target rather than in the shared
+# table because Cargo *unions* a dependency's features across every matching
+# table: a shared `full` would silently re-add the features this drops.
+# Retained set mirrors `epics-base-rs` (§8.1.1) so the non-net tokio API
+# surface the always-compiled code uses still type-checks.
+[target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "rt-multi-thread",
@@ -258,7 +262,7 @@ required-features = ["client"]
 name = "mshim-rs"
 path = "src/bin/mshim-rs.rs"
 
-# `rtems-pva-ioc` used to be declared here. It moved to `epics-bridge-rs` when
+# `realtime-pva-ioc` used to be declared here. It moved to `epics-bridge-rs` when
 # it grew a QSRV group source: the mount needs the bridge, and this package
 # cannot depend on the bridge without a cyclic package dependency (measured —
 # doc/qsrv-rtems-design.md §9.7). This package now produces no target binary.

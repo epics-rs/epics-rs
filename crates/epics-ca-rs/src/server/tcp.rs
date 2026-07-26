@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 // These `tokio::io` traits/wrappers are used only by the async accept/read
 // front-end (`handle_client`, `drain_and_flush`); the shared read helper takes
-// a `tokio::io::AsyncReadExt` bound by full path. Host-only on RTEMS.
-#[cfg(not(target_os = "rtems"))]
+// a `tokio::io::AsyncReadExt` bound by full path. Host-only on
+// `epics_embedded_target` (RTEMS or VxWorks).
+#[cfg(not(epics_embedded_target))]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 // `tokio::net::TcpListener` (and the `socket2` keepalive setup) back only the
-// async accept path; the RTEMS build serves TCP through `server::blocking`
+// async accept path; the embedded build serves TCP through `server::blocking`
 // (`std::net`), so the `tokio::net` accept front-end is gated out there.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -48,7 +49,7 @@ fn resolve_inactivity_timeout() -> Option<Duration> {
 /// Read into `buf` with an optional idle cap. If `cap` is `None`, the read
 /// is unbounded (matches C `recv()` blocking semantics in `camsgtask.c`);
 /// if `cap` is `Some(d)`, returns `Err(d)` after `d` of inactivity.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -131,7 +132,7 @@ mod cap_parse_tests {
 /// stalling the whole per-client dispatcher task. C rsrv defaults
 /// SO_SNDTIMEO to 5 s; we honour the same default and let
 /// `EPICS_CAS_SEND_TMO` override.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 fn send_timeout() -> Duration {
     static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(resolve_send_timeout)
@@ -140,7 +141,7 @@ fn send_timeout() -> Duration {
 /// The uncached resolution behind [`send_timeout`]. Resolving once per
 /// process keeps a rejected value from re-printing its diagnostic on every
 /// client connect.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 fn resolve_send_timeout() -> Duration {
     crate::estdlib::env_double("EPICS_CAS_SEND_TMO")
         .ok()
@@ -227,17 +228,17 @@ use crate::server::monitor::spawn_monitor_sender;
 use crate::server::outbox::Outbox;
 // The accumulator is shared with the blocking driver, but this file's only
 // user of it is the async `handle_client`; host-only, same gate as that fn.
-// The RTEMS driver reaches the same primitive from `server::blocking`.
-#[cfg(not(target_os = "rtems"))]
+// The embedded driver reaches the same primitive from `server::blocking`.
+#[cfg(not(epics_embedded_target))]
 use crate::server::recv::{Admit, RecvAccumulator, Refused};
 // `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 use crate::server::outbox::OutboxDrain;
 use epics_base_rs::error::CaResult;
 // The accept backoff is shared with the blocking driver, but this file's only
 // user of it is the async `accept_loop`; host-only, same gate as that fn. The
-// RTEMS driver reaches the same primitive from `server::blocking`.
-#[cfg(not(target_os = "rtems"))]
+// embedded driver reaches the same primitive from `server::blocking`.
+#[cfg(not(epics_embedded_target))]
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
@@ -651,14 +652,14 @@ pub(crate) struct ClientState {
     audit: Option<crate::audit::AuditLogger>,
     /// Optional per-client token bucket. None disables rate limiting.
     // Set in `ClientState::new` / the async accept path, consumed only by the
-    // async read loop (`handle_client`), which is gated out on RTEMS.
-    #[cfg_attr(target_os = "rtems", allow(dead_code))]
+    // async read loop (`handle_client`), which is gated out on `epics_embedded_target`.
+    #[cfg_attr(epics_embedded_target, allow(dead_code))]
     rate_limiter: Option<crate::server::rate_limit::RateLimiter>,
     /// Consecutive denied messages — disconnect when this exceeds the
     /// configured strike threshold.
-    #[cfg_attr(target_os = "rtems", allow(dead_code))]
+    #[cfg_attr(epics_embedded_target, allow(dead_code))]
     rate_limit_strikes: u32,
-    #[cfg_attr(target_os = "rtems", allow(dead_code))]
+    #[cfg_attr(epics_embedded_target, allow(dead_code))]
     rate_limit_strike_threshold: u32,
     /// Capability-token verifier shared across all clients on this
     /// listener. When set, CLIENT_NAME payloads beginning with `cap:`
@@ -1066,14 +1067,14 @@ impl ClientState {
 /// polled is queued rather than refused — owning a `CaServer` implies
 /// "listening", with no readiness handshake for the caller to get
 /// wrong.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 #[derive(Clone)]
 pub struct BoundTcp {
     listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>,
     port: u16,
 }
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 impl BoundTcp {
     /// The port every listener in this set is bound to. This is the
     /// port SEARCH replies and beacons advertise — it differs from the
@@ -1099,7 +1100,7 @@ impl BoundTcp {
 /// must use that same port; if a per-interface bind fails it is logged
 /// and skipped (matches C `cleanup:` / `continue;` in
 /// `caservertask.c:744-749`, which frees the conf and proceeds).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
     let intf_addrs: Vec<std::net::Ipv4Addr> = {
         let cfg = super::addr_list::from_env()?;
@@ -1181,7 +1182,7 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
 /// (`softioc-rs --port 0`); C cannot express that — `envGetInetPortConfigParam`
 /// rejects any port at or below 5000 — so getting one back is what was asked
 /// for, not a fallback, and C's warning has nothing to say about it.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 fn announce_tcp_port(configured: u16, bound: u16) {
     if configured != 0 && bound != configured {
         // C `caservertask.c:580-590`, five `errlogPrintf` lines, verbatim —
@@ -1218,7 +1219,7 @@ fn announce_tcp_port(configured: u16, bound: u16) {
 /// is its own start, and the beacon-reset signal is reachable solely through
 /// [`CaServer::trigger_beacon_anomaly`](super::ca_server::CaServer::trigger_beacon_anomaly)
 /// — the ca-gateway's `generateBeaconAnomaly` analogue.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tcp_listener(
     db: Arc<PvDatabase>,
@@ -1356,7 +1357,7 @@ pub async fn run_tcp_listener(
 /// multi-NIC hosts can tell which listener saw the failure. The
 /// `actual_port` parameter is the TCP port shared across all
 /// listeners (decided in `bind_tcp_listeners`).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: Arc<TcpListener>,
@@ -1660,7 +1661,7 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
 /// Batching is preserved: a whole dispatch burst (or a run of monitor
 /// frames) is written back-to-back before the single `flush`, so N framed
 /// replies still collapse to one TCP write.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 async fn drain_and_flush<W: AsyncWrite + Unpin>(
     sock: &mut BufWriter<W>,
     drain: &mut OutboxDrain,
@@ -1681,7 +1682,7 @@ async fn drain_and_flush<W: AsyncWrite + Unpin>(
 /// `peer.ip()` for the `state.hostname` ACF key — the
 /// cryptographically authenticated identity is always more
 /// trustworthy than the network address.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 #[allow(clippy::too_many_arguments)]
 async fn handle_client<S>(
     stream: S,

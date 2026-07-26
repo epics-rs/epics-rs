@@ -453,7 +453,13 @@ impl BlockingCaServer {
                     }
                     let peer = match stream.peer_addr() {
                         Ok(p) => p,
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "epics_ca_rs::server::blocking",
+                                error = %e, "blocking CA server: peer_addr failed, dropping connection"
+                            );
+                            continue;
+                        }
                     };
                     let db = self.db.clone();
                     let acf = self.acf.clone();
@@ -1567,8 +1573,8 @@ mod tests {
         let files = [
             ("server/blocking.rs", include_str!("blocking.rs")),
             (
-                "bin/rtems-ca-ioc.rs",
-                include_str!("../bin/rtems-ca-ioc.rs"),
+                "bin/realtime-ca-ioc.rs",
+                include_str!("../bin/realtime-ca-ioc.rs"),
             ),
         ];
 
@@ -1639,10 +1645,10 @@ mod tests {
     /// edit to the entry point cannot quietly restore that.
     #[test]
     fn the_rtems_ioc_is_not_mute() {
-        let prod = production_scope(include_str!("../bin/rtems-ca-ioc.rs"));
+        let prod = production_scope(include_str!("../bin/realtime-ca-ioc.rs"));
         assert!(
             prod.contains("install_console_subscriber("),
-            "rtems-ca-ioc installs no tracing subscriber: every diagnostic it \
+            "realtime-ca-ioc installs no tracing subscriber: every diagnostic it \
              and its server emit is discarded"
         );
     }

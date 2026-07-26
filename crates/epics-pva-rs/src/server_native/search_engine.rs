@@ -95,8 +95,33 @@ fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
     Ok(())
 }
 
+/// VxWorks: `randABytes`, bound by `libc` for this target even though
+/// neither `getentropy` nor `arc4random_buf` is (measured: zero occurrences
+/// of either symbol anywhere in the VxWorks SDK sysroot or kernel).
+///
+/// A dedicated arm rather than falling into the Unix one below, for the same
+/// reason RTEMS has its own: `target_family = "unix"` holds for VxWorks too
+/// and `/dev/urandom` is not something this target provides.
+///
+/// `randABytes`'s errno behavior on failure has not been measured on this
+/// target, so a nonzero return reports a bare "entropy draw failed"
+/// `io::Error` rather than `io::Error::last_os_error()`, which would assert
+/// an errno value nobody has confirmed this call actually sets.
+#[cfg(target_os = "vxworks")]
+fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
+    // SAFETY: `buf` is a valid, exclusively-borrowed 12-byte region and the
+    // length passed is its own.
+    let rc = unsafe { libc::randABytes(buf.as_mut_ptr(), buf.len() as libc::c_int) };
+    if rc != 0 {
+        return Err(io::Error::other(
+            "randABytes failed to draw entropy for the server GUID",
+        ));
+    }
+    Ok(())
+}
+
 /// Every other Unix: `/dev/urandom`.
-#[cfg(all(unix, not(target_os = "rtems")))]
+#[cfg(all(unix, not(any(target_os = "rtems", target_os = "vxworks"))))]
 fn fill_entropy(buf: &mut [u8; 12]) -> io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf))
@@ -502,10 +527,10 @@ pub(crate) async fn search_matched_cids(
 /// does, because that socket is the only thing that can deliver one:
 /// [`super::udp`] joins `224.0.0.128` on loopback and classifies what arrives
 /// there ([`super::udp::classify_loopback_datagram`]). That module is
-/// `#[cfg(not(target_os = "rtems"))]`, and the driver that replaces it on the
-/// target — [`super::blocking`]'s UDP responder — serves one plain
-/// `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and can
-/// therefore only ever produce [`Origin::Direct`].
+/// `#[cfg(not(epics_embedded_target))]`, and the driver that replaces it on
+/// an embedded target — [`super::blocking`]'s UDP responder — serves one
+/// plain `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and
+/// can therefore only ever produce [`Origin::Direct`].
 ///
 /// So on the target these are not merely unused, they are unreachable, and
 /// carrying them there made the RTEMS gate print `variants FromOriginTag and
@@ -524,9 +549,9 @@ pub(crate) async fn search_matched_cids(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     Direct,
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(not(epics_embedded_target))]
     FromOriginTag,
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(not(epics_embedded_target))]
     Forwarded,
 }
 
@@ -581,15 +606,16 @@ mod tests {
         assert_eq!(seen.len(), DRAWS);
     }
 
-    /// **Proven by inspection, pinned by source guard.** The RTEMS arm cannot
-    /// be executed on this host, so what is testable here is that it *exists*
-    /// and that it is selected by the target rather than by the family.
+    /// **Proven by inspection, pinned by source guard.** Neither the RTEMS
+    /// nor the VxWorks arm can be executed on this host, so what is testable
+    /// here is that each *exists* and is selected by the target rather than
+    /// by the family.
     ///
     /// That distinction is the whole defect: `target_family = "unix"` holds
-    /// for RTEMS, so a bare `#[cfg(unix)]` arm silently routed RTEMS into a
-    /// `/dev/urandom` open a BSP need not provide. A future "simplification"
-    /// that merges the two arms back together must fail here rather than on a
-    /// board.
+    /// for both, so a bare `#[cfg(unix)]` arm would silently route either
+    /// into a `/dev/urandom` open neither provides. A future
+    /// "simplification" that merges the arms back together must fail here
+    /// rather than on a board.
     #[test]
     fn rtems_selects_entropy_by_target_not_by_family() {
         let prod = production_scope(include_str!("search_engine.rs"));
@@ -604,22 +630,34 @@ mod tests {
              and not arc4random_buf, which returns void"
         );
         assert_eq!(
-            prod.matches(r#"#[cfg(all(unix, not(target_os = "rtems")))]"#)
-                .count(),
+            prod.matches(r#"#[cfg(target_os = "vxworks")]"#).count(),
             1,
-            "the /dev/urandom arm must exclude RTEMS explicitly"
+            "VxWorks must have an entropy arm of its own"
+        );
+        assert!(
+            prod.contains("libc::randABytes("),
+            "the VxWorks arm must call randABytes — neither getentropy nor \
+             arc4random_buf exists in the VxWorks SDK sysroot or kernel"
+        );
+        assert_eq!(
+            prod.matches(
+                r#"#[cfg(all(unix, not(any(target_os = "rtems", target_os = "vxworks"))))]"#
+            )
+            .count(),
+            1,
+            "the /dev/urandom arm must exclude RTEMS and VxWorks explicitly"
         );
         assert_eq!(
             prod.matches(r#"#[cfg(unix)]"#).count(),
             0,
-            "a bare cfg(unix) arm would capture RTEMS again — that is the defect"
+            "a bare cfg(unix) arm would capture RTEMS/VxWorks again — that is the defect"
         );
     }
 
     /// **Proven by inspection, pinned by source guard.** The two forwarded
-    /// origins are `cfg`-gated off the RTEMS target, and this pins the fact
-    /// that makes that sound: the driver that serves UDP there constructs
-    /// only [`Origin::Direct`].
+    /// origins are `cfg`-gated off every embedded target, and this pins the
+    /// fact that makes that sound: the driver that serves UDP there
+    /// constructs only [`Origin::Direct`].
     ///
     /// The gate is not cosmetic. `Forwarded` and `FromOriginTag` carry pvxs's
     /// anti-loop rule and its refusal of an `isAny()` reply address
@@ -646,7 +684,7 @@ mod tests {
             assert_eq!(
                 prod.matches(gated).count(),
                 0,
-                "`{gated}` is `#[cfg(not(target_os = \"rtems\"))]`; naming it \
+                "`{gated}` is `#[cfg(not(epics_embedded_target))]`; naming it \
                  from the target's own UDP responder cannot compile there, and \
                  doing so means the loopback-multicast path arrived without \
                  the anti-loop rules that go with it"

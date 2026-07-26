@@ -10,7 +10,7 @@
 //! dies with "there is no reactor running" (`server/udp.rs:773`,
 //! `server/tcp.rs:1338`), so the C client finds nothing to connect to. That is
 //! by design rather than a defect: the feature replaces the async server, and
-//! its entry point is `rtems-ca-ioc`, not `softioc-rs`. The equivalent
+//! its entry point is `realtime-ca-ioc`, not `softioc-rs`. The equivalent
 //! feature-ON coverage is `blocking_real_record_e2e.rs`.
 //!
 //! Note this file carries no census marker: its tests are plain `#[test]`

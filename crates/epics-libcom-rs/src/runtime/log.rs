@@ -609,7 +609,7 @@ mod tests {
     /// image.
     #[test]
     fn an_entry_thread_panic_says_the_image_is_finished() {
-        let line = panic_announcement(Some("main"), "rtems-ca-ioc.rs:118", "iocInit failed");
+        let line = panic_announcement(Some("main"), "realtime-ca-ioc.rs:118", "iocInit failed");
         assert!(
             line.contains("going down"),
             "a panic out of the entry thread ends the image, and the console is \

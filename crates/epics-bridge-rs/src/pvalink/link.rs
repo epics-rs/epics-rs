@@ -3756,9 +3756,10 @@ mod tests {
     // tokio reactor while `dial_pva`'s hosted arm is still `tokio::net`
     // (`TcpStream::connect` → `PollEvented::new` → "no reactor running").
     // The feature swaps the executor, not the transport; the target does not
-    // have this shape at all, because `target_os = "rtems"` selects the
-    // blocking dial. Gated out feature-ON (stage 3); the on-target boot is
-    // what proves this path there.
+    // have this shape at all, because `exec_backend` (which every
+    // `epics_embedded_target` build sets) selects the blocking dial. Gated
+    // out feature-ON (stage 3); the on-target boot is what proves this path
+    // there.
     #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn upstream_death_disconnects_the_inp_monitor_link() {

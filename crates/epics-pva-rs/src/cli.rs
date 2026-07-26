@@ -194,7 +194,7 @@ pub fn version_information() -> &'static str {
 /// is the post-`expand()` SEARCH list — the auto-address-list broadcast
 /// fan-out folded in and the `AUTO_ADDR_LIST` flag cleared to `NO`
 /// (`config.cpp:640-643`) — exactly as the client will search.
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
 }
@@ -206,7 +206,7 @@ pub fn print_effective_config() {
 /// `util.cpp:660-673`). A multicast entry additionally carries its
 /// `,ttl@iface` modifiers, exactly as pvxs `SockEndpoint::operator<<` prints
 /// them (`config.cpp:125-135`).
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
     use std::fmt::Write;
     let mut s = ep.addr.to_string();
@@ -226,8 +226,8 @@ fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
 /// unit-testable without capturing process stdout.
 ///
 /// Host-only: it renders the *post-`expand()`* config, and
-/// [`crate::config::env::Config`] does not exist on RTEMS.
-#[cfg(not(target_os = "rtems"))]
+/// [`crate::config::env::Config`] does not exist on `epics_embedded_target`.
+#[cfg(not(epics_embedded_target))]
 pub fn effective_config_string() -> String {
     use crate::config;
     use std::fmt::Write;
@@ -407,15 +407,16 @@ pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
     if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
         return Ok(v4);
     }
-    #[cfg(all(unix, not(target_os = "rtems")))]
+    #[cfg(all(unix, not(epics_embedded_target)))]
     {
         iface_name_to_ipv4(spec)
     }
-    // RTEMS is `cfg(unix)`, but its newlib exposes no `getifaddrs`/
-    // `ifaddrs`/`freeifaddrs` (design doc §8.1), so a name cannot be
-    // resolved there. Same answer as any other non-getifaddrs host: say so
-    // and name the workaround, rather than guessing an address.
-    #[cfg(any(not(unix), target_os = "rtems"))]
+    // RTEMS and VxWorks are both `cfg(unix)`, but RTEMS's newlib exposes no
+    // `getifaddrs`/`ifaddrs`/`freeifaddrs` (design doc §8.1), and neither
+    // does VxWorks's `libc` module, so a name cannot be resolved on either.
+    // Same answer as any other non-getifaddrs host: say so and name the
+    // workaround, rather than guessing an address.
+    #[cfg(any(not(unix), epics_embedded_target))]
     {
         Err(format!(
             "interface-name override {spec:?} requires a host with \
@@ -425,7 +426,7 @@ pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
 }
 
 /// Look up an interface's first IPv4 address by name via `getifaddrs`.
-#[cfg(all(unix, not(target_os = "rtems")))]
+#[cfg(all(unix, not(epics_embedded_target)))]
 fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
     use std::ffi::CStr;
     use std::net::Ipv4Addr;

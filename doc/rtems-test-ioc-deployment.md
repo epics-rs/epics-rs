@@ -17,7 +17,7 @@ this rig; **nothing else may be killed**, and these two are killed only through
 
 | | CA IOC | QSRV (PVA) IOC |
 |---|---|---|
-| binary | `rtems-ca-ioc` | `rtems-pva-ioc` |
+| binary | `realtime-ca-ioc` | `realtime-pva-ioc` |
 | image | `~/rtems-bringup/caioc-deploy.exe` (7,969,572 B) | `~/rtems-bringup/qsrvioc-deploy.exe` (11,079,980 B) |
 | features | `--no-default-features --features client-core` | `--no-default-features --features qsrv-core,pvalink,bringup-probes` |
 | guest port | TCP+UDP 5064 | TCP 5075, UDP search 5076 |
@@ -65,7 +65,15 @@ panel's own worktree, moved to branch `box-deploy` = `ad5d77bc`.
 Both builds exit 0, and `epics-libcom-rs v0.24.3` appears in the compile list of
 both, so the extracted crate is in both images.
 
+These are dev images; for measured release/strip/LTO sizes on this target (and
+on vxworks), see `doc/vxworks-port.md` §5.5.
+
 ## 4. Smoke results
+
+Captured before the binaries were renamed to `realtime-ca-ioc` /
+`realtime-pva-ioc`, so the `RTEMS:MSG` values below still read the old names —
+that field carries the string the running image printed, and rewriting it here
+would make this section report a run that never happened.
 
 Client tools: pvxs and EPICS base are installed on the box but not on `PATH` —
 `~/rtems-bringup/pvxs-build/pvxs/bin/linux-x86_64/` and

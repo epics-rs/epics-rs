@@ -4,7 +4,7 @@
 //! binary plus a C entry task (`POSIX_Init`) that configures the kernel, brings
 //! up libbsd and only then calls `main`. This crate owns that C code and the
 //! link flags that go with it, once, for every IOC binary in the workspace —
-//! `rtems-ca-ioc` today and `rtems-pva-ioc` when it exists. Duplicating a
+//! `realtime-ca-ioc` today and `realtime-pva-ioc` when it exists. Duplicating a
 //! `build.rs` and a copy of the C into each IOC crate would be two owners for
 //! one boot contract, which is the shape that produces divergence.
 //!

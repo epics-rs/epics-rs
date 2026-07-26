@@ -194,21 +194,25 @@ pub fn target_status_pvs(prefix: &str, started: Instant) -> Vec<StatusPv> {
         StatusPv::new(format!("{prefix}:FD_FREE"), || {
             reading(fd_usage().map(|fd| fd.free() as f64))
         }),
+        // Each field is read on its own: a target can measure one and not
+        // another (VxWorks' mimalloc reports committed bytes but has no
+        // free-run metric at all), and the three PVs say so independently
+        // rather than all going `NaN` because one of them cannot be had.
         StatusPv::new(format!("{prefix}:MEM_FREE"), || {
-            reading(mem_usage().map(|m| m.free as f64))
+            reading(mem_usage().free.map(|v| v as f64))
         }),
         StatusPv::new(format!("{prefix}:MEM_USED"), || {
-            reading(mem_usage().map(|m| m.used as f64))
+            reading(mem_usage().used.map(|v| v as f64))
         }),
         StatusPv::new(format!("{prefix}:MEM_MAX"), || {
-            reading(mem_usage().map(|m| m.total() as f64))
+            reading(mem_usage().total().map(|v| v as f64))
         }),
         // The fragmentation signal, and the reason it is worth a PV of its
         // own: an allocation fails on the largest free block, not on the free
         // total, so this is the number that falls before a connection stops
         // being able to start its thread.
         StatusPv::new(format!("{prefix}:MEM_BLK"), || {
-            reading(mem_usage().map(|m| m.largest_free as f64))
+            reading(mem_usage().largest_free.map(|v| v as f64))
         }),
         // The one value none of the others gives: a reset. Without it a client
         // cannot tell a board reboot from a network blip, because both look

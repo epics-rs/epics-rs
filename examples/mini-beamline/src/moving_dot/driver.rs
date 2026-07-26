@@ -242,7 +242,7 @@ pub fn create_moving_dot_with_config(
     let dot_params = det.dot_params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default())?;
 
     let shared_output = Arc::new(parking_lot::Mutex::new(array_output));
     let queued_counter = Arc::new(QueuedArrayCounter::new());

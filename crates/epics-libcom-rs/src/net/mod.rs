@@ -6,10 +6,13 @@
 //!
 //! * **Wire constants.** Address literals the protocols embed in the
 //!   datagrams they build ([`ORIGIN_TAG_MCAST_GROUP`]). No socket, no
-//!   `tokio`, no `socket2` — compiles for every target, RTEMS included.
+//!   `tokio`, no `socket2` — compiles for every target, RTEMS and VxWorks
+//!   included.
 //! * **Socket-bearing modules** — [`async_udp_v4`], [`iface_map`],
-//!   [`loopback_mcast`]. Built on `tokio::net` / `socket2` / `if-addrs`,
-//!   none of which cross to `armv7-rtems-eabihf`, so they are host-only.
+//!   [`loopback_mcast`]. Built on `tokio::net` / `socket2` / `if-addrs`, none
+//!   of which cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples,
+//!   so they are gated off `epics_embedded_target` and are otherwise
+//!   host-only.
 //!
 //! The socket modules:
 //!
@@ -25,11 +28,11 @@
 
 use std::net::Ipv4Addr;
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod async_udp_v4;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod iface_map;
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub mod loopback_mcast;
 
 /// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
@@ -40,16 +43,17 @@ pub mod loopback_mcast;
 /// Lives here rather than in [`loopback_mcast`] because it is *wire data*,
 /// not a socket: the PVA SEARCH decoder writes it into the destination of
 /// every ORIGIN_TAG re-broadcast it decides on, and that decoder runs on
-/// RTEMS where the socket half of this module does not exist. Gating a
-/// constant behind a socket module is what forced the PVA decoder to stay
-/// host-only; the fix is to move the constant, not to copy it.
+/// `epics_embedded_target` where the socket half of this module does not
+/// exist. Gating a constant behind a socket module is what forced the PVA
+/// decoder to stay host-only; the fix is to move the constant, not to copy
+/// it.
 pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
 
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use async_udp_v4::{
     AsyncUdpV4, RecvMeta, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
 };
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use iface_map::{IfaceInfo, IfaceMap};
-#[cfg(not(target_os = "rtems"))]
+#[cfg(not(epics_embedded_target))]
 pub use loopback_mcast::bind_loopback_mcast;

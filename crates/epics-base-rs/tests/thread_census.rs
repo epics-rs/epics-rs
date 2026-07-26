@@ -15,7 +15,26 @@
 //! count rather than a slack share of the combined one.
 //!
 //! The subject is `server/ioc_app.rs` and `server/scan.rs`: the two files in
-//! this crate that build threads with `std::thread::Builder`.
+//! this crate that create threads.
+//!
+//! # Why the `Builder` sweeps became a ban
+//!
+//! All four of this crate's thread sites are threads the IOC cannot correctly
+//! run without — the scan owner, the seven `scan-%g` rates, and the two iocsh
+//! boot-script runners — and all four now go through
+//! `runtime::task::MandatoryThread`, whose constructor takes the name, the band
+//! and the stack class. That is the same "enforced by its signature" argument
+//! the sweeps already made for `spawn_dedicated_thread`: a caller cannot omit
+//! what it must pass, so counting `Builder` sites and inspecting their chains
+//! has nothing left to inspect here.
+//!
+//! Rather than let the guards pass vacuously, they became the stronger
+//! statement they were approximating: **this crate creates no thread outside
+//! `runtime::task`'s owners.** That covers the original two findings (2 MiB
+//! default stacks, OS-anonymous threads) *and* the one that motivated the move
+//! — a mandatory thread whose `spawn` failure was resolved locally with
+//! `.expect`, killing one thread on a `panic = "unwind"` target and leaving the
+//! IOC serving without it.
 
 /// Everything before the first column-0 `#[cfg(test)]` — the code that
 /// actually ships.
@@ -37,112 +56,116 @@ fn files() -> [(&'static str, &'static str); 2] {
     ]
 }
 
-/// Every thread this crate creates states a stack size.
+/// Source lines outside comments, with their 1-based numbers.
+fn code_lines(src: &str) -> impl Iterator<Item = (usize, &str)> {
+    production_scope(src)
+        .lines()
+        .enumerate()
+        .map(|(n, l)| (n + 1, l.trim_start()))
+        .filter(|(_, l)| !l.starts_with("//"))
+}
+
+/// Every thread this crate creates states a stack size, a band and a name —
+/// because every one of them is created through an owner whose constructor
+/// takes all three.
 ///
 /// `std` gives RTEMS the generic 2 MiB `DEFAULT_MIN_STACK_SIZE`
 /// (`std/src/sys/thread/unix.rs`: the carve-out list names vxworks, l4re,
 /// espidf and nuttx — not rtems). On the host that is lazily-committed
 /// address space and costs nothing measurable; on the target it is carved
 /// eagerly out of a fixed pool, which is why an unset stack size is the
-/// first ceiling the IOC hits rather than a rounding error.
+/// first ceiling the IOC hits rather than a rounding error. `std` likewise
+/// calls the platform `pthread_setname_np` from `Builder::spawn` only on the
+/// hosted targets it supports, and RTEMS is not one of them, so a name set
+/// with `Builder::name` is invisible in an RTEMS task listing.
 ///
-/// `spawn_dedicated_thread` is enforced by its signature — the class is a
-/// parameter, so a caller cannot omit it. This covers the threads that
-/// still build a `std::thread::Builder` directly.
-///
-/// It also bans the API that has no class to state:
-/// `std::thread::spawn` cannot express a stack size at all, so a site
-/// using it does not fail the `Builder` check above — it is invisible to
-/// it. Same defect, different anchor. (The six bare `thread::spawn` sites
+/// Both are parameters of `MandatoryThread::new` and of
+/// `spawn_dedicated_thread`, so a caller cannot omit them. What is left to
+/// check is that nothing sidesteps those constructors — including
+/// `std::thread::spawn`, which cannot express a stack size at all and so was
+/// invisible to the old `Builder`-chain sweep. (The bare `thread::spawn` sites
 /// elsewhere in the workspace — `ca::repeater`, `ca::calink`,
-/// `ca::server::ca_server`, `pva::server::pva_server` — all sit behind
-/// `#[cfg(not(target_os = "rtems"))]` module gates and are therefore
-/// distinct: they are not in the RTEMS closure at all. Every file listed
-/// here is.)
+/// `ca::server::ca_server`, `pva::server::pva_server`, `bridge::pvalink` — are
+/// distinct: none is a mandatory IOC thread. They are the interactive iocsh
+/// REPL, the best-effort in-process CA repeater fallback, and per-command
+/// helpers that are joined on the next line.)
 ///
 /// Fails today, on Linux, with no cross toolchain.
 #[test]
-fn every_thread_in_this_crate_states_a_stack_size() {
-    let mut unclassified = Vec::new();
-    let mut checked = 0usize;
+fn this_crate_creates_no_thread_outside_the_runtime_owners() {
+    // Split so this guard does not match its own needle in the file it is
+    // written in.
+    let bare = concat!("thread", "::spawn(");
+    let mut strays = Vec::new();
     for (label, src) in files() {
-        let prod = production_scope(src);
-        for (n, after) in prod.split("thread::Builder::new()").skip(1).enumerate() {
-            checked += 1;
-            // The class must be set before the closure is handed over;
-            // `.spawn(` ends the builder chain.
-            let chain = after.split(".spawn(").next().unwrap_or("");
-            if !chain.contains(".stack_size(") {
-                unclassified.push(format!("{label} (Builder #{})", n + 1));
+        for (n, line) in code_lines(src) {
+            if line.contains("thread::Builder::new()") {
+                strays.push(format!("{label}:{n} (raw Builder)"));
             }
-        }
-        // The classless API. Split so this guard does not match its own
-        // needle in the file it is written in.
-        let bare = concat!("thread", "::spawn(");
-        for (n, line) in prod.lines().enumerate() {
-            let t = line.trim_start();
-            if t.starts_with("//") {
-                continue;
-            }
-            if t.contains(bare) && !t.contains("Builder") {
-                unclassified.push(format!("{label}:{} (bare spawn)", n + 1));
+            if line.contains(bare) && !line.contains("Builder") {
+                strays.push(format!("{label}:{n} (bare spawn)"));
             }
         }
     }
-
     assert!(
-        checked >= 4,
-        "expected to find the crate's Builder sites, found {checked} — \
-         did a file move? update this guard's file list"
-    );
-    assert!(
-        unclassified.is_empty(),
-        "these threads take std's 2 MiB default on RTEMS: {unclassified:?}"
+        strays.is_empty(),
+        "these sites bypass `runtime::task`'s thread owners, so their stack \
+         class, OS name and spawn-failure handling are stated locally or not \
+         at all: {strays:?}"
     );
 }
 
-/// Every thread this crate starts publishes its name to the OS.
+/// …and the owner is actually used, so the ban above cannot pass by the files
+/// having quietly stopped creating threads.
 ///
-/// `std` calls the platform `pthread_setname_np` from `Builder::spawn`
-/// on the hosted targets it supports, and RTEMS is not one of them — so
-/// there, a name set with `Builder::name` lives only in Rust's `Thread`
-/// struct and the kernel shows nothing. Bring-up had to measure libbsd's
-/// priority band by other means for exactly that reason.
-///
-/// The defect is a call that is *absent*, so this is source inspection
-/// over every production `Builder` site in the crate — the same sweep
-/// shape as `every_thread_in_this_crate_states_a_stack_size`, and it
-/// fails the same way when a new thread forgets. Either prologue counts:
-/// `enter_ioc_thread` for a thread with an EPICS band, bare
-/// `name_current_thread` for one that deliberately has none.
+/// The floor is this crate's exact site count: `scan.rs` creates the scan owner
+/// and the periodic rates, `ioc_app.rs` the two iocsh boot-script runners.
 #[test]
-fn every_thread_in_this_crate_publishes_its_name() {
-    let mut anonymous = Vec::new();
-    let mut checked = 0usize;
+fn every_thread_in_this_crate_goes_through_mandatory_thread() {
+    let mut owned = Vec::new();
     for (label, src) in files() {
-        for (n, after) in production_scope(src)
-            .split("thread::Builder::new()")
-            .skip(1)
-            .enumerate()
-        {
-            let (_chain, body) = after.split_once(".spawn(").unwrap_or((after, ""));
-            checked += 1;
-            // The prologue is the closure's first work, so look at the
-            // closure, not the builder chain.
-            if !body.contains("enter_ioc_thread(") && !body.contains("name_current_thread()") {
-                anonymous.push(format!("{label} (Builder #{})", n + 1));
+        for (n, line) in code_lines(src) {
+            if line.contains("MandatoryThread::new(") {
+                owned.push(format!("{label}:{n}"));
             }
         }
     }
-
     assert!(
-        checked >= 4,
-        "expected to find the crate's Builder sites, found {checked} — \
-         did a file move? update this guard's file list"
+        owned.len() >= 4,
+        "expected this crate's four mandatory-thread sites, found {} ({owned:?}) — \
+         did a file move? update this guard's file list",
+        owned.len()
     );
+}
+
+/// Every mandatory thread's spawn failure is resolved by its owner, never at
+/// the call site.
+///
+/// `MandatoryThread::spawn` returns a bare `JoinHandle`, so there is nothing to
+/// unwrap; `try_spawn` returns a `Result` precisely so a caller inside a
+/// fallible boot step can hand the failure to whoever decides that this IOC
+/// serves. Unwrapping *that* would restore the original defect: on a
+/// `panic = "unwind"` target — RTEMS and VxWorks both default to unwind — the
+/// panic kills only the calling thread, and the IOC goes on answering clients
+/// with the work that thread owned never running.
+#[test]
+fn no_mandatory_spawn_failure_is_resolved_at_the_call_site() {
+    let mut unwrapped = Vec::new();
+    for (label, src) in files() {
+        let prod = production_scope(src);
+        for (n, after) in prod.split(".try_spawn(").skip(1).enumerate() {
+            // The statement the `try_spawn` call belongs to: everything up to
+            // the first `;` that follows it.
+            let stmt = after.split_once(";").map(|(s, _)| s).unwrap_or(after);
+            if stmt.contains(".expect(") || stmt.contains(".unwrap(") {
+                unwrapped.push(format!("{label} (try_spawn #{})", n + 1));
+            }
+        }
+    }
     assert!(
-        anonymous.is_empty(),
-        "these threads are invisible in an RTEMS task listing: {anonymous:?}"
+        unwrapped.is_empty(),
+        "these sites turn a mandatory thread's spawn failure back into a \
+         thread-local panic: {unwrapped:?}"
     );
 }
 
@@ -158,20 +181,16 @@ fn every_thread_in_this_crate_publishes_its_name() {
 /// The allowlist the runtime half carries — the definition line and the
 /// prologue's own delegation — has no counterpart here: both live in
 /// `epics-runtime-rs`'s `task.rs`, so on this side of the split the
-/// permitted count is zero and any hit is a stray. The `Builder` floor is
-/// what keeps that from passing vacuously after a file move, the same job
-/// `seen_definition` does in the runtime half.
+/// permitted count is zero and any hit is a stray.
+/// `every_thread_in_this_crate_goes_through_mandatory_thread` is what keeps
+/// this from passing vacuously after a file move, the same job `seen_definition`
+/// does in the runtime half.
 #[test]
 fn only_the_prologue_reaches_the_banding_call() {
-    let mut checked = 0usize;
     for (label, src) in files() {
-        let prod = production_scope(src);
-        checked += prod.split("thread::Builder::new()").skip(1).count();
-        let strays: Vec<&str> = prod
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains("apply_to_current_thread("))
-            .filter(|l| !l.starts_with("//"))
+        let strays: Vec<&str> = code_lines(src)
+            .filter(|(_, l)| l.contains("apply_to_current_thread("))
+            .map(|(_, l)| l)
             .collect();
         assert!(
             strays.is_empty(),
@@ -179,9 +198,4 @@ fn only_the_prologue_reaches_the_banding_call() {
              everything else would band an OS-anonymous one — {strays:?}"
         );
     }
-    assert!(
-        checked >= 4,
-        "expected to find the crate's Builder sites, found {checked} — \
-         did a file move? update this guard's file list"
-    );
 }

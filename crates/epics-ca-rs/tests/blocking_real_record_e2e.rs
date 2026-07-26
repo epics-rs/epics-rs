@@ -1,10 +1,10 @@
 //! The blocking CA front-end serving a **real record database** — the exact
-//! `rtems-ca-ioc` runtime shape — to a raw-socket client.
+//! `realtime-ca-ioc` runtime shape — to a raw-socket client.
 //!
 //! `blocking_raw_client_e2e.rs` proves the wire protocol against `SimplePv`
 //! fixtures. This file replaces those with genuine records loaded through
 //! [`IocBuilder`] (`dbLoadRecords` + `iocInit`), which is what
-//! `crates/epics-ca-rs/src/bin/rtems-ca-ioc.rs` actually runs: `ao`,
+//! `crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs` actually runs: `ao`,
 //! `longout` and `stringout` from the binary's built-in `DEMO_DB`, plus an
 //! async `calcout`. Record instances carry per-type native DBR types, real
 //! field tables (`EGU`, `PREC`) and real processing on put — none of which a
@@ -58,7 +58,7 @@ use raw_ca::*;
 const DBR_STRING: u16 = 0;
 const DBR_LONG: u16 = 5;
 
-/// The `rtems-ca-ioc` built-in `DEMO_DB`, plus an async `calcout`.
+/// The `realtime-ca-ioc` built-in `DEMO_DB`, plus an async `calcout`.
 ///
 /// `CALC "A+1"` with `A` defaulting to 0 makes every cycle compute; `OOPT`
 /// defaults to "Every Time" so `should_output()` is always true; `ODLY` then
@@ -67,14 +67,14 @@ const DBR_LONG: u16 = 5;
 const DEMO_DB: &str = concat!(
     "record(ao, \"RT:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
     "record(longout, \"RT:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
-    "record(stringout, \"RT:MSG\") { field(VAL, \"rtems-ca-ioc\") }\n",
+    "record(stringout, \"RT:MSG\") { field(VAL, \"realtime-ca-ioc\") }\n",
     "record(calcout, \"RT:DLY\") { field(CALC, \"A+1\") field(ODLY, \"0.15\") }\n",
 );
 
 /// The ODLY of `RT:DLY` above — the floor the deferred put-callback must clear.
 const ODLY: Duration = Duration::from_millis(150);
 
-/// Load the real database exactly as `rtems-ca-ioc::load_database` does:
+/// Load the real database exactly as `realtime-ca-ioc::load_database` does:
 /// `background_init()` first (C `callbackInit`, so a record can defer a tail
 /// before any client connects), then `IocBuilder::build` driven by
 /// `block_on_sync`, which parks this thread between polls — the build future
@@ -173,7 +173,7 @@ fn real_records_announce_native_types_and_serve_their_values() {
     let r = c.expect(CA_PROTO_READ_NOTIFY, "stringout READ_NOTIFY");
     assert_eq!(
         payload_string(&r),
-        "rtems-ca-ioc",
+        "realtime-ca-ioc",
         "stringout VAL from the db string"
     );
 

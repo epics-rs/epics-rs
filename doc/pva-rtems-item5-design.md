@@ -16,6 +16,11 @@ Unqualified `tcp.rs` below means `crates/epics-pva-rs/src/server_native/tcp.rs`
 in the **pva-cs-ring** worktree. CA-side and base-runtime citations are
 explicitly prefixed.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ---
 
 ## 0. Headline: the plan's item-5 shape is wrong in one load-bearing way

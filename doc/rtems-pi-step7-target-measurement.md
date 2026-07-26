@@ -20,6 +20,11 @@ Two shorthands used throughout:
   **downwards**: a *lower* core number is *more urgent*. A priority-inheritance
   boost therefore shows up as core going **down**.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ## 0. The defect the measurement found first
 
 The flip was not bootable on target. `PiMutex::new` initialised the

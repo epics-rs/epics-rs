@@ -68,6 +68,21 @@ tokio = { version = "1", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
+# the statistics funnel's thread census. VxWorks 7 gives an RTP no task
+# enumerator at all (`taskIdListGet` and `taskEach` are kernel-mode only), so
+# unlike RTEMS — where `rtems_task_iterate` walks the kernel's own table — the
+# list has to be built as the threads start.
+#
+# Target-gated rather than a plain dependency, and the gate is doing real work:
+# on RTEMS `epics-rtems-boot`'s build script emits an *image* link contract
+# (`rustc-link-arg`, the pre-group libraries) that propagates to every dependent
+# binary, and this package must stay takeable by a consumer that brings its own
+# boot glue. On VxWorks that same package compiles no C and emits no link
+# contract — the edge costs one module and nothing else.
+[target.'cfg(target_os = "vxworks")'.dependencies]
+epics-rtems-boot = { workspace = true }
+
 [dev-dependencies]
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared `rtems-exec-model` test-gating census, called by

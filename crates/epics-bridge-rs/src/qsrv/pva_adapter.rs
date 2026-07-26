@@ -3136,7 +3136,7 @@ mod tests {
         // `&[]`: this case drives the base startup queue (the real
         // `dbLoadGroup` command ran above), which is the host route. The
         // caller-supplied list is the target's route and is exercised by
-        // `rtems-pva-ioc`'s own tests.
+        // `realtime-pva-ioc`'s own tests.
         load_qsrv_groups(&provider, &db, &[]).await;
         let store = Arc::new(QsrvPvStore::new(provider));
 

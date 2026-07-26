@@ -295,7 +295,7 @@ impl ScanScheduler {
 ///   scans no matter which protocol runner it hands off to.
 /// * Entry-point binaries that assemble an IOC without `IocApplication`
 ///   (`softioc-rs`, `oracle-ioc`, `dual-ioc-rs`, `qsrv-rs`,
-///   `rtems-ca-ioc`, `rtems-pva-ioc`) start one themselves, right where
+///   `realtime-ca-ioc`, `realtime-pva-ioc`) start one themselves, right where
 ///   their hand-rolled iocInit sequence ends.
 ///
 /// Protocol servers must NOT start scanning — that was the defect this

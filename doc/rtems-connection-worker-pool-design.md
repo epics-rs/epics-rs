@@ -5,6 +5,11 @@ Scope: `epics-base-rs` `runtime::worker_pool` (new), `runtime::blocking_io`
 (both pumps), `epics-pva-rs` `server_native::blocking` (the connection
 thread), and the two blocking-client dial sites that reach the pumps.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ## 1. The defect
 
 Every `std::thread` **creation** leaves 176–179 B behind permanently on

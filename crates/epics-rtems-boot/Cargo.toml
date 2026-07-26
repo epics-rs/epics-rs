@@ -2,7 +2,7 @@
 name = "epics-rtems-boot"
 version.workspace = true
 edition.workspace = true
-description = "RTEMS boot shim (POSIX_Init + kernel configuration) and link contract for epics-rs IOCs"
+description = "RTEMS boot shim (POSIX_Init + kernel configuration), link contract, and the per-OS IOC statistics funnel for epics-rs IOCs"
 license-file = "LICENSE"
 authors.workspace = true
 repository.workspace = true
@@ -19,4 +19,14 @@ cc = "1"
 # build-dependency table above, a *regular* target-cfg dependency IS evaluated
 # against the target, so this gate works and costs a host build nothing.
 [target.'cfg(target_os = "rtems")'.dependencies]
+libc = "0.2"
+
+# `stats/vxworks.rs` reads descriptor usage through POSIX rather than through
+# the C shim, which this package deliberately does not cross-compile for
+# VxWorks: an RTP has neither `rtems_libio_iops` nor the kernel's `iosFdEntry`,
+# so there is nothing for a shim to reach that libc does not already declare.
+# That is also why there is no `vxworks_boot_linked` counterpart to
+# `rtems_boot_linked` — no C of ours is compiled, so no build-script cfg is
+# needed to say whether it was.
+[target.'cfg(target_os = "vxworks")'.dependencies]
 libc = "0.2"

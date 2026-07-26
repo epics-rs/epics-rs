@@ -4,6 +4,11 @@ Closes §8.0 gap 2 of `doc/rtems-scope-b-session-handoff.md`: *"thread priority
 observed on target — unmeasured"*. Everything below is a reading taken from a
 booted RTEMS 6 guest, not a claim read out of the source.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ## What was measured, and with what
 
 **Method point.** The priority is read **back from the kernel** with

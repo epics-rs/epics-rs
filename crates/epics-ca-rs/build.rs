@@ -1,4 +1,4 @@
-//! Emits the RTEMS link arguments for `rtems-ca-ioc`.
+//! Emits the RTEMS link arguments for `realtime-ca-ioc`.
 //!
 //! This crate produces an RTEMS IOC binary, and link *arguments* — unlike
 //! `-L`/`-l` — do not propagate from a dependency's build script to a
@@ -54,7 +54,7 @@
 //! UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
 //! the target when the fact it needs is the *backend*; a host build with
 //! `--features rtems-exec-model` compiled the UDP transport in and panicked on
-//! it at `rtems-ca-ioc`'s first search (measured, `doc/calink-rtems-design.md`
+//! it at `realtime-ca-ioc`'s first search (measured, `doc/calink-rtems-design.md`
 //! §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
 //! exists", so the transport takes that one and `SearchTransport` has the
 //! single `NameServersOnly` variant on `exec_backend` — the target's shape,

@@ -625,7 +625,7 @@ impl RecvBodyPolicy {
 /// A `tokio::net::TcpStream::connect` there panics ("there is no reactor
 /// running") even though the process has a runtime elsewhere. Gating
 /// this seam on `target_os = "rtems"` named the target where the fact it needs
-/// is the backend, which is why `rtems-ca-ioc` still panicked on its first
+/// is the backend, which is why `realtime-ca-ioc` still panicked on its first
 /// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
 /// item 2).
 ///

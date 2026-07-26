@@ -1,4 +1,4 @@
-//! Emits the RTEMS link arguments for `rtems-pva-ioc`.
+//! Emits the RTEMS link arguments for `realtime-pva-ioc`.
 //!
 //! This crate produces an RTEMS IOC binary, and link *arguments* — unlike
 //! `-L`/`-l` — do not propagate from a dependency's build script to a

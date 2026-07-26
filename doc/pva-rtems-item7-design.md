@@ -16,6 +16,11 @@ Read-only scoping. Every claim carries file:line. Two worktrees:
 `1906c7cb` (dep-gate), `bfaae8f3` (CA), `93590517` (pva-cs-ring) is an ancestor
 of it — all three are unmerged, which is what §7 decision 4 is about.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands.
+
 ---
 
 ## §0 Headline — the item as written cannot be the first stage

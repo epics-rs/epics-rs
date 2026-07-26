@@ -14,7 +14,7 @@
 // and `run_beacon_monitor` is started through `runtime::task::spawn`, which on
 // `exec_backend` lands it on a callback-pool worker that has none. A hosted
 // `--features rtems-exec-model` build had `feature = "client"` on and panicked
-// on both of those sockets at `rtems-ca-ioc` boot, measured — two of the three
+// on both of those sockets at `realtime-ca-ioc` boot, measured — two of the three
 // panics in `doc/calink-rtems-design.md` §10.10 item 2.
 // RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the full CA client over
 // tokio::net or pin a specific tokio runtime flavor. These run and pass in the
@@ -32,7 +32,7 @@ mod types;
 pub use sync_group::{SyncGroup, SyncGroupResults, SyncGroupStat, SyncGroupStatus};
 
 /// BRING-UP PROBE: the CA dial pool's `(workers, attempts)`, for
-/// `rtems-ca-ioc`'s console reporter. `transport` is private, and a bin target
+/// `realtime-ca-ioc`'s console reporter. `transport` is private, and a bin target
 /// is a separate crate, so the rig's one accessor is re-exported here rather
 /// than the module being opened up for it.
 #[cfg(all(feature = "bringup-probes", any(exec_backend, ca_blocking_client)))]

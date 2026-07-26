@@ -316,7 +316,7 @@ pub fn dial_pool_probe() -> (usize, usize) {
 /// backend a task runs on a cooperative callback-band worker shared with every
 /// other future on its band, so running the connect inline parks the band for
 /// the whole bound. Measured exactly there (gdb all-thread dump, host-linux
-/// `rtems-pva-ioc`): the single `cbMedium` worker sat in `poll(timeout=39999)`
+/// `realtime-pva-ioc`): the single `cbMedium` worker sat in `poll(timeout=39999)`
 /// under `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a name
 /// server that did not answer starved every future on Medium for ~40 s per
 /// attempt (the executor failure class of `doc/qsrv-rtems-design.md` §9.15.1).
@@ -448,7 +448,7 @@ async fn dial_blocking(
 /// A `tokio::net::TcpStream::connect` there panics ("there is no reactor
 /// running") even though the process has a runtime elsewhere. Gating
 /// this seam on `target_os = "rtems"` named the target where the fact it needs
-/// is the backend, which is why `rtems-pva-ioc` still panicked on its first
+/// is the backend, which is why `realtime-pva-ioc` still panicked on its first
 /// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
 /// item 2).
 ///
@@ -3168,7 +3168,7 @@ mod tests {
 
     /// The dial seam must never occupy a callback-band worker.
     ///
-    /// Measured (gdb all-thread dump of the host-linux `rtems-pva-ioc`): the
+    /// Measured (gdb all-thread dump of the host-linux `realtime-pva-ioc`): the
     /// single `cbMedium` worker sat in `poll(timeout=39999)` under
     /// `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a
     /// synchronous dial to a SYN-blackholed name server held the band for

@@ -126,6 +126,39 @@ jobs:
     - name: Type-check the RTEMS closure
       run: ./scripts/rtems-check.sh
 
+  # The VxWorks 7 counterpart of `rtems-closure` — and deliberately a much
+  # smaller job, because full parity with it is IMPOSSIBLE, not merely absent.
+  #
+  # `rtems-closure` above type-checks the whole RTEMS closure on a runner
+  # because its toolchain is a public `nightly` + `rust-src` and its `libc`
+  # fixes are pinned in the workspace `[patch.crates-io]`. VxWorks has neither
+  # lever: the Wind River SDK is proprietary, and `-Zbuild-std` compiles std
+  # against rust-src's own `library/Cargo.lock`, which a workspace patch does
+  # not reach — so its `libc` fix has to live in a prepared toolchain that is
+  # not a public artefact either. The target rows are therefore structurally
+  # box-only (`coding-agent@192.168.2.128`), and the script says so in its own
+  # output rather than leaving this comment as the only place it is written
+  # down.
+  #
+  # What DOES run here is the binary census, which needs no toolchain at all
+  # and catches the highest-value regression class — a new `src/bin/*.rs`
+  # landing classified as neither a target binary nor host-only, which is
+  # exactly how a target binary last fell outside a gate. `vxworks-check.sh`
+  # runs its census first and unconditionally, then prints the skip banner and
+  # exits 0, so this job is green-when-classified and red-when-not.
+  #
+  # No toolchain step on purpose: the half of the script that runs here invokes
+  # no cargo, and installing a Rust toolchain it never uses would make the job
+  # look like it compiled something. A future census row that does need cargo
+  # must add the step in the same change.
+  vxworks-census:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: VxWorks binary census (target rows are box-only)
+      run: ./scripts/vxworks-check.sh
+
   # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback
   # onto a real `PTHREAD_PRIO_INHERIT` pthread mutex
   # (crates/epics-libcom-rs/src/runtime/sync.rs). No other job turns the

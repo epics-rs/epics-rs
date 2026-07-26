@@ -1,7 +1,7 @@
-//! `rtems-pva-ioc` must complete its whole init path on the host under
+//! `realtime-pva-ioc` must complete its whole init path on the host under
 //! `--features rtems-exec-model` without a panic.
 //!
-//! The reasoning is `epics-ca-rs`'s `tests/rtems_ca_ioc_boots.rs`, applied to
+//! The reasoning is `epics-ca-rs`'s `tests/realtime_ca_ioc_boots.rs`, applied to
 //! the other IOC binary: under `rtems-exec-model` the `runtime::task` seam
 //! routes `spawn` to the std-thread background executor, a future that lands
 //! on a callback-pool worker runs with **no tokio reactor entered**, and a
@@ -22,10 +22,10 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
     // The other arm of the same entry point — see the CA counterpart.
     use std::process::{Command, Stdio};
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rtems-pva-ioc"))
+    let out = Command::new(env!("CARGO_BIN_EXE_realtime-pva-ioc"))
         .stdin(Stdio::null())
         .output()
-        .expect("spawn rtems-pva-ioc");
+        .expect("spawn realtime-pva-ioc");
     assert!(!out.status.success(), "expected a refusal exit status");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -99,7 +99,7 @@ mod exec_model {
         let log = std::fs::File::create(&log_path).expect("create the console log");
         let log_err = log.try_clone().expect("clone the console log handle");
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rtems-pva-ioc"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_realtime-pva-ioc"));
         cmd.arg(&db)
             .env("EPICS_PVA_SERVER_PORT", free_tcp_port().to_string())
             .env("EPICS_PVAS_SERVER_PORT", free_tcp_port().to_string())
@@ -112,7 +112,7 @@ mod exec_model {
         // purpose: the binary compiles its own default in and, with the
         // variable unset, uses it before it builds the client — the same path
         // the target takes, where nothing outside the image can configure it
-        // (`rtems-pva-ioc.rs` `STAGE5_NAME_SERVER`). Whatever it points at,
+        // (`realtime-pva-ioc.rs` `STAGE5_NAME_SERVER`). Whatever it points at,
         // the dial to it is the seam under test. The clean build compiles no
         // default in (the SLIRP address is rig topology), so it is pointed at
         // a closed local port, like the CA boot test always is.
@@ -121,7 +121,7 @@ mod exec_model {
             "EPICS_PVA_NAME_SERVERS",
             format!("127.0.0.1:{}", closed_port()),
         );
-        let child = cmd.spawn().expect("spawn rtems-pva-ioc");
+        let child = cmd.spawn().expect("spawn realtime-pva-ioc");
         let mut child = Killed(child);
 
         let read_log = || {
@@ -141,15 +141,15 @@ mod exec_model {
         while !console.contains("pvalink resolver installed") {
             assert!(
                 !console.contains("panic"),
-                "rtems-pva-ioc panicked during init:\n{console}"
+                "realtime-pva-ioc panicked during init:\n{console}"
             );
             assert!(
                 child.0.try_wait().expect("poll the child").is_none(),
-                "rtems-pva-ioc exited during init:\n{console}"
+                "realtime-pva-ioc exited during init:\n{console}"
             );
             assert!(
                 Instant::now() < deadline,
-                "rtems-pva-ioc did not finish init within {INIT_BUDGET:?}:\n{console}"
+                "realtime-pva-ioc did not finish init within {INIT_BUDGET:?}:\n{console}"
             );
             std::thread::sleep(Duration::from_millis(50));
             console = read_log();
@@ -176,15 +176,15 @@ mod exec_model {
             while !console.contains("searching=1") {
                 assert!(
                     !console.contains("panic"),
-                    "rtems-pva-ioc panicked after init:\n{console}"
+                    "realtime-pva-ioc panicked after init:\n{console}"
                 );
                 assert!(
                     child.0.try_wait().expect("poll the child").is_none(),
-                    "rtems-pva-ioc exited after init:\n{console}"
+                    "realtime-pva-ioc exited after init:\n{console}"
                 );
                 assert!(
                     Instant::now() < deadline,
-                    "rtems-pva-ioc never started searching for its pva:// link \
+                    "realtime-pva-ioc never started searching for its pva:// link \
                      within {SEARCH_BUDGET:?}:\n{console}"
                 );
                 std::thread::sleep(Duration::from_millis(50));
@@ -200,18 +200,18 @@ mod exec_model {
         #[cfg(not(feature = "bringup-probes"))]
         {
             let deadline = Instant::now() + INIT_BUDGET;
-            while !console.contains("rtems-pva-ioc: LOCAL:PAI") {
+            while !console.contains("realtime-pva-ioc: LOCAL:PAI") {
                 assert!(
                     !console.contains("panic"),
-                    "rtems-pva-ioc panicked after init:\n{console}"
+                    "realtime-pva-ioc panicked after init:\n{console}"
                 );
                 assert!(
                     child.0.try_wait().expect("poll the child").is_none(),
-                    "rtems-pva-ioc exited after init:\n{console}"
+                    "realtime-pva-ioc exited after init:\n{console}"
                 );
                 assert!(
                     Instant::now() < deadline,
-                    "rtems-pva-ioc never listed its records within \
+                    "realtime-pva-ioc never listed its records within \
                      {INIT_BUDGET:?}:\n{console}"
                 );
                 std::thread::sleep(Duration::from_millis(50));
@@ -230,11 +230,11 @@ mod exec_model {
 
         assert!(
             !console.contains("panic"),
-            "rtems-pva-ioc panicked after init:\n{console}"
+            "realtime-pva-ioc panicked after init:\n{console}"
         );
         assert!(
             child.0.try_wait().expect("poll the child").is_none(),
-            "rtems-pva-ioc exited after init:\n{console}"
+            "realtime-pva-ioc exited after init:\n{console}"
         );
     }
 }

@@ -1084,8 +1084,17 @@ pub fn apply_to_current_thread_under(
 /// [`RtPolicy::Disabled`] no scheduler call happens and there is no ordering
 /// to have — the hosted default, where the locks still exclude but do not
 /// prioritise ([`crate::runtime::sync::is_pi_mutex_active`]).
+/// A third thing on VxWorks, for the same reason as the name: an RTP cannot
+/// enumerate its own tasks, so the statistics funnel's thread census is built
+/// from what announces itself here. This is the seam because it is already the
+/// one every IOC thread passes through to take its band — "every thread that
+/// bands itself registers itself" adds a consequence to that invariant rather
+/// than a rule to remember at each spawn. A thread that starts outside it is
+/// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
+    #[cfg(target_os = "vxworks")]
+    epics_rtems_boot::stats::register_task();
     apply_to_current_thread(priority)
 }
 
@@ -2920,6 +2929,39 @@ mod tests {
         assert!(
             seen_definition,
             "the banding function moved out of this file list; update the guard"
+        );
+    }
+
+    /// The prologue must also announce the thread to the statistics funnel's
+    /// census, and that call has to be checked as text because nothing else can
+    /// check it: it is `#[cfg]`ed to VxWorks, so on the host and on RTEMS it
+    /// compiles away and deleting it breaks no build and no test. What it would
+    /// break is one target's task census, which would come back empty — an IOC
+    /// that reads as having no threads rather than as having a missing call.
+    ///
+    /// Located inside the prologue's own body rather than anywhere in the file,
+    /// because a registration that drifted out of the single thread-transition
+    /// owner is the same defect as no registration: threads would start without
+    /// passing it.
+    #[test]
+    fn the_prologue_registers_the_thread_for_the_vxworks_census() {
+        let body = production_scope(include_str!("task.rs"))
+            .split_once("pub fn enter_ioc_thread(")
+            .expect("the prologue is still in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("the prologue's body is terminated")
+            .0;
+        assert!(
+            body.contains("#[cfg(target_os = \"vxworks\")]"),
+            "the census registration must stay gated to the one OS whose \
+             backend needs it; `epics-rtems-boot` is a dependency of this \
+             package on that target only"
+        );
+        assert!(
+            body.contains("epics_rtems_boot::stats::register_task();"),
+            "VxWorks gives an RTP no task enumerator, so `dump_tasks` and \
+             `stack_report` list exactly what announced itself here"
         );
     }
 

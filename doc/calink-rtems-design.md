@@ -22,6 +22,14 @@ Every number here was produced by running the command quoted next to it on
 this tree at `8c305c37`. Where a claim could not be measured it says so and
 lands in §7, not in the body.
 
+**Naming note (2026-07-25).** The target IOC binaries were later renamed —
+`rtems-ca-ioc` → `realtime-ca-ioc`, `rtems-pva-ioc` → `realtime-pva-ioc`.
+Every old name below is left exactly as captured, because this file is a
+record of the tree as it stood, not a description of it as it stands. The one
+exception is §12.3, which cites the two boot tests by path: those files were
+renamed too, and a path that does not resolve points nowhere, so it carries
+the current names.
+
 ---
 
 ## 0. The reframing, and the numbers that produce it
@@ -2638,9 +2646,9 @@ built in exactly that state.
 
 ### 12.3 The gate
 
-`rtems-ca-ioc` and `rtems-pva-ioc` are each booted as a child process over a
-temporary database (`epics-ca-rs/tests/rtems_ca_ioc_boots.rs`,
-`epics-bridge-rs/tests/rtems_pva_ioc_boots.rs`), watched to the resolver-install
+`realtime-ca-ioc` and `realtime-pva-ioc` are each booted as a child process over
+a temporary database (`epics-ca-rs/tests/realtime_ca_ioc_boots.rs`,
+`epics-bridge-rs/tests/realtime_pva_ioc_boots.rs`), watched to the resolver-install
 line and then to positive evidence that the client reached the seam — the CA
 IOC's refused name-server dial, the PVA IOC's STAGE-5 probe reporting a search
 in flight. The assertion is liveness *and* a clean console: a panic on a

@@ -673,9 +673,23 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
 
 ## 7. Known opens
 
-* **E8 / E9 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
-  for this target; E9 needs a VxWorks SYN ladder; E10's dial numbers are now
-  unblocked, since the probe images link and run. None has been run on VxWorks.
+* **E8 / E9 measurement procedures.** E8 (pool probe) needs re-authoring for
+  this target; E9 needs a VxWorks SYN ladder. Neither has been run on VxWorks.
+* **E10 is closed, both halves.** The pooled-vs-per-attempt dial residue is
+  **0 B/attempt on VxWorks 7**, for the CA half *and* the PVA half, measured
+  2026-07-26 by `-Wl,--wrap` live-block accounting over ~230 dial attempts per
+  image: CA differs by −184 B, PVA by +184 B, in both cases exactly one 184 B
+  timer-sleep group of sampling skew (resolution ±0.8 B/attempt). The brief's
+  `semMCreate`/`semBCreate` hypothesis is measured false with the mechanism
+  named — VxWorks 7 returns per-thread blocks *and* per-thread semaphores on
+  thread exit, so 235 extra thread creations add zero live blocks in all three
+  per-thread size classes. `DialPool` therefore buys no heap residue on this
+  target; its value here is thread-creation rate and the fd/stack ceiling.
+  `doc/vxworks-dial-attempt-residue-on-target-measurement.md` carries the
+  transcripts, the rig (`doc/vxworks-e10-rig/`) and two remaining opens — the
+  CA name-server queue ceiling was reproduced but not re-proven on this target,
+  and a PVA-only `timer_sleep::sleep_until` growth of 184 B per ~30 s is
+  independent of the dial shape and has no measured bound.
 * **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
   Not a formula difference: `StackSizeClass::bytes` is
   `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as

@@ -605,8 +605,12 @@ TASKDUMP tag=c6-12 id=0x000100ed prio=189 name=c6-wd-ctl stack_high=3504 stack_m
 
 The host regression test is `the_deadline_holds_with_no_socket_send_timeout`
 (`blocking_io.rs`): it sets no write timeout at all, which is the VxWorks
-condition reproduced on Linux. On the pre-fix tree it fails after 20.010 s; on
-the fixed tree it passes in 0.207 s.
+condition reproduced on Linux. With the pre-fix loop body put back (deadline
+checked at the top, then a blocking `write`) it fails at **20.008 s** with
+`Timeout` — and that figure is the *test's own* outer bound, `send_timeout ×
+100`, not a property of the defect: the write had not returned by 100× the
+deadline it was given and would not have returned later either. On the fixed
+tree the same test passes in **0.208 s**.
 
 Committed as `df8d65a8` (the fix) and `facf496a` (the on-target probe).
 

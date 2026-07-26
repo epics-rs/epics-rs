@@ -479,6 +479,10 @@ times are unaffected. The row-5 settings are adopted as the workspace profile
 `release-embedded` (root `Cargo.toml`: inherits `release`, `strip = "symbols"`,
 `lto = "fat"`, `codegen-units = 1`); substitute `--profile release-embedded`
 for `--release` in the row-2 invocations below to build the deployable image.
+`scripts/embedded-image.sh <rtems|vxworks> <ca|pva>` is the owned entry point
+for exactly that build — it defaults to `release-embedded` (Cargo itself has
+no target-conditional profile, so the default lives at the entry point;
+override with `EMBEDDED_PROFILE=` for a comparison row).
 
 #### `x86_64-wrs-vxworks` (`.vxe`)
 

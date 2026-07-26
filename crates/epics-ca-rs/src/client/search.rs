@@ -1201,7 +1201,11 @@ async fn run_nameserver_connection(
             continue;
         };
 
-        let (mut reader, mut writer) = super::transport::split_circuit(stream);
+        // The watchdog arrives with the halves — see
+        // `transport::CircuitWatchdog`. This circuit is retired on the same
+        // `echo_idle_secs() + ECHO_TIMEOUT_SECS` bound a data circuit is,
+        // because it is the same rule object, not a second copy of the rule.
+        let (mut reader, mut writer, mut watchdog) = super::transport::split_circuit(stream);
 
         // Send initial VERSION + HOST_NAME + CLIENT_NAME so the nameserver
         // accepts our search frames (mirrors transport.rs handshake).
@@ -1232,6 +1236,12 @@ async fn run_nameserver_connection(
         }
 
         let resp_tx = response_tx.clone();
+        // The watchdog lives with the reader and the writer lives with the
+        // pump, so the probe crosses between them. That is the shape
+        // `read_loop` already has — it holds the watchdog and pushes the echo
+        // bytes out through `write_tx` — and it is why the reader can own the
+        // liveness rule without owning the socket's send half.
+        let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<()>();
         let read_task = epics_base_rs::runtime::task::spawn(async move {
             let mut buf = vec![0u8; 8192];
             let mut accumulated: Vec<u8> = Vec::new();
@@ -1247,10 +1257,56 @@ async fn run_nameserver_connection(
             // the same frame.
             let mut body_policy = super::transport::RecvBodyPolicy::new();
             loop {
-                let n = match reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
+                watchdog.note_iteration();
+                let n = tokio::select! {
+                    _ = epics_base_rs::runtime::task::sleep_until(watchdog.deadline()),
+                        if watchdog.is_armed() =>
+                    {
+                        match watchdog.expired() {
+                            super::transport::WatchdogExpiry::SendEcho {
+                                suspend_wake,
+                                wall_skip,
+                            } => {
+                                if suspend_wake {
+                                    tracing::info!(
+                                        nameserver = %addr,
+                                        wall_skip_secs = wall_skip.as_secs(),
+                                        "suspend wake detected; probing with shortened \
+                                         echo timeout"
+                                    );
+                                }
+                                // The pump writes it; a closed channel means
+                                // the pump is already gone.
+                                if echo_tx.send(()).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            super::transport::WatchdogExpiry::Unresponsive => {
+                                // The probe went unanswered. C reaches the same
+                                // verdict on a name-service `tcpiiu` — its
+                                // `recvDog` is armed with no `isNameService()`
+                                // branch — and this port's recovery for a
+                                // name server is the redial its outer loop
+                                // already owns, on the one CONN_TMO knob.
+                                tracing::warn!(
+                                    nameserver = %addr,
+                                    bound_secs = super::transport::CircuitWatchdog::retire_bound()
+                                        .as_secs(),
+                                    "EPICS_CA_NAME_SERVERS peer did not answer \
+                                     CA_PROTO_ECHO; retiring the circuit"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    read_result = reader.read(&mut buf) => match read_result {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    },
                 };
+                // Any byte proves the peer is alive, an ECHO reply included.
+                watchdog.data_arrived();
                 accumulated.extend_from_slice(&buf[..n]);
                 // Bytes owed to an already-refused oversize message are
                 // consumed before framing resumes.
@@ -1341,7 +1397,6 @@ async fn run_nameserver_connection(
 
         // Pipe outgoing search frames to the TCP writer until the reader
         // task ends or the channel closes.
-        let mut writer_failed = false;
         // Closed outgoing channel = client shutdown. Track it so we
         // fall through to read_task cleanup, then exit the outer
         // reconnect loop. Earlier code `return`-ed directly which
@@ -1356,15 +1411,21 @@ async fn run_nameserver_connection(
                         break 'pump;
                     };
                     if writer.write_all(&bytes).await.is_err() {
-                        writer_failed = true;
                         break 'pump;
                     }
                 }
-                _ = epics_base_rs::runtime::task::sleep(Duration::from_secs(60)) => {
-                    // Periodic noop keeps the connection warm.
+                probe = echo_rx.recv() => {
+                    // The reader's watchdog asked for a probe. Pre-fix this
+                    // arm was a hardcoded 60 s `sleep` whose echo nobody ever
+                    // looked for a reply to, which is why a name server that
+                    // accepted and went silent was held indefinitely.
+                    if probe.is_none() {
+                        // Reader gone; the `read_task.is_finished()` check
+                        // below ends the pump.
+                        break 'pump;
+                    }
                     let echo = CaHeader::new(CA_PROTO_ECHO);
                     if writer.write_all(&echo.to_bytes()).await.is_err() {
-                        writer_failed = true;
                         break 'pump;
                     }
                 }
@@ -1382,12 +1443,14 @@ async fn run_nameserver_connection(
             return;
         }
 
-        if writer_failed {
-            // Same cadence as a failed connect: one knob (CONN_TMO), so a
-            // nameserver that accepts and immediately drops cannot be
-            // hammered any harder than one that refuses outright.
-            epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
-        }
+        // Same cadence as a failed connect, whichever half gave out: one knob
+        // (CONN_TMO), so a nameserver that accepts and immediately drops — or
+        // one the watchdog just retired for not answering CA_PROTO_ECHO —
+        // cannot be hammered any harder than one that refuses outright.
+        // Applied to the read-side exits too since the watchdog started
+        // producing them; before that, only a failed write waited, and a peer
+        // that closed on us was redialled at once.
+        epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
     }
 }
 
@@ -3148,6 +3211,106 @@ mod tests {
             }
             None => panic!("search-response channel closed before a reply arrived"),
         }
+    }
+
+    /// An `EPICS_CA_NAME_SERVERS` peer that accepts, keeps reading and never
+    /// answers is retired on the bound every CA TCP connection is held to —
+    /// `CircuitWatchdog::retire_bound()`, i.e. `echo_idle_secs()` of quiet plus
+    /// `ECHO_TIMEOUT_SECS` for the `CA_PROTO_ECHO` probe to come back.
+    ///
+    /// Measured before this rule existed, on a VxWorks target against exactly
+    /// this peer: ten consecutive descriptor censuses on one local port over
+    /// ≈600 s, one accept, dial-pool `attempts=1`
+    /// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §3.5). The reader
+    /// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
+    /// reply, so nothing could ever end the circuit short of TCP itself giving
+    /// up — which a *silent but reachable* peer never makes happen.
+    ///
+    /// Retirement is observed from the peer's side, as a SECOND accept: the
+    /// per-name-server task redials after the same `CONN_TMO` a failed connect
+    /// waits. Against the pre-fix reader the first accept is the only one there
+    /// will ever be, so this test times out instead of passing.
+    ///
+    /// Virtual time (`start_paused`), because the bound is built from
+    /// `EPICS_CA_CONN_TMO` and defaults to 30 s + 5 s, with another 30 s before
+    /// the redial. Real sockets under a paused clock still work — tokio
+    /// auto-advances only while nothing is runnable, which is precisely what a
+    /// silent peer produces.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_name_server_is_retired_on_the_circuit_bound() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock name-server listener bind");
+        let ns_addr = ns_listener.local_addr().expect("mock name-server addr");
+
+        let (accept_tx, mut accept_rx) = mpsc::unbounded_channel::<()>();
+        let _ns_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _peer)) = ns_listener.accept().await else {
+                    return;
+                };
+                if accept_tx.send(()).is_err() {
+                    return;
+                }
+                // Read everything and answer nothing — the peer shape measured
+                // on target. Draining matters: a peer whose receive buffer
+                // filled would stall the client's writes instead, which is a
+                // different failure and not the one under test.
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (_req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
+        let engine = name_servers_only_search_engine(
+            vec![ns_addr],
+            req_rx,
+            resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
+        )
+        .expect("name-servers-only engine must build with a non-empty NS list");
+        let _engine_handle = tokio::spawn(engine);
+
+        // The circuit is dialled by `run_engine` itself, so the first accept
+        // needs no search request.
+        tokio::time::timeout(Duration::from_secs(30), accept_rx.recv())
+            .await
+            .expect("the engine must dial the name server")
+            .expect("accept channel closed");
+
+        // From here the peer says nothing at all. Retirement (the watchdog's
+        // verdict) plus one CONN_TMO of redial cadence is the whole budget;
+        // the slack covers the dial itself.
+        let budget = crate::client::transport::CircuitWatchdog::retire_bound()
+            + crate::client::transport::connection_timeout()
+            + Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(budget, accept_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "a silent name server must be retired within \
+                     echo_idle_secs() + ECHO_TIMEOUT_SECS and redialled; no \
+                     second accept in {budget:?}"
+                )
+            })
+            .expect("accept channel closed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= budget,
+            "redial took {elapsed:?}, past the {budget:?} the bound allows"
+        );
     }
 
     /// The name-service circuit reassembles a reply the kernel tore across

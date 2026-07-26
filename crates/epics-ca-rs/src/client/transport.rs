@@ -398,21 +398,29 @@ pub(super) type CaCircuit = TcpStream;
 #[cfg(any(exec_backend, ca_blocking_client))]
 pub(super) type CaCircuit = PumpedCircuit;
 
-/// Split a dialled circuit into the two halves `read_loop` / `write_loop` take.
+/// Split a dialled circuit into the halves `read_loop` / `write_loop` take, and
+/// the [`CircuitWatchdog`] that decides when its peer has stopped answering.
 ///
 /// A free function rather than a method so the two transports' *different*
 /// half types stay concrete — `read_loop` and `write_loop` are generic over
 /// `AsyncRead`/`AsyncWrite`, so neither boxing nor a trait object is needed on
 /// either side. The hosted arm keeps `into_split`'s owned halves (no `BiLock`,
 /// unchanged from before this seam existed).
+///
+/// The watchdog rides in the return type rather than being constructed by
+/// whoever remembers to: this is the only way to obtain the reader of a dialled
+/// circuit, so a CA TCP connection with no liveness rule cannot be built. See
+/// [`CircuitWatchdog`] for why that is the C shape.
 #[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
     tokio::net::tcp::OwnedReadHalf,
     tokio::net::tcp::OwnedWriteHalf,
+    CircuitWatchdog,
 ) {
-    stream.into_split()
+    let (reader, writer) = stream.into_split();
+    (reader, writer, CircuitWatchdog::new())
 }
 
 /// See the hosted definition.
@@ -422,8 +430,171 @@ pub(super) fn split_circuit(
 ) -> (
     epics_base_rs::runtime::blocking_io::GuardedReader,
     epics_base_rs::runtime::blocking_io::GuardedWriter,
+    CircuitWatchdog,
 ) {
-    (stream.reader, stream.writer)
+    (stream.reader, stream.writer, CircuitWatchdog::new())
+}
+
+// ---------------------------------------------------------------------------
+// The CA client's one TCP liveness rule
+// ---------------------------------------------------------------------------
+
+/// What an expired [`CircuitWatchdog`] deadline means.
+///
+/// The verdict is the same for every circuit; the *recovery* is the caller's,
+/// because the two circuits have different machinery to recover with — exactly
+/// as in C, where `unresponsiveCircuitNotify` moves `connectedList` channels to
+/// `unrespCircuit` (`tcpiiu.cpp:922-940`) and a name-service circuit, whose
+/// `connectedList` is empty, falls through that block.
+pub(super) enum WatchdogExpiry {
+    /// The peer has been quiet for the idle period. Probe it, then wait
+    /// `ECHO_TIMEOUT_SECS` for an answer.
+    SendEcho {
+        /// libca Issue #190: wall-clock skipped far past the sleep we asked
+        /// for, so the host was suspended rather than the peer being quiet.
+        /// The probe window is shortened; the caller logs it.
+        suspend_wake: bool,
+        wall_skip: Duration,
+    },
+    /// The probe went unanswered inside `ECHO_TIMEOUT_SECS`. The watchdog has
+    /// disarmed itself; C `tcpRecvWatchdog::expire` returns `noRestart` here
+    /// and `unresponsiveCircuitNotify` cancels the timer outright
+    /// (`tcpRecvWatchdog.cpp:81`, `tcpiiu.cpp:915-921`). Any byte from the peer
+    /// re-arms it through [`CircuitWatchdog::data_arrived`].
+    Unresponsive,
+}
+
+/// **The CA client's one TCP liveness rule** — the fourth seam shared by the
+/// upstream circuit's [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's
+/// reader (`client/search.rs::run_nameserver_connection`), after the dial
+/// ([`dial_ca`]), the framing ([`next_frame`]) and the receive-side body limit
+/// ([`RecvBodyPolicy`]).
+///
+/// **Invariant:** every CA TCP connection this client opens is retired if its
+/// peer answers nothing within `echo_idle_secs() + ECHO_TIMEOUT_SECS`.
+///
+/// It is inherited rather than opted into: [`split_circuit`] hands one back
+/// with the two halves, so the reader of a dialled circuit cannot be obtained
+/// without it. That is this port's shape of what C gets from `tcpiiu`'s
+/// constructor — `cac::setSearchDestinations` (`cac.cpp:260-282`) builds a name
+/// server through `findOrCreateVirtCircuit` like any data circuit, so
+/// `tcpRecvThread::connect` arms `recvDog.connectNotify` for it at
+/// `tcpiiu.cpp:627` with no `isNameService()` branch anywhere in the watchdog
+/// path. C's five `isNameService()` branches are all elsewhere: search-dest
+/// wiring (`:452`, `:811`), the connect-failure retry cadence (`:637`, `:647`)
+/// and the zero-channel shutdown (`:2023`).
+///
+/// Before this existed the name-service reader had no liveness rule at all — it
+/// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
+/// reply, so a name server that accepted, kept reading and never answered was
+/// held indefinitely: ten consecutive censuses on one local port over ≈600 s,
+/// measured on VxWorks
+/// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §3.5).
+pub(super) struct CircuitWatchdog {
+    idle: Duration,
+    echo: Duration,
+    deadline: epics_base_rs::runtime::task::Instant,
+    /// A probe is out and its answer is what the deadline now waits for.
+    echo_pending: bool,
+    /// C's timer armed/cancelled state, distinct from the circuit-level
+    /// unresponsive flag that `read_loop` also drives from `write_loop`.
+    armed: bool,
+    /// libca `tcpRecvWatchdog::beaconAnomaly`: while set, healthy beacons do
+    /// not refresh the deadline, so it expires on its own schedule.
+    beacon_anomaly: bool,
+    /// Wall-clock anchor for suspend detection, refreshed per loop iteration.
+    last_iteration_at: std::time::SystemTime,
+    suspend_threshold: Duration,
+}
+
+impl CircuitWatchdog {
+    /// Shortened probe window once a suspend wake is detected, so recovery is
+    /// seconds rather than tens of seconds.
+    const SUSPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(super) fn new() -> Self {
+        let idle = Duration::from_secs(echo_idle_secs());
+        Self {
+            idle,
+            echo: Duration::from_secs(ECHO_TIMEOUT_SECS),
+            deadline: epics_base_rs::runtime::task::Instant::now() + idle,
+            echo_pending: false,
+            armed: true,
+            beacon_anomaly: false,
+            last_iteration_at: std::time::SystemTime::now(),
+            // 3× idle — large enough to ignore ordinary scheduling jitter,
+            // small enough to fire on a real suspend of even a few minutes.
+            suspend_threshold: idle.saturating_mul(3).max(Duration::from_secs(60)),
+        }
+    }
+
+    /// The invariant's bound: the longest a peer may say nothing before this
+    /// watchdog calls its circuit dead — `echo_idle_secs()` of quiet, then
+    /// `ECHO_TIMEOUT_SECS` for the probe to be answered. One home for the
+    /// number, so a test asserting the bound cites what the code enforces.
+    pub(super) fn retire_bound() -> Duration {
+        Duration::from_secs(echo_idle_secs()) + Duration::from_secs(ECHO_TIMEOUT_SECS)
+    }
+
+    /// What to `sleep_until`. Meaningful only while [`Self::is_armed`].
+    pub(super) fn deadline(&self) -> epics_base_rs::runtime::task::Instant {
+        self.deadline
+    }
+
+    pub(super) fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Refresh the suspend-detection anchor at the top of a loop iteration.
+    pub(super) fn note_iteration(&mut self) {
+        self.last_iteration_at = std::time::SystemTime::now();
+    }
+
+    /// Bytes arrived from the peer — libca `messageArrivalNotify`. Any byte
+    /// counts, including an ECHO reply and a frame the parser later rejects.
+    pub(super) fn data_arrived(&mut self) {
+        self.echo_pending = false;
+        self.beacon_anomaly = false;
+        self.armed = true;
+        self.deadline = epics_base_rs::runtime::task::Instant::now() + self.idle;
+    }
+
+    /// libca `beaconAnomalyNotify`: sticky flag, deadline untouched.
+    pub(super) fn beacon_anomaly(&mut self) {
+        self.beacon_anomaly = true;
+    }
+
+    /// libca `beaconArrivalNotify`: refresh only when beacons are trusted and
+    /// no probe is outstanding.
+    pub(super) fn beacon_arrived(&mut self) {
+        if !self.beacon_anomaly && !self.echo_pending {
+            self.deadline = epics_base_rs::runtime::task::Instant::now() + self.idle;
+        }
+    }
+
+    /// The deadline fired. Advances the state machine and says what the peer's
+    /// silence now means.
+    pub(super) fn expired(&mut self) -> WatchdogExpiry {
+        let wall_skip = std::time::SystemTime::now()
+            .duration_since(self.last_iteration_at)
+            .unwrap_or(Duration::ZERO);
+        if self.echo_pending {
+            self.armed = false;
+            return WatchdogExpiry::Unresponsive;
+        }
+        self.echo_pending = true;
+        let suspend_wake = wall_skip >= self.suspend_threshold;
+        let probe = if suspend_wake {
+            Self::SUSPEND_PROBE_TIMEOUT
+        } else {
+            self.echo
+        };
+        self.deadline = epics_base_rs::runtime::task::Instant::now() + probe;
+        WatchdogExpiry::SendEcho {
+            suspend_wake,
+            wall_skip,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,7 +2042,12 @@ async fn connect_server(
                 }
             };
         tracing::debug!(server = %server_addr, "TLS handshake complete");
+        // The one reader path that does not come from `split_circuit` — the
+        // halves are tokio's, over the TLS stream. It is still a CA TCP
+        // connection, so it carries the same [`CircuitWatchdog`]; `read_loop`
+        // takes one by value, which is what makes that unskippable.
         let (reader, writer) = tokio::io::split(tls_stream);
+        let watchdog = CircuitWatchdog::new();
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1900,11 +2076,12 @@ async fn connect_server(
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
     } else {
-        let (reader, writer) = split_circuit(stream);
+        let (reader, writer, watchdog) = split_circuit(stream);
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1933,6 +2110,7 @@ async fn connect_server(
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
@@ -1940,7 +2118,7 @@ async fn connect_server(
 
     #[cfg(not(feature = "experimental-rust-tls"))]
     let (read_task, write_task) = {
-        let (reader, writer) = split_circuit(stream);
+        let (reader, writer, watchdog) = split_circuit(stream);
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1969,6 +2147,7 @@ async fn connect_server(
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
@@ -2222,6 +2401,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     unresponsive: std::sync::Arc<UnresponsiveGate>,
     bytes_pending_in_os: OsRecvQueueProbe,
     server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    mut watchdog: CircuitWatchdog,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
     // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
@@ -2245,42 +2425,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // ignore-don't-close policy — see [`RecvBodyPolicy`], shared with the
     // name-service circuit's reader.
     let mut body_policy = RecvBodyPolicy::new();
-    let idle_timeout = Duration::from_secs(echo_idle_secs());
-    let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
-    let mut echo_pending = false;
-    // libca Issue #190 (laptop-suspend stall): the OS may pause the
-    // tokio reactor for many minutes during system suspend. On
-    // resume, `Instant::now()` jumps forward by ~the suspend
-    // duration. The Sleep fires immediately (deadline in the past)
-    // and sends an echo — but the TCP socket may be half-open and
-    // we'd otherwise wait the full 5 s echo timeout to find out.
-    // Track wall-clock between loop iterations; if it skips more than
-    // `SUSPEND_THRESHOLD` (3× idle_timeout — large enough to ignore
-    // ordinary scheduling jitter, small enough to fire on a real
-    // suspend of even a few minutes) we use the abbreviated echo
-    // timeout so recovery completes in seconds instead of tens.
-    const SUSPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    let suspend_threshold = idle_timeout.saturating_mul(3).max(Duration::from_secs(60));
-    // Anchor for suspend detection — refreshed at the top of every
-    // loop iteration. Initialized at the loop entry; first iteration
-    // overwrites it before the wall-clock skip is consulted.
-    let mut last_loop_at;
-    // libca `tcpRecvWatchdog::beaconAnomaly` flag. Set when the
-    // beacon monitor classifies a beacon as anomalous — fresh sequence
-    // or off-band period (`bhe.cpp:226-262`); suppresses subsequent
-    // healthy-beacon watchdog refreshes so the deadline expires on
-    // its own schedule. Cleared on any data arrival from the server.
-    let mut beacon_anomaly = false;
-    // C `tcpRecvWatchdog`'s timer armed/cancelled state. `expire` returns
-    // `noRestart` once the echo probe times out (`tcpRecvWatchdog.cpp:81`)
-    // and `unresponsiveCircuitNotify` cancels the timer outright
-    // (`tcpiiu.cpp:915-921`), so the watchdog stops firing on an
-    // already-unresponsive circuit; the socket stays open and any byte from
-    // the server re-arms it. Distinct from the shared `unresponsive` flag,
-    // which is the circuit-level state — also set by the send watchdog in
-    // `write_loop` — and guards the one-shot `CircuitUnresponsive` /
-    // `CircuitResponsive` events.
-    let mut watchdog_armed = true;
+    // The idle period, the probe window, the armed/cancelled state, the
+    // beacon-anomaly flag and libca Issue #190's suspend detection all live in
+    // [`CircuitWatchdog`], which `split_circuit` handed us — the same rule the
+    // name-service circuit's reader runs. Nothing about the liveness bound is
+    // decided here.
     // libca flow control (C `tcpRecvThread::run`, `tcpiiu.cpp:543-572`).
     // `contig_recv_msg_count` counts consecutive receive frames that each
     // left bytes still unread in the OS socket buffer; once it reaches
@@ -2351,16 +2500,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // optional here: on the RTEMS target this loop runs with no tokio reactor
     // in the process, and `tokio::time::sleep_until` panics the task instead
     // of firing (§11.1).
-    let mut deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
-
     loop {
-        // Refresh the suspend-detection anchor at the top of each
-        // loop iteration. When the sleep branch wakes, `wall_skip =
-        // SystemTime::now() - last_loop_at` reveals whether the host
-        // was suspended during the await — sleep duration on a live
-        // system stays bounded by `idle_timeout`/`echo_timeout`, so a
-        // skip far beyond that is a strong suspend signal.
-        last_loop_at = std::time::SystemTime::now();
+        // Refresh the suspend-detection anchor at the top of each loop
+        // iteration. When the sleep branch wakes, the wall-clock skip since
+        // this point reveals whether the host was suspended during the await.
+        watchdog.note_iteration();
         // Not processing a message while parked in `select!` (blocked in
         // the socket read / watchdog / beacon wait). C `_receiveThreadIsBusy`
         // is false here; the send watchdog may mark the circuit unresponsive
@@ -2387,16 +2531,14 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         // beacons to reset the connection time out
                         // watchdog until we have received a ping
                         // response" comment in tcpRecvWatchdog.cpp.
-                        beacon_anomaly = true;
+                        watchdog.beacon_anomaly();
                     }
                     Some(false) => {
                         // libca beaconArrivalNotify: refresh the
                         // deadline only when we trust beacons (no
                         // anomaly outstanding) and aren't already
                         // probing.
-                        if !beacon_anomaly && !echo_pending {
-                            deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
-                        }
+                        watchdog.beacon_arrived();
                     }
                     None => {
                         // Transport manager dropped the sender —
@@ -2409,18 +2551,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             // Watchdog deadline expired. Disabled while the watchdog is
             // cancelled (C: unresponsive circuit, timer not restarted).
-            _ = epics_base_rs::runtime::task::sleep_until(deadline), if watchdog_armed => {
-                // libca Issue #190: detect suspend wake. If wall-clock
-                // skipped far more than expected for this sleep, the
-                // tokio reactor was paused (laptop suspend / VM stop).
-                // Shorten the echo probe so recovery is seconds, not
-                // tens of seconds.
-                let now_wall = std::time::SystemTime::now();
-                let wall_skip = now_wall
-                    .duration_since(last_loop_at)
-                    .unwrap_or(Duration::ZERO);
-                let suspend_wake = wall_skip >= suspend_threshold;
-                if echo_pending {
+            _ = epics_base_rs::runtime::task::sleep_until(watchdog.deadline()), if watchdog.is_armed() => {
+                match watchdog.expired() {
+                WatchdogExpiry::Unresponsive => {
                     // Echo timeout. C `tcpRecvWatchdog::expire` with
                     // `probeResponsePending` set calls `receiveTimeoutNotify`
                     // and returns `noRestart` (`tcpRecvWatchdog.cpp:54-81`).
@@ -2436,21 +2569,20 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // So: perform the one-shot unresponsive transition
                     // (shared with the send watchdog via the gate — only the
                     // winning transition emits), emit the trailing probe, and
-                    // DISARM the watchdog. The data-arrival path below is the
-                    // recovery: it re-arms the deadline and emits the sole
-                    // `CircuitResponsive`. A server that goes quiet for
-                    // minutes and comes back keeps its circuit, its channels
-                    // and its subscriptions, with no re-search.
+                    // let the watchdog stay DISARMED. The data-arrival path
+                    // below is the recovery: it re-arms the deadline and emits
+                    // the sole `CircuitResponsive`. A server that goes quiet
+                    // for minutes and comes back keeps its circuit, its
+                    // channels and its subscriptions, with no re-search.
                     unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
                     if send_echo(&write_tx, server_minor_version).is_err() {
                         let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                         return;
                     }
-                    watchdog_armed = false;
                     continue;
                 }
                 // Idle expired — send echo heartbeat. The deadline
-                // path itself doesn't read `beacon_anomaly`; the
+                // path itself doesn't read the beacon-anomaly flag; the
                 // flag's job is upstream, in the beacon-arrival
                 // branch, where it gates whether healthy beacons
                 // refresh the deadline. By the time we get here on
@@ -2458,23 +2590,21 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 // already kept the deadline at its original value
                 // long enough for it to expire on the schedule it
                 // would have had without any beacons at all.
-                if send_echo(&write_tx, server_minor_version).is_err() {
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                    return;
+                WatchdogExpiry::SendEcho { suspend_wake, wall_skip } => {
+                    if send_echo(&write_tx, server_minor_version).is_err() {
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
+                        return;
+                    }
+                    if suspend_wake {
+                        tracing::info!(
+                            server = %server_addr,
+                            wall_skip_secs = wall_skip.as_secs(),
+                            "suspend wake detected; probing with shortened echo timeout"
+                        );
+                    }
+                    continue;
                 }
-                echo_pending = true;
-                let probe = if suspend_wake {
-                    tracing::info!(
-                        server = %server_addr,
-                        wall_skip_secs = wall_skip.as_secs(),
-                        "suspend wake detected; probing with shortened echo timeout"
-                    );
-                    SUSPEND_PROBE_TIMEOUT
-                } else {
-                    echo_timeout
-                };
-                deadline = epics_base_rs::runtime::task::Instant::now() + probe;
-                continue;
+                }
             }
             // Data from the server.
             read_result = reader.read(&mut buf) => {
@@ -2496,12 +2626,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // set, a concurrent send stall in `write_loop` restarts its
         // watchdog rather than marking this live circuit unresponsive.
         unresponsive.set_recv_busy(true);
-        echo_pending = false;
-        beacon_anomaly = false;
         // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
         // an unresponsive circuit's cancelled timer comes back here).
-        watchdog_armed = true;
-        deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
+        watchdog.data_arrived();
         // Phase D: bump the per-server "last RX" stamp before any
         // protocol parsing so that even ECHO replies and frames the
         // parser later rejects still count as proof of liveness.
@@ -3208,6 +3335,7 @@ mod read_loop_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -3484,6 +3612,7 @@ mod recv_body_limit_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // Extended header announcing 3x max_frame_body_bytes() of body.
@@ -3536,6 +3665,7 @@ mod recv_body_limit_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 20 MiB EVENT_ADD body for a subscription nobody is waiting on: the
@@ -3650,6 +3780,7 @@ mod malformed_header_close_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 16-byte header declaring a 12-byte payload: 12 & 0x7 != 0.
@@ -3697,6 +3828,7 @@ mod malformed_header_close_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -3785,6 +3917,7 @@ mod error_echo_dispatch_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // ECA_TOLARGE echoing subscription id 0xCAFE_BABE — the exact
@@ -3866,6 +3999,7 @@ mod error_echo_dispatch_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         const ECA_GETFAIL: u32 = 0xC4;
@@ -3958,6 +4092,7 @@ mod flow_control_tests {
             Arc::new(UnresponsiveGate::new()),
             probe,
             Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
         Harness {
             client,
@@ -4143,6 +4278,7 @@ mod recv_watchdog_tests {
             Arc::clone(&unresponsive),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         let idle = Duration::from_secs(echo_idle_secs());
@@ -4245,6 +4381,7 @@ mod recv_watchdog_tests {
             Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         drop(client_io);
@@ -4289,6 +4426,7 @@ mod recv_watchdog_tests {
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // DBR_DOUBLE, one element: the post-recovery value.

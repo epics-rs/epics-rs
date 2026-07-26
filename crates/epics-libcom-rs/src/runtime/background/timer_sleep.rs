@@ -38,13 +38,26 @@
 //! timer entry is armed lazily on the **first poll** — a `Sleep` that is
 //! created and dropped without ever being awaited schedules nothing.
 //!
-//! The [`DelayedTimer`](crate::runtime::background::delayed_timer::DelayedTimer) has no cancel handle (C `callbackRequestDelayed` starts
-//! a fire-and-forget `epicsTimer`), so a dropped-before-deadline `Sleep` cannot
-//! un-schedule its entry. Instead [`Sleep`]'s `Drop` clears the stored waker, so
-//! when the orphaned timer callback eventually fires it finds no waker and wakes
-//! nobody — a clean cancel with no stale wakeup. The one wasted timer tick is
-//! the cost of the runtime-free design and matches how C leaves an already-armed
-//! `epicsTimer` to expire harmlessly.
+//! A [`Sleep`] **owns** the queue entry it arms: [`TimerHandle::schedule_wake`]
+//! hands back a [`WakeKey`], and [`Sleep`]'s `Drop` both clears the stored waker
+//! and cancels that key. Clearing the waker is what makes the cancel clean — a
+//! wake that races the drop finds no waker and wakes nobody — and cancelling the
+//! key is what makes it *free*: the entry holds a clone of the shared
+//! `Arc<Mutex<SleepState>>`, so leaving it queued keeps that cell and the OS
+//! mutex inside it alive for the entire remaining delay.
+//!
+//! That retention is not theoretical and not small. A `select!` arm holding a
+//! long-period `interval` tick re-arms a fresh `Sleep` on every loop iteration
+//! and drops it when another arm wins, so an uncancellable entry accumulates at
+//! the loop's iteration rate for the whole period. Measured on VxWorks 7 against
+//! the PVA search engine's 180 s `BEACON_CLEAN_INTERVAL` tick: ~124 live entries
+//! at ~184 B each, released in one batch every 180 s
+//! (`doc/vxworks-dial-attempt-residue-on-target-measurement.md`).
+//!
+//! Cancellation is a property of the *wake* path only.
+//! [`TimerHandle::schedule`] — C `callbackRequestDelayed`
+//! (`callback.c:410-419`) — stays fire-and-forget, because there the caller
+//! keeps no handle and the queue is the only owner.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -52,7 +65,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use super::delayed_timer::TimerHandle;
+use super::delayed_timer::{TimerHandle, WakeKey};
 
 /// Shared between a [`Sleep`] and its armed timer callback.
 struct SleepState {
@@ -69,8 +82,15 @@ pub struct Sleep {
     deadline: Instant,
     timer: TimerHandle,
     state: Arc<Mutex<SleepState>>,
-    /// Whether the timer entry has been armed (arming is lazy, on first poll).
+    /// Whether the first poll has run. Arming is lazy and attempted exactly
+    /// once; a timer already shut down when that poll ran queues nothing, and
+    /// this is what stops every later poll from retrying.
     armed: bool,
+    /// The queue entry this `Sleep` owns — `Some` exactly while one is queued,
+    /// and the thing `Drop` gives back. Separate from `armed` so neither field
+    /// has to mean two things: "we tried" and "we hold one" are different
+    /// facts, and it is the second that governs the memory.
+    entry: Option<WakeKey>,
 }
 
 /// A future completing `dur` from now — mirrors `tokio::time::sleep`. The
@@ -91,6 +111,7 @@ pub fn sleep_until(timer: &TimerHandle, deadline: Instant) -> Sleep {
             waker: None,
         })),
         armed: false,
+        entry: None,
     }
 }
 
@@ -122,7 +143,7 @@ impl Future for Sleep {
             // Inline wakeup on the timer thread — see the module docs: a sleep
             // wake is a non-blocking `waker.wake()`, and dispatching it to the
             // callback pool would deadlock a `spawn`ed future that awaits it.
-            this.timer.schedule_wake(
+            this.entry = this.timer.schedule_wake(
                 delay,
                 Box::new(move || {
                     let mut st = cb_state.lock().unwrap();
@@ -140,9 +161,15 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        // Clear the waker so an already-armed (uncancellable) timer callback
-        // wakes nobody when it fires. Leaving `fired` untouched is fine — the
-        // future is gone.
+        // Give the queue entry back first. It holds a clone of `state`, so
+        // until it goes the shared cell — and the OS mutex std lazily creates
+        // inside it — stays alive for the whole remaining delay. Cancelling an
+        // entry that already fired is a no-op, so no ordering is owed here.
+        if let Some(key) = self.entry.take() {
+            self.timer.cancel_wake(key);
+        }
+        // Clear the waker so a wake that raced the cancel finds nobody. Leaving
+        // `fired` untouched is fine — the future is gone.
         self.state.lock().unwrap().waker = None;
     }
 }
@@ -266,6 +293,76 @@ mod tests {
             count.load(Ordering::SeqCst),
             0,
             "a dropped sleep must not wake a stale waker"
+        );
+    }
+
+    /// The E10 regression: a dropped `Sleep` must give its queue entry back,
+    /// not leave it to expire. Before the entry was owned, the ~184 B a `Sleep`
+    /// allocates (shared cell, boxed wake, and the OS mutex std lazily creates
+    /// inside the cell) stayed live for the whole remaining delay — so a
+    /// `select!` arm re-arming a long-period tick each iteration accumulated
+    /// one of those per iteration until the period elapsed.
+    #[test]
+    fn dropping_a_sleep_releases_its_timer_entry() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        let waker = Waker::from(Arc::new(CountWaker(Arc::new(AtomicUsize::new(0)))));
+        let mut cx = Context::from_waker(&waker);
+
+        // An hour out, so only the drop can retire it.
+        let mut s = Box::pin(sleep(&h, Duration::from_secs(3600)));
+        assert!(s.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(h.scheduled_count(), 1, "the first poll must arm an entry");
+
+        drop(s);
+        assert_eq!(
+            h.scheduled_count(),
+            0,
+            "a dropped sleep left its entry queued; it holds the shared cell for an hour"
+        );
+    }
+
+    /// A `Sleep` created and never polled arms nothing, so it has nothing to
+    /// give back — the lazy-arming half of the same invariant.
+    #[test]
+    fn dropping_an_unpolled_sleep_queues_nothing() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        drop(sleep(&h, Duration::from_secs(3600)));
+        assert_eq!(h.scheduled_count(), 0);
+    }
+
+    /// The interval case the leak was actually measured through: each `tick()`
+    /// that loses a `select!` race drops mid-await, and every one of those must
+    /// leave the queue as it found it.
+    #[test]
+    fn abandoned_interval_ticks_leave_no_entries() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        let waker = Waker::from(Arc::new(CountWaker(Arc::new(AtomicUsize::new(0)))));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut iv = interval(&h, Duration::from_secs(180));
+        // The first tick is immediate and arms nothing; the rest are 180 s out.
+        let mut first = Box::pin(iv.tick());
+        assert!(first.as_mut().poll(&mut cx).is_ready());
+        drop(first);
+
+        for _ in 0..32 {
+            let mut t = Box::pin(iv.tick());
+            assert!(t.as_mut().poll(&mut cx).is_pending());
+            drop(t); // the `select!` arm lost
+        }
+        assert_eq!(
+            h.scheduled_count(),
+            0,
+            "abandoned interval ticks accumulate one queue entry each per period"
         );
     }
 

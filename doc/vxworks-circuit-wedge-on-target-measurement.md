@@ -270,6 +270,10 @@ port rotates on every attempt — `55817` → `57885` → `51538` → `57696` �
 is a fresh SYN rather than a retained socket. None of the eight ever shows
 `peer=none(errno=57)`.
 
+That one-census survival is taken apart in [§3.5](#35-the-name-service-socket-correct-lifetime-here-and-the-wedge-it-is-not-covered-against):
+it is correct lifetime on this cut, and the reason it is correct is not the one
+that retires the data circuit.
+
 **One VxWorks-specific reading note.** On RTEMS the zombie censused as
 `peer=none mode=0140000`, and it was the `mode` that distinguished it: a live
 socket read `0140666`. That discriminator does not work here. Both readings
@@ -363,6 +367,101 @@ Control image: identical in shape. `n=7` connects in 0 ms, `n=8` in
 (`51562`, `55541`). The wedge costs a descriptor for the duration of the
 outage; it does not stop the client recovering when the peer comes back.
 
+### 3.5 The name-service socket: correct lifetime here, and the wedge it is not covered against
+
+§3.3 recorded that `fd=5` (`local=…:53951`) survived one census past the data
+circuit without saying why. It is **correct lifetime on this cut** — and the
+reason it is correct is not the reason the data circuit's is, which is the part
+worth having.
+
+**When it was retired, derived from the run's own cadence.** `FDPROBE` runs
+every ~10 s, so `seq` is a clock. Working backwards from the dial ladder: `n=4`
+submits at `seq=32` after the three-window gap `seq=29,30,31`, so `n=3` — which
+resolves 74 950 ms after its own submit — was submitted at `seq≈21.5`, i.e.
+**cut + ~90 s**. `FD_CNT` is 6 unbroken from `seq=18` to `seq=28`, with no dip
+to 5 anywhere in it, so the old socket closed and the redial socket opened
+inside the same 10 s window. That rules out the `writer_failed` exit of
+`run_nameserver_connection`, which sleeps `EPICS_CA_CONN_TMO` (30 s) before
+redialing and would have shown that gap. The pump exited on
+`read_task.is_finished()` instead: the reader ended, so the loop redialed at
+once.
+
+**What ended the reader.** Not the client. `dial_ca` arms `SO_KEEPALIVE`
+(`set_circuit_keepalive`) and leaves `PumpConfig`'s read timeout at its
+effectively-infinite default, so with the link down it is the guest's own TCP
+that eventually declares the peer gone and fails the read; `reader_pump` ends
+on that error and drops its sender, which is what the pump loop notices. The
+data circuit, 30 s earlier at cut + 60…70 s, was retired by something else
+entirely — CA's echo watchdog in `read_loop`, `echo_idle_secs()`
+(`EPICS_CA_CONN_TMO`, 30 s) of quiet then `ECHO_TIMEOUT_SECS` = 5 s for the
+probe to be answered. **The 30 s offset between the two retirements is the gap
+between a client-owned liveness rule and no liveness rule at all.**
+
+`run_nameserver_connection` (`crates/epics-ca-rs/src/client/search.rs`) sends
+`CA_PROTO_ECHO` on a hardcoded 60 s tick and **never checks that it was
+answered**. Nothing else in that loop times anything. So the connection is
+retired only when a write fails or a read fails — both transport events, both
+outside the client's control.
+
+**That is a second wedge, and this cut cannot reach it.** A link cut always
+ends in TCP giving up, which is why the outage run looks healthy. A name server
+that stays *reachable*, accepts, keeps reading, and simply never answers gives
+TCP nothing to give up on.
+
+Measured, same rig, image `silentns.vxe` from `facf496a` pointed at
+`~/vx-rig-e9/silentns-e9.py` on `10.0.2.2:46075` — a peer that accepts,
+`recv`s and discards forever, and sends no byte ever. Ten consecutive censuses,
+`c6-6` through `c6-60`, ≈600 s:
+
+```
+FDCENSUS tag=c6-6  fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-12 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-18 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-24 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-30 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-36 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-42 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-48 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-54 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+FDCENSUS tag=c6-60 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:52966 peer=10.0.2.2:46075 mode=0140666
+```
+
+**The same local port on every one of the ten.** The host side saw exactly one
+accept for the whole run (`17:05:46 accepted ('127.0.0.1', 33034) total=1`) and
+the dial pool reports `attempts=1` at `seq=65`, so not one redial was
+attempted. In the outage run this same descriptor slot rotated its port on
+every rung; here it never moves. Against the data circuit's 35 s bound
+(`EPICS_CA_CONN_TMO` + `ECHO_TIMEOUT_SECS`) the name-service connection was
+still held at ≥600 s — ≥17× — and nothing in the code path would have ended it
+at any later time either.
+
+**C does not have this asymmetry.** `cac::setSearchDestinations`
+(`modules/ca/src/client/cac.cpp:260-282`) builds each `EPICS_CA_NAME_SERVERS`
+entry through `findOrCreateVirtCircuit` and starts it with `piiu->start()`, so a
+name server in C **is** a `tcpiiu` — the same object as a data circuit, on
+`circuitList`, carrying `tcpRecvWatchdog` and `tcpSendWatchdog` unconditionally.
+Our port made the name-service connection a bespoke loop in `search.rs` instead,
+and the liveness rule did not come with it.
+
+**Cost, stated as what it does and does not break.** The connection keeps
+carrying searches, so if the silent server ever starts answering, resolution
+resumes on that same connection — this is not a permanent loss of the client.
+What is lost is *failover*: the client never abandons a name server that has
+gone silent, so with several configured it keeps feeding searches into the dead
+one, and a half-open peer is never detected. Throughout the 600 s above all six
+probe records read `SEVR=Ok("3") STAT=Ok("17")` — every `ca://` link down, with
+one held socket and no attempt to do anything about it.
+
+**Status: open.** This is a defect, it is measured, and it is not fixed in this
+round — the fix is to put the name-service connection under the same liveness
+rule as the data circuit (probe on `echo_idle_secs()` rather than a hardcoded
+60 s, and end the connection when `ECHO_TIMEOUT_SECS` passes with no byte from
+the peer), which is a change to CA client behaviour and is left for sign-off
+rather than taken silently. A related reading, noticed on the way and also not
+acted on: because a name server is a `tcpiiu` in C it is counted by
+`ca_get_ioc_connection_count()`, whereas our `circuits=Some(1)` counts data
+circuits only — pre-cut this image held two TCP connections and reported one.
+
 ## 4. Attribution: this is a blackhole, not a forged RST
 
 The hazard the RTEMS rig hit was libslirp forging RSTs into guest↔guest flows
@@ -405,17 +504,111 @@ connected socket, so every CA client circuit aborted the instant its dial
 succeeded. `SO_RCVTIMEO` on the same socket is accepted.
 
 This is the same rule `crates/epics-pva-rs/src/server_native/blocking.rs`
-already applied to the PVA server's accepted sockets; the fix moves it into the
-seam both blocking drivers share, so `SO_RCVTIMEO` stays fatal and
-`SO_SNDTIMEO` becomes best-effort in one place. The cost is stated rather than
-hidden: on a target that refuses the option, `write_frame_deadline` loses the
-timeout tick it regains control on, so a peer that never reads parks the writer
+already applied to the PVA server's accepted sockets; the first fix moved it
+into the seam both blocking drivers share, so `SO_RCVTIMEO` stayed fatal and
+`SO_SNDTIMEO` became best-effort in one place. The cost was stated rather than
+hidden: on a target that refuses the option, `write_frame_deadline` lost the
+timeout tick it regains control on, so a peer that never reads parked the writer
 pump in `write` instead of tripping the deadline. That is a stall under
 backpressure; the fatal version was no connection at all.
 
 Committed as `d4085caa`, and cherry-picked onto the control branch as
 `5dbcadd0` so that the A/B differential stays exactly the one commit under
 test.
+
+### 5.1 The stall that workaround left, and the fix that removes it
+
+`d4085caa` was a workaround and was labelled one. The root cause is not that
+`setsockopt` failed — it is that the send deadline was **not owned by the
+function that claims it**. `write_frame_deadline` regained control only because
+each blocking `write` returned `EAGAIN` under `SO_SNDTIMEO`, so on a target
+without that option the deadline was silently absent. An invariant one target
+can switch off is not an invariant. The asymmetry showed the shape: the PVA
+server's sends sit under `runtime::task::timeout` in `tcp.rs
+handle_connection_io` and stayed bounded, while the blocking client seam had
+nothing above it.
+
+`write_frame_deadline` now does its own waiting, at the seam both blocking
+drivers share:
+
+* `wait_writable` polls `POLLOUT` for exactly the time the deadline has left,
+  and returns "expired" rather than "ready" when that reaches zero;
+* `write_some` sends with `MSG_DONTWAIT`, so the send itself cannot park. That
+  flag rather than `O_NONBLOCK` because the reader pump shares this exact file
+  description and must not be switched to non-blocking underneath.
+
+Waiting for `POLLOUT` alone is not enough, and getting that wrong cost a round:
+a blocking `write` on a stream socket does not return a short count when the
+send buffer fills, it waits until the *whole* buffer is queued, so the write
+after a successful `poll` re-enters the same unbounded wait one byte later. The
+first attempt at this fix still parked for 20 s in the host regression test.
+
+`SEND_TICKS_PER_DEADLINE` and `send_tick_for` described the old mechanism and
+are removed with it — a **breaking public-API removal** in `epics-libcom-rs`,
+re-exported as `epics_base_rs::runtime::blocking_io`. The `set_write_timeout`
+calls in `drive_socket_blocking` and in the PVA blocking server are gone too:
+the option is now set nowhere in the write path, on any target, so there is no
+configuration under which the deadline is armed and no configuration under which
+it is not.
+
+**Measured on target, one boot, two legs against the same never-reading host
+peer** (`~/vx-rig-e9/deafpeer-e9.py` on `10.0.2.2:46064`, which accepts and never
+`recv`s; guest image `wedge-wd.vxe` from `facf496a`). Control is
+`set_write_timeout` then `write_all`, which is what the pump did while the
+deadline depended on the option; fix is `write_frame_deadline`. Both send an
+8 MiB frame under a 2000 ms deadline. Verbatim:
+
+```
+WDPROBE begin peer=10.0.2.2:46064 frame_bytes=8388608 send_timeout_ms=2000
+WDPROBE ctl so_sndtimeo=error kind=Uncategorized os=Some(42) msg=no protocol option (os error 42)
+WDPROBE ctl writing
+WDPROBE fix returned elapsed_ms=2016 outcome=Err((TimedOut, None))
+WDPROBE mark t_ms=17150 ctl_returned=false
+WDPROBE mark t_ms=27183 ctl_returned=false
+WDPROBE mark t_ms=37216 ctl_returned=false
+WDPROBE mark t_ms=47250 ctl_returned=false
+WDPROBE mark t_ms=57283 ctl_returned=false
+WDPROBE mark t_ms=67316 ctl_returned=false
+WDPROBE mark t_ms=77350 ctl_returned=false
+WDPROBE mark t_ms=87383 ctl_returned=false
+WDPROBE mark t_ms=97416 ctl_returned=false
+WDPROBE mark t_ms=107450 ctl_returned=false
+WDPROBE mark t_ms=117483 ctl_returned=false
+WDPROBE mark t_ms=127516 ctl_returned=false
+WDPROBE end t_ms=127516 ctl_returned=false
+```
+
+`os=Some(42)` is `ENOPROTOOPT` read on the target rather than assumed from the
+header. **The fixed leg returned at 2016 ms against a 2000 ms deadline — a
+16 ms overshoot — with `TimedOut` and no `raw_os_error`, which is this
+function's own error and not a socket's.** The control leg had not returned
+127.5 s later, 63× the deadline it had asked for, and it never does: the
+descriptor census shows it still holding its socket while the fixed leg's is
+already gone.
+
+```
+FDCENSUS tag=c6-6 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:61246 peer=10.0.2.2:45064 mode=0140666
+FDCENSUS tag=c6-6 fd=6 kind=tcp so_type=1 listening=0 local=10.0.2.15:59730 peer=10.0.2.2:45064 mode=0140666
+FDCENSUS tag=c6-6 fd=7 kind=tcp so_type=1 listening=0 local=10.0.2.15:56299 peer=10.0.2.2:46064 mode=0140666
+FDCENSUS end tag=c6-6 open=8 max=1000
+```
+
+`fd=7` is the control leg's connection to the deaf peer; the fixed leg's second
+connection to the same peer (the host saw both accepts, `held=2`) is absent
+because `write_frame_deadline` returned and its socket dropped. The parked
+thread is alive, not crashed — the task census names it at the same instant, and
+the console carries zero panics for the whole run:
+
+```
+TASKDUMP tag=c6-12 id=0x000100ed prio=189 name=c6-wd-ctl stack_high=3504 stack_margin=1045072
+```
+
+The host regression test is `the_deadline_holds_with_no_socket_send_timeout`
+(`blocking_io.rs`): it sets no write timeout at all, which is the VxWorks
+condition reproduced on Linux. On the pre-fix tree it fails after 20.010 s; on
+the fixed tree it passes in 0.207 s.
+
+Committed as `df8d65a8` (the fix) and `facf496a` (the on-target probe).
 
 ## 6. Verdict
 
@@ -455,7 +648,18 @@ unimplemented on VxWorks 7 and `drive_socket_blocking` propagated its
 `ENOPROTOOPT` fatally, so before `d4085caa` a CA client on this target
 established **no circuits at all**. Nothing in this row could have been
 measured without that fix, and it is a defect in the shipped port, not in the
-rig.
+rig. That first fix was a workaround and left a stall behind it; §5.1 replaces
+it with the send deadline owned inside `write_frame_deadline`, measured on
+target at 2016 ms against a 2000 ms bound where the old path had not returned
+127.5 s later.
+
+**A second defect is open, measured and unfixed** (§3.5): the CA client's
+`EPICS_CA_NAME_SERVERS` connection has no liveness rule of its own, so a name
+server that accepts, keeps reading and never answers is held forever — ten
+consecutive censuses on the same local port, one accept, `attempts=1`, against
+the data circuit's 35 s bound. In C that connection is a `tcpiiu` and carries
+the same watchdog a data circuit does. The fix changes CA client behaviour and
+is left for sign-off.
 
 ## 7. Reproduction
 
@@ -871,7 +1075,68 @@ sleep 70
 "$E9/run-wedge-e9.sh" "$TAG" "$OUTAGE" "$RESTORE"
 ```
 
-### 7.7 Running it
+### 7.7 `~/vx-rig-e9/deafpeer-e9.py` — the never-reading peer (§5.1)
+
+```python
+# deafpeer-e9.py <port> - accept TCP connections and never read from them.
+#
+# The host half of the write-deadline measurement: the guest writes a frame at
+# a peer that completed the handshake and then stops consuming, which is the
+# condition write_frame_deadline exists to bound.  Nothing is ever recv()ed and
+# nothing is ever closed, so the only thing that can end a guest-side write is
+# the guest.
+import socket, sys, time
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port))
+s.listen(16)
+print(time.strftime("%H:%M:%S"), "deafpeer listening on 0.0.0.0:%d" % port, flush=True)
+held = []
+while True:
+    c, a = s.accept()
+    held.append(c)
+    print(time.strftime("%H:%M:%S"), "accepted", a, "held=%d" % len(held), flush=True)
+```
+
+### 7.8 `~/vx-rig-e9/silentns-e9.py` — the silent name server (§3.5)
+
+```python
+# silentns-e9.py <port> - accept TCP, read and discard, never send a byte.
+#
+# A CA name server that is REACHABLE and ACCEPTS but never answers.  Reading
+# matters: a peer that stops reading would eventually fail the guest's writes
+# and retire the connection for the wrong reason, which is the other item.
+# Here every guest write is consumed, so nothing at the transport layer ever
+# ends this connection.
+import socket, sys, threading, time
+port = int(sys.argv[1])
+def drain(c, a):
+    n = 0
+    while True:
+        try:
+            b = c.recv(65536)
+        except OSError:
+            break
+        if not b:
+            break
+        n += len(b)
+    print(time.strftime("%H:%M:%S"), "closed", a, "drained=%d" % n, flush=True)
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port)); s.listen(16)
+print(time.strftime("%H:%M:%S"), "silentns listening on 0.0.0.0:%d" % port, flush=True)
+held = []
+while True:
+    c, a = s.accept()
+    held.append(c)
+    print(time.strftime("%H:%M:%S"), "accepted", a, "total=%d" % len(held), flush=True)
+    threading.Thread(target=drain, args=(c, a), daemon=True).start()
+```
+
+### 7.9 Running it
+
+The outage A/B:
 
 ```
 cd ~/vx-rig-e9
@@ -881,6 +1146,29 @@ cd ~/vx-rig-e9
 ./ab-e9.sh wedge-ctl.vxe ctl 480 150
 ```
 
+The write-deadline A/B (§5.1) — the peer address is compiled in, so the
+`C6_WRITE_DEADLINE_PEER` export is what starts the probe at all:
+
+```
+python3 deafpeer-e9.py 46064 &
+C6_WRITE_DEADLINE_PEER=10.0.2.2:46064 ./build-vx-ca.sh wedge-wd.vxe 10.0.2.2:45064
+./boot-e9.sh wedge-wd.vxe wd ; ./upstream-e9.sh
+echo 'rtpSp "/host.host/wedge-wd.vxe"' > wd-con.in
+grep -a WDPROBE wd-console.log
+```
+
+The silent-name-server run (§3.5) — no `C6_WRITE_DEADLINE_PEER`, and the name
+server is the silent peer rather than the upstream IOC:
+
+```
+python3 silentns-e9.py 46075 &
+./build-vx-ca.sh silentns.vxe 10.0.2.2:46075
+./boot-e9.sh silentns.vxe sns
+echo 'rtpSp "/host.host/silentns.vxe"' > sns-con.in
+grep -a FDCENSUS sns-console.log
+```
+
 Artefacts on the box under `~/vx-rig-e9/`: `lad-console.log`,
-`lad-phases.txt`, `lad-cut.txt`, `lad-restore.txt`, and the `ctl-*`
-counterparts.
+`lad-phases.txt`, `lad-cut.txt`, `lad-restore.txt` and the `ctl-*`
+counterparts for the outage A/B; `wd-console.log` and `deafpeer.log` for §5.1;
+`sns-console.log` and `silentns.log` for §3.5.

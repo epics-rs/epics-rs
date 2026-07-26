@@ -605,6 +605,8 @@ static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// an operator needs the two told apart:
 ///
 /// * at capacity → the bound, which is the number to raise;
+/// * out of reservation → the target is short of memory for another client's
+///   threads, and the switch that says how much it may have;
 /// * spawn failed → what the target said, which is a memory problem and has
 ///   nothing to do with the bound (it was never reached).
 ///
@@ -617,6 +619,10 @@ fn refusal_reason(cause: &AcquireError) -> String {
         AcquireError::AtCapacity { capacity } => {
             format!("worker pool at capacity: {capacity} concurrent clients")
         }
+        // Deliberately the pool's own words: the three numbers and the name of
+        // the switch that moves them are the whole remedy, and restating them
+        // here is how they drift apart.
+        AcquireError::OutOfReservation { .. } => cause.to_string(),
         AcquireError::SpawnFailed(e) => format!("cannot create a client thread: {e}"),
         AcquireError::ShuttingDown => "the server is shutting down".to_string(),
     };

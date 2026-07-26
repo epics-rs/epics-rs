@@ -887,6 +887,14 @@ impl BlockingPvaServer {
                 );
                 return Ok(());
             }
+            Err(cause @ AcquireError::OutOfReservation { .. }) => {
+                // The other refusal the process itself makes. It is not a
+                // failure to start a connection — the server is healthy and
+                // said no — so it takes the refusal path and reports the pool's
+                // own words, which name the switch that raises the budget.
+                warn!(?peer, "blocking PVA server: refusing connection, {cause}");
+                return Ok(());
+            }
             Err(e) => return Err(e.into()),
         };
 

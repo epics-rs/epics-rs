@@ -38,6 +38,28 @@
 //! the *residue of the creation*. Its other job is to be the single owner of
 //! connection admission — the one place that can refuse with `EAGAIN`.
 //!
+//! # The bound is memory, not just a count
+//!
+//! A count bound cannot know when the target is out of thread memory: on
+//! `x86_64-wrs-vxworks` the CA pool's count bound (141, derived from the
+//! descriptor budget) was never reached, because the process hit a reserved
+//! address-space ceiling at 46 concurrent clients first — and what happened
+//! there was not a refusal. `pthread_create` began to fail, then a `std` mutex
+//! lock returned `EINVAL` and killed a worker, then an allocation of 64 bytes
+//! failed and took the whole RTP down with signal 6. A bound that is reached
+//! *after* the target has run out is not an admission gate.
+//!
+//! So every set's memory is reserved from one **process-wide** budget before a
+//! thread is created ([`try_reserve`], [`POOL_RESERVATION_ENV`]), and a set
+//! that does not fit is refused with [`AcquireError::OutOfReservation`] while
+//! the target still has the memory to deliver the refusal. Process-wide because
+//! the resource is: an IOC runs several pools, and three pools each inside
+//! their own bound can still walk the process past the ceiling together. The
+//! count bounds stay exactly what they were — `capacity` is a descriptor bound
+//! for the CA server and an operator's `max_connections` for the PVA server —
+//! because those are different resources and folding them into one number is
+//! what makes a bound unable to say which one ran out.
+//!
 //! # Accounting: busy is what is counted, and a set idles through one gate
 //!
 //! A set returns to the idle pool when **both** its [`SetLease`] has dropped
@@ -66,9 +88,9 @@
 use std::collections::VecDeque;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
@@ -182,6 +204,14 @@ struct PoolInner {
     name_prefix: &'static str,
     /// The most sets that may ever exist — connection admission's hard bound.
     capacity: usize,
+    /// What one whole set reserves: the sum over the roster of
+    /// [`thread_reservation`]. Fixed by the roster, so admission needs no
+    /// per-set arithmetic.
+    set_reservation: usize,
+    /// The account this pool reserves from and releases to. One and the same
+    /// for every production pool, so a release cannot land anywhere but where
+    /// its reservation came from.
+    reservation: &'static Reservation,
     reg: Mutex<Registry>,
 }
 
@@ -410,6 +440,9 @@ fn announce_worker_death(prefix: &str, index: usize, roles: usize) {
 struct WorkerExit {
     inner: Arc<PoolInner>,
     set: Arc<SetHandle>,
+    /// This thread's share of its set's reservation, given back here — the one
+    /// place that runs for a thread that exists and never for one that does not.
+    reserved: usize,
     /// Set true only where the worker returns normally. Left false on every
     /// unwind, which is what tells the two apart in `Drop`.
     clean: bool,
@@ -417,6 +450,11 @@ struct WorkerExit {
 
 impl Drop for WorkerExit {
     fn drop(&mut self) {
+        // Unconditional and first: the thread's memory goes back to the process
+        // budget however the thread ended. Every other decision below is about
+        // the *set*, and a clean exit returns early from those.
+        self.inner.reservation.release(self.reserved);
+
         let (first_death, last_gone) = {
             let mut st = lock_set(&self.set);
             // Read and write `dead` under the set lock, so the first death is
@@ -513,6 +551,174 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
     free_if_idle(inner, set, freed);
 }
 
+// ---------------------------------------------------------------------------
+// The process-wide thread-memory reservation
+// ---------------------------------------------------------------------------
+
+/// How many MiB of thread memory every pool in this process may reserve
+/// *together*. Overrides [`default_reservation_budget`]; read once, on first
+/// admission.
+pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
+
+/// Address space one pool thread reserves **beyond its declared stack**.
+///
+/// Measured on `x86_64-wrs-vxworks`: three arms of one image differing only in
+/// the connection roster's [`StackSizeClass`] walled at 47 / 59 / 80 concurrent
+/// clients as the declared per-connection stack fell 3,145,728 → 2,097,152 →
+/// 1,048,576 B. Charging each thread its declared stack *plus a flat 1 MiB*
+/// puts all three walls at 246.4 / 247.5 / 251.7 MB — a 2.1 % spread — while
+/// charging the declared stack alone predicts a wall that never happened
+/// (`doc/vxworks-ca-refusal-fidelity.md` §8; the three-arm measurement is E8's,
+/// `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1` §10).
+///
+/// RTEMS takes the same figure, **assumed rather than measured**: it is the
+/// conservative direction — over-charging refuses one connection early, while
+/// under-charging is what walks the process into the ceiling. A host is not
+/// charged, because a host's budget is unbounded anyway.
+const fn per_thread_overhead(embedded: bool) -> usize {
+    if embedded { 1 << 20 } else { 0 }
+}
+
+/// RTP object-arena bytes one pool thread consumes — **unmeasured, and so far
+/// not charged**.
+///
+/// Every VxWorks pthread mutex materialises a kernel `SEMAPHORE` object on its
+/// *first lock*: `pthread_mutex_init` only stamps the magic, and
+/// `pthreadMutexInit` calls `semMCreate` from `pthread_mutex_lock`, returning
+/// `0x16` (`EINVAL`, not `ENOMEM`) when it comes back NULL — which `std`
+/// reports as "failed to lock mutex: invalid argument (os error 22)" and
+/// panics. That is the death this pool saw at the wall, and eager
+/// initialisation cannot avoid it. The objects come from the RTP object arena,
+/// which is **not** the address space charged above and not the allocator heap
+/// either, which is why the same wall shows as an `EINVAL` in one probe and as
+/// a failed 64-byte allocation in another.
+///
+/// It stays `0` until the per-thread figure is measured on target (E8's
+/// `semMCreate` wrap). When it lands: if it is small next to a stack it can be
+/// added to [`thread_reservation`]; if it turns out to bind *first*, it needs
+/// its own budget rather than a share of this one, because the two arenas run
+/// out independently.
+const PER_THREAD_OBJECT_ARENA: usize = 0;
+
+/// The budget when [`POOL_RESERVATION_ENV`] is unset.
+///
+/// Unbounded on a host: the pool's own set counts are the bound there, and no
+/// host in this workspace has ever met a thread-memory wall.
+///
+/// 160 MiB on an embedded target, chosen from where the measured target stopped
+/// *working*, not from where it stopped admitting. On the ~958 MB VxWorks guest
+/// the CA pool dies at **set 46** (~230 MiB reserved, at 5 MiB a set): a
+/// 64-byte allocation fails, the RTP takes signal 6 and is deleted, and no
+/// refusal is delivered at all. That figure is measured on this exact code, not
+/// inherited: with the budget raised to 320 MiB the same image on the same
+/// guest walks to set 46 and dies there, and with the default it refuses at set
+/// 32 and keeps serving (`doc/vxworks-ca-refusal-fidelity.md` §9). 160 MiB is
+/// 14 sets of headroom below that — what the margin buys is that the allocator
+/// and the object arena still work while the refusal is being written to the
+/// socket and the console.
+///
+/// The ceiling itself moves with the target's RAM (≥739 MB at 1470 MB of guest
+/// memory), which is exactly why this is an operator switch and not a derived
+/// constant: only the operator knows the target. The switch is not decorative —
+/// raising it was measured to move the wall on target.
+const fn default_reservation_budget(embedded: bool) -> usize {
+    if embedded { 160 << 20 } else { usize::MAX }
+}
+
+/// Parse [`POOL_RESERVATION_ENV`] (`None` = unset ⇒ `default`), with the
+/// default injected so a host test can ask what an embedded process would do
+/// with the same input.
+///
+/// A value that is not a positive whole number of MiB is ignored, with a record,
+/// rather than silently becoming a bound nobody chose.
+fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(mb) if mb > 0 => mb.saturating_mul(1 << 20),
+        _ => {
+            errlog_sev_printf(
+                ErrlogSevEnum::Minor,
+                &format!(
+                    "{POOL_RESERVATION_ENV}={raw:?} is not a positive whole number of MiB; \
+                     keeping the built-in worker-pool reservation budget"
+                ),
+            );
+            default
+        }
+    }
+}
+
+/// One account of thread memory: a fixed budget and what is held against it.
+///
+/// A type rather than a pair of free functions so the budget can be *named* at
+/// its owner — the process has exactly one account
+/// ([`PROCESS_RESERVATION`]), and a test can hold its own without an
+/// environment variable and without a one-shot global it cannot reset.
+struct Reservation {
+    budget: usize,
+    held: AtomicUsize,
+}
+
+impl Reservation {
+    const fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            held: AtomicUsize::new(0),
+        }
+    }
+
+    /// Take `bytes`, or refuse with `(held, budget)` — the two numbers a
+    /// refusal has to report.
+    ///
+    /// A whole set is taken in one step, before a single thread is created: the
+    /// point of the budget is to refuse *before* the target is asked for memory
+    /// it does not have, and a partial reservation would be no reservation.
+    fn try_reserve(&self, bytes: usize) -> Result<(), (usize, usize)> {
+        let mut held = self.held.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = held.checked_add(bytes).filter(|n| *n <= self.budget) else {
+                return Err((held, self.budget));
+            };
+            match self
+                .held
+                .compare_exchange_weak(held, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => held = actual,
+            }
+        }
+    }
+
+    /// Give `bytes` back. Called once per *thread*, by the thread's own exit
+    /// guard, plus once by a failed grow for the threads it never created — so
+    /// the account tracks threads that exist, not sets that were planned.
+    fn release(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::SeqCst);
+    }
+}
+
+/// Thread memory every pool in this process has reserved and not yet given
+/// back.
+///
+/// Process-wide and not per-pool because the resource is: a target that runs
+/// out of address space does not care which pool reserved it, and an IOC runs
+/// several (the CA server's, the CA client's, the PVA server's). A per-pool
+/// budget would let three pools each stay inside their own bound and still walk
+/// the process past the ceiling together.
+static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
+    Reservation::new(resolve_reservation_budget(
+        std::env::var(POOL_RESERVATION_ENV).ok().as_deref(),
+        default_reservation_budget(cfg!(epics_embedded_target)),
+    ))
+});
+
+/// What one thread of `role` reserves.
+fn thread_reservation(role: &WorkerRole) -> usize {
+    role.stack.bytes() + per_thread_overhead(cfg!(epics_embedded_target)) + PER_THREAD_OBJECT_ARENA
+}
+
 /// Why [`WorkerPool::acquire`] refused.
 ///
 /// # The defect this closes
@@ -523,6 +729,11 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
 /// * [`AtCapacity`](Self::AtCapacity) — *this process* said no. Every set the
 ///   pool may create is already leased. The remedy is to raise the bound (or to
 ///   accept the bound as the connection limit it is); the target is fine.
+/// * [`OutOfReservation`](Self::OutOfReservation) — *this process* said no on
+///   behalf of the target: admitting would reserve more thread memory than the
+///   process is allowed to hold. The remedy is RAM plus a raised
+///   [`POOL_RESERVATION_ENV`], and the target is still healthy — which is the
+///   whole point of refusing here rather than one connection later.
 /// * [`SpawnFailed`](Self::SpawnFailed) — *the target* said no. The OS refused
 ///   to create the set's threads. The remedy is memory, and the pool's own
 ///   bound is irrelevant because it was never reached.
@@ -556,6 +767,17 @@ pub enum AcquireError {
         /// The pool's declared capacity, in sets.
         capacity: usize,
     },
+    /// Admitting would take the process past its thread-memory budget. Nothing
+    /// was reserved and no thread was created.
+    OutOfReservation {
+        /// What this set would have reserved, in bytes.
+        requested: usize,
+        /// Already reserved by every pool in the process, in bytes.
+        reserved: usize,
+        /// The process budget, in bytes — the number [`POOL_RESERVATION_ENV`]
+        /// raises.
+        budget: usize,
+    },
     /// The OS refused to create the set's threads. The pool was below its
     /// capacity and `created` is left exactly as it was found.
     SpawnFailed(io::Error),
@@ -572,6 +794,19 @@ impl std::fmt::Display for AcquireError {
             AcquireError::AtCapacity { capacity } => {
                 write!(f, "worker pool at capacity ({capacity} sets)")
             }
+            AcquireError::OutOfReservation {
+                requested,
+                reserved,
+                budget,
+            } => write!(
+                f,
+                "worker pool at its thread-memory budget: this set needs {} KiB, \
+                 {} of {} MiB already reserved — raise {POOL_RESERVATION_ENV} \
+                 if the target has the memory",
+                requested / 1024,
+                reserved >> 20,
+                budget >> 20,
+            ),
             AcquireError::SpawnFailed(e) => write!(f, "cannot create a worker set: {e}"),
             AcquireError::ShuttingDown => write!(f, "worker pool is shutting down"),
         }
@@ -582,7 +817,9 @@ impl std::error::Error for AcquireError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AcquireError::SpawnFailed(e) => Some(e),
-            AcquireError::AtCapacity { .. } | AcquireError::ShuttingDown => None,
+            AcquireError::AtCapacity { .. }
+            | AcquireError::OutOfReservation { .. }
+            | AcquireError::ShuttingDown => None,
         }
     }
 }
@@ -590,7 +827,13 @@ impl std::error::Error for AcquireError {
 impl From<AcquireError> for io::Error {
     fn from(cause: AcquireError) -> io::Error {
         let kind = match &cause {
-            AcquireError::AtCapacity { .. } => io::ErrorKind::WouldBlock,
+            // The reservation gate is the capacity gate's twin — the process
+            // refusing, not the target — so it keeps the same historical kind
+            // for callers that only propagate; the variant is what tells them
+            // apart.
+            AcquireError::AtCapacity { .. } | AcquireError::OutOfReservation { .. } => {
+                io::ErrorKind::WouldBlock
+            }
             // The OS's own kind, so a propagating caller sees what the target
             // actually said rather than a re-labelling of it.
             AcquireError::SpawnFailed(e) => e.kind(),
@@ -619,11 +862,25 @@ impl<const N: usize> WorkerPool<N> {
     /// pool owns heap state; a process-lifetime pool is a `LazyLock<WorkerPool>`,
     /// a server-lifetime pool is a field dropped with the server.
     pub fn new(name_prefix: &'static str, roster: [WorkerRole; N], capacity: usize) -> Self {
+        Self::with_reservation(name_prefix, roster, capacity, &PROCESS_RESERVATION)
+    }
+
+    /// [`Self::new`] against a named account, so a test can bound a pool by a
+    /// budget of its own choosing without touching the process's.
+    fn with_reservation(
+        name_prefix: &'static str,
+        roster: [WorkerRole; N],
+        capacity: usize,
+        reservation: &'static Reservation,
+    ) -> Self {
+        let set_reservation = roster.iter().map(thread_reservation).sum();
         Self {
             inner: Arc::new(PoolInner {
                 roster: Box::new(roster),
                 name_prefix,
                 capacity,
+                set_reservation,
+                reservation,
                 reg: Mutex::new(Registry {
                     idle: VecDeque::new(),
                     all: Vec::new(),
@@ -680,20 +937,42 @@ impl<const N: usize> WorkerPool<N> {
                 });
             }
             Decision::Reuse(set) => set,
-            Decision::Grow(index) => match self.spawn_set(index) {
-                Ok((set, joins)) => {
-                    let mut reg = self.inner.lock();
-                    reg.joins.extend(joins);
-                    reg.all.push(set.clone());
-                    set
-                }
-                Err(e) => {
-                    // The reservation is given back so a later attempt may grow
-                    // again; nothing else changed.
+            Decision::Grow(index) => {
+                // The memory this set will hold is taken from the process
+                // budget *before* the target is asked to create anything, so a
+                // refusal happens while the target is still healthy enough to
+                // deliver it. Reusing an idle set reserves nothing: its threads
+                // already exist and are already charged.
+                if let Err((reserved, budget)) = self
+                    .inner
+                    .reservation
+                    .try_reserve(self.inner.set_reservation)
+                {
                     self.inner.lock().created -= 1;
-                    return Err(AcquireError::SpawnFailed(e));
+                    return Err(AcquireError::OutOfReservation {
+                        requested: self.inner.set_reservation,
+                        reserved,
+                        budget,
+                    });
                 }
-            },
+                match self.spawn_set(index) {
+                    Ok((set, joins)) => {
+                        let mut reg = self.inner.lock();
+                        reg.joins.extend(joins);
+                        reg.all.push(set.clone());
+                        set
+                    }
+                    Err(e) => {
+                        // The slot reservation is given back so a later attempt
+                        // may grow again; the memory reservation of the threads
+                        // that were never created was given back by `spawn_set`,
+                        // and the ones that were created give theirs back as
+                        // they exit. Nothing else changed.
+                        self.inner.lock().created -= 1;
+                        return Err(AcquireError::SpawnFailed(e));
+                    }
+                }
+            }
         };
 
         // Lease it: leased, not parked. A grown set starts with these values;
@@ -761,6 +1040,7 @@ impl<const N: usize> WorkerPool<N> {
                     let mut exit = WorkerExit {
                         inner: inner.clone(),
                         set: set_for_worker.clone(),
+                        reserved: thread_reservation(&role),
                         clean: false,
                     };
                     // The band is the role's, for the thread's whole life. Taken
@@ -773,6 +1053,16 @@ impl<const N: usize> WorkerPool<N> {
             match spawned {
                 Ok(handle) => joins.push(handle),
                 Err(e) => {
+                    // The threads from this slot on do not exist and never
+                    // will, so their share of the set's reservation is given
+                    // back here — the ones that *were* created give theirs back
+                    // through their own exit guards, so every byte is released
+                    // exactly once by whoever it was spent on.
+                    let unspawned: usize = self.inner.roster[joins.len()..]
+                        .iter()
+                        .map(thread_reservation)
+                        .sum();
+                    self.inner.reservation.release(unspawned);
                     // Retire the workers already spawned for this set. Their
                     // senders live in `set`, still held here, so the `Stop`s land.
                     for tx in &set.senders {
@@ -1226,5 +1516,145 @@ mod tests {
         }
         // Must not hang: the `Stop`s reach idle workers and the join completes.
         drop(pool);
+    }
+
+    /// One set of [`roster2`] on a 64-bit host: two `Small` stacks and no
+    /// per-thread overhead charged off-target.
+    const HOST_SET: usize = 2 * 512 * 1024;
+
+    /// # Invariant
+    ///
+    /// MUST: admission refuse while the thread memory it would reserve is still
+    /// unspent. MUST NOT: a pool create a thread whose memory is not already
+    /// reserved from the budget.
+    ///
+    /// The defect: the pool's only bound was a *count*, so on
+    /// `x86_64-wrs-vxworks` the CA server walked to 41 concurrent clients and
+    /// the RTP died — a 64-byte allocation failed, `signal 6`, whole process
+    /// gone — with its count bound of 141 nowhere in sight
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §6.3). A bound reached after the
+    /// target has run out is not an admission gate.
+    ///
+    /// The boundary is exact rather than narrative: a budget of two sets admits
+    /// two and refuses the third, and the refusal costs no thread.
+    #[test]
+    fn admission_refuses_at_the_memory_budget_before_the_count_bound() {
+        static TWO_SETS: Reservation = Reservation::new(2 * HOST_SET);
+        // Capacity 8 so the count bound cannot be what refuses.
+        let pool: WorkerPool<2> =
+            WorkerPool::with_reservation("test-budget", roster2(), 8, &TWO_SETS);
+
+        let (l1, _w1) = pool.acquire().expect("first set fits");
+        let (l2, _w2) = pool.acquire().expect("second set fits exactly");
+        assert_eq!(pool.worker_count(), 4, "two sets, two threads each");
+
+        let refused = pool.acquire().err().expect("the third set does not fit");
+        assert!(
+            matches!(
+                refused,
+                AcquireError::OutOfReservation {
+                    requested,
+                    reserved,
+                    budget,
+                } if requested == HOST_SET
+                    && reserved == 2 * HOST_SET
+                    && budget == 2 * HOST_SET
+            ),
+            "the refusal must name what was asked for, what is held and the \
+             budget — the three numbers the remedy needs: {refused:?}"
+        );
+        assert_eq!(
+            pool.worker_count(),
+            4,
+            "a refusal must not have created the threads it refused"
+        );
+        assert_eq!(
+            pool.set_usage(),
+            (2, 2, 8),
+            "the refused grow must leave the slot reservation exactly as it \
+             found it"
+        );
+
+        drop(l1);
+        drop(l2);
+        // Returning a set does not return its memory: its threads still exist.
+        // What must come back is the *reuse*, and it does — the fourth borrow
+        // creates nothing.
+        let (l3, _w3) = pool.acquire().expect("an idle set is reused, not grown");
+        assert_eq!(pool.worker_count(), 4);
+        drop(l3);
+        drop(pool);
+        assert_eq!(
+            TWO_SETS.held.load(Ordering::SeqCst),
+            0,
+            "every thread's reservation must come back when the pool is dropped"
+        );
+    }
+
+    /// The release side of the same invariant on the path that has no `Drop` of
+    /// its own to lean on: a set whose worker *died*. Its memory must return to
+    /// the budget, or a target that loses a worker refuses connections it has
+    /// the memory to serve — for the life of the process.
+    #[test]
+    fn a_dead_set_gives_its_memory_back_to_the_budget() {
+        static ONE_SET: Reservation = Reservation::new(HOST_SET);
+        let pool: WorkerPool<2> = WorkerPool::with_reservation("test-rel", roster2(), 4, &ONE_SET);
+
+        let (lease, [reader, _writer]) = pool.acquire().expect("the one set fits");
+        let (go, wait) = channel::<()>();
+        let job = reader.run(move || {
+            let _ = wait.recv();
+            std::panic::panic_any(PanicOnDrop);
+        });
+        drop(job);
+        drop(lease);
+        go.send(()).expect("the worker is waiting on this");
+        drop(go);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ONE_SET.held.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a set that lost a worker kept its reservation: held {} of {}",
+                ONE_SET.held.load(Ordering::SeqCst),
+                HOST_SET
+            );
+            thread::yield_now();
+        }
+        pool.acquire()
+            .expect("the budget freed by the dead set must admit a new one");
+    }
+
+    /// The budget's two policy inputs, both arms of each, without needing the
+    /// target that selects them.
+    #[test]
+    fn the_reservation_budget_reads_its_switch_and_its_target_default() {
+        assert_eq!(
+            default_reservation_budget(false),
+            usize::MAX,
+            "a host is not bounded by thread memory"
+        );
+        assert_eq!(
+            default_reservation_budget(true),
+            160 * 1024 * 1024,
+            "the embedded default is the measured one; changing it is a \
+             behaviour change and must be stated here"
+        );
+        assert_eq!(per_thread_overhead(false), 0);
+        assert_eq!(
+            per_thread_overhead(true),
+            1024 * 1024,
+            "the flat per-thread reservation measured on VxWorks 7"
+        );
+
+        let default = default_reservation_budget(true);
+        assert_eq!(resolve_reservation_budget(None, default), default);
+        assert_eq!(resolve_reservation_budget(Some("8"), default), 8 << 20);
+        assert_eq!(resolve_reservation_budget(Some(" 12 "), default), 12 << 20);
+        // A value that is not a budget leaves the default standing rather than
+        // becoming a bound nobody chose.
+        assert_eq!(resolve_reservation_budget(Some("0"), default), default);
+        assert_eq!(resolve_reservation_budget(Some("lots"), default), default);
+        assert_eq!(resolve_reservation_budget(Some(""), default), default);
     }
 }

@@ -687,6 +687,28 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   socket). Running it uncovered and fixed one shipped defect: `SO_SNDTIMEO` is
   unimplemented here and `drive_socket_blocking` propagated its `ENOPROTOOPT`
   fatally, so a CA client on this target established no circuits at all.
+  The first fix for that made the option best-effort and was a workaround; the
+  round that closed it moved the bound inside `write_frame_deadline`
+  (`poll(POLLOUT, remaining)` + `send(MSG_DONTWAIT)`), so the send deadline no
+  longer depends on a socket option any target may refuse and `SO_SNDTIMEO` is
+  now set nowhere in the write path. Measured on target in one boot against a
+  peer that accepts and never reads: the bounded path returned at **2016 ms
+  against a 2000 ms deadline**, the old path had not returned **127.5 s** later
+  and still held its descriptor (§5.1). This removes `SEND_TICKS_PER_DEADLINE`
+  and `send_tick_for` from the public API of `epics-libcom-rs`.
+* **The CA name-service connection has no liveness rule — open, measured.**
+  `run_nameserver_connection` sends `CA_PROTO_ECHO` on a hardcoded 60 s tick and
+  never checks that it was answered, so an `EPICS_CA_NAME_SERVERS` peer that
+  accepts, keeps reading and never replies is held indefinitely: ten consecutive
+  censuses on the same local port over ≈600 s, one accept, dial-pool
+  `attempts=1`, against the data circuit's 35 s bound
+  (`EPICS_CA_CONN_TMO` + `ECHO_TIMEOUT_SECS`). The link-cut A/B cannot reach
+  this because a cut always ends in TCP giving up — which is also what retired
+  the name-service socket 30 s after the data circuit in that run. C has no such
+  asymmetry: `cac::setSearchDestinations` builds a name server through
+  `findOrCreateVirtCircuit`, so it is a `tcpiiu` with the same watchdogs. The
+  fix changes CA client behaviour and is held for sign-off
+  ([§3.5](vxworks-circuit-wedge-on-target-measurement.md)).
 * **E8 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
   for this target; E10's dial numbers are now unblocked, since the probe images
   link and run. Neither has been run on VxWorks.

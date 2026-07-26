@@ -472,11 +472,13 @@ The §5.1 figures are **dev** images — the gate builds `check`/`dev`, so those
 are the numbers the rest of this file quotes. They are not what anyone ships.
 Measured 2026-07-25/26 on `gv100`, five rows per target, both binaries each.
 
-**Every row below is a CLI `--config` row. The repository defines no release
-profile overrides at all** — no `[profile.release]` `strip`, `lto` or
-`codegen-units` in any manifest. Adopting any of this is a pending decision,
-not something the tree does today, so a plain `cargo build --release` still
-produces the row-2 sizes.
+**Every row below was measured as a CLI `--config` row** — `[profile.release]`
+itself carries no `strip`/`lto`/`codegen-units` override in any manifest, so a
+plain `cargo build --release` still produces the row-2 sizes and host build
+times are unaffected. The row-5 settings are adopted as the workspace profile
+`release-embedded` (root `Cargo.toml`: inherits `release`, `strip = "symbols"`,
+`lto = "fat"`, `codegen-units = 1`); substitute `--profile release-embedded`
+for `--release` in the row-2 invocations below to build the deployable image.
 
 #### `x86_64-wrs-vxworks` (`.vxe`)
 

@@ -54,6 +54,17 @@ mqtt-rs = { path = "crates/mqtt-rs", version = "0.25.0" }
 modbus-rs = { path = "crates/modbus-rs", version = "0.25.0", package = "epics-modbus-rs" }
 epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.25.0" }
 
+# Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
+# image size is a real resource: `cargo build --profile release-embedded ...`
+# reproduces row 5 of the measured matrix in `doc/vxworks-port.md` §5.5
+# (vs `--release`+strip: CA −15.6/−18.9 %, PVA −19.7/−22.6 %; cold build ~2×).
+# `release` itself is untouched, so host build times are unaffected.
+[profile.release-embedded]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+
 
 # RTEMS 6 (armv7-rtems-eabihf) needs libc definitions that the published crate
 # does not yet carry: `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/`off_t`/

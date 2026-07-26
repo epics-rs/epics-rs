@@ -673,18 +673,53 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
 
 ## 7. Known opens
 
-* **E8 / E9 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
-  for this target; E9 needs a VxWorks SYN ladder; E10's dial numbers are now
-  unblocked, since the probe images link and run. None has been run on VxWorks.
-* **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
-  Not a formula difference: `StackSizeClass::bytes` is
-  `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as
-  C's `STACK_SIZE(f)` is, so a 64-bit target costs precisely 2× what
-  `armv7-rtems-eabihf` costs, class for class. The sizing **decision** is
-  deferred until `STACKUSE` high-water data is collected across a real
-  workload — the census that produces it now exists and has been run once, but
-  not under load.
-* **A 1-in-3 wall-abort with mutex `EINVAL`** is observed and not root-caused.
+* **E8 is measured; E9 / E10 are not.** E8 (pool probe) was re-authored for
+  this target as `doc/vx-ca-pool-probe.patch` and run under load:
+  `doc/vxworks-ca-worker-pool-on-target-measurement.md`. Holding 141 concurrent
+  CA clients, `POOLPROBE` gives `BUSY == SETS == CONNS` with
+  `worker_count() == 2 × sets` on every sample and `sets` never past
+  `CAS_CLIENT_POOL_CAPACITY = 141`, and all 282 pooled workers read
+  `vx = 199 - epics` with zero mismatches over three independent instruments
+  (`pthread_getschedparam`, `taskPriorityGet`, `taskInfoGet`). E9 still needs a
+  VxWorks SYN ladder; E10's dial numbers are unblocked but not taken.
+* **Connection-wall sizing.** The wall is **not** a fixed client count. Measured
+  on one image on two guests: 47 concurrent clients on `~958MB`, refused with
+  `EAGAIN` from the worker spawn, and 141 on `~1982MB`, refused by
+  `CAS_CLIENT_POOL_CAPACITY` itself. The earlier "44 concurrent clients" figure
+  is retracted — it was reproduced at neither size. Per connection the port
+  reserves 3,145,728 B (`CAS-client` Big + `CAS-event` Medium) and *uses*
+  19,208 B of it, flat from n = 1 to n = 141; `cbMedium` at 206,800 B is the one
+  class whose high-water justifies `Big`. Not a formula difference:
+  `StackSizeClass::bytes` is `f * 0x10000 * size_of::<usize>()`, parameterised
+  by pointer width exactly as C's `STACK_SIZE(f)` is, so a 64-bit target costs
+  precisely 2× what `armv7-rtems-eabihf` costs, class for class. The sizing
+  **decision** is now unblocked on data; what is still missing is why `EAGAIN`
+  lands at 47 rather than later, since only 61,145,088 B of ~958 MiB was
+  committed there.
+* **A 1-in-3 wall-abort with mutex `EINVAL`** is not root-caused and did not
+  reproduce: three wall events across the two guests, zero matches for
+  `EINVAL|mutex|panic|abort|Exception` on any console.
+* **Connection establishment knees 180× at ~80 concurrent clients.** 0.04 s per
+  handshake up to 80, then 7.23–7.46 s each from somewhere in (80, 88] onward.
+  Not the fd table (146 of 1000) and not the pool's capacity check (that fires
+  at 142). Cause unknown.
+* **Status PVs and the console reporter are lagging indicators under load.**
+  Pooled workers band at 179/180 and `status-pv`, `scan-owner`, `c6-probe` all
+  band at 189, so on a 1-vCPU guest the reporter printed nothing for 402 s of a
+  connection ramp and `RTEMS:CA_CONN_CNT` read `0` while 141 clients were
+  attached, catching up only once the load went static. The priority model
+  working as §4 specifies — but any row that counts something under load needs a
+  client-side derivation beside the PV, not the PV alone.
+* **The task census truncates before a saturated pool.** `MAX_TASKS = 192` in
+  `crates/epics-rtems-boot/src/stats/vxworks.rs`, and 141 CA clients need 282
+  worker slots on their own: `count=192 capacity=192 dropped=109`. `dropped=` is
+  exact, so the truncation is honest, but the dump cannot audit a full pool.
+* **Refusal `errlog` records are dropped without a discard notice.** Both walls
+  logged every refusal through `epics_ca_rs::server::blocking`'s `WARN` and
+  counted every one in `POOLPROBE REFUSED=`, while the `errlog` leg printed 4 of
+  8 on one guest and 3 of 4 on the other and emitted no `messages were
+  discarded` line. The `errlog` counter itself is right (it labels the 8th
+  refusal `#8`), so the loss is after the call.
 * **`MEM_FREE`, `MEM_MAX`, `MEM_BLK` stay `NaN`** until either mimalloc grows a
   public free-bytes accessor or a defensible source appears. §3.1 is the
   standing rejection, not a TODO.

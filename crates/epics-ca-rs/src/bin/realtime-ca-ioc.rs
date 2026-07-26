@@ -241,6 +241,31 @@ mod ioc {
         None => "10.0.2.2:15076",
     };
 
+    /// C6 PROBE: `host:port` of a peer that accepts a connection and then
+    /// never reads from it, for the write-deadline measurement. Empty — the
+    /// default — leaves that probe unstarted, so its presence costs the outage
+    /// rig nothing.
+    ///
+    /// Build-time like [`C6_NAME_SERVER`] and for the same reason: a target
+    /// image has no configuration surface, and the peer is a host address the
+    /// rig picks.
+    #[cfg(feature = "bringup-probes")]
+    const C6_WRITE_DEADLINE_PEER: &str = match option_env!("C6_WRITE_DEADLINE_PEER") {
+        Some(s) => s,
+        None => "",
+    };
+
+    /// The deadline the write-deadline probe gives one frame, and how large
+    /// that frame is. The frame has to be bigger than everything between the
+    /// guest's send buffer and the peer's unread receive buffer, or the write
+    /// completes and the run measures nothing — a completed leg prints its
+    /// elapsed time and says so, so that outcome is visible rather than
+    /// mistaken for a bound.
+    #[cfg(feature = "bringup-probes")]
+    const C6_WRITE_DEADLINE_MS: u64 = 2_000;
+    #[cfg(feature = "bringup-probes")]
+    const C6_WRITE_DEADLINE_FRAME: usize = 8 * 1024 * 1024;
+
     /// C6 PROBE: the record the band-occupancy tick writes, and the
     /// interval it aims for. 200 ms is well inside the upstream's 10 Hz
     /// burst rate, so a burst overlaps several ticks.
@@ -338,6 +363,123 @@ mod ioc {
             let stat = db.get_pv(&format!("{rec}.STAT")).map(|v| v.to_string());
             println!("C6 seq={seq} record {rec} VAL={val:?} SEVR={sevr:?} STAT={stat:?}");
         }
+    }
+
+    /// C6 PROBE: is a frame write bounded on a target with no `SO_SNDTIMEO`?
+    ///
+    /// Two legs against the same never-reading peer inside one boot, so the
+    /// stack, the buffers and the clock are identical between them:
+    ///
+    /// * **control** — `set_write_timeout` then `write_all`, which is what the
+    ///   writer pump did while the deadline depended on that socket option
+    ///   taking. On a target that refuses the option this thread has nothing
+    ///   entitled to reclaim it.
+    /// * **fixed** — `write_frame_deadline`, which owns its own wait
+    ///   (`poll(POLLOUT, remaining)` + `send(MSG_DONTWAIT)`) and so cannot be
+    ///   disarmed by the option being absent.
+    ///
+    /// Both legs print their elapsed time and their outcome. A leg that
+    /// *completes* says so: silence is never read as a bound here, and a frame
+    /// small enough to fit in the path's buffers would show up as a fast
+    /// `Ok(())` rather than as a passing measurement.
+    #[cfg(feature = "bringup-probes")]
+    fn c6_write_deadline_probe() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let peer = C6_WRITE_DEADLINE_PEER;
+        let send_timeout = std::time::Duration::from_millis(C6_WRITE_DEADLINE_MS);
+        println!(
+            "WDPROBE begin peer={peer} frame_bytes={C6_WRITE_DEADLINE_FRAME} \
+             send_timeout_ms={C6_WRITE_DEADLINE_MS}"
+        );
+        let started = Instant::now();
+
+        // ---- control leg ------------------------------------------------
+        let ctl_returned = Arc::new(AtomicBool::new(false));
+        match std::net::TcpStream::connect(peer) {
+            Ok(sock) => {
+                // The option this whole item is about, read on the target
+                // rather than assumed from the header.
+                match sock.set_write_timeout(Some(send_timeout)) {
+                    Ok(()) => println!("WDPROBE ctl so_sndtimeo=ok"),
+                    Err(e) => println!(
+                        "WDPROBE ctl so_sndtimeo=error kind={:?} os={:?} msg={e}",
+                        e.kind(),
+                        e.raw_os_error()
+                    ),
+                }
+                let flag = ctl_returned.clone();
+                match thread::Builder::new()
+                    .name("c6-wd-ctl".to_string())
+                    .stack_size(StackSizeClass::Medium.bytes())
+                    .spawn(move || {
+                        let _ = epics_base_rs::runtime::task::enter_ioc_thread(
+                            epics_base_rs::runtime::task::ThreadPriority::Low,
+                        );
+                        let mut sock = sock;
+                        let frame = vec![0u8; C6_WRITE_DEADLINE_FRAME];
+                        let leg = Instant::now();
+                        let outcome = sock
+                            .write_all(&frame)
+                            .map_err(|e| (e.kind(), e.raw_os_error()));
+                        flag.store(true, Ordering::SeqCst);
+                        println!(
+                            "WDPROBE ctl returned elapsed_ms={} outcome={outcome:?}",
+                            leg.elapsed().as_millis()
+                        );
+                    }) {
+                    Ok(_) => println!("WDPROBE ctl writing"),
+                    Err(e) => println!("WDPROBE ctl thread refused: {e}"),
+                }
+            }
+            Err(e) => println!(
+                "WDPROBE ctl connect failed kind={:?} os={:?} msg={e}",
+                e.kind(),
+                e.raw_os_error()
+            ),
+        }
+
+        // ---- fixed leg ---------------------------------------------------
+        // Its own connection, so the control leg's queued bytes are not part
+        // of what it measures.
+        thread::sleep(std::time::Duration::from_secs(5));
+        match std::net::TcpStream::connect(peer) {
+            Ok(sock) => {
+                let frame = vec![0u8; C6_WRITE_DEADLINE_FRAME];
+                let leg = Instant::now();
+                let outcome = epics_base_rs::runtime::blocking_io::write_frame_deadline(
+                    &sock,
+                    &frame,
+                    send_timeout,
+                )
+                .map_err(|e| (e.kind(), e.raw_os_error()));
+                println!(
+                    "WDPROBE fix returned elapsed_ms={} outcome={outcome:?}",
+                    leg.elapsed().as_millis()
+                );
+            }
+            Err(e) => println!(
+                "WDPROBE fix connect failed kind={:?} os={:?} msg={e}",
+                e.kind(),
+                e.raw_os_error()
+            ),
+        }
+
+        // ---- the control leg, kept under measurement ----------------------
+        for _ in 0..12 {
+            thread::sleep(std::time::Duration::from_secs(10));
+            println!(
+                "WDPROBE mark t_ms={} ctl_returned={}",
+                started.elapsed().as_millis(),
+                ctl_returned.load(Ordering::SeqCst)
+            );
+        }
+        println!(
+            "WDPROBE end t_ms={} ctl_returned={}",
+            started.elapsed().as_millis(),
+            ctl_returned.load(Ordering::SeqCst)
+        );
     }
 
     /// Load the database: every command-line argument is a `.db` file path
@@ -781,6 +923,24 @@ mod ioc {
                 }) {
                 Ok(_) => {}
                 Err(e) => eprintln!("C6 probe: cannot start the reporter thread: {e}"),
+            }
+
+            // The write-deadline measurement, only when the rig named a peer
+            // for it. Its own thread: both legs are meant to block, and the
+            // reporter above must keep printing while they do.
+            if !C6_WRITE_DEADLINE_PEER.is_empty() {
+                match thread::Builder::new()
+                    .name("c6-wd-probe".to_string())
+                    .stack_size(StackSizeClass::Medium.bytes())
+                    .spawn(|| {
+                        let _ = epics_base_rs::runtime::task::enter_ioc_thread(
+                            epics_base_rs::runtime::task::ThreadPriority::Low,
+                        );
+                        c6_write_deadline_probe();
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("C6 probe: cannot start the write-deadline probe: {e}"),
+                }
             }
         }
 

@@ -203,12 +203,13 @@ DIALPROBE resolve n=3 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connectio
 DIALPROBE resolve n=4 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
 ```
 
-Both halves are driven at a 5 s redial cadence so 1500 s yields ~285 attempts
-instead of the shipping cadence's ~48: CA through a compiled-in
-`EPICS_CA_CONN_TMO=5` default, PVA through the one constant that has no
-environment variable, `search_engine.rs`'s
-`const RECONNECT_INTERVAL: Duration = Duration::from_secs(10)` → `5`. Neither
-changes what one attempt allocates; both change how often one happens.
+Both halves are driven at a 5 s redial cadence, so 1500 s yields ~285 attempts
+where the shipping cadences would give ~50 (CA's 30 s `EPICS_CA_CONN_TMO`) and
+~150 (PVA's 10 s `RECONNECT_INTERVAL`). CA is retuned through a compiled-in
+`EPICS_CA_CONN_TMO=5` default; PVA has no environment variable for it, so
+`search_engine.rs`'s
+`const RECONNECT_INTERVAL: Duration = Duration::from_secs(10)` is edited to `5`.
+Neither changes what one attempt allocates; both change how often one happens.
 
 | image | dial shape | half |
 |---|---|---|

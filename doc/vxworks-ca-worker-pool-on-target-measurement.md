@@ -936,3 +936,58 @@ a failing `pthread_create` whose outcome ranges from a clean refusal to an RTP
 abort (§13). A budget bound would refuse before thread creation can fail, and
 would give idle-set release a natural trigger. That is a semantic change to a
 public constant and is **not** made here; it is raised for sign-off.
+
+---
+
+## 13. The wall-abort mutex `EINVAL` reproduced
+
+UNFIXED 8 recorded that the 1-in-3 wall-abort with mutex `EINVAL` did not
+reproduce in three wall events, and the follow-up brief judged it not fixable
+on that basis, asking only that it be captured if seen. **It was seen, twice,
+in four wall events this round**, and it is no longer unexplained in the way it
+was.
+
+A arm, `~958MB`, at the wall — three panics, `CAS-client 48`, `CAS-client 49`
+and `CAS-event 49`:
+
+```
+ERROR epics_base_rs::errlog: sevr=fatal panic on thread `CAS-client 48` at /home/coding-agent/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/pal/unix/sync/mutex.rs:69: failed to lock mutex: invalid argument (os error 22) -- that thread is gone and nothing restarts it; the IOC keeps listening and keeps answering searches, so from outside it still looks healthy
+```
+
+C arm, `~958MB`, at the wall — one panic, and this time it took the process:
+
+```
+ERROR epics_base_rs::errlog: sevr=fatal panic on thread `CAS-event 79` at …/sync/mutex.rs:69: failed to lock mutex: invalid argument (os error 22) -- …
+fatal runtime error: an irrecoverable error occurred while synchronizing threads, aborting
+0xffff800012127000 (CAS-event 79): RTP 0xffff800008cc2000 has been deleted due to signal 6.
+```
+
+What the four wall events say:
+
+| arm | guest | wall | panics | outcome |
+|---|---|---|---|---|
+| A (Big/Medium) | ~958MB | 47/48 | 3 | IOC survived, kept serving |
+| B (Medium/Medium) | ~958MB | 59 | 0 | clean `EAGAIN` refusal |
+| C (Small/Small) | ~958MB | 80 | 1 | **RTP deleted, signal 6** |
+| A | ~1470MB, ~1982MB | 141 | 0 | pool-capacity refusal |
+
+It fires **only at the reservation wall** — never below it, in any of the
+sub-wall ramps this round, and never on a guest large enough that the pool
+capacity is reached first. The failing mutex is in the worker body, not in the
+census registry: the `PRIOPROBE` line for `CAS-client 48` printed immediately
+before its panic, and `register_task()` runs before that readback inside
+`enter_ioc_thread`, so the registry mutex had already locked successfully.
+
+That converts "1-in-3, unexplained" into a resource-exhaustion-correlated
+failure: at the point where thread creation is failing, a mutex is being locked
+that was never successfully initialised, and `pthread_mutex_lock` returns
+`EINVAL`. Whether the uninitialised mutex is one of std's or one of ours is
+**not** established here, and neither is the exact allocation that fails — that
+would need the RTP arena instrumented, which §10 deliberately avoided needing.
+
+The consequence is the part that matters for the port, and it is worse than
+UNFIXED 8 implied: **a client that fills the pool can take the whole IOC
+down.** Not "one worker thread is lost while the IOC looks healthy" — in the C
+arm the RTP was deleted by signal 6. This is the strongest argument for the
+budget-bounded admission in §12: the pool must refuse *before* thread creation
+can fail, because the failure mode past that point is not a refusal at all.

@@ -145,6 +145,13 @@ fn empty_server_port_skips_the_unable_to_find_line() {
 /// (`udpiiu.cpp:168`), and every registration retry sends to the stored
 /// `this->repeaterPort` — so a client prints the diagnostics exactly once,
 /// not once per registration attempt.
+///
+/// `client` only, unlike its `EPICS_CA_SERVER_PORT` siblings above: the
+/// repeater port is resolved by the repeater registration the `client` feature
+/// adds, so a `client-core` build registers with no repeater and prints no
+/// diagnostic for it. Per-test rather than per-file — the server-port cases in
+/// this file hold under both feature sets.
+#[cfg(feature = "client")]
 #[test]
 fn out_of_range_repeater_port_prints_cs_two_lines_once() {
     let err = caget_stderr("EPICS_CA_REPEATER_PORT", "3000");

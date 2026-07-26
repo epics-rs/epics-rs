@@ -5371,7 +5371,15 @@ mod priority_circuit_tests {
 // Host/tokio-only: drives the real `run_transport_manager`, which spawns its
 // per-circuit tasks with `tokio::spawn` and has no reactor under
 // `rtems-exec-model` (same reason as `priority_circuit_tests`' async cases).
-#[cfg(all(test, not(feature = "rtems-exec-model")))]
+//
+// `feature = "client"` as well, and stated here rather than inside: every case
+// below reads establishment off `TransportEvent::ServerConnected`, which is a
+// `client`-only variant (`types.rs`) with a `client`-only emit site
+// (`read_loop`) because its one consumer is the beacon EMA reset. Without this
+// in the gate the module referred to a variant that does not exist under
+// `--no-default-features --features client-core`, which is a compile error and
+// not a skipped test.
+#[cfg(all(test, feature = "client", not(feature = "rtems-exec-model")))]
 mod circuit_retirement_tests {
     //! The wedge measured on the RTEMS target (topology-B, an 11-minute
     //! upstream outage, `~/rtems-bringup/topoB/wedge-fd3-*`): a data circuit's

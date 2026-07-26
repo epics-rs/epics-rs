@@ -243,10 +243,18 @@ scope; recorded here because it was measured.
 
 ## 8. Left open
 
-* **The wire status still collapses the two gates.** `available` = 48 for both,
-  because every alternative that is semantically right is `CA_K_ERROR` and
-  aborts default-handler clients (§5). Closing this needs a new CA status code
-  with `CA_K_WARNING` severity — a wire-visible change, not taken here.
+* **The wire status still collapses the two gates, and this is a protocol
+  limit rather than a deferred fix.** `available` = 48 for both. The CA status
+  vocabulary contains no code that can safely say *server full*: any status
+  whose severity is not `CA_K_WARNING` calls `abort()` in a default-handler
+  client (`ca_client_context.cpp:410-416`), and the one code that means what the
+  capacity gate means — `ECA_MAXIOC` — is `DEFMSG(CA_K_ERROR, 1)` and is marked
+  `/* defunct */` upstream (`caerr.h:86`). So the choice is not "48 versus the
+  right code"; it is "48 versus crashing every stock `caget` that meets a full
+  IOC". Keeping `ECA_ALLOCMEM` and carrying the gate in the diagnostic string is
+  the decision (user sign-off, 2026-07-27). Closing it for real needs a new
+  `CA_K_WARNING` status code, i.e. a change to the protocol's vocabulary, not to
+  this server.
 * **`RTEMS:CA_REFUSED_CNT` reads 0 while the wall is loaded.** The status PVs
   starve under the ramp (a known band-189 effect on this target), so the
   server-side refusal counter is not a usable cross-check at the wall; the

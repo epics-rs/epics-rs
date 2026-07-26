@@ -24,12 +24,20 @@ difference is either a target property or a defect.
 Image, built on the box in a clone of this branch:
 
 ```
-cargo +nightly build --release -p epics-ca-rs --bin realtime-ca-ioc \
-  --target x86_64-wrs-vxworks -Zbuild-std=std,panic_abort \
-  --features client-core,bringup-probes \
+cargo +nightly build --profile release-embedded -j4 --no-default-features \
+  -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
   --config 'patch.crates-io.libc-std.package="libc"' \
-  --config 'patch.crates-io.libc-std.path="…/31d5776f9952aa349813d7fbef3addae1bf0a5ef-0.2.185"'
+  --config 'patch.crates-io.libc-std.path="…/31d5776f9952aa349813d7fbef3addae1bf0a5ef-0.2.185"' \
+  -p epics-ca-rs --bin realtime-ca-ioc --features client-core,bringup-probes
 ```
+
+`--no-default-features` is load-bearing and `--profile release-embedded` is
+not interchangeable with `--release`. Without the former the build stops with
+eleven `E0433: cannot find hostname/discovery in crate` — the default features
+pull in host-only discovery code that does not exist for this target. An
+earlier revision of this section recorded `--release` and omitted
+`--no-default-features`; that line never built, and the invocation above is
+the one taken verbatim from `~/vx-rig-e8/build-poolprobe.log:109`.
 
 The two `--config` lines come from `./scripts/libc-std-patch.sh nightly`, not
 by hand. A hand-written bare `patch.crates-io.libc.path=…` does **not** reach

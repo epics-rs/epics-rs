@@ -49,10 +49,24 @@
 //! set's own state once, mutates, and checks the idle condition behind a
 //! `parked` flag so a double push is unrepresentable; only then, and never while
 //! holding the set lock, does it touch the pool lock to push the set back.
+//!
+//! # A worker that dies retires its set
+//!
+//! That accounting is exact only while every dispatched job comes back, and a
+//! worker *thread* can die where the job's `catch_unwind` does not reach — on
+//! target it did, at the memory wall, in a `std` mutex that returned `EINVAL`.
+//! So the set's slot is released by the thread's destructor ([`WorkerExit`]),
+//! not by a code path that a panic can skip: any exit that was not asked for
+//! marks the set dead, stops its siblings, and gives the slot back to `created`
+//! when the last of its threads is gone. A dead set is never pooled again,
+//! because a set one thread short cannot serve a connection — and a dispatch
+//! that lands on a worker already gone is reported as *not run*, never as a
+//! clean completion.
 
 use std::collections::VecDeque;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -101,11 +115,18 @@ struct SetState {
     /// second push: the lease drop and the last job completion can race, and
     /// exactly one of them must move the set to idle.
     parked: bool,
+    /// Threads of this set that have not yet exited. Reaches zero exactly once,
+    /// on the last thread's exit, which is what releases the set's slot.
+    live_workers: usize,
 }
 
 impl SetState {
     /// Mutate under the lock, then answer *did this transition free the set?* —
     /// true at most once per lease, because `parked` latches.
+    ///
+    /// Whether a freed set may be *re-pooled* is not decided here: a retired set
+    /// still transitions to free, and [`free_if_idle`] is the single gate that
+    /// drops it instead of pushing it.
     fn became_free(&mut self) -> bool {
         if !self.leased && self.running == 0 && !self.parked {
             self.parked = true;
@@ -118,8 +139,20 @@ impl SetState {
 
 /// A live set: its per-slot job senders and its shared accounting.
 struct SetHandle {
+    /// This set's creation index — its thread-name suffix, and how a retirement
+    /// names itself on the console.
+    index: usize,
     /// One sender per role, cloned into the [`Worker`]s handed out at lease.
     senders: Vec<Sender<Assignment>>,
+    /// One of this set's threads has exited. A dead set never idles again and
+    /// never leases again: its survivors are stopped and its slot goes back to
+    /// the bound once they are all gone.
+    ///
+    /// An atomic rather than a [`SetState`] field because [`free_if_idle`] must
+    /// read it while holding the *pool* lock, and the two locks have a fixed
+    /// order — the pool lock is never taken inside a set lock — so consulting
+    /// `state` from there would be the deadlock the order exists to prevent.
+    dead: AtomicBool,
     state: Mutex<SetState>,
 }
 
@@ -175,6 +208,13 @@ fn free_if_idle(inner: &Arc<PoolInner>, set: &Arc<SetHandle>, freed: bool) {
         // freed set stay freed.
         return;
     }
+    if set.dead.load(Ordering::SeqCst) {
+        // A retiring set must not be pooled. The read is under the pool lock and
+        // so is `WorkerExit`'s removal, so whichever runs second sees the other:
+        // either this push happens first and the removal takes it back out, or
+        // the death is already visible here and no push happens at all.
+        return;
+    }
     reg.idle.push_back(set.clone());
 }
 
@@ -215,9 +255,15 @@ impl Drop for SetLease {
 /// and `acquire` is the only source of a `Worker`, so a connection cannot use a
 /// worker it did not lease. Both facts hold by type, not by review.
 pub struct Worker {
+    inner: Arc<PoolInner>,
     set: Arc<SetHandle>,
     tx: Sender<Assignment>,
 }
+
+/// What a [`Job::join`] reports for a job that was never dispatched: the
+/// worker's receiver was already gone, so no body ever ran.
+const NEVER_DISPATCHED: &str =
+    "worker pool: the job was never dispatched — its worker thread had already exited";
 
 impl Worker {
     /// Count this dispatch against the set before the worker can finish it.
@@ -233,15 +279,34 @@ impl Worker {
     {
         let (done, done_rx) = sync_channel(1);
         self.charge();
-        // A closed channel means the worker is gone at teardown; the send below
-        // fails and the job simply never ran, which the pool's own shutdown
-        // ordering makes unreachable while any lease is outstanding.
-        let _ = self.tx.send(Assignment::Joinable {
-            body: Box::new(body),
-            ambient: InheritedRuntime::capture(),
-            done,
-        });
-        Job { done: done_rx }
+        if self
+            .tx
+            .send(Assignment::Joinable {
+                body: Box::new(body),
+                ambient: InheritedRuntime::capture(),
+                done,
+            })
+            .is_err()
+        {
+            // The worker died before this dispatch. Give back the charge the
+            // worker will now never settle, and tell the joiner the truth: the
+            // body did not run.
+            finish_job(&self.inner, &self.set);
+            // The joiner learns *that* the job did not run; only here is the
+            // *reason* known, and a joiner that reports its own loss ("the pump
+            // panicked") would otherwise name the wrong cause.
+            errlog_sev_printf(
+                ErrlogSevEnum::Major,
+                &format!(
+                    "{} worker pool: set {} took no job — {NEVER_DISPATCHED}.",
+                    self.inner.name_prefix, self.set.index
+                ),
+            );
+            return Job { done: None };
+        }
+        Job {
+            done: Some(done_rx),
+        }
     }
 
     /// Dispatch a job nobody will join. The worker announces a panic through
@@ -251,26 +316,46 @@ impl Worker {
         F: FnOnce() + Send + 'static,
     {
         self.charge();
-        let _ = self.tx.send(Assignment::Detached {
-            body: Box::new(body),
-            ambient: InheritedRuntime::capture(),
-            label,
-        });
+        if self
+            .tx
+            .send(Assignment::Detached {
+                body: Box::new(body),
+                ambient: InheritedRuntime::capture(),
+                label: label.clone(),
+            })
+            .is_err()
+        {
+            finish_job(&self.inner, &self.set);
+            // Nobody joins a detached job, so `errlog` is the only place this
+            // can be told; silence here is the loss this pool exists to stop.
+            errlog_sev_printf(
+                ErrlogSevEnum::Major,
+                &format!("{label}: {NEVER_DISPATCHED}. This connection is being torn down."),
+            );
+        }
     }
 }
 
 /// A handle to a running job, joined on the borrower's teardown path.
 pub struct Job {
-    done: Receiver<thread::Result<()>>,
+    /// `None` when the dispatch itself failed: there is no worker to hear from.
+    done: Option<Receiver<thread::Result<()>>>,
 }
 
 impl Job {
     /// Block until the job returns, yielding whether it panicked.
     ///
-    /// A dropped sender (the worker gone at teardown) reads as a clean
-    /// completion: there is no unwind to report and nothing to tear down twice.
+    /// A dropped sender (the worker gone at teardown after the job was taken)
+    /// reads as a clean completion: there is no unwind to report and nothing to
+    /// tear down twice. A job that was never dispatched at all is *not* clean —
+    /// it reports [`NEVER_DISPATCHED`], because a borrower that is told its
+    /// body succeeded when it never ran is the same silent loss as a dropped
+    /// panic payload.
     pub fn join(self) -> thread::Result<()> {
-        self.done.recv().unwrap_or(Ok(()))
+        match self.done {
+            Some(done) => done.recv().unwrap_or(Ok(())),
+            None => Err(Box::new(NEVER_DISPATCHED)),
+        }
     }
 }
 
@@ -289,6 +374,96 @@ fn announce_panic(label: &str) {
              torn down. Other connections are unaffected."
         ),
     );
+}
+
+/// Announce a worker thread that left without being asked to. One record per
+/// set, on the first death, naming what the pool lost.
+fn announce_worker_death(prefix: &str, index: usize, roles: usize) {
+    errlog_sev_printf(
+        ErrlogSevEnum::Major,
+        &format!(
+            "{prefix} worker pool: a thread of set {index} exited unexpectedly. \
+             The set's {roles} threads are being retired and its slot returned; \
+             other connections are unaffected."
+        ),
+    );
+}
+
+/// The one exit path of a worker thread.
+///
+/// # The defect this closes
+///
+/// `catch_unwind` around the job body does not make the *thread* unwind-proof:
+/// dropping the panic payload after the joiner is gone, and the two mutex takes
+/// in the return path, all sit outside it. On VxWorks 7 the second of those is
+/// not hypothetical — a `std` mutex lock at the memory wall returns `EINVAL`
+/// and `std` panics, killing the worker between `catch_unwind` and
+/// `finish_job`. The set then had `running == 1` forever with no thread to
+/// settle it: never idle, never re-leased, its slot held against the pool's
+/// bound for the life of the process (`BUSY=2 SETS=50 WORKERS=100 CONNS=0`
+/// measured on target).
+///
+/// So the accounting hangs off the thread's *destructor*, not off a code path:
+/// however the thread ends — `Stop`, a closed channel, or an unwind anywhere
+/// including the prologue — this runs. A death retires the whole set, because a
+/// set one thread short can never serve a connection again.
+struct WorkerExit {
+    inner: Arc<PoolInner>,
+    set: Arc<SetHandle>,
+    /// Set true only where the worker returns normally. Left false on every
+    /// unwind, which is what tells the two apart in `Drop`.
+    clean: bool,
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let (first_death, last_gone) = {
+            let mut st = lock_set(&self.set);
+            // Read and write `dead` under the set lock, so the first death is
+            // decided once even when two threads of a set die together.
+            let already_dead = self.set.dead.load(Ordering::SeqCst);
+            if self.clean && !already_dead {
+                // The ordinary end of a healthy worker: teardown's `Stop`, or a
+                // failed grow retiring the threads it did create. The set was
+                // never a thread short, so there is nothing to account for.
+                return;
+            }
+            // A survivor of an already-dead set comes through here too, however
+            // it was asked to leave, so the count reaches zero exactly once.
+            st.live_workers -= 1;
+            self.set.dead.store(true, Ordering::SeqCst);
+            (!already_dead, st.live_workers == 0)
+        };
+
+        if first_death {
+            // A dead set never runs another job; its survivors are asked to
+            // leave, and the last one out releases the slot below.
+            for tx in &self.set.senders {
+                let _ = tx.send(Assignment::Stop);
+            }
+        }
+        {
+            let mut reg = self.inner.lock();
+            if !reg.stopping {
+                // Out of `idle` on the first death, so nothing can lease a set
+                // that is short a thread; out of `all` and off `created` only
+                // when the last thread is gone, so the slot is released exactly
+                // once and never while a dying thread still holds its stack.
+                reg.idle.retain(|s| !Arc::ptr_eq(s, &self.set));
+                if last_gone {
+                    reg.all.retain(|s| !Arc::ptr_eq(s, &self.set));
+                    reg.created -= 1;
+                }
+            }
+        }
+        if first_death {
+            announce_worker_death(
+                self.inner.name_prefix,
+                self.set.index,
+                self.inner.roster.len(),
+            );
+        }
+    }
 }
 
 /// A worker's whole life: take a job, run it under the submitter's ambient
@@ -530,6 +705,7 @@ impl<const N: usize> WorkerPool<N> {
         }
         let workers: Vec<Worker> = (0..N)
             .map(|slot| Worker {
+                inner: self.inner.clone(),
                 set: set.clone(),
                 tx: set.senders[slot].clone(),
             })
@@ -555,11 +731,17 @@ impl<const N: usize> WorkerPool<N> {
             receivers.push(rx);
         }
         let set = Arc::new(SetHandle {
+            index,
             senders,
+            dead: AtomicBool::new(false),
             state: Mutex::new(SetState {
                 leased: false,
                 running: 0,
                 parked: false,
+                // The set's full roster. A grow that fails partway never
+                // publishes the set and retires its threads through `Stop`, so
+                // no short-staffed set is ever counted here.
+                live_workers: N,
             }),
         });
 
@@ -573,11 +755,20 @@ impl<const N: usize> WorkerPool<N> {
                 .name(name)
                 .stack_size(role.stack.bytes())
                 .spawn(move || {
+                    // Installed before anything that can unwind — the prologue
+                    // included — so no way out of this thread leaves the set
+                    // counted against the pool's bound. See `WorkerExit`.
+                    let mut exit = WorkerExit {
+                        inner: inner.clone(),
+                        set: set_for_worker.clone(),
+                        clean: false,
+                    };
                     // The band is the role's, for the thread's whole life. Taken
                     // here in the closure so the crate's thread-prologue guards
                     // see it on the spawned body.
                     let _ = enter_ioc_thread(role.priority);
                     worker_loop(inner, set_for_worker, rx);
+                    exit.clean = true;
                 });
             match spawned {
                 Ok(handle) => joins.push(handle),
@@ -887,6 +1078,136 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// A panic payload whose own `Drop` panics — the deterministic stand-in for
+    /// a worker thread that dies somewhere the job's `catch_unwind` does not
+    /// cover.
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("payload drop: the worker thread dies here, outside catch_unwind");
+        }
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a set whose worker thread has exited be retired — released from
+    /// `busy`, dropped from the idle deque, and given back to `created`. MUST
+    /// NOT: a worker's death leave its set counted busy for the life of the
+    /// process.
+    ///
+    /// Measured on `x86_64-wrs-vxworks` at the reservation wall: three worker
+    /// threads died across two sets and the pool reported `BUSY=2 SETS=50
+    /// WORKERS=100 CONNS=0` — two sets leased forever with no client attached,
+    /// so the connection bound was permanently 139 instead of 141 and every
+    /// further death cost another set
+    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §14, on
+    /// `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`).
+    ///
+    /// The target's mechanism was a `std` mutex lock returning `EINVAL` inside
+    /// the loop's return path, which is not reproducible on demand. This
+    /// reproduces the *same* thread death at the *same* point deterministically:
+    /// the job's panic is caught, and then the payload is dropped on the worker
+    /// thread — `let _ = done.send(outcome)` drops it there when the joiner is
+    /// already gone — so the worker unwinds before it reaches `finish_job`.
+    /// Any panic on that stretch does this; the payload is only how the test
+    /// gets one on demand.
+    #[test]
+    fn a_worker_that_dies_retires_its_set_instead_of_leaking_it() {
+        let pool: WorkerPool<2> = WorkerPool::new("test-dead", roster2(), 2);
+        let (lease, [reader, _writer]) = pool.acquire().expect("borrow");
+
+        // The body waits, so the `Job` can be dropped first: the worker's
+        // `done.send` must fail for the payload to drop on the worker thread.
+        let (go, wait) = channel::<()>();
+        let job = reader.run(move || {
+            let _ = wait.recv();
+            std::panic::panic_any(PanicOnDrop);
+        });
+        drop(job);
+        drop(lease);
+        go.send(()).expect("the worker is waiting on this");
+        drop(go);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (busy, created, _cap) = pool.set_usage();
+            if busy == 0 {
+                assert_eq!(
+                    created, 0,
+                    "a set with a dead worker must not stay countable: its \
+                     threads are gone, so its slot must return to the bound"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the set is still busy with no lease and no live job: a worker \
+                 that died took its set out of circulation permanently, which \
+                 is the one-set-per-death leak measured on target"
+            );
+            thread::yield_now();
+        }
+
+        // And the pool still admits: the retired set freed its slot.
+        let (lease2, [r2, w2]) = pool.acquire().expect("borrow after a death");
+        assert!(
+            r2.run(|| {}).join().is_ok(),
+            "a fresh set must actually run"
+        );
+        assert!(w2.run(|| {}).join().is_ok());
+        drop(lease2);
+    }
+
+    /// The other side of the death boundary: the lease is still held when the
+    /// worker dies. Retirement may not wait for the borrower — the slot has to
+    /// come back while the borrower still holds its (now useless) lease, and the
+    /// lease drop that follows must not push a thread-short set back to idle.
+    #[test]
+    fn a_death_under_a_live_lease_returns_the_slot_and_never_repools_the_set() {
+        let pool: WorkerPool<2> = WorkerPool::new("test-dead-leased", roster2(), 2);
+        let (lease, [reader, writer]) = pool.acquire().expect("borrow");
+
+        // Same handshake as above: the payload must drop on the *worker*, so the
+        // `Job` has to be gone before the body panics.
+        let (go, wait) = channel::<()>();
+        let job = reader.run(move || {
+            let _ = wait.recv();
+            std::panic::panic_any(PanicOnDrop);
+        });
+        drop(job);
+        go.send(()).expect("the worker is waiting on this");
+        drop(go);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.set_usage().1 != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a set that lost a thread stayed countable while its lease was \
+                 held; the slot must return as soon as the threads are gone"
+            );
+            thread::yield_now();
+        }
+
+        // The surviving role is unusable, and says so rather than reporting a
+        // body that never ran as a clean completion.
+        assert!(
+            writer.run(|| {}).join().is_err(),
+            "a job dispatched into a retired set must be reported as not run"
+        );
+
+        drop(lease);
+        assert_eq!(
+            pool.set_usage(),
+            (0, 0, 2),
+            "the lease drop must not re-pool a retired set"
+        );
+        assert!(
+            pool.acquire().is_ok(),
+            "the pool must still admit after a death under lease"
+        );
     }
 
     /// Dropping the pool retires its worker threads rather than leaking them.

@@ -991,3 +991,33 @@ down.** Not "one worker thread is lost while the IOC looks healthy" — in the C
 arm the RTP was deleted by signal 6. This is the strongest argument for the
 budget-bounded admission in §12: the pool must refuse *before* thread creation
 can fail, because the failure mode past that point is not a refusal at all.
+
+---
+
+## 14. New: a panicking worker leaks its pool set permanently
+
+Not one of the four follow-up items; found while measuring §13, in shared code
+rather than in the VxWorks backend, so it is recorded and not fixed here.
+
+After the three A-arm panics of §13, with every client disconnected:
+
+```
+POOLPROBE seq=13 BUSY=2 SETS=50 CAP=141 WORKERS=100 REFUSED=0 CONNS=0
+```
+
+`CONNS=0` and `BUSY=2`. Three worker threads died across two sets, and those
+two sets are leased forever: nothing returns a `SetLease` whose worker panicked,
+so `became_free()` is never reached for them and `free_if_idle()` can never
+reclaim them. The capacity is permanently 139 instead of 141, and each further
+panic costs another set.
+
+This is `WorkerPool`'s accounting, in `worker_pool.rs`, shared with
+`armv7-rtems-eabihf` — not a VxWorks-backend defect, and not reachable from the
+E8 row's scope. The invariant it breaks is the symmetric-accounting one: a set
+is marked busy by the actor that leased it, and must be released by the actor
+that finished with it, but a panicking worker is neither — it exits without
+passing through either owner. Stated here so it is not rediscovered from the
+`BUSY=2 CONNS=0` line alone.
+
+It compounds §13: at the reservation wall a panic is likelier, and each panic
+permanently shrinks the pool that the wall already constrained.

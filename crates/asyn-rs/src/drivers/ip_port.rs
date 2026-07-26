@@ -295,30 +295,167 @@ enum IpIoInner {
     Unix(std::os::unix::net::UnixStream),
 }
 
-/// Write all data with retry on WouldBlock/Interrupted, enforcing a deadline.
+/// `libc`'s RTEMS glob re-exports these two names from more than one module,
+/// so a bare `libc::POLLOUT` / `libc::MSG_DONTWAIT` is ambiguous on
+/// `armv7-rtems-eabihf` — the `FIONREAD_REQUEST` precedent in
+/// `epics-libcom-rs/src/runtime/blocking_io.rs`. VxWorks 7 defines both
+/// unambiguously and at these same values (`libc` `src/vxworks/mod.rs:1198`
+/// and `:1029`).
+#[cfg(target_os = "rtems")]
+const POLLOUT_EVENT: libc::c_short = 0x0004;
+#[cfg(target_os = "rtems")]
+const SEND_DONTWAIT: libc::c_int = 0x0080;
+#[cfg(all(unix, not(target_os = "rtems")))]
+const POLLOUT_EVENT: libc::c_short = libc::POLLOUT;
+#[cfg(all(unix, not(target_os = "rtems")))]
+const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
+
+/// Wait until the socket will take bytes, or `deadline` passes first
+/// (`Ok(false)`).
+///
+/// C parity, and why the write bound is not `SO_SNDTIMEO`: `drvAsynIPPort.c`
+/// compiles the `setsockopt(SO_SNDTIMEO)` block only under `USE_SOCKTIMEOUT`,
+/// which is `#if defined(__rtems__)` (`:71-72`). Every other target — vxWorks
+/// included, through its own `FAKE_POLL` (`:75-76`) — takes `USE_POLL` (`:74`),
+/// where `writeIt` polls `POLLOUT` for `writePollmsec` (`:667-686`) and then
+/// sends. This port armed `SO_SNDTIMEO` on all platforms instead, and VxWorks 7
+/// does not implement the option: `setsockopt` fails `ENOPROTOOPT` (errno 42,
+/// measured on target), so the `?` on it failed every asyn IP write there
+/// before a byte was sent.
+trait WaitWritable {
+    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool>;
+}
+
+/// Hand bytes to the socket without parking — the stream arms of [`IpIoInner`].
+///
+/// C reaches the same place by putting the socket in non-blocking mode once, at
+/// connect (`setNonBlock(fd, 1)`, `drvAsynIPPort.c:511`, under `USE_POLL`). This
+/// port carries `MSG_DONTWAIT` per send instead: C polls its reads too, whereas
+/// this driver bounds reads with `SO_RCVTIMEO` — which VxWorks does implement,
+/// and which a permanently non-blocking socket would defeat. A per-send flag
+/// leaves the shared file description, and that read bound, untouched.
+///
+/// The wait alone is not enough to make the deadline hold: a blocking `write` on
+/// a stream socket does not return a short count when the send buffer fills, it
+/// waits until the whole buffer is queued.
+trait SendWithoutParking {
+    fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> WaitWritable for T {
+    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let mut fds = libc::pollfd {
+                fd: self.as_raw_fd(),
+                events: POLLOUT_EVENT,
+                revents: 0,
+            };
+            let ms = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+            let rc = unsafe { libc::poll(&mut fds, 1, ms) };
+            if rc > 0 {
+                return Ok(true);
+            }
+            if rc == 0 {
+                return Ok(false);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> SendWithoutParking for T {
+    fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe {
+            libc::send(
+                self.as_raw_fd(),
+                buf.as_ptr().cast(),
+                buf.len(),
+                SEND_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+}
+
+/// Windows implements `SO_SNDTIMEO`, so there the bound rides on the option and
+/// the send may park under it — the same split `blocking_io.rs` takes.
+#[cfg(not(unix))]
+fn arm_send_timeout(
+    set: impl FnOnce(Option<Duration>) -> std::io::Result<()>,
+    deadline: std::time::Instant,
+) -> std::io::Result<bool> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    set(Some(remaining))?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+impl WaitWritable for TcpStream {
+    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+        arm_send_timeout(|t| self.set_write_timeout(t), deadline)
+    }
+}
+
+#[cfg(not(unix))]
+impl WaitWritable for UdpSocket {
+    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+        arm_send_timeout(|t| self.set_write_timeout(t), deadline)
+    }
+}
+
+#[cfg(not(unix))]
+impl SendWithoutParking for TcpStream {
+    fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (&mut &*self).write(buf)
+    }
+}
+
 /// Write `data` to the stream, retrying short writes until the deadline.
 ///
 /// Returns the bytes the peer accepted. C parity
-/// (`drvAsynIPPort.c::writeRaw`, like `drvAsynSerialPort.c:849`): a write that
+/// (`drvAsynIPPort.c::writeIt`, like `drvAsynSerialPort.c:849`): a write that
 /// stalls part-way reports `*nbytesTransfered` **together with** its
 /// `asynTimeout`/`asynError` status, so a failure here carries the accepted
 /// count in [`AsynError::with_partial_write`] rather than dropping it — that
 /// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
+///
+/// The loop is C's shape: wait for `POLLOUT`, send, advance, repeat until the
+/// buffer is gone (`drvAsynIPPort.c:666-733`). Waiting first is what bounds the
+/// call — see [`WaitWritable`] for why that bound is not `SO_SNDTIMEO`.
 fn write_with_retry(
-    stream: &mut impl Write,
+    stream: &(impl WaitWritable + SendWithoutParking),
     data: &[u8],
     deadline: std::time::Instant,
 ) -> AsynResult<usize> {
     let mut offset = 0;
     while offset < data.len() {
-        if std::time::Instant::now() > deadline {
-            return Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "write timeout".into(),
+        match stream.wait_writable(deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "write timeout".into(),
+                }
+                .with_partial_write(offset));
             }
-            .with_partial_write(offset));
+            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
-        match stream.write(&data[offset..]) {
+        match stream.send_without_parking(&data[offset..]) {
             Ok(0) => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
@@ -327,12 +464,12 @@ fn write_with_retry(
                 .with_partial_write(offset));
             }
             Ok(n) => offset += n,
+            // C retries both of these against `pasynUser->timeout`
+            // (`drvAsynIPPort.c:694-710`); the deadline is re-read at the top
+            // of the loop, so the retry is bounded without a sleep.
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
     }
@@ -478,24 +615,30 @@ impl OctetNext for IpIoState {
         // C writeRaw reports what the socket took (`*nbytesTransfered`) on
         // success and on failure alike; return the real count rather than
         // assuming the whole buffer went out.
+        // No arm arms `SO_SNDTIMEO`: the deadline is enforced by the wait in
+        // `write_with_retry`, which is what C does everywhere but RTEMS. See
+        // `WaitWritable` — VxWorks 7 rejects the option outright, so setting it
+        // here failed every write on that target before a byte was sent.
         match inner {
-            IpIoInner::Tcp(stream) => {
-                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)
-            }
+            IpIoInner::Tcp(stream) => write_with_retry(stream, data, deadline),
             IpIoInner::Udp(socket, peer) => {
-                socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
+                // C polls `POLLOUT` before the datagram too — `writeIt` shares
+                // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
+                // (`drvAsynIPPort.c:666-691`).
+                if !socket.wait_writable(deadline)? {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "write timeout".into(),
+                    });
+                }
+                // C drvAsynIPPort.c::writeIt (688): sendto the resolved
                 // remote on the unconnected socket. A datagram is all-or-
                 // nothing, so a failed sendto transferred zero bytes and needs
                 // no partial-write carrier.
                 Ok(socket.send_to(data, *peer)?)
             }
             #[cfg(unix)]
-            IpIoInner::Unix(stream) => {
-                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
-                write_with_retry(stream, data, deadline)
-            }
+            IpIoInner::Unix(stream) => write_with_retry(stream, data, deadline),
         }
     }
 
@@ -2750,6 +2893,98 @@ mod tests {
             "zero-timeout write of a writable socket must attempt the send, not instant-timeout"
         );
 
+        handle.join().unwrap();
+    }
+
+    /// The write path bounds itself with a wait, and arms no `SO_SNDTIMEO`.
+    ///
+    /// VxWorks 7 does not implement `SO_SNDTIMEO` — `setsockopt` fails with
+    /// `ENOPROTOOPT` (errno 42), measured on target — and this driver used to
+    /// arm the option on every write and propagate that failure with `?`, so
+    /// every asyn IP write there failed before a byte was sent. C never arms it
+    /// on VxWorks either: `drvAsynIPPort.c` compiles the option only under
+    /// `USE_SOCKTIMEOUT`, which is `#if defined(__rtems__)` (`:71-72`), while
+    /// vxWorks takes `USE_POLL` (`:74-76`) and bounds `writeIt` with
+    /// `poll(POLLOUT, writePollmsec)` (`:667-686`) instead.
+    ///
+    /// Host proxy for a target-only failure: Linux implements the option, so
+    /// the pre-fix code also returned Timeout here. What fails before the fix
+    /// is the `write_timeout()` assertion — arming the option AT ALL is the
+    /// defect. `unix` only, because on Windows `SO_SNDTIMEO` works and the
+    /// bound deliberately still rides on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_write_bounds_itself_without_arming_so_sndtimeo() {
+        let (listener, port) = start_echo_server();
+        // The peer accepts and never reads, so the send buffers fill and the
+        // write stalls part-way. It must hold the connection open until the
+        // write has run: a dropped socket would make the write fail with EPIPE
+        // instead of stalling.
+        let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let _ = wait_for_release.recv();
+            drop(sock);
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let payload = vec![0x5Au8; 8 * 1024 * 1024];
+        let timeout = Duration::from_millis(200);
+        let mut user = AsynUser::new(0).with_timeout(timeout);
+        let start = std::time::Instant::now();
+        let res = drv.write_octet(&mut user, &payload);
+        let elapsed = start.elapsed();
+
+        let err = match res {
+            Err(e) => e,
+            other => panic!("a peer that never reads must stall the write, got {other:?}"),
+        };
+        let AsynError::PartialWrite { source, nbytes } = &err else {
+            panic!(
+                "C reports *nbytesTransferred with the timeout status \
+                 (drvAsynIPPort.c:712-719), got {err:?}"
+            );
+        };
+        assert!(
+            matches!(
+                **source,
+                AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    ..
+                }
+            ),
+            "C `writeIt` returns asynTimeout when its POLLOUT wait expires \
+             (drvAsynIPPort.c:684-686), got {source:?}"
+        );
+        // …and some of the 8 MiB did go out before the stall, so this is the
+        // send loop reaching its deadline and not an instant refusal.
+        assert!(
+            *nbytes > 0,
+            "the send loop must have moved bytes before the deadline"
+        );
+        // The wait is what bounds the call. A blocking `write` on a stream
+        // socket does not return short when the send buffer fills — it waits
+        // until the whole buffer is queued — so a wait-then-blocking-write
+        // would park here far past the deadline.
+        assert!(
+            elapsed < timeout * 50,
+            "the write must return at its deadline ({timeout:?}), took {elapsed:?}"
+        );
+        // The finding: no `SO_SNDTIMEO` was armed. This is the assertion that
+        // fails before the fix.
+        let Some(IpIoInner::Tcp(stream)) = drv.io.inner.as_ref() else {
+            panic!("the TCP arm must still hold its stream");
+        };
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            None,
+            "the write path must not arm SO_SNDTIMEO — VxWorks 7 rejects it \
+             with ENOPROTOOPT and C only sets it under __rtems__"
+        );
+
+        let _ = release.send(());
         handle.join().unwrap();
     }
 

@@ -34,7 +34,7 @@ records with the full areaDetector plugin chain from a single `cargo build`.
 - **areaDetector** — NDArray, driver base, 26 plugins (Stats/ROI/FFT/file writers/PVA push/…)
 - **synApps modules** — std (epid/throttle/timestamp), scaler, optics, mca
 - **Drivers** — MQTT broker bridge, Modbus TCP/RTU/ASCII
-- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 6, Linux PREEMPT_RT
+- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 6, VxWorks 7, Linux PREEMPT_RT
 
 ## Installation
 
@@ -202,8 +202,38 @@ RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
 The custom target spec this workspace deviates on (`has-thread-local: true`,
 `doc/rtems-tls-spec-deviation.md`) is applied automatically by a rustc-wrapper
 wired in `.cargo/config.toml` — plain `cargo build` is the whole interface.
-The full build manual, including the PVA/QSRV image and the spec escape hatch,
-is in [`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
+`./scripts/embedded-image.sh rtems ca` builds the same binary on the
+`release-embedded` profile (strip + fat LTO), which is what a deployment ships:
+4.6 MB against the dev build's 122.9 MB. The full build manual, including the
+PVA/QSRV image and the spec escape hatch, is in
+[`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
+
+## Build for VxWorks 7 (x86_64-wrs-vxworks)
+
+VxWorks 7 is the second embedded target, reached through the same
+`epics_embedded_target` cfg rather than a second OS special case. It is also
+tier-3, so it needs a nightly toolchain with `rust-src` and `-Zbuild-std`, but
+being a builtin triple it needs no custom spec:
+
+```bash
+# census, then type-check the whole VxWorks closure — no SDK needed
+./scripts/vxworks-check.sh
+
+# deployable RTP image (needs the Wind River SDK: wr-cc and the RTP libs)
+./scripts/embedded-image.sh vxworks ca
+```
+
+Both embedded targets take their `libc` fixes from one pinned public fork
+branch (`physwkim/libc`, `epics-rs-0.2`). A manifest `[patch.crates-io]` does
+not reach `-Zbuild-std`, which resolves std against rust-src's own lock, so
+`scripts/libc-std-patch.sh` derives a config-level patch from that same pin;
+`vxworks-check.sh` and `embedded-image.sh` both call it, leaving the manifest
+line the single source of truth for what libc is compiled. That is what lets
+the closure be type-checked on a stock nightly, CI included. Linking stays on a
+box with the SDK — producing or booting a `.vxe` is the one half no runner can
+do. The target contract, the cfg architecture, and what was measured on target
+(gate rows, CA/PVA round-trips, image sizes) are in
+[`doc/vxworks-port.md`](doc/vxworks-port.md).
 
 ## Run on RT Linux (PREEMPT_RT)
 

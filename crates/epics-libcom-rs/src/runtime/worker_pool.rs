@@ -358,9 +358,12 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
 /// the one discriminator a consumer had was the message *prose*, and every
 /// consumer that branched on `kind()` silently answered the wrong question.
 /// Both server drivers did: the CA server reported both as one status on the
-/// wire, and the PVA server reported an out-of-threads target as
-/// `max_connections reached` (measured on VxWorks 7,
-/// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §4).
+/// wire — measured on VxWorks 7, where both gates were reached on one image
+/// with `available=48` on each (`doc/vxworks-ca-refusal-fidelity.md` §6) — and
+/// the PVA server's `kind() == WouldBlock` arm reports an out-of-threads target
+/// as `max_connections reached`, naming a bound that never fired. That second
+/// one is by construction, not measured: the blocking PVA server has not been
+/// driven to its wall on this target.
 ///
 /// Naming the gate in the type is what makes that class of mistake unwritable:
 /// a consumer that wants "is this the connection limit" must now say so, and
@@ -389,8 +392,8 @@ impl std::fmt::Display for AcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // The leading words are load-bearing: they are what the on-target
-            // consoles and `doc/vxworks-ca-worker-pool-on-target-measurement.md`
-            // already carry, so an operator's existing grep keeps working.
+            // consoles and `doc/vxworks-ca-refusal-fidelity.md` already carry,
+            // so an operator's existing grep keeps working.
             AcquireError::AtCapacity { capacity } => {
                 write!(f, "worker pool at capacity ({capacity} sets)")
             }

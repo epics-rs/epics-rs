@@ -609,9 +609,9 @@ static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 ///   nothing to do with the bound (it was never reached).
 ///
 /// `worker pool at capacity` is kept verbatim from the pre-fix wording: it is
-/// the string in the on-target consoles and in
-/// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §4.2, so an operator's
-/// existing grep still finds a refusal.
+/// the string in the on-target consoles quoted in
+/// `doc/vxworks-ca-refusal-fidelity.md` §2, so an operator's existing grep
+/// still finds a refusal.
 fn refusal_reason(cause: &AcquireError) -> String {
     let gate = match cause {
         AcquireError::AtCapacity { capacity } => {
@@ -677,7 +677,7 @@ fn refusal_reason(cause: &AcquireError) -> String {
 /// The two admission gates mean different things and need different remedies
 /// ([`AcquireError`]), but the status *field* cannot carry which one it was.
 /// The constraint is libca's, not ours: `ca_client_context::vSignal`
-/// (`ca_client_context.cpp:405-413`) ends every default-handler exception with
+/// (`ca_client_context.cpp:410-416`) ends every default-handler exception with
 ///
 /// ```text
 /// if (!(ca_status & CA_M_SUCCESS) &&
@@ -703,7 +703,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
 
     // Tell the peer. The echoed header is a synthetic CA_PROTO_VERSION: the
     // client has sent nothing we are answering, and `defaultExcep` is what
-    // index 0 of libca's exception jump table selects (`cac.cpp:96`).
+    // index 0 of libca's exception jump table selects (`cac.cpp:96-97`).
     let echo = CaHeader::new(CA_PROTO_VERSION);
     let frame = crate::server::tcp::build_ca_error_frame(
         &echo,
@@ -723,7 +723,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     // refusal produce two records that a reader has to reconcile.
     //
     // Both halves were broken and the E8 target run measured both
-    // (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.4). This used to
+    // (`doc/vxworks-ca-refusal-fidelity.md` §2). This used to
     // announce on `errlog` only when the ordinal was a power of two, *and* emit
     // an ungated `tracing::warn!` beside it. On the 1024M guest that put 8 WARN
     // lines and 4 `errlog` lines on the console for 8 refusals; on the 2048M
@@ -740,7 +740,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     // than what this replaced, and there is no rate to trade against.
     //
     // `errlog` is the surviving sink because it is C's `epicsPrintf` /
-    // `errlogPrintf` seam (`rsrv/caservertask.c:117`, `:1246`, `:1252`, all
+    // `errlogPrintf` seam (`rsrv/caservertask.c:117`, `:1248`, `:1255`, all
     // three unconditional — C throttles the *accept loop* with a 15 s sleep,
     // never the message) and because it reaches the console even with no
     // `tracing` subscriber installed, which is the state an RTEMS IOC binary
@@ -1589,7 +1589,7 @@ mod tests {
             "the status must stay ECA_ALLOCMEM for both gates: it is the only \
              CA_K_WARNING code for an exhausted resource, and a non-warning \
              severity aborts a default-handler libca client \
-             (ca_client_context.cpp:405-413)"
+             (ca_client_context.cpp:410-416)"
         );
         String::from_utf8_lossy(&frame[2 * CaHeader::SIZE..])
             .trim_end_matches('\0')
@@ -1604,9 +1604,9 @@ mod tests {
     ///
     /// The two need opposite remedies — raise the bound versus give the target
     /// memory — and on VxWorks 7 both walls were reached on the same image,
-    /// 47 concurrent with `EAGAIN` on one guest and 141 with the pool's own
-    /// capacity on the other, with `available=48` on both
-    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §4.3). The status
+    /// 96 concurrent with `EAGAIN` on a 1280M guest and 141 with the pool's own
+    /// capacity on a 2048M one, with `available=48` on both
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §6). The status
     /// code cannot separate them (see [`refuse_client`]), so the diagnostic
     /// must, and it must carry the *bound* — a capacity refusal that does not
     /// say what the capacity is tells an operator nothing they can act on.
@@ -1684,7 +1684,7 @@ mod tests {
     /// Both halves failed on target and both are asserted here, because either
     /// one alone makes the console's refusal count a number an operator cannot
     /// read. Measured on VxWorks 7 at the connection wall
-    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.4): 8 refusals
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §2): 8 refusals
     /// produced 4 `errlog` records and 8 `warn` records, and 4 refusals
     /// produced 3 and 4 — so neither sink's line count was the refusal count,
     /// and the `errlog` stream, which is the one an EPICS operator reads,

@@ -860,3 +860,79 @@ does not transfer, and the constraint is structural rather than an oversight.
 Nothing in the VxWorks path runs in that context: `register_task` is called
 from `enter_ioc_thread` at thread startup, and `snapshot` already allocates.
 Not verifiable from this rig either way; it is an `armv7-rtems-eabihf` item.
+
+---
+
+## 12. The pool never shrinks, measured against C `rsrv`
+
+UNFIXED 6 recorded the non-shrink and called it "by design". This round put a
+number on it and checked the reference, and the conclusion changes: **on a
+memory-constrained guest it is a defect, not a design choice.**
+
+C `rsrv` is the reference shape and it is the opposite of a pool. Each accepted
+TCP client gets a thread created for it —
+`epicsThreadCreate("CAS-client", epicsThreadPriorityCAServerLow, epicsThreadGetStackSize(epicsThreadStackBig), camsgtask, pClient)`
+at `modules/database/src/ioc/rsrv/caservertask.c:109` — and an event thread from
+`db_start_events(client->evuser, "CAS-event", …)` at `:1514`. Both are torn
+down per client: `destroy_tcp_client` calls `db_close_events(client->evuser)`
+and `camsgtask` returns on disconnect. **C's steady-state retention after a
+burst is zero threads.**
+
+Ours, measured directly rather than argued from the source. Burst of 40 held 90 s
+so the status-PV scan refreshes, then every ramp connection dropped, then 75 s
+settle, then sampled again on *fresh* connections:
+
+```
+[    0.1s] retA2 idle      CONN_CNT=0.0  REFUSED=0.0 FD_CNT=5.0  MEM_USED=60047360.0
+[   91.1s] retA2 top       CONN_CNT=40.0 REFUSED=0.0 FD_CNT=45.0 MEM_USED=60047360.0
+[  166.2s] retA2 after     CONN_CNT=0.0  REFUSED=0.0 FD_CNT=5.0  MEM_USED=60047360.0
+POOLPROBE seq=68 BUSY=0 SETS=45 CAP=141 WORKERS=90 REFUSED=0 CONNS=0
+```
+
+Everything cheap comes back and the one expensive thing does not:
+
+| resource | at the top | after every client left |
+|---|---|---|
+| file descriptors | `FD_CNT=45` | `FD_CNT=5` — returned |
+| connections | `CONN_CNT=40` | `CONN_CNT=0` — returned |
+| committed heap | `MEM_USED` unchanged | unchanged — nothing to return |
+| **threads and their stack reservation** | `SETS=45 WORKERS=90` | **`SETS=45 WORKERS=90`, `BUSY=0 CONNS=0`** |
+
+Held across every reporter cycle to the end of the run. A cold-pool repeat
+(`rtpDelete` then `rtpSp`, `SETS=0 WORKERS=0` confirmed before the burst) walled
+at 42 sets and ended the same way, `POOLPROBE seq=20 BUSY=0 SETS=42 CAP=141
+WORKERS=84 REFUSED=2 CONNS=0`.
+
+`MEM_USED` moving zero bytes across a 40-client burst is not the status-PV
+staleness of §7.2 — `CONN_CNT` and `FD_CNT` tracked correctly in the same
+samples. It is the pool working as intended: those 45 sets already existed, so
+the burst allocated nothing. The §6.2 figure of 1,073,152 B per connection is
+growth of the *pool*, charged on first use of a set, not per connection.
+
+**Why this is a defect and not a trade.** §10 established that the binding
+resource on this guest is reserved address space, ceiling ~248 MB. The 42
+retained sets are 42 × 3,145,728 = 132,120,576 B — **53 % of the guest's entire
+RTP reservation ceiling, held permanently with zero clients attached.** A
+transient burst is thereby converted into a permanent exhaustion: the address
+space is never returned, so nothing else in that RTP — the PVA server, the
+database, file I/O — can ever have it back. C, retaining zero, has no such
+mode.
+
+**Why it is nonetheless not a one-line fix.** The pool exists because of the
+measured per-thread leak on the sister target: every `std::thread` leaks 128 B
+on RTEMS, so create-and-destroy-per-client leaks without bound. Shrinking the
+pool reintroduces thread destruction. Two things must be said honestly here:
+the VxWorks per-thread-exit leak is **unmeasured** — it cannot be measured
+through a pool that never destroys a thread — and even granting a leak of the
+RTEMS size, retaining a thread costs 3,145,728 B of reservation to avoid 128 B,
+a ratio of 24,576:1. The arithmetic favours shrinking decisively; the missing
+measurement is what the shrink would cost, not whether it is worth wanting.
+
+The structural fix is the same one §10 points at from the other side: bound the
+pool by a **reservation budget** rather than by a fixed set count.
+`CAS_CLIENT_POOL_CAPACITY = 141` bounds the wrong quantity — on the `~958MB`
+guest it is never the binding term, so the IOC walks past the real ceiling into
+a failing `pthread_create` whose outcome ranges from a clean refusal to an RTP
+abort (§13). A budget bound would refuse before thread creation can fail, and
+would give idle-set release a natural trigger. That is a semantic change to a
+public constant and is **not** made here; it is raised for sign-off.

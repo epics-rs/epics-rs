@@ -686,10 +686,30 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   per-thread size classes. `DialPool` therefore buys no heap residue on this
   target; its value here is thread-creation rate and the fd/stack ceiling.
   `doc/vxworks-dial-attempt-residue-on-target-measurement.md` carries the
-  transcripts, the rig (`doc/vxworks-e10-rig/`) and two remaining opens — the
-  CA name-server queue ceiling was reproduced but not re-proven on this target,
-  and a PVA-only `timer_sleep::sleep_until` growth of 184 B per ~30 s is
-  independent of the dial shape and has no measured bound.
+  transcripts and the rig (`doc/vxworks-e10-rig/`).
+* **E10's `timer_sleep` growth was a leak, and it is fixed at source.** The
+  184 B per ~30 s that round 1 left open is wall-clock paced, not attempt
+  paced — halving the dial rate over the same wall clock left it unchanged
+  (+6624 B against +6440 B) while the `sleep_until` trough climbed +6 entries
+  per 180 s `BEACON_CLEAN_INTERVAL` cycle against a flat arm rate, i.e.
+  ~530 KB/day on an unattended IOC. Cause: a `Sleep` dropped before its
+  deadline could not take its queue entry back, because `DelayedTimer` held
+  entries in a `BinaryHeap`, which addresses only its top; the entry kept the
+  future's `Arc<Mutex<SleepState>>` — and the `pthread` mutex `std` creates
+  inside it — alive for the whole remaining delay. The queue is now a
+  `BTreeMap<WakeKey, _>`, `schedule_wake` returns the key and `Drop for Sleep`
+  cancels it, so an entry is addressable by construction. Measured on target:
+  `pva-fixed-5s` reads the same `live_bytes` at seq 30, 138 and 139 over 223
+  dial attempts and 9.0 M allocations, with **no size class and no call site
+  changed**; `pva-fixed-perattempt` repeats it on the other dial arm. This is
+  `epics-libcom-rs` runtime code, so it applied to every `exec_backend`
+  consumer, RTEMS included.
+* **The CA name-server queue ceiling is now observed on VxWorks.** With
+  `EPICS_CA_NAMESERVER_QUEUE_DEPTH` compiled in at 8, `fire_searches` holds
+  exactly 8 live 144 B blocks for 172 further dial attempts while its call
+  count runs 8 → 16 — `ns_try_send` drops rather than queues. Ceiling at the
+  shipping default is 256 × 144 B = 36,864 B, reached only while a configured
+  name server is unreachable.
 * **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
   Not a formula difference: `StackSizeClass::bytes` is
   `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as

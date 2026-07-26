@@ -461,12 +461,345 @@ specific to the PVA reconnect path's use of `timer_sleep::sleep_until`, whose
 This measurement cannot say whether it is bounded: both arms ran the same 5 s
 cadence for the same ~25 minutes, so wall-clock pacing and attempt pacing are
 not separable here, and no ceiling was reached within the run. It is recorded
-as an open, not as a leak.
+as an open, not as a leak. **Result 6 separates the two pacings and Result 7
+closes it at source** — it is a leak, it is wall-clock paced, and it is gone.
 
 `MEM_USED` (mimalloc `current_commit`, page-granular) read **16998400** on every
 sample of all four runs, so it neither confirms nor contradicts a sub-4 KB
 delta; `MEM_FREE` is `-1` (NaN) on this target as already recorded in
 `doc/vxworks-port.md`.
+
+# Round 2 — the open items
+
+Same box, same rig, same resource block; four more images, each differing from
+a round-1 image in exactly one thing.
+
+| image | half | dial | `RECONNECT_INTERVAL` | timer | shim |
+|---|---|---|---|---|---|
+| `pva-nofix-10s` | PVA | pooled | **10 s** (shipping) | round-1 | task-keyed |
+| `pva-fixed-5s` | PVA | pooled | 5 s | **cancel-on-drop** | task-keyed |
+| `pva-fixed-perattempt` | PVA | per-attempt | 5 s | **cancel-on-drop** | task-keyed |
+| `ca-nsdepth8` | CA | pooled | — | round-1 | task-keyed |
+
+## Result 6 — the PVA growth is wall-clock paced, and it is a leak
+
+`pva-nofix-10s` is the round-1 pooled PVA image with the *shipping* 10 s
+`RECONNECT_INTERVAL` instead of the rig's 5 s: half the dial attempts over the
+same wall clock. The window is the same six sawtooth cycles, seq 30 → 138.
+
+```
+== /home/coding-agent/vx-rig-e10/logs/console-pva-nofix-10s.log
+samples paired: 139  window seq 30..138 (109 samples)
+  start seq=  30 attempts=  31 workers=   1 live_bytes=  662875 live_blocks=  1774 MEM_USED=16998400
+  end   seq= 138 attempts= 143 workers=   1 live_bytes=  669499 live_blocks=  1918 MEM_USED=16998400
+  delta over 112 attempts: live_bytes +6624  live_blocks +144  MEM_USED +0
+```
+
+Against round-1 `pva-pooled` over the identical window: 223 attempts,
+**+6440 B / +140 blocks**. Halving the attempt rate — 223 attempts down to 112
+over the same 1090 s — left the growth **unchanged to within one 184 B group**.
+It is paced by the wall clock, not by dial attempts.
+
+The per-site series says the same thing directly. `sleep_until`'s own call
+count runs at a flat ~142 per 60 s in *both* cadences, and its live count
+sawtooths on the 180 s `BEACON_CLEAN_INTERVAL` period with a **monotone +6 per
+cycle**:
+
+```
+HEAPSITE seq=6 pc=0x6df9b6 calls=151 bytes=8456 live=70 livebytes=3920
+HEAPSITE seq=18 pc=0x6df9b6 calls=436 bytes=24416 live=13 livebytes=728
+HEAPSITE seq=36 pc=0x6df9b6 calls=866 bytes=48496 live=19 livebytes=1064
+HEAPSITE seq=54 pc=0x6df9b6 calls=1294 bytes=72464 live=26 livebytes=1456
+HEAPSITE seq=72 pc=0x6df9b6 calls=1723 bytes=96488 live=31 livebytes=1736
+HEAPSITE seq=90 pc=0x6df9b6 calls=2151 bytes=120456 live=37 livebytes=2072
+HEAPSITE seq=108 pc=0x6df9b6 calls=2583 bytes=144648 live=43 livebytes=2408
+HEAPSITE seq=126 pc=0x6df9b6 calls=3013 bytes=168728 live=49 livebytes=2744
+```
+
+A constant arm rate with a rising trough is the definition of retention: the
+troughs 13 → 49 climb by 6 entries every 180 s and never come back. Not a
+bounded warm-up. At 184 B per ~30 s that is **~530 KB/day**, which on an IOC
+meant to run for months is a leak, and it is `epics-libcom-rs` runtime code —
+not PVA code — so every `exec_backend` consumer has it. `addr2line` on this
+image resolves the four sites of the group exactly as in round 1:
+
+```
+0x21b769   -> <std::sys::sync::once_box::OnceBox<std::sys::pal::unix::sync::mutex::Mutex>>::initialize::<<std::sys::sync::mutex::pthread::Mutex>::get::{closure#0}>
+0x6df9b6   -> epics_libcom_rs::runtime::background::timer_sleep::sleep_until
+0x755885   -> semMCreate
+0x6dfbd0   -> <epics_libcom_rs::runtime::background::timer_sleep::Sleep as core::future::future::Future>::poll
+```
+
+**Root cause.** A `select!` arm holding `beacon_clean_tick.tick()` builds a
+fresh `Sleep` on every loop iteration, polls it — which files a queue entry at a
+deadline up to 180 s out — and drops it when another arm wins. The entry holds
+a clone of the `Sleep`'s `Arc<Mutex<SleepState>>`, and the queue was a
+`BinaryHeap`, which can only pop its top: an entry inside it is addressable by
+nobody, so a dropped `Sleep` could not take its entry back and the cell (plus
+the `pthread` mutex `std` lazily creates inside it, hence the `semMCreate`)
+lived to the deadline regardless. The retained set is therefore
+`arm-rate × period`, which is why it tracks the wall clock and ignores the dial.
+
+## Result 7 — cancel-on-drop closes it: 0 B over 223 attempts
+
+The fix is the container, not a guard: `TimerState::queue` becomes a
+`BTreeMap<WakeKey, TimerEntry>`, `schedule` returns the `WakeKey` it filed the
+entry under, and `Drop for Sleep` hands that key back through
+`TimerHandle::cancel_wake`. An entry is addressable *by construction*; nothing
+checks a cancelled-set at expiry, because a cancelled entry is not there.
+`TimerHandle::schedule` — C `callbackRequestDelayed` — stays fire-and-forget,
+where the caller keeps no handle and the queue really is the only owner.
+
+`pva-fixed-5s` is round-1's `pva-pooled` with that change and nothing else,
+same 5 s cadence, same window, same 223 attempts:
+
+```
+== /home/coding-agent/vx-rig-e10/logs/console-pva-fixed-5s.log
+samples paired: 139  window seq 30..138 (109 samples)
+  start seq=  30 attempts=  62 workers=   1 live_bytes=  627034 live_blocks=  1246 MEM_USED=16998400
+  end   seq= 138 attempts= 285 workers=   1 live_bytes=  627034 live_blocks=  1246 MEM_USED=16998400
+  delta over 223 attempts: live_bytes +0  live_blocks +0  MEM_USED +0
+  lsq slope: 0.000 B/attempt
+  endpoint  : 0.000 B/attempt
+  accounting: alloc=11440413 free=11437192 untracked_free=0 blk_ovf=0 site_ovf=0 size_ovf=0
+
+  per-size-class delta, detail seq 30 -> 138 (attempts 62 -> 285):
+            TOTAL  dcount    +0  dbytes       +0
+
+  per-site delta, detail seq 30 -> 138 (top 15 by dbytes):
+    sites with any change: 0
+```
+
+Not a reduced slope — an identical byte count. `live_bytes` reads 627034 at
+seq 30, at seq 138 and at seq 139, across 9.0 M intervening allocations, and
+**no size class and no call site changed at all**. The sawtooth is gone too, not
+just its drift: the four classes are flat rather than oscillating.
+
+```
+HEAPSIZE seq=138 size=80 live=63 bytes=5040 allocs=3657
+HEAPSIZE seq=138 size=56 live=18 bytes=1008 allocs=3876
+HEAPSIZE seq=138 size=40 live=144 bytes=5760 allocs=4014
+HEAPSIZE seq=138 size=8 live=19 bytes=152 allocs=310354
+```
+
+Accounting health at the endpoint — `alloc − free − realloc == live_blocks`:
+
+```
+HEAPCALL seq=138 malloc=11438388 free=11437192 calloc=24 realloc=1975 pmemalign=0 alignedalloc=0 memalign=26 in_calloc=0 in_realloc=0 nest_ovf=0
+```
+
+11440413 − 11437192 − 1975 = **1246** = `live_blocks`. Exact.
+
+`pva-fixed-perattempt` repeats it on the other dial arm, where `workers` climbs
+one per attempt so the per-attempt shape is provably in force:
+
+```
+== /home/coding-agent/vx-rig-e10/logs/console-pva-fixed-perattempt.log
+samples paired: 80  window seq 30..78 (49 samples)
+  start seq=  30 attempts=  62 workers=  62 live_bytes=  622846 live_blocks=  1229 MEM_USED=16998400
+  end   seq=  78 attempts= 162 workers= 162 live_bytes=  622846 live_blocks=  1229 MEM_USED=16998400
+  delta over 100 attempts: live_bytes +0  live_blocks +0  MEM_USED +0
+  workers: min=62 max=162
+```
+
+**Host regression tests, fail-first.** In `timer_sleep`:
+`dropping_a_sleep_releases_its_timer_entry`,
+`dropping_an_unpolled_sleep_queues_nothing`, and
+`abandoned_interval_ticks_leave_no_entries` (32 abandoned 180 s ticks must leave
+0 entries). With the `cancel_wake` call in `Drop for Sleep` removed, the first
+and third fail — the third with `left: 32, right: 0` — and pass with it. In
+`delayed_timer`: `cancelling_a_wake_drops_its_entry_before_the_deadline`,
+`cancelling_an_already_gone_wake_is_a_no_op`, and
+`equal_deadlines_fire_in_submission_order`, which pins the ordering the
+`BinaryHeap`'s reversed `Ord` used to provide.
+
+## Result 8 — the nameserver-queue ceiling, observed on VxWorks
+
+Round 1 reproduced the `fire_searches` growth on this target but took its
+*ceiling* from the shared source. `ca-nsdepth8` is round-1's `ca-pooled` with
+one line added to the compiled-in defaults — `EPICS_CA_NAMESERVER_QUEUE_DEPTH`
+= 8 — because at the measured ~1 block per 94 s the shipping 256 would need
+~6.7 hours to fill.
+
+The class stops dead:
+
+```
+HEAPSIZE seq=6 size=144 live=9 bytes=1296 allocs=22
+HEAPSIZE seq=12 size=144 live=11 bytes=1584 allocs=36
+HEAPSIZE seq=18 size=144 live=12 bytes=1728 allocs=49
+HEAPSIZE seq=24 size=144 live=13 bytes=1872 allocs=63
+HEAPSIZE seq=30 size=144 live=13 bytes=1872 allocs=76
+...
+HEAPSIZE seq=108 size=144 live=13 bytes=1872 allocs=243
+```
+
+Flat at 13 from seq 24 to seq 108 — **84 samples, 840 s, attempts 50 → 222** —
+while `allocs` keeps climbing 63 → 243. Round-1 `ca-pooled` over the same span
+went 13 → 23.
+
+The site itself shows why, and shows the cap is the queue's and not something
+else's:
+
+```
+HEAPSITE seq=6 pc=0x2f32eb calls=4 bytes=576 live=4 livebytes=576
+HEAPSITE seq=18 pc=0x2f32eb calls=7 bytes=1008 live=7 livebytes=1008
+HEAPSITE seq=24 pc=0x2f32eb calls=8 bytes=1152 live=8 livebytes=1152
+HEAPSITE seq=30 pc=0x2f32eb calls=9 bytes=1296 live=8 livebytes=1152
+HEAPSITE seq=60 pc=0x2f32eb calls=12 bytes=1728 live=8 livebytes=1152
+HEAPSITE seq=108 pc=0x2f32eb calls=16 bytes=2304 live=8 livebytes=1152
+```
+
+`pc=0x2f32eb` is `epics_ca_rs::client::search::fire_searches::{closure#0}`.
+`live` reaches exactly **8**, the pinned depth, and never moves again, while
+`calls` runs on 8 → 16: the search agent keeps producing frames and `ns_try_send`
+keeps *dropping* them rather than queuing. Growth is bounded by the configured
+depth, observed on this target rather than read out of the constructor. Ceiling
+at the shipping default: **256 × 144 B = 36,864 B**, reached only while a
+configured name server is unreachable.
+
+Capping it is also most of the CA half's residue. Over 172 attempts the pinned
+image grows **+1936 B / +9 blocks**, of which 1568 B is the one-shot of Result 9
+and the remaining 8 blocks are two 184 B timer-sleep groups (Result 6's leak, in
+the far smaller dose the CA path takes); round-1 `ca-pooled` grew +3560 B / +23
+blocks over 234 attempts with the queue uncapped.
+
+## Result 9 — the 1568 B mpsc block is a one-shot
+
+Read out of the round-1 CA logs; no new image was needed. The 1568 B class holds
+exactly one block from the first sample, gains its second between seq 24 and
+seq 30, and then does not move again for the remaining 108 samples (~1080 s) of
+**either** arm:
+
+```
+ca-pooled
+HEAPSIZE seq=24 size=1568 live=1 bytes=1568 allocs=1
+HEAPSIZE seq=30 size=1568 live=2 bytes=3136 allocs=2
+HEAPSIZE seq=138 size=1568 live=2 bytes=3136 allocs=2
+ca-perattempt
+HEAPSIZE seq=24 size=1568 live=1 bytes=1568 allocs=1
+HEAPSIZE seq=30 size=1568 live=2 bytes=3136 allocs=2
+HEAPSIZE seq=138 size=1568 live=2 bytes=3136 allocs=2
+```
+
+The two blocks come from two different sites, and the `push` site's own call
+count is **1**, constant from the sample it first appears in to the end:
+
+```
+ca-pooled
+HEAPSITE seq=6 pc=0x2c9dc7 calls=1 bytes=1568 live=1 livebytes=1568
+HEAPSITE seq=30 pc=0x256c10 calls=1 bytes=1568 live=1 livebytes=1568
+HEAPSITE seq=138 pc=0x256c10 calls=1 bytes=1568 live=1 livebytes=1568
+ca-perattempt
+HEAPSITE seq=6 pc=0x2c9d57 calls=1 bytes=1568 live=1 livebytes=1568
+HEAPSITE seq=138 pc=0x256ba0 calls=1 bytes=1568 live=1 livebytes=1568
+```
+
+```
+0x2c9dc7 -> tokio::sync::mpsc::chan::channel::<epics_ca_rs::client::CoordRequest, tokio::sync::mpsc::unbounded::Semaphore>
+0x256c10 -> <tokio::sync::mpsc::list::Tx<epics_ca_rs::client::CoordRequest>>::push
+0x256ba0 -> <tokio::sync::mpsc::list::Tx<epics_ca_rs::client::CoordRequest>>::push
+```
+
+So it is a **one-shot, not a per-something**: 1568 B is tokio's `mpsc` linked
+list `Block<CoordRequest>`, one allocated when the channel is constructed and a
+second the single time the queue's head first ran past the first block's slots.
+tokio recycles blocks through its own free list, so the steady state needs
+exactly two and never claims a third — 235 further dial attempts in the
+per-attempt arm add none. Both arms cross the boundary in the same sample
+interval, which is itself evidence the dial shape has nothing to do with it.
+
+## Result 10 — the instrument: a `__thread` flag is fatal on this target
+
+Round 1 left the nesting flags as plain globals and recorded the consequence: a
+malloc on one thread counted as nested because *another* thread was inside
+`realloc`, and the per-attempt PVA image reported `in_realloc=800` with no real
+nesting anywhere. The obvious repair — `static __thread int` — was applied
+first, and the image it produced **dies before `main`**:
+
+```
+-> rtpSp "/host.host/pva-nofix-10s.vxe"
+value = -140737203437568 = 0xffff800010fb8000 = _sysTableEnd + 0xffff800010baa000
+-> 0xffff800010fc2400 (iPva-nofix-10s): RTP 0xffff800010fb8000 has been deleted due to signal 11.
+```
+
+`edrShow` on the guest names the faulting instruction and the path to it:
+
+```
+Injection Point:     rtpSigLib.c:7468
+...
+rsp        = 0x0000000000e0fda0   r14        = 0x0000000000000000
+rbp        = 0x0000000000e0fde0   r15        = 0x0000000000000000
+pc         = 0x0000000000748365   eflags     = 0x0000000000000282
+tlsbase    = 0x0000000000000000
+
+<<<<<Disassembly>>>>>
+
+*0x0000000000748365  64 48 8b 04 25 00 00 00
+                    00                      MOV            %RAX, %FS:[0xffffffff0]
+
+<<<<<Traceback>>>>>
+
+0x0000000000225b24 _start       +0x23 : __init ()
+0x0000000000200199 __init       +0x9  : 0x000000000078e4a0 ()
+0x000000000078e4d0 __wr_need_frame_add+0x40 : 0x000000000078f974 ()
+0x000000000078f978 __unw_getcontext+0x78 : _Mtx_init ()
+0x00000000007bdd5b _Mtx_init    +0x1b : mtx_init ()
+0x000000000078c61e mtx_init     +0x1e : semMCreate ()
+0x0000000000755d15 semMCreate   +0x15 : __wrap_malloc ()
+```
+
+`tlsbase` is zero: the C runtime's own startup allocates — `__init` →
+`_Mtx_init` → `semMCreate` → `malloc` — **before** the RTP's TLS base register
+is set, so an allocator wrapper that reads a `__thread` cell faults on the one
+path every image must survive. This is a property of the target, not of this
+shim: any `--wrap` allocator interposer on VxWorks 7 that touches TLS has the
+same hole.
+
+The flags are therefore keyed by `taskIdSelf()` in a 64-slot table claimed by
+CAS. The cell now means "this identified task is inside", not "somebody is", so
+the false positive is gone by construction rather than by discounting the
+number. `taskIdSelf()` is safe in that pre-TLS window and VxWorks says so
+itself — disassembled out of the image, `_taskWindTcbCurrent` branches on a
+global TLS-ready flag and only then reads `%fs`:
+
+```
+0000000000075d718 <_taskWindTcbCurrent+0x8>:
+  75d718:	83 3c 25 f4 30 df 00 	cmpl   $0x0,0xdf30f4
+  75d738:	e8 f3 10 00 00       	call   75e830 <_tlsTcbCurrentGet>
+  75d746:	e8 45 8a 00 00       	call   766190 <_taskTcbCurrentGet>
+
+000000000075e830 <_tlsTcbCurrentGet>:
+  75e834:	64 48 8b 04 25 38 00 	mov    %fs:0x38,%rax
+
+0000000000766190 <_taskTcbCurrentGet>:
+  766190:	68 7a 02 00 00       	push   $0x27a
+  766198:	0f 05                	syscall
+```
+
+It is called at all only when a `nest_occupied` gate is nonzero, which for
+essentially the whole run it is not, so the hot path stays one relaxed load.
+
+**Proven on target.** `pva-fixed-perattempt` is the dial shape that produced the
+800, run with the task-keyed shim:
+
+```
+HEAPCALL seq=80 malloc=6656318 free=6655469 calloc=189 realloc=1696 pmemalign=0 alignedalloc=0 memalign=191 in_calloc=0 in_realloc=0 nest_ovf=0
+```
+
+`in_realloc=0` on **all 80** samples of the run — against 800 in round 1 — at
+6.66 M mallocs and 180 thread creations (`HEAPSIZE size=2048 allocs` 31 → 180),
+with `nest_ovf=0`, so the 64-slot table never overflowed and no reading was
+dropped. Round 1's per-attempt arm reported its 800 at 11.4 M mallocs and ~304
+thread creations; scaled to this run's churn the old shim would have reported on
+the order of 280, and this one reports none.
+
+Two rig holes were closed with it. `build-shim-e10.sh` now records the compile
+line, which round 1 did not — the source was committed but the recipe was not,
+so the object could not be rebuilt from the repository alone — and it refuses to
+emit an object with a `.tbss` section, so the fatal build cannot be produced
+silently. The script also states the trap that hid the crash for one build:
+cargo does not track `-Clink-arg` inputs, so a rebuilt shim alone leaves every
+image "up to date" and the old object ships.
 
 ## What is therefore true
 
@@ -487,23 +820,33 @@ delta; `MEM_FREE` is `-1` (NaN) on this target as already recorded in
    architecture and libc: same site, same 144 B class, +10 blocks over the same
    span, identical in both dial shapes.
 5. **The PVA half carries a growth the CA half does not** — 184 B per ~30 s in
-   `timer_sleep::sleep_until` — which is independent of the dial shape and is
-   left open below.
+   `timer_sleep::sleep_until` — which is independent of the dial shape. Round 2
+   settled it: see 6 and 7.
+6. **That growth is a leak, wall-clock paced, ~530 KB/day.** Halving the dial
+   rate over the same wall clock left it at +6624 B against +6440 B, and the
+   `sleep_until` trough climbs +6 entries per 180 s cycle against a flat arm
+   rate. It is `epics-libcom-rs` runtime code, so it is not PVA's and not
+   VxWorks's — every `exec_backend` consumer has it.
+7. **A `Sleep` now owns its timer entry and returns it on drop, and the residue
+   is 0 B.** `BinaryHeap` → `BTreeMap<WakeKey, _>` makes an entry addressable by
+   construction; `pva-fixed-5s` reads the *same* `live_bytes` at seq 30, 138 and
+   139 across 9.0 M allocations, with no size class and no call site changed,
+   and `pva-fixed-perattempt` repeats it on the other dial arm.
+8. **The `EPICS_CA_NAMESERVER_QUEUE_DEPTH` ceiling is observed on VxWorks, not
+   inferred.** With the depth pinned to 8 the `fire_searches` site holds exactly
+   8 live blocks for 172 further attempts while its call count runs on.
+9. **The 1568 B mpsc block is a one-shot** — two tokio `Block<CoordRequest>`
+   ever, one at channel construction and one when the queue first crossed a
+   block boundary, in both dial shapes.
+10. **A `--wrap` allocator shim on this target must not touch TLS.** The C
+    runtime allocates before the RTP's TLS base register is set, so a `__thread`
+    cell in the wrapper is a `signal 11` before `main`. The nesting flags are
+    keyed by `taskIdSelf()` instead, and the false positive that motivated the
+    change is gone: `in_realloc=0` on all 80 samples of the arm that reported
+    800.
 
 ## Not measured / open
 
-* **The `EPICS_CA_NAMESERVER_QUEUE_DEPTH` ceiling was not re-proven here.** On
-  RTEMS it was proven by pinning the depth to 8 and watching growth stop dead
-  at +8 blocks. This run reproduced the site and the growth but ran no
-  depth-pinned VxWorks image, so on this target the ceiling is inferred from
-  the shared source, not observed.
-* **The PVA `timer_sleep` growth (Result 5) has no measured bound.** Nothing in
-  this run distinguishes wall-clock pacing from attempt pacing, and no ceiling
-  was reached in ~25 minutes. Whether it is a bounded warm-up like the CA
-  channel or an unbounded retention is unanswered.
-* **The 1568 B `tokio::sync::mpsc::list::Tx<CoordRequest>::push` block** in the
-  CA images (+1 over the window, both arms) was not chased further; it is one
-  block per run, identical in both shapes.
 * **`MEM_USED` gives no independent cross-check.** On RTEMS the wrapper's number
   was confirmed against `mem_usage()` to within one heap block. Here
   `current_commit` is page-granular and never moved, so the wrapper's number
@@ -520,23 +863,40 @@ delta; `MEM_FREE` is `-1` (NaN) on this target as already recorded in
   than a timing-sensitive slope, so load cannot move the byte counts, but the
   attempt *cadence* between runs differs by one attempt (284/284/285/286 over
   the same 1500 s).
-* **The `in_realloc` false positive is characterised, not eliminated.** Making
-  the flag thread-local would remove it; it was left alone because the exact
-  `alloc − free − realloc == live_blocks` identity already proves no
-  double-insert occurred.
+* **Round 1's `heapresidue.o` cannot be reproduced.** Its compile line was not
+  recorded and the object was overwritten in round 2. The source is committed
+  and unchanged for those four runs, and `build-shim-e10.sh` now records the
+  recipe, but the exact round-1 object is gone.
+* **The +6-entries-per-cycle residue of Result 6 was closed, not explained to
+  the last entry.** The arm rate is flat and the trough rises, which is enough
+  to call it retention and enough to fix it at source; which 6 of each cycle's
+  ~426 arms outlived their deadline was not identified, and after Result 7 there
+  is nothing left to identify it in.
+* **Nothing here measures a `tokio_backend` host.** `timer_sleep` is reached
+  only under `exec_backend` (`target_os` rtems/vxworks, or the
+  `rtems-exec-model` feature), so the leak of Result 6 and its fix are
+  embedded-target facts; the host tests exercise the same code through that
+  feature, not through a target boot.
 
 ## Artefacts
 
-Console logs of all four boots, gzipped, in `doc/vxworks-e10-rig/evidence/`:
-`console-ca-pooled.log.gz` (790,974 B raw), `console-ca-perattempt.log.gz`
-(949,875 B), `console-pva-pooled.log.gz` (705,073 B),
-`console-pva-perattempt.log.gz` (865,704 B). Every number in this document was
-read from these files with `doc/vxworks-e10-rig/analyse-e10.py`.
+Console logs of all eight boots, gzipped, in `doc/vxworks-e10-rig/evidence/`.
+Round 1: `console-ca-pooled.log.gz` (790,974 B raw),
+`console-ca-perattempt.log.gz` (949,875 B), `console-pva-pooled.log.gz`
+(705,073 B), `console-pva-perattempt.log.gz` (865,704 B). Round 2:
+`console-pva-nofix-10s.log.gz` (706,678 B), `console-pva-fixed-5s.log.gz`
+(703,886 B), `console-pva-fixed-perattempt.log.gz` (496,365 B),
+`console-ca-nsdepth8.log.gz` (623,444 B), and `console-tls-crash.log.gz`
+(2,168 B — the `__thread` image's whole life, boot to `edrShow`). Every number
+in this document was read from these files with
+`doc/vxworks-e10-rig/analyse-e10.py`.
 
 Rig sources in `doc/vxworks-e10-rig/` — the box is not backed up:
-`heapresidue.c` (the shim), `build-e10.sh` (the `--wrap` link and the two libc
-`--config` lines), `boot-e10.sh` / `stop-e10.sh` (own-pid-only rig discipline),
+`heapresidue.c` (the shim), `build-shim-e10.sh` (its compile line and the
+`.tbss` refusal), `build-e10.sh` (the `--wrap` link and the two libc `--config`
+lines), `boot-e10.sh` / `stop-e10.sh` (own-pid-only rig discipline),
 `ftpd-e10.py` (rig ftpd on 2131 / passive 60010-60015), `apply-e10.py` (the
-anchored source mutations, `probe` / `perattempt` / `revert`), `analyse-e10.py`,
-`env.sh`. The mutations themselves are also carried as a flat patch in
-`doc/vxworks-e10-dial-residue-probe.patch`.
+anchored source mutations, `probe` / `perattempt` / `revert`),
+`pin-nsdepth.py` (Result 8's compiled-in depth), `set-reconnect.py` (Result 6's
+cadence), `analyse-e10.py`, `env.sh`. The round-1 mutations are also carried as
+a flat patch in `doc/vxworks-e10-dial-residue-probe.patch`.

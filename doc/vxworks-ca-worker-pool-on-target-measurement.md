@@ -665,6 +665,8 @@ not backed up. Ports are the E8 block: host `31534`/`35064`/`35075`, ftpd
 | `doc/vx-rig-e8/stop-e8.sh` | kills by recorded pid after re-reading `/proc/<pid>/comm` |
 | `doc/vx-rig-e8/poolramp.py` | plateau driver: 1,2,4,8,16,24,32,40 held, 75 s dwell each, D1+D2 |
 | `doc/vx-rig-e8/wallprobe2.py` | straight ramp to the wall, own deadline, logs its own progress |
+| `doc/vx-rig-e8/phaseramp.py` | as `wallprobe2`, but logs **every** connection and splits the handshake into `connect`/`search`/`create`/`read` — the split that root-caused §11. Runs its ramp at module level, so it cannot be imported |
+| `doc/vx-rig-e8/retention.py` | idle / burst / after-everyone-left, sampling on fresh connections each time — §12. Self-contained because `phaseramp` cannot be imported |
 | `doc/vx-rig-e8/wallprobe.py` | first-cut ramp (logs failures only) — kept because §6.1's reuse run used it |
 
 ```sh
@@ -685,6 +687,16 @@ python3 -u poolramp.py 75 120 > poolramp-drive.log 2>&1
 # 4b. straight ramp to the wall (section 4.2).  Arguments:
 #     ceiling, hold seconds, tag, internal deadline seconds.
 python3 -u wallprobe2.py 200 90 mem2048 600 > wallprobe2-mem2048.log 2>&1
+
+# 4c. ramp to the wall logging EVERY connection with the handshake split into
+#     phases (sections 10, 11).  Same four arguments as wallprobe2.
+python3 -u phaseramp.py 200 90 medium1024 300 > phaseramp-medium1024.log 2>&1
+
+# 4d. retention: idle / burst / after-everyone-left, on fresh connections each
+#     time (section 12).  Arguments: burst, settle seconds, tag, hold seconds.
+#     The hold is load-bearing -- a burst faster than the status-PV scan is
+#     sampled through pre-burst values and the retention figure comes out zero.
+python3 -u retention.py 40 75 retA2 90 > retention-retA2.log 2>&1
 
 # 5. stop -- by recorded pid only
 ./stop-e8.sh

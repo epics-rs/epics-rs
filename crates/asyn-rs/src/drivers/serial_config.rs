@@ -1,8 +1,11 @@
 //! Platform-independent serial line configuration.
 //!
-//! Shared by the POSIX termios backend ([`super::serial_port`], unix) and the
-//! Win32 DCB backend ([`super::serial_port`] on Windows, from
-//! `serial_port_win32.rs`). C asyn keeps the two device backends
+//! Shared by the POSIX termios backend (`serial_port.rs`, unix) and the
+//! Win32 DCB backend (`serial_port_win32.rs`, Windows). Named in prose rather
+//! than linked: neither module exists on RTEMS or VxWorks (see
+//! `drivers/mod.rs`), where an intra-doc link to it would dangle. This module
+//! itself is platform-independent and builds everywhere. C asyn keeps the two
+//! device backends
 //! (`drvAsynSerialPort.c` / `drvAsynSerialPortWin32.c`) as separate files that
 //! share only the spec grammar and option names; this module is the single
 //! source of that shared grammar so the two Rust backends cannot drift.

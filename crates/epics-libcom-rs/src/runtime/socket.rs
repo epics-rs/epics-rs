@@ -388,11 +388,26 @@ mod sys {
         Ok(unsafe { TcpListener::from_raw_fd(owned.into_raw()) })
     }
 
+    // This module's target set is exactly {rtems, vxworks} — that is what
+    // `epics_embedded_target` means. Both `connect_fd` and `set_nonblocking`
+    // below are written as that closed pair rather than as a
+    // `vxworks`/`everything else` split, so adding a third embedded triple
+    // fails to compile *here*, at the decision, instead of silently taking
+    // whichever arm happened to be the fallback.
+    #[cfg(not(any(target_os = "rtems", target_os = "vxworks")))]
+    compile_error!(
+        "epics_embedded_target gained a triple beyond rtems/vxworks: choose \
+         its connect_fd and set_nonblocking arms explicitly"
+    );
+
     /// Put `fd` into non-blocking mode.
     ///
     /// C `drvAsynIPPort.c::setNonBlock` (`:176-199`) branches exactly here:
     /// VxWorks uses `ioctl(fd, FIONBIO, &flags)` — note it passes the address
-    /// of the flag, not the flag — and everything else uses `fcntl`.
+    /// of the flag, not the flag itself — where a POSIX target uses `fcntl`.
+    /// Only the VxWorks arm exists: RTEMS takes the blocking `connect_fd`
+    /// below and never needs the socket switched, so an `fcntl` arm here
+    /// would be dead on every triple this module compiles for.
     #[cfg(target_os = "vxworks")]
     fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
         let mut flags: libc::c_int = i32::from(on);
@@ -400,25 +415,6 @@ mod sys {
         // pointer, which `flags` provides for the duration of the call.
         let rc = unsafe { libc::ioctl(fd, libc::FIONBIO, &mut flags as *mut libc::c_int) };
         if rc < 0 {
-            return Err(last_error());
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "vxworks"))]
-    fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
-        // SAFETY: `fd` is a valid descriptor; F_GETFL takes no further argument.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-        if flags < 0 {
-            return Err(last_error());
-        }
-        let next = if on {
-            flags | libc::O_NONBLOCK
-        } else {
-            flags & !libc::O_NONBLOCK
-        };
-        // SAFETY: `fd` is valid and `next` is a flag word derived from F_GETFL.
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, next) } < 0 {
             return Err(last_error());
         }
         Ok(())
@@ -471,7 +467,7 @@ mod sys {
     /// because its VxWorks headers lack `poll`; the Rust `libc` binding for the
     /// triple exposes `poll` directly, so the fake is unnecessary and the
     /// observable behaviour is the same.
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(target_os = "vxworks")]
     fn connect_fd(owned: &OwnedFd, remote: SocketAddr, timeout: Duration) -> io::Result<()> {
         let sin = sockaddr_in(remote)?;
         set_nonblocking(owned.0, true)?;

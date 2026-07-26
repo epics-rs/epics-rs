@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.25.1 — 2026-07-26
+
+Patch release. VxWorks 7 (`x86_64-wrs-vxworks`) joins RTEMS 6 as a supported
+embedded target, reached by generalizing the RTEMS cfg into a capability cfg
+rather than by adding a second OS special case. Both embedded targets now take
+their `libc` fixes from one pinned public fork branch, which is what lets the
+VxWorks closure be type-checked in CI instead of only on the bring-up box.
+Also: a mandatory IOC thread that cannot start is now process-fatal instead of
+silently absent, and the `release-embedded` profile plus
+`scripts/embedded-image.sh` give both targets a deployable-image entry point.
+Additive API only; no breaking changes. Workspace version 0.25.0 -> 0.25.1.
+
+### VxWorks 7 (x86_64-wrs-vxworks)
+
+- **`epics_embedded_target` replaces `target_os = "rtems"` as the porting
+  cfg.** Every arm that meant "this target has no reactor, no ambient OS
+  services, one address family" now keys on the capability rather than the OS
+  name, in `epics-libcom-rs`, `epics-base-rs`, `epics-ca-rs`, `epics-pva-rs`
+  and `epics-bridge-rs`; the arms that are genuinely RTEMS-specific (the boot
+  shim, the BSP link contract) deliberately stay on `target_os`. Adding the
+  second embedded target touched cfg predicates, not protocol code.
+
+- **The statistics funnel becomes a per-OS backend selection.**
+  `epics-rtems-boot` owns it for both targets: `MemUsage` fields are
+  individually optional, so a target reports only what its OS can answer, and a
+  VxWorks backend binds `taskIdSelf`, `taskInfoGet`, `rtpIoTableSizeGet` and
+  mimalloc's `current_commit` for the task, stack, fd and memory census. The fd
+  walk is bounded by `rtpIoTableSizeGet` (a `size_t` return, per `ioLib.h:533`)
+  rather than `sysconf`. The console census moved into the same funnel, so
+  `epics-ca-rs` and `epics-bridge-rs` print one format on both targets.
+
+- **`scripts/vxworks-check.sh`**, the portability gate: a binary census plus
+  every target row, on the same bidirectional-census discipline as
+  `rtems-check.sh`. VxWorks also gets its own SCHED_FIFO priority mapping in
+  `epics-libcom-rs`'s task layer and its own entropy source for the PVA server
+  GUID.
+
+- **One libc fork branch for both embedded targets.** The workspace pin moves
+  to `physwkim/libc` branch `epics-rs-0.2`, which now carries the VxWorks
+  `pread`/`pwrite`/`killpg`/`getentropy` shims alongside the RTEMS
+  sockaddr/type-width fixes. A manifest `[patch.crates-io]` never reaches
+  `-Zbuild-std`, which resolves std against rust-src's own
+  `library/Cargo.lock`, so the new `scripts/libc-std-patch.sh` derives a
+  config-level patch from that same pin — a clone of the pinned rev relabelled
+  to the libc version the toolchain's lock demands, emitted as an alias entry
+  so the workspace graph keeps the committed resolution while the std graph
+  takes the relabelled copy. `vxworks-check.sh` and `scripts/embedded-image.sh`
+  both call it, leaving the manifest line the single source of truth for what
+  libc is compiled.
+
+- **The VxWorks closure is now type-checked in CI.** With the patched libc
+  public, the `vxworks-census` job installs the same stock `nightly` +
+  `rust-src` as `rtems-closure` and runs the whole gate rather than the census
+  alone. Linking stays on the bring-up box, because a `.vxe` needs the
+  proprietary Wind River SDK — a gap now stated as a fact rather than left as
+  an absent gate.
+
+- `doc/vxworks-port.md` documents the target and toolchain contract, the cfg
+  architecture, the priority model, and what was measured on target: 11/11 gate
+  rows, CA and PVA round-trips over the wire, the census blocks verbatim, and
+  (§5.5) a five-row strip/LTO size matrix for both targets and both binaries.
+
+### Runtime and asyn
+
+- **A mandatory IOC thread whose spawn fails is now process-fatal.** Such a
+  thread resolved its own spawn `Result` with `.expect(..)`, and on a
+  `panic = "unwind"` target that kills only the calling thread — measured on a
+  VxWorks RTP, an `EAGAIN` from the periodic-scan spawn left the process
+  answering CA with zero periodic scanning. `MandatoryThread` makes the failure
+  process-fatal, matching C, where a rate that was never created wedges
+  `iocInit`; the areaDetector plugin data threads route through it.
+
+- **`asyn-rs` port creation is fallible.** `create_port_runtime` ended in
+  `.expect(..)` too, so a `*Configure` line whose port thread failed to start
+  unwound iocsh while later st.cmd lines ran against a port that did not exist.
+  A port whose runtime thread cannot start is now never registered, matching
+  `registerDriver`'s unwind-before-`ellAdd` order in C.
+
+### Embedded images
+
+- **`release-embedded` profile and `scripts/embedded-image.sh`.** Cargo has no
+  target-conditional profile, so the "what do we ship" default lives at the
+  entry point: `./scripts/embedded-image.sh <rtems|vxworks> <ca|pva>` builds on
+  a profile inheriting `release` with `strip = "symbols"`, `lto = "fat"`,
+  `codegen-units = 1`. Measured against the dev images the gates build: RTEMS
+  CA 122,884,636 B -> 4,604,848 B, VxWorks CA 116,768,688 B -> 4,287,696 B,
+  both boot-verified and round-tripped. A plain `cargo build --release` is
+  unchanged.
+
+- **The target IOC binaries are renamed `realtime-ca-ioc` and
+  `realtime-pva-ioc`** (were `rtems-ca-ioc` / `rtems-pva-ioc`), since they now
+  serve two embedded targets.
+
+### Fixes
+
+- `epics-pva-rs`: `SO_SNDTIMEO` is best-effort on the blocking accept path.
+  VxWorks returns `ENOPROTOOPT`, which was fatal and closed every accepted
+  connection.
+- `epics-ca-rs`, `epics-pva-rs`: a failing `peer_addr()` is logged before the
+  accepted connection is dropped.
+
 ## v0.25.0 — 2026-07-24
 
 Minor release. RTEMS 6 goes from "type-checks" to a verified embedded target —

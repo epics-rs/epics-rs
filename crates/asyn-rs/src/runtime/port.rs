@@ -525,7 +525,12 @@ mod tests {
     ///
     /// Root is not subject to `RLIMIT_NPROC` (`CAP_SYS_RESOURCE`), so the
     /// parent says why it is not asserting rather than passing vacuously.
-    #[cfg(all(unix, not(target_os = "rtems"), not(target_os = "vxworks")))]
+    ///
+    /// Linux-only: `RLIMIT_NPROC` counts threads (`clone`) against the limit
+    /// only there. On macOS/BSD it limits `fork` alone — `pthread_create`
+    /// succeeds regardless, so the refusal cannot be provoked (measured: both
+    /// macOS CI runners fail the child's "registration must fail" assertion).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_port_whose_thread_cannot_be_created_is_not_registered() {
         const CHILD: &str = "EPICS_RS_PORT_THREAD_EAGAIN_CHILD";

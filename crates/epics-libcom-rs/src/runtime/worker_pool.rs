@@ -338,6 +338,90 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
     free_if_idle(inner, set, freed);
 }
 
+/// Why [`WorkerPool::acquire`] refused.
+///
+/// # The defect this closes
+///
+/// `acquire` refuses at two gates that mean opposite things to whoever has to
+/// act on the refusal:
+///
+/// * [`AtCapacity`](Self::AtCapacity) — *this process* said no. Every set the
+///   pool may create is already leased. The remedy is to raise the bound (or to
+///   accept the bound as the connection limit it is); the target is fine.
+/// * [`SpawnFailed`](Self::SpawnFailed) — *the target* said no. The OS refused
+///   to create the set's threads. The remedy is memory, and the pool's own
+///   bound is irrelevant because it was never reached.
+///
+/// Both used to be an `io::Error`, and both landed on `io::ErrorKind::WouldBlock`
+/// — the capacity arm by construction, the spawn arm because a failed
+/// `Builder::spawn` is `EAGAIN` and `std` decodes `EAGAIN` as `WouldBlock`. So
+/// the one discriminator a consumer had was the message *prose*, and every
+/// consumer that branched on `kind()` silently answered the wrong question.
+/// Both server drivers did: the CA server reported both as one status on the
+/// wire, and the PVA server reported an out-of-threads target as
+/// `max_connections reached` (measured on VxWorks 7,
+/// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §4).
+///
+/// Naming the gate in the type is what makes that class of mistake unwritable:
+/// a consumer that wants "is this the connection limit" must now say so, and
+/// gets an answer that cannot be an `EAGAIN` in disguise.
+///
+/// The [`From`] conversion to `io::Error` keeps each variant's historical
+/// `ErrorKind` for callers that only propagate, and carries `self` as the
+/// error's payload so the gate survives the conversion and stays recoverable
+/// with `downcast_ref`.
+#[derive(Debug)]
+pub enum AcquireError {
+    /// Every set the pool may ever create is leased out. `capacity` is the
+    /// bound that was reached — the number to report and the number to raise.
+    AtCapacity {
+        /// The pool's declared capacity, in sets.
+        capacity: usize,
+    },
+    /// The OS refused to create the set's threads. The pool was below its
+    /// capacity and `created` is left exactly as it was found.
+    SpawnFailed(io::Error),
+    /// The pool is shutting down and will not lease again.
+    ShuttingDown,
+}
+
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The leading words are load-bearing: they are what the on-target
+            // consoles and `doc/vxworks-ca-worker-pool-on-target-measurement.md`
+            // already carry, so an operator's existing grep keeps working.
+            AcquireError::AtCapacity { capacity } => {
+                write!(f, "worker pool at capacity ({capacity} sets)")
+            }
+            AcquireError::SpawnFailed(e) => write!(f, "cannot create a worker set: {e}"),
+            AcquireError::ShuttingDown => write!(f, "worker pool is shutting down"),
+        }
+    }
+}
+
+impl std::error::Error for AcquireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AcquireError::SpawnFailed(e) => Some(e),
+            AcquireError::AtCapacity { .. } | AcquireError::ShuttingDown => None,
+        }
+    }
+}
+
+impl From<AcquireError> for io::Error {
+    fn from(cause: AcquireError) -> io::Error {
+        let kind = match &cause {
+            AcquireError::AtCapacity { .. } => io::ErrorKind::WouldBlock,
+            // The OS's own kind, so a propagating caller sees what the target
+            // actually said rather than a re-labelling of it.
+            AcquireError::SpawnFailed(e) => e.kind(),
+            AcquireError::ShuttingDown => io::ErrorKind::BrokenPipe,
+        };
+        io::Error::new(kind, cause)
+    }
+}
+
 /// A bounded, per-role set of persistent threads that connections borrow.
 ///
 /// `N` is the set size — three for the PVA server (`conn`, `reader`, `writer`),
@@ -377,15 +461,16 @@ impl<const N: usize> WorkerPool<N> {
     ///
     /// * an idle set exists → reuse it (no thread created);
     /// * none, and `created < capacity` → grow by one set (`N` threads);
-    /// * none, and at capacity → [`io::ErrorKind::WouldBlock`] — the `EAGAIN`
-    ///   the operator reads as "this server is full";
-    /// * a thread could not be created → that `io::Error`, with `created`
-    ///   left exactly as it was found.
+    /// * none, and at capacity → [`AcquireError::AtCapacity`] carrying the
+    ///   bound that was reached;
+    /// * a thread could not be created → [`AcquireError::SpawnFailed`], with
+    ///   `created` left exactly as it was found.
     ///
-    /// The two errors are kept distinct because they mean different things:
-    /// `WouldBlock` is a full server, any other is a target out of thread
-    /// resources.
-    pub fn acquire(&self) -> io::Result<(SetLease, [Worker; N])> {
+    /// The refusals are a sum type and not an `io::Error` because they mean
+    /// opposite things — a full process versus a target out of thread resources
+    /// — and as `io::Error` they were indistinguishable: both are
+    /// `ErrorKind::WouldBlock`. See [`AcquireError`].
+    pub fn acquire(&self) -> Result<(SetLease, [Worker; N]), AcquireError> {
         // Decide under the pool lock, spawn without it: a reserved-then-spawn
         // step keeps `created` an exact bound without holding the lock across a
         // thread creation.
@@ -397,10 +482,7 @@ impl<const N: usize> WorkerPool<N> {
         let decision = {
             let mut reg = self.inner.lock();
             if reg.stopping {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "worker pool is shutting down",
-                ));
+                return Err(AcquireError::ShuttingDown);
             }
             if let Some(set) = reg.idle.pop_front() {
                 Decision::Reuse(set)
@@ -415,10 +497,9 @@ impl<const N: usize> WorkerPool<N> {
 
         let set = match decision {
             Decision::Full => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "worker pool at capacity",
-                ));
+                return Err(AcquireError::AtCapacity {
+                    capacity: self.inner.capacity,
+                });
             }
             Decision::Reuse(set) => set,
             Decision::Grow(index) => match self.spawn_set(index) {
@@ -432,7 +513,7 @@ impl<const N: usize> WorkerPool<N> {
                     // The reservation is given back so a later attempt may grow
                     // again; nothing else changed.
                     self.inner.lock().created -= 1;
-                    return Err(e);
+                    return Err(AcquireError::SpawnFailed(e));
                 }
             },
         };
@@ -674,22 +755,82 @@ mod tests {
         assert_eq!(pool.worker_count(), 2);
     }
 
-    /// At capacity, `acquire` refuses with `WouldBlock` and creates no thread.
+    /// At capacity, `acquire` refuses by naming the bound and creates no thread.
     #[test]
     fn acquire_refuses_at_capacity_without_creating_a_thread() {
         let pool: WorkerPool<2> = WorkerPool::new("test-cap", roster2(), 1);
         let (lease, _workers) = pool.acquire().expect("first borrow");
         let before = pool.worker_count();
-        let refused = pool.acquire();
-        assert_eq!(
-            refused.err().map(|e| e.kind()),
-            Some(io::ErrorKind::WouldBlock),
-            "a full pool must refuse with EAGAIN, not queue or grow"
+        let refused = pool.acquire().err();
+        assert!(
+            matches!(refused, Some(AcquireError::AtCapacity { capacity: 1 })),
+            "a full pool must refuse by naming the bound it reached, not queue \
+             or grow: {refused:?}"
         );
         assert_eq!(
             pool.worker_count(),
             before,
             "a refusal must create no thread"
+        );
+        drop(lease);
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a refusal name which gate refused. MUST NOT: "this process is
+    /// full" and "this target is out of threads" be the same value.
+    ///
+    /// They were, and the collapse is `std`'s, not ours: a failed
+    /// `Builder::spawn` is `EAGAIN`, `std` decodes `EAGAIN` as
+    /// `ErrorKind::WouldBlock`, and the capacity refusal was constructed as
+    /// `WouldBlock` too. So a consumer branching on `kind()` — as the PVA
+    /// accept path did — could not tell a full server from a target that had
+    /// run out of thread resources, and reported the second as the first.
+    ///
+    /// The first assertion is the collapse itself, asserted rather than
+    /// described, so this test still states *why* the type exists if `std` ever
+    /// changes that mapping.
+    #[test]
+    fn a_full_pool_and_a_refused_spawn_are_not_the_same_refusal() {
+        let eagain = io::Error::from_raw_os_error(11);
+        assert_eq!(
+            eagain.kind(),
+            io::ErrorKind::WouldBlock,
+            "EAGAIN decodes as WouldBlock — the collapse this type exists to \
+             undo. If this ever stops holding, say so here rather than in a \
+             comment."
+        );
+
+        let pool: WorkerPool<2> = WorkerPool::new("test-gate", roster2(), 1);
+        let (lease, _workers) = pool.acquire().expect("first borrow");
+        let full = pool.acquire().err().expect("the pool is full");
+        let spawn_failed = AcquireError::SpawnFailed(io::Error::from_raw_os_error(11));
+
+        assert!(
+            matches!(full, AcquireError::AtCapacity { .. }),
+            "a full pool is a capacity refusal: {full:?}"
+        );
+        assert!(
+            !matches!(spawn_failed, AcquireError::AtCapacity { .. }),
+            "a refused spawn must never present as the capacity gate: it is \
+             the difference between 'raise the bound' and 'add memory'"
+        );
+        // …and the distinction survives the lossy conversion, so even a caller
+        // that only ever sees `io::Error` can recover the gate.
+        let as_io: io::Error = full.into();
+        assert_eq!(
+            as_io.kind(),
+            io::ErrorKind::WouldBlock,
+            "the historical kind is preserved for callers that only propagate"
+        );
+        assert!(
+            matches!(
+                as_io
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<AcquireError>()),
+                Some(AcquireError::AtCapacity { capacity: 1 })
+            ),
+            "the gate must survive the io::Error conversion: {as_io:?}"
         );
         drop(lease);
     }

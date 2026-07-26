@@ -140,7 +140,7 @@ use epics_base_rs::runtime::blocking_io;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
+use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
 
@@ -472,11 +472,12 @@ impl BlockingCaServer {
                     //
                     // This is also the only fallible step left before the client
                     // is served, which is what makes it the only place a refusal
-                    // is owed. `WouldBlock` is "this process is full" (§5) and
-                    // any other error is "this target is out of thread
-                    // resources"; both mean this client cannot be served, so
-                    // both go to the one refusal owner, whose console line
-                    // carries the cause verbatim to tell them apart.
+                    // is owed. `AcquireError::AtCapacity` is "this process is
+                    // full" (§5) and `SpawnFailed` is "this target is out of
+                    // thread resources"; both mean this client cannot be served,
+                    // so both go to the one refusal owner, which names the gate
+                    // it was handed rather than re-deriving it from an error
+                    // message.
                     //
                     // Note the socket is still held here, un-moved, precisely so
                     // there is something to refuse *with*: a refusal after
@@ -596,6 +597,32 @@ impl BlockingCaServer {
 /// refusals, and an operator never has to know a schedule to read one.
 static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The words one refusal is reported with, on the wire and on the console.
+///
+/// Built from the gate, not from an error's `Display`, so the two refusals
+/// cannot converge on the same text as the process ages or as `std`'s errno
+/// mapping changes. Each arm names the remedy, because that is the whole reason
+/// an operator needs the two told apart:
+///
+/// * at capacity → the bound, which is the number to raise;
+/// * spawn failed → what the target said, which is a memory problem and has
+///   nothing to do with the bound (it was never reached).
+///
+/// `worker pool at capacity` is kept verbatim from the pre-fix wording: it is
+/// the string in the on-target consoles and in
+/// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §4.2, so an operator's
+/// existing grep still finds a refusal.
+fn refusal_reason(cause: &AcquireError) -> String {
+    let gate = match cause {
+        AcquireError::AtCapacity { capacity } => {
+            format!("worker pool at capacity: {capacity} concurrent clients")
+        }
+        AcquireError::SpawnFailed(e) => format!("cannot create a client thread: {e}"),
+        AcquireError::ShuttingDown => "the server is shutting down".to_string(),
+    };
+    format!("CAS: no resources for a new client ({gate})")
+}
+
 /// Refuse an accepted client that the server has no resources to serve:
 /// tell the peer, tell the operator, then close.
 ///
@@ -622,6 +649,12 @@ static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// and on failure calls `epicsSocketDestroy(sock)` **plus**
 /// `epicsPrintf("CAS: no space in pool for a new client ...")`. The message is
 /// the part that matters — `epicsPrintf` reaches the console unconditionally.
+/// C also names *which* check refused, in the message and nowhere else: its two
+/// `create_client` refusals differ only by `(below max block thresh)` versus
+/// `(alloc failed)`, and its third (`caservertask.c:117`) is a distinct string
+/// again. So "the gate is named in the text" is C's answer too; what is ours
+/// alone is that the text is now generated from the gate rather than from an
+/// error's prose.
 ///
 /// Two deliberate differences:
 ///
@@ -638,9 +671,35 @@ static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 ///   (`cac::executeResponse`, `cac.cpp:1208-1220`) — there is no
 ///   version-verified gate — so this is legible from either site, including
 ///   the accept-loop one where the circuit never got its VERSION reply.
-fn refuse_client(peer: SocketAddr, cause: &std::io::Error, send: impl FnOnce(&[u8])) {
+///
+/// # Why both gates send `ECA_ALLOCMEM`, and why that is not a choice
+///
+/// The two admission gates mean different things and need different remedies
+/// ([`AcquireError`]), but the status *field* cannot carry which one it was.
+/// The constraint is libca's, not ours: `ca_client_context::vSignal`
+/// (`ca_client_context.cpp:405-413`) ends every default-handler exception with
+///
+/// ```text
+/// if (!(ca_status & CA_M_SUCCESS) &&
+///     CA_EXTRACT_SEVERITY(ca_status) != CA_K_WARNING) { errlogFlush(); abort(); }
+/// ```
+///
+/// so any status whose severity is not `CA_K_WARNING` **aborts a client that
+/// has not installed its own exception handler** — which is every `caget`,
+/// `camonitor` and IOC client by default. `ECA_MAXIOC` ("Maximum simultaneous
+/// IOC connections exceeded", `caerr.h:86`) is the one code that says exactly
+/// what the capacity gate means, and it is `CA_K_ERROR`; sending it would turn
+/// a refusal into a client crash. No `CA_K_WARNING` code means "server full",
+/// so `ECA_ALLOCMEM` (`CA_K_WARNING`, and true of both gates in the sense that
+/// a resource ran out) stays for both.
+///
+/// What carries the gate is the diagnostic string, and it reaches the client:
+/// `defaultExcep` passes it as the exception's `Context:` line
+/// (`cac.cpp:1013-1016`, `%.400s`). So the distinction is on the wire, in the
+/// only field that can hold it — see [`refusal_reason`].
+fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8])) {
     let nth = REFUSED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let reason = format!("CAS: no resources for a new client ({cause})");
+    let reason = refusal_reason(cause);
 
     // Tell the peer. The echoed header is a synthetic CA_PROTO_VERSION: the
     // client has sent nothing we are answering, and `defaultExcep` is what
@@ -1464,10 +1523,10 @@ mod tests {
 
         refuse_client(
             peer,
-            &std::io::Error::new(
+            &AcquireError::SpawnFailed(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "cannot allocate the client thread stack",
-            ),
+            )),
             |frame| {
                 use std::io::Write;
                 let _ = server.write_all(frame);
@@ -1509,6 +1568,75 @@ mod tests {
         assert!(
             text.contains("no resources for a new client"),
             "the diagnostic string must reach the client: {text:?}"
+        );
+    }
+
+    /// The diagnostic string of a refusal frame, as a client reads it.
+    ///
+    /// Skips the response header and the echoed request header; what remains is
+    /// the NUL-padded message libca hands to its exception handler as the
+    /// `Context:` line.
+    fn refusal_frame_text(cause: &AcquireError) -> String {
+        let mut frame = Vec::new();
+        refuse_client(
+            "127.0.0.1:5064".parse().expect("literal peer address"),
+            cause,
+            |bytes| frame = bytes.to_vec(),
+        );
+        assert_eq!(
+            u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+            crate::protocol::ECA_ALLOCMEM,
+            "the status must stay ECA_ALLOCMEM for both gates: it is the only \
+             CA_K_WARNING code for an exhausted resource, and a non-warning \
+             severity aborts a default-handler libca client \
+             (ca_client_context.cpp:405-413)"
+        );
+        String::from_utf8_lossy(&frame[2 * CaHeader::SIZE..])
+            .trim_end_matches('\0')
+            .to_string()
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a refusal say which admission gate refused, and say it in the one
+    /// wire field that can carry it. MUST NOT: the capacity gate and the
+    /// thread-spawn gate produce the same refusal text.
+    ///
+    /// The two need opposite remedies — raise the bound versus give the target
+    /// memory — and on VxWorks 7 both walls were reached on the same image,
+    /// 47 concurrent with `EAGAIN` on one guest and 141 with the pool's own
+    /// capacity on the other, with `available=48` on both
+    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §4.3). The status
+    /// code cannot separate them (see [`refuse_client`]), so the diagnostic
+    /// must, and it must carry the *bound* — a capacity refusal that does not
+    /// say what the capacity is tells an operator nothing they can act on.
+    #[test]
+    fn each_admission_gate_names_itself_and_its_remedy_in_the_refusal() {
+        let at_capacity = refusal_frame_text(&AcquireError::AtCapacity {
+            capacity: CAS_CLIENT_POOL_CAPACITY,
+        });
+        let spawn_failed = refusal_frame_text(&AcquireError::SpawnFailed(
+            std::io::Error::from_raw_os_error(11),
+        ));
+
+        assert_ne!(
+            at_capacity, spawn_failed,
+            "the two gates must not read the same on the wire"
+        );
+        assert!(
+            at_capacity.contains(&CAS_CLIENT_POOL_CAPACITY.to_string()),
+            "a capacity refusal must name the bound it hit — that number is the \
+             remedy: {at_capacity:?}"
+        );
+        assert!(
+            !spawn_failed.contains(&CAS_CLIENT_POOL_CAPACITY.to_string()),
+            "a target that refused a thread has nothing to do with the pool's \
+             bound, which was never reached: {spawn_failed:?}"
+        );
+        assert!(
+            spawn_failed.contains("client thread"),
+            "a spawn refusal must say the target refused a thread, not imply a \
+             configured limit: {spawn_failed:?}"
         );
     }
 
@@ -1581,7 +1709,9 @@ mod tests {
             for _ in 0..REFUSALS {
                 refuse_client(
                     peer,
-                    &std::io::Error::new(std::io::ErrorKind::WouldBlock, "worker pool at capacity"),
+                    &AcquireError::AtCapacity {
+                        capacity: CAS_CLIENT_POOL_CAPACITY,
+                    },
                     // The peer leg is not under test here; refusing with a
                     // discarded frame keeps this off the network entirely.
                     |_frame| {},

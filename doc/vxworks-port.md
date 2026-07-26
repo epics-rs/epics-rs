@@ -725,18 +725,26 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   `asynDriver/epicsInterruptibleSyscall.c:31` includes `ioLib.h` under
   `#ifdef vxWorks`. Closing that gap is separate work and is not attempted
   here; until then this fix is proven on the host only.
-* **The CA name-service connection has no liveness rule — open, measured.**
-  `run_nameserver_connection` sends `CA_PROTO_ECHO` on a hardcoded 60 s tick and
-  never checks that it was answered, so an `EPICS_CA_NAME_SERVERS` peer that
-  accepts, keeps reading and never replies is held indefinitely: ten consecutive
-  censuses on the same local port over ≈600 s, one accept, dial-pool
-  `attempts=1`, against the data circuit's 35 s bound
-  (`EPICS_CA_CONN_TMO` + `ECHO_TIMEOUT_SECS`). The link-cut A/B cannot reach
-  this because a cut always ends in TCP giving up — which is also what retired
-  the name-service socket 30 s after the data circuit in that run. C has no such
-  asymmetry: `cac::setSearchDestinations` builds a name server through
+* **The CA name-service connection had no liveness rule — closed, measured
+  both ways.** `run_nameserver_connection` sent `CA_PROTO_ECHO` on a hardcoded
+  60 s tick and never checked that it was answered, so an
+  `EPICS_CA_NAME_SERVERS` peer that accepts, keeps reading and never replies was
+  held indefinitely: ten consecutive censuses on the same local port over
+  ≈600 s, one accept, dial-pool `attempts=1`, against the data circuit's 35 s
+  bound (`EPICS_CA_CONN_TMO` + `ECHO_TIMEOUT_SECS`). The link-cut A/B cannot
+  reach this because a cut always ends in TCP giving up — which is also what
+  retired the name-service socket 30 s after the data circuit in that run. C has
+  no such asymmetry: `cac::setSearchDestinations` builds a name server through
   `findOrCreateVirtCircuit`, so it is a `tcpiiu` with the same watchdogs. The
-  fix changes CA client behaviour and is held for sign-off
+  fix inherits the rule the same way rather than branching on the peer's kind:
+  `CircuitWatchdog` is returned by `split_circuit` with the reader and writer
+  halves and taken **by value** by `read_loop`, so a CA TCP reader without a
+  liveness rule does not compile. Re-measured on the E9 rig with the fix
+  compiled in: seven retirements at **35, 35, 35, 37, 35, 35, 35 s** against the
+  35 s bound, eight dial/retire cycles in 8 minutes with `FD_CNT=6` and
+  `MEM_USED=17022976` on all 47 censuses. One deliberate deviation: C's
+  `unresponsiveCircuitNotify` keeps the socket, our name-service reader ends and
+  redials after `CONN_TMO`
   ([§3.5](vxworks-circuit-wedge-on-target-measurement.md)).
 * **E8 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
   for this target; E10's dial numbers are now unblocked, since the probe images

@@ -452,15 +452,74 @@ one, and a half-open peer is never detected. Throughout the 600 s above all six
 probe records read `SEVR=Ok("3") STAT=Ok("17")` — every `ca://` link down, with
 one held socket and no attempt to do anything about it.
 
-**Status: open.** This is a defect, it is measured, and it is not fixed in this
-round — the fix is to put the name-service connection under the same liveness
-rule as the data circuit (probe on `echo_idle_secs()` rather than a hardcoded
-60 s, and end the connection when `ECHO_TIMEOUT_SECS` passes with no byte from
-the peer), which is a change to CA client behaviour and is left for sign-off
-rather than taken silently. A related reading, noticed on the way and also not
-acted on: because a name server is a `tcpiiu` in C it is counted by
-`ca_get_ioc_connection_count()`, whereas our `circuits=Some(1)` counts data
-circuits only — pre-cut this image held two TCP connections and reported one.
+**Status: closed, and the close is measured on target.** The fix is structural
+rather than a `run_nameserver_connection` special case: the idle period, the
+probe window, the armed state and the suspend detection now live in one
+`CircuitWatchdog` (`crates/epics-ca-rs/src/client/transport.rs`), which
+`split_circuit` hands out with the reader and writer halves and which
+`read_loop` takes **by value** as a required parameter — so a CA TCP reader
+cannot be constructed without the rule that retires it, which is what C gets
+from `tcpiiu`'s constructor. No runtime branch distinguishes a name server
+anywhere; `isNameService()` has no counterpart in our watchdog path either.
+
+Re-measured on the same rig with image `silentns-fix.vxe` built from
+`beb8b6ee`, the same `~/vx-rig-e9/silentns-e9.py` on `10.0.2.2:46075`, RTP
+started 23:28:29 UTC and run to 23:36:21 UTC. The peer's own log — accept and
+close timestamps, one-second resolution, taken on the host with no guest clock
+involved:
+
+```
+23:28:02 silentns listening on 0.0.0.0:46075
+23:28:39 accepted ('127.0.0.1', 54008) total=1
+23:29:14 closed ('127.0.0.1', 54008) drained=520
+23:29:44 accepted ('127.0.0.1', 58326) total=2
+23:30:19 closed ('127.0.0.1', 58326) drained=376
+23:30:49 accepted ('127.0.0.1', 50576) total=3
+23:31:24 closed ('127.0.0.1', 50576) drained=232
+23:31:54 accepted ('127.0.0.1', 36158) total=4
+23:32:31 closed ('127.0.0.1', 36158) drained=376
+23:33:01 accepted ('127.0.0.1', 32824) total=5
+23:33:36 closed ('127.0.0.1', 32824) drained=88
+23:34:06 accepted ('127.0.0.1', 34482) total=6
+23:34:41 closed ('127.0.0.1', 34482) drained=232
+23:35:11 accepted ('127.0.0.1', 48350) total=7
+23:35:46 closed ('127.0.0.1', 48350) drained=232
+23:36:16 accepted ('127.0.0.1', 42862) total=8
+```
+
+Seven completed hold intervals: **35, 35, 35, 37, 35, 35, 35 s** against the
+35 s bound (`EPICS_CA_CONN_TMO` 30 s + `ECHO_TIMEOUT_SECS` 5 s). The one 37 s
+reading is reported as captured; the interval is peer-side accept→close at
+one-second resolution and carries the guest's connect and the drain thread's
+`recv`-returns-0 print, so it is not a second guest-side clock. Redial
+follows 30 s later every time — the one `CONN_TMO` knob — giving the ≈65 s
+period visible above, and eight accepts where the pre-fix run had one in
+19 minutes.
+
+Guest side, from `snsfix-console.log`, seven times, one per retirement:
+
+```
+WARN  epics_ca_rs::client::search: EPICS_CA_NAME_SERVERS peer did not answer CA_PROTO_ECHO; retiring the circuit nameserver=10.0.2.2:46075 bound_secs=35
+```
+
+and the dial pool counts the redials the peer saw — `attempts=1` at `seq=1`
+rising to `attempts=8` at `seq=45`, where the pre-fix run held `attempts=1`
+through `seq=65`. Across all 47 censuses of the run `FD_CNT=6` and
+`MEM_USED=17022976` never moved, so eight dial/retire cycles leak neither a
+descriptor nor heap.
+
+**One deviation from C, deliberate.** C's `unresponsiveCircuitNotify`
+(`tcpiiu.cpp:899-941`) marks the circuit unresponsive, re-arms a single echo
+and *keeps the socket*; our name-service reader ends instead, which retires
+the socket and redials after `CONN_TMO`. That is what makes the retirement
+observable to a census at all, and it is what recovers failover — but it is a
+different recovery shape from C's and is recorded here rather than implied.
+
+A related reading, noticed on the way and **still not acted on**: because a
+name server is a `tcpiiu` in C it is counted by
+`ca_get_ioc_connection_count()`, whereas our `circuits=` counts data circuits
+only — this run reported `circuits=Some(0)` on all 47 censuses while holding a
+name-service TCP connection for most of them.
 
 ## 4. Attribution: this is a blackhole, not a forged RST
 
@@ -657,13 +716,15 @@ it with the send deadline owned inside `write_frame_deadline`, measured on
 target at 2016 ms against a 2000 ms bound where the old path had not returned
 127.5 s later.
 
-**A second defect is open, measured and unfixed** (§3.5): the CA client's
-`EPICS_CA_NAME_SERVERS` connection has no liveness rule of its own, so a name
-server that accepts, keeps reading and never answers is held forever — ten
-consecutive censuses on the same local port, one accept, `attempts=1`, against
-the data circuit's 35 s bound. In C that connection is a `tcpiiu` and carries
-the same watchdog a data circuit does. The fix changes CA client behaviour and
-is left for sign-off.
+**A second defect was found by this rig and is now closed** (§3.5): the CA
+client's `EPICS_CA_NAME_SERVERS` connection had no liveness rule of its own, so
+a name server that accepts, keeps reading and never answers was held forever —
+ten consecutive censuses on the same local port, one accept, `attempts=1`,
+against the data circuit's 35 s bound. In C that connection is a `tcpiiu` and
+carries the same watchdog a data circuit does; here the rule now lives in one
+`CircuitWatchdog` that `read_loop` takes by value, so no CA TCP reader exists
+without it. Re-measured on the same rig: seven retirements at 35–37 s and
+eight redials in 8 minutes, `FD_CNT` and `MEM_USED` flat throughout.
 
 ## 7. Reproduction
 
@@ -1172,7 +1233,21 @@ echo 'rtpSp "/host.host/silentns.vxe"' > sns-con.in
 grep -a FDCENSUS sns-console.log
 ```
 
+The post-fix repeat of that run, identical but for the image and the tag —
+the third argument builds the fetched branch instead of leaving the tree
+where it is, and the evidence is the peer's own accept/close log next to the
+guest's retirement lines:
+
+```
+python3 silentns-e9.py 46075 > silentns-fix.log &
+./build-vx-ca.sh silentns-fix.vxe 10.0.2.2:46075 FETCH_HEAD
+./boot-e9.sh silentns-fix.vxe snsfix
+echo 'rtpSp "/host.host/silentns-fix.vxe"' > snsfix-con.in
+grep -a nameserver snsfix-console.log ; cat silentns-fix.log
+```
+
 Artefacts on the box under `~/vx-rig-e9/`: `lad-console.log`,
 `lad-phases.txt`, `lad-cut.txt`, `lad-restore.txt` and the `ctl-*`
 counterparts for the outage A/B; `wd-console.log` and `deafpeer.log` for §5.1;
-`sns-console.log` and `silentns.log` for §3.5.
+`sns-console.log` and `silentns.log` for the §3.5 defect, `snsfix-console.log`
+and `silentns-fix.log` for its close.

@@ -453,7 +453,13 @@ impl BlockingCaServer {
                     }
                     let peer = match stream.peer_addr() {
                         Ok(p) => p,
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "epics_ca_rs::server::blocking",
+                                error = %e, "blocking CA server: peer_addr failed, dropping connection"
+                            );
+                            continue;
+                        }
                     };
                     let db = self.db.clone();
                     let acf = self.acf.clone();

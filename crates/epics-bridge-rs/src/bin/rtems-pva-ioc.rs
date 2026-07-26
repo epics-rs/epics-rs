@@ -107,15 +107,20 @@
 //! it stays compiled and linted in the default test set, but refuses to run
 //! rather than silently starting the runtime it exists to avoid.
 //!
-//! The predicate is `any(target_os = "rtems", feature = "rtems-exec-model")`,
-//! the same one `rtems-ca-ioc` carries. It was narrowed to `target_os =
-//! "rtems"` alone for one stage — `epics-bridge-rs` did not yet declare
-//! `rtems-exec-model`, and naming a feature the crate does not have is a
-//! dangling predicate: `unexpected_cfg` warnings and an arm no configuration
-//! can select. Stage 4 declared the feature *with* the `rtems-exec-gate`
-//! census it owes (§6.3) rather than dodging the bill by adding the name
-//! alone, so the `any(...)` form is back and the body below is host-compiled,
-//! host-linted and host-tested under `--features rtems-exec-model`.
+//! The predicate is `any(target_os = "rtems", target_os = "vxworks", feature
+//! = "rtems-exec-model")`, the same one `rtems-ca-ioc` carries. It was
+//! narrowed to `target_os = "rtems"` alone for one stage — `epics-bridge-rs`
+//! did not yet declare `rtems-exec-model`, and naming a feature the crate
+//! does not have is a dangling predicate: `unexpected_cfg` warnings and an
+//! arm no configuration can select. Stage 4 declared the feature *with* the
+//! `rtems-exec-gate` census it owes (§6.3) rather than dodging the bill by
+//! adding the name alone, so the `any(...)` form is back and the body below
+//! is host-compiled, host-linted and host-tested under `--features
+//! rtems-exec-model`. `target_os = "vxworks"` is bin-side plumbing only — the
+//! `exec_backend` cfg `epics-base-rs/build.rs` derives for the
+//! `runtime::task` seam still gates on `target_os = "rtems"` or the feature,
+//! so a VxWorks build also needs one of those until its own `exec_backend`
+//! predicate lands.
 //!
 //! Coverage today, in full: `scripts/rtems-check.sh` compiles it for the
 //! target in both configurations; the host feature-ON selection compiles it
@@ -136,7 +141,12 @@ use std::process::ExitCode;
 /// this file parse it and build the group for real; the `rtems` and
 /// `rtems-exec-model` arms are the production use. On a host non-test build
 /// with the feature off it is compiled away, so it is never dead code.
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model", test))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model",
+    test
+))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -258,7 +268,11 @@ mod demo_db {
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -915,17 +929,25 @@ mod ioc {
     }
 }
 
-#[cfg(any(target_os = "rtems", feature = "rtems-exec-model"))]
+#[cfg(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+))]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(target_os = "rtems", feature = "rtems-exec-model")))]
+#[cfg(not(any(
+    target_os = "rtems",
+    target_os = "vxworks",
+    feature = "rtems-exec-model"
+)))]
 fn main() -> ExitCode {
     eprintln!(
         "rtems-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf`, or on a host select \
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host select \
          `--features rtems-exec-model`, which routes the `runtime::task` seam to \
          the same std-thread executor the target uses."
     );

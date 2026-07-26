@@ -259,5 +259,123 @@ scope; recorded here because it was measured.
   starve under the ramp (a known band-189 effect on this target), so the
   server-side refusal counter is not a usable cross-check at the wall; the
   numbers above are console and wire counts.
-* **The 1024M allocator abort** (§6.3) is measured and not root-caused. Out of
-  this family, and pre-existing on `origin/main`.
+* **The 1024M allocator abort** (§6.3) is measured and not root-caused. It is
+  no longer *reached* on the default configuration — §9's reservation budget
+  refuses at 32 sets and the abort needs 46 — but the failure itself is
+  untouched: raise `EPICS_RS_POOL_RESERVATION_MB` past the ceiling and it
+  returns unchanged (§9.3). The budget bounds the process away from it; it does
+  not fix it. Root cause is E10's.
+* **The object-arena term of the reservation is unmeasured** (§9.2). Each
+  VxWorks pthread mutex materialises a kernel `SEMAPHORE` on first lock, from an
+  arena that is neither the address space charged nor the allocator heap — which
+  is why the same wall shows as `EINVAL` in one probe and as a failed 64-byte
+  allocation in another. The term is named and charged 0 pending E8's
+  `semMCreate` wrap; if it turns out to bind first it needs its own budget, not
+  a share of this one.
+* **The 160 MiB default costs connections on a well-provisioned target.** It is
+  the guest this was measured on, not the largest one: at 1470 MB of guest
+  memory E8 measured a ceiling ≥739 MB, where the same default still refuses at
+  32. The remedy is the switch, and the refusal names it. A budget derived from
+  the target's own memory is not possible today — the reserved-address-space
+  ceiling is not a fixed fraction of RAM across the sizes measured (25.9 % at
+  958 MB, ≥50 % at 1470 MB) and the VxWorks census backend reports `MEM_FREE` as
+  NaN.
+
+## 9. The pool walked past the memory ceiling, and now refuses before it
+
+Two defects in `runtime/worker_pool.rs`, closed after §§1–8 and measured on the
+same rig. They are one family with §6.3: the IOC had no bound on the *memory*
+its connection threads reserve, so every path that ran out — a failed
+`pthread_create`, a `std` mutex whose `semMCreate` returned NULL, a failed
+64-byte allocation — was reached by walking past the ceiling rather than by
+refusing at it.
+
+### 9.1 A worker that dies leaked its set
+
+`catch_unwind` wraps the job body, not the thread. Dropping the panic payload
+when the joiner is gone, and both mutex takes in the worker's return path, sit
+outside it — and on this target the second is real: a `std` mutex lock at the
+wall returns `EINVAL` ("failed to lock mutex: invalid argument (os error 22)")
+and `std` panics. The set was then stuck at `running == 1` with no thread left
+to settle it: never idle, never leased again, its slot held against the pool's
+bound for the life of the process. Measured on the E8 branch as `BUSY=2 SETS=50
+WORKERS=100 CONNS=0` — two sets held with no client attached.
+
+The accounting now hangs off the thread's destructor (`WorkerExit`), so any exit
+that was not asked for marks the set dead, stops its siblings, and returns the
+slot when the last of its threads is gone. A dead set is never pooled again, and
+a dispatch onto a worker already gone is reported as *not run* instead of as a
+clean completion.
+
+### 9.2 The bound was a count, and the count was never what ran out
+
+`CAS_CLIENT_POOL_CAPACITY = 141` is a *descriptor* bound (§ the constant's own
+derivation). It was never approached on this guest. `Reservation` adds the
+bound that was missing: one process-wide account of thread memory, charged per
+thread as **declared stack + a flat 1 MiB** (E8's three-arm measurement) with the
+RTP object arena named as a third term and not yet charged (`semMCreate` is what
+returns NULL at the wall; E8's wrap will give the per-thread figure). A whole
+set is reserved before any thread is created, so admission refuses while the
+target is still healthy enough to deliver the refusal. Default 160 MiB on an
+embedded target, unbounded on a host, raised with
+`EPICS_RS_POOL_RESERVATION_MB`.
+
+The CA set is `Big` + `Medium` = 3 MiB declared + 2 MiB overhead = **5 MiB**, so
+160 MiB is 32 sets.
+
+### 9.3 Measured: 1024M guest, one image, three budgets
+
+`doc/vx-rig-e11/refusalprobe-poolfix1024.log`,
+`doc/vx-rig-e11/refusalprobe-envraise320.log`, and the control
+`doc/vx-rig-e11/refusalprobe-base1024.log`.
+
+| budget | sets reached | outcome |
+| --- | --- | --- |
+| none (`origin/main` control) | 46 (41 ramp + 5 monitor) | `memory allocation of 64 bytes failed`, signal 6, RTP deleted, **zero refusals** |
+| 320 MiB (`putenv` in the kernel shell) | 46 | identical death at `CAS-client 46`, zero refusals |
+| 160 MiB (the default) | 32 (27 ramp + 5 monitor) | **8 consecutive refusals, IOC alive** |
+
+At the default the whole run takes 1.4 s and ends with `spot-check: 10/10
+sampled held connections still answer a fresh READ_NOTIFY`. Every refusal
+carries `status=48` and the gate in the text:
+
+```
+CAS: no resources for a new client (worker pool at its thread-memory budget:
+this set needs 5120 KiB, 160 of 160 MiB already reserved — raise
+EPICS_RS_POOL_RESERVATION_MB if the target has the memory)
+```
+
+and one `errlog` record each, ordinals `#1`–`#8` consecutive
+(`~/vx-rig-e11/console-e11-1024M-POOLFIX-refuses.log`), which is §4's
+one-record-per-refusal rule holding on a gate that did not exist when it was
+written.
+
+The 320 MiB row is what makes the default's number a measurement rather than a
+guess: the switch reaches the RTP (the wall moved from 32 to 46), and raising it
+past the ceiling walks straight back into §6.3's abort at the same set 46. So
+the fatal point on this guest is ~230 MiB of pool reservation, and 160 MiB sits
+14 sets below it. On a larger guest the ceiling is higher (E8: ≥739 MB at 1470
+MB of guest memory) and the same switch is how an operator gets those
+connections back — the cost of the default is that a well-provisioned target
+serves 32 CA clients until it is raised.
+
+### 9.4 Host regression tests
+
+* `a_worker_that_dies_retires_its_set_instead_of_leaking_it` — kills a worker
+  thread at exactly the point the target killed one (the payload drop after the
+  joiner is gone), asserts the set stops being busy, that `created` returns to
+  0, and that a fresh borrow still runs. Fails on the pre-fix tree by timeout:
+  the set stays busy forever.
+* `a_death_under_a_live_lease_returns_the_slot_and_never_repools_the_set` — the
+  other side of the boundary: the borrower still holds its lease. Asserts the
+  slot comes back anyway, that a dispatch onto the retired set reports *not
+  run*, and that the lease drop does not re-pool it.
+* `admission_refuses_at_the_memory_budget_before_the_count_bound` — a budget of
+  exactly two sets against a capacity of eight: two admitted, the third refused
+  with the three numbers the remedy needs, no thread created, and the account
+  back to zero when the pool drops. Fails with the gate removed.
+* `a_dead_set_gives_its_memory_back_to_the_budget` — a budget of exactly one
+  set, whose worker then dies; the memory must return or the target refuses
+  connections it has the memory to serve. Fails with the release removed.
+* `the_reservation_budget_reads_its_switch_and_its_target_default` — both arms
+  of both target-dependent constants and every switch-parse case, on a host.

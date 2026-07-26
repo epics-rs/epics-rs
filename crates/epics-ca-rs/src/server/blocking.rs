@@ -590,18 +590,11 @@ impl BlockingCaServer {
 
 /// How many clients this server has refused for want of resources, ever.
 ///
-/// Not a rate limiter's clock. On RTEMS `Instant` is quantised to whole
-/// seconds by the libc `timespec` defect (`epics_rtems_boot`'s layout guard),
-/// so a time-windowed limiter is exactly the wrong shape here. Counting and
-/// emitting on powers of two needs no clock at all, cannot suppress the first
-/// occurrence by construction, and keeps the console readable when a client
-/// retries in a loop against a server that is out of memory.
+/// The number [`refused_clients`] reports over CA, and the ordinal each refusal
+/// record carries. Nothing reads it to decide whether to print: every refusal is
+/// announced, so the count of refusal records on the console *is* the count of
+/// refusals, and an operator never has to know a schedule to read one.
 static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// True for the 1st, 2nd, 4th, 8th … refusal.
-fn refusal_should_be_announced(nth: u64) -> bool {
-    nth.is_power_of_two()
-}
 
 /// Refuse an accepted client that the server has no resources to serve:
 /// tell the peer, tell the operator, then close.
@@ -662,20 +655,43 @@ fn refuse_client(peer: SocketAddr, cause: &std::io::Error, send: impl FnOnce(&[u
     );
     send(&frame);
 
-    // Tell the operator. `errlog` is C's `epicsPrintf` seam and reaches the
-    // console even with no `tracing` subscriber installed
-    // (`runtime::log::errlog_sev_printf`), which is the state every RTEMS IOC
-    // binary runs in.
-    if refusal_should_be_announced(nth) {
-        epics_base_rs::runtime::log::errlog_sev_printf(
-            epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-            &format!("{reason} — refused {peer} (refusal #{nth})"),
-        );
-    }
-    tracing::warn!(
-        target: "epics_ca_rs::server::blocking",
-        %peer, error = %cause, nth,
-        "refused a CA client for want of resources"
+    // Tell the operator: one record, on one sink, for every refusal.
+    //
+    // # Invariant
+    //
+    // MUST: each refusal produce exactly one console record, carrying its
+    // ordinal. MUST NOT: any refusal be sampled away, and MUST NOT: one
+    // refusal produce two records that a reader has to reconcile.
+    //
+    // Both halves were broken and the E8 target run measured both
+    // (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.4). This used to
+    // announce on `errlog` only when the ordinal was a power of two, *and* emit
+    // an ungated `tracing::warn!` beside it. On the 1024M guest that put 8 WARN
+    // lines and 4 `errlog` lines on the console for 8 refusals; on the 2048M
+    // guest, 4 and 3. Neither number is the refusal count unless you already
+    // know which sink follows which rule — and the `errlog` stream, the one an
+    // EPICS operator reads, understated the wall by half.
+    //
+    // The sampling bought nothing it was meant to buy. Its purpose was to keep
+    // a retrying client from flooding a serial console, but the `warn!` beside
+    // it was ungated and reached that same console through
+    // `runtime::log::install_console_subscriber` — so the console already paid
+    // one line per refusal and the schedule only suppressed the *second* line.
+    // One record per refusal is therefore also strictly less console traffic
+    // than what this replaced, and there is no rate to trade against.
+    //
+    // `errlog` is the surviving sink because it is C's `epicsPrintf` /
+    // `errlogPrintf` seam (`rsrv/caservertask.c:117`, `:1246`, `:1252`, all
+    // three unconditional — C throttles the *accept loop* with a 15 s sleep,
+    // never the message) and because it reaches the console even with no
+    // `tracing` subscriber installed, which is the state an RTEMS IOC binary
+    // runs in. It is also a `tracing` event on `epics_base_rs::errlog`, so a
+    // subscriber-based application still sees every refusal. Nothing the
+    // `warn!` carried is lost: its `peer` and `nth` are in this line, and its
+    // `error` is `reason`'s parenthesised tail.
+    epics_base_rs::runtime::log::errlog_sev_printf(
+        epics_base_rs::runtime::log::ErrlogSevEnum::Major,
+        &format!("{reason} — refused {peer} (refusal #{nth})"),
     );
 }
 
@@ -1496,20 +1512,100 @@ mod tests {
         );
     }
 
-    /// The first refusal is always announced. A rate limit that can swallow
-    /// occurrence #1 is indistinguishable, to an operator, from the silence
-    /// this change exists to remove.
+    /// Counts `tracing` events by target, on the thread that emits them.
+    ///
+    /// Installed with `with_default`, so it is scoped to the calling thread and
+    /// no concurrently-running test can add to its counts. Declaring a
+    /// `max_level_hint` is what makes `runtime::log::nothing_is_listening`
+    /// false, so `errlog`'s console fallback stays quiet and every record
+    /// arrives here exactly once.
+    struct RefusalRecorder {
+        errlog: Arc<AtomicUsize>,
+        elsewhere: Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for RefusalRecorder {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            let counter = if event.metadata().target() == "epics_base_rs::errlog" {
+                &self.errlog
+            } else {
+                &self.elsewhere
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: every refusal produce exactly one console record. MUST NOT: a
+    /// refusal be sampled away, and MUST NOT: one refusal produce two records.
+    ///
+    /// Both halves failed on target and both are asserted here, because either
+    /// one alone makes the console's refusal count a number an operator cannot
+    /// read. Measured on VxWorks 7 at the connection wall
+    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.4): 8 refusals
+    /// produced 4 `errlog` records and 8 `warn` records, and 4 refusals
+    /// produced 3 and 4 — so neither sink's line count was the refusal count,
+    /// and the `errlog` stream, which is the one an EPICS operator reads,
+    /// understated the wall by half with no notice that it had.
+    ///
+    /// Seven is deliberate: it is not a power of two and it spans three of
+    /// them, so the schedule that produced the defect cannot satisfy this by
+    /// coincidence the way the measured runs' 4 and 8 nearly did.
     #[test]
-    fn the_first_refusal_can_never_be_rate_limited_away() {
-        assert!(refusal_should_be_announced(1), "the first refusal is mute");
-        // …and the schedule after it is logarithmic, so a client retrying in
-        // a loop cannot flood the console.
-        let announced: Vec<u64> = (1..=64)
-            .filter(|n| refusal_should_be_announced(*n))
-            .collect();
-        assert_eq!(announced, vec![1, 2, 4, 8, 16, 32, 64]);
-        assert!(!refusal_should_be_announced(3));
-        assert!(!refusal_should_be_announced(1000));
+    fn every_refusal_produces_exactly_one_console_record() {
+        const REFUSALS: usize = 7;
+
+        let errlog = Arc::new(AtomicUsize::new(0));
+        let elsewhere = Arc::new(AtomicUsize::new(0));
+        let recorder = RefusalRecorder {
+            errlog: errlog.clone(),
+            elsewhere: elsewhere.clone(),
+        };
+
+        let peer: SocketAddr = "127.0.0.1:5064".parse().expect("literal peer address");
+        tracing::subscriber::with_default(recorder, || {
+            for _ in 0..REFUSALS {
+                refuse_client(
+                    peer,
+                    &std::io::Error::new(std::io::ErrorKind::WouldBlock, "worker pool at capacity"),
+                    // The peer leg is not under test here; refusing with a
+                    // discarded frame keeps this off the network entirely.
+                    |_frame| {},
+                );
+            }
+        });
+
+        assert_eq!(
+            errlog.load(Ordering::Relaxed),
+            REFUSALS,
+            "every refusal must reach the operator: {} of {REFUSALS} refusals \
+             produced an errlog record. A refusal that is not announced is \
+             invisible at exactly the moment an operator is reading the console \
+             to find out why clients stopped connecting.",
+            errlog.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            elsewhere.load(Ordering::Relaxed),
+            0,
+            "one refusal is one record: {} record(s) landed off the errlog \
+             sink, so the console carries two accounts of the same event under \
+             two emission rules and neither one is the refusal count",
+            elsewhere.load(Ordering::Relaxed),
+        );
     }
 
     /// A bind failure must not be described as a `local_addr` failure, nor

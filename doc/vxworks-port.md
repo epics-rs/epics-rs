@@ -695,7 +695,9 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   peer that accepts and never reads: the bounded path returned at **2016 ms
   against a 2000 ms deadline**, the old path had not returned **127.5 s** later
   and still held its descriptor (§5.1). This removes `SEND_TICKS_PER_DEADLINE`
-  and `send_tick_for` from the public API of `epics-libcom-rs`.
+  and `send_tick_for` from the public API of `epics-libcom-rs`, so the next
+  release is a **0.26.0 minor bump** — decided against a deprecated shim, since
+  the two items exist only to split a deadline the caller no longer owns.
 * **The CA name-service connection has no liveness rule — open, measured.**
   `run_nameserver_connection` sends `CA_PROTO_ECHO` on a hardcoded 60 s tick and
   never checks that it was answered, so an `EPICS_CA_NAME_SERVERS` peer that

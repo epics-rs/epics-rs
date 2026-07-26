@@ -698,8 +698,8 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   and `send_tick_for` from the public API of `epics-libcom-rs`, so the next
   release is a **0.26.0 minor bump** — decided against a deprecated shim, since
   the two items exist only to split a deadline the caller no longer owns.
-* **The same `SO_SNDTIMEO` defect in `asyn-rs`, closed — latent, and it stays
-  latent by design.** `drivers::ip_port::IpIoState::write` armed the option on
+* **The same `SO_SNDTIMEO` defect in `asyn-rs`, closed — latent until the
+  crate's port gap is closed.** `drivers::ip_port::IpIoState::write` armed the option on
   all three of its arms (TCP, UDP, Unix) and propagated the result with `?`, so
   the write path would fail before sending a byte on a target that refuses the
   option. C never sets it here either: `drvAsynIPPort.c` compiles the option
@@ -708,16 +708,23 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   bounds `writeIt` with `poll(POLLOUT, writePollmsec)` (`:667-686`) on a socket
   `connectIt` already made non-blocking (`:511`). `write_with_retry` now has
   C's shape, proven by a host regression test that fails without it.
-  **On-target verification is not available and is not owed**: `asyn-rs` is a
-  host-only crate. Its `socket2` dependency is unconditional, in the shared
-  `[dependencies]` (`crates/asyn-rs/Cargo.toml:16`), where `epics-ca-rs`
-  deliberately keeps `socket2`/`if-addrs`/`tokio` full behind
+  **On-target verification is not available until an open port gap is closed.**
+  `asyn-rs` does not build for VxWorks or RTEMS: its `socket2` dependency is
+  unconditional, in the shared `[dependencies]`
+  (`crates/asyn-rs/Cargo.toml:16`), where `epics-ca-rs` keeps
+  `socket2`/`if-addrs`/`tokio` full behind
   `[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]`
-  (`crates/epics-ca-rs/Cargo.toml:82`) — and none of this gate's six crates
-  depends on `asyn-rs`. So the crate is absent from `vxworks-check.sh`'s
-  `CRATES` because it belongs on the host side of that table, not because a
-  wall wants lifting; making it build for `x86_64-wrs-vxworks` would be a
-  target-table rework, not a fix.
+  (`crates/epics-ca-rs/Cargo.toml:82`); `socket2` 0.5.10 aliases `IovLen` under
+  two `target_os` lists that omit vxworks, and the crate is absent from
+  `vxworks-check.sh`'s `CRATES`, so nothing catches a regression here. That is
+  a gap, not a decision: C `asyn` supports vxWorks explicitly —
+  `drvAsynIPPort.c:63` disables `AF_UNIX` for vxWorks alone, `:75` selects
+  `FAKE_POLL` for it, `setNonBlock` branches to `ioctl(fd, FIONBIO, &flags)`
+  at `:178`, the socket `cleanup` comment at `:243` exists to "reduce problems
+  with vxWorks when the IOC restarts", and
+  `asynDriver/epicsInterruptibleSyscall.c:31` includes `ioLib.h` under
+  `#ifdef vxWorks`. Closing that gap is separate work and is not attempted
+  here; until then this fix is proven on the host only.
 * **The CA name-service connection has no liveness rule — open, measured.**
   `run_nameserver_connection` sends `CA_PROTO_ECHO` on a hardcoded 60 s tick and
   never checks that it was answered, so an `EPICS_CA_NAME_SERVERS` peer that

@@ -1,0 +1,141 @@
+diff --git a/crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs b/crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs
+index abd52a62..b8797440 100644
+--- a/crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs
++++ b/crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs
+@@ -301,6 +301,20 @@ mod ioc {
+             "FDPROBE seq={seq} FD_CNT={fd_cnt} FD_MAX={fd_max} CA_CONN_CNT={}",
+             server.active_connections()
+         );
++        // MEASUREMENT ONLY (doc/vx-ca-pool-probe.patch). The pool's own numbers
++        // beside the connection count: SETS is the high-water mark of thread
++        // *creations*, which is the bound the conversion claims, and BUSY is
++        // what is leased right now. A flat SETS under a connect/disconnect ramp
++        // is the whole statement; SETS climbing with CONNS and stopping at CAP
++        // is the bound holding under a concurrent one.
++        let (pool_busy, pool_sets, pool_cap, pool_workers) =
++            epics_ca_rs::server::blocking::client_pool_probe();
++        println!(
++            "POOLPROBE seq={seq} BUSY={pool_busy} SETS={pool_sets} CAP={pool_cap} \
++             WORKERS={pool_workers} REFUSED={} CONNS={}",
++            epics_ca_rs::server::blocking::refused_clients(),
++            server.active_connections()
++        );
+         println!(
+             "C6 seq={seq} links={} circuits={conns:?}",
+             resolver.link_count(),
+diff --git a/crates/epics-ca-rs/src/server/blocking.rs b/crates/epics-ca-rs/src/server/blocking.rs
+index b8f6bf7f..2563ee57 100644
+--- a/crates/epics-ca-rs/src/server/blocking.rs
++++ b/crates/epics-ca-rs/src/server/blocking.rs
+@@ -352,6 +352,21 @@ impl Drop for ClientSlot {
+     }
+ }
+ 
++/// BRING-UP PROBE (`doc/vx-ca-pool-probe.patch`): the CA client pool's
++/// `(busy_sets, created_sets, capacity, workers)`, for `realtime-ca-ioc`'s
++/// console reporter.
++///
++/// [`CAS_CLIENT_POOL`] is private and a bin target is a separate crate, so the
++/// rig gets one accessor rather than the static. `created_sets` is the number
++/// the bound is *about* — thread creations, which is what the per-accept shape
++/// grew without limit — and `busy_sets` is what is leased right now, so a flat
++/// `created` under a rising `busy` is the whole statement.
++#[cfg(feature = "bringup-probes")]
++pub fn client_pool_probe() -> (usize, usize, usize, usize) {
++    let (busy, created, capacity) = CAS_CLIENT_POOL.set_usage();
++    (busy, created, capacity, CAS_CLIENT_POOL.worker_count())
++}
++
+ /// How many clients this process has refused for want of resources, ever.
+ ///
+ /// Monotonic and process-wide, not per-server: the resource that runs out — the
+diff --git a/crates/epics-libcom-rs/src/runtime/task.rs b/crates/epics-libcom-rs/src/runtime/task.rs
+index f040a23f..c52ecbf6 100644
+--- a/crates/epics-libcom-rs/src/runtime/task.rs
++++ b/crates/epics-libcom-rs/src/runtime/task.rs
+@@ -1095,7 +1095,84 @@ pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
+     name_current_thread();
+     #[cfg(target_os = "vxworks")]
+     epics_rtems_boot::stats::register_task();
+-    apply_to_current_thread(priority)
++    let applied = apply_to_current_thread(priority);
++    // MEASUREMENT ONLY (doc/vx-ca-pool-probe.patch). Removed once the reading
++    // is recorded. Every pooled CA worker comes through here, so this is the
++    // one site that sees them all, and it sees each one at creation — which is
++    // what makes the label set an independent witness of `POOLPROBE`'s
++    // `WORKERS`.
++    #[cfg(target_os = "vxworks")]
++    vx_priority_readback(
++        std::thread::current().name().unwrap_or("<unnamed>"),
++        priority.value() as i32,
++        &format!("{applied:?}"),
++    );
++    applied
++}
++
++/// MEASUREMENT ONLY — read the band back off the OS scheduler and print it.
++///
++/// [`apply_to_current_thread`] reports what it *asked* for; this reports what
++/// the kernel actually holds, which is the only thing a band claim can be
++/// checked against. Three legs, where RTEMS's counterpart had two:
++///
++/// * `posix=` — `pthread_getschedparam`, the POSIX value this port sets;
++/// * `vx=` — `taskPriorityGet` on the calling task, the **native** value
++///   VxWorks derived from it. RTEMS's second leg was `rtems_task_iterate` from
++///   outside the thread; here the native reading is available on the thread
++///   itself, so both legs describe the same task with no id mapping in between;
++/// * and the census's `prio=` (`taskInfoGet`, `stats::dump_tasks`) is a third,
++///   taken later from a different API — which needs no patch at all.
++///
++/// `expect_posix`/`expect_vx` are printed rather than asserted so a mismatch is
++/// a reading, not a crashed IOC.
++#[cfg(target_os = "vxworks")]
++fn vx_priority_readback(label: &str, requested_epics: i32, applied: &str) {
++    let mut policy: std::ffi::c_int = -1;
++    // SAFETY: `pthread_getschedparam` acts on the calling thread and writes
++    // only into the two live locals given, both of `libc`'s own VxWorks width.
++    let (rc, posix) = unsafe {
++        let mut param: libc::sched_param = std::mem::zeroed();
++        let rc = libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param);
++        (rc, param.sched_priority)
++    };
++    let mut vx: std::ffi::c_int = -1;
++    // SAFETY: `taskIdSelf` names the calling task and `taskPriorityGet` writes
++    // only into the live `c_int` given. Both are `T`-defined in the RTP-side
++    // `libc.a` (measured with `nmpentium`, per this port's rule that a symbol is
++    // declared only once it has been seen defined).
++    let vx_rc = unsafe { vx_sched::taskPriorityGet(libc::taskIdSelf(), &mut vx) };
++    println!(
++        "PRIOPROBE label={label} epics={requested_epics} applied={applied} \
++         getsched_rc={rc} policy={policy} posix={posix} taskprio_rc={vx_rc} vx={vx} \
++         expect_posix={} expect_vx={}",
++        56 + requested_epics.min(99),
++        199 - requested_epics.min(99)
++    );
++}
++
++/// MEASUREMENT ONLY — the one scheduler symbol this probe needs that `libc`
++/// does not declare for VxWorks.
++///
++/// `libc` binds `taskIdSelf`, `taskNameGet`/`Set`, `pthread_getschedparam` and
++/// `pthread_setschedparam`, but none of `taskPriorityGet`, `taskPrioritySet`,
++/// `taskIdListGet` or `taskInfoGet`. Of those, `taskIdListGet` is kernel-only
++/// and absent from every RTP library — which is why the statistics funnel's
++/// census is a registry rather than an enumeration — but `taskPriorityGet`
++/// **is** defined in the RTP-side `libc.a`, so the native band is readable from
++/// inside an RTP after all.
++///
++/// `TASK_ID` is `OBJ_HANDLE` is `int`, the same 4-byte spelling
++/// `stats::vxworks` pins for `taskInfoGet`; `libc::taskIdSelf` is reused rather
++/// than redeclared so the two cannot disagree about it.
++#[cfg(target_os = "vxworks")]
++mod vx_sched {
++    use std::ffi::c_int;
++
++    unsafe extern "C" {
++        /// `taskLib.h`: `STATUS taskPriorityGet (TASK_ID tid, int * pPriority)`.
++        pub fn taskPriorityGet(tid: c_int, p_priority: *mut c_int) -> c_int;
++    }
+ }
+ 
+ /// Push `std::thread::current().name()` down to the OS thread object.

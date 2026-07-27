@@ -242,7 +242,7 @@ pub const RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT: bool = size_of::<libc::time_t>() ==
 /// The check is on the family's *offset*, not on the presence of `sin_len`:
 /// naming a field that does not exist is a compile error, which would take the
 /// toolchain-free portability gate down with it (see the note on
-/// [`_RTEMS_LIBC_TIME_LAYOUT`]). An offset of 1 says a length byte precedes
+/// `_RTEMS_LIBC_TIME_LAYOUT`). An offset of 1 says a length byte precedes
 /// the family, which is the property that matters.
 ///
 /// # Which socket types are checked

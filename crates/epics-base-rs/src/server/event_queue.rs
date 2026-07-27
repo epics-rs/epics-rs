@@ -850,7 +850,12 @@ mod tests {
 
     fn ev(v: i32) -> MonitorEvent {
         MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::Long(v),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         }
@@ -1259,12 +1264,12 @@ mod tests {
         let mut arr = vec![0.0f64; 32];
         arr[0] = v as f64;
         MonitorEvent {
-            snapshot: Snapshot::new(
+            snapshot: std::sync::Arc::new(Snapshot::new(
                 EpicsValue::DoubleArray(arr),
                 0,
                 0,
                 std::time::SystemTime::UNIX_EPOCH,
-            ),
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         }

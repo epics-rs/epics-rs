@@ -191,7 +191,7 @@ impl FilterChain {
         use crate::server::snapshot::Snapshot;
         let snap = Snapshot::new(value, 0, 0, std::time::SystemTime::now());
         let event = MonitorEvent {
-            snapshot: snap,
+            snapshot: std::sync::Arc::new(snap),
             origin: 0,
             mask: EventMask::VALUE,
         };
@@ -201,7 +201,9 @@ impl FilterChain {
             FilteredMonitorEvent::new(event)
         };
         let filtered = self.apply(wrapped)?;
-        Some(filtered.event.snapshot.value)
+        // Sole owner on this path (the snapshot was built one statement above
+        // and never shared), so `unwrap_or_clone` moves rather than copies.
+        Some(std::sync::Arc::unwrap_or_clone(filtered.event.snapshot).value)
     }
 
     /// epics-base PR `17a8dbc` parity: apply the filter chain to a
@@ -302,7 +304,12 @@ mod tests {
     }
 
     fn make_event(v: f64) -> FilteredMonitorEvent {
-        let snapshot = Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH);
+        let snapshot = std::sync::Arc::new(Snapshot::new(
+            EpicsValue::Double(v),
+            0,
+            0,
+            SystemTime::UNIX_EPOCH,
+        ));
         FilteredMonitorEvent::new(MonitorEvent {
             snapshot,
             origin: 0,

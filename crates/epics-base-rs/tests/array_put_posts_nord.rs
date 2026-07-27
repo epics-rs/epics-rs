@@ -74,7 +74,7 @@ async fn nord_sub(db: &PvDatabase, rec: &str) -> EventReader {
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        out.push(ev.snapshot.value);
+        out.push(ev.snapshot.value.clone());
     }
     out
 }

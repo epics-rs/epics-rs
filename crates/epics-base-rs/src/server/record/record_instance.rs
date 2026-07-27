@@ -4940,8 +4940,13 @@ impl RecordInstance {
         for (field, value, posting_mask) in &snapshot.changed_fields {
             let posting_mask = *posting_mask;
             if let Some(subs) = self.subscribers.get(field) {
-                // Build a full snapshot once per field (with display metadata)
-                let mon_snap = self.make_monitor_snapshot(field, value.clone());
+                // Build a full snapshot once per field (with display
+                // metadata) and hand every subscriber a reference to that one
+                // snapshot — C posts the fixed-size `db_field_log` and reads
+                // the wide value by reference at delivery (`camessage.c:516`),
+                // so a per-subscriber deep copy of an array value is a port
+                // deviation, not parity.
+                let mon_snap = Arc::new(self.make_monitor_snapshot(field, value.clone()));
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -5039,7 +5044,7 @@ impl RecordInstance {
                 if publishes_value {
                     posted = Some(value.clone());
                 }
-                let mon_snap = self.make_monitor_snapshot(field, value);
+                let mon_snap = Arc::new(self.make_monitor_snapshot(field, value));
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.

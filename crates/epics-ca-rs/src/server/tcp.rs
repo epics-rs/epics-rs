@@ -5265,13 +5265,23 @@ pub(crate) async fn register_subscription(
                         // string instead of an empty 40-byte
                         // pad.
                         if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                            event.snapshot.class_name =
+                            std::sync::Arc::make_mut(&mut event.snapshot).class_name =
                                 Some(record_for_task.read().record.record_type().to_string());
                         }
                         // long-string boundary conversion before
                         // encoding: `$` → CHAR[40]+NUL, or a native
-                        // record field → scalar DBR_STRING.
-                        super::apply_long_string_mode(&mut event.snapshot, long_string_mode);
+                        // record field → scalar DBR_STRING. Both this and
+                        // the CLASS_NAME override are per-subscription
+                        // rewrites of a snapshot every other subscriber
+                        // shares, so they take the copy-on-write path —
+                        // and only when they have something to write, so a
+                        // `Plain` channel (the common case) never copies.
+                        if long_string_mode != crate::server::LongStringMode::Plain {
+                            super::apply_long_string_mode(
+                                std::sync::Arc::make_mut(&mut event.snapshot),
+                                long_string_mode,
+                            );
+                        }
                         let mut payload_bytes = match encode_dbr(requested_type, &event.snapshot) {
                             Ok(bytes) => bytes,
                             Err(_) => break,
@@ -5614,7 +5624,7 @@ pub(crate) async fn run_event_task<W>(
                         // async record-field producer sets it per event.
                         if d.data_type == epics_base_rs::types::DBR_CLASS_NAME {
                             if let ChannelTarget::RecordField { record, .. } = &d.target {
-                                event.snapshot.class_name =
+                                std::sync::Arc::make_mut(&mut event.snapshot).class_name =
                                     Some(record.read().record.record_type().to_string());
                             }
                         }

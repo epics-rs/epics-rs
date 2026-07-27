@@ -2545,7 +2545,11 @@ mod tests {
             .try_recv()
             .expect("DBE_PROPERTY subscriber receives the property event");
         assert_eq!(
-            ev.snapshot.display.expect("event carries metadata").units,
+            ev.snapshot
+                .display
+                .clone()
+                .expect("event carries metadata")
+                .units,
             "V"
         );
         assert_eq!(

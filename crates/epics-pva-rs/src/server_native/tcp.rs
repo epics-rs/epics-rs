@@ -319,7 +319,7 @@ fn pv_field_to_filter_event(
 
     let val = crate::leaf_convert::pv_leaf_to_epics_value(value)?;
     Some(FilteredMonitorEvent::new(MonitorEvent {
-        snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
+        snapshot: std::sync::Arc::new(Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH)),
         origin: 0,
         mask: EventMask::VALUE,
     }))

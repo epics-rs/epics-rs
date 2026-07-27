@@ -186,7 +186,30 @@ pub type ReadHook = Arc<
 /// Carries a full Snapshot so GR/CTRL metadata (PREC, EGU, limits) is available.
 #[derive(Debug, Clone)]
 pub struct MonitorEvent {
-    pub snapshot: Snapshot,
+    /// The posted value, **shared** with every other subscriber this post
+    /// reached.
+    ///
+    /// C never copies a wide value into an event at all. `db_create_field_log`
+    /// stores anything wider than `union native_value` by reference
+    /// (`dbfl_type_ref`, `dtor == NULL`, so `dbfl_has_copy` is false), and the
+    /// value is read at DELIVERY: `read_reply` reserves the payload inside the
+    /// client's existing send buffer (`cas_copy_in_header`,
+    /// `camessage.c:516`) and `dbGet` converts straight from the record's live
+    /// field into it (`dbAccess.c:1020`, the `!dbfl_has_copy(pfl)` arm). One
+    /// array, N events pointing at it, zero retained copies.
+    ///
+    /// The port cannot read the record at delivery — the event outlives the
+    /// record lock — so it snapshots once at post time. `Arc` is what makes
+    /// that snapshot C's single array instead of one owned copy per
+    /// subscriber: `record_instance` built `make_monitor_snapshot` once and
+    /// then deep-cloned it per subscriber, so a 1 MiB waveform with four
+    /// monitors cost 4 MiB retained where C costs four ~100-byte field logs.
+    /// Measured consequence on `x86_64-wrs-vxworks`: `memory allocation of
+    /// 1048576 bytes failed` and `signal 6` at fan-out 4, while the same four
+    /// clients without array monitors survived at a HIGHER MEM_USED
+    /// (213,311,488 B vs the 211,804,160 B the aborting run died at) — the
+    /// fan-out was the discriminator, not the memory level.
+    pub snapshot: Arc<Snapshot>,
     /// Origin writer ID. When non-zero, subscribers with the same
     /// `ignore_origin` can filter out self-triggered events.
     /// Used to prevent sequencer write-back loops.
@@ -662,10 +685,15 @@ impl ProcessVariable {
     /// the per-subscriber channel-filter chain, and the slow-consumer
     /// coalesce-overflow accounting are applied identically — one event
     /// class differs per caller, nothing else. The snapshot is built once
-    /// by the caller (one timestamp per logical event) and cloned per
-    /// subscriber.
+    /// by the caller (one timestamp per logical event) and SHARED with every
+    /// subscriber — C's one array behind N field logs. A per-subscription
+    /// filter that rewrites the value pays for its own copy, and only then
+    /// (`Arc::make_mut`), which is also C: the filter chain runs
+    /// per-subscription and a filter that changes the value makes its own
+    /// field log.
     fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot, origin: u64) {
         use crate::server::database::filters::FilteredMonitorEvent;
+        let snapshot = Arc::new(snapshot);
         // Same ambient-origin inheritance as the record funnels
         // (`notify_field_with_origin` / `notify_from_snapshot`): a post
         // carrying no origin of its own inherits the current thread's
@@ -693,7 +721,7 @@ impl ProcessVariable {
                 continue;
             }
             let event = MonitorEvent {
-                snapshot: snapshot.clone(),
+                snapshot: Arc::clone(&snapshot),
                 origin,
                 mask: post,
             };
@@ -954,7 +982,10 @@ impl PvSubscription {
     /// carrying the latest value, because further posts replaced that entry in
     /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-820`).
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
-        Some(self.reader.recv().await?.snapshot)
+        // Free when this reader holds the last reference to the shared
+        // snapshot, which is the single-subscriber case; a copy only when
+        // another subscriber still holds it.
+        Some(Arc::unwrap_or_clone(self.reader.recv().await?.snapshot))
     }
 
     /// Non-blocking [`Self::recv_snapshot`]. Delegates to
@@ -965,7 +996,9 @@ impl PvSubscription {
     /// blocking drain loop with no reactor present
     /// (`doc/rtems-runtime-portability-design.md` §9 phase 6).
     pub fn try_recv_snapshot(&mut self) -> Result<Snapshot, TryRecvError> {
-        self.reader.try_recv().map(|e| e.snapshot)
+        self.reader
+            .try_recv()
+            .map(|e| Arc::unwrap_or_clone(e.snapshot))
     }
 
     /// Await the next change as the full [`MonitorEvent`] — snapshot plus the
@@ -1381,7 +1414,11 @@ mod metadata_tests {
         pv.set(EpicsValue::Double(2.0));
         let ev = rx.try_recv().expect("value event delivered");
         assert_eq!(
-            ev.snapshot.display.expect("metadata on value post").units,
+            ev.snapshot
+                .display
+                .clone()
+                .expect("metadata on value post")
+                .units,
             "degC"
         );
     }
@@ -1409,7 +1446,11 @@ mod metadata_tests {
         pv.set_snapshot(snap);
         let ev = rx.try_recv().expect("snapshot delivered");
         assert_eq!(
-            ev.snapshot.display.expect("caller display kept").units,
+            ev.snapshot
+                .display
+                .clone()
+                .expect("caller display kept")
+                .units,
             "volts"
         );
     }
@@ -1441,6 +1482,7 @@ mod metadata_tests {
         assert_eq!(
             ev.snapshot
                 .display
+                .clone()
                 .expect("property post carries metadata")
                 .units,
             "degC"
@@ -1492,6 +1534,7 @@ mod metadata_tests {
         assert_eq!(
             ev.snapshot
                 .display
+                .clone()
                 .expect("property post carries shadow metadata")
                 .units,
             "degC"

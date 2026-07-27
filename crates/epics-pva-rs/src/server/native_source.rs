@@ -3344,7 +3344,12 @@ ASG(DEFAULT) {
         use epics_base_rs::server::snapshot::Snapshot;
 
         let mk = |mask: EventMask| epics_base_rs::server::pv::MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::SystemTime::now()),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::Double(1.0),
+                0,
+                0,
+                std::time::SystemTime::now(),
+            )),
             origin: 0,
             mask,
         };

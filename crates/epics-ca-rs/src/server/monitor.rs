@@ -116,16 +116,17 @@ pub(crate) fn send_event(
     // scalar DBR_STRING). Clone only when a conversion actually runs
     // (most channels are `Plain`).
     let ls_snap;
-    let snapshot = if long_string_mode == LongStringMode::Plain {
-        &event.snapshot
-    } else {
-        ls_snap = {
-            let mut s = event.snapshot.clone();
-            super::apply_long_string_mode(&mut s, long_string_mode);
-            s
+    let snapshot: &epics_base_rs::server::snapshot::Snapshot =
+        if long_string_mode == LongStringMode::Plain {
+            &event.snapshot
+        } else {
+            ls_snap = {
+                let mut s = (*event.snapshot).clone();
+                super::apply_long_string_mode(&mut s, long_string_mode);
+                s
+            };
+            &ls_snap
         };
-        &ls_snap
-    };
     let mut payload = encode_dbr(data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
     // CA-268: DBR_CLASS_NAME wire payload is always one fixed 40-byte
@@ -242,7 +243,7 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         let event = MonitorEvent {
-            snapshot,
+            snapshot: std::sync::Arc::new(snapshot),
             origin: 0,
             mask: epics_base_rs::server::recgbl::EventMask::VALUE,
         };

@@ -765,3 +765,103 @@ not fixed — the operator's instrument on a shell-less target is the status PVs
 and a periodic unbounded console dump cannot sit above the threads it measures.
 Bounding the census's per-tick output would let it move up; that is a change to
 what the probe prints, not to which band it takes.
+
+### 11.7 The object-arena gate: still not demonstrated, and now bracketed
+
+§11.1 left the gate shipped and its on-target effect unverified. This round
+tried to make it fire, with a standalone RTP (`arenaprobe`, x86_64 VxWorks,
+same toolchain and libc patch as the image) that asks the same question the
+gate asks — `try_lock` on a mutex one statement old and unshared, where `false`
+cannot mean contention and can only mean the target refused the object.
+
+| asked | answer |
+| --- | --- |
+| A: is the arena a flat per-RTP object count? | 20,000 mutex objects created from one thread, **no refusal** |
+| B: which wall does a pool-shaped load meet first? | `pthread_create` refuses at **85 sets / 170 workers**; at that instant `try_lock` still **succeeds** |
+| C: does exhausting the RTP address space exhaust the arena? | with 170 live threads and only 1 further 1 MiB mapping and 109 further 4 KiB pages obtainable, `try_lock` still **succeeds** |
+
+B's 170 × 1536 KiB = 255 MiB matches §10.2's 254 MiB ceiling for this guest, so
+the load really was at the wall. C was run twice, with and without A, because A
+grows whatever backs the objects and would otherwise hand C a pool with slack in
+it; the verdict is identical (109 vs 110 pages, `try_lock` succeeds both times).
+
+So `semMCreate`'s objects are not drawn from the RTP's user address space, and
+the refusal is not a per-RTP object count reachable from one thread. **E8's 588
+event is not reproducible on this rig**, and the two mechanisms that would have
+explained it are now excluded rather than untried. What remains unexplained is
+what was different about E8's process — the measurement there came through a
+`semMCreate` wrap inside the full IOC at 49 sets, and nothing in this probe
+reaches that state before the address-space wall does.
+
+The gate therefore stays as §11.1 left it: unit-tested, costless when the target
+is healthy (one `try_lock` per set), and **never observed to fire on target**.
+
+### 11.8 RTEMS, measured on this branch: the budget is the first gate
+
+e10-residue's RTEMS numbers come from an `origin/main` image, which has neither
+`default_reservation_budget` nor `EPICS_RS_POOL_RESERVATION_MB` — its only
+gates were the count cap and the `EAGAIN` catch, so its 106-client figure is
+arithmetic. Measured instead on this branch's image
+(`scripts/embedded-image.sh rtems ca`, 256 MB `xilinx-zynq-a9`):
+
+```
+WALL attempt=31 held=30
+  CAS: no resources for a new client (worker pool at its thread-memory budget:
+  this set needs 3584 KiB, 158 of 160 MiB already reserved — raise
+  EPICS_RS_POOL_RESERVATION_MB if the target has the memory)
+```
+
+The budget binds at **30 clients**, against a count cap of 141 — not inert, and
+not merely tightest: it is the only gate that is ever reached. The earlier claim
+that 160 MiB is inert on RTEMS was wrong.
+
+Two numbers explain why it is so tight. A set is charged 3584 KiB — `Big` +
+`Medium` stacks (1024 + 512 KiB at RTEMS' 256 KiB unit) plus **2 × 1 MiB of
+`per_thread_overhead`** — while the heap the ramp actually spends is
+`MEM_FREE` 233,299,144 → 198,277,640 over 30 clients, i.e. **1,167,383 B per
+client**. The charge is 3.1× what the target spends, and the whole of that
+excess is the flat 1 MiB per thread, which §10.2 measured on VxWorks as a
+*Rust* thread's own arena and which this RTEMS ramp does not show. Taking
+CAS-client from `Big` to `Medium` (e8-poolprobe's `0176e2ac`, not in this
+branch) makes a set 3072 KiB and moves the wall to ≈35 clients — it does not
+change the order of the gates.
+
+**The switch cannot be turned on RTEMS at all.** `rtems_init.c:195` hands `main`
+a fixed one-element argv and `POSIX_Init` calls `setenv` zero times, so nothing
+outside the image can set `EPICS_RS_POOL_RESERVATION_MB`. The silent-death
+defect §11.2 closes is reachable on VxWorks only; on RTEMS the built-in default
+is the only value that can ever be in force.
+
+### 11.9 Released clients do not give the heap back
+
+Same run, immediately after the wall: all 30 clients closed, then `MEM_FREE`
+sampled for 40 s.
+
+| moment | `MEM_FREE` | `CA_CONN_CNT` | `FD_CNT` |
+| --- | --- | --- | --- |
+| baseline | 233,299,144 | 0 | 8 |
+| at the wall | 198,277,640 | 22 | 30 |
+| +2 s after release | 174,699,304 | 7 | 15 |
+| +40 s after release | 174,698,272 | 7 | 15 |
+
+Descriptors come back and connections come back; the heap does not. It goes
+*further down* by 23,578,336 B across the disconnect and is flat to within
+1 KiB for the next 40 s. Part of the retention is by design — a pool holds its
+idle sets, which is the point of a pool — but that accounts for what the ramp
+spent, not for a further 23.6 MB spent while tearing down.
+
+On the accounting question e10 raised, the reservation ledger is not the leak:
+on `SpawnFailed` the never-created threads' share is released once by
+`spawn_set` (`roster[joins.len()..]`), each created thread releases its own
+share once and unconditionally in `WorkerExit::drop` (first statement, before
+any early return), the created threads are joined before `spawn_set` returns,
+and `acquire`'s error arm releases nothing further — it only gives back the
+`created` slot. Every byte is released exactly once by whoever spent it, so a
+half-created worker cannot be holding a reservation.
+
+What the ledger does *not* cover is the OS thread resource: a set that dies has
+its slot and its reservation returned, but its `JoinHandle`s stay in
+`Registry::joins` until the pool is dropped, so an exited worker is neither
+joined nor detached for the life of the process. That is a live path to
+unreclaimed thread memory, and it is not the one measured above — the sets in
+this run went idle, not dead. Both remain open.

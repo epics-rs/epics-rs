@@ -1173,3 +1173,65 @@ margin and return a further 524,288 B per connection, but the
 `Medium`-client/`Small`-event wall is unmeasured, so no wall number is
 claimed for it.
 
+## 16. `MAX_LINK_DEPTH = 16` silently truncates a legal FLNK chain
+
+Found while establishing that the §15 high-water is depth-inclusive. The
+`E8` set has a 32-deep chain `RTEMS:E8:H` → `L1..L32`; a CA put to `H`
+processes `H` and `L1..L15` and stops. Measured with
+`doc/vx-rig-e8/chainprobe.py`, reading every link rather than sampling:
+
+```
+[    9.3s] chain-1 H          = 1200.0
+[    9.3s] chain-1 L1  depth=1  = 1201.0
+...
+[    9.3s] chain-1 L15 depth=15 = 1215.0
+[    9.3s] chain-1 L16 depth=16 = 0.0
+[    9.3s] chain-1 L17 depth=17 = 0.0
+[    9.3s] chain-1 L18 depth=18 = 0.0
+```
+
+The cause is `process_entry_prelude`
+(`crates/epics-base-rs/src/server/database/processing.rs:1253-1265`):
+
+```rust
+const MAX_LINK_DEPTH: usize = 16;
+...
+if depth >= MAX_LINK_DEPTH {
+    eprintln!("link chain depth limit reached at record {name}");
+    return Ok(None);
+}
+```
+
+and the console confirms it fires, 436 times in one run:
+
+```
+link chain depth limit reached at record RTEMS:E8:L16
+```
+
+**This is a parity deviation.** C has no depth counter on the FLNK path:
+`dbScanPassive` → `processTarget` (`db/dbDbLink.c:427-436`) guards only
+against re-entering a record already in its own cycle (`psrc->pact = TRUE`),
+which bounds *cycles*, not *depth*. C's `MAX_LOCK 10`
+(`db/dbAccess.c:103,544-546`) is unrelated — it raises `SCAN_ALARM` after ten
+attempts to process an already-active record. So a linear 32-deep FLNK
+chain, which is legal and processes fully under C, stops halfway here.
+
+Two aspects make it worse than a bare limit: the bail is `Ok(None)`, so
+nothing is reported to the client and no record alarm is raised — the put
+returns success — and the notice goes to `eprintln!`, which on this target
+reaches only the console and not `errlog` (`doc/vxworks-port.md` §7), so a
+production IOC would show no trace of it at all.
+
+Not fixed here, and deliberately so: raising the bound trades a silent
+truncation for unbounded recursion, and each level is a
+`Pin<Box<dyn Future>>` (`processing.rs:615-626`) — a **heap** allocation per
+link, on the target where §18 shows allocation failure at the wall killing a
+thread. Depth is cheap in stack and expensive in heap here, so the bound is
+entangled with the reservation budget and needs sign-off, not a constant
+bump. Listed in §19.
+
+The upside for §15: because the engine caps at 16, no database can drive the
+recursion deeper, so 65,912 B covers the deepest chain this engine will ever
+walk — the number is depth-inclusive by construction rather than by
+choice of test data.
+

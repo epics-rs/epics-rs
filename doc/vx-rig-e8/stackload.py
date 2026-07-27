@@ -286,6 +286,12 @@ for r in range(ROUNDS):
                      "ok%s" % ("" if got is None else " bytes=%d" % got))
             except Exception as e:
                 note(name, False, time.time() - t, classify(e))
+            # Which (round, connection) a stall lands on is the only thing that
+            # distinguishes a load-dependent outlier from a first-touch one.
+            el = time.time() - t
+            if el > 5.0:
+                log("SLOW %s round=%d conn=%d t0=%.3f elapsed=%.3f"
+                    % (name, r + 1, i + 1, t - T0, el))
         c.drain()
     if r == 0:
         for k in sorted(stats):

@@ -355,119 +355,130 @@ impl EpicsValue {
         }
     }
 
-    /// Serialize a value to bytes for writing
+    /// Serialize a value to bytes for writing.
+    ///
+    /// Thin wrapper over [`EpicsValue::write_into`], which is the single
+    /// owner of the wire layout. Prefer `write_into` on any path that
+    /// already has a destination buffer: C's `dbGet` converts the field
+    /// straight into the reply buffer (`dbAccess.c:1020`) and never
+    /// materialises a standalone payload, so a wide array should be written
+    /// once rather than built here and copied.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_into(&mut buf);
+        buf
+    }
+
+    /// Append this value's CA wire bytes to `dst`.
+    ///
+    /// The port of C `convert(paddr, pbuf, ...)` writing into the payload
+    /// space `cas_copy_in_header` reserved inside the client's send buffer
+    /// (`camessage.c:516` → `dbAccess.c:1020`): one materialisation of the
+    /// value, in the buffer that will be written to the socket.
+    pub fn write_into(&self, dst: &mut Vec<u8>) {
         match self {
             Self::String(s) => {
                 let mut buf = [0u8; 40];
                 let bytes = s.as_bytes();
                 let len = bytes.len().min(39);
                 buf[..len].copy_from_slice(&bytes[..len]);
-                buf.to_vec()
+                dst.extend_from_slice(&buf);
             }
-            Self::Short(v) => v.to_be_bytes().to_vec(),
-            Self::Float(v) => v.to_be_bytes().to_vec(),
-            Self::Enum(v) => v.to_be_bytes().to_vec(),
-            Self::EnumWithChoices { index, .. } => index.to_be_bytes().to_vec(),
-            Self::Char(v) => vec![*v],
-            Self::Long(v) => v.to_be_bytes().to_vec(),
-            Self::Double(v) => v.to_be_bytes().to_vec(),
+            Self::Short(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Float(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Enum(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::EnumWithChoices { index, .. } => dst.extend_from_slice(&index.to_be_bytes()),
+            Self::Char(v) => dst.push(*v),
+            Self::Long(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Double(v) => dst.extend_from_slice(&v.to_be_bytes()),
             // Over CA, Int64 is served as Double (8-byte f64 big-endian).
             // Precision is lost for |v| > 2^53; that is a CA protocol limitation.
-            Self::Int64(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::Int64(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // UInt64 mirrors Int64: no CA wire type, served as DBR_DOUBLE.
-            Self::UInt64(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::UInt64(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // DBF_USHORT promotes to DBR_LONG on the wire
             // (db_convert.h `dbDBRnewToDBRold[DBR_USHORT] = DBR_LONG`); a u16
             // fits losslessly in i32. Emit 4 promoted big-endian bytes to
             // match `dbr_type()` == Long.
-            Self::UShort(v) => (*v as i32).to_be_bytes().to_vec(),
+            Self::UShort(v) => dst.extend_from_slice(&(*v as i32).to_be_bytes()),
             // DBF_ULONG promotes to DBR_DOUBLE on the wire
             // (db_convert.h `dbDBRnewToDBRold[DBR_ULONG] = DBR_DOUBLE`),
             // mirroring UInt64. Emit 8 promoted big-endian bytes.
-            Self::ULong(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::ULong(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // DBF_UCHAR promotes to DBR_CHAR on the wire (db_convert.h
             // `dbDBRnewToDBRold[DBR_UCHAR] = DBR_CHAR`); the raw byte is
             // identical to `Char`, only the interpretation is unsigned.
-            Self::UChar(v) => vec![*v],
+            Self::UChar(v) => dst.push(*v),
             Self::ShortArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 2);
+                dst.reserve(arr.len() * 2);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::FloatArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::EnumArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 2);
+                dst.reserve(arr.len() * 2);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::DoubleArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::LongArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::Int64Array(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
             Self::UInt64Array(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
             // DBF_USHORT[] promotes element-wise to DBR_LONG[] (4 bytes each).
             Self::UShortArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as i32).to_be_bytes());
+                    dst.extend_from_slice(&(*v as i32).to_be_bytes());
                 }
-                buf
             }
             // DBF_ULONG[] promotes element-wise to DBR_DOUBLE[] (8 bytes each).
             Self::ULongArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
-            Self::CharArray(arr) => arr.clone(),
+            Self::CharArray(arr) => dst.extend_from_slice(arr),
             // DBF_UCHAR[] promotes to DBR_CHAR[] over CA (identical raw bytes,
             // same as CharArray); the unsigned interpretation is carried by
             // the type, not the wire bytes.
-            Self::UCharArray(arr) => arr.clone(),
+            Self::UCharArray(arr) => dst.extend_from_slice(arr),
             Self::StringArray(arr) => {
-                let mut buf = vec![0u8; arr.len() * 40];
+                let start = dst.len();
+                dst.resize(start + arr.len() * 40, 0);
                 for (i, s) in arr.iter().enumerate() {
                     let bytes = s.as_bytes();
                     let len = bytes.len().min(39);
-                    buf[i * 40..i * 40 + len].copy_from_slice(&bytes[..len]);
+                    let at = start + i * 40;
+                    dst[at..at + len].copy_from_slice(&bytes[..len]);
                 }
-                buf
             }
         }
     }

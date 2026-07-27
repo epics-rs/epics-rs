@@ -14,6 +14,7 @@ pub mod beacon;
 pub mod blocking;
 #[cfg(not(epics_embedded_target))]
 pub mod ca_server;
+pub(crate) mod frame;
 #[cfg(not(epics_embedded_target))]
 pub mod introspection;
 pub mod ioc_app;

@@ -55,10 +55,20 @@ fn epics_timestamp_parts(timestamp: WallTime) -> (u32, u32) {
 
 /// Convert value to the target native type and serialize to bytes.
 fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    convert_and_serialize_into(native, value, &mut buf);
+    Ok(buf)
+}
+
+/// [`convert_and_serialize`] appending into a caller-owned buffer. When the
+/// value already has the requested native type — every monitor on an
+/// unconverted field — the bytes go straight onto `dst` with no intermediate.
+fn convert_and_serialize_into(native: DbFieldType, value: &EpicsValue, dst: &mut Vec<u8>) {
     if value.dbr_type() == native {
-        return Ok(value.to_bytes());
+        value.write_into(dst);
+    } else {
+        value.convert_to(native).write_into(dst);
     }
-    Ok(value.convert_to(native).to_bytes())
 }
 
 // precision-aware `*_STRING` rendering of a numeric field.
@@ -388,17 +398,37 @@ pub(crate) fn dbr_meta_size(dbr_type: u16, native: DbFieldType) -> usize {
     }
 }
 
+/// Append the STS metadata prefix (`status`, `severity`, RISC pad).
+fn write_sts_meta(dst: &mut Vec<u8>, native: DbFieldType, status: u16, severity: u16) {
+    dst.extend_from_slice(&status.to_be_bytes());
+    dst.extend_from_slice(&severity.to_be_bytes());
+    dst.extend_from_slice(sts_pad(native));
+}
+
+/// Append the TIME metadata prefix (STS plus the EPICS timestamp).
+fn write_time_meta(
+    dst: &mut Vec<u8>,
+    native: DbFieldType,
+    status: u16,
+    severity: u16,
+    timestamp: WallTime,
+) {
+    let (secs, nanos) = epics_timestamp_parts(timestamp);
+    dst.extend_from_slice(&status.to_be_bytes());
+    dst.extend_from_slice(&severity.to_be_bytes());
+    dst.extend_from_slice(&secs.to_be_bytes());
+    dst.extend_from_slice(&nanos.to_be_bytes());
+    dst.extend_from_slice(time_pad(native));
+}
+
 fn serialize_sts(
     native: DbFieldType,
     val_bytes: &[u8],
     status: u16,
     severity: u16,
 ) -> CaResult<Vec<u8>> {
-    let pad = sts_pad(native);
-    let mut buf = Vec::with_capacity(4 + pad.len() + val_bytes.len());
-    buf.extend_from_slice(&status.to_be_bytes());
-    buf.extend_from_slice(&severity.to_be_bytes());
-    buf.extend_from_slice(pad);
+    let mut buf = Vec::with_capacity(4 + sts_pad(native).len() + val_bytes.len());
+    write_sts_meta(&mut buf, native, status, severity);
     buf.extend_from_slice(val_bytes);
     Ok(buf)
 }
@@ -410,14 +440,8 @@ fn serialize_time(
     severity: u16,
     timestamp: WallTime,
 ) -> CaResult<Vec<u8>> {
-    let (secs, nanos) = epics_timestamp_parts(timestamp);
-    let pad = time_pad(native);
-    let mut buf = Vec::with_capacity(12 + pad.len() + val_bytes.len());
-    buf.extend_from_slice(&status.to_be_bytes());
-    buf.extend_from_slice(&severity.to_be_bytes());
-    buf.extend_from_slice(&secs.to_be_bytes());
-    buf.extend_from_slice(&nanos.to_be_bytes());
-    buf.extend_from_slice(pad);
+    let mut buf = Vec::with_capacity(12 + time_pad(native).len() + val_bytes.len());
+    write_time_meta(&mut buf, native, status, severity, timestamp);
     buf.extend_from_slice(val_bytes);
     Ok(buf)
 }
@@ -500,10 +524,41 @@ fn serialize_gr_ctrl(
 
 /// Encode a DBR response from a Snapshot. GR/CTRL types include real metadata.
 /// Plain/Sts/Time are byte-identical to serialize_dbr output.
+///
+/// Thin wrapper over [`encode_dbr_into`] — use that on any path that already
+/// owns the buffer the bytes are headed for.
 pub fn encode_dbr(
     dbr_type: u16,
     snapshot: &crate::server::snapshot::Snapshot,
 ) -> CaResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    encode_dbr_into(&mut buf, dbr_type, snapshot)?;
+    Ok(buf)
+}
+
+/// Append the DBR wire body for `snapshot` to `dst`, leaving whatever `dst`
+/// already holds untouched.
+///
+/// This is the shape C uses. `read_reply` never builds a standalone payload:
+/// `cas_copy_in_header` reserves the header *and* the payload inside the
+/// client's existing send buffer and hands back `pPayload`
+/// (`rsrv/camessage.c:516`), then `dbGet`'s `!dbfl_has_copy(pfl)` arm converts
+/// the record's live field straight into that space (`dbAccess.c:1020`). So the
+/// caller reserves its header room in `dst` and the metadata plus the converted
+/// value land after it — a 1 MiB waveform is materialised once, not built here
+/// and copied into a frame.
+///
+/// One deviation remains and is deliberate: a request whose DBR type differs
+/// from the value's native type still builds a converted `EpicsValue` first
+/// (`convert_and_serialize` → `EpicsValue::convert_to`), because the port's
+/// conversion is value-to-value where C's `convert()` is field-to-buffer. The
+/// native-type case — every monitor on an unconverted field, including the
+/// array fan-out this exists for — takes the zero-copy path.
+pub fn encode_dbr_into(
+    dst: &mut Vec<u8>,
+    dbr_type: u16,
+    snapshot: &crate::server::snapshot::Snapshot,
+) -> CaResult<()> {
     // CLASS_NAME (38) emits a fixed 40-byte string from
     // snapshot.class_name and ignores snapshot.value entirely.
     // Early-return BEFORE convert_and_serialize so a waveform PV's
@@ -517,32 +572,26 @@ pub fn encode_dbr(
             let len = bytes.len().min(39);
             buf[..len].copy_from_slice(&bytes[..len]);
         }
-        return Ok(buf.to_vec());
+        dst.extend_from_slice(&buf);
+        return Ok(());
     }
     let native = super::native_type_for_dbr(dbr_type)?;
-    // a `*_STRING` request of a Double/Float field must honor the
-    // record's precision (C `getDoubleString` → `cvtDoubleToString`).
-    // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
-    // route string requests through the precision-aware converter here.
-    let val_bytes = if native == DbFieldType::String {
-        convert_value_to_dbr_string(&snapshot.value, snapshot).to_bytes()
-    } else {
-        convert_and_serialize(native, &snapshot.value)?
-    };
     let status = snapshot.alarm.status;
     let severity = snapshot.alarm.severity;
 
+    // Metadata first — it precedes the value in every DBR layout — so the
+    // value can then be converted directly onto the tail of `dst`.
     match dbr_type {
-        0..=6 => Ok(val_bytes),
-        7..=13 => serialize_sts(native, &val_bytes, status, severity),
-        14..=20 => serialize_time(native, &val_bytes, status, severity, snapshot.timestamp),
-        21..=27 => encode_gr(native, &val_bytes, snapshot),
-        28..=34 => encode_ctrl(native, &val_bytes, snapshot),
+        0..=6 => {}
+        7..=13 => write_sts_meta(dst, native, status, severity),
+        14..=20 => write_time_meta(dst, native, status, severity, snapshot.timestamp),
+        21..=27 => write_gr_meta(dst, native, snapshot),
+        28..=34 => write_ctrl_meta(dst, native, snapshot),
         // PUT_ACKT (35) and PUT_ACKS (36) are write-only on the wire:
         // the server should never produce them in a read response. We
         // expose a no-op encoding so callers that round-trip through
         // encode_dbr (e.g. forwarders) don't fail loudly.
-        super::DBR_PUT_ACKT | super::DBR_PUT_ACKS => Ok(val_bytes),
+        super::DBR_PUT_ACKT | super::DBR_PUT_ACKS => {}
         // STSACK_STRING — alarm acknowledge string response. Layout:
         //   status(2) severity(2) ackt(2) acks(2) value(40) = 48 bytes.
         // ackt/acks are taken from snapshot.alarm if available; the
@@ -550,113 +599,89 @@ pub fn encode_dbr(
         super::DBR_STSACK_STRING => {
             let ackt = snapshot.alarm.ackt.unwrap_or(0);
             let acks = snapshot.alarm.acks.unwrap_or(0);
-            let mut buf = Vec::with_capacity(8 + val_bytes.len());
-            buf.extend_from_slice(&status.to_be_bytes());
-            buf.extend_from_slice(&severity.to_be_bytes());
-            buf.extend_from_slice(&ackt.to_be_bytes());
-            buf.extend_from_slice(&acks.to_be_bytes());
-            buf.extend_from_slice(&val_bytes);
-            Ok(buf)
+            dst.extend_from_slice(&status.to_be_bytes());
+            dst.extend_from_slice(&severity.to_be_bytes());
+            dst.extend_from_slice(&ackt.to_be_bytes());
+            dst.extend_from_slice(&acks.to_be_bytes());
         }
         // CLASS_NAME (38) handled by the early-return above.
-        _ => Err(CaError::UnsupportedType(dbr_type)),
+        _ => return Err(CaError::UnsupportedType(dbr_type)),
     }
+
+    // a `*_STRING` request of a Double/Float field must honor the
+    // record's precision (C `getDoubleString` → `cvtDoubleToString`).
+    // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
+    // route string requests through the precision-aware converter here.
+    if native == DbFieldType::String {
+        convert_value_to_dbr_string(&snapshot.value, snapshot).write_into(dst);
+    } else {
+        convert_and_serialize_into(native, &snapshot.value, dst);
+    }
+    Ok(())
 }
 
-/// Encode GR (graphic/display) metadata + value.
-fn encode_gr(
+/// Append GR (graphic/display) metadata — the real snapshot values, not the
+/// zeroed layout `serialize_gr_ctrl` emits.
+fn write_gr_meta(
+    dst: &mut Vec<u8>,
     native: DbFieldType,
-    val_bytes: &[u8],
     snapshot: &crate::server::snapshot::Snapshot,
-) -> CaResult<Vec<u8>> {
-    let status = snapshot.alarm.status;
-    let severity = snapshot.alarm.severity;
-    let mut buf = Vec::with_capacity(96 + val_bytes.len());
-    buf.extend_from_slice(&status.to_be_bytes());
-    buf.extend_from_slice(&severity.to_be_bytes());
+) {
+    write_gr_ctrl_meta(dst, native, snapshot, 6)
+}
+
+/// Append CTRL (control) metadata. Same as GR but with 8 limits (adds
+/// upper/lower ctrl).
+fn write_ctrl_meta(
+    dst: &mut Vec<u8>,
+    native: DbFieldType,
+    snapshot: &crate::server::snapshot::Snapshot,
+) {
+    write_gr_ctrl_meta(dst, native, snapshot, 8)
+}
+
+/// The one GR/CTRL metadata layout owner; `n_limits` (6 vs 8) is the only
+/// difference between the two DBR classes.
+fn write_gr_ctrl_meta(
+    dst: &mut Vec<u8>,
+    native: DbFieldType,
+    snapshot: &crate::server::snapshot::Snapshot,
+    n_limits: usize,
+) {
+    dst.extend_from_slice(&snapshot.alarm.status.to_be_bytes());
+    dst.extend_from_slice(&snapshot.alarm.severity.to_be_bytes());
 
     match native {
         DbFieldType::String => {
-            buf.extend_from_slice(sts_pad(native));
+            dst.extend_from_slice(sts_pad(native));
         }
         DbFieldType::Enum => {
-            encode_enum_metadata(&mut buf, snapshot);
+            encode_enum_metadata(dst, snapshot);
         }
         DbFieldType::Float => {
-            encode_prec_units_limits_f32(&mut buf, snapshot, 6);
+            encode_prec_units_limits_f32(dst, snapshot, n_limits);
         }
         DbFieldType::Double => {
-            encode_prec_units_limits_f64(&mut buf, snapshot, 6);
+            encode_prec_units_limits_f64(dst, snapshot, n_limits);
         }
         DbFieldType::Short => {
-            encode_units_limits_i16(&mut buf, snapshot, 6);
+            encode_units_limits_i16(dst, snapshot, n_limits);
         }
-        // DBF_USHORT promotes to DBR_LONG; use the Long GR layout.
+        // DBF_USHORT promotes to DBR_LONG; use the Long GR/CTRL layout.
         DbFieldType::Long | DbFieldType::UShort => {
-            encode_units_limits_i32(&mut buf, snapshot, 6);
+            encode_units_limits_i32(dst, snapshot, n_limits);
         }
-        // DBF_UCHAR promotes to DBR_CHAR; use the Char GR layout.
+        // DBF_UCHAR promotes to DBR_CHAR; use the Char GR/CTRL layout.
         DbFieldType::Char | DbFieldType::UChar => {
-            encode_units_limits_u8(&mut buf, snapshot, 6);
-            buf.push(0); // RISC_pad
+            encode_units_limits_u8(dst, snapshot, n_limits);
+            dst.push(0); // RISC_pad
         }
-        // Int64/UInt64/ULong have no CA GR type; use Double layout (DBF_ULONG
-        // promotes to DBR_DOUBLE).
+        // Int64/UInt64/ULong have no CA GR/CTRL type; use Double layout
+        // (DBF_ULONG promotes to DBR_DOUBLE).
         DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
-            encode_prec_units_limits_f64(&mut buf, snapshot, 6);
+            encode_prec_units_limits_f64(dst, snapshot, n_limits);
         }
     }
-
-    buf.extend_from_slice(val_bytes);
-    Ok(buf)
-}
-
-/// Encode CTRL (control) metadata + value. Same as GR but with 8 limits (adds upper/lower ctrl).
-fn encode_ctrl(
-    native: DbFieldType,
-    val_bytes: &[u8],
-    snapshot: &crate::server::snapshot::Snapshot,
-) -> CaResult<Vec<u8>> {
-    let status = snapshot.alarm.status;
-    let severity = snapshot.alarm.severity;
-    let mut buf = Vec::with_capacity(96 + val_bytes.len());
-    buf.extend_from_slice(&status.to_be_bytes());
-    buf.extend_from_slice(&severity.to_be_bytes());
-
-    match native {
-        DbFieldType::String => {
-            buf.extend_from_slice(sts_pad(native));
-        }
-        DbFieldType::Enum => {
-            encode_enum_metadata(&mut buf, snapshot);
-        }
-        DbFieldType::Float => {
-            encode_prec_units_limits_f32(&mut buf, snapshot, 8);
-        }
-        DbFieldType::Double => {
-            encode_prec_units_limits_f64(&mut buf, snapshot, 8);
-        }
-        DbFieldType::Short => {
-            encode_units_limits_i16(&mut buf, snapshot, 8);
-        }
-        // DBF_USHORT promotes to DBR_LONG; use the Long CTRL layout.
-        DbFieldType::Long | DbFieldType::UShort => {
-            encode_units_limits_i32(&mut buf, snapshot, 8);
-        }
-        // DBF_UCHAR promotes to DBR_CHAR; use the Char CTRL layout.
-        DbFieldType::Char | DbFieldType::UChar => {
-            encode_units_limits_u8(&mut buf, snapshot, 8);
-            buf.push(0); // RISC_pad
-        }
-        // Int64/UInt64/ULong have no CA CTRL type; use Double layout (DBF_ULONG
-        // promotes to DBR_DOUBLE).
-        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
-            encode_prec_units_limits_f64(&mut buf, snapshot, 8);
-        }
-    }
-
-    buf.extend_from_slice(val_bytes);
-    Ok(buf)
 }
 
 /// Write units field (8 bytes, null-padded).

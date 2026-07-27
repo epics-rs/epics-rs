@@ -649,6 +649,13 @@ drivers share:
   flag rather than `O_NONBLOCK` because the reader pump shares this exact file
   description and must not be switched to non-blocking underneath.
 
+  **The second sentence is superseded (v0.25.2).** The flag is not a bound —
+  XNU decides from `so_state & SS_NBIO` and ignores what the caller passes, and
+  this target was never measured honouring it — so `write_frame_deadline` owns
+  the mode after all. Switching the shared description is safe because the
+  reader pump was converted with it: it polls `POLLIN` instead of parking in
+  `read`. See `doc/darwin-send-dontwait-gap.md`.
+
 Waiting for `POLLOUT` alone is not enough, and getting that wrong cost a round:
 a blocking `write` on a stream socket does not return a short count when the
 send buffer fills, it waits until the *whole* buffer is queued, so the write

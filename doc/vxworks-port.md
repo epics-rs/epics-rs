@@ -689,9 +689,12 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   fatally, so a CA client on this target established no circuits at all.
   The first fix for that made the option best-effort and was a workaround; the
   round that closed it moved the bound inside `write_frame_deadline`
-  (`poll(POLLOUT, remaining)` + `send(MSG_DONTWAIT)`), so the send deadline no
-  longer depends on a socket option any target may refuse and `SO_SNDTIMEO` is
-  now set nowhere in the write path. Measured on target in one boot against a
+  (`poll(POLLOUT, remaining)` over a socket the function itself puts in
+  non-blocking mode), so the send deadline no longer depends on a socket option
+  any target may refuse and `SO_SNDTIMEO` is now set nowhere in the write path.
+  That first landed resting on `send(MSG_DONTWAIT)` rather than on the mode,
+  which Darwin ignores and this target was never measured honouring; corrected
+  in v0.25.2, `doc/darwin-send-dontwait-gap.md`. Measured on target in one boot against a
   peer that accepts and never reads: the bounded path returned at **2016 ms
   against a 2000 ms deadline**, the old path had not returned **127.5 s** later
   and still held its descriptor (§5.1). This removes `SEND_TICKS_PER_DEADLINE`

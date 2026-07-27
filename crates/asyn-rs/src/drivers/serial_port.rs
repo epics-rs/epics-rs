@@ -322,6 +322,35 @@ fn option_unsupported_here(key: &str) -> AsynError {
     }
 }
 
+/// Write `speed` into both directions of `t`, reporting the platform's own
+/// refusal instead of discarding it. The single owner of that write: nothing
+/// else may call `cfset[io]speed`, so a caller cannot forget the check.
+///
+/// C tests both returns and answers asynError carrying the `strerror` text
+/// (`drvAsynSerialPort.c:346-355`). Dropping that is not cosmetic, because
+/// `cfsetospeed` is where a platform enforces its speed table — and the table
+/// is not implied by `B300 == 300`. Measured on RTEMS 6:
+/// `rtems_termios_baud_to_number(31250)` is 0 and `cfsetospeed` refuses the
+/// rate, leaving the previous one, while a `tcsetattr` carrying 31250 in
+/// `c_ospeed` directly is accepted and reads back. Without the check
+/// `set_option("baud", "31250")` answered `Ok` and `get_option("baud")` then
+/// reported 31250 on a line still running at 9600.
+fn set_termios_speed(t: &mut platform::termios, speed: platform::Speed) -> AsynResult<()> {
+    if unsafe { platform::cfsetispeed(t, speed) } < 0 {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("cfsetispeed returned {}", std::io::Error::last_os_error()),
+        });
+    }
+    if unsafe { platform::cfsetospeed(t, speed) } < 0 {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("cfsetospeed returned {}", std::io::Error::last_os_error()),
+        });
+    }
+    Ok(())
+}
+
 impl SerialConfig {
     /// Apply this configuration to a raw termios struct.
     ///
@@ -334,10 +363,7 @@ impl SerialConfig {
             status: AsynStatus::Error,
             message: format!("unsupported baud rate: {}", self.baud),
         })?;
-        unsafe {
-            platform::cfsetispeed(t, baud);
-            platform::cfsetospeed(t, baud);
-        }
+        set_termios_speed(t, baud)?;
 
         // Data bits
         t.c_cflag &= !platform::CSIZE;
@@ -403,9 +429,17 @@ impl SerialConfig {
 /// asynError ("Unsupported data rate", lines 340-343) for anything outside it.
 ///
 /// Both embedded targets are in the first group — VxWorks at `termios.h:22-52`
-/// and RTEMS at `sys/_termios.h:186-221` — so both accept arbitrary rates
-/// exactly as C does there. Which group a target is in is `asyn_baud_code_is_rate`,
-/// named once in `build.rs` because this file asks the question three times.
+/// and RTEMS at `sys/_termios.h:186-221` — so both take the passthrough branch
+/// exactly as C does there. Which group a target is in is
+/// `asyn_baud_code_is_rate`, named once in `build.rs` because this file asks
+/// the question three times.
+///
+/// Passthrough here is not a promise that the *device* will take the rate, and
+/// C makes no such promise either: it is only the statement that this platform
+/// has no separate encoding to look the rate up in. Measured on RTEMS 6, where
+/// `rtems_termios_baud_to_number(31250)` is 0 and `cfsetospeed` refuses the
+/// rate outright — which is why [`set_termios_speed`], not this function, is
+/// where a rate is finally accepted or refused.
 fn baud_to_speed(baud: u32) -> Option<platform::Speed> {
     #[cfg(asyn_baud_code_is_rate)]
     {
@@ -1290,10 +1324,7 @@ impl PortDriver for DrvAsynSerialPort {
                         status: AsynStatus::Error,
                         message: format!("Unsupported data rate ({baud} baud)"),
                     })?;
-                unsafe {
-                    platform::cfsetispeed(&mut self.termios, speed);
-                    platform::cfsetospeed(&mut self.termios, speed);
-                }
+                set_termios_speed(&mut self.termios, speed)?;
                 self.baud = baud as u32;
             }
             "bits" => {
@@ -3084,6 +3115,34 @@ mod tests {
         assert!(
             matches!(platform::drain(-1), Some(Err(_))),
             "hosted unix has tcdrain; -1 must fail as an fd, not as a facility"
+        );
+    }
+
+    /// A speed the platform's own `cfsetospeed` refuses must come back as an
+    /// error, not as a silently unchanged rate.
+    ///
+    /// `baud_to_speed` keeps an invalid code from reaching here through the
+    /// public API on this host, so the owner is exercised directly — which is
+    /// the point: it is the owner, not the caller, that has to refuse. The
+    /// failure this reproduces was measured on RTEMS, where the rate reached
+    /// `cfsetospeed` and was dropped.
+    #[test]
+    fn a_speed_the_platform_refuses_is_an_error_not_a_silent_no_op() {
+        let mut t: platform::termios = unsafe { std::mem::zeroed() };
+        set_termios_speed(&mut t, platform::B9600).expect("9600 is settable everywhere");
+        let before = unsafe { libc::cfgetospeed(&t) };
+        let bogus = platform::Speed::MAX / 2;
+        let r = set_termios_speed(&mut t, bogus);
+        assert!(
+            matches!(&r, Err(AsynError::Status { message, .. })
+                     if message.starts_with("cfsetispeed returned")
+                     || message.starts_with("cfsetospeed returned")),
+            "must name the call C names, got {r:?}"
+        );
+        assert_eq!(
+            unsafe { libc::cfgetospeed(&t) },
+            before,
+            "a refused speed must leave the previous rate in place"
         );
     }
 

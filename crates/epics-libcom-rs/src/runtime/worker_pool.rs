@@ -177,6 +177,20 @@ struct SetHandle {
     /// `state` from there would be the deadlock the order exists to prevent.
     dead: AtomicBool,
     state: Mutex<SetState>,
+    /// This set's own threads, so the owner that returns the set's slot can
+    /// return its *threads* in the same step.
+    ///
+    /// On the set and not in a flat registry vector because a handle has to be
+    /// findable from the set that is retiring, and the only identity a set has
+    /// is its `Arc` — `index` is reused once a slot comes back, so it cannot key
+    /// this. A pool-wide vector had no way to say which handles had just died,
+    /// and so said nothing: an exited worker stayed neither joined nor detached
+    /// for the life of the process, holding its stack.
+    ///
+    /// Emptied by retirement, which *detaches* — the last thread out is one of
+    /// these threads, and a thread cannot join itself. Drained by teardown,
+    /// which joins, because there the caller is not one of them.
+    joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Everything the pool mutates, under one lock. Never taken while a set lock is
@@ -192,8 +206,6 @@ struct Registry {
     /// so it is the true bound on creations — the number the per-connection
     /// shape grew without limit.
     created: usize,
-    /// Every worker thread, for the join at teardown.
-    joins: Vec<JoinHandle<()>>,
     /// Set once teardown has begun; a set freed after this is not re-pooled.
     stopping: bool,
 }
@@ -228,6 +240,13 @@ impl PoolInner {
 
 fn lock_set(set: &SetHandle) -> std::sync::MutexGuard<'_, SetState> {
     set.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The set's own thread handles. Innermost of the three locks — taken while the
+/// pool lock is held, and nothing is taken while *it* is held — so it adds no
+/// new order to the pool/set pair.
+fn lock_joins(set: &SetHandle) -> std::sync::MutexGuard<'_, Vec<JoinHandle<()>>> {
+    set.joins.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Push a set back to idle if a transition just freed it. Called from both the
@@ -496,6 +515,13 @@ impl Drop for WorkerExit {
                 if last_gone {
                     reg.all.retain(|s| !Arc::ptr_eq(s, &self.set));
                     reg.created -= 1;
+                    // The slot and the *threads* come back in one step. Dropping
+                    // a `JoinHandle` detaches, which is the only move available
+                    // here: the caller is the set's last thread and cannot join
+                    // itself. Left undone, an exited worker stayed neither
+                    // joined nor detached until the pool dropped, holding its
+                    // stack for the life of the process.
+                    lock_joins(&self.set).clear();
                 }
             }
         }
@@ -1295,7 +1321,6 @@ impl<const N: usize> WorkerPool<N> {
                     idle: VecDeque::new(),
                     all: Vec::new(),
                     created: 0,
-                    joins: Vec::new(),
                     stopping: false,
                 }),
             }),
@@ -1366,9 +1391,8 @@ impl<const N: usize> WorkerPool<N> {
                     });
                 }
                 match self.spawn_set(index) {
-                    Ok((set, joins)) => {
+                    Ok(set) => {
                         let mut reg = self.inner.lock();
-                        reg.joins.extend(joins);
                         reg.all.push(set.clone());
                         set
                     }
@@ -1411,7 +1435,7 @@ impl<const N: usize> WorkerPool<N> {
 
     /// Spawn one set's `N` threads. On a partway failure the threads already
     /// created are stopped and joined, so a failed grow leaks nothing.
-    fn spawn_set(&self, index: usize) -> io::Result<(Arc<SetHandle>, Vec<JoinHandle<()>>)> {
+    fn spawn_set(&self, index: usize) -> io::Result<Arc<SetHandle>> {
         let mut senders = Vec::with_capacity(N);
         let mut receivers = Vec::with_capacity(N);
         for _ in 0..N {
@@ -1432,6 +1456,7 @@ impl<const N: usize> WorkerPool<N> {
                 // no short-staffed set is ever counted here.
                 live_workers: N,
             }),
+            joins: Mutex::new(Vec::with_capacity(N)),
         });
 
         // The object-arena gate. Nothing has been created yet, so refusing here
@@ -1496,7 +1521,10 @@ impl<const N: usize> WorkerPool<N> {
                 }
             }
         }
-        Ok((set, joins))
+        // The set owns its threads from here on: nothing outside it can retire
+        // them, and its own retirement cannot forget them.
+        lock_joins(&set).extend(joins);
+        Ok(set)
     }
 
     /// Threads this pool has created, ever — never more than
@@ -1528,13 +1556,16 @@ impl<const N: usize> Drop for WorkerPool<N> {
             let mut reg = self.inner.lock();
             reg.stopping = true;
             reg.idle.clear();
-            let joins = std::mem::take(&mut reg.joins);
             // One `Stop` per worker across *every* set — leased or idle — so no
             // worker is left parked on `recv`. `all` is what makes a leased set's
-            // senders reachable here; the idle deque alone would miss them.
+            // senders reachable here; the idle deque alone would miss them. A
+            // retired set is not in `all` and needs neither: its threads were
+            // stopped and detached when its slot went back.
             let mut senders: Vec<Sender<Assignment>> = Vec::new();
+            let mut joins: Vec<JoinHandle<()>> = Vec::new();
             for set in &reg.all {
                 senders.extend(set.senders.iter().cloned());
+                joins.append(&mut lock_joins(set));
             }
             (senders, joins)
         };
@@ -2044,6 +2075,60 @@ mod tests {
         }
         pool.acquire()
             .expect("the budget freed by the dead set must admit a new one");
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: the owner that returns a set's slot return the set's *threads* in
+    /// the same step. MUST NOT: an exited worker be left neither joined nor
+    /// detached.
+    ///
+    /// The defect: every worker's `JoinHandle` went into one pool-wide vector
+    /// that nothing ever pruned, because a flat vector cannot say which handles
+    /// belong to the set that just died — `index` is reused as soon as a slot
+    /// comes back, so it cannot key them either. A set therefore gave back its
+    /// slot and its reservation while its threads stayed unreaped until the pool
+    /// dropped, which for a server-lifetime pool is the life of the process. The
+    /// handles now live on the set, so the retirement that already owns the slot
+    /// owns them too.
+    #[test]
+    fn a_dead_set_retires_its_thread_handles_with_its_slot() {
+        let pool: WorkerPool<2> = WorkerPool::new("test-joins", roster2(), 4);
+        let (lease, [reader, _writer]) = pool.acquire().expect("borrow");
+        // Held past the set's retirement on purpose: this is the only vantage
+        // from which "the slot came back but the threads did not" is visible.
+        let set = lease.set.clone();
+        assert_eq!(
+            lock_joins(&set).len(),
+            2,
+            "a live set owns one handle per thread"
+        );
+
+        let (go, wait) = channel::<()>();
+        let job = reader.run(move || {
+            let _ = wait.recv();
+            std::panic::panic_any(PanicOnDrop);
+        });
+        drop(job);
+        drop(lease);
+        go.send(()).expect("the worker is waiting on this");
+        drop(go);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.set_usage().1 != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the dead set never gave its slot back: {:?}",
+                pool.set_usage()
+            );
+            thread::yield_now();
+        }
+        assert!(
+            lock_joins(&set).is_empty(),
+            "the slot came back and the threads did not — {} handle(s) still \
+             neither joined nor detached",
+            lock_joins(&set).len()
+        );
     }
 
     /// The budget's two policy inputs, both arms of each, without needing the

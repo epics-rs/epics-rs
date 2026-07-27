@@ -746,6 +746,21 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   `unresponsiveCircuitNotify` keeps the socket, our name-service reader ends and
   redials after `CONN_TMO`
   ([§3.5](vxworks-circuit-wedge-on-target-measurement.md)).
+
+  **The verdict and the descriptor now land together.** Retiring the reader is
+  not retiring the circuit: a descriptor lives until *both* halves are dropped,
+  and the reconnect backoff sat in the same scope as the send half, so a circuit
+  the watchdog had just declared unresponsive stayed open a further
+  `EPICS_CA_CONN_TMO` — 69.6 s of socket for a 35 s verdict, on the host test
+  that now bounds it. `serve_nameserver_circuit` is the circuit's scope and the
+  backoff is in its caller. Measured on the rig against a control image that
+  differs by that one hunk: the descriptor goes at `seq=16` with the fix and at
+  `seq=19` without it — 30 s apart — and only the control ever censuses it as
+  `peer=none(errno=57)`, the VxWorks reading for a socket already shut but still
+  allocated ([§3.6](vxworks-circuit-wedge-on-target-measurement.md)). The data
+  circuit gets the same guarantee from a different owner, `CircuitDeathGuard`,
+  and is the later of the two afterwards (138 s) because C keeps an unresponsive
+  circuit's socket on purpose.
 * **E8 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
   for this target; E10's dial numbers are now unblocked, since the probe images
   link and run. Neither has been run on VxWorks.

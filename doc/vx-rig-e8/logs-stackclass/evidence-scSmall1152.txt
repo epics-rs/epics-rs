@@ -1,0 +1,6 @@
+          OS Memory Size: ~1086MB
+memory allocation of 64 bytes failed
+memory allocation of 80 bytes failed
+0xffff80001440a600 (CAS-client 105): RTP 0xffff800008c42000 has been deleted due to signal 6.
+POOLPROBE seq=1 BUSY=106 SETS=106 CAP=141 WORKERS=212 REFUSED=0 CONNS=105
+POOLPROBE seq=2 BUSY=106 SETS=106 CAP=141 WORKERS=212 REFUSED=0 CONNS=105

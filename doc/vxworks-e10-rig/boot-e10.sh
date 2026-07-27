@@ -16,6 +16,10 @@ SDK=$HOME/wrsdk-vxworks7-qemu-1.17.0
 KERNEL=$SDK/vxsdk/bsps/itl_generic_3_0_0_5/vxWorks
 IMG=$1
 SECS=${2:-1400}
+# Guest RAM. The E11 abort is a function of it — 1024M dies, 1280M walls
+# cleanly — so it is a parameter, not a constant. `-m` is the ONLY thing that
+# changes between those arms.
+RAM=${VXRAM:-1024M}
 CON=/tmp/vxcon-e10.sock
 LOG=$R/logs/console-$IMG.log
 FTPLOG=$R/logs/ftpd-$IMG.log
@@ -34,7 +38,7 @@ for p in 60010 60011 60012 60013 60014 60015; do
     GUESTFWD="$GUESTFWD,guestfwd=tcp:10.0.2.100:$p-cmd:python3 /tmp/pybridge.py $p"
 done
 
-qemu-system-x86_64 -m 1024M -kernel "$KERNEL" \
+qemu-system-x86_64 -m "$RAM" -kernel "$KERNEL" \
   -net nic \
   -net "user,hostfwd=tcp:127.0.0.1:21534-:1534,hostfwd=tcp:127.0.0.1:25064-:5064,hostfwd=tcp:127.0.0.1:25075-:5075,$GUESTFWD" \
   -display none -monitor none \
@@ -43,7 +47,7 @@ qemu-system-x86_64 -m 1024M -kernel "$KERNEL" \
   > "$R/logs/qemu-$IMG.log" 2>&1 &
 QPID=$!
 echo $QPID > "$R/qemu.pid"
-echo "qemu pid=$QPID image=$IMG secs=$SECS log=$LOG"
+echo "qemu pid=$QPID image=$IMG ram=$RAM secs=$SECS log=$LOG"
 
 for _ in $(seq 30); do [ -S "$CON" ] && break; sleep 1; done
 mkfifo "$R/con.in"

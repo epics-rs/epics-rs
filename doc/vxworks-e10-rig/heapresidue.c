@@ -48,6 +48,15 @@
  *     CONSUMES entries, so it cannot be called twice — fatal for a differential
  *     that samples every 10 s.  This one is a non-destructive threshold print.
  *
+ *  5. AN ALLOCATION FAILURE MUST SPEAK BEFORE IT DIES.  Rust's
+ *     `handle_alloc_error` aborts, and an RTP abort is `signal 6` with the
+ *     console gone, so "memory allocation of N bytes failed" names a size and
+ *     nothing else — not the call site, not what the heap held at that instant.
+ *     Every wrapper here checks its real allocator's return and, on the first
+ *     failure, prints the size, the site and a full class/site dump
+ *     (`HEAPFAIL`, then a `seq=999999` report) while the process still has a
+ *     console.
+ *
  * THE NESTING FLAGS ARE KEYED BY TASK, AND MUST NOT BE `__thread`.
  * `in_calloc` / `in_realloc` answer "is THIS thread inside calloc/realloc right
  * now", which is the only question that makes a nested malloc a double-insert.
@@ -407,6 +416,40 @@ static int blk_remove(void *vp)
 
 #define SITE() ((uintptr_t)__builtin_return_address(0))
 
+/* --------------------------------------------------------- failure report */
+
+/* A NULL from the real allocator is the last thing this process will do that
+ * anyone can observe: Rust's `handle_alloc_error` aborts, and on VxWorks an
+ * RTP abort takes the whole process with `signal 6`, console and all.  The
+ * only place the failing size and its call site still exist is right here, so
+ * they are printed before returning, together with a full non-destructive dump
+ * of every size class and site — the heap's composition AT the failure, which
+ * no post-mortem on this target can reconstruct.
+ *
+ * Capped at FAIL_REPORTS so a failing allocator inside the report path cannot
+ * recurse into an unbounded print storm, and the dump is emitted only for the
+ * first one, which is the one that kills the process. */
+#define FAIL_REPORTS 8
+static uint64_t n_fail;
+
+void heapresidue_report(unsigned seq, int detail);
+
+static void fail_report(const char *what, size_t n, uintptr_t pc)
+{
+    uint64_t seen = __atomic_fetch_add(&n_fail, 1, __ATOMIC_RELAXED);
+    if (seen >= FAIL_REPORTS) return;
+    printf("HEAPFAIL n=%llu what=%s size=%llu pc=0x%llx live_bytes=%lld "
+           "live_blocks=%lld alloc=%llu free=%llu\n",
+           (unsigned long long)(seen + 1), what, (unsigned long long)n,
+           (unsigned long long)pc,
+           (long long)__atomic_load_n(&live_bytes, __ATOMIC_RELAXED),
+           (long long)__atomic_load_n(&live_blocks, __ATOMIC_RELAXED),
+           (unsigned long long)(n_malloc + n_calloc + n_realloc + n_pmemalign +
+                                n_alignedalloc + n_memalign),
+           (unsigned long long)n_free);
+    if (seen == 0) heapresidue_report(999999u, 1);
+}
+
 /* -------------------------------------------------------------- wrappers */
 
 void *__wrap_malloc(size_t n)
@@ -415,6 +458,7 @@ void *__wrap_malloc(size_t n)
     __atomic_fetch_add(&n_malloc, 1, __ATOMIC_RELAXED);
     nest_note_malloc();
     p = __real_malloc(n);
+    if (!p && n) fail_report("malloc", n, SITE());
     blk_insert(p, n, SITE());
     return p;
 }
@@ -434,6 +478,7 @@ void *__wrap_calloc(size_t a, size_t b)
     slot = nest_enter(0);
     p = __real_calloc(a, b);
     nest_leave(slot, 0);
+    if (!p && a && b) fail_report("calloc", a * b, SITE());
     blk_insert(p, a * b, SITE());
     return p;
 }
@@ -447,6 +492,7 @@ void *__wrap_realloc(void *q, size_t n)
     slot = nest_enter(1);
     p = __real_realloc(q, n);
     nest_leave(slot, 1);
+    if (!p && n) fail_report("realloc", n, SITE());
     if (p) {
         blk_insert(p, n, SITE());
     } else if (q && n != 0) {
@@ -462,6 +508,7 @@ int __wrap_posix_memalign(void **out, size_t align, size_t n)
     int rc;
     __atomic_fetch_add(&n_pmemalign, 1, __ATOMIC_RELAXED);
     rc = __real_posix_memalign(out, align, n);
+    if (rc != 0 && n) fail_report("posix_memalign", n, SITE());
     if (rc == 0 && out) blk_insert(*out, n, SITE());
     return rc;
 }
@@ -471,6 +518,7 @@ void *__wrap_aligned_alloc(size_t align, size_t n)
     void *p;
     __atomic_fetch_add(&n_alignedalloc, 1, __ATOMIC_RELAXED);
     p = __real_aligned_alloc(align, n);
+    if (!p && n) fail_report("aligned_alloc", n, SITE());
     blk_insert(p, n, SITE());
     return p;
 }
@@ -480,6 +528,7 @@ void *__wrap_memalign(size_t align, size_t n)
     void *p;
     __atomic_fetch_add(&n_memalign, 1, __ATOMIC_RELAXED);
     p = __real_memalign(align, n);
+    if (!p && n) fail_report("memalign", n, SITE());
     blk_insert(p, n, SITE());
     return p;
 }

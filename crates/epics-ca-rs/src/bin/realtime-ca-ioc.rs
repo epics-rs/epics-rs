@@ -200,6 +200,7 @@ mod ioc {
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::net::cas_server_port;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    use epics_base_rs::runtime::worker_pool::ThreadCharge;
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
@@ -607,13 +608,20 @@ mod ioc {
         names.sort();
 
         let srv_tcp = server.clone();
+        // The stack class states what this thread takes; the charge is what
+        // makes the worker pool's budget know it was taken. Held inside the
+        // body, so it is released by the thread ending and by nothing else,
+        // and a `spawn` that fails drops the closure and gives it back.
+        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let tcp_thread = match thread::Builder::new()
             .name("CAS-TCP".to_string())
             // caservertask.c:716-718 — `epicsThreadStackMedium`. It accepts and
             // hands off; the per-client thread is where the depth is.
             .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || srv_tcp.serve())
-        {
+            .spawn(move || {
+                let _charge = charge;
+                srv_tcp.serve()
+            }) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("realtime-ca-ioc: cannot start the CA accept thread: {e}");
@@ -621,12 +629,15 @@ mod ioc {
             }
         };
         let srv_udp = server.clone();
+        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let udp_thread = match thread::Builder::new()
             .name("CAS-UDP".to_string())
             // caservertask.c:722-724 — `epicsThreadStackMedium`, same as TCP.
             .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || srv_udp.serve_udp_search(udp))
-        {
+            .spawn(move || {
+                let _charge = charge;
+                srv_udp.serve_udp_search(udp)
+            }) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("realtime-ca-ioc: cannot start the CA name-search thread: {e}");
@@ -756,10 +767,12 @@ mod ioc {
                 "C6 probe: EPICS_CA_NAME_SERVERS={C6_NAME_SERVER} (compiled in), \
                  EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s",
             );
+            let charge = ThreadCharge::fixed(StackSizeClass::Medium);
             match thread::Builder::new()
                 .name("c6-probe".to_string())
                 .stack_size(StackSizeClass::Medium.bytes())
                 .spawn(move || {
+                    let _charge = charge;
                     let _ = epics_base_rs::runtime::task::enter_ioc_thread(
                         epics_base_rs::runtime::task::ThreadPriority::Low,
                     );
@@ -861,6 +874,64 @@ mod tests {
                  tokio runtime and drives every future via park_on"
             );
         }
+    }
+
+    /// Every thread this entry point starts is charged to the process account.
+    ///
+    /// A stack class alone is not enough, and
+    /// `every_ca_server_thread_states_a_stack_size` in `server/blocking.rs` is
+    /// the guard that already covers the class half. The class says how much
+    /// this thread takes; the charge is what makes the worker pool's budget
+    /// know it was taken. Without it the pool admits clients against a number
+    /// that has never heard of the acceptor, the name-search responder or the
+    /// probe — roughly 15 MiB of fixed IOC threads measured on the VxWorks
+    /// target, so the refusal lands later than the budget says it will.
+    ///
+    /// The charge must be held *inside* the spawned body, not by the spawning
+    /// function: a guard left on the calling thread is released the moment
+    /// `main` walks past the `spawn`, while the thread it paid for runs for the
+    /// life of the IOC. That is the shape this guard pins.
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_thread_here_is_charged_to_the_process_account() {
+        let src = include_str!("realtime-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // Needle assembled with `concat!` so this guard does not match itself
+        // in the file it is written in.
+        let mut sites = 0usize;
+        let mut unpaid = Vec::new();
+        for (n, after) in prod
+            .split(concat!("thread", "::Builder::new()"))
+            .skip(1)
+            .enumerate()
+        {
+            sites += 1;
+            let body = after.split(".spawn(").nth(1).unwrap_or("");
+            // The charge is the first statement of the body, so a short window
+            // is the whole check: a `_charge` further down would be a `Drop`
+            // that runs at a different time than the thread's life.
+            let head = &body[..body.len().min(120)];
+            if !head.contains("let _charge = charge;") {
+                unpaid.push(format!("Builder #{}", n + 1));
+            }
+        }
+        assert_eq!(
+            sites, 3,
+            "expected the accept thread, the UDP responder and the bring-up \
+             probe, found {sites} — a thread was added or moved, and the \
+             account has to be told about it"
+        );
+        assert!(
+            unpaid.is_empty(),
+            "these threads reserve stack the pool's budget never hears about, \
+             so it admits clients against memory that is already gone: \
+             {unpaid:?}. Take a `ThreadCharge::fixed` before the `spawn` and \
+             move it into the body."
+        );
     }
 
     /// The target has no shell, so an IOC that publishes no status PVs can only

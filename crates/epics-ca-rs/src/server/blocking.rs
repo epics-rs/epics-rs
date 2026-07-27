@@ -277,26 +277,56 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   allowance. That is the port's own cost — `park_on` pins each connection's
 ///   async state machine onto this stack — and it is what the class table, not
 ///   the class name, has to cover. See §15 of
-///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B is 3.14 %
-///   of `Big` and proved invariant across payloads from 8 B to 1,048,576 B, the
+///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B proved
+///   invariant across payloads from 8 B to 1,048,576 B, the
 ///   `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes, `subArray`, `compress`, the FLNK
 ///   recursion at its `MAX_LINK_DEPTH` cap, and six monitors per connection.
-///   Reservation, not usage, is the binding resource on that target, and the
-///   measured wall moves 47 → 59 concurrent clients if this drops to `Medium`
-///   (15.9× headroom on the measured worst case). The reason it still says
-///   `Big` is that this roster is shared with `armv7-rtems-eabihf`, where no
-///   `CAS-client` stack high-water has ever been measured.
+///
+///   **The class is `Medium`, decided from a measurement on BOTH targets this
+///   roster serves.** The second one closed the gap that used to hold this at
+///   `Big`: `armv7-rtems-eabihf` measures **24,432 B**, converged over a
+///   4-client/400-round and an 8-client/500-round run, and inclusive of the
+///   inline FLNK chain. Headroom against `Medium`, which is pointer-width
+///   scaled (`STACK_SIZE(f) = f * 0x10000 * sizeof(void *)`):
+///
+///   | target | high-water | `Medium` | headroom |
+///   |---|---|---|---|
+///   | `x86_64-wrs-vxworks` | 65,912 B | 1,048,576 B | 15.9× |
+///   | `armv7-rtems-eabihf` | 24,432 B | 524,288 B | 21.5× |
+///
+///   Both numbers are only *bounds* because the FLNK recursion is bounded. The
+///   armv7 measurement puts one inline FLNK hop at ~1,934 B and the chainless
+///   floor at 8,960 B, so this high-water rises LINEARLY with the depth of the
+///   user's link graph. `MAX_LINK_DEPTH` is what caps it — and it is now a cap
+///   that announces itself rather than truncating in silence
+///   (`PvDatabase::refuse_bounded_entry`), so it cannot be raised or removed
+///   without the change being visible. **Raising or removing that bound reopens
+///   this stack to the user's DB depth and invalidates both numbers above**;
+///   at ~1,934 B/hop, `Medium` on armv7 covers roughly 266 hops of headroom and
+///   the x86_64 side about half that per byte of pointer width.
+///
+///   What the class buys: reservation, not usage, is the binding resource on
+///   VxWorks (a thread costs its declared stack plus ~1 MiB of reserved address
+///   space), and the measured wall moves **47 → 59** concurrent clients at
+///   `Medium`.
 /// * `event` is the per-client monitor sender, C's `event_task`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
-///   one class below the receiver, because it formats and sends queued events
-///   rather than dispatching commands — and banded one level below it
+///   because it formats and sends queued events rather than dispatching
+///   commands — and banded one level below the receiver
 ///   (`caservertask.c:560`, computed at `:1508`) so a client that stops
 ///   reading cannot starve command dispatch.
+///
+///   This one stays at C's class on one measurement, not two: `CAS-event` on
+///   `armv7-rtems-eabihf` is **3,816 B** (137.4× headroom against that
+///   target's `Medium` of 524,288 B), and no `CAS-event` high-water has been
+///   measured on `x86_64-wrs-vxworks`. Dropping it to `Small` would be a
+///   one-target decision, and this role is not what moves the wall — the
+///   receiver's class is 4× larger in bytes reserved.
 fn client_roster() -> [WorkerRole; 2] {
     [
         WorkerRole {
             suffix: "client",
-            stack: StackSizeClass::Big,
+            stack: StackSizeClass::Medium,
             priority: ThreadPriority::CaServerLow,
         },
         WorkerRole {
@@ -1648,14 +1678,25 @@ mod tests {
             &prod[at..]
         };
         let roster = &roster[..roster.find("\n}").expect("client_roster body")];
-        for class in ["StackSizeClass::Big", "StackSizeClass::Medium"] {
-            assert!(
-                roster.contains(class),
-                "the per-client worker roster must state `{class}`: C creates \
-                 the receiver with epicsThreadStackBig (caservertask.c:109-111) \
-                 and the event task with epicsThreadStackMedium (dbEvent.c:1117)"
-            );
-        }
+        // Every role states a class — checked by counting declarations against
+        // roles, not by naming the classes. Naming them is what this guard used
+        // to do (`Big` for the receiver, from C's
+        // `epicsThreadGetStackSize(epicsThreadStackBig)`,
+        // `caservertask.c:109-111`), and it was the wrong invariant: C's class
+        // NAMES do not carry C's VxWorks byte SIZES (C's `Big` there is
+        // 22,000 B, ours is 2,097,152 B), so the class has to be chosen from
+        // the measured high-water on every target this roster serves. The
+        // reasoning for the current choice is on `client_roster` itself. What
+        // must not regress is a role with no class at all, which is two threads
+        // per client at std's 2 MiB default.
+        let roles = roster.matches("WorkerRole {").count();
+        let classes = roster.matches("stack: StackSizeClass::").count();
+        assert_eq!(
+            classes, roles,
+            "every per-client worker role must state a stack class: {roles} \
+             roles, {classes} classes"
+        );
+        assert!(roles >= 2, "the roster lost a role: {roles}");
     }
 
     /// The RTEMS IOC installs a console subscriber before it does anything

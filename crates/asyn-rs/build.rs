@@ -18,6 +18,7 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
     println!("cargo::rustc-check-cfg=cfg(asyn_serial_backend)");
+    println!("cargo::rustc-check-cfg=cfg(asyn_baud_code_is_rate)");
     println!("cargo::rustc-check-cfg=cfg(asyn_af_unix)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -38,15 +39,34 @@ fn main() {
     // CARGO_CFG_TARGET_FAMILY is comma-separated for targets in more than one
     // family, so this is a membership test, not an equality test.
     //
-    // NOT `epics_embedded_target`: VxWorks has the backend (its `libc` binds
-    // VxWorks 7's POSIX termios ABI-correctly), RTEMS does not (`libc`'s
-    // newlib `struct termios` is the Linux shape, so it would compile and
-    // write to the wrong offsets). The predicate must therefore name RTEMS,
-    // and `drivers::mod` states the evidence.
+    // Every unix plus Windows: the POSIX backend reaches the termios ABI
+    // through its own `platform` seam rather than through `libc` directly, so
+    // a target whose `libc` binding is wrong or absent (RTEMS) is a matter of
+    // which arm of that seam compiles, not of whether the driver exists.
     let unix = target_family.split(',').any(|f| f == "unix");
     let windows = target_family.split(',').any(|f| f == "windows");
-    if (unix && target_os != "rtems") || windows {
+    if unix || windows {
         println!("cargo::rustc-cfg=asyn_serial_backend");
+    }
+
+    // Whether this platform's termios `Bxxx` speed codes ARE the literal baud
+    // rate. C asks it as a preprocessor test on the constants themselves
+    // (`drvAsynSerialPort.c:272-273`), which decides whether *any* rate can be
+    // programmed or only the ladder's; `drivers::serial_port` needs the answer
+    // as a `cfg` because the two arms name different constants, and it needs
+    // it three times — `baud_to_speed`, its inverse, and the assertion that
+    // pins this list against the constants. Named once here so adding a target
+    // is one edit rather than three that can disagree.
+    //
+    // macOS/iOS and the BSDs are the group C names; both embedded targets join
+    // it — VxWorks (`termios.h:22-52`) and RTEMS (`sys/_termios.h:186-221`)
+    // both define `B300 == 300`. Linux is the counter-example: there the codes
+    // are small encoded integers and `B9600 == 13`.
+    if matches!(
+        target_os.as_str(),
+        "macos" | "ios" | "freebsd" | "netbsd" | "openbsd" | "dragonfly" | "vxworks" | "rtems"
+    ) {
+        println!("cargo::rustc-cfg=asyn_baud_code_is_rate");
     }
 
     // Whether `unix://` is a usable protocol, mirroring C's own `HAS_AF_UNIX`:

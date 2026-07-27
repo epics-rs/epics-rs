@@ -30,7 +30,7 @@ pub(crate) enum ValueRoute {
 }
 
 /// Per-subscription overflow/pause buffer shared between the
-/// coordinator (producer) and the [`MonitorHandle`] (consumer).
+/// coordinator (producer) and the [`super::MonitorHandle`] (consumer).
 ///
 /// # State machine
 ///
@@ -297,7 +297,7 @@ pub(crate) struct SubscriptionRecord {
     pub priority: u8,
     pub callback_tx: mpsc::Sender<CaResult<Snapshot>>,
     /// "Latest pending" slot — see [`CoalesceSlot`]. Shared with the
-    /// [`MonitorHandle`] so the consumer drains it after the bounded
+    /// [`super::MonitorHandle`] so the consumer drains it after the bounded
     /// channel empties.
     pub coalesce_slot: Arc<CoalesceSlot>,
     pub needs_restore: bool,

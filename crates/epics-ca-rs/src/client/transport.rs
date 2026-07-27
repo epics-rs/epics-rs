@@ -391,7 +391,9 @@ impl AsyncWrite for PumpedCircuit {
 }
 
 /// What [`dial_ca`] returns: a `tokio::net::TcpStream` on a hosted build, a
-/// [`PumpedCircuit`] where there is no reactor to register one with.
+/// `PumpedCircuit` where there is no reactor to register one with. Not a link:
+/// `PumpedCircuit` is compiled only under the configuration this alias is
+/// compiled *out* of, so it is never in this doc build's scope.
 #[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) type CaCircuit = TcpStream;
 /// See the hosted definition.
@@ -1192,7 +1194,9 @@ impl Drop for ServerConnection {
 /// The manager retiring the circuit on this signal is what frees a reader pump
 /// still parked in a blocking `read` that a peer RST never woke (RTEMS libbsd,
 /// measured): removing the `ServerConnection` runs its `Drop`, which aborts the
-/// sibling task and drops the [`GuardedReader`]/[`GuardedWriter`] guards, and
+/// sibling task and drops the
+/// [`GuardedReader`](epics_base_rs::runtime::blocking_io::GuardedReader)/[`GuardedWriter`](epics_base_rs::runtime::blocking_io::GuardedWriter)
+/// guards, and
 /// those `shutdown(Both)` the socket — the only thing that returns that read.
 /// Before this signal the circuit was retired only lazily, at the next
 /// `CreateChannel`; during a prolonged upstream outage that reconnect never

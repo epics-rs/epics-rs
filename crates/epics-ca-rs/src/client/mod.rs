@@ -5457,7 +5457,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
     out
 }
 
-/// Parse `EPICS_CA_NAME_SERVERS` — whitespace-separated host[:port] entries
+/// Parse `EPICS_CA_NAME_SERVERS` — whitespace-separated `host[:port]` entries
 /// reachable over TCP. Returns each entry's resolved [`SocketAddr`] alongside
 /// the operator-supplied hostname when one was given (None for raw-IP
 /// entries). The hostname is later threaded into the TLS handshake as the

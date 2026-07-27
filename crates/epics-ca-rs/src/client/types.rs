@@ -1119,8 +1119,10 @@ pub(crate) enum SearchRequest {
     /// `addAddrToChannelAccessAddressList` (iocinf.cpp:45). The
     /// new entry is consulted on the next scheduled search round;
     /// already-pending searches do NOT auto-restart against the
-    /// new address — call [`super::CaClient::hurry_up`] (or wait
-    /// for the natural retry) for that.
+    /// new address — they reach it at their natural retry. There is
+    /// no way to force a round: [`super::CaClient`] exposes none, and
+    /// neither does libca, whose `addAddrToChannelAccessAddressList`
+    /// only fills a list and never touches a live `cac`.
     AddAddress(SocketAddr),
     /// Remove a unicast address from the search engine's working
     /// address list. Used when a discovery backend reports an IOC
@@ -1131,7 +1133,7 @@ pub(crate) enum SearchRequest {
     ///
     /// `client` only: a `DiscoveryEvent::Removed` is the sole producer —
     /// there is no `CaClient::remove_address` counterpart to
-    /// [`CaClient::add_address`], because libca has no
+    /// [`super::CaClient::add_address`], because libca has no
     /// `removeAddrFromChannelAccessAddressList` either.
     #[cfg(feature = "client")]
     RemoveAddress(SocketAddr),

@@ -808,7 +808,8 @@ impl SearchTransport {
     /// Send one built SEARCH datagram to every UDP destination.
     ///
     /// Nothing is sent without a UDP transport: the destinations a datagram
-    /// would go to live inside [`UdpTransport`], so there is no list to walk
+    /// would go to live inside `UdpTransport` (`#[cfg(tokio_backend)]`, so not
+    /// in scope on the exec-backend doc build), so there is no list to walk
     /// rather than a list that must be checked for emptiness.
     async fn fanout(&mut self, frame: &[u8], site: &'static str) {
         match self {

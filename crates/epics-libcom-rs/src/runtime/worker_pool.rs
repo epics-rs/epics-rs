@@ -1836,24 +1836,18 @@ mod tests {
     /// accept path did — could not tell a full server from a target that had
     /// run out of thread resources, and reported the second as the first.
     ///
-    /// The first assertion is the collapse itself, asserted rather than
-    /// described, so this test still states *why* the type exists if `std` ever
-    /// changes that mapping.
+    /// The spawn failure below is given that same `WouldBlock` kind on
+    /// purpose: the two refusals have to stay apart in the one case where the
+    /// kind cannot tell them apart, which is the case that actually occurs.
+    /// That `EAGAIN` really is what arrives with that kind is a property of
+    /// the platform's errno table, asserted separately by
+    /// `eagain_still_decodes_as_would_block`.
     #[test]
     fn a_full_pool_and_a_refused_spawn_are_not_the_same_refusal() {
-        let eagain = io::Error::from_raw_os_error(11);
-        assert_eq!(
-            eagain.kind(),
-            io::ErrorKind::WouldBlock,
-            "EAGAIN decodes as WouldBlock — the collapse this type exists to \
-             undo. If this ever stops holding, say so here rather than in a \
-             comment."
-        );
-
         let pool: WorkerPool<2> = WorkerPool::new("test-gate", roster2(), 1);
         let (lease, _workers) = pool.acquire().expect("first borrow");
         let full = pool.acquire().err().expect("the pool is full");
-        let spawn_failed = AcquireError::SpawnFailed(io::Error::from_raw_os_error(11));
+        let spawn_failed = AcquireError::SpawnFailed(io::ErrorKind::WouldBlock.into());
 
         assert!(
             matches!(full, AcquireError::AtCapacity { .. }),
@@ -1882,6 +1876,27 @@ mod tests {
             "the gate must survive the io::Error conversion: {as_io:?}"
         );
         drop(lease);
+    }
+
+    /// The platform half of the invariant above: `std` decoding `EAGAIN` as
+    /// `WouldBlock` is what makes a full pool and an out-of-threads target
+    /// indistinguishable by `kind()` alone, and so is what `AcquireError`
+    /// exists to undo.
+    ///
+    /// Unix-only because the errno table is. Raw code 11 is `ERROR_BAD_FORMAT`
+    /// on Windows, where it decodes as `Uncategorized` and where thread
+    /// exhaustion never surfaces as `EAGAIN` in the first place — asserting it
+    /// there would be asserting a different platform's fact.
+    #[cfg(unix)]
+    #[test]
+    fn eagain_still_decodes_as_would_block() {
+        assert_eq!(
+            io::Error::from_raw_os_error(11).kind(),
+            io::ErrorKind::WouldBlock,
+            "EAGAIN decodes as WouldBlock — the collapse `AcquireError` exists \
+             to undo. If this ever stops holding, say so here rather than in a \
+             comment."
+        );
     }
 
     /// A job that panics returns its set, and the worker keeps serving: the next

@@ -113,7 +113,19 @@ COMMON=(+nightly check --locked --no-default-features "-Zbuild-std=std,panic_abo
 # base names, so a target break in a module base does not reach — the whole
 # `net` socket half is gated off RTEMS, for instance — would be invisible here
 # exactly as `src/bin` was before this script existed.
-CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
+#
+# `asyn-rs` is listed for the reason the VxWorks gate states at length and this
+# target shares: C asyn names an RTOS explicitly in its transport
+# (`drvAsynIPPort.c:63/:75/:178`, `epicsInterruptibleSyscall.c:31` — vxWorks
+# there, but the RTEMS half of the same file set is `USE_SOCKTIMEOUT`,
+# `drvAsynIPPort.c:71-72`), so this is target code. And `epics-libcom-rs`'s
+# `runtime::socket` embedded arm — raw `libc` `socket`/`setsockopt`/`bind`/
+# `connect` — has asyn's two IP drivers as its only consumer, so without this
+# entry the seam is compiled for the triple and every caller of it is not.
+# Kept identical to the VxWorks gate's list on purpose: the two targets share
+# one embedded arm, and a crate checked on one but not the other would let a
+# break hide behind whichever gate was not run.
+CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs asyn-rs)
 
 # Per-crate feature selection, on top of COMMON's `--no-default-features`.
 #
@@ -144,9 +156,20 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # / service discovery / reverse-DNS stack a record link never reaches. This is
 # the same selection the CA ratchet below measures, so the probe and the built
 # binary agree by construction rather than by two people remembering.
+#
+# `asyn-rs`'s entry is the exception to the paragraph above: it is a WORKAROUND,
+# not a statement that `epics` is this crate's target configuration. `asyn-rs`
+# under `--no-default-features` has never compiled on any platform — 7 errors,
+# all `E0433`, reproducible on host x86_64 Linux: `port_actor.rs:1915` and
+# `:1916` cannot resolve `epics_base_rs`, and `manager.rs:102`, `:123`, `:153`,
+# `:207`, `:239` cannot find `asyn_record` in the crate root, because the
+# `epics` feature is not honoured in the code. The empty selection is what this
+# gate would otherwise use here, so the fix is to repair those 7 at source and
+# DELETE this entry, not to keep tuning it.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
     [epics-ca-rs]="client-core"
+    [asyn-rs]="epics"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.

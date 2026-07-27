@@ -209,7 +209,23 @@ log_common() { log "vxworks-check: target-row invocation: cargo +${TOOLCHAIN:-<u
 # `epics-base-rs`: a crate reached as a dependency is resolved with the
 # features its dependent asked for, so a break under this gate's own
 # `--no-default-features` selection would be invisible.
-CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
+#
+# `asyn-rs` is here because C asyn targets vxWorks explicitly rather than
+# incidentally, in four places: `drvAsynIPPort.c:63` turns AF_UNIX off for
+# vxWorks alone (`#if !defined(_WIN32) && !defined(vxWorks) && defined(AF_UNIX)`),
+# `:75` selects `FAKE_POLL` there, `:178` branches `setNonBlock` onto
+# `ioctl(fd, FIONBIO, &flags)`, and `epicsInterruptibleSyscall.c:31` includes
+# `ioLib.h` on the same predicate. A device-support layer whose upstream names
+# this target that often is target code, so it belongs under the gate rather
+# than beside it.
+#
+# It also closes a hole the gate would otherwise carry. `epics-libcom-rs`'s
+# `runtime::socket` embedded arm is raw `libc` `socket`/`setsockopt`/`bind`/
+# `connect`, and asyn's two IP drivers are its only consumer. Without this
+# entry that `unsafe` is the one block in the workspace whose *consumer* CI
+# never compiles for this triple: the seam would be checked and every use of it
+# would not.
+CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs asyn-rs)
 
 # Per-crate feature selection, on top of COMMON's `--no-default-features`.
 # Identical to the RTEMS gate's, and deliberately so: these are the same two
@@ -224,9 +240,21 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # the `ca://` resolver, and `client-core` rather than `client` is the circuit,
 # search engine, subscriptions and resolver WITHOUT the beacon/repeater/
 # discovery stack a record link never reaches.
+#
+# `asyn-rs`'s entry is a WORKAROUND, and is the one line here that does not
+# describe a target configuration. Every other selection names what that crate
+# actually runs on the target; this one names `epics` because `asyn-rs` under
+# `--no-default-features` has never compiled on any platform — 7 errors, all
+# `E0433`, which reproduce on host x86_64 Linux: `port_actor.rs:1915` and
+# `:1916` cannot resolve `epics_base_rs`, and `manager.rs:102`, `:123`, `:153`,
+# `:207`, `:239` cannot find `asyn_record` in the crate root. The `epics`
+# feature is simply not honoured in the code. The empty selection is what this
+# gate would otherwise use for this crate, so when those 7 are fixed at source
+# this entry should be DELETED rather than re-tuned.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
     [epics-ca-rs]="client-core"
+    [asyn-rs]="epics"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.

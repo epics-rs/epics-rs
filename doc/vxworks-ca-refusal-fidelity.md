@@ -859,9 +859,99 @@ and `acquire`'s error arm releases nothing further — it only gives back the
 `created` slot. Every byte is released exactly once by whoever spent it, so a
 half-created worker cannot be holding a reservation.
 
-What the ledger does *not* cover is the OS thread resource: a set that dies has
-its slot and its reservation returned, but its `JoinHandle`s stay in
-`Registry::joins` until the pool is dropped, so an exited worker is neither
-joined nor detached for the life of the process. That is a live path to
-unreclaimed thread memory, and it is not the one measured above — the sets in
-this run went idle, not dead. Both remain open.
+What the ledger did *not* cover was the OS thread resource: a set that died had
+its slot and its reservation returned, but its `JoinHandle`s stayed in
+`Registry::joins` until the pool was dropped, so an exited worker was neither
+joined nor detached for the life of the process. Closed by moving the handles
+into `SetHandle::joins`, so the owner that returns the slot retires the threads
+in the same step (`WorkerExit::drop`, `last_gone` arm). It was never the path
+measured above — the sets in this run went idle, not dead — so the 23.6 MB
+stays open.
+
+**For e10-residue:** the 1,615,912 B that did not return across a refused
+attempt in `sq3` and the 23,578,336 B here are the **same arena** — both are
+`MEM_FREE`, the free total of the one RTEMS malloc heap reported by
+`_Protected_heap_Get_information(RTEMS_Malloc_Heap)`, which is also the heap
+pthread stacks come from; they differ only in the event size (one refused
+attempt vs thirty released clients).
+
+### 11.10 Per-target thread cost, measured on both targets
+
+`per_thread_overhead` and `default_reservation_budget` took an `embedded: bool`,
+which says "not a host" where both figures mean "this target". VxWorks' flat
+1 MiB per thread (§10.2) was therefore charged on RTEMS, where §11.8 measured
+1,167,383 B of heap per client against 3,670,016 B charged. `ThreadMemoryTarget`
+replaces the bool, and each figure is an exhaustive `match`, so a fourth target
+cannot inherit whichever one was measured first.
+
+Both targets re-measured on this branch, one image per target, everything else
+held:
+
+| target | guest | budget | per set | admitted | first gate |
+| --- | --- | --- | --- | --- | --- |
+| RTEMS, before | 256 MB zynq-a9 | 160 MiB | 3584 KiB | **30** | thread-memory budget |
+| RTEMS, after | 256 MB zynq-a9 | 160 MiB | 1536 KiB | **90** | thread-memory budget |
+| VxWorks, before | 1024M | 160 MiB | 5120 KiB | **17** | thread-memory budget |
+| VxWorks, after | 1024M | 160 MiB | 5120 KiB | **17** | thread-memory budget |
+
+RTEMS admits 3× what it did; the refusal text is the same shape with the charge
+corrected (`this set needs 1536 KiB, 158 of 160 MiB already reserved`). The
+budget is still the first gate at 90, so the count cap of 141 and the heap are
+still never reached — the over-charge was costing capacity, not changing which
+gate binds. VxWorks is unchanged to the client: `attempt=18 held=17`,
+`this set needs 5120 KiB, 156 of 160 MiB already reserved`, byte-identical to
+the pre-change run, which is the point — the figure it was measured on keeps it.
+
+Heap spent by the 90-client RTEMS ramp: `MEM_FREE` 233,290,600 → 155,267,024,
+i.e. 866,929 B per client (a second run of the same image: 233,299,152 →
+139,337,200 over 90, 1,044,022 B per client — the spread is `MEM_FREE` sampling
+lag against an 8-client sample interval, not two different costs). Either
+figure is under the 1,572,864 B of stack a set declares, which is why there is
+no flat term to charge on this target.
+
+### 11.11 The RTEMS budget now has a basis, and it answers on target
+
+`malloc_free_space` (`rtems/malloc.h`, `librtemscpu`) is declared directly in
+`worker_pool.rs` rather than reached through `epics-rtems-boot`, because this
+crate's dependency on that package is `cfg(target_os = "vxworks")` by design.
+It matters most on RTEMS precisely because §11.8 established that
+`EPICS_RS_POOL_RESERVATION_MB` cannot be set there at all: the built-in default
+is the only budget that target will ever run, and a default nobody can override
+is the one that has to be checked.
+
+At 256 MB the guest reports 233,299,152 B free at boot, so the 160 MiB default
+is confirmed and the boot is silent — which is also the shape a *missing* RTEMS
+arm would have. The check cannot be provoked by shrinking the guest either: the
+image needs 267,370,496 B of RAM to load, so 160M and 192M do not boot at all
+(`qemu-system-arm: kernel ... is too large to fit in RAM`). Demonstrated instead
+with a probe-only build whose RTEMS default was raised to 512 MiB:
+
+```
+sevr=major worker-pool reservation budget clamped from 512 MiB to 128 MiB:
+  at 512 MiB this target has less than that free in the heap its thread stacks
+  come from. EPICS_RS_POOL_RESERVATION_MB names a ceiling the target still has
+  to confirm; it does not add memory
+```
+
+512 → 256 → 128 is exactly the halving descent against 233.3 MB free. Without
+the RTEMS arm the same build would have adopted 512 MiB in silence.
+
+### 11.12 The notice named a mechanism the target did not use
+
+That probe build also showed a defect in the clamp message itself: pre-fix it
+read *"this target would not reserve 512 MiB of address space in one mapping"*
+on RTEMS, where nothing had been mapped — the refusal came from the malloc
+heap. The words lived in `BudgetVerdict::notice` while the probe lived behind
+its own `cfg` cascade, and two cascades drift.
+
+Closed by making the basis part of the answer: `target_admits` returns
+`TargetAnswer { granted, basis }`, and `Clamped`/`FloorHeld` carry the `basis`
+into the message, so the words come from the arm that produced the verdict. The
+host regression asserts the notice contains the probe's own basis string, which
+fails if a message ever re-hardcodes one. Measured after the fix on both
+targets:
+
+- RTEMS — `at 512 MiB this target has less than that free in the heap its
+  thread stacks come from`
+- VxWorks — `at 320 MiB this target would not reserve that much address space
+  in one mapping`

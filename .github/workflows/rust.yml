@@ -406,7 +406,17 @@ jobs:
   # afterwards for the same reason: a config-added patch entry needs a lock
   # bookkeeping write that `--locked` refuses.
   #
-  # Red the day it lands, like the host job: 51 sites are open.
+  # `--document-private-items` on both rows, matching the host job. Without it
+  # these rows structurally cannot see a private item that exists only on one
+  # target, and that is the whole shape of the priority map:
+  # `map_epics_priority`, `map_epics_priority_rtems`, `map_epics_priority_vxworks`
+  # and `rtems_core_priority` are each private and each gated to one
+  # `target_os`, so a doc under one gate citing an item under another resolves
+  # in no configuration. Measured on `epics-libcom-rs` at this commit: 0 sites
+  # without the flag on either target, 1 (RTEMS) and 3 (VxWorks) with it.
+  #
+  # Red the day it lands, like the host job: 233 sites on RTEMS and 234 on
+  # VxWorks at this commit, plus `asyn-rs`, whose row does not reach rustdoc.
   rustdoc-embedded:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -448,7 +458,7 @@ jobs:
             asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (armv7-rtems-eabihf)"
-          cargo +nightly doc --no-deps --no-default-features \
+          cargo +nightly doc --no-deps --no-default-features --document-private-items \
             -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
             -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
           echo "::endgroup::"
@@ -474,8 +484,8 @@ jobs:
             asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (x86_64-wrs-vxworks)"
-          cargo +nightly doc --no-deps --no-default-features "${cfg[@]}" \
-            -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
+          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+            "${cfg[@]}" -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
             -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
           echo "::endgroup::"
         done

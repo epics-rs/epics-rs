@@ -10,10 +10,10 @@
 //!
 //! | Module | Feature | Description |
 //! |--------|---------|-------------|
-//! | [`qsrv`] | `qsrv` (default) | Record → pvAccess channels (C++ QSRV equivalent) |
+//! | `qsrv` | `qsrv` (default) | Record → pvAccess channels (C++ QSRV equivalent) |
 //! | `ca_gateway` | `ca-gateway` | CA fan-out gateway (C++ ca-gateway equivalent) |
 //! | `pvalink` | `pvalink` | PVA links for record INP/OUT fields |
-//! | [`pva_gateway`] | `pva-gateway` | PVA-to-PVA proxy (mirrors `pva2pva/p2pApp`) |
+//! | `pva_gateway` | `pva-gateway` | PVA-to-PVA proxy (mirrors `pva2pva/p2pApp`) |
 //!
 //! Enable a bridge with its Cargo feature; `qsrv` is on by default.
 //!
@@ -23,15 +23,15 @@
 //! PVA Client ←→ [epics-pva-rs server] ←→ BridgeProvider ←→ PvDatabase
 //! ```
 //!
-//! - [`BridgeProvider`] implements [`ChannelProvider`] — the PVA server calls
+//! - `BridgeProvider` implements `ChannelProvider` — the PVA server calls
 //!   into it to resolve channel names and create channels.
-//! - [`BridgeChannel`] serves single-record PVs (NTScalar, NTEnum, NTScalarArray).
-//! - [`GroupChannel`] serves multi-record composite PVs from JSON config.
-//! - [`BridgeMonitor`] / [`GroupMonitor`] bridge `DbSubscription` events to PVA monitor updates.
+//! - `BridgeChannel` serves single-record PVs (NTScalar, NTEnum, NTScalarArray).
+//! - `GroupChannel` serves multi-record composite PVs from JSON config.
+//! - `BridgeMonitor` / `GroupMonitor` bridge `DbSubscription` events to PVA monitor updates.
 //!
 //! The `ChannelProvider`, `Channel`, and `PvaMonitor` traits are defined in
-//! [`qsrv`]; `qsrv::pva_adapter::QsrvPvStore` bridges them to the native
-//! [`epics_pva_rs::server_native::ChannelSource`] trait so the native PVA
+//! `qsrv`; `qsrv::pva_adapter::QsrvPvStore` bridges them to the native
+//! `epics_pva_rs::server_native::ChannelSource` trait so the native PVA
 //! server can serve qsrv channels directly.
 //!
 //! ## ca-gateway (CA fan-out gateway)

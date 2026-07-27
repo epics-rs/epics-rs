@@ -219,6 +219,7 @@ dependencies = [
  "criterion",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "libc",
  "parking_lot",
  "serde",

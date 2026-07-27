@@ -9,15 +9,15 @@
 //!
 //! | C source                              | Rust module                |
 //! |---------------------------------------|----------------------------|
-//! | `procServ.cc` (main, SendToAll)       | [`procserv::supervisor`]   |
-//! | `processFactory.cc` (PTY child)       | [`procserv::child`]        |
-//! | `acceptFactory.cc` (TCP/UNIX listen)  | [`procserv::listener`]     |
-//! | `clientFactory.cc` (per-client conn)  | [`procserv::client`]       |
-//! | libtelnet IAC parser/encoder          | [`procserv::telnet`]       |
-//! | `processInput` command-key dispatch   | [`procserv::menu`]         |
-//! | `processFactoryNeedsRestart` policy   | [`procserv::restart`]      |
-//! | `forkAndGo` daemonize + signals       | [`procserv::daemon`]       |
-//! | log/info/pid file + PROCSERV_INFO env | [`procserv::sidecar`]      |
+//! | `procServ.cc` (main, SendToAll)       | `procserv::supervisor`   |
+//! | `processFactory.cc` (PTY child)       | `procserv::child`        |
+//! | `acceptFactory.cc` (TCP/UNIX listen)  | `procserv::listener`     |
+//! | `clientFactory.cc` (per-client conn)  | `procserv::client`       |
+//! | libtelnet IAC parser/encoder          | `procserv::telnet`       |
+//! | `processInput` command-key dispatch   | `procserv::menu`         |
+//! | `processFactoryNeedsRestart` policy   | `procserv::restart`      |
+//! | `forkAndGo` daemonize + signals       | `procserv::daemon`       |
+//! | log/info/pid file + PROCSERV_INFO env | `procserv::sidecar`      |
 //!
 //! ## Architectural notes (from porting analysis)
 //!
@@ -42,16 +42,21 @@
 //!
 //! * **Narrow telnet usage**. Only `IAC WILL ECHO` + `IAC DO
 //!   LINEMODE` negotiated; only DATA/SEND/ERROR events handled. The
-//!   in-crate [`procserv::telnet`] parser is ~80 LOC, vendoring
+//!   in-crate `procserv::telnet` parser is ~80 LOC, vendoring
 //!   `libtelnet.c` is unnecessary.
 //!
-//! * **Unix-only initially**. C procServ requires `forkpty(3)` and
-//!   POSIX signals. Cross-platform support (ConPTY on Windows) is
-//!   future work; the whole `procserv` module is `#[cfg(unix)]`-gated
-//!   so workspace builds on non-Unix succeed but the binary is
-//!   unavailable.
+//! * **Host platforms only**. C procServ requires `forkpty(3)`,
+//!   `execvp(3)` and POSIX signals, and declares it in its build
+//!   system as `PROD_HOST`. The module is gated on
+//!   `procserv_host_platform`, an allowlist emitted by `build.rs`,
+//!   not on `cfg(unix)` — RTEMS and VxWorks are unix-family with no
+//!   second process to supervise, and a unix target that is not on
+//!   the list is refused at build time rather than compiled away.
+//!   Cross-platform support (ConPTY on Windows) is future work; there
+//!   the module compiles away so workspace builds succeed and the
+//!   binary reports why.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(all(feature = "procserv", unix))]
+#[cfg(all(feature = "procserv", procserv_host_platform))]
 pub mod procserv;

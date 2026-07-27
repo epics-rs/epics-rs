@@ -205,7 +205,7 @@ pub struct McaRecord {
     /// field.
     ///
     /// The record keeps it because `process()` must commit `ACQG` from the SAME
-    /// status the read was decided on ([`cycle::McaRecord::apply_status`] must
+    /// status the read was decided on ([`McaRecord::apply_status`] must
     /// not commit it early, or a client sees acquisition stop before the final
     /// spectrum is posted — C `mcaRecord.c:735-742`).
     pub status: McaStatus,
@@ -734,7 +734,7 @@ impl Record for McaRecord {
     /// the `.dbd` declares next — and each of those four is then divided into an
     /// "ROI index" of 32..33 and used to shift `M_R0 << i` by up to 33, which is
     /// undefined behaviour for a 32-bit `unsigned long`. The port addresses a
-    /// region by NAME through [`roi_field`], whose suffix set is closed, so a
+    /// region by NAME through `roi_field`, whose suffix set is closed, so a
     /// field that is not an ROI control field cannot be one.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if !after {

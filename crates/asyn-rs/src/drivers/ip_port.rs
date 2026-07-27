@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::socket;
+
 use super::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -29,7 +31,10 @@ use crate::{asyn_trace, asyn_trace_io};
 /// - `UDP&` → UDP + `SO_REUSEPORT` (C line 375-378, NOT broadcast)
 /// - `UDP*` → UDP + `SO_BROADCAST` (C line 379-382, NOT multicast)
 /// - `UDP*&` → UDP + `SO_BROADCAST` + `SO_REUSEPORT` (C line 383-387)
-/// - `unix://path` → Unix domain socket (cfg(unix) only)
+/// - `unix://path` → Unix domain socket. Present wherever C defines
+///   `HAS_AF_UNIX` — every unix but VxWorks, which `drvAsynIPPort.c:62`
+///   excludes by name. RTEMS keeps it; C excludes only `_WIN32` and
+///   `vxWorks`.
 /// - `HTTP` → TCP + `FLAG_CONNECT_PER_TRANSACTION` (C line 368-371)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpProtocol {
@@ -123,20 +128,35 @@ impl IpPortConfig {
             .strip_prefix("unix://")
             .or_else(|| spec.strip_prefix("UNIX://"))
         {
-            if path.is_empty() {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "empty unix socket path".into(),
+            // Where the platform has no AF_UNIX the spec is refused *here*, in
+            // parsing, which is where C refuses it — `drvAsynIPPortConfigure`
+            // prints "AF_UNIX not available on this platform." and returns -1
+            // from inside this same `unix://` branch (drvAsynIPPort.c:315-317).
+            // That makes a startup script fail on the line that is wrong,
+            // rather than accepting it and failing later on the first connect.
+            #[cfg(not(asyn_af_unix))]
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("AF_UNIX not available on this platform: '{path}'"),
+            });
+
+            #[cfg(asyn_af_unix)]
+            {
+                if path.is_empty() {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "empty unix socket path".into(),
+                    });
+                }
+                return Ok(Self {
+                    host: path.to_string(),
+                    port: 0,
+                    local_port: None,
+                    protocol: IpProtocol::Unix,
+                    connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+                    no_delay: false,
                 });
             }
-            return Ok(Self {
-                host: path.to_string(),
-                port: 0,
-                local_port: None,
-                protocol: IpProtocol::Unix,
-                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-                no_delay: false,
-            });
         }
 
         // Parse protocol suffix (case-insensitive)
@@ -291,7 +311,7 @@ enum IpIoInner {
     // sendto/recvfrom. We mirror that: the socket is left unconnected and
     // the resolved peer is carried alongside it for `send_to`.
     Udp(UdpSocket, std::net::SocketAddr),
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     Unix(std::os::unix::net::UnixStream),
 }
 
@@ -559,7 +579,7 @@ impl OctetNext for IpIoState {
                     Err(e) => Err(classify_read_error(e)),
                 }
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => {
                 // Same C fall-through as the TCP arm (drvAsynIPPort.c:744-756):
                 // a failed set_read_timeout must not pre-empt the read that
@@ -637,7 +657,7 @@ impl OctetNext for IpIoState {
                 // no partial-write carrier.
                 Ok(socket.send_to(data, *peer)?)
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => write_with_retry(stream, data, deadline),
         }
     }
@@ -691,7 +711,7 @@ impl OctetNext for IpIoState {
                     let _ = socket.set_nonblocking(false);
                 }
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             Some(IpIoInner::Unix(stream)) => {
                 let restore = stream.set_nonblocking(true);
                 loop {
@@ -1147,7 +1167,7 @@ impl DrvAsynIPPort {
 
     /// Build a port configured exactly as C's `drvAsynIPPortConfigure(portName,
     /// hostInfo, priority, noAutoConnect, noProcessEos)` leaves one:
-    /// [`Self::new`] plus [`Self::apply_ip_port_configure`] (the `registerPort`
+    /// [`Self::new`] plus `Self::apply_ip_port_configure` (the `registerPort`
     /// autoConnect flag and, unless `noProcessEos`, the default EOS interpose —
     /// drvAsynIPPort.c:1043-1066).
     ///
@@ -1293,43 +1313,19 @@ impl DrvAsynIPPort {
     ///
     /// Single owner of socket creation for both transports, so a new option
     /// cannot be added to one and forgotten on the other.
-    fn new_socket(
-        &self,
-        domain: socket2::Domain,
-        ty: socket2::Type,
-        protocol: socket2::Protocol,
-    ) -> AsynResult<socket2::Socket> {
-        let socket = socket2::Socket::new(domain, ty, Some(protocol))?;
-        if self.config.protocol.broadcast() {
-            socket.set_broadcast(true).map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("Can't set {} socket BROADCAST option: {e}", self.host_info),
-            })?;
+    ///
+    /// C picks SO_REUSEADDR when `USE_SO_REUSEADDR` is defined for the target
+    /// and SO_REUSEPORT otherwise (:465-469) — exactly *one* of the pair, unlike
+    /// the datagram-fanout helper `drvAsynIPServerPort` uses, which sets both.
+    /// Which one is the platform's business, and
+    /// [`socket::SocketOptions::reuse_port`] carries C's own
+    /// `#ifndef SO_REUSEPORT` degrade rule for it.
+    fn socket_options(&self) -> socket::SocketOptions {
+        socket::SocketOptions {
+            broadcast: self.config.protocol.broadcast(),
+            reuse_port: self.config.protocol.reuse_port(),
+            reuse_address: false,
         }
-        if self.config.protocol.reuse_port() {
-            // C picks SO_REUSEADDR when `USE_SO_REUSEADDR` is defined for the
-            // target and SO_REUSEPORT otherwise (:465-469); socket2 exposes
-            // `set_reuse_port` only where the option exists.
-            #[cfg(unix)]
-            socket.set_reuse_port(true).map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "Can't set {} socket SO_REUSEPORT option: {e}",
-                    self.host_info
-                ),
-            })?;
-            #[cfg(not(unix))]
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!(
-                        "Can't set {} socket SO_REUSEPORT option: {e}",
-                        self.host_info
-                    ),
-                })?;
-        }
-        Ok(socket)
     }
 
     fn connect_tcp(&mut self) -> AsynResult<TcpStream> {
@@ -1347,59 +1343,24 @@ impl DrvAsynIPPort {
 
         let mut last_err: Option<AsynError> = None;
         for remote_addr in &addrs {
-            let domain = if remote_addr.is_ipv6() {
-                socket2::Domain::IPV6
-            } else {
-                socket2::Domain::IPV4
-            };
-            let socket =
-                match self.new_socket(domain, socket2::Type::STREAM, socket2::Protocol::TCP) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                };
             // C binds the local address only when one was configured — "a very
             // unusual configuration" (:495-506).
-            if let Some(local_port) = self.config.local_port {
-                let local_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
-                    (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
-                } else {
-                    (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
-                };
-                // Not C's: a fixed local port would otherwise be unusable for the
-                // TIME_WAIT lifetime of the previous connection.
-                if let Err(e) = socket.set_reuse_address(true) {
-                    last_err = Some(AsynError::Io(e));
-                    continue;
-                }
-                if let Err(e) = socket.bind(&local_addr.into()) {
-                    last_err = Some(AsynError::Io(e));
-                    continue;
-                }
-            }
-            match socket.connect_timeout(&(*remote_addr).into(), self.config.connect_timeout) {
-                Ok(()) => return Ok(TcpStream::from(socket)),
-                // C `connectIt` uses a *blocking* `connect()` (drvAsynIPPort.c:513-523)
-                // and only switches the socket to non-blocking afterward (:536), so it
-                // never polls the connecting socket: a blocking connect returns as soon
-                // as the TCP handshake completes and cannot observe a peer that hangs up
-                // right after. `socket2::connect_timeout` instead `poll()`s the socket
-                // for `POLLIN|POLLOUT` and rejects a `POLLHUP` even when `SO_ERROR` is
-                // clear (it returns io::Error "no error set after POLLHUP"). macOS raises
-                // that `POLLHUP` when the peer FINs immediately after accepting, where
-                // Linux does not. On macOS the handshake still completed, so C treats the
-                // link as connected and lets the *later read* surface the EOF
-                // (`closeConnection`, "Read from broken connection", :819) — it does not
-                // fail the connect. Match C: if the socket is in fact connected
-                // (`getpeername` succeeds) the connect succeeded, whatever POLLHUP
-                // socket2 flagged; a genuine connect failure (refused/unreachable/timeout)
-                // never reached ESTABLISHED, so `peer_addr()` errors and we keep `e`.
-                Err(e) => match socket.peer_addr() {
-                    Ok(_) => return Ok(TcpStream::from(socket)),
-                    Err(_) => last_err = Some(AsynError::Io(e)),
-                },
+            let local_addr: Option<std::net::SocketAddr> =
+                self.config.local_port.map(|local_port| {
+                    if remote_addr.is_ipv6() {
+                        (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
+                    } else {
+                        (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
+                    }
+                });
+            let mut opts = self.socket_options();
+            // Not C's: a fixed local port would otherwise be unusable for the
+            // TIME_WAIT lifetime of the previous connection. Only meaningful
+            // when a local bind actually happens.
+            opts.reuse_address = local_addr.is_some();
+            match socket::tcp_connect(*remote_addr, local_addr, opts, self.config.connect_timeout) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(AsynError::Io(e)),
             }
         }
         Err(last_err.unwrap_or_else(|| AsynError::Status {
@@ -1427,31 +1388,25 @@ impl DrvAsynIPPort {
                 message: format!("UDP resolve '{remote}': no addresses"),
             })?;
         let local_port = self.config.local_port.unwrap_or(0);
-        let (domain, local_addr): (socket2::Domain, std::net::SocketAddr) = if peer.is_ipv6() {
-            (
-                socket2::Domain::IPV6,
-                (std::net::Ipv6Addr::UNSPECIFIED, local_port).into(),
-            )
+        let local_addr: std::net::SocketAddr = if peer.is_ipv6() {
+            (std::net::Ipv6Addr::UNSPECIFIED, local_port).into()
         } else {
-            (
-                socket2::Domain::IPV4,
-                (std::net::Ipv4Addr::UNSPECIFIED, local_port).into(),
-            )
+            (std::net::Ipv4Addr::UNSPECIFIED, local_port).into()
         };
         // The options go on the fresh socket, before the bind — the whole point
         // of `udp&` is two ports sharing one local port, and the kernel only
         // honours SO_REUSEPORT on an unbound socket (C :461-477, then :495-506).
-        let socket = self.new_socket(domain, socket2::Type::DGRAM, socket2::Protocol::UDP)?;
-        socket
-            .bind(&local_addr.into())
-            .map_err(|e| AsynError::Status {
+        // That ordering is the seam's contract, not this call site's.
+        let socket = socket::udp_socket(local_addr, self.socket_options()).map_err(|e| {
+            AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("UDP bind '{local_addr}' failed: {e}"),
-            })?;
-        Ok((UdpSocket::from(socket), peer))
+            }
+        })?;
+        Ok((socket, peer))
     }
 
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     fn connect_unix(&mut self) -> AsynResult<std::os::unix::net::UnixStream> {
         let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
             AsynError::Status {
@@ -1474,7 +1429,7 @@ impl PortDriver for DrvAsynIPPort {
 
     /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
     /// (drvAsynIPPort.c:1037-1053) — no register interface. A record with
-    /// IFACE=Int32/UInt32/Float64 on this port gets C's "No asyn<X> interface"
+    /// IFACE=Int32/UInt32/Float64 on this port gets C's `No asyn<X> interface`
     /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         crate::interfaces::octet_transport_capabilities()
@@ -1513,16 +1468,21 @@ impl PortDriver for DrvAsynIPPort {
                 let (socket, peer) = self.connect_udp()?;
                 self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpProtocol::Unix => {
                 let stream = self.connect_unix()?;
                 self.io.inner = Some(IpIoInner::Unix(stream));
             }
-            #[cfg(not(unix))]
+            // Unreachable rather than defensive: `IpPortConfig::parse` refuses
+            // a `unix://` spec outright on a platform without AF_UNIX, so no
+            // config carrying this variant can exist here. The arm is present
+            // because `IpProtocol::Unix` is still a variant of the enum and the
+            // match must be exhaustive.
+            #[cfg(not(asyn_af_unix))]
             IpProtocol::Unix => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
-                    message: "Unix domain sockets not supported on this platform".into(),
+                    message: "AF_UNIX not available on this platform".into(),
                 });
             }
             IpProtocol::Http => {
@@ -1793,6 +1753,10 @@ mod tests {
         crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
     }
 
+    /// Gated with its only caller,
+    /// `eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes`, which
+    /// needs `crate::iocsh` and so exists only under `epics`.
+    #[cfg(feature = "epics")]
     fn chain_read_eom(
         drv: &mut DrvAsynIPPort,
         user: &AsynUser,
@@ -3402,6 +3366,11 @@ mod tests {
     ///     is silently dropped from the read.
     ///
     /// Assert the 3 bytes. Under the inverted chain this returns 2 and fails.
+    ///
+    /// Gated on `epics`: the interpose order under test is the one
+    /// `crate::iocsh::build_configured_ip_port` installs, and `iocsh` is part
+    /// of the EPICS surface. The driver itself needs no feature.
+    #[cfg(feature = "epics")]
     #[test]
     fn eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes() {
         use crate::interpose::com::IAC;
@@ -3502,7 +3471,7 @@ mod tests {
 
     // --- Unix socket integration test ---
 
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     #[test]
     fn test_unix_socket_connect_roundtrip() {
         use std::os::unix::net::UnixListener;

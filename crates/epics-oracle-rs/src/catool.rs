@@ -633,7 +633,7 @@ fn normalize_ca_error(msg: &str) -> String {
 /// is what makes batching safe *by construction* instead of by a size limit
 /// someone has to remember. `camonitor` is still deliberately not run through
 /// this path — it needs its output *incrementally* while it runs, which is a
-/// different requirement from not deadlocking (see [`monitor`]).
+/// different requirement from not deadlocking (see [`CaTools::monitor`]).
 ///
 /// Shared with [`crate::pvatool`]: the PVA instrument owes the identical
 /// "a tool that did not finish is an ERROR" guarantee, and a second copy of

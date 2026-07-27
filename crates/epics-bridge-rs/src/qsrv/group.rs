@@ -960,7 +960,7 @@ impl GroupChannel {
     }
 
     /// Read only specific members by field name and compose a partial PvStructure.
-    /// Same access enforcement as [`read_group`].
+    /// Same access enforcement as `read_group`.
     #[allow(dead_code)]
     async fn read_partial(&self, field_names: &[String]) -> BridgeResult<PvStructure> {
         if !self.access.can_read(&self.def.name).await {
@@ -1014,10 +1014,10 @@ impl GroupChannel {
     }
 
     /// Read a single member's value from the database. Used by the
-    /// non-atomic [`read_group`] path: it locks the backing record
+    /// non-atomic `read_group` path: it locks the backing record
     /// itself (no pre-held guard exists). The atomic path MUST use
     /// [`Self::read_member_locked`] instead — see the deadlock note
-    /// in [`read_group`].
+    /// in `read_group`.
     async fn read_member(&self, member: &GroupMember) -> BridgeResult<PvField> {
         if let Some(field) = Self::read_member_channelless(member) {
             return Ok(field);
@@ -1036,7 +1036,7 @@ impl GroupChannel {
     }
 
     /// Read a single member's value against a record instance that the
-    /// caller already holds a read guard on. The atomic [`read_group`]
+    /// caller already holds a read guard on. The atomic `read_group`
     /// path uses this so it never re-locks a record whose guard is
     /// held by `lock_group_records_read` (recursive-read deadlock).
     fn read_member_locked(
@@ -1596,7 +1596,7 @@ impl GroupChannel {
     /// ["record._options.atomic"]`, and `:181` runs
     /// `setForceProcessingFlag` against `pvRequest()`). The native
     /// wire path captures the INIT pvRequest on `ChannelContext` and
-    /// passes the parsed [`PutOptions`] plus the explicit atomic
+    /// passes the parsed [`super::channel::PutOptions`] plus the explicit atomic
     /// override here. `atomic_override` is `None` when the request
     /// did not set the option, in which case the group's configured
     /// default (`self.def.atomic`) applies — matching pvxs's
@@ -2188,7 +2188,7 @@ pub struct GroupMonitor {
     pump: Arc<super::group_pump::GroupPump>,
     /// This subscription's registration finalizer. `Some` ⟺ the pump is
     /// draining this monitor's member subscriptions. Dropping it (in
-    /// [`PvaMonitor::stop`] or on monitor drop) is THE teardown path: it
+    /// [`super::provider::PvaMonitor::stop`] or on monitor drop) is THE teardown path: it
     /// queues the pump's `Deregister`, which releases the member
     /// `DbSubscription`s and this monitor's update-queue producer.
     registration: Option<super::group_pump::RegistrationHandle>,
@@ -2199,7 +2199,7 @@ pub struct GroupMonitor {
     /// cancels, `groupsource.cpp:240-300`).
     update_rx: Option<super::group_pump::UpdatePoller>,
     /// Detachable enable/disable handles for every member `DbSubscription`
-    /// (value + PROPERTY) opened in [`start`]. Collected before each
+    /// (value + PROPERTY) opened in [`super::provider::PvaMonitor::start`]. Collected before each
     /// subscription is moved into the pump's registration so the per-op
     /// MONITOR START/STOP gate can `db_event_disable`/`enable` the
     /// whole group's upstream on a client STOP/RESUME — pvxs
@@ -2272,7 +2272,7 @@ impl GroupMonitor {
     }
 
     /// Detachable enable/disable handles for every member subscription
-    /// opened in [`PvaMonitor::start`] (value + PROPERTY per channeled
+    /// opened in [`super::provider::PvaMonitor::start`] (value + PROPERTY per channeled
     /// member). Used by the per-op MONITOR START/STOP gate so
     /// a client STOP suspends the whole group's upstream event flow.
     /// Empty before `start()`.
@@ -2292,9 +2292,9 @@ impl GroupMonitor {
     /// (`groupsource.cpp:480-485`), so seeding a group monitor from GET made
     /// the initial frame's `record._options` disagree with the update
     /// stream. Read through the monitor's own `group_channel` — built in
-    /// [`PvaMonitor::start`] with `with_monitor_stamp`/
+    /// [`super::provider::PvaMonitor::start`] with `with_monitor_stamp`/
     /// `with_monitor_queue_size`, the identical value path
-    /// [`poll`](Self::poll) drains — so the seed and the deltas share one
+    /// [`super::provider::PvaMonitor::poll`] drains — so the seed and the deltas share one
     /// stamping by construction. Returns the full (unfiltered) group value,
     /// matching the update stream and pvxs's fully-marked first event; the
     /// wire layer applies the client's pvRequest field mask uniformly to
@@ -2698,7 +2698,7 @@ impl AnyMonitor {
     /// vs the GET path `:480-485`. A single-record monitor has no group-style
     /// `record._options` branch, so its GET seed and monitor frames already
     /// carry identical options; it returns `None` and the adapter keeps the
-    /// GET seed. Valid after [`PvaMonitor::start`].
+    /// GET seed. Valid after [`super::provider::PvaMonitor::start`].
     pub async fn seed(&self) -> Option<PvField> {
         match self {
             Self::Single(_) => None,
@@ -2708,7 +2708,7 @@ impl AnyMonitor {
 
     /// Detachable enable/disable handles for this monitor's backing
     /// `DbSubscription`s, for the per-op MONITOR START/STOP gate.
-    /// Valid after [`PvaMonitor::start`].
+    /// Valid after [`super::provider::PvaMonitor::start`].
     pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
         match self {
             Self::Single(m) => m.activation_handles(),

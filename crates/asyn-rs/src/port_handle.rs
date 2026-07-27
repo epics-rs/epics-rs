@@ -197,7 +197,7 @@ impl PortHandle {
         }
     }
 
-    /// Record the driver's declared interface set — see [`Self::interfaces`].
+    /// Record the driver's declared interface set — see `Self::interfaces`.
     /// Called by the runtime layer at handle construction, from the driver's own
     /// [`crate::port::PortDriver::capabilities`].
     pub fn set_interfaces(&mut self, interfaces: Vec<Capability>) {

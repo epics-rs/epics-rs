@@ -30,6 +30,7 @@ pub mod ioc_role;
 pub mod json_string;
 pub mod log;
 pub mod net;
+pub mod socket;
 pub mod stdlib;
 pub mod supervise;
 pub mod sync;

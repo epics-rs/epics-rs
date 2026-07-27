@@ -13,12 +13,18 @@ tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "m
 parking_lot = "0.12"
 thiserror = "2"
 bitflags = "2"
-socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 chrono = "0.4"
 serde_json = "1"
 tracing = "0.1"
 epics-base-rs = { workspace = true, optional = true }
+# `runtime::socket` is the workspace's one owner of "open a socket, set the
+# address-reuse/broadcast options, then bind" — the ordering `socket2` cannot
+# express on the embedded triples, because it does not build for either of
+# them. Not optional and not behind `epics`: `drivers::ip_port` and
+# `drivers::ip_server_port` are unconditional modules, so their socket layer
+# has to be too.
+epics-libcom-rs = { workspace = true }
 
 [features]
 default = ["epics"]
@@ -66,6 +72,13 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Tests only, and host-only. Production code reaches sockets through
+# `epics_libcom_rs::runtime::socket`; these are the tests that read an option
+# back off a bound socket (`SockRef::reuse_port`) to prove the seam set it,
+# which needs socket2's getters. They never build for the embedded triples —
+# socket2 does not compile there, which is why the seam exists.
+[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dev-dependencies]
+socket2 = { version = "0.5", features = ["all"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 # Integration tests that drive the asyn record through a real CA server's
 # put gate (the process-passive `should_process` path). No dependency cycle:
@@ -75,3 +88,26 @@ epics-ca-rs = { workspace = true }
 [[bench]]
 name = "throughput"
 harness = false
+
+# Integration tests of the EPICS-IOC surface — the record device support, the
+# iocsh commands, and `epics_base_rs`'s database — so they exist only when that
+# surface does. Declared as `required-features` rather than `#![cfg(feature =
+# "epics")]` inside each file: cargo then SKIPS the target, instead of
+# compiling a file whose contents have been cfg'd away to nothing, which reads
+# as a passing test that never ran. The other six files in `tests/` name only
+# the framework and are auto-discovered unchanged.
+[[test]]
+name = "iocsh_port_is_traceable"
+required-features = ["epics"]
+
+[[test]]
+name = "ip_server_port_accepts"
+required-features = ["epics"]
+
+[[test]]
+name = "port_runtime_lifetime"
+required-features = ["epics"]
+
+[[test]]
+name = "process_gate_tests"
+required-features = ["epics"]

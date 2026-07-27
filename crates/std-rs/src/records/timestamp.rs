@@ -280,7 +280,7 @@ impl Record for TimestampRecord {
     ///
     /// The framework's snapshot builders force-post the deadband field on
     /// every cycle the deadband gate fires (and the gate always fires for
-    /// a non-numeric value — see [`RecordInstance::check_deadband_ext`],
+    /// a non-numeric value — see [`epics_base_rs::server::record::RecordInstance::check_deadband_ext`],
     /// whose `to_f64()` returns `None` for a string `VAL`). Returning the
     /// default `"VAL"` here would therefore re-post `VAL` on every scan,
     /// even when the rendered string is unchanged — diverging from C's

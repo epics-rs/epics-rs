@@ -94,7 +94,7 @@ pub const HSC_ERROR_MESSAGES: [&str; 14] = [
 
 /// Classify a controller `ERROR;` response into `(error_code, message)`,
 /// matching C's `numWords`-based handling (xia_slit.st:1253-1262): a code-less
-/// `ERROR;` (`None`) reports `ERROR_UNKNOWN` with "<id>: unknown error", while a
+/// `ERROR;` (`None`) reports `ERROR_UNKNOWN` with `<id>: unknown error`, while a
 /// code present in the 0..13 table reports that code and its `hscErrors[]` text.
 /// An out-of-table code also maps to `ERROR_UNKNOWN` (C indexes `hscErrors[]`
 /// unguarded there — a C boundary bug we deliberately do not copy). Shared by

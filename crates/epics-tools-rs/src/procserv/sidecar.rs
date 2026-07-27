@@ -95,7 +95,7 @@ impl LogSink {
     }
 }
 
-/// Per-line writer to the supervisor log. Wraps a [`LogSink`] with
+/// Per-line writer to the supervisor log. Wraps a `LogSink` with
 /// timestamp prefixing — every line emitted by the child PTY is
 /// prefixed with the configured timestamp format. Multiple writers are
 /// serialized via a parking_lot mutex around the sink, but the typical
@@ -383,7 +383,8 @@ pub fn render_procserv_info_env(info: &InfoSnapshot) -> String {
 /// creation (`procServ.cc:824-832`) and creates the control listeners
 /// before the log listener (`procServ.cc:515-534`), so head order is the
 /// reverse of creation order: the log endpoint first, then the control
-/// endpoints in reverse of their `ctlSpecs` order. [`bind_endpoints`]
+/// endpoints in reverse of their `ctlSpecs` order.
+/// [`super::listener::bind_endpoints`]
 /// binds in creation order (controls, then log), so reverse iteration
 /// reproduces head order exactly. `manage-procs` is order-independent
 /// (`manage.py:68` joins all ports), so this ordering is functional parity

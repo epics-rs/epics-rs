@@ -928,7 +928,7 @@ impl Hdf5Writer {
 
     /// Dataset shape and chunk geometry for a pre-compressed (direct chunk
     /// write) detector dataset. Identical leading-axis structure to
-    /// [`standard_layout`], but every chunk holds exactly **one whole frame**:
+    /// `standard_layout`, but every chunk holds exactly **one whole frame**:
     /// the codec compressed each frame as a single unit, so C
     /// `NDFileHDF5Dataset::verifyChunking` (NDFileHDF5Dataset.cpp:185-235)
     /// requires the leading frame-axis chunk == 1 and every frame-axis chunk ==
@@ -962,7 +962,7 @@ impl Hdf5Writer {
     /// whose backend (`SwmrFileWriter`) supports only one extensible frame
     /// axis. With extra dims the leading axis is fixed at the product of the
     /// extra-dim sizes (the N-dimensional structure is recorded as HDF5
-    /// attributes); the non-SWMR path uses [`standard_layout`], which builds
+    /// attributes); the non-SWMR path uses `standard_layout`, which builds
     /// C's full multi-extra-dimension dataspace.
     ///
     /// Returns `(shape, chunk, extra_dim_extent)` where `extra_dim_extent` is
@@ -1343,7 +1343,7 @@ impl Hdf5Writer {
     }
 
     /// Build every group node declared in the loaded layout XML against a
-    /// `SwmrFileWriter`, the SWMR counterpart of [`build_layout_groups`].
+    /// `SwmrFileWriter`, the SWMR counterpart of `build_layout_groups`.
     ///
     /// Paths are created parent-first (shortest path-depth first) via the
     /// rust-hdf5 0.2.17 `SwmrFileWriter::create_group` API, which takes the
@@ -1396,7 +1396,7 @@ impl Hdf5Writer {
     }
 
     /// Materialise every `<hardlink>` declared in the loaded layout XML against
-    /// a `SwmrFileWriter`, the SWMR counterpart of [`build_layout_hardlinks`].
+    /// a `SwmrFileWriter`, the SWMR counterpart of `build_layout_hardlinks`.
     ///
     /// Uses the rust-hdf5 0.2.17 `SwmrFileWriter::create_hard_link` API. Called
     /// from `open_swmr` after the layout groups and image dataset exist and
@@ -1604,7 +1604,7 @@ impl Hdf5Writer {
     /// no layout is loaded.
     ///
     /// `file` is the live `Standard` write-mode HDF5 handle. The SWMR path has
-    /// its own counterpart, [`build_swmr_layout_hardlinks`], which runs before
+    /// its own counterpart, `build_swmr_layout_hardlinks`, which runs before
     /// `start_swmr()` (C++ `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then
     /// `startSWMR`) so SWMR readers see the links during streaming.
     fn build_layout_hardlinks(&self, file: &H5File) -> ADResult<()> {
@@ -2877,7 +2877,7 @@ fn write_ndattr_dataset_attr(ds: &rust_hdf5::H5Dataset, attr_name: &str, value: 
     }
 }
 
-/// SWMR counterpart of [`write_ndattr_element_attr`] for group element-attrs:
+/// SWMR counterpart of `write_ndattr_group_attr` for group element-attrs:
 /// write a live NDAttribute value as a group HDF5 attribute, addressed by the
 /// group's absolute path. The datatype follows the runtime NDAttribute value
 /// (C `typeNd2Hdf`); `Undefined` is skipped.
@@ -3258,7 +3258,7 @@ struct Hdf5ParamIndices {
     layout_error_msg: Option<usize>,
 }
 
-/// HDF5 file processor wrapping FilePluginController<Hdf5Writer>.
+/// HDF5 file processor wrapping `FilePluginController<Hdf5Writer>`.
 pub struct Hdf5FileProcessor {
     ctrl: FilePluginController<Hdf5Writer>,
     hdf5_params: Hdf5ParamIndices,

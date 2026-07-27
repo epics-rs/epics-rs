@@ -3,7 +3,7 @@
 //! Controls a Kohzu-style monochromator with up to 3 motors (Theta, Y, Z).
 //! Provides energy/wavelength/theta conversions using Bragg's law:
 //!   lambda = 2d * sin(theta), where d = a / sqrt(H^2 + K^2 + L^2)
-//!   E [keV] = 12.3984244 / lambda [Angstrom]
+//!   `E [keV] = 12.3984244 / lambda [Angstrom]`
 //!
 //! Supports Normal, Channel-Cut, Freeze-Z, and Freeze-Y operating modes.
 //! Supports Auto and Manual modes, plus Set/Use calibration mode.

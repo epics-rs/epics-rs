@@ -56,7 +56,7 @@ pub enum GatewayCommand {
 impl GatewayCommand {
     /// Parse a single command line. Returns `Noop` for blank/comment lines.
     /// Retained as the programmatic single-command API; the command-file
-    /// path uses the per-token parser ([`Self::parse_token`]) so it can
+    /// path uses the per-token parser (`Self::parse_token`) so it can
     /// honor C's multi-command-per-line shape.
     pub fn parse(line: &str) -> Option<Self> {
         let line = line.trim();
@@ -420,7 +420,7 @@ impl CommandHandler {
     /// a burst of different flags is ordered by C's fixed sequence, not by
     /// token order in the file (`R3 AS` reloads access first, then reports);
     /// and the broader Rust programmatic vocabulary
-    /// ([`GatewayCommand::parse_token`]: `PVL`, `VERSION`, long aliases,
+    /// (`GatewayCommand::parse_token`: `PVL`, `VERSION`, long aliases,
     /// lowercase) is NOT honored here — those are reported as invalid, so
     /// the command-file path matches C exactly while the control-PV /
     /// programmatic APIs keep the extensions.

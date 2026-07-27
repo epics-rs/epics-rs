@@ -18,11 +18,11 @@ use epics_base_rs::types::{EpicsValue, PvString};
 /// `SMSL` ("Setpoint Mode Select", `epidRecord.dbd:17`) is `menu(menuOmsl)`,
 /// but its field *name* is record-specific — the base registry keys the
 /// shared `menuOmsl` table by the standard name `OMSL` — so it is mapped
-/// per record to [`MENU_OMSL`].
+/// per record to [`epics_base_rs::server::record::dbd_generated::MENU_OMSL`].
 /// `ReadDbLink` target for the bumpless-transfer OUTL readback.
 ///
 /// Deliberately NOT a `.dbd` field: it names the internal staging cell
-/// [`EpidRecord::outl_seed`], not a CA-visible one. C reads OUTL inside
+/// `EpidRecord::outl_seed`, not a CA-visible one. C reads OUTL inside
 /// `do_pid`, after the MDT gate, so the value must not be observable (nor
 /// monitor-posted) on a cycle C would have gated — see `pre_process_actions`.
 const OUTL_SEED_FIELD: &str = "__OUTL_SEED";
@@ -445,12 +445,12 @@ impl EpidRecord {
     /// the flag and returns `ProcessOutcome::async_pending()` so the
     /// trigger pass skips the process tail (checkAlarms / monitor /
     /// recGblFwdLink) — C `devEpidSoftCallback.c:143-145` +
-    /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig_pending`].
+    /// `epidRecord.c:205-210`. See `EpidRecord::ca_trig_pending`.
     pub fn set_ca_trig_pending(&mut self) {
         self.ca_trig_pending = true;
     }
 
-    /// Owner setter for [`EpidRecord::outl_write`]. Only `do_pid` calls
+    /// Owner setter for `EpidRecord::outl_write`. Only `do_pid` calls
     /// this — it clears the flag at entry and re-enables it per `fbon`
     /// on the success path, mirroring C's OUTL `dbPutLink` gate
     /// (`devEpidSoft.c:220`). Keeping it private to a setter preserves
@@ -512,7 +512,7 @@ impl Record for EpidRecord {
     /// can only run BEFORE `process()` / `do_pid`, whereas C reads OUTL
     /// *after* the `dt < MDT` gate (`devEpidSoft.c:125`) and the record's
     /// UDF gate (`epidRecord.c:195`). So the read does NOT land in `.I` /
-    /// `.OVAL` here — it lands in [`EpidRecord::outl_seed`], and `do_pid`
+    /// `.OVAL` here — it lands in `EpidRecord::outl_seed`, and `do_pid`
     /// consumes it at C's line. A cycle that C would have gated leaves the
     /// staged value unconsumed: no field write, no monitor, and FBOP stays
     /// 0 so the next ungated cycle re-reads and seeds for real.
@@ -1035,7 +1035,7 @@ impl Record for EpidRecord {
         Some(self)
     }
 
-    /// C `epidRecord.c` UDF ownership — see [`EpidRecord::value_undefined`].
+    /// C `epidRecord.c` UDF ownership — see `EpidRecord::value_undefined`.
     ///
     /// The framework's post-`process()` step runs
     /// `common.udf = value_is_undefined()` (gated on `clears_udf()`,

@@ -1,10 +1,14 @@
 pub mod device;
 mod io_intr;
-pub mod registry;
 pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
-pub use registry::{
-    PortEntry, PortRegistry, asyn_record_factory, get_port, port_names, register_asyn_record_type,
-    register_port, unregister_port,
+// The port registry itself is [`crate::registry`], not this module's: it is the
+// framework's process-wide name claim, used by `crate::manager` whether or not
+// an EPICS record layer exists. Re-exported here because every existing caller
+// — `ad-core-rs`, `ad-plugins-rs`, `modbus-rs`, `mqtt-rs` and the example IOCs
+// — spells it `asyn_record::get_port`, and moving the definition is not a
+// reason to break them.
+pub use crate::registry::{
+    PortEntry, PortRegistry, get_port, port_names, register_port, unregister_port,
 };
 
 use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan};
@@ -29,6 +33,25 @@ use crate::port_handle::PortHandle;
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 use crate::user::AsynUser;
+
+/// Return the asyn record type factory for injection into IocBuilder.
+///
+/// This and [`register_asyn_record_type`] are what actually belonged to this
+/// module when the port registry was split out to [`crate::registry`]: both
+/// name `epics_base_rs` record machinery, so both exist only under the `epics`
+/// feature, and neither is reachable from the framework core.
+pub fn asyn_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    ("asyn", Box::new(|| Box::new(AsynRecord::default())))
+}
+
+/// Register the "asyn" record type via the global registry (legacy).
+/// Prefer `asyn_record_factory()` with `IocBuilder::register_record_type()`.
+pub fn register_asyn_record_type() {
+    epics_base_rs::server::db_loader::register_record_type(
+        "asyn",
+        Box::new(|| Box::new(AsynRecord::default())),
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -2786,7 +2809,7 @@ impl AsynRecord {
             ));
         }
 
-        match registry::get_port(&self.port) {
+        match crate::registry::get_port(&self.port) {
             Some(entry) => {
                 // C `connectDevice` asks the port for asynDrvUser *before* it
                 // resolves anything (`findInterface(asynDrvUserType)`,
@@ -4227,7 +4250,7 @@ impl Record for AsynRecord {
         Ok(())
     }
 
-    /// C `process()` (asynRecord.c:329-372). The body is [`Self::process_cycle`];
+    /// C `process()` (asynRecord.c:329-372). The body is `Self::process_cycle`;
     /// this wrapper is C's `done:` label (:369-371), whose `gotValue = 0` is the
     /// invariant that keeps the interrupt cell honest:
     ///
@@ -4263,7 +4286,7 @@ impl Record for AsynRecord {
     /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
     /// report the error and leave the record Passive (dbScan.c:278-293). The
     /// port's `setup_io_intr` runs the same demotion off
-    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
+    /// `AsynRecordDevice::io_intr_receiver`; for a *runtime* SCAN put
     /// the failure text is what reaches the operator, in ERRS, exactly as C's
     /// `reportError` puts it there (:617,:627,:637,:647).
     fn set_io_intr_scan(&mut self, active: bool) {
@@ -5749,7 +5772,7 @@ mod tests {
 
         register_port("test_asyn_rec", handle, trace).unwrap();
 
-        let entry = registry::get_port("test_asyn_rec");
+        let entry = crate::registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().handle.port_name(), "test_asyn_rec");
     }
@@ -8230,7 +8253,7 @@ mod tests {
     /// Minimal `can_block` port whose Int32 parameter 0 holds a known value,
     /// backed by a real [`PortActor`] thread — the off-thread orchestration
     /// submits against it exactly as a production blocking driver.
-    fn canblock_int32_entry(value: i32) -> super::registry::PortEntry {
+    fn canblock_int32_entry(value: i32) -> crate::registry::PortEntry {
         use crate::interrupt::InterruptManager;
         use crate::param::ParamType;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -8269,7 +8292,7 @@ mod tests {
             actor_id,
         );
         handle.set_can_block(true);
-        super::registry::PortEntry {
+        crate::registry::PortEntry {
             handle,
             trace: Arc::new(TraceManager::new()),
         }
@@ -8402,7 +8425,7 @@ mod tests {
             actor_id,
         );
         handle.set_can_block(true);
-        let entry = super::registry::PortEntry {
+        let entry = crate::registry::PortEntry {
             handle,
             trace: Arc::new(TraceManager::new()),
         };
@@ -8518,7 +8541,7 @@ mod tests {
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
         // Known baseline mask, then register the port for the record to find.
         trace.set_trace_mask(Some(port_name), TraceMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
+        crate::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         // Build the record, hand it the database handle, and connect it —
         // connecting registers the trace exception callback with the same
@@ -8637,7 +8660,7 @@ mod tests {
         // `monitorStatus`): TMSK = ERROR, all IO bits clear.
         trace.set_trace_mask(Some(port_name), TraceMask::ERROR);
         trace.set_trace_io_mask(Some(port_name), TraceIoMask::empty());
-        super::registry::register_port(port_name, handle, trace.clone()).unwrap();
+        crate::registry::register_port(port_name, handle, trace.clone()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "TRACE_POSTIFNEW_REC";
@@ -8778,7 +8801,7 @@ mod tests {
         );
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(Arc::new(ExceptionManager::new()));
-        super::registry::register_port(port_name, handle, trace).unwrap();
+        crate::registry::register_port(port_name, handle, trace).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "ERRS_POST_REC";
@@ -9042,7 +9065,7 @@ mod tests {
             Arc::new(InterruptManager::new(256)),
             actor_id,
         );
-        super::registry::register_port(port_name, handle.clone(), trace.clone()).unwrap();
+        crate::registry::register_port(port_name, handle.clone(), trace.clone()).unwrap();
 
         let db = PvDatabase::new();
         let rec_name = "EXCEPT_CNCT_REC";

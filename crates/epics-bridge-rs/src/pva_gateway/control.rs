@@ -138,7 +138,7 @@ impl ControlSource {
     /// (`flush` / `drop` / `reload`). A flush/drop/reload is then
     /// allowed iff this ACF grants WRITE to the caller's
     /// `(host, account, method, roles)` under the control ASG
-    /// ([`CONTROL_ASG`]) — the same [`AccessGate`] machinery the
+    /// (`CONTROL_ASG`) — the same [`AccessGate`] machinery the
     /// proxied namespace uses, NOT a host/account allow-list. Without
     /// this the writable surface stays closed (every RPC denied).
     pub fn with_control_acf(mut self, cfg: AccessSecurityConfig) -> Self {
@@ -148,7 +148,7 @@ impl ControlSource {
     }
 
     /// ASG/ASL resolver for the control gate: every writable control PV
-    /// resolves to [`CONTROL_ASG`] with ASL 0, so an operator grants
+    /// resolves to `CONTROL_ASG` with ASL 0, so an operator grants
     /// WRITE to it independently of the proxied namespace's per-PV ASGs.
     fn control_asg_resolver() -> AsgAslResolver {
         Arc::new(|_pv_name| Box::pin(async { (CONTROL_ASG.to_string(), 0u8) }))

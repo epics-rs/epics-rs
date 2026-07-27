@@ -4,13 +4,16 @@
 //! same `PROCSERV_INFO` env contract, same per-line PTY behaviour.
 //! See [`epics_tools_rs::procserv`] for architectural notes.
 
-#[cfg(not(unix))]
+// Reached on Windows alone: a unix target that is not a host platform never
+// gets here, because `build.rs` refuses the build outright. So the message
+// names the port that is missing rather than a platform class.
+#[cfg(not(procserv_host_platform))]
 fn main() {
-    eprintln!("procserv-rs is Unix-only (requires forkpty)");
+    eprintln!("procserv-rs needs forkpty(3); no Windows (ConPTY) backend exists yet");
     std::process::exit(2);
 }
 
-#[cfg(unix)]
+#[cfg(procserv_host_platform)]
 mod app {
     use std::path::PathBuf;
     use std::process::ExitCode;
@@ -175,7 +178,7 @@ mod app {
 
         /// Executable to launch instead of the positional command
         /// (`-e` / `--exec`, C `childExec`, procServ.cc:295-296,459-462).
-        /// The child still presents argv[0] = the command, so a wrapper
+        /// The child still presents `argv[0]` = the command, so a wrapper
         /// runs under the original command line. Default: exec the
         /// command itself.
         #[arg(short = 'e', long = "exec", value_name = "PATH")]
@@ -1380,7 +1383,7 @@ mod app {
     }
 }
 
-#[cfg(unix)]
+#[cfg(procserv_host_platform)]
 fn main() -> std::process::ExitCode {
     app::entry()
 }

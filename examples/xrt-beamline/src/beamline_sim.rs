@@ -21,15 +21,15 @@ use xrt_sources::geometric::GeometricSource;
 
 /// Beamline geometry constants (distances in mm).
 pub struct BeamlineGeometry {
-    /// Source to DCM distance [mm]
+    /// Source to DCM distance `mm`
     pub source_to_dcm: f64,
-    /// DCM crystal gap [mm]
+    /// DCM crystal gap `mm`
     pub dcm_gap: f64,
-    /// DCM to HFM distance [mm]
+    /// DCM to HFM distance `mm`
     pub dcm_to_hfm: f64,
-    /// HFM to VFM distance [mm]
+    /// HFM to VFM distance `mm`
     pub hfm_to_vfm: f64,
-    /// VFM to sample distance [mm]
+    /// VFM to sample distance `mm`
     pub vfm_to_sample: f64,
 }
 
@@ -47,13 +47,13 @@ impl Default for BeamlineGeometry {
 
 /// Undulator parameters for energy calculation.
 pub struct UndulatorConfig {
-    /// Electron beam energy [GeV]
+    /// Electron beam energy `GeV`
     pub electron_energy: f64,
-    /// Undulator period [mm]
+    /// Undulator period `mm`
     pub period: f64,
     /// Maximum K parameter (at minimum gap)
     pub k_max: f64,
-    /// Minimum gap [mm]
+    /// Minimum gap `mm`
     pub gap_min: f64,
     /// Gap coefficient for exponential decay
     pub gap_coeff: f64,
@@ -79,7 +79,7 @@ impl UndulatorConfig {
         self.k_max * (-self.gap_coeff * gap / self.period).exp()
     }
 
-    /// Calculate fundamental energy [eV] from gap [mm].
+    /// Calculate fundamental energy `eV` from gap `mm`.
     ///
     /// E₁(keV) = 0.9496 * E_e²(GeV) / (λ_u(cm) * (1 + K²/2))
     /// E₁(eV)  = 9496 * E_e²(GeV) / (λ_u(mm) * (1 + K²/2))
@@ -166,21 +166,21 @@ pub struct SimConfig {
     pub nrays: usize,
     pub geometry: BeamlineGeometry,
     pub undulator: UndulatorConfig,
-    /// Screen half-width [mm]
+    /// Screen half-width `mm`
     pub screen_dx: f64,
-    /// Screen half-height [mm]
+    /// Screen half-height `mm`
     pub screen_dz: f64,
     /// Screen bins in x
     pub screen_nx: usize,
     /// Screen bins in z
     pub screen_nz: usize,
-    /// Source divergence σ_x [rad]
+    /// Source divergence σ_x `rad`
     pub source_div_x: f64,
-    /// Source divergence σ_z [rad]
+    /// Source divergence σ_z `rad`
     pub source_div_z: f64,
-    /// Source size σ_x [mm]
+    /// Source size σ_x `mm`
     pub source_size_x: f64,
-    /// Source size σ_z [mm]
+    /// Source size σ_z `mm`
     pub source_size_z: f64,
     /// Energy bandwidth ΔE/E for the source
     pub energy_bandwidth: f64,
@@ -209,9 +209,9 @@ impl Default for SimConfig {
 pub struct SimResult {
     pub capture: ScreenCapture,
     pub beamline_output: BeamlineOutput,
-    /// Photon energy at source [eV]
+    /// Photon energy at source `eV`
     pub source_energy: f64,
-    /// DCM selected energy [eV]
+    /// DCM selected energy `eV`
     pub dcm_energy: f64,
 }
 

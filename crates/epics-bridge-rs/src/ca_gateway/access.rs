@@ -28,7 +28,7 @@
 //! ## Status
 //!
 //! Per-rule enforcement is live: every PUT goes through
-//! [`super::upstream::build_write_hook`], which calls [`Self::can_write`]
+//! `super::upstream::build_write_hook`, which calls [`AccessConfig::can_write`]
 //! with the ASG from `.pvlist`, the rule's ASL, and the (user, host)
 //! pair the CA server attaches to the WriteContext. Rejected puts
 //! return `ECA_NORDACCESS` to the client and are recorded in the

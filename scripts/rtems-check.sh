@@ -36,6 +36,32 @@
 # So the narrowest flag set that covers the target is `--lib` for each crate
 # plus `--bin` for each binary that is actually built for RTEMS.
 #
+# WHAT `--lib` HIDES, AND WHY THAT IS RIGHT FOR ALL BUT ONE OF THEM
+#
+# Enumerated from `cargo metadata` over the seven CRATES: 26 `bin`, 358 `test`,
+# 4 `bench`, 1 `example`, 7 `custom-build`. The criterion is whether the target
+# is an artifact of a TARGET IMAGE:
+#
+#   * `bin` — two of the 26 are (`realtime-ca-ioc`, `realtime-pva-ioc`); an
+#     image is one linked binary, and these are the two anyone boots. They get
+#     explicit `--bin` rows below. The other 24 are host CLI tools and are in
+#     HOST_ONLY. Hiding those is the point: they do not compile for the target.
+#   * `test`/`bench` — host harnesses. Neither is linked into an image: there
+#     is no `libtest` runner and no `cargo bench` on the RTEMS image, whose
+#     entry point is `POSIX_Init` calling one binary's `main`. Compiling them
+#     for the target would gate code no image contains.
+#   * `example` — `epics-ca-rs`'s one example is `required-features = client`,
+#     a host feature the target selection does not carry. Same class as the
+#     host CLI tools.
+#   * `custom-build` — NOT hidden. A build script is compiled for the HOST and
+#     RUN by every row here, `--lib` included (measured: `Running
+#     build-script-build` appears in `-v` output of a `--lib --target` row), so
+#     `epics-rtems-boot`'s layout refusals and `--cfg rtems_boot_linked` are
+#     exercised by this gate without naming them.
+#
+# So `--lib` hides nothing that lands on the target — provided the binary
+# census below actually sees every binary, which is the part that had a hole.
+#
 # Usage:
 #   ./scripts/rtems-check.sh          # check every crate and target binary
 #   ./scripts/rtems-check.sh --quiet  # only report failures
@@ -113,7 +139,19 @@ COMMON=(+nightly check --locked --no-default-features "-Zbuild-std=std,panic_abo
 # base names, so a target break in a module base does not reach — the whole
 # `net` socket half is gated off RTEMS, for instance — would be invisible here
 # exactly as `src/bin` was before this script existed.
-CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs)
+#
+# `asyn-rs` is listed for the reason the VxWorks gate states at length and this
+# target shares: C asyn names an RTOS explicitly in its transport
+# (`drvAsynIPPort.c:63/:75/:178`, `epicsInterruptibleSyscall.c:31` — vxWorks
+# there, but the RTEMS half of the same file set is `USE_SOCKTIMEOUT`,
+# `drvAsynIPPort.c:71-72`), so this is target code. And `epics-libcom-rs`'s
+# `runtime::socket` embedded arm — raw `libc` `socket`/`setsockopt`/`bind`/
+# `connect` — has asyn's two IP drivers as its only consumer, so without this
+# entry the seam is compiled for the triple and every caller of it is not.
+# Kept identical to the VxWorks gate's list on purpose: the two targets share
+# one embedded arm, and a crate checked on one but not the other would let a
+# break hide behind whichever gate was not run.
+CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot epics-bridge-rs asyn-rs)
 
 # Per-crate feature selection, on top of COMMON's `--no-default-features`.
 #
@@ -144,6 +182,14 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # / service discovery / reverse-DNS stack a record link never reaches. This is
 # the same selection the CA ratchet below measures, so the probe and the built
 # binary agree by construction rather than by two people remembering.
+#
+# `asyn-rs` belongs with the first five: the empty selection IS its target
+# configuration. It briefly carried `[asyn-rs]="epics"` as a stated workaround,
+# because `--no-default-features` had never compiled the crate on any platform
+# (7 `E0433`s). Fixed at source — the port registry moved out of `asyn_record`
+# into the core `registry` module, and the alarm-code mapping stopped importing
+# `epics_base_rs` — so the entry is deleted, which is what the workaround
+# comment said to do rather than re-tune it.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
     [epics-ca-rs]="client-core"
@@ -181,8 +227,9 @@ BINS=(
 # (`required-features`), gated by a feature predicate, or gated by nothing at
 # all was invisible to it and would land outside the gate exactly as
 # `realtime-ca-ioc` did. Requiring every binary to be classified one way or the
-# other removes the way to be absent: a new `src/bin/*.rs` fails this script
-# until someone states which side it is on.
+# other removes the way to be absent: a new bin target — declared any of the
+# ways cargo allows, see the census — fails this script until someone states
+# which side it is on.
 #
 # Every entry here is a host CLI tool. Measured, not assumed: they do not
 # compile for `armv7-rtems-eabihf` at all (E0432/E0433/E0308) and were never
@@ -216,16 +263,15 @@ HOST_ONLY=(
     # SIXTH binary, `realtime-pva-ioc`, is the target's QSRV mount and is in BINS
     # above, not here.
     #
-    # Spelled with underscores because the census computes its pairs from
-    # `basename src/bin/*.rs .rs`, and the bridge's `[[bin]]` entries give
-    # explicit `path`s whose file names use underscores while the bin NAMES use
-    # hyphens (`src/bin/ca_gateway_rs.rs` -> bin `ca-gateway-rs`). Hyphens here
-    # would fail the census twice over — "unclassified" and "stale" at once.
-    epics-bridge-rs:ca_gateway_rs
-    epics-bridge-rs:dual_gateway_rs
-    epics-bridge-rs:dual_ioc_rs
-    epics-bridge-rs:pva_gateway_rs
-    epics-bridge-rs:qsrv_rs
+    # Spelled as cargo NAMES, not file stems: the bridge's `[[bin]]` entries give
+    # explicit `path`s whose file names use underscores while the names use
+    # hyphens (`src/bin/ca_gateway_rs.rs` -> bin `ca-gateway-rs`), and the census
+    # below asks cargo rather than the filesystem.
+    epics-bridge-rs:ca-gateway-rs
+    epics-bridge-rs:dual-gateway-rs
+    epics-bridge-rs:dual-ioc-rs
+    epics-bridge-rs:pva-gateway-rs
+    epics-bridge-rs:qsrv-rs
 )
 
 QUIET=0
@@ -238,17 +284,46 @@ if ! cargo +nightly --version >/dev/null 2>&1; then
     exit 1
 fi
 
-# Census: every binary in the RTEMS crates is in BINS or in HOST_ONLY.
+# Census: every binary CARGO declares in the RTEMS crates is in BINS or in
+# HOST_ONLY.
+#
+# The population comes from `cargo metadata`, not from a `crates/*/src/bin/*.rs`
+# glob. Measured, not assumed: with the glob in place, a `[[bin]]` whose `path`
+# points outside `src/bin` (`src/canary_main.rs`) and a nested
+# `src/bin/<name>/main.rs` were both invisible — cargo declared two binaries
+# neither this script nor `vxworks-check.sh` named, and both gates still exited
+# 0. That is the break this census exists to prevent with one convention
+# removed: `realtime-ca-ioc` escaped a check that searched for a STRING, and
+# these escaped a check that searches a PATH. Asking cargo removes the search.
+#
+# Keyed by cargo's bin NAME, which is what the `--bin` rows below take, so the
+# lists and the compile rows now name the same thing. The bridge's five
+# host-only entries were previously spelled with their file stems' underscores
+# for exactly the reason this change deletes.
+#
+# `--no-deps --offline` compiles nothing, needs no network, no registry and no
+# target toolchain, and measures 0.06 s here; `jq` is already a hard dependency
+# of `rtems-tls-spec.sh` on this path. Not used instead: the "available bin
+# targets" help text of `cargo check --bin ''`, which is a message with no
+# stability contract, where `--format-version 1` has one.
+if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to read the binary census from cargo metadata." >&2
+    exit 1
+fi
+METADATA="$(cargo metadata --no-deps --offline --format-version 1)"
+
 CLASSIFIED=("${BINS[@]}" "${HOST_ONLY[@]}")
 present=()
 unclassified=()
 for crate in "${CRATES[@]}"; do
-    for src in "crates/$crate/src/bin"/*.rs; do
-        [[ -e "$src" ]] || continue
-        pair="$crate:$(basename "$src" .rs)"
+    while IFS= read -r bin; do
+        [[ -n "$bin" ]] || continue
+        pair="$crate:$bin"
         present+=("$pair")
         printf '%s\n' "${CLASSIFIED[@]}" | grep -qx "$pair" || unclassified+=("$pair")
-    done
+    done < <(jq -r --arg c "$crate" \
+        '.packages[] | select(.name == $c) | .targets[]
+         | select(any(.kind[]; . == "bin")) | .name' <<<"$METADATA")
 done
 
 if [[ ${#unclassified[@]} -gt 0 ]]; then
@@ -261,15 +336,17 @@ if [[ ${#unclassified[@]} -gt 0 ]]; then
     exit 1
 fi
 
-# The other direction: a listed binary whose source is gone. Left unchecked, a
-# rename would silently stop being covered while both lists still looked full.
+# The other direction: a listed binary cargo no longer declares. Left
+# unchecked, a rename would silently stop being covered while both lists still
+# looked full.
 stale=()
 for pair in "${CLASSIFIED[@]}"; do
     printf '%s\n' "${present[@]}" | grep -qx "$pair" || stale+=("$pair")
 done
 
 if [[ ${#stale[@]} -gt 0 ]]; then
-    echo "error: these binaries are listed in $0 but have no source file:" >&2
+    echo "error: these binaries are listed in $0 but cargo declares no such" >&2
+    echo "       bin target:" >&2
     printf '  %s\n' "${stale[@]}" >&2
     echo "Remove or rename the entry — a stale one covers nothing." >&2
     exit 1

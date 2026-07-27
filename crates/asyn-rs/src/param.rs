@@ -299,7 +299,7 @@ impl ParamEntry {
 pub struct ParamList {
     max_addr: usize,
     multi_device: bool,
-    /// params[addr][index] = ParamEntry
+    /// `params[addr][index] = ParamEntry`
     params: Vec<Vec<ParamEntry>>,
     name_to_index: HashMap<String, usize>,
 }
@@ -1179,7 +1179,7 @@ impl ParamList {
     }
 
     /// C `paramList::report` (asynPortDriver.cpp:885-892) — the count line, then
-    /// every parameter through [`ParamEntry::report`].
+    /// every parameter through `ParamEntry::report`.
     ///
     /// C has one `paramList` per address and reports the one it was handed; here
     /// one list holds every address, so the address is the argument. It takes no

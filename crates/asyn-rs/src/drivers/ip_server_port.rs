@@ -55,6 +55,7 @@ use std::time::{Duration, SystemTime};
 // parking_lot::Mutex — consistent with the rest of asyn-rs and
 // poison-tolerant: a panic in a worker thread cannot poison the lock
 // and take out the port (std::sync::Mutex would).
+use epics_libcom_rs::runtime::socket;
 use parking_lot::Mutex;
 
 use crate::asyn_trace;
@@ -918,38 +919,21 @@ impl DrvAsynIPServerPort {
     /// (drvAsynIPServerPort.c lines ~440-470).
     fn open_udp_listener(&mut self) -> AsynResult<()> {
         let addr = self.resolve_bind_addr()?;
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("UDP socket() failed: {e}"),
-            })?;
         // C enables datagram fanout on the UDP server socket
         // (drvAsynIPServerPort.c:426-429): for SOCK_DGRAM it calls
         // `epicsSocketEnableAddressUseForDatagramFanout`, which sets
         // SO_REUSEPORT (where available) followed by SO_REUSEADDR — so
         // multiple IOCs can bind the same UDP port and the kernel fans
         // each datagram out to them. The TCP listener gets only
-        // SO_REUSEADDR (:430); the fanout helper is SOCK_DGRAM-only.
-        #[cfg(unix)]
-        sock.set_reuse_port(true).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("UDP SO_REUSEPORT failed: {e}"),
-        })?;
-        sock.set_reuse_address(true)
-            .map_err(|e| AsynError::Status {
+        // SO_REUSEADDR (:430); the fanout helper is SOCK_DGRAM-only. That
+        // pairing is `SocketOptions::FANOUT`, and the seam is what keeps the
+        // options ahead of the bind on both hosted and embedded targets.
+        let socket = socket::udp_socket(addr, socket::SocketOptions::FANOUT).map_err(|e| {
+            AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("UDP SO_REUSEADDR failed: {e}"),
-            })?;
-        sock.bind(&addr.into()).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("UDP bind '{addr}' failed: {e}"),
+                message: format!("UDP bind '{addr}' failed: {e}"),
+            }
         })?;
-        let socket = UdpSocket::from(sock);
         // Read timeout caps shutdown latency — recv wakes every
         // 200ms so the worker can observe `udp_shutdown` flag.
         socket
@@ -1032,39 +1016,21 @@ impl DrvAsynIPServerPort {
     }
 
     fn bind_with_options(&self, addr: SocketAddr) -> AsynResult<TcpListener> {
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(|e| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("socket() failed: {e}"),
-                })?;
-        // Unconditional SO_REUSEADDR (drvAsynIPServerPort.c:430).
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("SO_REUSEADDR failed: {e}"),
-            })?;
-        socket.bind(&addr.into()).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("bind '{addr}' failed: {e}"),
-        })?;
+        // Unconditional SO_REUSEADDR and no SO_REUSEPORT
+        // (drvAsynIPServerPort.c:430) — that is `SocketOptions::REUSE_ADDRESS`.
+        //
         // Backlog independent of `max_clients` — the slot cap bounds
         // *concurrent* accepted clients, not the kernel's pending-
         // connection queue. A small backlog (= max_clients) caused
         // third-party connect() to block in tests when 2 prior
         // connections were already queued. 128 mirrors the typical
         // SOMAXCONN on Linux/macOS while staying portable.
-        socket.listen(128).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("listen failed: {e}"),
-        })?;
-        Ok(TcpListener::from(socket))
+        socket::tcp_listener(addr, socket::SocketOptions::REUSE_ADDRESS, 128).map_err(|e| {
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("bind '{addr}' failed: {e}"),
+            }
+        })
     }
 
     /// Return the actual bound port (useful when `bind_port = 0`).
@@ -1670,7 +1636,7 @@ impl PortDriver for DrvAsynIPSubport {
     /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
     /// (case-insensitive) and errors on anything else. The option then arms the
     /// first disjunct of `readIt`'s `should_disconnect` (:797-799) — see
-    /// [`ClientSlot::classify_read_error`].
+    /// `ClientSlot::classify_read_error`.
     ///
     /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
     /// connection; an accepted socket has nothing to re-dial, so it is not

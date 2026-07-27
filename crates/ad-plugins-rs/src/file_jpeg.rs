@@ -164,7 +164,7 @@ impl NDFileWriter for JpegWriter {
     }
 }
 
-/// JPEG file processor wrapping FilePluginController<JpegWriter>.
+/// JPEG file processor wrapping `FilePluginController<JpegWriter>`.
 pub struct JpegFileProcessor {
     ctrl: FilePluginController<JpegWriter>,
     jpeg_quality_idx: Option<usize>,

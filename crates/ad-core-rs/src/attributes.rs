@@ -145,7 +145,7 @@ impl NDAttrValue {
     /// String value of a *string-typed* attribute, mirroring C++
     /// `NDAttribute::getValue(NDAttrString, …)` which returns `ND_ERROR`
     /// (leaving the caller's buffer unchanged) for any non-string attribute.
-    /// Unlike [`as_string`], a numeric attribute yields `None` rather than its
+    /// Unlike [`Self::as_string`], a numeric attribute yields `None` rather than its
     /// decimal rendering, so callers that drive control behaviour off a
     /// string-typed attribute (filename, file number, destination port) ignore
     /// a mis-typed numeric attribute exactly as the C reader does.

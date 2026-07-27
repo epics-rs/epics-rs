@@ -223,7 +223,7 @@ impl DrvAsynPrologixPort {
     /// Mirrors C asyn `prologixSetEos` (drvPrologixGPIB.c:439-459), but realizes
     /// the intent C's never-store bug dropped: the driver-level `eos` actually
     /// changes, and the bridge's `++eot_enable` is re-issued to follow it (1 in
-    /// EOI mode, 0 in EOS mode, see [`Self::eot_enable_arg`]) so the EOT marker
+    /// EOI mode, 0 in EOS mode, see `Self::eot_enable_arg`) so the EOT marker
     /// never collides with an eos-terminated read. Single owner of the eos
     /// transition (also reached via `set_input_eos`).
     pub fn set_eos(&mut self, eos: Option<u8>) -> AsynResult<()> {

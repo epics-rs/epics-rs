@@ -593,7 +593,7 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
     Ok(array)
 }
 
-/// TIFF file processor wrapping FilePluginController<TiffWriter>.
+/// TIFF file processor wrapping `FilePluginController<TiffWriter>`.
 pub struct TiffFileProcessor {
     pub ctrl: FilePluginController<TiffWriter>,
 }

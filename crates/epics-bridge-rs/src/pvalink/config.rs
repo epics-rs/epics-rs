@@ -145,9 +145,9 @@ pub struct PvaLinkConfig {
     pub monitor: bool,
     /// pvxs `proc` mode (`Default`/`PP`/`NPP`/`CP`/`CPP`),
     /// preserved as a five-state enum. Drives the OUT-side PUT process
-    /// request ([`ProcMode::put_process_request`]) and, for `CP`/`CPP`,
+    /// request (`ProcMode::put_process_request`) and, for `CP`/`CPP`,
     /// the INP scan-on-update flags below (set at parse time via
-    /// [`ProcMode::inp_scan`]).
+    /// `ProcMode::inp_scan`).
     pub proc: ProcMode,
     /// True iff the link reports DBE_VALUE notifications back to the local
     /// record (INP, monitor mode).
@@ -262,7 +262,7 @@ impl PvaLinkConfig {
         // `opts` is the convenience-URI option map split from the
         // `?key=value` query above. This is the Rust-extension path:
         // string values, lenient `yes`/`no` booleans. It is applied
-        // through [`Self::apply_options`]. The structured-JSON JLink path
+        // through `Self::apply_options`. The structured-JSON JLink path
         // ([`Self::from_jlink_options`]) does NOT come through here — it
         // dispatches by JSON value KIND to stay pvxs-faithful, so a
         // string on a boolean key is ignored rather than coerced.
@@ -333,8 +333,8 @@ impl PvaLinkConfig {
     /// each option STRICTLY by its JSON value KIND through distinct
     /// callbacks (`pva_parse_{null,bool,integer,string}`, wired at
     /// `:286-300`). This path reproduces that dispatch via
-    /// [`Self::apply_jlink_option`]; it does NOT share the
-    /// convenience-URI [`Self::apply_options`], which collapses every
+    /// `Self::apply_jlink_option`; it does NOT share the
+    /// convenience-URI `Self::apply_options`, which collapses every
     /// value to text and accepts lenient `yes`/`no` booleans. Keeping the
     /// two paths separate is the structural reason a JSON string on a
     /// boolean key (`pipeline:"yes"`) is IGNORED here, exactly as pvxs
@@ -388,7 +388,7 @@ impl PvaLinkConfig {
     /// booleans, not as the strings `"true"`/`"false"`. Options that are
     /// not pvxs JLink keys at all (`monitor`, `notify`, `scan_on_update`,
     /// `queueSize`) are likewise ignored — those exist only on the
-    /// convenience-URI [`Self::apply_options`] path.
+    /// convenience-URI `Self::apply_options` path.
     fn apply_jlink_option(cfg: &mut PvaLinkConfig, pv_name: &str, key: &str, val: &JlinkValue) {
         match val {
             JlinkValue::Bool(b) => match key {
@@ -451,7 +451,7 @@ impl PvaLinkConfig {
     /// query). This is the Rust-extension path: every value is a string
     /// and booleans accept lenient `yes`/`no`. The pvxs-parity
     /// structured-JSON path is [`Self::from_jlink_options`] /
-    /// [`Self::apply_jlink_option`], which dispatches by JSON value KIND
+    /// `Self::apply_jlink_option`, which dispatches by JSON value KIND
     /// and does NOT come through here. Legacy bare modifiers (`PP`/`MS`/…)
     /// are NOT handled here — they exist only on the convenience-URI path
     /// and are applied by `parse`.

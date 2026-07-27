@@ -35,7 +35,6 @@ pub enum ClientStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
-    #[cfg(unix)]
     Console(crate::procserv::console::ConsoleStream),
 }
 
@@ -45,7 +44,6 @@ impl std::fmt::Debug for ClientStream {
             Self::Tcp(s) => f.debug_tuple("Tcp").field(s).finish(),
             #[cfg(unix)]
             Self::Unix(s) => f.debug_tuple("Unix").field(s).finish(),
-            #[cfg(unix)]
             Self::Console(_) => f.write_str("Console"),
         }
     }
@@ -59,7 +57,6 @@ pub enum ClientPeer {
     Unix(Option<std::path::PathBuf>),
     /// The launching terminal, attached in foreground mode
     /// (C `clientFactory(0)`, `procServ.cc:568`).
-    #[cfg(unix)]
     Console,
 }
 
@@ -163,7 +160,6 @@ pub fn spawn_client(
         // The terminal gets the same read/write task pair — including the
         // telnet parser, which C also runs on its fd-0 client
         // (`clientFactory.cc:167` `telnet_init`).
-        #[cfg(unix)]
         ClientStream::Console(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
     }
 

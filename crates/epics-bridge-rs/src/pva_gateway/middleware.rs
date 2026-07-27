@@ -1169,7 +1169,7 @@ impl<F: Fn(AuditEvent) + Send + Sync + 'static> AuditSink for ClosureAudit<F> {
 ///
 /// The drainer task keeps running until both: (a) every clone of
 /// this sink has been dropped, and (b) the receiver has drained.
-/// Drop order matters in shutdown — drop the gateway / Arc<Audited>
+/// Drop order matters in shutdown — drop the gateway / `Arc<Audited>`
 /// chain BEFORE waiting on `.flush()` to avoid leaving events
 /// in flight.
 ///

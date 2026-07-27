@@ -936,7 +936,7 @@ fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
 /// so an I/O Intr waveform whose FTVL differs from the array's native element
 /// type still gets correctly-converted data each frame instead of the raw
 /// native array. Returns `None` for non-array interfaces (scalar records keep
-/// [`param_value_to_epics_value`]).
+/// `param_value_for_iface`).
 fn convert_param_array_to_iface(
     iface_type: &str,
     pv: &crate::param::ParamValue,
@@ -1212,7 +1212,7 @@ impl AsynDeviceSupport {
     /// through that same interface (`asynFloat64` takes `float_val`, `asynInt32`
     /// takes `int_val`, …).
     ///
-    /// The scalar rules are the interface read rules themselves ([`ParamValue::as_int32`]
+    /// The scalar rules are the interface read rules themselves ([`crate::param::ParamValue::as_int32`]
     /// and friends), the very ones [`crate::param::ParamList::get_int32`] applies when the
     /// polled path reads the same parameter — one owner, so the two paths cannot
     /// disagree about what an `asynFloat64` record may be handed.

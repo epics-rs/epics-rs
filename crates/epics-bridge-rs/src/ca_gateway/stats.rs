@@ -127,7 +127,7 @@ pub(crate) fn prefix_with_separator(bare: &str) -> String {
 /// C ca-gateway defaults `-prefix` to the host name, falling back to
 /// `gateway` when the name is unavailable (`gateServer.cc:1877-1891`).
 /// Returned as the bare namespace; the `:` separator is added by
-/// [`prefix_with_separator`] at publish time.
+/// `prefix_with_separator` at publish time.
 pub fn default_stats_prefix() -> String {
     let host = epics_base_rs::runtime::env::hostname();
     if host.is_empty() {

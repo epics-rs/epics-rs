@@ -25,6 +25,7 @@ pub mod port;
 pub(crate) mod port_actor;
 pub mod port_handle;
 pub(crate) mod protocol;
+pub mod registry;
 pub mod request;
 pub mod runtime;
 pub mod services;

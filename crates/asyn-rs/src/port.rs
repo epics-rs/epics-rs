@@ -479,7 +479,7 @@ impl PortDriverBase {
     /// which bypasses the edge guard and fans spurious duplicates out to
     /// listeners (CA gateway shadow tasks, asynRecord, monitor relays).
     ///
-    /// On a port whose link is owned elsewhere ([`Connection::Shared`]) the write
+    /// On a port whose link is owned elsewhere (`Connection::Shared`) the write
     /// is not this port's to make — the owner already moved the truth — so the
     /// call reduces to publishing whatever edge that produced.
     ///
@@ -585,7 +585,7 @@ impl PortDriverBase {
     /// Returns `true` when a fresh auto-connect attempt is permitted:
     /// either no transition has been recorded yet (mirrors C's
     /// zero-initialised `lastConnectDisconnect`, whose diff against `now`
-    /// is effectively infinite), or at least [`AUTO_CONNECT_THROTTLE`] has
+    /// is effectively infinite), or at least `AUTO_CONNECT_THROTTLE` has
     /// elapsed since the last transition or attempt. A disconnected
     /// `auto_connect` device that just dropped — or whose previous
     /// reconnect just failed — is refused until the window passes, so a
@@ -1309,7 +1309,7 @@ impl PortDriverBase {
     /// drvModbusAsyn.cpp:1706/1736/1808). This is the analogue: the driver
     /// decodes per interface and fires each value tagged with its `iface`, so the
     /// interrupt filter routes it only to records on that interface
-    /// ([`InterruptFilter::iface`]). `uint32_changed_mask` is the changed-bit
+    /// ([`InterruptFilter::iface`](crate::interrupt::InterruptFilter::iface)). `uint32_changed_mask` is the changed-bit
     /// mask for the `UInt32Digital` interface (a record's `@asynMask` gates on it,
     /// `asynPortDriver.cpp:720`); pass `0` for the other interfaces, whose
     /// subscribers carry no mask filter.
@@ -1552,7 +1552,7 @@ pub trait PortDriver: Send + Sync + 'static {
     ///
     /// So this prints only what the *driver* owns. The port's enable / connect /
     /// queue / lock / exception / trace state is the manager's to print and is
-    /// printed by [`crate::port_actor::PortActor::report_port`]; duplicating it
+    /// printed by `crate::port_actor::PortActor::report_port`; duplicating it
     /// here would give the operator two answers to the same question, from two
     /// owners, with no rule for which one wins.
     ///
@@ -1563,7 +1563,7 @@ pub trait PortDriver: Send + Sync + 'static {
     /// (:3695-3708).
     ///
     /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
-    /// stream. [`crate::port_actor::PortActor::report_port`] is the one owner that
+    /// stream. `crate::port_actor::PortActor::report_port` is the one owner that
     /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
     fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
         use std::fmt::Write as _;

@@ -163,7 +163,7 @@ pub struct GatewayConfig {
     pub cache_mode: CacheMode,
     /// Upstream-monitor event mask (C `-mask`). Selects which `DBE_*`
     /// events the gateway's upstream subscriptions request. Defaults to
-    /// [`DEFAULT_EVENT_MASK`] (`DBE_VALUE | DBE_ALARM`), matching
+    /// `DEFAULT_EVENT_MASK` (`DBE_VALUE | DBE_ALARM`), matching
     /// ca-gateway `gateResources.cc:339` — notably NOT `DBE_LOG`, which
     /// the raw `CaChannel::subscribe()` default would add. Build from a
     /// `-mask` spec string with [`resolve_event_mask`].
@@ -323,7 +323,7 @@ pub(crate) fn parse_event_mask(spec: &str) -> u16 {
 ///
 /// Applies ca-gateway's default-keep rule (`gateway.cc:1146`): a spec that
 /// names no recognised DBE bit — or no `-mask` at all — keeps
-/// [`DEFAULT_EVENT_MASK`] (`DBE_VALUE | DBE_ALARM`); otherwise the parsed
+/// `DEFAULT_EVENT_MASK` (`DBE_VALUE | DBE_ALARM`); otherwise the parsed
 /// mask wins verbatim, so `-mask v`, `-mask va`, and `-mask vap` are all
 /// reproducible.
 pub fn resolve_event_mask(spec: Option<&str>) -> u16 {

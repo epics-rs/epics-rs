@@ -180,7 +180,7 @@ impl GroupPvDef {
     /// (`fielddefinition.h:24`), so the `pvxgl <level>3` detail output is
     /// byte-identical to pvxs `Group::show`. Shares the channeled-target
     /// rules with the monitor mark path
-    /// ([`super::group::GroupMonitor::value_event_mark`]).
+    /// (`GroupMonitor::value_event_mark`).
     pub fn resolved_trigger_targets(&self, idx: usize) -> Vec<&str> {
         let Some(source) = self.members.get(idx) else {
             return Vec::new();
@@ -1088,8 +1088,8 @@ const CONST_OBJECT_TOO_DEEP: &str = "group +const cannot contain a nested object
 /// then over-corrected and rejected EVERY array, dropping groups pvxs loads.
 /// Mirror pvxs's callback semantics instead:
 ///
-/// * Scalars (`bool`/number/string) map to [`PvField::Scalar`].
-/// * `null` maps to [`PvField::Null`] (pvxs accepts an empty/unset const).
+/// * Scalars (`bool`/number/string) map to [`epics_pva_rs::pvdata::PvField::Scalar`].
+/// * `null` maps to [`epics_pva_rs::pvdata::PvField::Null`] (pvxs accepts an empty/unset const).
 /// * An array yields its first scalar/null element ([`const_from_array`]),
 ///   nested arrays being transparent like pvxs; an object anywhere in it is
 ///   a hard error so the group is skipped (per-group recovery).

@@ -125,7 +125,7 @@ pub struct PvaLinkRegistry {
     channel_records: RwLock<HashMap<RegistryKey, BTreeSet<String>>>,
 }
 
-/// Build the [`RegistryKey`] for a config — the shared
+/// Build the `RegistryKey` for a config — the shared
 /// `(channelName, pvRequest)` identity pvxs caches by.
 fn key_of(config: &PvaLinkConfig) -> RegistryKey {
     (
@@ -186,7 +186,7 @@ impl PvaLinkRegistry {
             .insert(record.to_string());
     }
 
-    /// Exact lookup for the full config's [`RegistryKey`]. Returns
+    /// Exact lookup for the full config's `RegistryKey`. Returns
     /// `None` when no link with that exact key has been opened.
     pub fn try_get(&self, config: &PvaLinkConfig) -> Option<Arc<PvaLink>> {
         let key: RegistryKey = (
@@ -378,7 +378,7 @@ impl PvaLinkRegistry {
     }
 
     /// Test-only: insert a pre-built [`PvaLink`] under its config's
-    /// [`RegistryKey`]. Lets a test seed a cached link (e.g. an INP
+    /// `RegistryKey`. Lets a test seed a cached link (e.g. an INP
     /// link with a pre-populated value) without standing up a PVA
     /// server, so the resolver getter paths can be exercised against
     /// a known cache state.
@@ -404,7 +404,7 @@ impl PvaLinkRegistry {
     /// Distinct monitor-variant identities `(pv_name, pipeline,
     /// queue_size)` of every opened INP link, sorted for a stable order.
     ///
-    /// Backs [`PvaLinkResolver::link_names`] (the `LinkSet` enumeration
+    /// Backs [`epics_base_rs::server::database::LinkSet::link_names`] (the `LinkSet` enumeration
     /// contract): each identity round-trips to an `is_connected(name)`
     /// query that lands on that variant's own monitor. Only INP links
     /// carry a monitor connection signal — OUT links install no monitor —

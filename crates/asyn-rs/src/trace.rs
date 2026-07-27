@@ -314,7 +314,7 @@ pub struct TraceConfig {
     pub trace_io_mask: TraceIoMask,
     pub trace_info_mask: TraceInfoMask,
     pub io_truncate_size: usize,
-    /// C `tracePvt.traceBufferSize`. Starts at [`DEFAULT_TRACE_BUFFER_SIZE`] and
+    /// C `tracePvt.traceBufferSize`. Starts at `DEFAULT_TRACE_BUFFER_SIZE` and
     /// is grown — never shrunk — by `setTraceIOTruncateSize` when the new
     /// truncate size exceeds it (asynManager.c:2947-2953).
     pub trace_buffer_size: usize,
@@ -567,7 +567,7 @@ impl TraceManager {
     /// The message line is the port's stand-in for C's `vfprintf(fp, pformat,
     /// pvar)` — whose format string ends in `\n` at every asyn driver call site
     /// — and the *data section* follows it, one block per enabled
-    /// [`TraceIoMask`] bit ([`append_io_data`]).
+    /// [`TraceIoMask`] bit (`append_io_data`).
     pub fn output_device_io(
         &self,
         port: &str,

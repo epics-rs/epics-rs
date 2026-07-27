@@ -79,7 +79,7 @@ impl EosDevice {
 /// state machine matching, including resynchronization on partial matches.
 ///
 /// Matches the C implementation's behavior:
-/// - One [`EosDevice`] per addressed device (C's per-(port, addr) `eosPvt`), so
+/// - One `EosDevice` per addressed device (C's per-(port, addr) `eosPvt`), so
 ///   two devices on a multi-device port hold two terminators *and* two
 ///   read-ahead buffers — neither device's bytes can be served to the other
 /// - Fixed-size internal buffer (2048 bytes) per device

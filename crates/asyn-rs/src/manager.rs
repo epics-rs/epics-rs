@@ -226,7 +226,7 @@ impl PortManager {
     /// C parity: `asynManager::report` walks the global port list to
     /// emit one entry per port — iocsh `asynReport` exposes the same
     /// view (no port argument = all ports). Used by
-    /// [`crate::iocsh::register_asyn_commands`] for the no-port-arg
+    /// `iocsh::register_asyn_commands` for the no-port-arg
     /// case; also useful for diagnostic tooling.
     ///
     /// This is the union of the ports this manager registered and the ports

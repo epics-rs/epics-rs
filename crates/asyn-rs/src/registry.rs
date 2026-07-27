@@ -19,7 +19,7 @@
 //! Nothing here names `epics_base_rs` or any record type; it is `HashMap`,
 //! `Mutex` and this crate's own `PortHandle`. The two functions that genuinely
 //! did belong to the record layer — the `asyn` record-type factory and its
-//! legacy global registration — stayed behind in [`crate::asyn_record`], which
+//! legacy global registration — stayed behind in `asyn_record`, which
 //! re-exports these names so existing `asyn_record::get_port` callers are
 //! unchanged.
 

@@ -10,7 +10,7 @@
 //! — this DSET, and the same demotion in `ioc_app::setup_io_intr`.
 //!
 //! Everything the interrupt mode actually does lives in the record's
-//! [`IoIntrScan`](super::io_intr::IoIntrScan), exactly as C keeps
+//! `IoIntrScan`, exactly as C keeps
 //! `registerInterrupts` / the callbacks / `gotValue` in `asynRecPvt`. This type
 //! is the seam, not the mechanism.
 
@@ -78,7 +78,7 @@ impl DeviceSupport for AsynRecordDevice {
     /// C registers the driver interrupt callbacks in `getIoIntInfo(0)` and
     /// cancels them in `getIoIntInfo(1)`, so a value is pushed to the record
     /// **only** while it is on the I/O Intr scan list —
-    /// [`IoIntrScan`](super::io_intr::IoIntrScan) holds that invariant by
+    /// `IoIntrScan` holds that invariant by
     /// construction. The framework's alternative gate (re-check `SCAN` on every
     /// wakeup) would be a second, weaker copy of the same rule; declaring the
     /// device SCAN-independent says "the source decides", which is what C does.

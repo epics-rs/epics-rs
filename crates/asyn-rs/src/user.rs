@@ -122,7 +122,7 @@ pub struct AsynUser {
     /// `asynPrint`/`asynPrintIO` (`findTracePvt`, asynManager.c:3040-3060) —
     /// including an *interpose*, which has no other handle on the port
     /// (`asynInterposeCom.c:237-239` prints the unstuffed read at
-    /// `ASYN_TRACEIO_FILTER`). [`crate::port_actor::PortActor`] is the single
+    /// `ASYN_TRACEIO_FILTER`). `PortActor` is the single
     /// owner of this linkage: it stamps every request's user with the port it is
     /// about to run on. A user built outside a port (a unit test, a driver's own
     /// internal user) carries `None` and its prints are silent.

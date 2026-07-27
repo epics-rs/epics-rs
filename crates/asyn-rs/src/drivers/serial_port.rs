@@ -832,7 +832,7 @@ impl PortDriver for DrvAsynSerialPort {
     /// The raw device read — the **bottom** of the port's octet chain, C
     /// `drvAsynSerialPort.c::readIt` below the interposes the manager installed
     /// on top of it. The interpose chain is run by the port
-    /// ([`crate::port::octet_read_chain`]), not from here: a driver that
+    /// (`crate::port::octet_read_chain`), not from here: a driver that
     /// dispatched its own chain gave every other driver a chain that never ran.
     fn io_read_octet_eom(
         &mut self,

@@ -1024,7 +1024,7 @@ impl DrvAsynIPPort {
 
     /// Build a port configured exactly as C's `drvAsynIPPortConfigure(portName,
     /// hostInfo, priority, noAutoConnect, noProcessEos)` leaves one:
-    /// [`Self::new`] plus [`Self::apply_ip_port_configure`] (the `registerPort`
+    /// [`Self::new`] plus `Self::apply_ip_port_configure` (the `registerPort`
     /// autoConnect flag and, unless `noProcessEos`, the default EOS interpose —
     /// drvAsynIPPort.c:1043-1066).
     ///
@@ -1286,7 +1286,7 @@ impl PortDriver for DrvAsynIPPort {
 
     /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
     /// (drvAsynIPPort.c:1037-1053) — no register interface. A record with
-    /// IFACE=Int32/UInt32/Float64 on this port gets C's "No asyn<X> interface"
+    /// IFACE=Int32/UInt32/Float64 on this port gets C's `No asyn<X> interface`
     /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         crate::interfaces::octet_transport_capabilities()

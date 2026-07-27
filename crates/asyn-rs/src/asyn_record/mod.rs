@@ -4250,7 +4250,7 @@ impl Record for AsynRecord {
         Ok(())
     }
 
-    /// C `process()` (asynRecord.c:329-372). The body is [`Self::process_cycle`];
+    /// C `process()` (asynRecord.c:329-372). The body is `Self::process_cycle`;
     /// this wrapper is C's `done:` label (:369-371), whose `gotValue = 0` is the
     /// invariant that keeps the interrupt cell honest:
     ///
@@ -4286,7 +4286,7 @@ impl Record for AsynRecord {
     /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
     /// report the error and leave the record Passive (dbScan.c:278-293). The
     /// port's `setup_io_intr` runs the same demotion off
-    /// [`device::AsynRecordDevice::io_intr_receiver`]; for a *runtime* SCAN put
+    /// `AsynRecordDevice::io_intr_receiver`; for a *runtime* SCAN put
     /// the failure text is what reaches the operator, in ERRS, exactly as C's
     /// `reportError` puts it there (:617,:627,:637,:647).
     fn set_io_intr_scan(&mut self, active: bool) {

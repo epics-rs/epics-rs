@@ -1179,7 +1179,7 @@ impl ParamList {
     }
 
     /// C `paramList::report` (asynPortDriver.cpp:885-892) — the count line, then
-    /// every parameter through [`ParamEntry::report`].
+    /// every parameter through `ParamEntry::report`.
     ///
     /// C has one `paramList` per address and reports the one it was handed; here
     /// one list holds every address, so the address is the argument. It takes no

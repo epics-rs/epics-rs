@@ -1636,7 +1636,7 @@ impl PortDriver for DrvAsynIPSubport {
     /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
     /// (case-insensitive) and errors on anything else. The option then arms the
     /// first disjunct of `readIt`'s `should_disconnect` (:797-799) — see
-    /// [`ClientSlot::classify_read_error`].
+    /// `ClientSlot::classify_read_error`.
     ///
     /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
     /// connection; an accepted socket has nothing to re-dial, so it is not

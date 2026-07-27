@@ -39,6 +39,11 @@ RAMP = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 # Past this held count the ramp slows to one client per `PUSH_INTERVAL`-plus and
 # samples every step, so the approach to the wall is read rather than inferred.
 SLOW_FROM = int(sys.argv[8]) if len(sys.argv) > 8 else 10 ** 9
+# After the wall, keep attempting.  Each attempt is refused; the question is
+# whether the heap comes back.  A refusal that costs memory and does not return
+# it is a leak on the `pthread_create` EAGAIN path; one drop followed by a flat
+# line is something else and needs a different explanation.
+REFUSE_REPEAT = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 
 PV = "RTEMS:AO"
 MONPV = ("RTEMS:UPTIME", "RTEMS:MEM_FREE", "RTEMS:MEM_USED", "RTEMS:MEM_MAX",
@@ -341,6 +346,30 @@ if RAMP:
         log("AT THE WALL malloc_free_space()=%.0f B; C base gate "
             "osiSufficentSpaceInPool(16384) = %s"
             % (wb, "PASS" if wb > 50000 + 16384 else "REFUSE"))
+
+    prev_free = num(atwall, "RTEMS:MEM_FREE")
+    for r in range(REFUSE_REPEAT):
+        t = time.time()
+        seen, how = None, None
+        try:
+            c = Sess(40000 + r, timeout=30)
+            nm = pad(PV)
+            c.s.sendall(hdr(18, len(nm), 0, 0, 55, 13) + nm)
+            c.drain(15.0, until=lambda s: len(s.ch) >= 1)
+            seen = c.errors
+            how = "ADMITTED" if c.ch else "ACCEPTED_NO_CHANNEL"
+            c.s.close()
+        except Exception as e:
+            how = "%s: %s" % (type(e).__name__, e)
+            seen = getattr(c, "errors", None)
+        time.sleep(QUIET)
+        v = sample("refusal-%d" % (r + 1), maxwait=60.0)
+        f = num(v, "RTEMS:MEM_FREE")
+        d = (prev_free - f) if (prev_free is not None and f is not None) else None
+        log("REFUSAL %d %s in %.1fs frames=%r  MEM_FREE delta since previous = %s"
+            % (r + 1, how, time.time() - t, seen,
+               ("%.0f B" % d) if d is not None else "?"))
+        prev_free = f
 
 for s in loads + held:
     try:

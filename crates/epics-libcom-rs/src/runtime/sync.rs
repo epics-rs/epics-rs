@@ -53,7 +53,7 @@ pub type PriorityInheritanceMutex<T> = pi_mutex::PiMutex<T>;
 #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
 pub type PriorityInheritanceMutex<T> = parking_lot::Mutex<T>;
 
-/// The guard [`PriorityInheritanceMutex::lock`] hands out, nameable so a
+/// The guard `PriorityInheritanceMutex::lock` hands out, nameable so a
 /// caller can *store* one — the per-record write gate
 /// (`server::database::record_lock`) holds a `'static` guard in a struct
 /// field rather than a local.

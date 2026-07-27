@@ -1216,7 +1216,7 @@ fn bind_one(info: &IfaceInfo, port: u16, broadcast: bool) -> io::Result<NicSocke
 }
 
 /// Bind to an arbitrary IPv4 address while keeping the NIC metadata
-/// from `info`. Used by [`bind_with_map`] to create both the
+/// from `info`. Used by [`AsyncUdpV4::bind_with_map`] to create both the
 /// primary unicast socket (`bind_ip = info.ip`) and an auxiliary
 /// broadcast-RX socket (`bind_ip = info.broadcast`).
 fn bind_one_at(

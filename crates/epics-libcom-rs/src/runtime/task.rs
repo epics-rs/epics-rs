@@ -230,7 +230,7 @@ impl BlockingBridge {
         Self
     }
 
-    /// Drive `fut` on this thread via [`park_on`]; whatever it spawns or
+    /// Drive `fut` on this thread via `park_on`; whatever it spawns or
     /// sleeps on lands on the background executor.
     pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
         park_on(fut)
@@ -1257,7 +1257,7 @@ fn probe_fifo_range() -> RtRange {
 /// RTEMS/vxWorks (`RTEMS-score/osdThread.c:94`, `vxWorks/osdThread.c:99`).
 ///
 /// **Hosted only.** RTEMS deliberately does not use this map — see
-/// [`map_epics_priority_rtems`] for the shape and the reason. The `test`
+/// `map_epics_priority_rtems` for the shape and the reason. The `test`
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
 #[cfg(any(target_os = "linux", test))]

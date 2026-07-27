@@ -16,6 +16,81 @@ use super::{PvDatabase, apply_timestamp};
 /// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
 const STRING_FIELD_MAX_LEN: usize = 39;
 
+/// **The single owner of "this record's processing cycle was refused."**
+///
+/// C publishes a refused cycle exactly once, in `dbProcess`'s `MAX_LOCK`
+/// branch (`dbAccess.c:544-556`):
+///
+/// ```c
+/// recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM, "Async in progress");
+/// monitor_mask = recGblResetAlarms(precord);
+/// monitor_mask |= DBE_VALUE|DBE_LOG;
+/// db_post_events(precord, ((char *)precord) + pdbFldDes->offset, monitor_mask);
+/// ```
+///
+/// so a refusal is never a silent success: the record carries SCAN_ALARM /
+/// INVALID with the reason in `AMSG`, and the transition is posted. Every
+/// refusal the port can make routes through here — C's `MAX_LOCK` re-entry and
+/// the port's own `MAX_LINK_DEPTH` / `MAX_LINK_OPS` bounds, which C does not
+/// have at all and which must therefore be at least as audible as C's.
+///
+/// Returns the post set for the caller to hand to `notify_from_snapshot` after
+/// releasing the write guard, or `None` when the record already carries this
+/// refusal — C's `if (precord->stat == SCAN_ALARM) goto all_done`, which is
+/// what keeps a repeatedly refused record from re-posting every cycle.
+fn scan_alarm_refusal(
+    instance: &mut RecordInstance,
+    msg: &str,
+) -> Option<crate::server::record::ProcessSnapshot> {
+    use crate::server::recgbl::EventMask;
+    if instance.common.stat == crate::server::recgbl::alarm_status::SCAN_ALARM
+        && instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid
+    {
+        return None;
+    }
+    crate::server::recgbl::rec_gbl_set_sevr_msg(
+        &mut instance.common,
+        crate::server::recgbl::alarm_status::SCAN_ALARM,
+        crate::server::record::AlarmSeverity::Invalid,
+        msg,
+    );
+    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+    // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec, &VAL,
+    // DBE_VALUE|DBE_LOG)` plus recGblResetAlarms' `val_mask = DBE_ALARM` for
+    // the fresh transition). The alarm fields carry their C per-field masks
+    // (recGbl.c:201-220): this only runs on a fresh SCAN_ALARM/INVALID raise,
+    // so sevr AND stat both moved — SEVR posts DBE_VALUE, STAT/AMSG post the
+    // shared `stat_mask` = DBE_ALARM|DBE_VALUE.
+    let stat_mask = EventMask::ALARM | EventMask::VALUE;
+    let mut changed_fields = Vec::new();
+    if let Some(val) = instance.record.val() {
+        changed_fields.push((
+            "VAL".to_string(),
+            val,
+            EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+        ));
+    }
+    changed_fields.push((
+        "SEVR".to_string(),
+        EpicsValue::Short(instance.common.sevr as i16),
+        EventMask::VALUE,
+    ));
+    changed_fields.push((
+        "STAT".to_string(),
+        EpicsValue::Short(instance.common.stat as i16),
+        stat_mask,
+    ));
+    // Include AMSG so subscribers reading the alarm text observe the reason
+    // alongside the SCAN_ALARM transition (C `recGbl.c:210-211` posts STAT and
+    // AMSG together when `stat_mask` is non-zero).
+    changed_fields.push((
+        "AMSG".to_string(),
+        EpicsValue::String(instance.common.amsg.clone().into()),
+        stat_mask,
+    ));
+    Some(crate::server::record::ProcessSnapshot { changed_fields })
+}
+
 /// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
 fn truncate_string_field(s: PvString) -> PvString {
     let bytes = s.as_bytes();
@@ -1242,8 +1317,13 @@ impl PvDatabase {
     /// run it in the SAME order relative to the gate: bail decisions are made
     /// before any waiting, exactly as they were when this was open-coded.
     ///
-    /// `Ok(None)` is a silent bail (depth, ops budget, cycle); `Err` is C's
-    /// `S_db_notFound`.
+    /// `Ok(None)` is "this entry did not run"; `Err` is C's `S_db_notFound`.
+    ///
+    /// Only ONE of those non-runs is silent, and it is the one C's is: the
+    /// cycle guard. Both resource bounds go through
+    /// [`Self::refuse_bounded_entry`], which raises the record's alarm and
+    /// logs before it hands back the `Ok(None)` — so a bound cannot be
+    /// written as a bare `return Ok(None)` here.
     fn process_entry_prelude(
         &self,
         name: &str,
@@ -1260,15 +1340,20 @@ impl PvDatabase {
         let name: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
 
         if depth >= MAX_LINK_DEPTH {
-            eprintln!("link chain depth limit reached at record {name}");
-            return Ok(None);
+            return self
+                .refuse_bounded_entry(&name, &format!("link chain depth limit {MAX_LINK_DEPTH}"));
         }
         if visited.len() >= MAX_LINK_OPS {
-            eprintln!("link chain ops budget exhausted at record {name}");
-            return Ok(None);
+            return self
+                .refuse_bounded_entry(&name, &format!("link chain ops limit {MAX_LINK_OPS}"));
         }
         if !visited.insert(name.clone()) {
-            return Ok(None); // Cycle detected, skip
+            // C has no counterpart to raise here: `processTarget`
+            // (`dbDbLink.c:436`) stops a cycle with `psrc->pact = TRUE` and
+            // `dbProcess` returns 0 for an already-active record without any
+            // alarm until MAX_LOCK. Re-reaching a record inside one cascade is
+            // ordinary FLNK-graph shape, not a refusal, so this stays silent.
+            return Ok(None);
         }
 
         let rec = {
@@ -1280,6 +1365,55 @@ impl PvDatabase {
             Some(r) => Ok(Some((name, r))),
             None => Err(CaError::ChannelNotFound(name)),
         }
+    }
+
+    /// Refuse a process entry that hit one of the port's own resource bounds,
+    /// and make the refusal audible before returning it.
+    ///
+    /// C has no depth counter and no ops budget: `processTarget`
+    /// (`dbDbLink.c:427-436`) only marks the source `pact` and recurses, so a
+    /// chain of any length runs and only a genuine cycle stops. The port keeps
+    /// bounds because each link level is a `Pin<Box<dyn Future>>` on the
+    /// calling thread's stack and an unbounded chain is a stack overflow on an
+    /// embedded target — but a bound C does not have must not be quieter than
+    /// the refusal C does have. So the record ends in SCAN_ALARM / INVALID with
+    /// the reason in `AMSG` ([`scan_alarm_refusal`], C `dbAccess.c:544-556`),
+    /// and the reason goes to `errlog` where an operator reads it, not to a
+    /// bare `eprintln!` that no IOC log ever sees.
+    ///
+    /// Returns the prelude's "did not run" value so that the only way to write
+    /// a bound bail is through this function.
+    fn refuse_bounded_entry(
+        &self,
+        name: &str,
+        why: &str,
+    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
+        let rec = {
+            let records = self.inner.records.read();
+            records.get(name).cloned()
+        };
+        // The record the chain could not reach may not exist — a dangling FLNK
+        // at the bound. The refusal is still reported; there is simply nothing
+        // to raise it on.
+        if let Some(rec) = rec {
+            let snapshot = {
+                let mut instance = rec.write();
+                scan_alarm_refusal(&mut instance, why)
+            };
+            match snapshot {
+                Some(snapshot) => {
+                    rec.read().notify_from_snapshot(&snapshot);
+                }
+                // Already refused and still in SCAN_ALARM/INVALID: C posts
+                // nothing on a repeat, and repeating the log line for every
+                // put into the same over-long chain would drown the first one.
+                None => return Ok(None),
+            }
+        }
+        crate::runtime::log::errlog_printf(&format!(
+            "dbProcess: {name} not processed, {why} exceeded\n"
+        ));
+        Ok(None)
     }
 
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.
@@ -1412,56 +1546,12 @@ impl PvDatabase {
                     // Bail out without raising alarm yet.
                     return Ok(());
                 }
-                // Raise SCAN_ALARM/INVALID, reset alarm transition,
-                // and post VAL monitor (DBE_VALUE | DBE_LOG).
-                crate::server::recgbl::rec_gbl_set_sevr_msg(
-                    &mut instance.common,
-                    crate::server::recgbl::alarm_status::SCAN_ALARM,
-                    crate::server::record::AlarmSeverity::Invalid,
-                    "Async in progress",
-                );
-                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-                // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec,
-                // &VAL, DBE_VALUE|DBE_LOG)` plus recGblResetAlarms'
-                // `val_mask = DBE_ALARM` for the fresh transition). The
-                // alarm fields carry their C per-field masks
-                // (recGbl.c:201-220): this guard only runs on a fresh
-                // SCAN_ALARM/INVALID raise, so sevr AND stat both moved —
-                // SEVR posts DBE_VALUE, STAT/AMSG post the shared
-                // `stat_mask` = DBE_ALARM|DBE_VALUE.
-                use crate::server::recgbl::EventMask;
-                let stat_mask = EventMask::ALARM | EventMask::VALUE;
-                let mut changed_fields = Vec::new();
-                if let Some(val) = instance.record.val() {
-                    changed_fields.push((
-                        "VAL".to_string(),
-                        val,
-                        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-                    ));
-                }
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(instance.common.sevr as i16),
-                    EventMask::VALUE,
-                ));
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(instance.common.stat as i16),
-                    stat_mask,
-                ));
-                // Include AMSG so subscribers reading the alarm text
-                // observe "Async in progress" alongside the SCAN_ALARM
-                // transition (C `recGbl.c:210-211` posts STAT and AMSG
-                // together when `stat_mask` is non-zero).
-                changed_fields.push((
-                    "AMSG".to_string(),
-                    EpicsValue::String(instance.common.amsg.clone().into()),
-                    stat_mask,
-                ));
-                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
+                let snapshot = scan_alarm_refusal(&mut instance, "Async in progress");
                 drop(instance);
-                let inst = rec.read();
-                inst.notify_from_snapshot(&snapshot);
+                if let Some(snapshot) = snapshot {
+                    let inst = rec.read();
+                    inst.notify_from_snapshot(&snapshot);
+                }
                 return Ok(());
             }
             // Not pact: reset lcnt (mirrors C `else { precord->lcnt = 0; }`

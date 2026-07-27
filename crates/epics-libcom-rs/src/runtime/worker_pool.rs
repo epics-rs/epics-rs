@@ -684,6 +684,217 @@ fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
     }
 }
 
+/// The smallest budget the boot-time check will settle for.
+///
+/// A CA worker set costs ~5 MiB, so a process held to this floor admits one set
+/// and refuses everything after it. That is the terminal behaviour on a target
+/// that confirms no size at all: bounded and loud, rather than an `abort` at the
+/// first client.
+const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
+
+/// Will this target give `bytes` of address space, right now?
+///
+/// `Some(true)`/`Some(false)` is a measurement; `None` means this target has no
+/// basis for the question and the answer must not be invented.
+///
+/// On VxWorks the basis is one anonymous `PROT_NONE` mapping, taken and released
+/// immediately. It is the only quantity in the RTP that tracks the wall this
+/// budget exists to stay under: an `mmap` ladder run at three stack classes and
+/// two guest sizes reports a ceiling equal to the `pthread_create` wall **to the
+/// byte**, while `memFindMax`, `memInfoGet`, `sysctl` `HW_PHYSMEM`,
+/// `sysconf(_SC_PHYS_PAGES)`, `getrlimit` and `rtpInfoGet` are each blind to it
+/// (`doc/vxworks-ca-refusal-fidelity.md` §10.1–§10.2). One mapping under-reads
+/// that ceiling — 192 MiB confirms on a guest whose chunked ceiling is 254 MiB —
+/// so it is a *lower* bound, which is the safe direction for a veto: it can
+/// refuse a budget the target would in fact have honoured, never admit one it
+/// would not.
+///
+/// Every other target answers `None`. RTEMS is not excluded for want of an
+/// `mmap`; it is excluded because no RTEMS ladder has been run, so nothing is
+/// known to relate a mapping there to the wall (§10.4), and a probe whose
+/// relation to the resource is unmeasured is a guess wearing a measurement's
+/// clothes.
+#[cfg(target_os = "vxworks")]
+fn address_space_admits(bytes: usize) -> Option<bool> {
+    /// `sys/mman.h:66` — VxWorks requires this exact `fd` with `MAP_ANON`.
+    const MAP_ANON_FD: libc::c_int = -1;
+
+    // SAFETY: an anonymous `PROT_NONE` mapping of `bytes` at an address of the
+    // kernel's choosing. Nothing is read or written through the pointer: it is
+    // compared against `MAP_FAILED` and then unmapped exactly once, with the
+    // same length it was created with.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            MAP_ANON_FD,
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return Some(false);
+    }
+    // SAFETY: `addr` came from the mapping above and is released once.
+    unsafe { libc::munmap(addr, bytes) };
+    Some(true)
+}
+
+#[cfg(not(target_os = "vxworks"))]
+fn address_space_admits(_bytes: usize) -> Option<bool> {
+    None
+}
+
+/// What the boot-time check concluded about the configured budget.
+///
+/// A verdict rather than a bare `usize` so that *deciding* and *saying* are
+/// separate functions: the defect being closed here is a budget that kills the
+/// process without a word, and a decision that carries its own announcement can
+/// be asserted by a test without a `tracing` subscriber. A verdict that reaches
+/// [`announce_reservation_budget`] cannot arrive silently by accident — silence
+/// is one named variant, [`BudgetVerdict::Confirmed`], and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetVerdict {
+    /// The target gave the configured size when asked. Nothing to say.
+    Confirmed(usize),
+    /// The target would not give `asked`; `adopted` is the largest size below it
+    /// that the target did give.
+    Clamped { asked: usize, adopted: usize },
+    /// This target has nothing that measures the ceiling, so `adopted` stands
+    /// unchecked. `from_env` is whether an operator chose it.
+    Unverifiable { adopted: usize, from_env: bool },
+    /// Nothing down to [`RESERVATION_PROBE_FLOOR`] was confirmed.
+    FloorHeld { asked: usize },
+}
+
+impl BudgetVerdict {
+    /// The budget this verdict adopts.
+    const fn budget(self) -> usize {
+        match self {
+            BudgetVerdict::Confirmed(bytes)
+            | BudgetVerdict::Unverifiable { adopted: bytes, .. } => bytes,
+            BudgetVerdict::Clamped { adopted, .. } => adopted,
+            BudgetVerdict::FloorHeld { .. } => RESERVATION_PROBE_FLOOR,
+        }
+    }
+
+    /// What the operator is told at boot, if anything.
+    ///
+    /// A returned value rather than a call into `errlog` so a test can assert
+    /// *which* outcomes are silent: on a shell-less target the whole account of
+    /// the admission policy is what `errlog` said at boot, and "nothing was
+    /// said" has to be a decision this function makes, not an arm somebody
+    /// forgot to write.
+    ///
+    /// Silent in exactly two cases: the target confirmed what was configured, or
+    /// the target cannot check and nobody configured anything — the built-in
+    /// default carries its own measurement (see [`default_reservation_budget`])
+    /// and a warning on every boot would be noise.
+    fn notice(self) -> Option<(ErrlogSevEnum, String)> {
+        match self {
+            BudgetVerdict::Confirmed(_) => None,
+            BudgetVerdict::Unverifiable {
+                from_env: false, ..
+            } => None,
+            BudgetVerdict::Clamped { asked, adopted } => Some((
+                ErrlogSevEnum::Major,
+                format!(
+                    "worker-pool reservation budget clamped from {} MiB to {} MiB: this target \
+                     would not reserve {} MiB of address space in one mapping. Set \
+                     {POOL_RESERVATION_ENV} no higher than the target can give — usable address \
+                     space is what the OS leaves after keeping its own",
+                    asked >> 20,
+                    adopted >> 20,
+                    asked >> 20
+                ),
+            )),
+            BudgetVerdict::Unverifiable { adopted, .. } => Some((
+                ErrlogSevEnum::Minor,
+                format!(
+                    "{POOL_RESERVATION_ENV} sets the worker-pool reservation budget to {} MiB, \
+                     and this target has no measurement that tracks its thread-memory ceiling: \
+                     this value cannot be verified and is taken as given",
+                    adopted >> 20
+                ),
+            )),
+            BudgetVerdict::FloorHeld { asked } => Some((
+                ErrlogSevEnum::Major,
+                format!(
+                    "this target confirmed no worker-pool reservation budget down to {} MiB \
+                     (asked for {} MiB); holding that floor, so the pool refuses nearly every \
+                     client instead of exhausting the address space",
+                    RESERVATION_PROBE_FLOOR >> 20,
+                    asked >> 20
+                ),
+            )),
+        }
+    }
+}
+
+/// Reduce `requested` to a budget this target has been *shown* to give.
+///
+/// # The defect this closes
+///
+/// [`POOL_RESERVATION_ENV`] is the operator's only escape hatch, and it took the
+/// operator at their word. Raised past what the address space can honour it does
+/// not raise the ceiling — it removes the refusal that was keeping the process
+/// under it: on the ~958 MB guest, `320` walks the CA pool to set 46 and the RTP
+/// takes signal 6 with no refusal delivered to anyone
+/// (`doc/vxworks-ca-refusal-fidelity.md` §9, §11.2). A switch that can kill the
+/// IOC silently is worse than no switch.
+///
+/// # The rule
+///
+/// Adopt the largest confirmed size not above `requested`, found by halving.
+/// Uniform: the built-in default is probed on exactly the same path as an
+/// operator's value, because a fallback nobody measured is the same defect one
+/// step down. Halving is coarse on purpose — this is a veto, not a search, and
+/// an operator who wants a size between two halvings names it and has that
+/// confirmed. The descent terminates at [`RESERVATION_PROBE_FLOOR`], so its cost
+/// is `log2(requested / floor)` mappings, and only the first of them is paid
+/// when the configured value is honest.
+fn decide_reservation_budget(
+    requested: usize,
+    from_env: bool,
+    mut admits: impl FnMut(usize) -> Option<bool>,
+) -> BudgetVerdict {
+    if requested == usize::MAX {
+        // No wall to stay under, and no mapping of this size to ask about.
+        return BudgetVerdict::Confirmed(requested);
+    }
+    let mut candidate = requested;
+    loop {
+        match admits(candidate) {
+            None => {
+                return BudgetVerdict::Unverifiable {
+                    adopted: requested,
+                    from_env,
+                };
+            }
+            Some(true) if candidate == requested => return BudgetVerdict::Confirmed(candidate),
+            Some(true) => {
+                return BudgetVerdict::Clamped {
+                    asked: requested,
+                    adopted: candidate,
+                };
+            }
+            Some(false) if candidate <= RESERVATION_PROBE_FLOOR => {
+                return BudgetVerdict::FloorHeld { asked: requested };
+            }
+            Some(false) => candidate = (candidate / 2).max(RESERVATION_PROBE_FLOOR),
+        }
+    }
+}
+
+/// Say what the boot-time check concluded, and hand back the budget it adopts.
+fn announce_reservation_budget(verdict: BudgetVerdict) -> usize {
+    if let Some((severity, message)) = verdict.notice() {
+        errlog_sev_printf(severity, &message);
+    }
+    verdict.budget()
+}
+
 /// One account of thread memory: a fixed budget and what is held against it.
 ///
 /// A type rather than a pair of free functions so the budget can be *named* at
@@ -761,11 +972,19 @@ impl Reservation {
 /// several (the CA server's, the CA client's, the PVA server's). A per-pool
 /// budget would let three pools each stay inside their own bound and still walk
 /// the process past the ceiling together.
+/// Forced by the first thread the IOC charges, which on every entry point in
+/// this workspace is a fixed facility thread created during start-up — so the
+/// boot-time check in [`decide_reservation_budget`] and whatever it has to say
+/// land before the first client, not on the first client.
 static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
-    Reservation::new(resolve_reservation_budget(
-        std::env::var(POOL_RESERVATION_ENV).ok().as_deref(),
-        default_reservation_budget(cfg!(epics_embedded_target)),
-    ))
+    let default = default_reservation_budget(cfg!(epics_embedded_target));
+    let requested =
+        resolve_reservation_budget(std::env::var(POOL_RESERVATION_ENV).ok().as_deref(), default);
+    Reservation::new(announce_reservation_budget(decide_reservation_budget(
+        requested,
+        requested != default,
+        address_space_admits,
+    )))
 });
 
 /// What one thread of `stack` reserves — the whole per-thread formula, in one
@@ -1857,6 +2076,220 @@ mod tests {
         assert_eq!(resolve_reservation_budget(Some("0"), default), default);
         assert_eq!(resolve_reservation_budget(Some("lots"), default), default);
         assert_eq!(resolve_reservation_budget(Some(""), default), default);
+    }
+
+    /// A probe that answers from a table and records what it was asked.
+    fn probe<'a>(
+        answers: &'static [(usize, Option<bool>)],
+        asked: &'a mut Vec<usize>,
+    ) -> impl FnMut(usize) -> Option<bool> + 'a {
+        move |bytes| {
+            asked.push(bytes);
+            answers
+                .iter()
+                .find(|(size, _)| *size == bytes)
+                .map(|(_, answer)| *answer)
+                .unwrap_or(Some(false))
+        }
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: the adopted reservation budget be one the target answered for, or
+    /// else be announced as unverified. MUST NOT: a configured budget reach the
+    /// pool without either a confirmation or a notice.
+    ///
+    /// The defect: `EPICS_RS_POOL_RESERVATION_MB` was the operator's only escape
+    /// hatch and was taken at face value. Raised past what the address space can
+    /// honour it does not add memory, it deletes the refusal that was keeping the
+    /// process below the wall — 320 MiB on the ~958 MB guest walks the CA pool to
+    /// set 46, and the RTP takes `signal 6` with no refusal delivered
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §9, §11.2).
+    ///
+    /// One case per boundary of the descent, not per story.
+    #[test]
+    fn a_configured_budget_is_confirmed_clamped_or_declared_unverifiable() {
+        // Host: no wall, and `usize::MAX` is not a mapping anyone can ask about,
+        // so the probe is not even consulted.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(usize::MAX, false, probe(&[], &mut asked)),
+            BudgetVerdict::Confirmed(usize::MAX)
+        );
+        assert!(asked.is_empty(), "no mapping is asked for on a host");
+
+        // The target gives what was configured: one mapping, adopted as asked,
+        // and nothing is said.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(
+                160 << 20,
+                false,
+                probe(&[(160 << 20, Some(true))], &mut asked)
+            ),
+            BudgetVerdict::Confirmed(160 << 20)
+        );
+        assert_eq!(asked, vec![160 << 20], "an honest value costs one mapping");
+
+        // The measured case: 320 MiB configured on the ~958 MB guest, whose
+        // single-mapping bound is between 192 and 256 MiB (§10.2/§10.3). The
+        // descent rejects 320 and adopts 160.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(
+                320 << 20,
+                true,
+                probe(
+                    &[(320 << 20, Some(false)), (160 << 20, Some(true))],
+                    &mut asked
+                )
+            ),
+            BudgetVerdict::Clamped {
+                asked: 320 << 20,
+                adopted: 160 << 20
+            }
+        );
+        assert_eq!(asked, vec![320 << 20, 160 << 20]);
+
+        // No basis: the value stands, and stands *declared*. `from_env` is the
+        // whole difference between a notice and silence.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(320 << 20, true, probe(&[(320 << 20, None)], &mut asked)),
+            BudgetVerdict::Unverifiable {
+                adopted: 320 << 20,
+                from_env: true
+            }
+        );
+        assert_eq!(asked, vec![320 << 20], "one question, then no more");
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(160 << 20, false, probe(&[(160 << 20, None)], &mut asked)),
+            BudgetVerdict::Unverifiable {
+                adopted: 160 << 20,
+                from_env: false
+            }
+        );
+    }
+
+    /// The descent's own boundaries: it ends *on* the floor, never below it, and
+    /// a target that confirms nothing leaves the pool bounded rather than dead.
+    #[test]
+    fn the_budget_descent_terminates_on_the_floor() {
+        // Nothing is confirmed. The descent halves to the floor and stops there.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(64 << 20, true, probe(&[], &mut asked)),
+            BudgetVerdict::FloorHeld { asked: 64 << 20 }
+        );
+        assert_eq!(
+            asked,
+            vec![64 << 20, 32 << 20, 16 << 20, 8 << 20],
+            "halving, and the last question is the floor itself"
+        );
+
+        // A halving that would undershoot lands on the floor instead of below
+        // it: 10 MiB / 2 is 5 MiB, which is not a size worth asking about.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(
+                10 << 20,
+                true,
+                probe(&[(RESERVATION_PROBE_FLOOR, Some(true))], &mut asked)
+            ),
+            BudgetVerdict::Clamped {
+                asked: 10 << 20,
+                adopted: RESERVATION_PROBE_FLOOR
+            }
+        );
+        assert_eq!(asked, vec![10 << 20, RESERVATION_PROBE_FLOOR]);
+
+        // Configured below the floor and refused: one question, and the floor is
+        // held rather than the descent running past it.
+        let mut asked = Vec::new();
+        assert_eq!(
+            decide_reservation_budget(4 << 20, true, probe(&[], &mut asked)),
+            BudgetVerdict::FloorHeld { asked: 4 << 20 }
+        );
+        assert_eq!(asked, vec![4 << 20]);
+    }
+
+    /// # Invariant
+    ///
+    /// MUST NOT: any outcome but "the target confirmed what was configured"
+    /// reach the pool without an `errlog` line. The defect being closed is a
+    /// budget that kills the process without a word, so silence has to be a
+    /// decision this code makes rather than an arm nobody wrote — the `match` is
+    /// exhaustive so a new verdict cannot compile until it is classified.
+    #[test]
+    fn every_verdict_but_confirmation_is_announced() {
+        for verdict in [
+            BudgetVerdict::Confirmed(160 << 20),
+            BudgetVerdict::Clamped {
+                asked: 320 << 20,
+                adopted: 160 << 20,
+            },
+            BudgetVerdict::Unverifiable {
+                adopted: 320 << 20,
+                from_env: true,
+            },
+            BudgetVerdict::Unverifiable {
+                adopted: 160 << 20,
+                from_env: false,
+            },
+            BudgetVerdict::FloorHeld { asked: 320 << 20 },
+        ] {
+            let notice = verdict.notice();
+            match verdict {
+                BudgetVerdict::Confirmed(bytes) => {
+                    assert_eq!(notice, None, "an honoured budget is not news");
+                    assert_eq!(verdict.budget(), bytes);
+                }
+                BudgetVerdict::Unverifiable {
+                    adopted,
+                    from_env: false,
+                } => {
+                    assert_eq!(
+                        notice, None,
+                        "the built-in default carries its own measurement"
+                    );
+                    assert_eq!(verdict.budget(), adopted);
+                }
+                BudgetVerdict::Unverifiable { adopted, .. } => {
+                    let (severity, message) = notice.expect("an unverified value must say so");
+                    assert_eq!(severity, ErrlogSevEnum::Minor);
+                    assert!(
+                        message.contains("cannot be verified")
+                            && message.contains(POOL_RESERVATION_ENV),
+                        "the notice must name the switch and its own uncertainty: {message}"
+                    );
+                    assert_eq!(verdict.budget(), adopted);
+                }
+                BudgetVerdict::Clamped { asked, adopted } => {
+                    let (severity, message) = notice.expect("a clamp must say so");
+                    assert_eq!(
+                        severity,
+                        ErrlogSevEnum::Major,
+                        "the IOC is not doing what the switch said"
+                    );
+                    assert!(
+                        message.contains(&format!("{} MiB", asked >> 20))
+                            && message.contains(&format!("{} MiB", adopted >> 20)),
+                        "both numbers, or the operator cannot tell what happened: {message}"
+                    );
+                    assert_eq!(verdict.budget(), adopted);
+                }
+                BudgetVerdict::FloorHeld { asked } => {
+                    let (severity, message) = notice.expect("a held floor must say so");
+                    assert_eq!(severity, ErrlogSevEnum::Major);
+                    assert!(
+                        message.contains(&format!("{} MiB", asked >> 20)),
+                        "the notice must name what was asked for: {message}"
+                    );
+                    assert_eq!(verdict.budget(), RESERVATION_PROBE_FLOOR);
+                }
+            }
+        }
     }
 
     /// # Invariant

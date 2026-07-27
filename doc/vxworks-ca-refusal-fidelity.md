@@ -463,6 +463,12 @@ measurement adds is that an operator can now compute the switch rather than
 guess it: usable address space ≈ OS memory − 705 MB, a CA set costs 5 MiB, and
 the default keeps 14 sets of headroom below the wall.
 
+The second bullet is a cost against *sizing* the budget, not against *vetoing*
+one. Asked "is the configured value obtainable" rather than "what is the
+ceiling", one mapping is a yes/no and the under-read falls on the safe side — so
+that is what boot does with it (§11.2), while the constant stays what an
+unconfigured process gets.
+
 ### 10.4 RTEMS
 
 `malloc_get_statistics` does not exist in RTEMS 6: it is absent from every
@@ -527,11 +533,36 @@ box whose measured ceiling is ~254 MiB of thread reservation (§10.2). The switc
 is documented as "raise it if the target has the memory" and takes the operator
 at their word; when they are wrong the process dies rather than refusing.
 
-A startup clamp is possible and is the structural close: §10.2's single-mapping
-probe returns 192 MiB on this guest against a true ceiling of 254 MiB — a sound
-lower bound, obtained in ~0.3 s from one `PROT_NONE` mapping that is released
-immediately — so a configured budget could be clamped to what the address space
-will actually give instead of to what the operator believes. That is not built.
+That is now closed at boot. `decide_reservation_budget` adopts the largest size
+the target *answers for*, found by halving from the configured value down to an
+8 MiB floor, where the answer is §10.2's single anonymous `PROT_NONE` mapping,
+taken and released. One mapping under-reads the chunked ceiling — 192 MiB
+confirms on a guest whose ladder reaches 254 MiB — which is the safe direction
+for a veto: it can refuse a budget the target would in fact have honoured, never
+admit one it would not. Halving is coarse on purpose; an operator who wants a
+size between two halvings names it and has that one confirmed.
+
+Measured on this rig, same image, same 1024M guest, `EPICS_RS_POOL_RESERVATION_MB`
+varied at the shell:
+
+| configured | adopted | boot line | wall | outcome |
+| --- | --- | --- | --- | --- |
+| 320 MiB (pre-fix) | 320 MiB | none | — | RTP deleted, `signal 6`, at CAS-client 46 |
+| 320 MiB | 160 MiB | `sevr=major … clamped from 320 MiB to 160 MiB` | 18/17 | refuses, keeps serving |
+| 160 MiB (= default) | 160 MiB | silent | 18/17 | refuses, keeps serving |
+| 4096 MiB | 128 MiB | `sevr=major … clamped from 4096 MiB to 128 MiB` | 12/11 | refuses, keeps serving |
+
+The clamp line lands before `iocInit`, two lines into the RTP's own output. Its
+cost is the descent: shell-prompt to `serving` is 14 s at one mapping (160) and
+16 s at six (4096 → 2048 → 1024 → 512 → 256 all refused, 128 given), so ≤ ~2 s
+for the deepest descent an operator can provoke on this guest, paid once.
+
+What the switch cannot do on RTEMS is be checked at all: no RTEMS ladder has been
+run (§10.4), so nothing there is known to relate a mapping to the wall. A
+configured value stands, and stands *declared* — `sevr=minor … this value cannot
+be verified and is taken as given`. Silence is reserved for the two cases that
+have earned it: the target confirmed what was asked, or nobody asked for
+anything.
 
 ### 11.3 RTEMS: the budget is live, and refuses
 

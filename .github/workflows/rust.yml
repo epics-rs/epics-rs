@@ -424,6 +424,14 @@ jobs:
     # and `scripts/vxworks-check.sh` compile. Kept as `--lib`: the host CLI
     # binaries do not build for either target and were never meant to, which is
     # the same reason those scripts name their target binaries one by one.
+    #
+    # `asyn-rs` joined that closure in `8ea3459f`, and its `epics` selection is
+    # the scripts' `CRATE_FEATURES[asyn-rs]`. Its row cannot pass yet on any
+    # tree where `asyn-rs` still names `socket2` as a production dependency:
+    # `socket2` does not compile for either triple (20 errors on
+    # `armv7-rtems-eabihf`, 12 on `x86_64-wrs-vxworks`, measured), so the row
+    # dies before rustdoc runs. It goes green with the same `runtime::socket`
+    # swap the two gate scripts already depend on.
     - name: rustdoc for armv7-rtems-eabihf
       env:
         RUSTDOCFLAGS: -D warnings
@@ -432,11 +440,12 @@ jobs:
         set -u
         rc=0
         for crate in epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs \
-                     epics-rtems-boot epics-bridge-rs; do
+                     epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
             epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
+            asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (armv7-rtems-eabihf)"
           cargo +nightly doc --no-deps --no-default-features \
@@ -457,11 +466,12 @@ jobs:
           < <(./scripts/libc-std-patch.sh nightly)
         rc=0
         for crate in epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs \
-                     epics-rtems-boot epics-bridge-rs; do
+                     epics-rtems-boot epics-bridge-rs asyn-rs; do
           feats=()
           case "$crate" in
             epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
             epics-ca-rs)     feats=(--features client-core) ;;
+            asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (x86_64-wrs-vxworks)"
           cargo +nightly doc --no-deps --no-default-features "${cfg[@]}" \

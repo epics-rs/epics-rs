@@ -324,9 +324,13 @@ enum IpIoInner {
 #[cfg(target_os = "rtems")]
 const POLLOUT_EVENT: libc::c_short = 0x0004;
 #[cfg(target_os = "rtems")]
+const POLLIN_EVENT: libc::c_short = 0x0001;
+#[cfg(target_os = "rtems")]
 const SEND_DONTWAIT: libc::c_int = 0x0080;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const POLLOUT_EVENT: libc::c_short = libc::POLLOUT;
+#[cfg(all(unix, not(target_os = "rtems")))]
+const POLLIN_EVENT: libc::c_short = libc::POLLIN;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 
@@ -349,28 +353,92 @@ trait WaitWritable {
 /// Hand bytes to the socket without parking — the stream arms of [`IpIoInner`].
 ///
 /// C reaches the same place by putting the socket in non-blocking mode once, at
-/// connect (`setNonBlock(fd, 1)`, `drvAsynIPPort.c:511`, under `USE_POLL`). This
-/// port carries `MSG_DONTWAIT` per send instead: C polls its reads too, whereas
-/// this driver bounds reads with `SO_RCVTIMEO` — which VxWorks does implement,
-/// and which a permanently non-blocking socket would defeat. A per-send flag
-/// leaves the shared file description, and that read bound, untouched.
+/// connect (`setNonBlock(fd, 1)`, `drvAsynIPPort.c:511`, under `USE_POLL`), and
+/// so does this driver — [`OWNED_NONBLOCKING`]. The per-send `MSG_DONTWAIT`
+/// below is kept on top of it, not instead of it.
+///
+/// It was instead of it, on the reasoning that a per-send flag leaves the file
+/// description alone and so leaves the `SO_RCVTIMEO` read bound — which VxWorks
+/// implements — in place. That traded a bound every target honours for one that
+/// only some do; the read side now polls as C's does ([`BoundNextRead`]), which
+/// is the price, and it is the smaller one.
 ///
 /// The wait alone is not enough to make the deadline hold: a blocking `write` on
 /// a stream socket does not return a short count when the send buffer fills, it
 /// waits until the whole buffer is queued.
 ///
-/// # Known gap: Darwin ignores the flag, and C does not rely on it
+/// # The flag is the fast path, not the guarantee
 ///
 /// XNU's `sosend` sleeps on `so_state & SS_NBIO` and its internal `MSG_NBIO`,
-/// not on `MSG_DONTWAIT`, so on macOS and iOS the send parks and
-/// `write_octet`'s timeout stops bounding it — measured, macOS CI 2026-07-27,
-/// where a stalled 8 MiB write outlived a 240 s test timeout. C is unaffected
-/// precisely because it takes the other branch above: `setNonBlock(fd, 1)` at
-/// connect plus a poll on reads. Closing this means adopting that shape here,
-/// which costs the `SO_RCVTIMEO` read bound VxWorks does implement.
-/// `doc/darwin-send-dontwait-gap.md`.
+/// not on `MSG_DONTWAIT`, so while the flag was the only thing holding the send
+/// out of a park, a stalled 8 MiB write on macOS outlived a 240 s test timeout
+/// (measured, macOS CI 2026-07-27, `doc/darwin-send-dontwait-gap.md`). C never
+/// had the exposure because it takes the other branch described above, and this
+/// driver now takes it too — [`OWNED_NONBLOCKING`], applied at connect. The
+/// flag stays because where it is honoured it saves the loop a `poll`.
 trait SendWithoutParking {
     fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize>;
+}
+
+/// The blocking mode this driver owns for a live socket, applied once at
+/// connect by [`IpIoState::own_blocking_mode`].
+///
+/// Non-blocking on unix, which is C's `setNonBlock(fd, 1)` at connect
+/// (`drvAsynIPPort.c:511`) under `USE_POLL`. With the mode owned, neither
+/// direction can park whatever the target does with `MSG_DONTWAIT`,
+/// `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the bound is the poll in
+/// [`WaitWritable`] / [`BoundNextRead`] on every unix alike. Blocking
+/// elsewhere: Windows implements both options and both bounds ride on them.
+const OWNED_NONBLOCKING: bool = cfg!(unix);
+
+/// Make the `read`/`recv_from` that follows return within `timeout`.
+///
+/// The read-side counterpart to [`WaitWritable`], and it moved here for the
+/// same reason the write bound did: on unix the descriptor is non-blocking, so
+/// `SO_RCVTIMEO` no longer applies to the call and a `POLLIN` wait does. C is
+/// again the same shape — under `USE_POLL` it polls its reads too, which is
+/// what makes the option's absence from that path unremarkable rather than a
+/// regression.
+///
+/// Returns nothing on purpose. A poll error, and the expiry itself, both fall
+/// through to the read, which reports the real outcome — expiry as `WouldBlock`
+/// on the non-blocking socket, the same `asynTimeout` `SO_RCVTIMEO` produced
+/// (see [`classify_read_error`]). That is C's own fall-through: `readRaw`
+/// records a failed `setsockopt(SO_RCVTIMEO)` and proceeds to `recv` anyway
+/// (`drvAsynIPPort.c:744-756`), letting the recv outcome govern teardown
+/// (`:797-821`).
+trait BoundNextRead {
+    fn bound_next_read(&self, timeout: Duration);
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> BoundNextRead for T {
+    fn bound_next_read(&self, timeout: Duration) {
+        let mut fds = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: POLLIN_EVENT,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
+        // and stays open for the call; `poll` reads `fd`/`events` and writes
+        // only `revents`.
+        unsafe { libc::poll(&mut fds, 1, ms) };
+    }
+}
+
+#[cfg(not(unix))]
+impl BoundNextRead for TcpStream {
+    fn bound_next_read(&self, timeout: Duration) {
+        let _ = self.set_read_timeout(Some(timeout));
+    }
+}
+
+#[cfg(not(unix))]
+impl BoundNextRead for UdpSocket {
+    fn bound_next_read(&self, timeout: Duration) {
+        let _ = self.set_read_timeout(Some(timeout));
+    }
 }
 
 #[cfg(unix)]
@@ -511,6 +579,27 @@ struct IpIoState {
     inner: Option<IpIoInner>,
 }
 
+impl IpIoState {
+    /// Put the live socket into the mode this driver owns
+    /// ([`OWNED_NONBLOCKING`]), which is what both bounds are built on.
+    ///
+    /// One site for all four transports, called from `connect` after the socket
+    /// is installed, so a transport added later cannot reach the read and write
+    /// paths without it. C does it in the same place and for the same reason:
+    /// `setNonBlock(fd, 1)` immediately after the connect succeeds
+    /// (`drvAsynIPPort.c:511`).
+    fn own_blocking_mode(&self) -> AsynResult<()> {
+        match self.inner.as_ref() {
+            Some(IpIoInner::Tcp(stream)) => stream.set_nonblocking(OWNED_NONBLOCKING),
+            Some(IpIoInner::Udp(socket, _peer)) => socket.set_nonblocking(OWNED_NONBLOCKING),
+            #[cfg(asyn_af_unix)]
+            Some(IpIoInner::Unix(stream)) => stream.set_nonblocking(OWNED_NONBLOCKING),
+            None => Ok(()),
+        }
+        .map_err(AsynError::Io)
+    }
+}
+
 impl OctetNext for IpIoState {
     fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let inner = self.inner.as_mut().ok_or_else(|| AsynError::Status {
@@ -526,16 +615,14 @@ impl OctetNext for IpIoState {
         }
         match inner {
             IpIoInner::Tcp(stream) => {
-                // C readRaw (drvAsynIPPort.c:744-756) records a failed
-                // setsockopt(SO_RCVTIMEO) but falls through to recv(); the recv
-                // outcome governs teardown (:797-821). On macOS this setsockopt
-                // returns EINVAL on a reset socket, so an early return (`?`) here
-                // would replace the ECONNRESET the read is about to surface with a
-                // synthetic "set_read_timeout failed", and the port would never
-                // classify the transport as dead. Drop the error and read — the
-                // status taint C keeps for a >0-byte read (:822-831) is
-                // unreachable here (the EINVAL cause is a socket whose read fails).
-                let _ = stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
+                // C readRaw (drvAsynIPPort.c:744-756) records a failed bound but
+                // falls through to recv(); the recv outcome governs teardown
+                // (:797-821). Keeping that shape is what lets an ECONNRESET the
+                // read is about to surface reach the caller, instead of a
+                // synthetic "arming the bound failed" that would leave the port
+                // never classifying the transport as dead — the status taint C
+                // keeps for a >0-byte read (:822-831) is unreachable here.
+                stream.bound_next_read(socket_poll_timeout(user.timeout));
                 match stream.read(buf) {
                     // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
                     // SOCK_STREAM socket means the peer closed — report
@@ -562,10 +649,10 @@ impl OctetNext for IpIoState {
                 }
             }
             IpIoInner::Udp(socket, _peer) => {
-                // Same C fall-through as the TCP arm: setsockopt(SO_RCVTIMEO)
-                // precedes the socketType branch in readRaw (:749) and a failure
-                // does not return — the recvfrom governs. Drop the error and read.
-                let _ = socket.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
+                // Same C fall-through as the TCP arm: the bound precedes the
+                // socketType branch in readRaw (:749) and a failure does not
+                // return — the recvfrom governs.
+                socket.bound_next_read(socket_poll_timeout(user.timeout));
                 // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
                 // unconnected datagram socket so it accepts replies from any
                 // peer (broadcast/multi-peer); the source address is only
@@ -593,9 +680,9 @@ impl OctetNext for IpIoState {
             #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => {
                 // Same C fall-through as the TCP arm (drvAsynIPPort.c:744-756):
-                // a failed set_read_timeout must not pre-empt the read that
-                // surfaces the real transport error. Drop the error and read.
-                let _ = stream.set_read_timeout(Some(socket_poll_timeout(user.timeout)));
+                // a failed bound must not pre-empt the read that surfaces the
+                // real transport error.
+                stream.bound_next_read(socket_poll_timeout(user.timeout));
                 match stream.read(buf) {
                     // Unix-domain stream EOF = peer closed = END, the same
                     // stream semantics as the TCP arm above.
@@ -705,7 +792,11 @@ impl OctetNext for IpIoState {
                     }
                 }
                 if restore.is_ok() {
-                    let _ = stream.set_nonblocking(false);
+                    // Back to the mode the driver owns, not to blocking: on
+                    // unix that mode already *is* non-blocking, and restoring
+                    // blocking here would silently disarm both bounds for the
+                    // rest of the connection.
+                    let _ = stream.set_nonblocking(OWNED_NONBLOCKING);
                 }
             }
             Some(IpIoInner::Udp(socket, _peer)) => {
@@ -719,7 +810,7 @@ impl OctetNext for IpIoState {
                     }
                 }
                 if restore.is_ok() {
-                    let _ = socket.set_nonblocking(false);
+                    let _ = socket.set_nonblocking(OWNED_NONBLOCKING);
                 }
             }
             #[cfg(asyn_af_unix)]
@@ -735,7 +826,11 @@ impl OctetNext for IpIoState {
                     }
                 }
                 if restore.is_ok() {
-                    let _ = stream.set_nonblocking(false);
+                    // Back to the mode the driver owns, not to blocking: on
+                    // unix that mode already *is* non-blocking, and restoring
+                    // blocking here would silently disarm both bounds for the
+                    // rest of the connection.
+                    let _ = stream.set_nonblocking(OWNED_NONBLOCKING);
                 }
             }
             None => {}
@@ -1511,6 +1606,9 @@ impl PortDriver for DrvAsynIPPort {
                 self.io.inner = Some(IpIoInner::Tcp(stream));
             }
         }
+        // Before the port is announced connected, so no read or write can reach
+        // a socket whose mode this driver does not own.
+        self.io.own_blocking_mode()?;
         self.base.set_connected(true);
         asyn_trace!(
             Some(self.base.trace),
@@ -2888,12 +2986,12 @@ mod tests {
     /// defect. `unix` only, because on Windows `SO_SNDTIMEO` works and the
     /// bound deliberately still rides on it.
     ///
-    /// Not Darwin either, and for the opposite reason: there the option is
-    /// absent *and* `MSG_DONTWAIT` is ignored, so this write really does park
-    /// with nothing to end it. The exclusion marks an open defect, not a
-    /// platform exemption — see [`SendWithoutParking`]'s "Known gap" and
-    /// `doc/darwin-send-dontwait-gap.md`.
-    #[cfg(all(unix, not(target_vendor = "apple")))]
+    /// Darwin included, and it is the case that proves the mode is what carries
+    /// the bound: there `SO_SNDTIMEO` is absent by this test's own construction
+    /// *and* `MSG_DONTWAIT` is ignored by XNU, so before
+    /// [`IpIoState::own_blocking_mode`] this write parked with nothing to end
+    /// it.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_write_bounds_itself_without_arming_so_sndtimeo() {
         let (listener, port) = start_echo_server();

@@ -972,18 +972,17 @@ fn wait_writable(sock: &TcpStream, deadline: Instant) -> io::Result<bool> {
 /// `SIGPIPE` needs no flag here: Rust's startup sets it to `SIG_IGN` on every
 /// Unix target, so a send to a closed peer returns `EPIPE`.
 ///
-/// # Known gap: Darwin ignores this flag on send
+/// # The flag is the fast path, not the guarantee
 ///
-/// XNU's `sosend` decides whether to sleep from `so_state & SS_NBIO` and its
-/// own internal `MSG_NBIO`; `MSG_DONTWAIT` reaches it only as the sockbuf-lock
-/// wait hint, so the send parks anyway. Measured, macOS CI 2026-07-27: with
-/// `SO_SNDTIMEO` armed the frame ends at its deadline, and with the option
-/// absent the identical call outlived a 20 s wait and a 240 s test timeout.
-/// So on macOS and iOS — and only there — [`write_frame_deadline`]'s bound
-/// does ride on `SO_SNDTIMEO` after all, and a caller that arms none has no
-/// bound at all. Closing it means this module owning the socket's blocking
-/// mode and polling both directions, which changes the read path the embedded
-/// targets were measured on; tracked in `doc/darwin-send-dontwait-gap.md`.
+/// It cannot be the guarantee, because a target may ignore it. XNU's `sosend`
+/// decides whether to sleep from `so_state & SS_NBIO` and its own internal
+/// `MSG_NBIO`, and `MSG_DONTWAIT` reaches it only as the sockbuf-lock wait
+/// hint, so on Darwin the send parked and the deadline was left riding on
+/// whatever `SO_SNDTIMEO` the caller had armed — measured, macOS CI
+/// 2026-07-27, `doc/darwin-send-dontwait-gap.md`. What makes the send return
+/// on every target is [`own_blocking_mode`]. The flag stays because where it
+/// *is* honoured it saves the loop a `poll` on the common path where the
+/// socket has room.
 #[cfg(unix)]
 fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
@@ -1044,11 +1043,11 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 ///
 /// # The deadline holds on every target, by construction
 ///
-/// This function owns its bound end to end. It owns the socket's blocking mode
-/// ([`own_blocking_mode`]) so that no syscall below it can park; `wait_writable`
-/// does every wait, against `deadline`. Between them there is no call in this
-/// loop that can outlast `send_timeout`, and nothing a caller does or fails to
-/// do can disarm it.
+/// This function owns its bound end to end. It takes over the socket's blocking
+/// mode (`own_blocking_mode`, crate-private) so that no syscall below it can
+/// park; `wait_writable` does every wait, against `deadline`. Between them there
+/// is no call in this loop that can outlast `send_timeout`, and nothing a caller
+/// does or fails to do can disarm it.
 ///
 /// Owning the mode is what makes that true rather than nearly true. `write_some`
 /// passing `MSG_DONTWAIT` is not enough on its own: XNU consults `SS_NBIO` and
@@ -1312,16 +1311,16 @@ impl Default for PumpConfig {
 /// protocol code cannot tell from a split socket, with both pump threads owned
 /// by the values returned.
 ///
-/// The socket's blocking mode is taken over here ([`own_blocking_mode`]), and
-/// fatally: it is what makes both pumps' bounds hold by construction rather
-/// than wherever a flag or option is honoured, so a target that refused it
-/// would be a target this seam cannot bound, and that is worth a failed dial
-/// rather than a silent park. `SO_RCVTIMEO` is still set, also fatally, but as
-/// the *value* the reader's wait uses and as the mechanism on the `not(unix)`
-/// arm; on unix the wait is [`wait_readable`]. There is no send-side
-/// counterpart: [`write_frame_deadline`] owns its own bound and needs no socket
-/// option, so there is nothing here for a target that implements fewer of them
-/// to switch off.
+/// The socket's blocking mode is taken over here (`own_blocking_mode`,
+/// crate-private), and fatally: it is what makes both pumps' bounds hold by
+/// construction rather than wherever a flag or option is honoured, so a target
+/// that refused it would be a target this seam cannot bound, and that is worth
+/// a failed dial rather than a silent park. `SO_RCVTIMEO` is still set, also
+/// fatally, but as the *value* the reader's wait uses and as the mechanism on
+/// the `not(unix)` arm; on unix the wait is a `POLLIN` poll. There is no
+/// send-side counterpart: [`write_frame_deadline`] owns its own bound and needs
+/// no socket option, so there is nothing here for a target that implements
+/// fewer of them to switch off.
 ///
 /// # The pool, and the two bands it carries
 ///

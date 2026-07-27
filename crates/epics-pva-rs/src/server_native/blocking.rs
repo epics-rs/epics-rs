@@ -163,7 +163,7 @@ use epics_base_rs::runtime::blocking_io::{
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
+use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
@@ -847,17 +847,25 @@ impl BlockingPvaServer {
     ///
     /// Admission lives in [`WorkerPool::acquire`] now, not in an `active` check:
     /// the pool's capacity *is* `max_connections`, so a full pool refuses with
-    /// [`io::ErrorKind::WouldBlock`], which this maps to the same operator-visible
+    /// [`AcquireError::AtCapacity`], which this maps to the same operator-visible
     /// warning the old gate produced. Any other `acquire` error is a target out
     /// of thread resources and propagates to the accept loop's "connection not
     /// started" path.
+    ///
+    /// That split used to be written as `e.kind() == io::ErrorKind::WouldBlock`,
+    /// and it was wrong for the case that matters: a failed thread spawn is
+    /// `EAGAIN`, `std` decodes `EAGAIN` as `WouldBlock`, so a target that had
+    /// run out of thread resources was reported to the operator as
+    /// `max_connections reached` — pointing at a config knob when the machine
+    /// was out of memory. Matching the gate instead of an errno makes the two
+    /// unmixable; the CA driver had the same defect on its own refusal path.
     fn start_connection(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
         // One atomic borrow of all three roles — connection body, reader pump,
         // writer pump — so a server at capacity can never hold a partial set and
         // block for the rest.
         let (lease, [conn_worker, reader_worker, writer_worker]) = match self.conn_pool.acquire() {
             Ok(set) => set,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(AcquireError::AtCapacity { capacity }) => {
                 // Dropping the stream closes it. Refusing costs more here than on
                 // the host: each connection is three threads, not two tasks.
                 //
@@ -867,14 +875,26 @@ impl BlockingPvaServer {
                 // (`epics_base_rs::runtime::log::install_console_subscriber`),
                 // which is the same silent-refusal defect the CA driver had at
                 // its thread ceiling.
+                //
+                // `limit` is the bound the pool actually enforced, not the
+                // configured number it was built from: they are the same today
+                // and reporting the enforced one keeps them the same tomorrow.
                 warn!(
                     ?peer,
-                    limit = self.config.max_connections,
+                    limit = capacity,
                     "blocking PVA server: refusing connection, max_connections reached"
                 );
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(cause @ AcquireError::OutOfReservation { .. }) => {
+                // The other refusal the process itself makes. It is not a
+                // failure to start a connection — the server is healthy and
+                // said no — so it takes the refusal path and reports the pool's
+                // own words, which name the switch that raises the budget.
+                warn!(?peer, "blocking PVA server: refusing connection, {cause}");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
         };
 
         self.active.fetch_add(1, Ordering::AcqRel);

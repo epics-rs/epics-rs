@@ -1,0 +1,49 @@
+[    0.1s] e11-1280M monitor RTEMS:CA_CONN_CNT      initial=0.0
+[    0.1s] e11-1280M monitor RTEMS:CA_REFUSED_CNT   initial=0.0
+[    0.1s] e11-1280M monitor RTEMS:FD_CNT           initial=5.0
+[    0.2s] e11-1280M monitor RTEMS:FD_MAX           initial=1000.0
+[    0.2s] e11-1280M monitor RTEMS:MEM_USED         initial=16998400.0
+[    0.2s] e11-1280M monitors=5 ceiling=200 refusals_wanted=8 deadline=420s
+[    0.2s] e11-1280M SAMPLE idle           CONN_CNT=0.0 REFUSED=0.0 FD_CNT=5.0 FD_MAX=1000.0 MEM_USED=16998400.0
+[    0.5s] e11-1280M UP held=8 total=13 last_conn=0.04s
+[    0.8s] e11-1280M UP held=16 total=21 last_conn=0.03s
+[    1.2s] e11-1280M UP held=24 total=29 last_conn=0.04s
+[    1.5s] e11-1280M UP held=32 total=37 last_conn=0.03s
+[    1.8s] e11-1280M UP held=40 total=45 last_conn=0.03s
+[    2.2s] e11-1280M UP held=48 total=53 last_conn=0.05s
+[    2.6s] e11-1280M UP held=56 total=61 last_conn=0.03s
+[    2.9s] e11-1280M UP held=64 total=69 last_conn=0.04s
+[    3.3s] e11-1280M UP held=72 total=77 last_conn=0.03s
+[    3.6s] e11-1280M UP held=80 total=85 last_conn=0.03s
+[   49.4s] e11-1280M UP held=88 total=93 last_conn=7.27s
+[   78.5s] e11-1280M WALL attempt=92 held=91 elapsed_conn=7.25s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[   82.1s] e11-1280M REFUSAL 2/8 elapsed_conn=3.67s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[   85.9s] e11-1280M REFUSAL 3/8 elapsed_conn=3.74s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[   89.6s] e11-1280M REFUSAL 4/8 elapsed_conn=3.74s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[   93.3s] e11-1280M REFUSAL 5/8 elapsed_conn=3.74s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[   97.1s] e11-1280M REFUSAL 6/8 elapsed_conn=3.74s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[  100.8s] e11-1280M REFUSAL 7/8 elapsed_conn=3.70s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[  104.5s] e11-1280M REFUSAL 8/8 elapsed_conn=3.66s REFUSED_BY_SERVER(status=48 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))')
+[  104.5s] e11-1280M === TOP ===
+[  104.5s] e11-1280M D1 client-side served = 91 ramp + 5 monitor = 96
+[  104.5s] e11-1280M refusals observed client-side = 8
+[  104.5s] e11-1280M refusal 1 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 1 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 2 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 2 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 3 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 3 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 4 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 4 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 5 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 5 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 6 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 6 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 7 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 7 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M refusal 8 frame status=48 len=152 text='CAS: no resources for a new client (cannot create a client thread: resource unavailable try again (os error 11))'
+[  104.5s] e11-1280M refusal 8 hex=000b008800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e74202863616e6e6f7420637265617465206120636c69656e74207468726561643a207265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f7220313129290000000000000000
+[  104.5s] e11-1280M SAMPLE top            CONN_CNT=0.0 REFUSED=0.0 FD_CNT=5.0 FD_MAX=1000.0 MEM_USED=16998400.0
+[  104.5s] e11-1280M spot-check: 10/10 sampled held connections still answer a fresh READ_NOTIFY
+[  104.5s] e11-1280M released 91 ramp connections
+[  104.5s] e11-1280M refusalprobe done deadline_hit=False

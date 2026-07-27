@@ -92,8 +92,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::CaResult;
+use crate::runtime::ioc_role::{IocRole, spawn_ioc_role};
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
-use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread};
+use crate::runtime::task::{StackSizeClass, block_on_sync};
 use crate::server::database::PvDatabase;
 use crate::server::pv::ProcessVariable;
 use crate::types::{EpicsValue, PvString};
@@ -287,13 +288,13 @@ pub fn serve_status_pvs(db: Arc<PvDatabase>, pvs: Vec<StatusPv>) -> CaResult<Sta
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
-    // Low: this is the least urgent thread in the IOC by construction — it
-    // reports, it does not serve — so it must never be the reason a scan or a
-    // CA reply waits. Small: its whole frame is a `Vec` walk and one `set` per
-    // PV.
-    spawn_dedicated_thread(
-        "status-pv".to_string(),
-        ThreadPriority::Low,
+    // The band comes from the role, not from here: these readings are how the
+    // IOC is observed while it is loaded, so the thread that produces them
+    // must be schedulable then — see `runtime::ioc_role`. Small: its whole
+    // frame is a `Vec` walk and one `set` per PV.
+    spawn_ioc_role(
+        IocRole::StatusPublisher,
+        "status-pv",
         StackSizeClass::Small,
         move || push_loop(&published, &worker_shutdown),
     )?;
@@ -672,5 +673,38 @@ mod tests {
             .find(|pv| pv.name() == "IOC:UPTIME")
             .expect("UPTIME is in the common set");
         assert!(matches!((uptime.read)(), EpicsValue::String(_)));
+    }
+
+    /// The pusher's band is the role's, and this file cannot name one.
+    ///
+    /// It named `ThreadPriority::Low` until the ramp measurement showed what
+    /// that costs: the publisher stopped for the whole ramp and `UPTIME`
+    /// resumed two seconds after the load ended, so the numbers an operator
+    /// reads at the wall were the numbers from before it. A band written here
+    /// is a band chosen outside `runtime::ioc_role`, which is the thing that
+    /// went wrong; the guard is that this file never writes one.
+    #[test]
+    fn the_pusher_takes_its_band_by_role_and_names_none_itself() {
+        let src = include_str!("status_pv.rs");
+        let prod = match src.find(concat!("\n#[cfg", "(test)]")) {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            !prod.contains(concat!("Thread", "Priority")),
+            "this file must not name a scheduling band — ask \
+             `runtime::ioc_role` for one by role"
+        );
+        assert!(
+            prod.contains("spawn_ioc_role(\n        IocRole::StatusPublisher,"),
+            "the status pusher must start through `spawn_ioc_role` as \
+             `IocRole::StatusPublisher`"
+        );
+        // The role's own module owns what that band *is*; this only pins that
+        // it is the one asked for here.
+        assert_eq!(
+            crate::runtime::ioc_role::IocRole::StatusPublisher.band(),
+            crate::runtime::task::ThreadPriority::ScanLow
+        );
     }
 }

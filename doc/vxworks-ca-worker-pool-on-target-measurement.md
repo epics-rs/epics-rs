@@ -1267,9 +1267,99 @@ a large-array monitor event buffer. C bounds this differently — a CA monitor
 on a large array in C is bounded by `EPICS_CA_MAX_ARRAY_BYTES`/
 `AUTO_ARRAY_BYTES` and refused with `ECA_TOLARGE` rather than aborting; see
 `doc/`'s note that `EPICS_CA_MAX_ARRAY_BYTES` is not a ceiling in our
-implementation. Not fixed here: the fix is a bounded per-subscriber event
-queue with a documented overflow policy, which is `epics-base-rs` event-queue
-work outside this row. Listed in §19.
+implementation.
+
+### 17.1 Fixed: three copies of the value per delivery, where C makes none
+
+The memory level is *not* the discriminator. The `MONBIG=0` control above
+survived at `MEM_USED = 213,311,488 B`, **above** the 211,804,160 B the
+aborting run died at, so what kills the IOC is the fan-out, not the total.
+
+C never copies a wide value. `db_create_field_log` stores anything wider
+than `union native_value` by reference (`dbfl_type_ref`, `dtor == NULL`, so
+`dbfl_has_copy` is false) and the value is read at DELIVERY: `read_reply`
+reserves the payload inside the client's *existing* send buffer
+(`cas_copy_in_header`, `rsrv/camessage.c:516`) and `dbGet`'s
+`!dbfl_has_copy(pfl)` arm converts the record's live field straight into it
+(`dbAccess.c:1020`). One array, N events pointing at it, one reused
+per-client buffer.
+
+The port made three copies of a 1 MiB array per delivery:
+
+1. **Per-subscriber snapshot.** `record_instance` built one
+   `make_monitor_snapshot` and then deep-cloned it into each subscriber's
+   `MonitorEvent`.
+2. **`encode_dbr`'s value bytes, then again behind its metadata.**
+   `convert_and_serialize` returned a 1 MiB `Vec`, then `serialize_time`
+   allocated a second and copied it in after the 16 metadata bytes.
+3. **The frame.** `send_event` allocated a third `Vec` and copied the padded
+   payload in behind the header bytes.
+
+Closed structurally: `MonitorEvent::snapshot` is an `Arc<Snapshot>` — the
+port of C's by-reference field log — with `Arc::make_mut` for the
+per-subscription filters that rewrite a value, which is also C (the filter
+chain runs per subscription and a rewriting filter makes its own field log).
+`encode_dbr_into` / `EpicsValue::write_into` append into a caller-owned
+buffer, and `server::frame::FrameBuf` is the port of the
+`cas_copy_in_header` reservation: one buffer that starts with room for the
+largest CA header, into which the payload is encoded in place. All four
+DBR-reply sites (`monitor::send_event`, the async record-field producer,
+`send_monitor_snapshot`, `build_read_reply`) go through it.
+
+### 17.2 Proof on target
+
+The workload that aborted, re-run unchanged on the fixed image — same guest
+(`-m 1024M`), same cold boot, `stackload.py 4 130 all3 10 1`:
+
+```
+[  124.0s] all3 OP get_WFBIG  ok=40   fail=0    worst=  0.813s first=ok bytes=1048576 firstfail=None
+[  124.0s] all3 OP get_BIG_ctrl ok=40   fail=0    worst=  0.811s first=ok bytes=1048656 firstfail=None
+[  124.0s] all3 OP put_WFBIG  ok=40   fail=0    worst=  1.423s first=ok firstfail=None
+[  124.0s] all3 OP put_chain  ok=40   fail=0    worst=  0.078s first=ok firstfail=None
+[  256.1s] all3 HOLD ok=68 fail=0 firstfail=None
+[  256.1s] all3 stackload done
+```
+
+480/480 ops across the twelve cases, `HOLD 68/68`, and no `signal 6`, no
+`memory allocation of` line, no `has been deleted` line anywhere in the
+console log. `MEM_USED` and the collapse counter, per census pass:
+
+| seq | `MEM_USED` | `MONPROBE COLLAPSED` |
+|-----|-----------:|---------------------:|
+| 1–5 (idle) | 43,278,336 | 0 |
+| 6 (rounds) | **215,539,712** | 448 |
+| 7–11 (130 s hold) | 214,425,600 | 448 |
+| 12–13 (clients gone) | 204,988,416 | 448 |
+
+The peak 215,539,712 B is **higher than both** the 211,804,160 B the
+aborting run died at and the 213,311,488 B the monitor-less control reached,
+and it survives — the level was never the boundary. `COLLAPSED` rises to 448
+during the rounds and is flat across the whole hold, which is `aee878ca`'s
+wide-value one-entry cap doing the work C's `db_queue_event_log` early-drop
+does (`dbEvent.c:786-799`).
+
+Post-mortem, the RTP that previously died is in `STATE_NORMAL`:
+
+```
+       NAME                  ID              STATE       OPTIONS   TASK CNT
+-------------------- ------------------ --------------- ---------- --------
+< ealtime-ca-ioc.vxe 0xffff800008c42000 STATE_NORMAL           0x1       27
+```
+
+and `edrShow` holds exactly one record, the cold-boot `INFO/BOOT` — no
+exception was injected.
+
+Console silence is not death and was not used as evidence either way here:
+the census kept printing through the hold and past it (seq 13, 15), so the
+low-priority reporter never starved in this run.
+
+**Still open after this**: the port materialises the value once per delivery
+where C materialises it zero times, because the event outlives the record
+lock and cannot read the live field at delivery; and the one buffer is
+allocated per delivery where C reuses the client's send buffer. A request
+whose DBR type differs from the field's native type also still builds a
+converted `EpicsValue` first, since the port's conversion is value-to-value
+where C's `convert()` is field-to-buffer.
 
 ## 18. The wall-abort mutex `EINVAL` is `semMCreate` returning NULL
 
@@ -1357,8 +1447,13 @@ arm.
 2. **`MAX_LINK_DEPTH = 16` truncates legal FLNK chains silently** (§16) —
    C has no such bound. Needs a decision, not a constant bump, because each
    level is a heap-allocated boxed future.
-3. **A monitored large array can abort the RTP** (§17) — needs a bounded
-   per-subscriber event queue with an overflow policy, in `epics-base-rs`.
+3. ~~**A monitored large array can abort the RTP** (§17)~~ — FIXED and proven
+   on target (§17.1, §17.2): the three per-delivery copies of the value are
+   gone (`Arc<Snapshot>`, `encode_dbr_into`, `FrameBuf`) and the workload that
+   aborted now runs 480/480 with a peak `MEM_USED` above the old abort point.
+   What remains is narrower: one materialisation per delivery where C makes
+   zero, and a per-delivery allocation where C reuses the client's send
+   buffer.
 4. **Semaphore exhaustion kills a worker thread and leaks its set** (§18) —
    input to the reservation-budget work; the budget must count semaphore
    objects and throttle creation rate.

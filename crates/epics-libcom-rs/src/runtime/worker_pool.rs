@@ -721,11 +721,31 @@ impl Reservation {
         }
     }
 
+    /// Take `bytes` that cannot be refused.
+    ///
+    /// The pool is elastic and so it asks; a scan thread, the callback bands,
+    /// the CA acceptor and the audit writer are not — an IOC that declines to
+    /// create them is not an IOC. They are still *charged*, because the budget's
+    /// job is to say how much room is left, and a thread the account never heard
+    /// of makes that number a statement about a different process. Over-budget
+    /// is representable on purpose: it makes the elastic consumer refuse sooner,
+    /// which is the correct consequence of the fixed threads having taken the
+    /// room.
+    fn charge(&self, bytes: usize) {
+        self.held.fetch_add(bytes, Ordering::SeqCst);
+    }
+
     /// Give `bytes` back. Called once per *thread*, by the thread's own exit
     /// guard, plus once by a failed grow for the threads it never created — so
     /// the account tracks threads that exist, not sets that were planned.
     fn release(&self, bytes: usize) {
         self.held.fetch_sub(bytes, Ordering::SeqCst);
+    }
+
+    /// What the account currently holds.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
     }
 }
 
@@ -744,9 +764,59 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
     ))
 });
 
+/// What one thread of `stack` reserves — the whole per-thread formula, in one
+/// place, so a pool worker and a fixed IOC thread cost the account the same.
+fn thread_reservation_bytes(stack: StackSizeClass) -> usize {
+    stack.bytes() + per_thread_overhead(cfg!(epics_embedded_target)) + PER_THREAD_OBJECT_ARENA
+}
+
 /// What one thread of `role` reserves.
 fn thread_reservation(role: &WorkerRole) -> usize {
-    role.stack.bytes() + per_thread_overhead(cfg!(epics_embedded_target)) + PER_THREAD_OBJECT_ARENA
+    thread_reservation_bytes(role.stack)
+}
+
+/// One thread's charge against the process account, held for exactly as long as
+/// the thread is.
+///
+/// # Invariant
+///
+/// **MUST:** every thread this workspace creates holds one of these for its
+/// whole life, pool worker or not. **MUST NOT:** any thread reserve stack the
+/// account has not been told about.
+///
+/// # The defect this closes
+///
+/// The budget was an account of *pool* threads only, while an IOC also runs
+/// fixed ones — the scan bands, the delayed-callback timer, the CA acceptor,
+/// the audit writer, the status pusher, the dial pool's workers. Measured at
+/// roughly 15 MiB on the VxWorks target: inside the headroom, and therefore
+/// invisible, which is not the same as accounted for. Two things go wrong while
+/// it stays invisible. The pool believes it may take the whole budget when it
+/// may not, so the refusal lands later than the number says; and the moment a
+/// target has more fixed threads than this one — a second server, more scan
+/// rates — the error is no longer small and nothing reports that it grew.
+///
+/// [`Drop`] is the release, so an exit path cannot forget: the charge is moved
+/// into the thread body and dies with it, including on unwind, and a
+/// `Builder::spawn` that fails drops the closure and with it the charge.
+pub struct ThreadCharge {
+    bytes: usize,
+}
+
+impl ThreadCharge {
+    /// Charge one fixed thread of `stack`. Never refuses — see
+    /// [`Reservation::charge`].
+    pub fn fixed(stack: StackSizeClass) -> Self {
+        let bytes = thread_reservation_bytes(stack);
+        PROCESS_RESERVATION.charge(bytes);
+        Self { bytes }
+    }
+}
+
+impl Drop for ThreadCharge {
+    fn drop(&mut self) {
+        PROCESS_RESERVATION.release(self.bytes);
+    }
 }
 
 /// Why [`WorkerPool::acquire`] refused.
@@ -1686,5 +1756,78 @@ mod tests {
         assert_eq!(resolve_reservation_budget(Some("0"), default), default);
         assert_eq!(resolve_reservation_budget(Some("lots"), default), default);
         assert_eq!(resolve_reservation_budget(Some(""), default), default);
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a thread the IOC cannot decline to create still charge the one
+    /// account the pool spends from, for exactly as long as it runs. MUST NOT:
+    /// any thread's stack be invisible to the number admission divides.
+    ///
+    /// The defect: the budget counted pool workers only, while the same target
+    /// runs the scan bands, the callback timer, the CA acceptor, the audit
+    /// writer and the dial pool's workers — about 15 MiB on the VxWorks guest.
+    /// Being inside the headroom is not the same as being counted: the pool
+    /// believed it could take the whole budget, and nothing would have reported
+    /// the error growing on a target with more fixed threads.
+    #[test]
+    fn a_fixed_thread_charges_the_process_account_and_gives_it_back() {
+        let before = PROCESS_RESERVATION.held();
+        let expect = thread_reservation_bytes(StackSizeClass::Small);
+        {
+            let _charge = ThreadCharge::fixed(StackSizeClass::Small);
+            assert_eq!(
+                PROCESS_RESERVATION.held(),
+                before + expect,
+                "a fixed thread must appear in the account the pool divides"
+            );
+        }
+        assert_eq!(
+            PROCESS_RESERVATION.held(),
+            before,
+            "the charge is released by the guard's `Drop`, not by a caller"
+        );
+    }
+
+    /// The charge is tied to the *thread*, not to the call that started it.
+    ///
+    /// The boundary that matters: the account must still hold the stack while
+    /// the thread runs, and must be back to where it started once the thread
+    /// has ended — which is what makes a long-lived fixed thread reduce what
+    /// the pool may take, and a finished one give it back.
+    #[test]
+    fn the_spawn_helper_holds_its_charge_for_the_thread_and_not_the_call() {
+        use crate::runtime::task::spawn_dedicated_thread;
+
+        let before = PROCESS_RESERVATION.held();
+        let expect = thread_reservation_bytes(StackSizeClass::Small);
+        let (release, wait) = channel::<()>();
+        let (started, running) = channel::<()>();
+
+        let handle = spawn_dedicated_thread(
+            "charged-fixed-thread".to_string(),
+            ThreadPriority::Low,
+            StackSizeClass::Small,
+            move || {
+                let _ = started.send(());
+                let _ = wait.recv();
+            },
+        )
+        .expect("the host can create one thread");
+
+        running.recv().expect("the thread starts");
+        assert_eq!(
+            PROCESS_RESERVATION.held(),
+            before + expect,
+            "the account must hold the stack while the thread runs"
+        );
+
+        drop(release);
+        handle.join().expect("the thread ends cleanly");
+        assert_eq!(
+            PROCESS_RESERVATION.held(),
+            before,
+            "and must be back where it started once the thread is gone"
+        );
     }
 }

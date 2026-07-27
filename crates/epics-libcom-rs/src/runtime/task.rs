@@ -1212,6 +1212,7 @@ fn probe_fifo_range() -> RtRange {
     // The probe *changes the scheduling of the thread that runs it*, so it
     // runs on a throwaway thread — exactly why C hands `find_pri_range` to
     // its own `pthread_create`/`pthread_join` pair (`osdThread.c:316-334`).
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(StackSizeClass::Small);
     let probe = std::thread::Builder::new()
         .name("cbRtProbe".to_string())
         // Two `sched_get_priority_*` calls and a `sched_setscheduler`; nothing
@@ -1219,6 +1220,7 @@ fn probe_fifo_range() -> RtRange {
         // no reason for a throwaway probe to reserve 2 MiB on any target.
         .stack_size(StackSizeClass::Small.bytes())
         .spawn(move || {
+            let _charge = charge;
             // `osdThread.c:277-287`: failing at the minimum means no
             // permission for SCHED_FIFO at all.
             if set_fifo_priority(min) != 0 {
@@ -1809,10 +1811,13 @@ where
     F: FnOnce() + Send + 'static,
 {
     let ambient = InheritedRuntime::capture();
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
         .spawn(move || {
+            // Dies with the thread, so the account tracks threads that exist.
+            let _charge = charge;
             // Held for the whole body: it is what makes `tokio::spawn` and the
             // timer reachable from this thread, and therefore what lets a future
             // written for the hosted driver run unchanged under `block_on_sync`.
@@ -1890,10 +1895,12 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
         .spawn(move || {
+            let _charge = charge;
             let _ = enter_ioc_thread(priority);
             f()
         })
@@ -1979,10 +1986,12 @@ impl MandatoryThread {
         F: FnOnce() + Send + 'static,
     {
         let priority = self.priority;
+        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(self.stack);
         std::thread::Builder::new()
             .name(self.name)
             .stack_size(self.stack.bytes())
             .spawn(move || {
+                let _charge = charge;
                 let _ = enter_ioc_thread(priority);
                 f()
             })

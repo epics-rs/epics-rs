@@ -579,8 +579,9 @@ const fn per_thread_overhead(embedded: bool) -> usize {
     if embedded { 1 << 20 } else { 0 }
 }
 
-/// RTP object-arena bytes one pool thread consumes — **unmeasured, and so far
-/// not charged**.
+/// RTP object-arena bytes one pool thread consumes — measured, and deliberately
+/// **not charged**, because a per-thread byte charge is the wrong shape for what
+/// was measured.
 ///
 /// Every VxWorks pthread mutex materialises a kernel `SEMAPHORE` object on its
 /// *first lock*: `pthread_mutex_init` only stamps the magic, and
@@ -593,11 +594,17 @@ const fn per_thread_overhead(embedded: bool) -> usize {
 /// either, which is why the same wall shows as an `EINVAL` in one probe and as
 /// a failed 64-byte allocation in another.
 ///
-/// It stays `0` until the per-thread figure is measured on target (E8's
-/// `semMCreate` wrap). When it lands: if it is small next to a stack it can be
-/// added to [`thread_reservation`]; if it turns out to bind *first*, it needs
-/// its own budget rather than a share of this one, because the two arenas run
-/// out independently.
+/// E8's on-target `semMCreate` wrap then measured the exhaustion itself, on a
+/// cold 1024M guest: `semMCreate` returned NULL after 588 successful creations,
+/// at 49 sets / 98 workers / 48 connections — and creation **resumed past 1024**
+/// afterwards. So the arena has no fixed per-thread cost to charge: it is a
+/// transient rate limit, not a total, and a byte charge per thread cannot model
+/// a rate. It stays `0` for that reason rather than for want of a number.
+///
+/// What that exhaustion does to this pool is already closed on the other side:
+/// the `EINVAL` kills the worker, and the set it was holding is retired by
+/// [`WorkerExit`] instead of leaking (E8 saw the leak it fixes as
+/// `POOLPROBE BUSY=1 SETS=49 CONNS=0`).
 const PER_THREAD_OBJECT_ARENA: usize = 0;
 
 /// The budget when [`POOL_RESERVATION_ENV`] is unset.

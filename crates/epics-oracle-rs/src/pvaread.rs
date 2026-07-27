@@ -191,7 +191,7 @@ pub struct PvaCase {
     pub rust_side: PvaObservation,
     pub differences: Vec<PvaDifference>,
     /// CBUG ids that justified the differences (empty unless EXPECTED
-    /// DEVIATION). Mirrors [`crate::runner::CaseResult::allowlisted`].
+    /// DEVIATION). Mirrors [`crate::report::CaseResult::allowlisted`].
     #[serde(default)]
     pub allowlisted: Vec<String>,
     /// Why the channel could not be measured. Non-empty iff ERRORED.

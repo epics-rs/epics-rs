@@ -17,7 +17,7 @@
 //! event unattributable, and driven serially they cost one settle window each:
 //! 3386 channels x 2 sides x ~2s is over three hours.
 //!
-//! So this phase takes [`Runner::probe_monitor`]'s scoping precedent — **the
+//! So this phase takes [`crate::runner::Runner::probe_monitor`]'s scoping precedent — **the
 //! `VAL` channel of each record type** — and states what that leaves out:
 //!
 //! - **the 3346 non-`VAL` channels**, for the reason above. Not measured here.

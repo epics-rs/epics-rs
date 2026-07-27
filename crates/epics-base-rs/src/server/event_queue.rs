@@ -90,9 +90,9 @@
 //! an allocation failure, and a failed allocation in Rust aborts the process
 //! where C's `freeListCalloc` would merely return NULL.
 //!
-//! Hence [`SubQ::latest_only`], C's `useValque == FALSE` reached from the value
+//! Hence `SubQ::latest_only`, C's `useValque == FALSE` reached from the value
 //! rather than from the channel: the first post whose value does not satisfy
-//! [`EpicsValue::queues_by_value`] latches the subscription into keep-only-the-
+//! [`EpicsValue::queues_by_value`](crate::types::EpicsValue::queues_by_value) latches the subscription into keep-only-the-
 //! latest, and from then on a post with an entry already pending overwrites it
 //! instead of appending. Two consequences, both C's:
 //!
@@ -286,7 +286,7 @@ struct QueInner {
     /// queue. The poll-based twin of the `Notify` waiter list: a consumer
     /// that multiplexes MANY subscriptions from ONE task (the QSRV group
     /// drain) parks here instead of holding a `Notified` future per queue.
-    /// Flushed — woken and cleared — by [`EvQue::wake_readers`], the single
+    /// Flushed — woken and cleared — by `EvQue::wake_readers`, the single
     /// owner of reader wakeup, on every transition that can make a parked
     /// read Ready.
     poll_wakers: Vec<std::task::Waker>,
@@ -507,7 +507,7 @@ impl EvQue {
 
     /// Poll-based [`Self::next`]: the same gate and the same delivery, but
     /// instead of suspending on the queue's `Notify` it registers `cx`'s
-    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`].
+    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`](std::task::Poll::Pending).
     ///
     /// This is what lets ONE task await MANY subscriptions — the QSRV group
     /// drain polls each of its member readers in turn and parks once, its
@@ -516,7 +516,7 @@ impl EvQue {
     /// [`Self::wake_readers`] under the same lock, so a post landing between
     /// the check and the `Pending` return cannot be lost.
     ///
-    /// [`Poll::Ready`]`(None)` matches [`Self::next`]'s `None`: the
+    /// [`Poll::Ready`](std::task::Poll::Ready)`(None)` matches [`Self::next`]'s `None`: the
     /// subscription is detached, or its producer is gone and the queue
     /// drained. An entry withheld by EVENTS_OFF parks exactly where
     /// [`Self::next`] suspends (`flowCtrlMode && nDuplicates == 0`, no drain
@@ -772,7 +772,7 @@ impl EventReader {
     /// `None`, `Poll::Pending` with `cx`'s waker registered on the queue
     /// where `recv()` suspends. For consumers that multiplex many
     /// subscriptions from one task (the QSRV group drain) — the waker stays
-    /// registered until [`EvQue::wake_readers`] flushes it, so a caller that
+    /// registered until `EvQue::wake_readers` flushes it, so a caller that
     /// polled several readers and parked is woken by whichever queue changes
     /// first.
     pub fn poll_recv(

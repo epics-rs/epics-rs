@@ -373,7 +373,7 @@ impl IocShell {
         // `\033[32;1m`) and route errors through bold red so an
         // operator can scan a long terminal scrollback for command
         // outcomes. Honour the `NO_COLOR=1` env var convention
-        // (https://no-color.org) and fall through to plain output
+        // (<https://no-color.org>) and fall through to plain output
         // when stdout is not a TTY (already TTY-gated by `run_repl`
         // dispatch but defensive).
         let want_color = use_ansi_color();
@@ -527,7 +527,7 @@ impl IocShell {
 /// backslash literal and terminates the logical line normally.
 /// epics-base 8-D `c0da3dd` ANSI color: returns `true` if the iocsh
 /// REPL should emit ANSI color sequences. Honours `NO_COLOR` env var
-/// (https://no-color.org) and `EPICS_RS_IOCSH_NO_COLOR=1` opt-out;
+/// (<https://no-color.org>) and `EPICS_RS_IOCSH_NO_COLOR=1` opt-out;
 /// otherwise on by default in the interactive (TTY) path.
 ///
 /// Host-only: used only by the rustyline interactive editor, which is gated

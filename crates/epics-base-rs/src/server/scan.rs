@@ -78,7 +78,7 @@ fn periodic_thread_name(period: Duration) -> String {
 
 /// Shutdown signal shared by the periodic scan threads.
 ///
-/// The single owner of the stop transition is [`ScanStopGuard`], held
+/// The single owner of the stop transition is `ScanStopGuard`, held
 /// by the `ScanScheduler::run` future: dropping that future (the
 /// [`ScanOwner`] thread unblocking, tokio cancellation, runtime
 /// teardown) trips the flag and wakes every sleeper, preserving the
@@ -208,7 +208,7 @@ impl ScanScheduler {
     /// Run the PINI=YES pass (unless the IOC init path already ran it —
     /// see the exactly-once gate below) and all periodic scan tasks.
     /// Never returns; dropping the future stops every scan thread (see
-    /// [`ScanStopGuard`]).
+    /// `ScanStopGuard`).
     ///
     /// If another `ScanScheduler` has already started for the same DB
     /// (e.g. an IOC entry point and an embedded harness both starting a
@@ -315,7 +315,7 @@ impl ScanScheduler {
 ///
 /// # Why a dedicated thread, not a spawned task
 ///
-/// The owner future parks forever holding the [`ScanStopGuard`]. On the
+/// The owner future parks forever holding the `ScanStopGuard`. On the
 /// exec backend (`rtems-exec-model` / RTEMS) a spawned task that returns
 /// `Pending` with its waker registered nowhere has no strong holder — the
 /// executor drops it (tokio keeps detached tasks alive), the guard drops,
@@ -332,7 +332,7 @@ impl ScanScheduler {
 /// # Teardown
 ///
 /// Dropping the handle wakes the owner thread, which drops the scheduler
-/// future — tripping the stop flag through the [`ScanStopGuard`] — and
+/// future — tripping the stop flag through the `ScanStopGuard` — and
 /// joins the owner thread (the `scan-%g` threads themselves exit within
 /// one tick, unjoined, exactly as under the previous server-driven
 /// cancellation).

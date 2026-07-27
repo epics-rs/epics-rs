@@ -140,7 +140,7 @@ fn convert_value_to_dbr_string(
 }
 
 /// Render an enum index as C's `get_enum_str` does, through the channel's
-/// [`EnumStringForm`](crate::server::snapshot::EnumStringForm) — the one owner
+/// [`crate::server::snapshot::EnumStringForm`] — the one owner
 /// of "what string this enum value is".
 ///
 /// There is no decimal fallback, because C has no path that produces one: a
@@ -331,8 +331,7 @@ pub(crate) fn time_pad(native: DbFieldType) -> &'static [u8] {
 
 /// Metadata byte count that precedes `value[0]` for a GR (`ctrl=false`)
 /// or CTRL (`ctrl=true`) DBR struct. this is the single source
-/// of truth shared with [`serialize_gr_ctrl`] / [`encode_gr`] /
-/// [`encode_ctrl`] — every component below is the exact byte sequence
+/// of truth shared with [`serialize_gr_ctrl`] / `write_gr_ctrl_meta` — every component below is the exact byte sequence
 /// those writers emit before the value, so the sizer cannot drift from
 /// the encoder. `n_limits` is 6 for GR (display/alarm limits) and 8 for
 /// CTRL (plus upper/lower control limits).

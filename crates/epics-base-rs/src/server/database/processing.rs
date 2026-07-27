@@ -100,7 +100,7 @@ fn truncate_string_field(s: PvString) -> PvString {
     PvString::from_bytes(&bytes[..STRING_FIELD_MAX_LEN])
 }
 
-/// The DBR_STRING view of a [`Record::string_input_links`] source, C
+/// The DBR_STRING view of a [`Record::string_input_links`](crate::server::record::Record::string_input_links) source, C
 /// `sCalcoutRecord.c::fetch_values` (895-937).
 ///
 /// A `DBF_CHAR`/`DBF_UCHAR` source of more than one element is the one type C
@@ -574,7 +574,7 @@ enum SimOutcome {
     /// real process cycle, but skips the (already-substituted) body.
     Simulated,
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
-    /// body ([`Record::simulation_substitutes_input_stage`]) — swait. The SIOL
+    /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
     /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
     /// have already happened here (C `swaitRecord.c:415-421`, which precedes the
     /// OOPT switch); the caller runs the record body with its input-link fetch
@@ -603,7 +603,7 @@ enum SimOutcome {
     IllegalMode { is_output: bool },
     /// The SIML read FAILED and the record's support ABORTS on it — C
     /// `writeValue` returns before performing any I/O
-    /// ([`Record::aborts_on_failed_siml_read`]; `busy` is the only one):
+    /// ([`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read); `busy` is the only one):
     ///
     /// ```c
     /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
@@ -638,7 +638,7 @@ enum SimOutcome {
     /// this cycle (C `process()` returns 0 on the async-start pass). The
     /// SIOL round-trip + alarm/monitor tail run on the continuation, which
     /// re-enters with `is_continuation = true` and takes the synchronous
-    /// branch. The wrapped [`Duration`] is the `SDLY` delay.
+    /// branch. The wrapped [`Duration`](std::time::Duration) is the `SDLY` delay.
     DeferRead(std::time::Duration),
 }
 
@@ -798,7 +798,7 @@ impl PvDatabase {
     ///
     /// Synchronous: the gate is already held by the caller, so this entry has
     /// nothing to wait for. It goes straight to
-    /// [`Self::process_record_with_links_body`], which is where the H6
+    /// `process_record_with_links_body`, which is where the H6
     /// no-suspension contract lives.
     pub fn process_record_with_links_already_locked(
         &self,
@@ -910,7 +910,7 @@ impl PvDatabase {
 
     /// Schedule a delayed re-process of `name` — the single owner of the
     /// "mint a fresh [`AsyncToken`], sleep, then fire" pattern. Used by both
-    /// [`ProcessAction::ReprocessAfter`] (record-driven owner re-entry: ODLY
+    /// [`ProcessAction::ReprocessAfter`](crate::server::record::ProcessAction::ReprocessAfter) (record-driven owner re-entry: ODLY
     /// output delay, swait, sequence DLYn) and the `SDLY` async-simulation
     /// defer ([`SimOutcome::DeferRead`]). Minting advances the record's
     /// generation so a newer schedule supersedes any pending one; a stale
@@ -928,12 +928,12 @@ impl PvDatabase {
     }
 
     /// (Re)arm a record's monitor watchdog — the single owner of the
-    /// [`Record::watchdog_interval`] / [`Record::watchdog_fire`] tick, and the
+    /// [`Record::watchdog_interval`](crate::server::record::Record::watchdog_interval) / [`Record::watchdog_fire`](crate::server::record::Record::watchdog_fire) tick, and the
     /// port of C `histogramRecord.c::wdogInit` + `wdogCallback` (:102-152).
     ///
     /// Called from exactly two places, C's own two `wdogInit` call sites: once
     /// per record at `iocInit` (C `init_record` pass 1, `:168`) and from
-    /// [`ProcessAction::ArmWatchdog`], which a record's `special()` emits when
+    /// [`ProcessAction::ArmWatchdog`](crate::server::record::ProcessAction::ArmWatchdog), which a record's `special()` emits when
     /// a put changed the period (histogram SDEL, `:266-268`).
     ///
     /// Arming bumps the record's `watchdog_generation`, so a tick already in
@@ -1313,7 +1313,7 @@ impl PvDatabase {
     ///
     /// Factored out so the gate-taking entry
     /// ([`Self::process_record_with_links_inner`]) and the two gate-free
-    /// entries ([`Self::process_record_with_links_body`]'s direct callers)
+    /// entries (`process_record_with_links_body`'s direct callers)
     /// run it in the SAME order relative to the gate: bail decisions are made
     /// before any waiting, exactly as they were when this was open-coded.
     ///
@@ -1486,7 +1486,7 @@ impl PvDatabase {
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.
     ///
     /// Everything after the guard is bound lives in
-    /// [`Self::process_record_with_links_body`], which is a plain `fn`: the
+    /// `process_record_with_links_body`, which is a plain `fn`: the
     /// L1 gate-held region contains zero suspension points by construction,
     /// which is what C's `dbProcess` gives for free (`dbScanLock` is a
     /// blocking mutex and the whole cycle between lock and unlock is
@@ -4161,7 +4161,7 @@ impl PvDatabase {
     /// On a non-retry, disconnected link the lset returns `Err`; pvxs
     /// raises `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` on
     /// the owning record (`pvxs/ioc/pvalink_lset.cpp:677-679`). This raises
-    /// the same *pending* LINK/INVALID alarm via [`rec_gbl_set_sevr_msg`],
+    /// the same *pending* LINK/INVALID alarm via [`rec_gbl_set_sevr_msg`](crate::server::recgbl::rec_gbl_set_sevr_msg),
     /// promoted by the next `recGblResetAlarms` — exactly as the C late-set
     /// inside `recGblFwdLink` (after the record's own alarm/monitor stage)
     /// is.
@@ -4220,11 +4220,11 @@ impl PvDatabase {
     /// ends with `recGblInheritSevrMsg` (`dbDbLink.c:228-232`), so an
     /// `field(INP,"SRC MS")` on a compress / aao-DOL / epid link raises the
     /// READER to the source's severity. That inheritance runs here too, through
-    /// [`Database::input_link_inheritance`] — the same owner the multi-input
+    /// `input_link_inheritance` — the same owner the multi-input
     /// fetch uses.
     ///
     /// The DBR class of the read is the RECORD's
-    /// ([`Record::input_link_read_as`], C's `dbGetLink` `dbrType` argument),
+    /// ([`Record::input_link_read_as`](crate::server::record::Record::input_link_read_as), C's `dbGetLink` `dbrType` argument),
     /// resolved from the SOURCE's metadata by the same owner the OUT side uses
     /// ([`Self::resolve_out_target`]): a record that switches on the source's
     /// DBF class (sseq `DOLn`, `sseqRecord.c:640-705`) gets the value C's
@@ -4354,10 +4354,10 @@ impl PvDatabase {
     }
 
     /// Resolve one OUT link's TARGET and hand it to the record ahead of
-    /// `process()` — [`ProcessAction::ResolveOutTarget`].
+    /// `process()` — [`ProcessAction::ResolveOutTarget`](crate::server::record::ProcessAction::ResolveOutTarget).
     ///
     /// The record's own link string is the input, so an empty/constant `LNKn`
-    /// resolves to [`OutTarget::UNRESOLVED`] and the record sees "no target",
+    /// resolves to [`OutTarget::UNRESOLVED`](crate::server::record::OutTarget::UNRESOLVED) and the record sees "no target",
     /// which is the answer C's `default:` arm acts on.
     fn resolve_out_target_into_record(
         &self,
@@ -5365,7 +5365,7 @@ impl PvDatabase {
     ///
     /// Returns the SIML-read status the record's `readValue`/`writeValue` sees:
     /// `true` when the read FAILED. Only a record that declares
-    /// [`Record::aborts_on_failed_siml_read`] (busy) acts on it — see that hook
+    /// [`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read) (busy) acts on it — see that hook
     /// for why the other two families do not.
     pub(crate) fn rec_gbl_get_simm(
         &self,
@@ -5477,11 +5477,11 @@ impl PvDatabase {
     /// `devWfSoft.c:42`, `devSASoft.c` (arrays, via `dbLoadLinkArray`). The
     /// raw variants (`devAiSoftRaw.c`, `devBiSoftRaw.c`, `devMbbiSoftRaw.c`)
     /// load into RVAL instead and let the record's own RVAL→VAL conversion
-    /// run — hence the [`Record::raw_soft_input`] arm, the same sink the
+    /// run — hence the [`Record::raw_soft_input`](crate::server::record::Record::raw_soft_input) arm, the same sink the
     /// process-time path uses for `Raw Soft Channel`.
     ///
     /// This is the other half of the rule
-    /// [`super::links::PvDatabase::read_link_value_soft`] enforces (a constant
+    /// [`PvDatabase::read_link_value_soft`](super::PvDatabase::read_link_value_soft) enforces (a constant
     /// delivers NOTHING at process): without the init load a `field(INP, "5")`
     /// ai would never see 5 at all; without the process-time skip the constant
     /// would clobber the record's VAL on every scan.
@@ -5491,7 +5491,7 @@ impl PvDatabase {
     ///
     /// **This is THE init-seed owner.** Beyond the device-support INP above it
     /// applies the record's own `recGblInitConstantLink` table,
-    /// [`Record::constant_init_links`] — calc/calcout/sub/sel/aSub/scalcout/
+    /// [`Record::constant_init_links`](crate::server::record::Record::constant_init_links) — calc/calcout/sub/sel/aSub/scalcout/
     /// acalcout/transform `INPA..L → A..L`, sel `NVL → SELN`, fanout/dfanout/
     /// seq `SELL → SELN`, seq `DOLn → DOn`, aSub `SUBL → SNAM`, and the
     /// `DOL → VAL` seeds that also clear UDF. Every one of those links is

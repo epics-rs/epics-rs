@@ -51,7 +51,7 @@ fn check_put_disabled(
 /// `Record::put_field`) must set them — C likewise writes them through
 /// `dbStaticLib`'s `dbPutString`, which never crosses `dbPut`.
 ///
-/// The declaration itself lives in [`RecordInstance::is_no_mod`], which C
+/// The declaration itself lives in [`RecordInstance::is_no_mod`](crate::server::record::RecordInstance::is_no_mod), which C
 /// exposes as `dbChannelSpecial(...) == SPC_NOMOD` and reads from TWO places:
 /// this gate (`dbPut`, dbAccess.c:123-126) and `rsrvCheckPut`
 /// (camessage.c:2540-2551), which feeds the CA ACCESS_RIGHTS write bit. This
@@ -61,8 +61,8 @@ fn check_put_disabled(
 /// The one thing that legitimately changes ACKS/ACKT is C's alarm
 /// acknowledgement, and it does NOT come through here: `dbPut` dispatches on the
 /// DBR *request type* (`DBR_PUT_ACKT`/`DBR_PUT_ACKS`, `dbAccess.c:1331-1335`)
-/// ABOVE this gate, into [`RecordInstance::put_ackt`] /
-/// [`RecordInstance::put_acks`]. The wire route for that is
+/// ABOVE this gate, into [`RecordInstance::put_ackt`](crate::server::record::RecordInstance::put_ackt) /
+/// [`RecordInstance::put_acks`](crate::server::record::RecordInstance::put_acks). The wire route for that is
 /// [`PvDatabase::put_alarm_ack_from_ca`].
 ///
 /// `field` must already be upper-cased.
@@ -86,7 +86,7 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
 /// `PROC` and `UDF` are the ONLY two `dbCommon` `pp(TRUE)` fields
 /// (`dbCommon.dbd.pod`: PROC line 243, UDF line 552); every other `pp(TRUE)`
 /// field is declared per record TYPE and reached through
-/// [`Record::processes_after_put`]. Because the two `dbCommon` fields are NOT in
+/// [`Record::processes_after_put`](crate::server::record::Record::processes_after_put). Because the two `dbCommon` fields are NOT in
 /// any type's `process_passive_fields()` table, they are named here directly:
 /// `PROC` unconditionally (force-process on any SCAN), `UDF` on the Passive
 /// branch (an ordinary `pp` field, so it processes only when `SCAN == 0`, unlike
@@ -111,7 +111,7 @@ pub(crate) fn put_drives_processing_of(
             && (field == "UDF" || instance.record.processes_after_put(field)))
 }
 
-/// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`])
+/// Drain the record's per-cycle post marks ([`Record::take_cycle_posted_fields`](crate::server::record::Record::take_cycle_posted_fields))
 /// into monitor posts — the put-path counterpart of the `db_post_events` calls a
 /// C `special()` makes by hand.
 ///
@@ -134,7 +134,7 @@ fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
 }
 
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
-/// of the link writes it queued ([`Record::take_special_actions`]).
+/// of the link writes it queued ([`Record::take_special_actions`](crate::server::record::Record::take_special_actions)).
 ///
 /// The pairing is the point: `special()` and its drain are ONE step, so a queued
 /// action cannot survive the put that queued it — not even when `special()`
@@ -543,7 +543,7 @@ impl PvDatabase {
     /// Set a PV value or record field — the C `dbPut` analogue
     /// (`dbAccess.c:1316-1419`), whole: value write + `special`/`on_put`, the
     /// value-field UDF clear, and the field's `DBE_VALUE|DBE_LOG` monitor
-    /// post ([`dbput_post_put_field`], suppressed only for a `pp(TRUE)` value
+    /// post (`dbput_post_put_field`, suppressed only for a `pp(TRUE)` value
     /// field exactly as C's tail suppresses it). Tries record `put_field`
     /// first, then `put_common_field` as fallback.
     ///
@@ -564,7 +564,7 @@ impl PvDatabase {
     /// [`Self::put_record_field_from_ca_already_locked`].
     ///
     /// This is the whole `dbPut` body — the gate-held region, and it is a
-    /// `fn`. See [`Self::acquire_put_gate`].
+    /// `fn`. See `acquire_put_gate`.
     pub fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         self.put_pv_body(name, value)
     }
@@ -670,7 +670,7 @@ impl PvDatabase {
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             // The caller holds the advisory write gate (`dbScanLock`
-            // analogue) for `canonical_base` — see [`Self::acquire_put_gate`].
+            // analogue) for `canonical_base` — see `acquire_put_gate`.
             // It is held to the `return Ok(())` below, and that is the point:
             // C's `dbScanLock` covers `dbPut` *including*
             // `dbPutSpecial(paddr, 1)` and the scan-list move, so the tails
@@ -792,7 +792,7 @@ impl PvDatabase {
                 instance.notify_field_written_if_changed(&field, prev_value.as_ref());
 
                 // C `dbPut:1408-1414`'s field-monitor post, through the one owner
-                // ([`dbput_post_put_field`], shared with the CA route). `put_pv`
+                // (`dbput_post_put_field`, shared with the CA route). `put_pv`
                 // is the `dbPutLink` route's `dbPut` and the internal driver-put
                 // entry, and C posts DBE_VALUE|DBE_LOG from *every* `dbPut` —
                 // an NPP OUT link writing a calc's A, an autosave restore, a
@@ -1445,7 +1445,7 @@ impl PvDatabase {
     /// C `dbNotifyCompletion` → restart (dbNotify.c:207-231, state
     /// `notifyRestartInProgress`): replay a put-notify that landed on a PACT
     /// record, now that the record is idle. The single owner that consumes a
-    /// [`DeferredNotifyPut`]; called only from the async-completion tail.
+    /// [`DeferredNotifyPut`](crate::server::record::DeferredNotifyPut); called only from the async-completion tail.
     ///
     /// The replay goes back through the ordinary put entry, so if the record
     /// has ALREADY gone active again (a scan fired between the completion and
@@ -1474,7 +1474,7 @@ impl PvDatabase {
 
     /// The gate-held body of the whole CA field-put family — a `fn`, so
     /// nothing in it can suspend while the L1 gate is held. The gate is the
-    /// caller's; see [`Self::acquire_put_gate`].
+    /// caller's; see `acquire_put_gate`.
     fn put_record_field_from_ca_body(
         &self,
         record_name: &str,
@@ -1505,7 +1505,7 @@ impl PvDatabase {
         };
 
         // The caller holds the record's advisory write gate — the
-        // `dbScanLock(precord)` analogue, taken by [`Self::acquire_put_gate`]
+        // `dbScanLock(precord)` analogue, taken by `acquire_put_gate`
         // or (QSRV atomic group PUT) by `lock_records` over the whole member
         // set. While it is held a plain write to the same record blocks, so a
         // direct backing-record write cannot land between member writes of an
@@ -1896,7 +1896,7 @@ impl PvDatabase {
                 // or by the disable-alarm bail (`dbAccess.c:576`).
 
                 // C `dbPut:1408-1414`'s field-monitor post, through the one
-                // owner ([`dbput_post_put_field`], shared with `put_pv`). On
+                // owner (`dbput_post_put_field`, shared with `put_pv`). On
                 // this route the pp-value-field suppression pairs with the
                 // `should_process` gate below: a suppressed field is exactly
                 // one the reprocess cycle re-posts via the deadband snapshot.

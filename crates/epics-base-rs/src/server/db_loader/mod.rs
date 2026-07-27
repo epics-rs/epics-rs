@@ -1453,7 +1453,7 @@ pub fn resolve_linr_breaktable_names(
 /// device-support init via `DeviceSupportContext` — for every record type,
 /// even one that stores the field itself.
 ///
-/// [`RecordCommon`]: crate::server::record::RecordCommon
+/// [`RecordCommon`]: crate::server::record::CommonFields
 fn is_common_link_field(upper_name: &str) -> bool {
     matches!(upper_name, "INP" | "OUT")
 }

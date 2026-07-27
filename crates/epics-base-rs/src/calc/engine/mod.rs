@@ -203,7 +203,7 @@ pub(crate) fn isinf(v: f64) -> f64 {
 ///
 /// sCalc alone can also take a STRING bound, which is searched for rather than
 /// counted; that branch (and the wrap it must NOT do) lives with the operator, in
-/// [`string::subrange_bounds`].
+/// `string::subrange_bounds`.
 pub(crate) fn subrange_bounds(i: i64, j: i64, k: i64) -> (i64, i64) {
     let wrap = |v: i64| if v < 0 { v + k } else { v };
     (wrap(i).clamp(0, k), wrap(j).min(k))

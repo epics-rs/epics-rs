@@ -55,7 +55,7 @@ thread_local! {
     static AMBIENT_WRITE_ORIGIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// RAII scope for [`AMBIENT_WRITE_ORIGIN`]. Sound only around code with no
+/// RAII scope for `AMBIENT_WRITE_ORIGIN`. Sound only around code with no
 /// `.await` inside: the tag is thread-local, so crossing an await point
 /// would both leak it to interleaved tasks and lose it on work-stealing.
 /// The put paths that use it (`put_record_field_from_ca_no_notify_with_origin`)
@@ -938,7 +938,7 @@ impl RecordInstance {
         Self::new_boxed(name, Box::new(record))
     }
 
-    /// The raw text of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// The raw text of one `COMMON_LINK_FIELDS` entry, or `None` for any
     /// other field name.
     pub fn common_link_text(&self, field: &str) -> Option<&str> {
         Some(match field {
@@ -951,7 +951,7 @@ impl RecordInstance {
         })
     }
 
-    /// The parse cache of one [`COMMON_LINK_FIELDS`] entry, or `None` for any
+    /// The parse cache of one `COMMON_LINK_FIELDS` entry, or `None` for any
     /// other field name. The only mutable handle on the cache outside
     /// `put_common_field`, so the iocInit locality commit cannot reach a slot
     /// that has no matching raw text.
@@ -1455,7 +1455,7 @@ impl RecordInstance {
 
     /// Choice table for a field served as `DBR_ENUM` from a `DBF_MENU`:
     /// the record's own record-specific menu
-    /// ([`Record::menu_field_choices`](super::record_trait::Record::menu_field_choices)),
+    /// ([`Record::menu_field_choices`]),
     /// else a shared menu keyed by field name
     /// ([`shared_menu_choices`](super::menu_choices::shared_menu_choices)).
     /// The choices a `menu()` field serves as its `DBR_ENUM` labels.
@@ -1582,7 +1582,7 @@ impl RecordInstance {
     /// **The** owner of "what string does this enum-valued field render as" —
     /// C's `[DBF_*][DBR_STRING]` conversion row, chosen by the field's DBF
     /// class. Every path that renders an enum as a string goes through here:
-    /// the CA/PVA encoders (via [`snapshot::EnumInfo::string_form`] on the
+    /// the CA/PVA encoders (via [`EnumInfo::string_form`](crate::server::snapshot::EnumInfo::string_form) on the
     /// snapshot this builds) and the db-link read
     /// ([`Self::field_as_dbr_string`]). There is exactly one such table per
     /// field, and no path may reconstruct a second one.
@@ -1594,7 +1594,7 @@ impl RecordInstance {
     ///   whose `VAL` is an enum (`bo.OMSL`) must render its menu's choices, not
     ///   the record's `ZNAM`/`ONAM`.
     /// * `DBF_ENUM` `VAL` -> `getEnumString` -> the record's `get_enum_str`
-    ///   rset ([`Record::enum_string_form`](super::record_trait::Record::enum_string_form)).
+    ///   rset ([`Record::enum_string_form`]).
     ///
     /// `None` when the field has neither — C answers `S_db_noRSET`, an error;
     /// the port renders empty.
@@ -1704,7 +1704,7 @@ impl RecordInstance {
     /// The `.dbd` is the declaration, so the table generated FROM the `.dbd`
     /// ([`dbd_generated::record_fields`](super::dbd_generated::record_fields))
     /// is asked first, for every record type that has one. A record's own
-    /// [`Record::field_list`](super::record_trait::Record::field_list) is a
+    /// `Record::field_list` is a
     /// hand-written stand-in for that table, and it is consulted only for a
     /// record type the `.dbd` does not cover (`subArray`, and the record types
     /// the downstream crates add). It cannot be the primary answer: several of
@@ -1959,7 +1959,7 @@ impl RecordInstance {
     }
 
     /// Stamp a built snapshot with the property mask THIS channel supplies —
-    /// [`Self::property_support`] narrowed to the addressed field by C's
+    /// [`Record::property_support`] narrowed to the addressed field by C's
     /// second gate ([`PropertySupport::narrowed_to_field`]). Called by both
     /// snapshot builders once the value has settled (after
     /// [`Self::attach_menu_enum`] promoted a `DBF_MENU` field to its
@@ -3621,7 +3621,7 @@ impl RecordInstance {
     /// * [`Record::process_posted_fields`], when declared, is the closed set of
     ///   fields a process cycle may post at all.
     /// * A secondary value field ([`Record::fields_posted_with_value_mask`])
-    ///   carries VAL's monitor mask, gated per its [`ValuePostGate`].
+    ///   carries VAL's monitor mask, gated per its [`ValuePostGate`](super::ValuePostGate).
     /// * A CHANGED field carries [`AuxPostMask::mask_for`] — unless it is a
     ///   [`Record::fields_posted_only_when_marked`] field, which C never
     ///   change-detects (aCalcout AA..LL) and which therefore posts from its
@@ -4538,7 +4538,7 @@ impl RecordInstance {
     ///
     /// The last arm is not the same for every record type — a slot can also
     /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
-    /// per record type, read from its C source: [`control_default_arm`].
+    /// per record type, read from its C source: `control_default_arm`.
     fn route_field_metadata(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
         // The rset slots this record type actually supplies. A NULL slot makes
         // `dbAccess.c` clear the option bit, so the leaf is never served and

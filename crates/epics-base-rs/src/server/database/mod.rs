@@ -415,7 +415,7 @@ struct PvDatabaseInner {
     existence_gate: ArcSwapOption<ExistenceGate>,
     /// Per-scheme link sets — pluggable backends for `pva://` /
     /// `ca://` link resolution. Consulted before the legacy
-    /// [`ExternalPvResolver`] in [`Self::resolve_external_pv`].
+    /// [`ExternalPvResolver`] in `resolve_external_pv`.
     /// Mirrors the C-EPICS lset abstraction.
     ///
     /// Read-modify-write cell (`register_link_set` inserts one scheme into
@@ -1085,7 +1085,7 @@ impl PvDatabase {
     /// strings via [`Record::get_field`].
     ///
     /// `parsed` is the **post-`dbInitLink`** view, not the bare parse: each
-    /// link is mapped through [`PvDatabase::db_init_link_locality`], so a
+    /// link is mapped through `db_init_link_locality`, so a
     /// `Db` link naming a record this IOC does not have is reported as the
     /// `Ca` link C's `dbDbInitLink` → `dbCaAddLink` fallthrough makes it
     /// (`dbLink.c:117-129`, `dbDbLink.c:94-96`). Every consumer — the CP
@@ -1227,7 +1227,7 @@ impl PvDatabase {
     /// work-queue target plus the name the lset is addressed with.
     ///
     /// Single owner of the `ca://` / `pva://` prefix convention: the
-    /// cache-miss stage in [`Self::resolve_external_pv`] and the iocInit
+    /// cache-miss stage in `resolve_external_pv` and the iocInit
     /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
     /// the same [`link_put_queue::LinkKey`] from the same link, or the
     /// queue's once-per-link open would fire twice under two spellings.

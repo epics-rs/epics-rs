@@ -9,15 +9,15 @@
 //!
 //! | C source                              | Rust module                |
 //! |---------------------------------------|----------------------------|
-//! | `procServ.cc` (main, SendToAll)       | [`procserv::supervisor`]   |
-//! | `processFactory.cc` (PTY child)       | [`procserv::child`]        |
-//! | `acceptFactory.cc` (TCP/UNIX listen)  | [`procserv::listener`]     |
-//! | `clientFactory.cc` (per-client conn)  | [`procserv::client`]       |
-//! | libtelnet IAC parser/encoder          | [`procserv::telnet`]       |
-//! | `processInput` command-key dispatch   | [`procserv::menu`]         |
-//! | `processFactoryNeedsRestart` policy   | [`procserv::restart`]      |
-//! | `forkAndGo` daemonize + signals       | [`procserv::daemon`]       |
-//! | log/info/pid file + PROCSERV_INFO env | [`procserv::sidecar`]      |
+//! | `procServ.cc` (main, SendToAll)       | `procserv::supervisor`   |
+//! | `processFactory.cc` (PTY child)       | `procserv::child`        |
+//! | `acceptFactory.cc` (TCP/UNIX listen)  | `procserv::listener`     |
+//! | `clientFactory.cc` (per-client conn)  | `procserv::client`       |
+//! | libtelnet IAC parser/encoder          | `procserv::telnet`       |
+//! | `processInput` command-key dispatch   | `procserv::menu`         |
+//! | `processFactoryNeedsRestart` policy   | `procserv::restart`      |
+//! | `forkAndGo` daemonize + signals       | `procserv::daemon`       |
+//! | log/info/pid file + PROCSERV_INFO env | `procserv::sidecar`      |
 //!
 //! ## Architectural notes (from porting analysis)
 //!
@@ -42,7 +42,7 @@
 //!
 //! * **Narrow telnet usage**. Only `IAC WILL ECHO` + `IAC DO
 //!   LINEMODE` negotiated; only DATA/SEND/ERROR events handled. The
-//!   in-crate [`procserv::telnet`] parser is ~80 LOC, vendoring
+//!   in-crate `procserv::telnet` parser is ~80 LOC, vendoring
 //!   `libtelnet.c` is unnecessary.
 //!
 //! * **Host platforms only**. C procServ requires `forkpty(3)`,

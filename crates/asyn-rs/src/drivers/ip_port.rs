@@ -498,27 +498,13 @@ impl OctetNext for IpIoState {
         // C writeRaw reports what the socket took (`*nbytesTransfered`) on
         // success and on failure alike; return the real count rather than
         // assuming the whole buffer went out.
-        //
-        // Each arm sets SO_SNDTIMEO best-effort, the same treatment the read
-        // arms above give SO_RCVTIMEO, and for the stronger of the two reasons:
-        // C only ever calls `setsockopt(SO_SNDTIMEO)` under `USE_SOCKTIMEOUT`
-        // (`drvAsynIPPort.c:652-664`), which `:71-72` defines for `__rtems__`
-        // alone — every other target reaches `writeRaw` through `poll(POLLOUT)`
-        // and never sets the option. So a platform that refuses SO_SNDTIMEO is
-        // a platform on which C never asked for it, and `?` here would fail a
-        // write C performs. Measured on x86_64-wrs-vxworks: setting it on a
-        // connected TcpStream returns ENOPROTOOPT (errno 42), which made every
-        // `drvAsynIPPort` write fail before this. `deadline` above is the
-        // actual bound and `write_with_retry` enforces it in userspace; the
-        // socket timeout only decides how promptly a blocked send returns
-        // control to that loop.
         match inner {
             IpIoInner::Tcp(stream) => {
-                let _ = stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)));
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)
             }
             IpIoInner::Udp(socket, peer) => {
-                let _ = socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)));
+                socket.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 // C drvAsynIPPort.c::writeRaw (656): sendto the resolved
                 // remote on the unconnected socket. A datagram is all-or-
                 // nothing, so a failed sendto transferred zero bytes and needs
@@ -527,7 +513,7 @@ impl OctetNext for IpIoState {
             }
             #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => {
-                let _ = stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)));
+                stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)
             }
         }

@@ -992,22 +992,8 @@ impl Default for PumpConfig {
 /// by the values returned.
 ///
 /// Both socket timeouts are set here rather than left to the caller, because
-/// `SO_SNDTIMEO` is what lets [`write_frame_deadline`] regain control from a
-/// stalled send, and a caller that forgot it would leave the pump thread parked
-/// on a stuck peer.
-///
-/// `SO_SNDTIMEO` is nonetheless set **best-effort**, matching the accepted-side
-/// sockets in `epics-ca-rs` (`server/tcp.rs`) and `epics-pva-rs`
-/// (`server_native/blocking.rs`): `x86_64-wrs-vxworks` refuses the option
-/// outright with `ENOPROTOOPT` (errno 42, measured on target), so a `?` here
-/// made every CA and PVA *client* circuit fail to start on that triple — the
-/// server halves of the same family had already been converted for this exact
-/// reason. Where the option is refused the deadline still bounds the loop, but
-/// only once a `write` returns: a peer that accepts nothing at all can hold the
-/// pump thread past the deadline. That is strictly better than the circuit not
-/// existing at all, which is what the `?` produced. `SO_RCVTIMEO` keeps its `?`
-/// — it is measured working on both embedded triples, so a failure there is a
-/// real fault and not a platform that never had the option.
+/// getting `SO_SNDTIMEO` wrong silently disarms [`write_frame_deadline`]'s only
+/// way of regaining control.
 ///
 /// # The pool, and the two bands it carries
 ///
@@ -1030,8 +1016,7 @@ pub fn drive_socket_blocking(
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(config.read_timeout))?;
-    // Best-effort: see this function's docs — VxWorks refuses SO_SNDTIMEO.
-    let _ = stream.set_write_timeout(Some(send_tick_for(config.send_timeout)));
+    stream.set_write_timeout(Some(send_tick_for(config.send_timeout)))?;
 
     // Borrow the circuit's two pump workers as one set, or refuse. Roster order
     // is [reader, writer], the order `acquire` returns them.

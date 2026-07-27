@@ -591,6 +591,35 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
 /// admission.
 pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
 
+/// Whose thread-memory measurements apply.
+///
+/// Named targets and not an `embedded: bool`, because the bool was the defect:
+/// it said "not a host" where the numbers below mean "this target", so a figure
+/// measured on VxWorks was charged on RTEMS by default. Every arm below is an
+/// exhaustive `match`, so a fourth target cannot compile until someone decides
+/// what it costs — the decision is forced at the type rather than inherited from
+/// whichever target was measured first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadMemoryTarget {
+    /// Anything that is not an embedded target of this port.
+    Host,
+    VxWorks,
+    Rtems,
+}
+
+impl ThreadMemoryTarget {
+    /// The target this build runs on.
+    const fn current() -> Self {
+        if cfg!(target_os = "vxworks") {
+            ThreadMemoryTarget::VxWorks
+        } else if cfg!(target_os = "rtems") {
+            ThreadMemoryTarget::Rtems
+        } else {
+            ThreadMemoryTarget::Host
+        }
+    }
+}
+
 /// Address space one pool thread reserves **beyond its declared stack**.
 ///
 /// Measured on `x86_64-wrs-vxworks`: three arms of one image differing only in
@@ -611,12 +640,23 @@ pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
 /// for that reason; do not delete it on the theory that a thread costs only its
 /// stack, and do not read it as an address-space constant of the target.
 ///
-/// RTEMS takes the same figure, **assumed rather than measured**: it is the
-/// conservative direction — over-charging refuses one connection early, while
-/// under-charging is what walks the process into the ceiling. A host is not
-/// charged, because a host's budget is unbounded anyway.
-const fn per_thread_overhead(embedded: bool) -> usize {
-    if embedded { 1 << 20 } else { 0 }
+/// RTEMS charges nothing beyond the declared stack, **measured** and not
+/// assumed: a 30-client ramp on the 256 MB `xilinx-zynq-a9` moved `MEM_FREE`
+/// 233,299,144 → 198,277,640, i.e. 1,167,383 B per client against 1,572,864 B of
+/// declared stack for the pair. The target spends *less* than the stacks it was
+/// asked for; there is no flat term to find, and adding VxWorks' one charged
+/// 3,670,016 B per client — 3.1× — which is why the 160 MiB budget refused at
+/// 30 clients on a target whose count cap is 141
+/// (`doc/vxworks-ca-refusal-fidelity.md` §11.8). "Conservative" was the wrong
+/// reading of that: over-charging by 3× is not one connection of margin, it is
+/// three quarters of the target's capacity.
+///
+/// A host is not charged, because a host's budget is unbounded anyway.
+const fn per_thread_overhead(target: ThreadMemoryTarget) -> usize {
+    match target {
+        ThreadMemoryTarget::VxWorks => 1 << 20,
+        ThreadMemoryTarget::Rtems | ThreadMemoryTarget::Host => 0,
+    }
 }
 
 /// RTP object-arena bytes one pool thread consumes — measured, and deliberately
@@ -678,12 +718,16 @@ const PER_THREAD_OBJECT_ARENA: usize = 0;
 /// operator switch, and the arithmetic an operator needs for it: usable address
 /// space ≈ OS memory − 705 MB, and a CA set costs 5 MiB.
 ///
-/// RTEMS is handed the same 160 MiB and should not be: the guest this port runs
-/// is a 256 MB `xilinx-zynq-a9`, so the budget is 62.5 % of the whole target and
-/// the count bound or the heap is reached first. Sizing it needs an RTEMS-side
-/// ladder that has not been run (§10.4).
-const fn default_reservation_budget(embedded: bool) -> usize {
-    if embedded { 160 << 20 } else { usize::MAX }
+/// RTEMS takes the same 160 MiB, and there it is not a constant standing in for
+/// a measurement it cannot make: `malloc_free_space` answers on that target, so
+/// the boot check confirms or clamps this figure against the heap the guest
+/// actually has (see [`target_admits`]). It stays 160 MiB because that is what a
+/// 256 MB guest can confirm and a larger one should be allowed to exceed.
+const fn default_reservation_budget(target: ThreadMemoryTarget) -> usize {
+    match target {
+        ThreadMemoryTarget::VxWorks | ThreadMemoryTarget::Rtems => 160 << 20,
+        ThreadMemoryTarget::Host => usize::MAX,
+    }
 }
 
 /// Parse [`POOL_RESERVATION_ENV`] (`None` = unset ⇒ `default`), with the
@@ -1028,7 +1072,7 @@ impl Reservation {
 /// boot-time check in [`decide_reservation_budget`] and whatever it has to say
 /// land before the first client, not on the first client.
 static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
-    let default = default_reservation_budget(cfg!(epics_embedded_target));
+    let default = default_reservation_budget(ThreadMemoryTarget::current());
     let requested =
         resolve_reservation_budget(std::env::var(POOL_RESERVATION_ENV).ok().as_deref(), default);
     Reservation::new(announce_reservation_budget(decide_reservation_budget(
@@ -1041,7 +1085,7 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
 /// What one thread of `stack` reserves — the whole per-thread formula, in one
 /// place, so a pool worker and a fixed IOC thread cost the account the same.
 fn thread_reservation_bytes(stack: StackSizeClass) -> usize {
-    stack.bytes() + per_thread_overhead(cfg!(epics_embedded_target)) + PER_THREAD_OBJECT_ARENA
+    stack.bytes() + per_thread_overhead(ThreadMemoryTarget::current()) + PER_THREAD_OBJECT_ARENA
 }
 
 /// What one thread of `role` reserves.
@@ -2155,29 +2199,59 @@ mod tests {
         );
     }
 
-    /// The budget's two policy inputs, both arms of each, without needing the
-    /// target that selects them.
+    /// # Invariant
+    ///
+    /// MUST: every thread-memory figure be a number measured on the target it is
+    /// charged to. MUST NOT: one target's measurement be charged to another by
+    /// default.
+    ///
+    /// The defect: both policy inputs took an `embedded: bool`, which says "not
+    /// a host" where the numbers mean "this target". VxWorks' flat 1 MiB per
+    /// thread was therefore charged on RTEMS, where a 30-client ramp spends
+    /// 1,167,383 B per client against 3,670,016 B charged — 3.1× — so the
+    /// 160 MiB budget refused at 30 clients on a target whose count cap is 141
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §11.8).
+    ///
+    /// The `match` on each figure is exhaustive, so a fourth target cannot
+    /// compile until someone decides what it costs.
     #[test]
-    fn the_reservation_budget_reads_its_switch_and_its_target_default() {
-        assert_eq!(
-            default_reservation_budget(false),
-            usize::MAX,
-            "a host is not bounded by thread memory"
-        );
-        assert_eq!(
-            default_reservation_budget(true),
-            160 * 1024 * 1024,
-            "the embedded default is the measured one; changing it is a \
-             behaviour change and must be stated here"
-        );
-        assert_eq!(per_thread_overhead(false), 0);
-        assert_eq!(
-            per_thread_overhead(true),
-            1024 * 1024,
-            "the flat per-thread reservation measured on VxWorks 7"
-        );
+    fn each_target_is_charged_the_figure_measured_on_it() {
+        for target in [
+            ThreadMemoryTarget::Host,
+            ThreadMemoryTarget::VxWorks,
+            ThreadMemoryTarget::Rtems,
+        ] {
+            let (overhead, budget) = (
+                per_thread_overhead(target),
+                default_reservation_budget(target),
+            );
+            match target {
+                ThreadMemoryTarget::Host => {
+                    assert_eq!(overhead, 0);
+                    assert_eq!(budget, usize::MAX, "a host meets no thread-memory wall");
+                }
+                ThreadMemoryTarget::VxWorks => {
+                    assert_eq!(
+                        overhead,
+                        1024 * 1024,
+                        "the flat per-thread reservation measured on VxWorks 7: \
+                         three stack classes, walls within 2.1 %"
+                    );
+                    assert_eq!(budget, 160 * 1024 * 1024);
+                }
+                ThreadMemoryTarget::Rtems => {
+                    assert_eq!(
+                        overhead, 0,
+                        "RTEMS spends less than the stacks it is asked for — \
+                         1,167,383 B per client against 1,572,864 B declared — \
+                         so there is no flat term to charge"
+                    );
+                    assert_eq!(budget, 160 * 1024 * 1024);
+                }
+            }
+        }
 
-        let default = default_reservation_budget(true);
+        let default = default_reservation_budget(ThreadMemoryTarget::VxWorks);
         assert_eq!(resolve_reservation_budget(None, default), default);
         assert_eq!(resolve_reservation_budget(Some("8"), default), 8 << 20);
         assert_eq!(resolve_reservation_budget(Some(" 12 "), default), 12 << 20);

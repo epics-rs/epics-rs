@@ -1235,3 +1235,39 @@ recursion deeper, so 65,912 B covers the deepest chain this engine will ever
 walk — the number is depth-inclusive by construction rather than by
 choice of test data.
 
+## 17. A monitored 1 MiB waveform kills the IOC at four clients
+
+The first `WFBIG` run put `EVENT_ADD` on the 131,072-element array as well
+as reading it. Round 1 completed on all four connections; then every
+connection died at once. Verbatim:
+
+```
+memory allocation of 1048576 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+0xffff80000988a800 (CAS-client 3): RTP 0xffff800009444000 has been deleted due to signal 6.
+memory allocation of 1048576 bytes failed
+skipping backtrace printing to avoid potential recursion
+```
+
+`MEM_USED` had gone 43,278,336 → **211,804,160 B** on four connections, and
+the failing allocation is exactly the array payload size. The whole process
+is gone — not one thread, as in §18, but the RTP.
+
+Re-running the identical workload with the `WFBIG` monitor removed and
+everything else unchanged (`stackload.py … MONBIG=0`) survives a 480 s hold
+with `HOLD ok=432 fail=0` and 80/80 on every op, including eighty 1 MiB gets
+and eighty 1 MiB `WRITE_NOTIFY`s. So the reply path for a 1 MiB array is
+fine at this guest size; it is the **monitor event queues** that exhaust the
+heap — each subscriber's queue holds whole array copies, and four
+subscribers on a 1 MiB array is enough.
+
+This is the same family as the E10/E11 abort (`memory allocation of 64 bytes
+failed` → signal 6 at 41 held connections) and it names the allocation:
+a large-array monitor event buffer. C bounds this differently — a CA monitor
+on a large array in C is bounded by `EPICS_CA_MAX_ARRAY_BYTES`/
+`AUTO_ARRAY_BYTES` and refused with `ECA_TOLARGE` rather than aborting; see
+`doc/`'s note that `EPICS_CA_MAX_ARRAY_BYTES` is not a ceiling in our
+implementation. Not fixed here: the fix is a bounded per-subscriber event
+queue with a documented overflow policy, which is `epics-base-rs` event-queue
+work outside this row. Listed in §19.
+

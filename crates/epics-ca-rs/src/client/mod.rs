@@ -937,6 +937,11 @@ impl CaClient {
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let client_identity: types::ClientIdentitySlot =
             Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
+        // Built before the transport, because the circuit's receive path — not
+        // the coordinator — is what raises server exceptions (C ref:
+        // `cac::exceptionRespAction`, `cac.cpp:1082-1120`, runs inside
+        // `executeResponse` on the receive thread).
+        let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
@@ -945,6 +950,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    exception_slot.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
                     client_identity.clone(),
@@ -959,6 +965,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    exception_slot.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
                     client_identity.clone(),
@@ -967,7 +974,6 @@ impl CaClient {
         };
 
         let diagnostics = Arc::new(CaDiagnostics::default());
-        let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         #[cfg(ca_beacon_monitor)]
         let (beacon_ctrl_tx, beacon_ctrl_rx) =
@@ -4164,105 +4170,6 @@ async fn run_coordinator(
                                 });
                             }
                         }
-                    }
-                    TransportEvent::ServerError {
-                        eca_status,
-                        original_request,
-                        message,
-                        server_addr,
-                        data_type,
-                        count,
-                        pv_name,
-                    } => {
-                        // Already logged in the transport layer; this is the
-                        // libca exception path (`cac::exceptionRespAction` →
-                        // the per-command stub). `message` stays RAW — it is
-                        // C's `pCtx`, and the default handler prints it as
-                        // `ctx="..."`; the request command is carried
-                        // structurally (op / type / count), not smuggled into
-                        // the text.
-                        //
-                        // libca's exception jump table (`cac.cpp:93-124`) sends
-                        // READ / READ_NOTIFY / WRITE_NOTIFY / EVENT_ADD to the
-                        // stubs that complete the pending IO or the
-                        // subscription callback — the exception HOOK never
-                        // fires for those, and the tool prints its own
-                        // per-operation diagnostic instead. The transport has
-                        // already completed those waiters above, so they are
-                        // done here.
-                        let routed_to_a_callback = matches!(
-                            original_request,
-                            Some(
-                                crate::protocol::CA_PROTO_READ
-                                    | crate::protocol::CA_PROTO_READ_NOTIFY
-                                    | crate::protocol::CA_PROTO_WRITE_NOTIFY
-                                    | crate::protocol::CA_PROTO_EVENT_ADD
-                            )
-                        );
-                        if routed_to_a_callback {
-                            continue;
-                        }
-                        // What is left is `cac::writeExcep` (a plain
-                        // CA_PROTO_WRITE has no callback to complete, so libca
-                        // takes it to `oldChannelNotify::writeException`,
-                        // `cac.cpp:1049-1061`) and `cac::defaultExcep` for
-                        // every other command.
-                        let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
-                            types::CaOp::Put
-                        } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
-                            types::CaOp::ClearEvent
-                        } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
-                            types::CaOp::CreateChannel
-                        } else {
-                            types::CaOp::Other
-                        };
-                        let is_channel_exception = op == types::CaOp::Put;
-                        let pv_name = is_channel_exception
-                            .then_some(pv_name)
-                            .flatten()
-                            .map(|n| n.to_string());
-                        // `cac::defaultExcep` folds the host into the ctx
-                        // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
-                        // before raising; the channel path passes the server's
-                        // diagnostic through untouched.
-                        //
-                        // C's host there is `iiu.getHostName` — the circuit's
-                        // `hostNameCache`, i.e. the reverse-resolved NAME, the
-                        // same source `ca_host_name` reads (W10-B5). This
-                        // arm runs on the coordinator task, so it takes the
-                        // NON-blocking half of that cache: a `getnameinfo` here
-                        // would park every channel's progress behind one DNS
-                        // timeout.
-                        let message = if is_channel_exception {
-                            message
-                        } else {
-                            format!(
-                                "host={host} ctx={message}",
-                                host = types::peer_display_name(server_addr)
-                            )
-                        };
-                        types::dispatch_exception(
-                            &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message,
-                                server_addr: Some(server_addr),
-                                pv_name,
-                                status: Some(eca_status),
-                                op,
-                                data_type: is_channel_exception.then_some(data_type).flatten(),
-                                count: is_channel_exception.then_some(count).flatten(),
-                                // `cac::defaultExcep` (`cac.cpp:1006-1016`)
-                                // is libca's one null-file producer, so it is
-                                // the one block with no `Source File:` line;
-                                // the channel-write exception carries its own.
-                                source: if is_channel_exception {
-                                    types::LIBCA_WRITE_EXCEPTION_SITE
-                                } else {
-                                    types::ExceptionSite::NullFile
-                                },
-                            },
-                        );
                     }
                     TransportEvent::TcpClosed { server_addr, priority } => {
                         let circuit = (server_addr, priority);

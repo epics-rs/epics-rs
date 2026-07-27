@@ -1249,6 +1249,13 @@ pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     server_writers: DirectServerWriters,
     last_rx_at: super::types::ServerLastRxAt,
     // Shared client identity (user / host). Cloned per connect so each
@@ -1379,6 +1386,7 @@ pub(crate) async fn run_transport_manager(
                         #[cfg(feature = "experimental-rust-tls")]
                         let sni = pick_sni(server_addr);
                         let in_flight_clone = in_flight.clone();
+                        let exception_slot_clone = exception_slot.clone();
                         let last_rx_clone = last_rx_at.clone();
                         let identity_clone = client_identity.clone();
                         let circuit_dead_clone = circuit_dead_tx.clone();
@@ -1389,6 +1397,7 @@ pub(crate) async fn run_transport_manager(
                                 priority,
                                 event_tx_clone,
                                 in_flight_clone,
+                                exception_slot_clone,
                                 last_rx_clone,
                                 identity_clone,
                                 circuit_dead_clone,
@@ -1402,6 +1411,7 @@ pub(crate) async fn run_transport_manager(
                                 priority,
                                 event_tx_clone,
                                 in_flight_clone,
+                                exception_slot_clone,
                                 last_rx_clone,
                                 identity_clone,
                                 circuit_dead_clone,
@@ -1951,6 +1961,13 @@ async fn connect_server(
     priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     last_rx_at: super::types::ServerLastRxAt,
     identity: super::types::ClientIdentitySlot,
     // Fires the circuit key back to the transport manager the moment either
@@ -2091,6 +2108,7 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
@@ -2125,6 +2143,7 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
@@ -2162,6 +2181,7 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
@@ -2416,6 +2436,13 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
     bytes_pending_in_os: OsRecvQueueProbe,
@@ -3180,15 +3207,27 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let pv_name = echo_available
                         .or(err_cid)
                         .and_then(|c| in_flight.write_identities.get(&c).map(|n| n.clone()));
-                    let _ = event_tx.send(TransportEvent::ServerError {
-                        eca_status,
-                        original_request: orig_cmd,
-                        message: msg,
-                        server_addr,
-                        data_type: echo_type,
-                        count: echo_count,
-                        pv_name,
-                    });
+                    // Raise here, on the circuit's receive thread, in frame
+                    // order — `cac::exceptionRespAction` (`cac.cpp:1082-1120`)
+                    // runs inside `executeResponse`, so libca has already
+                    // raised the exception by the time it dispatches the next
+                    // response off the same circuit. Posting it to the
+                    // coordinator instead put it behind a queue that the
+                    // in-flight fast path does not use, and a readback landing
+                    // on that fast path could finish the tool before the
+                    // exception was ever raised.
+                    super::types::raise_server_exception(
+                        &exception_slot,
+                        super::types::ServerErrorFrame {
+                            eca_status,
+                            original_request: orig_cmd,
+                            message: msg,
+                            server_addr,
+                            data_type: echo_type,
+                            count: echo_count,
+                            pv_name,
+                        },
+                    );
                 }
                 CA_PROTO_SERVER_DISCONN => {
                     // server retired this cid — drop it from
@@ -3380,6 +3419,7 @@ mod read_loop_tests {
             write_tx,
             beacon_rx,
             crate::client::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             std::sync::Arc::new(dashmap::DashMap::new()),
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3657,6 +3697,7 @@ mod recv_body_limit_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3710,6 +3751,7 @@ mod recv_body_limit_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3825,6 +3867,7 @@ mod malformed_header_close_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3873,6 +3916,7 @@ mod malformed_header_close_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3953,6 +3997,16 @@ mod error_echo_dispatch_tests {
         let in_flight = super::super::types::InFlightOps::new();
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client_io, server_io) = tokio::io::duplex(256);
+        // The user-visible global exception hook, so the test observes what a
+        // tool observes instead of an internal event.
+        let raised = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let raised_in_hook = raised.clone();
+        let exception_slot = crate::client::types::CaExceptionSlot::default();
+        *exception_slot.write() = Some(std::sync::Arc::new(
+            move |_: &crate::client::types::CaException| {
+                raised_in_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
 
         let loop_handle = tokio::spawn(read_loop(
             server_io,
@@ -3962,6 +4016,7 @@ mod error_echo_dispatch_tests {
             write_tx,
             ba_rx,
             in_flight,
+            exception_slot,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -3983,16 +4038,14 @@ mod error_echo_dispatch_tests {
         // dispatcher's `_ => {}` arm swallowed it and only the global
         // `ServerError` hook fired.
         let mut saw_status_error = false;
-        let mut saw_server_error = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline && !(saw_status_error && saw_server_error) {
+        while tokio::time::Instant::now() < deadline && !saw_status_error {
             match tokio::time::timeout_at(deadline, event_rx.recv()).await {
                 Ok(Some(TransportEvent::MonitorStatusError { subid, eca_status })) => {
                     assert_eq!(subid, SUBID, "must carry the echoed subscription id");
                     assert_eq!(eca_status, ECA_TOLARGE, "must carry the ECA status");
                     saw_status_error = true;
                 }
-                Ok(Some(TransportEvent::ServerError { .. })) => saw_server_error = true,
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
             }
@@ -4002,9 +4055,17 @@ mod error_echo_dispatch_tests {
             "CA_PROTO_ERROR echoing EVENT_ADD must be routed to the \
              subscription (C: eventAddExcep → ioExceptionNotify)"
         );
-        assert!(
-            saw_server_error,
-            "the global exception hook must still fire (C: cac::exception)"
+        // ...and ONLY there. libca's jump table (`cac.cpp:93-124`) sends
+        // EVENT_ADD to `eventAddExcep`, which completes the subscription
+        // callback; the global hook (`cac::defaultExcep`) is not on that path.
+        // This assertion used to read the opposite, because it watched an
+        // internal `TransportEvent` that fired before the filter rather than
+        // the hook a tool actually installs.
+        assert_eq!(
+            raised.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an EVENT_ADD exception is the subscription's, not the global \
+             hook's (C: cac.cpp:93-124 → eventAddExcep)"
         );
 
         drop(client);
@@ -4044,6 +4105,7 @@ mod error_echo_dispatch_tests {
             write_tx,
             ba_rx,
             in_flight.clone(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -4138,9 +4200,9 @@ mod write_identity_tests {
         hdr.to_bytes().to_vec()
     }
 
-    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<Arc<str>> {
+    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<String> {
         let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
         let in_flight = super::super::types::InFlightOps::new();
@@ -4152,6 +4214,15 @@ mod write_identity_tests {
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client_io, server_io) = tokio::io::duplex(1024);
 
+        // Observe the exception where a tool observes it: the installed
+        // handler. `ca_add_exception_event`'s slot is the only surface the
+        // block is printed from.
+        let (exc_tx, mut exc_rx) = mpsc::unbounded_channel::<Option<String>>();
+        let exception_slot = crate::client::types::CaExceptionSlot::default();
+        *exception_slot.write() = Some(Arc::new(move |e: &crate::client::types::CaException| {
+            let _ = exc_tx.send(e.pv_name.clone());
+        }));
+
         let loop_handle = tokio::spawn(read_loop(
             server_io,
             server_addr,
@@ -4160,6 +4231,7 @@ mod write_identity_tests {
             write_tx,
             ba_rx,
             in_flight,
+            exception_slot,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -4173,17 +4245,10 @@ mod write_identity_tests {
         }
         client.flush().await.expect("flush");
 
-        let name = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(TransportEvent::ServerError { pv_name, .. }) => return pv_name,
-                    Some(_) => continue,
-                    None => return None,
-                }
-            }
-        })
-        .await
-        .expect("a ServerError must be emitted for a CA_PROTO_ERROR");
+        let name = tokio::time::timeout(Duration::from_secs(2), exc_rx.recv())
+            .await
+            .expect("an exception must be raised for a CA_PROTO_ERROR")
+            .expect("the handler must be called, not dropped");
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
@@ -4267,6 +4332,7 @@ mod flow_control_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             probe,
@@ -4453,6 +4519,7 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::clone(&unresponsive),
             drained_socket_probe(),
@@ -4556,6 +4623,7 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -4601,6 +4669,7 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             in_flight.clone(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
@@ -5025,6 +5094,7 @@ mod connect_deadline_tests {
             0,
             event_tx,
             InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             ServerLastRxAt::default(),
             identity,
             circuit_dead_tx,
@@ -5451,6 +5521,7 @@ mod priority_circuit_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5460,6 +5531,7 @@ mod priority_circuit_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5751,6 +5823,7 @@ mod circuit_retirement_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5760,6 +5833,7 @@ mod circuit_retirement_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,

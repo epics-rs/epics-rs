@@ -1,0 +1,45 @@
+PRIOPROBE label=CAS-event 56 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+PRIOPROBE label=CAS-client 57 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+PRIOPROBE label=CAS-event 57 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+PRIOPROBE label=CAS-client 58 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+
+Page Fault Num=0xe
+
+Esp0 0xffff800011187000 : 0x0000000000000001, 0xffffffff9ee9dbf0, 0xffffffffffffff20, 0xeeeeeeeeeeeeeeee
+Esp0 0xffff800011187020 : 0xffff800011187040, 0xffffffff80d48e71, 0x00000000000000e0, 0xeeeeeeeeeeeeeeee
+
+Page Dir Base   : 0x000000002a37c000                Program Counter : 0xffffffff80d48dfd
+Code Selector   : 0x0000000000000008                Eflags Register : 0x0000000000000246
+Error Code      : 0x0000000000000000
+Page Fault Addr : 0x0000000000000490 
+
+Task: 0xffff8000103efa00 "CAS-client 58"
+0xffff8000103efa00 (CAS-client 58): RTP 0xffff800008c40000 has had a failure and has been deleted.
+
+Page Fault Num=0xe
+
+Esp0 0xffff8000111860c0 : 0x0000000000000001, 0xffffffff9ee9dbf0, 0xfffffffffffff400, 0xeeeeeeeeeeeeeeee
+Esp0 0xffff8000111860e0 : 0xffff800011186100, 0xffffffff80d48e71, 0x0000000000000c00, 0xeeeeeeeeeeeeeeee
+
+Page Dir Base   : 0x000000002a37c000                Program Counter : 0xffffffff80d48dfd
+Code Selector   : 0x0000000000000008                Eflags Register : 0x0000000000000246
+Error Code      : 0x0000000000000000
+Page Fault Addr : 0x0000000000000490 
+
+Task: 0xffff8000103efa00 "CAS-client 58"
+0xffff8000103efa00 (CAS-client 58): RTP 0xffff800008c40000 has had a failure and has been deleted.
+
+Page Fault Num=0xe
+
+Esp0 0xffff800009933000 : 0x0000000000000001, 0xffffffff9ee9dbf0, 0xffffffffffffff20, 0xeeeeeeeeeeeeeeee
+Esp0 0xffff800009933020 : 0xffff800009933040, 0xffffffff80d48e71, 0x00000000000000e0, 0xeeeeeeeeeeeeeeee
+
+Page Dir Base   : 0x000000002a37c000                Program Counter : 0xffffffff80d48dfd
+Code Selector   : 0x0000000000000008                Eflags Register : 0x0000000000000246
+Error Code      : 0x0000000000000000
+Page Fault Addr : 0x0000000000000490 
+
+Task: 0xffff800008c85400 "cbTimer"
+0xffff800008c85400 (cbTimer): RTP 0xffff800008c40000 has had a failure and has been deleted.
+FDPROBE seq=1 FD_CNT=64 FD_MAX=1000 CA_CONN_CNT=58
+POOLPROBE seq=1 BUSY=59 SETS=59 CAP=141 WORKERS=118 REFUSED=0 CONNS=58

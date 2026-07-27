@@ -178,6 +178,12 @@ reported above without pretending otherwise:
   sustained sets, with the caveat that the first failure at this configuration
   is a leased-but-dead set rather than a refusal.
 
+  What killed that leased set has since been identified: `CAS-client 80`
+  page-faults at `0x490`, the same signature later reproduced at Medium/Medium
+  in both arms of the frame-pool A/B. The served count is unaffected — see
+  [the admission gate finding](vxworks-ca-admission-gate-is-not-a-ceiling.md),
+  which classifies all 16 wall boots including these two.
+
 A seventh run at `1152M` was discarded as a wall measurement for the same
 reason: the failure there is a 20 s handshake timeout at 100 held clients with
 the IOC alive and `SETS=106 CAP=141`, so it is not the thread-creation wall and

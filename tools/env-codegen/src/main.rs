@@ -344,7 +344,7 @@ fn emit(rows: &[(String, Value)]) -> String {
          //! drift and runs as part of `cargo nextest run -p env-codegen`.\n\
          //!\n\
          //! This module is the workspace's ONLY declaration of an EPICS environment\n\
-         //! default. [`EnvParam`](super::env::EnvParam) cannot be constructed outside\n\
+         //! default. [`EnvParam`] cannot be constructed outside\n\
          //! `epics-libcom-rs`, and none of its accessors take a `default` argument, so a\n\
          //! caller has no way to introduce a second one.\n\n",
     );

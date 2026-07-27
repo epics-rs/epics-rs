@@ -17,7 +17,12 @@ set -e -o pipefail
 R=$HOME/vx-rig-e10
 IMG=${1:-caioc-e10}
 KERNEL=$R/$IMG.exe
-LOG=$R/logs/rtems-$IMG.log
+# Guest RAM is a parameter for the same reason it is on the VxWorks side: the
+# thread/heap ladder needs to know whether the wall moves with it.  Whether the
+# BSP HONOURS it is itself a measurement — `xilinx_zynq_a9_qemu` may fix its
+# memory size at BSP build time, in which case `RTEMS:MEM_MAX` will not move.
+RAM=${RTEMSRAM:-256M}
+LOG=$R/logs/rtems-$IMG${RTEMSTAG:+-$RTEMSTAG}.log
 PIDF=$R/rtems-qemu.pid
 
 [ -f "$KERNEL" ] || { echo "no image $KERNEL"; exit 1; }
@@ -25,11 +30,11 @@ PIDF=$R/rtems-qemu.pid
 mkdir -p "$R/logs"
 : > "$LOG"
 
-setsid qemu-system-arm -M xilinx-zynq-a9 -m 256M -no-reboot -nographic \
+setsid qemu-system-arm -M xilinx-zynq-a9 -m "$RAM" -no-reboot -nographic \
   -serial null -serial mon:stdio \
   -nic "user,model=cadence_gem,mac=52:54:00:12:39:10,hostfwd=tcp:127.0.0.1:25164-:5064,hostfwd=udp:127.0.0.1:25165-:5064" \
   -kernel "$KERNEL" > "$LOG" 2>&1 < /dev/null &
 QPID=$!
 echo "$QPID" > "$PIDF"
 disown
-echo "rtems qemu pid=$QPID image=$IMG log=$LOG"
+echo "rtems qemu pid=$QPID image=$IMG ram=$RAM log=$LOG"

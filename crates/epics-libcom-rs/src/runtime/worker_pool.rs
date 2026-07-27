@@ -763,12 +763,32 @@ fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
 /// first client.
 const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 
+/// One target's answer about a size, carrying the quantity that produced it.
+///
+/// The basis travels *with* the answer because the boot notice has to name it:
+/// "would not reserve that much address space in one mapping" is true on
+/// VxWorks and false on RTEMS, where the same refusal comes from the malloc
+/// heap's free total. Two `cfg` cascades — one choosing the probe, one choosing
+/// the words — can drift apart and did, on target: the RTEMS guest was told
+/// about a mapping it had not made
+/// (`doc/vxworks-ca-refusal-fidelity.md` §11.12). One cascade returning both
+/// cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetAnswer {
+    /// Whether the target would give the size it was asked about.
+    granted: bool,
+    /// Reads after "this target", e.g. "would not reserve that much address
+    /// space in one mapping" — present on `granted` too, so a refusal at the
+    /// next step down still has words to use.
+    basis: &'static str,
+}
+
 /// Will this target give `bytes` of thread memory, right now?
 ///
-/// `Some(true)`/`Some(false)` is a measurement; `None` means this target has no
-/// basis for the question and the answer must not be invented. One question,
-/// answered from whatever quantity actually tracks the wall on each target —
-/// the resource differs, the veto does not.
+/// `Some` is a measurement; `None` means this target has no basis for the
+/// question and the answer must not be invented. One question, answered from
+/// whatever quantity actually tracks the wall on each target — the resource
+/// differs, the veto does not.
 ///
 /// On VxWorks the basis is one anonymous `PROT_NONE` mapping, taken and released
 /// immediately. It is the only quantity in the RTP that tracks the wall this
@@ -799,9 +819,10 @@ const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 /// default is the only budget it will ever run. A default nobody can override is
 /// a default that has to be checked.
 #[cfg(target_os = "vxworks")]
-fn target_admits(bytes: usize) -> Option<bool> {
+fn target_admits(bytes: usize) -> Option<TargetAnswer> {
     /// `sys/mman.h:66` — VxWorks requires this exact `fd` with `MAP_ANON`.
     const MAP_ANON_FD: libc::c_int = -1;
+    const BASIS: &str = "would not reserve that much address space in one mapping";
 
     // SAFETY: an anonymous `PROT_NONE` mapping of `bytes` at an address of the
     // kernel's choosing. Nothing is read or written through the pointer: it is
@@ -818,26 +839,35 @@ fn target_admits(bytes: usize) -> Option<bool> {
         )
     };
     if addr == libc::MAP_FAILED {
-        return Some(false);
+        return Some(TargetAnswer {
+            granted: false,
+            basis: BASIS,
+        });
     }
     // SAFETY: `addr` came from the mapping above and is released once.
     unsafe { libc::munmap(addr, bytes) };
-    Some(true)
+    Some(TargetAnswer {
+        granted: true,
+        basis: BASIS,
+    })
 }
 
 #[cfg(target_os = "rtems")]
-fn target_admits(bytes: usize) -> Option<bool> {
+fn target_admits(bytes: usize) -> Option<TargetAnswer> {
     // RTEMS `rtems/malloc.h`, defined in `librtemscpu`: bytes free in the
     // malloc heap. No arguments, no output parameters, no allocation.
     unsafe extern "C" {
         fn malloc_free_space() -> libc::size_t;
     }
     // SAFETY: a pure query into the RTEMS heap allocator.
-    Some(unsafe { malloc_free_space() } >= bytes)
+    Some(TargetAnswer {
+        granted: unsafe { malloc_free_space() } >= bytes,
+        basis: "has less than that free in the heap its thread stacks come from",
+    })
 }
 
 #[cfg(not(any(target_os = "vxworks", target_os = "rtems")))]
-fn target_admits(_bytes: usize) -> Option<bool> {
+fn target_admits(_bytes: usize) -> Option<TargetAnswer> {
     None
 }
 
@@ -854,13 +884,18 @@ enum BudgetVerdict {
     /// The target gave the configured size when asked. Nothing to say.
     Confirmed(usize),
     /// The target would not give `asked`; `adopted` is the largest size below it
-    /// that the target did give.
-    Clamped { asked: usize, adopted: usize },
+    /// that the target did give. `basis` is the quantity that refused, in the
+    /// words of the target that answered.
+    Clamped {
+        asked: usize,
+        adopted: usize,
+        basis: &'static str,
+    },
     /// This target has nothing that measures the ceiling, so `adopted` stands
     /// unchecked. `from_env` is whether an operator chose it.
     Unverifiable { adopted: usize, from_env: bool },
     /// Nothing down to [`RESERVATION_PROBE_FLOOR`] was confirmed.
-    FloorHeld { asked: usize },
+    FloorHeld { asked: usize, basis: &'static str },
 }
 
 impl BudgetVerdict {
@@ -892,16 +927,20 @@ impl BudgetVerdict {
             BudgetVerdict::Unverifiable {
                 from_env: false, ..
             } => None,
-            BudgetVerdict::Clamped { asked, adopted } => Some((
+            BudgetVerdict::Clamped {
+                asked,
+                adopted,
+                basis,
+            } => Some((
                 ErrlogSevEnum::Major,
                 format!(
-                    "worker-pool reservation budget clamped from {} MiB to {} MiB: this target \
-                     would not reserve {} MiB of address space in one mapping. Set \
-                     {POOL_RESERVATION_ENV} no higher than the target can give — usable address \
-                     space is what the OS leaves after keeping its own",
+                    "worker-pool reservation budget clamped from {} MiB to {} MiB: at {} MiB this \
+                     target {}. {POOL_RESERVATION_ENV} names a ceiling the target still has to \
+                     confirm; it does not add memory",
                     asked >> 20,
                     adopted >> 20,
-                    asked >> 20
+                    asked >> 20,
+                    basis
                 ),
             )),
             BudgetVerdict::Unverifiable { adopted, .. } => Some((
@@ -913,14 +952,16 @@ impl BudgetVerdict {
                     adopted >> 20
                 ),
             )),
-            BudgetVerdict::FloorHeld { asked } => Some((
+            BudgetVerdict::FloorHeld { asked, basis } => Some((
                 ErrlogSevEnum::Major,
                 format!(
                     "this target confirmed no worker-pool reservation budget down to {} MiB \
-                     (asked for {} MiB); holding that floor, so the pool refuses nearly every \
-                     client instead of exhausting the address space",
+                     (asked for {} MiB): even at {} MiB it {}. Holding that floor, so the pool \
+                     refuses nearly every client instead of exhausting the target",
                     RESERVATION_PROBE_FLOOR >> 20,
-                    asked >> 20
+                    asked >> 20,
+                    RESERVATION_PROBE_FLOOR >> 20,
+                    basis
                 ),
             )),
         }
@@ -952,7 +993,7 @@ impl BudgetVerdict {
 fn decide_reservation_budget(
     requested: usize,
     from_env: bool,
-    mut admits: impl FnMut(usize) -> Option<bool>,
+    mut admits: impl FnMut(usize) -> Option<TargetAnswer>,
 ) -> BudgetVerdict {
     if requested == usize::MAX {
         // No wall to stay under, and no mapping of this size to ask about.
@@ -960,24 +1001,28 @@ fn decide_reservation_budget(
     }
     let mut candidate = requested;
     loop {
-        match admits(candidate) {
-            None => {
-                return BudgetVerdict::Unverifiable {
-                    adopted: requested,
-                    from_env,
-                };
-            }
-            Some(true) if candidate == requested => return BudgetVerdict::Confirmed(candidate),
-            Some(true) => {
+        let Some(TargetAnswer { granted, basis }) = admits(candidate) else {
+            return BudgetVerdict::Unverifiable {
+                adopted: requested,
+                from_env,
+            };
+        };
+        match granted {
+            true if candidate == requested => return BudgetVerdict::Confirmed(candidate),
+            true => {
                 return BudgetVerdict::Clamped {
                     asked: requested,
                     adopted: candidate,
+                    basis,
                 };
             }
-            Some(false) if candidate <= RESERVATION_PROBE_FLOOR => {
-                return BudgetVerdict::FloorHeld { asked: requested };
+            false if candidate <= RESERVATION_PROBE_FLOOR => {
+                return BudgetVerdict::FloorHeld {
+                    asked: requested,
+                    basis,
+                };
             }
-            Some(false) => candidate = (candidate / 2).max(RESERVATION_PROBE_FLOOR),
+            false => candidate = (candidate / 2).max(RESERVATION_PROBE_FLOOR),
         }
     }
 }
@@ -2262,11 +2307,15 @@ mod tests {
         assert_eq!(resolve_reservation_budget(Some(""), default), default);
     }
 
+    /// The words a stand-in target answers with, so a test can assert that the
+    /// notice repeats the target's own account rather than a hard-coded one.
+    const TEST_BASIS: &str = "answered from the table this test wrote";
+
     /// A probe that answers from a table and records what it was asked.
     fn probe<'a>(
         answers: &'static [(usize, Option<bool>)],
         asked: &'a mut Vec<usize>,
-    ) -> impl FnMut(usize) -> Option<bool> + 'a {
+    ) -> impl FnMut(usize) -> Option<TargetAnswer> + 'a {
         move |bytes| {
             asked.push(bytes);
             answers
@@ -2274,6 +2323,10 @@ mod tests {
                 .find(|(size, _)| *size == bytes)
                 .map(|(_, answer)| *answer)
                 .unwrap_or(Some(false))
+                .map(|granted| TargetAnswer {
+                    granted,
+                    basis: TEST_BASIS,
+                })
         }
     }
 
@@ -2330,7 +2383,8 @@ mod tests {
             ),
             BudgetVerdict::Clamped {
                 asked: 320 << 20,
-                adopted: 160 << 20
+                adopted: 160 << 20,
+                basis: TEST_BASIS
             }
         );
         assert_eq!(asked, vec![320 << 20, 160 << 20]);
@@ -2364,7 +2418,10 @@ mod tests {
         let mut asked = Vec::new();
         assert_eq!(
             decide_reservation_budget(64 << 20, true, probe(&[], &mut asked)),
-            BudgetVerdict::FloorHeld { asked: 64 << 20 }
+            BudgetVerdict::FloorHeld {
+                asked: 64 << 20,
+                basis: TEST_BASIS
+            }
         );
         assert_eq!(
             asked,
@@ -2383,7 +2440,8 @@ mod tests {
             ),
             BudgetVerdict::Clamped {
                 asked: 10 << 20,
-                adopted: RESERVATION_PROBE_FLOOR
+                adopted: RESERVATION_PROBE_FLOOR,
+                basis: TEST_BASIS
             }
         );
         assert_eq!(asked, vec![10 << 20, RESERVATION_PROBE_FLOOR]);
@@ -2393,7 +2451,10 @@ mod tests {
         let mut asked = Vec::new();
         assert_eq!(
             decide_reservation_budget(4 << 20, true, probe(&[], &mut asked)),
-            BudgetVerdict::FloorHeld { asked: 4 << 20 }
+            BudgetVerdict::FloorHeld {
+                asked: 4 << 20,
+                basis: TEST_BASIS
+            }
         );
         assert_eq!(asked, vec![4 << 20]);
     }
@@ -2412,6 +2473,7 @@ mod tests {
             BudgetVerdict::Clamped {
                 asked: 320 << 20,
                 adopted: 160 << 20,
+                basis: TEST_BASIS,
             },
             BudgetVerdict::Unverifiable {
                 adopted: 320 << 20,
@@ -2421,7 +2483,10 @@ mod tests {
                 adopted: 160 << 20,
                 from_env: false,
             },
-            BudgetVerdict::FloorHeld { asked: 320 << 20 },
+            BudgetVerdict::FloorHeld {
+                asked: 320 << 20,
+                basis: TEST_BASIS,
+            },
         ] {
             let notice = verdict.notice();
             match verdict {
@@ -2449,7 +2514,11 @@ mod tests {
                     );
                     assert_eq!(verdict.budget(), adopted);
                 }
-                BudgetVerdict::Clamped { asked, adopted } => {
+                BudgetVerdict::Clamped {
+                    asked,
+                    adopted,
+                    basis,
+                } => {
                     let (severity, message) = notice.expect("a clamp must say so");
                     assert_eq!(
                         severity,
@@ -2461,14 +2530,23 @@ mod tests {
                             && message.contains(&format!("{} MiB", adopted >> 20)),
                         "both numbers, or the operator cannot tell what happened: {message}"
                     );
+                    assert!(
+                        message.contains(basis),
+                        "the notice must give the target's own account of the refusal, not a \
+                         mechanism it did not use: {message}"
+                    );
                     assert_eq!(verdict.budget(), adopted);
                 }
-                BudgetVerdict::FloorHeld { asked } => {
+                BudgetVerdict::FloorHeld { asked, basis } => {
                     let (severity, message) = notice.expect("a held floor must say so");
                     assert_eq!(severity, ErrlogSevEnum::Major);
                     assert!(
                         message.contains(&format!("{} MiB", asked >> 20)),
                         "the notice must name what was asked for: {message}"
+                    );
+                    assert!(
+                        message.contains(basis),
+                        "the notice must give the target's own account of the refusal: {message}"
                     );
                     assert_eq!(verdict.budget(), RESERVATION_PROBE_FLOOR);
                 }

@@ -633,10 +633,24 @@ const PER_THREAD_OBJECT_ARENA: usize = 0;
 /// and the object arena still work while the refusal is being written to the
 /// socket and the console.
 ///
-/// The ceiling itself moves with the target's RAM (≥739 MB at 1470 MB of guest
-/// memory), which is exactly why this is an operator switch and not a derived
-/// constant: only the operator knows the target. The switch is not decorative —
-/// raising it was measured to move the wall on target.
+/// The ceiling itself moves with the target's RAM, 1:1: an RTP is handed
+/// whatever is left after a fixed ~705 MB, measured as 254 MiB of usable address
+/// space on a ~958 MB guest and 764 MiB on a ~1470 MB one. So this constant is
+/// right for one box and mean to a bigger one — but it stays a constant, because
+/// nothing an RTP can call reports that ceiling. `sysctl`'s `HW_PHYSMEM` and
+/// `KERN_PHYSMEMTOP` answer `ENOENT`, `memFindMax`/`memInfoGet` describe a
+/// 256 KiB heap partition that sits flat while the process reserves a quarter of
+/// a gigabyte, `getrlimit` is in no RTP library, and `_SC_PHYS_PAGES` is not a
+/// constant the RTP `unistd.h` defines. An `mmap` ladder does find the ceiling
+/// exactly, but only by taking it, which in this process means another thread's
+/// allocation aborts (`doc/vxworks-ca-refusal-fidelity.md` §10). Hence the
+/// operator switch, and the arithmetic an operator needs for it: usable address
+/// space ≈ OS memory − 705 MB, and a CA set costs 5 MiB.
+///
+/// RTEMS is handed the same 160 MiB and should not be: the guest this port runs
+/// is a 256 MB `xilinx-zynq-a9`, so the budget is 62.5 % of the whole target and
+/// the count bound or the heap is reached first. Sizing it needs an RTEMS-side
+/// ladder that has not been run (§10.4).
 const fn default_reservation_budget(embedded: bool) -> usize {
     if embedded { 160 << 20 } else { usize::MAX }
 }

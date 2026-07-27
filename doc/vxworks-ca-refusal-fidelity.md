@@ -379,3 +379,104 @@ serves 32 CA clients until it is raised.
   connections it has the memory to serve. Fails with the release removed.
 * `the_reservation_budget_reads_its_switch_and_its_target_default` — both arms
   of both target-dependent constants and every switch-parse case, on a host.
+
+## 10. Can the budget be derived from the target instead of a constant?
+
+The 160 MiB default of §9.2 is correct for the box it was measured on. A 1470 MB
+guest holds ≥739 MB and still refuses at set 32, so the constant undersells a
+larger target. C solves the same problem with a live query rather than a
+constant — `osiSufficentSpaceInPool` polls `memFindMax()` on vxWorks and
+`malloc_free_space()` on RTEMS — so the question is whether that query is
+available to us. It is not. What is available is a *probe*, and the difference
+between the two is what decides the design.
+
+### 10.1 What an RTP can be asked, and what it answers
+
+Every candidate links: `memFindMax`, `memPartInfoGet`, `memInfoGet`,
+`memPartFindMax`, `sysctl` and `rtpInfoGet` are all `T` in the RTP `libc.a`.
+Linking is not answering. Measured on target (`doc/vx-rig-e11/memquery.c`,
+`doc/vx-rig-e11/adrspace-survey.log`):
+
+| asked | answer |
+| --- | --- |
+| `sysctl` `CTL_HW`/`HW_PHYSMEM`, `HW_USERMEM`, `HW_PAGESIZE` | `ENOENT` |
+| `sysctl` `CTL_KERN` 41/42 (`memtop`, `physmemtop`) | `ENOENT`; and `sysctlCommon.h` withdraws both names under `_WRS_CONFIG_LP64` |
+| `memFindMax()` | 261,744 B, flat from the first thread to the wall |
+| `memInfoGet()` | free 261,760 / maxfree 261,744 / alloc 0, flat likewise |
+| `sysconf(_SC_PHYS_PAGES)` | the constant does not exist in the RTP `unistd.h` |
+| `getrlimit`/`setrlimit` | defined in no library under `sysroot/usr/lib/common` |
+| `rtpInfoGet()` | `RTP_DESC` carries status, options, entry, ids, path, task count and text bounds — no memory field |
+
+`memFindMax` describes a 256 KiB heap partition that never moves while the
+process reserves a quarter of a gigabyte. That is the trap named up front: the
+binding resource is reserved address space, not free heap, and every heap
+question is blind to it. The target says so itself — `pthread_create` fails with
+`errno = 0xB4000E`, which is `M_adrSpaceLib` (module 180) and not a `memLib`
+code. base's `vxWorks/osdPoolStatus.c` is not wrong; it runs in the kernel,
+where `memFindMax` is the system heap. We run as an RTP, where it is not.
+
+### 10.2 What a probe can measure, exactly
+
+Taking, unlike asking, works. An `mmap(PROT_NONE)` ladder run to exhaustion and
+released reports a ceiling that equals the `pthread_create` wall **to the byte**,
+at three stack classes and two guest sizes:
+
+| guest | OS memory | stack | mmap chunks | mmap total | pthread wall | reserved at wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1024M | ~958 MB | 2 MiB | 127 | 266,338,304 | n=127 | 266,338,304 |
+| 1024M | ~958 MB | 1 MiB | 254 | 266,338,304 | n=254 | 266,338,304 |
+| 1024M | ~958 MB | 512 KiB | 509 | 266,862,592 | n=509 | 266,862,592 |
+| 1536M | ~1470 MB | 2 MiB | 382 | 801,112,064 | n=382 | 801,112,064 |
+
+Two laws fall out. The ceiling is a byte ceiling, not a thread count — it holds
+within one chunk (0.2 %) across a 4× change in stack size. And it moves 1:1 with
+guest memory: 958 − 254 MiB ≈ 704 MB, 1470 − 764 MiB ≈ 706 MB, so the target
+keeps a fixed ~705 MB and hands an RTP the rest. That is the same line E10
+measured from the other end (0.20580 clients per MB of guest RAM, R² = 0.998),
+seen at its source.
+
+A third measurement is why this stays a probe and not a policy: a bare pthread
+costs exactly its declared stack here, with no flat per-thread term at all — the
+ladder totals are `n × stack` in every row above. The flat 1 MiB that
+[`per_thread_overhead`] charges is therefore not what the OS charges for a
+thread; it is what a *Rust* thread reserves on top of its stack, which is
+consistent with a per-thread allocator arena and coherent with E10's abort
+landing on a 64-byte allocation inside a freshly spawned thread.
+
+### 10.3 Why the constant stays anyway
+
+The probe is exact, but it is a taking, and both ways of using it cost more than
+the constant does:
+
+* Run to exhaustion it holds the entire address space for the duration (~0.5 s
+  at 2 MiB chunks), during which any other thread's growth fails — and a failed
+  allocation in this process is `abort`, which is the very outcome §9.2 exists
+  to prevent. Trading a bounded refusal for a probabilistic abort is backwards.
+* Held to a single mapping it is safe but conservative: on the guest whose
+  chunked ceiling is 254 MiB, a single 256 MiB mapping fails and 192 MiB
+  succeeds — a ≥24 % under-read — and each attempt costs 0.3–0.5 s, so a
+  descent is seconds of startup.
+
+So the survey's answer to "is there a queryable quantity that tracks our wall"
+is **no**, and the constant plus `EPICS_RS_POOL_RESERVATION_MB` stays. What the
+measurement adds is that an operator can now compute the switch rather than
+guess it: usable address space ≈ OS memory − 705 MB, a CA set costs 5 MiB, and
+the default keeps 14 sets of headroom below the wall.
+
+### 10.4 RTEMS
+
+`malloc_get_statistics` does not exist in RTEMS 6: it is absent from every
+header under the BSP's `lib/include` and from every archive in `lib`. base knows
+this — `RTEMS-posix/osdPoolStatus.c` switches on `__RTEMS_MAJOR__ < 5` and uses
+`malloc_free_space()` for 5 and later. That function *is* reachable in our
+build: declared in `rtems/libcsupport.h`, defined in `librtemscpu.a`.
+
+Whether it tracks an RTEMS wall of ours is unmeasured — this port has never
+walled a pool on RTEMS, so there is no wall to compare a reading against. What
+is measured is that the budget is inert there: our RTEMS guest is a 256 MB
+`xilinx-zynq-a9`, and [`default_reservation_budget`] hands RTEMS the same
+160 MiB, which is 62.5 % of the entire guest. The count bound or the heap will
+be reached first, so on RTEMS the memory gate cannot be what refuses. Closing
+that needs an RTEMS-side ladder of the kind §10.2 ran here, and then either a
+measured RTEMS constant or, since RTEMS is a single address space where the heap
+*is* the binding resource, the `malloc_free_space()` query base already uses.

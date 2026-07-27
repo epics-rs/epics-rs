@@ -1324,6 +1324,10 @@ impl PvDatabase {
     /// [`Self::refuse_bounded_entry`], which raises the record's alarm and
     /// logs before it hands back the `Ok(None)` — so a bound cannot be
     /// written as a bare `return Ok(None)` here.
+    ///
+    /// Every `Ok(None)` is built by [`Self::entry_did_not_run`], which is
+    /// also where the put-notify wait-set is released, so a non-run cannot
+    /// strand a CA `WRITE_NOTIFY`.
     fn process_entry_prelude(
         &self,
         name: &str,
@@ -1347,24 +1351,78 @@ impl PvDatabase {
             return self
                 .refuse_bounded_entry(&name, &format!("link chain ops limit {MAX_LINK_OPS}"));
         }
-        if !visited.insert(name.clone()) {
-            // C has no counterpart to raise here: `processTarget`
-            // (`dbDbLink.c:436`) stops a cycle with `psrc->pact = TRUE` and
-            // `dbProcess` returns 0 for an already-active record without any
-            // alarm until MAX_LOCK. Re-reaching a record inside one cascade is
-            // ordinary FLNK-graph shape, not a refusal, so this stays silent.
-            return Ok(None);
-        }
-
         let rec = {
             let records = self.inner.records.read();
             records.get(&name).cloned()
         };
 
+        if !visited.insert(name.clone()) {
+            // C has no counterpart to raise here: `processTarget`
+            // (`dbDbLink.c:436`) stops a cycle with `psrc->pact = TRUE` and
+            // `dbProcess` returns 0 for an already-active record without any
+            // alarm until MAX_LOCK. Re-reaching a record inside one cascade is
+            // ordinary FLNK-graph shape, not a refusal, so this stays SILENT —
+            // but silent is about the alarm, not about the wait-set.
+            return self.entry_did_not_run(rec.as_ref());
+        }
+
         match rec {
             Some(r) => Ok(Some((name, r))),
             None => Err(CaError::ChannelNotFound(name)),
         }
+    }
+
+    /// The prelude's ONE "this entry did not run its cycle" exit — C
+    /// `dbProcess`'s `all_done` with `callNotifyCompletion = TRUE`.
+    ///
+    /// `join_put_notify` (C `dbNotifyAdd`) is called by the link dispatcher
+    /// on the will-process branch, *before* the recursion enters the prelude:
+    ///
+    /// ```text
+    /// links.rs:1427   let pact = tg.is_processing();
+    /// links.rs:1428   if !pact { tg.common.putf = src_putf;
+    /// links.rs:1430              join_put_notify(&mut tg, src_notify); }   // ws.enter()
+    /// links.rs:1440   self.process_record_with_links_recursive(target, visited, depth + 1)
+    /// ```
+    ///
+    /// So by the time a bound, or the cycle guard, decides the entry will not
+    /// run, the target is already counted in the wait-set — and nothing
+    /// downstream will ever `leave` for it, because the only `leave`s are on
+    /// paths that ran a cycle. The set never drains, the completion oneshot
+    /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply
+    /// (measured on x86_64-wrs-vxworks: the first put into a chain past
+    /// `MAX_LINK_DEPTH` never replied over 90s, and `RTEMS:E8:L16` was left
+    /// holding a wait-set that could never drain — after which every later put
+    /// completed, because `join_put_notify`'s `notify.is_none()` guard stops a
+    /// record that already holds a stale set from joining a live one).
+    ///
+    /// C decides this per exit path with one flag and one finalizer
+    /// (`dbAccess.c:495` `callNotifyCompletion = FALSE`, `:577` disabled,
+    /// `:599` no RSET, `:620-623` `all_done`), and the pact branch
+    /// (`:552-556`) deliberately does NOT set it: a record whose own cycle is
+    /// running owns its completion. The same split holds here — hence the
+    /// `is_processing` test, which is C's `if (precord->pact)`, not a guard
+    /// bolted on.
+    fn entry_did_not_run(
+        &self,
+        rec: Option<&Arc<parking_lot::RwLock<RecordInstance>>>,
+    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
+        if let Some(rec) = rec {
+            let notify = {
+                let mut instance = rec.write();
+                if instance.is_processing() {
+                    None
+                } else {
+                    instance.notify.take()
+                }
+            };
+            // `leave` fires the completion oneshot when it empties the set, so
+            // it runs outside the record lock — same as the SDIS-disable bail.
+            if let Some(ws) = notify {
+                ws.leave();
+            }
+        }
+        Ok(None)
     }
 
     /// Refuse a process entry that hit one of the port's own resource bounds,
@@ -1395,25 +1453,34 @@ impl PvDatabase {
         // The record the chain could not reach may not exist — a dangling FLNK
         // at the bound. The refusal is still reported; there is simply nothing
         // to raise it on.
-        if let Some(rec) = rec {
-            let snapshot = {
-                let mut instance = rec.write();
-                scan_alarm_refusal(&mut instance, why)
-            };
-            match snapshot {
-                Some(snapshot) => {
-                    rec.read().notify_from_snapshot(&snapshot);
+        let repeat = match &rec {
+            Some(rec) => {
+                let snapshot = {
+                    let mut instance = rec.write();
+                    scan_alarm_refusal(&mut instance, why)
+                };
+                match snapshot {
+                    Some(snapshot) => {
+                        rec.read().notify_from_snapshot(&snapshot);
+                        false
+                    }
+                    // Already refused and still in SCAN_ALARM/INVALID: C posts
+                    // nothing on a repeat, and repeating the log line for every
+                    // put into the same over-long chain would drown the first
+                    // one. Only the alarm and the log are debounced — the
+                    // wait-set release below is not, because every refused
+                    // entry joined its own put-notify.
+                    None => true,
                 }
-                // Already refused and still in SCAN_ALARM/INVALID: C posts
-                // nothing on a repeat, and repeating the log line for every
-                // put into the same over-long chain would drown the first one.
-                None => return Ok(None),
             }
+            None => false,
+        };
+        if !repeat {
+            crate::runtime::log::errlog_printf(&format!(
+                "dbProcess: {name} not processed, {why} exceeded\n"
+            ));
         }
-        crate::runtime::log::errlog_printf(&format!(
-            "dbProcess: {name} not processed, {why} exceeded\n"
-        ));
-        Ok(None)
+        self.entry_did_not_run(rec.as_ref())
     }
 
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.

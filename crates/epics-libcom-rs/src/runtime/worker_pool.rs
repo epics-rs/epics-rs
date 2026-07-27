@@ -719,10 +719,12 @@ fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
 /// first client.
 const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 
-/// Will this target give `bytes` of address space, right now?
+/// Will this target give `bytes` of thread memory, right now?
 ///
 /// `Some(true)`/`Some(false)` is a measurement; `None` means this target has no
-/// basis for the question and the answer must not be invented.
+/// basis for the question and the answer must not be invented. One question,
+/// answered from whatever quantity actually tracks the wall on each target —
+/// the resource differs, the veto does not.
 ///
 /// On VxWorks the basis is one anonymous `PROT_NONE` mapping, taken and released
 /// immediately. It is the only quantity in the RTP that tracks the wall this
@@ -736,13 +738,24 @@ const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 /// refuse a budget the target would in fact have honoured, never admit one it
 /// would not.
 ///
-/// Every other target answers `None`. RTEMS is not excluded for want of an
-/// `mmap`; it is excluded because no RTEMS ladder has been run, so nothing is
-/// known to relate a mapping there to the wall (§10.4), and a probe whose
-/// relation to the resource is unmeasured is a guess wearing a measurement's
-/// clothes.
+/// On RTEMS the basis is a *query*, not a taking: `malloc_free_space` reports
+/// the free total of the same heap RTEMS pthread stacks are allocated from, and
+/// it tracks — across a ramp that took the free total from 232.3 MB to 9.3 MB
+/// its gap to `MEM_BLK` widened only from 36,216 to 73,872 B, the opposite of
+/// VxWorks' `memFindMax` sitting flat while the process reserved a quarter of a
+/// gigabyte. Declared here rather than reached through `epics-rtems-boot`,
+/// because this crate's dependency on that package is `cfg(target_os =
+/// "vxworks")` by design — it must stay takeable by a consumer bringing its own
+/// boot glue — while the symbol itself is in `librtemscpu`, which every RTEMS
+/// image links.
+///
+/// RTEMS needs this *more* than VxWorks, not less: `rtems_init.c:195` hands
+/// `main` a fixed argv and `POSIX_Init` never calls `setenv`, so
+/// [`POOL_RESERVATION_ENV`] cannot be set on that target at all and the built-in
+/// default is the only budget it will ever run. A default nobody can override is
+/// a default that has to be checked.
 #[cfg(target_os = "vxworks")]
-fn address_space_admits(bytes: usize) -> Option<bool> {
+fn target_admits(bytes: usize) -> Option<bool> {
     /// `sys/mman.h:66` — VxWorks requires this exact `fd` with `MAP_ANON`.
     const MAP_ANON_FD: libc::c_int = -1;
 
@@ -768,8 +781,19 @@ fn address_space_admits(bytes: usize) -> Option<bool> {
     Some(true)
 }
 
-#[cfg(not(target_os = "vxworks"))]
-fn address_space_admits(_bytes: usize) -> Option<bool> {
+#[cfg(target_os = "rtems")]
+fn target_admits(bytes: usize) -> Option<bool> {
+    // RTEMS `rtems/malloc.h`, defined in `librtemscpu`: bytes free in the
+    // malloc heap. No arguments, no output parameters, no allocation.
+    unsafe extern "C" {
+        fn malloc_free_space() -> libc::size_t;
+    }
+    // SAFETY: a pure query into the RTEMS heap allocator.
+    Some(unsafe { malloc_free_space() } >= bytes)
+}
+
+#[cfg(not(any(target_os = "vxworks", target_os = "rtems")))]
+fn target_admits(_bytes: usize) -> Option<bool> {
     None
 }
 
@@ -1010,7 +1034,7 @@ static PROCESS_RESERVATION: LazyLock<Reservation> = LazyLock::new(|| {
     Reservation::new(announce_reservation_budget(decide_reservation_budget(
         requested,
         requested != default,
-        address_space_admits,
+        target_admits,
     )))
 });
 

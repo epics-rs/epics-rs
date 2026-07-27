@@ -3236,6 +3236,12 @@ mod tests {
         assert_eq!(cfg.protocol, IpProtocol::UdpBroadcastReusePort);
     }
 
+    // `unix://` parses on exactly the platforms where C defines `HAS_AF_UNIX`,
+    // so both halves of that condition carry their own case. Ungated, the
+    // accepting tests fail where the protocol does not exist, and the refusal
+    // — the whole point of parsing it at configure time — ships untested on
+    // the two targets it was written for.
+    #[cfg(asyn_af_unix)]
     #[test]
     fn test_parse_unix_socket() {
         let cfg = IpPortConfig::parse("unix:///tmp/asyn.sock").unwrap();
@@ -3244,9 +3250,21 @@ mod tests {
         assert_eq!(cfg.port, 0);
     }
 
+    #[cfg(asyn_af_unix)]
     #[test]
     fn test_parse_unix_empty_path() {
         assert!(IpPortConfig::parse("unix://").is_err());
+    }
+
+    #[cfg(not(asyn_af_unix))]
+    #[test]
+    fn test_parse_unix_refused_without_af_unix() {
+        let err = IpPortConfig::parse("unix:///tmp/asyn.sock")
+            .expect_err("a spec naming a protocol the platform lacks must not parse");
+        assert!(
+            err.to_string().contains("AF_UNIX not available"),
+            "the refusal must name AF_UNIX, as `drvAsynIPPortConfigure` does: {err}"
+        );
     }
 
     #[test]

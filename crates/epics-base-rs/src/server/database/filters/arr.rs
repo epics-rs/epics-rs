@@ -112,7 +112,12 @@ impl SubscriptionFilter for ArrayFilter {
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         let cfg = self.config;
         let mut event = event;
-        event.event.snapshot.value = match event.event.snapshot.value {
+        // `make_mut` copies only when another subscriber still shares this
+        // `Arc`; after it the snapshot is unique, so the value can be moved
+        // out (the arms below consume the `Vec`) and the slice moved back.
+        let snap = std::sync::Arc::make_mut(&mut event.event.snapshot);
+        let taken = std::mem::replace(&mut snap.value, EpicsValue::Double(0.0));
+        snap.value = match taken {
             EpicsValue::ShortArray(v) => EpicsValue::ShortArray(slice_with(v, cfg)),
             EpicsValue::LongArray(v) => EpicsValue::LongArray(slice_with(v, cfg)),
             EpicsValue::Int64Array(v) => EpicsValue::Int64Array(slice_with(v, cfg)),
@@ -216,14 +221,19 @@ mod tests {
 
     fn ev_array(v: Vec<f64>) -> FilteredMonitorEvent {
         FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::DoubleArray(v), 0, 0, SystemTime::UNIX_EPOCH),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::DoubleArray(v),
+                0,
+                0,
+                SystemTime::UNIX_EPOCH,
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         })
     }
 
     fn unpack(event: FilteredMonitorEvent) -> Vec<f64> {
-        match event.event.snapshot.value {
+        match std::sync::Arc::unwrap_or_clone(event.event.snapshot).value {
             EpicsValue::DoubleArray(v) => v,
             other => panic!("expected DoubleArray, got {other:?}"),
         }
@@ -313,7 +323,12 @@ mod tests {
     fn scalar_passes_unchanged() {
         let f = ArrayFilter::new(ArrayFilterConfig::default());
         let ev = FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::Double(3.14), 0, 0, SystemTime::UNIX_EPOCH),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::Double(3.14),
+                0,
+                0,
+                SystemTime::UNIX_EPOCH,
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         });
@@ -346,17 +361,17 @@ mod tests {
         let big = u64::MAX; // > i64::MAX, must survive the slice
         let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 2));
         let ev = FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Snapshot::new(
+            snapshot: std::sync::Arc::new(Snapshot::new(
                 EpicsValue::UInt64Array(vec![0, big, big - 1, 7]),
                 0,
                 0,
                 SystemTime::UNIX_EPOCH,
-            ),
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         });
         let out = f.apply(ev).unwrap();
-        match out.event.snapshot.value {
+        match out.event.snapshot.value.clone() {
             EpicsValue::UInt64Array(v) => assert_eq!(v, vec![big, big - 1]),
             other => panic!("expected sliced UInt64Array, got {other:?}"),
         }

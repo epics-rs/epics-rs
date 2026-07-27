@@ -761,18 +761,154 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   circuit gets the same guarantee from a different owner, `CircuitDeathGuard`,
   and is the later of the two afterwards (138 s) because C keeps an unresponsive
   circuit's socket on purpose.
-* **E8 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
-  for this target; E10's dial numbers are now unblocked, since the probe images
-  link and run. Neither has been run on VxWorks.
-* **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
-  Not a formula difference: `StackSizeClass::bytes` is
-  `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as
-  C's `STACK_SIZE(f)` is, so a 64-bit target costs precisely 2× what
-  `armv7-rtems-eabihf` costs, class for class. The sizing **decision** is
-  deferred until `STACKUSE` high-water data is collected across a real
-  workload — the census that produces it now exists and has been run once, but
-  not under load.
-* **A 1-in-3 wall-abort with mutex `EINVAL`** is observed and not root-caused.
+* **E8 is measured; E10 is not.** E8 (pool probe) was re-authored for
+  this target as `doc/vx-ca-pool-probe.patch` and run under load:
+  `doc/vxworks-ca-worker-pool-on-target-measurement.md`. Holding 141 concurrent
+  CA clients, `POOLPROBE` gives `BUSY == SETS == CONNS` with
+  `worker_count() == 2 × sets` on every sample and `sets` never past
+  `CAS_CLIENT_POOL_CAPACITY = 141`, and all 282 pooled workers read
+  `vx = 199 - epics` with zero mismatches over three independent instruments
+  (`pthread_getschedparam`, `taskPriorityGet`, `taskInfoGet`). E9's ladder has
+  since been measured — see its bullet above; E10's dial numbers are unblocked
+  but not taken.
+* **Connection-wall sizing.** The wall is **not** a fixed client count. Measured
+  on one image on two guests: 47 concurrent clients on `~958MB`, refused with
+  `EAGAIN` from the worker spawn, and 141 on `~1982MB`, refused by
+  `CAS_CLIENT_POOL_CAPACITY` itself. The earlier "44 concurrent clients" figure
+  is retracted — it was reproduced at neither size. Per connection the port
+  reserves 3,145,728 B (`CAS-client` Big + `CAS-event` Medium) and *uses*
+  19,208 B of it, flat from n = 1 to n = 141; `cbMedium` at 206,800 B is the one
+  class whose high-water justifies `Big`. Not a formula difference:
+  `StackSizeClass::bytes` is `f * 0x10000 * size_of::<usize>()`, parameterised
+  by pointer width exactly as C's `STACK_SIZE(f)` is, so a 64-bit target costs
+  precisely 2× what `armv7-rtems-eabihf` costs, class for class. **Why `EAGAIN`
+  lands at 47 is now answered** (§10 of the measurement): a three-arm
+  `StackSizeClass` A/B at fixed RAM moved the wall 47 → 59 → 80 as the declared
+  per-connection stack fell 3,145,728 → 2,097,152 → 1,048,576, which falsifies
+  "the wall tracks declared stack" — that predicted 141, the pool's own
+  capacity. Charging each thread its declared stack **plus a flat 1 MiB** makes
+  the total at all three walls 246.4 / 247.5 / 251.7 MB, a 2.1 % spread. The
+  binding resource is reserved address space, ceiling ~248 MB on this guest, not
+  committed memory. Two thirds of the per-connection cost is that per-thread
+  overhead, so the class is the minor lever and threads-per-connection the major
+  one; `Big` is justified by no high-water measured here (13,240 B in all three
+  arms) and costs a fifth of the wall.
+* **The class decision, now measured against a real database** (§15 of the
+  measurement). The 13,240 B above came from `READ_NOTIFY` on a single `ao`, so
+  it is superseded, not confirmed: driven against waveform / `subArray` /
+  `compress` / a FLNK chain / an 8-wide `dfanout` / six monitors per connection
+  and the `DBR_TIME` and `DBR_CTRL` reply shapes, `CAS-client` measures
+  **65,912 B** and `CAS-event` **7,120 B** — 5.0× and 1.19× the old figures — on
+  all four threads over four census passes, single-instance proved with
+  `rtpShow`. **The number is invariant**: payloads of 8 B, 32,768 B, 262,144 B
+  and 1,048,576 B, every reply shape, and all three class arms leave it
+  unchanged to the byte, because array payloads are on the heap. **The
+  bullet above is wrong on one point and it matters:** C's stack table is not
+  one table. `StackSizeClass::bytes` matches C's *POSIX* table
+  (`posix/osdThread.c:506-509`), but C on VxWorks uses `{4000, 6000, 11000} *
+  ARCH_STACK_FACTOR` (`vxWorks/osdThread.c:63-64`), so C's
+  `epicsThreadStackBig` on x86_64 is **22,000 B** and our `Big` is 95.3× it —
+  while our measured 65,912 B is 3.0× C's *entire* `Big`, because `park_on`
+  pins each connection's async state machine onto the connection stack. So
+  "match C's class" is not available as a decision rule here; only the measured
+  bytes are. `Big` runs at 3.14 % utilisation and `Medium` would keep 15.9×
+  margin while moving the measured wall 47 → 59. The change is **not made**:
+  `client_roster` is shared with `armv7-rtems-eabihf`, where no `CAS-client`
+  high-water has ever been measured.
+* **`MAX_LINK_DEPTH = 16` silently truncates a legal FLNK chain** (§16). A put
+  to a 32-deep chain processes the entry plus `L1..L15` and stops; C has no
+  depth counter on that path (`processTarget`, `dbDbLink.c:427-436`, guards
+  cycles via `pact`, and `MAX_LOCK 10` is an unrelated already-active alarm).
+  The bail is `Ok(None)`, so the put returns success with no client notice and
+  no record alarm, and the notice goes through `eprintln!` which never reaches
+  `errlog` on this target. Its one upside: the cap makes the 65,912 B above
+  depth-inclusive by construction.
+* **A monitored 1 MiB waveform aborts the RTP at four clients** (§17).
+  `EVENT_ADD` on a 131,072-element `DOUBLE` array drove `MEM_USED` 43,278,336 →
+  211,804,160 B and killed the process with `memory allocation of 1048576 bytes
+  failed` → signal 6. The same workload without that one monitor survives a
+  480 s hold with eighty 1 MiB gets and eighty 1 MiB `WRITE_NOTIFY`s, so the
+  reply path is sound and the per-subscriber event queues are what exhaust the
+  heap.
+* **A wall-abort with mutex `EINVAL` — now reproduced, and worse than filed.**
+  Two of four wall events this round, in the Big and Small arms and not the
+  Medium one, never below the wall, never on a guest where pool capacity binds
+  first. The census registry is exonerated. In the Small arm the panic deleted
+  the RTP with signal 6, so this is not "a worker is lost while the IOC looks
+  healthy" — **a client that fills the pool can take the IOC down.**
+  **Root cause now established, statically and on target** (§18). The SDK's
+  `pthreadLib.o` shows the first `lock()` on a `PTHREAD_MUTEX_INITIALIZER`
+  mutex reaching `pthreadMutexInitComplete` → `pthreadMutexInit` →
+  `semMCreate`, which on NULL returns `0x16` — `EINVAL`, not `ENOMEM` —
+  propagated verbatim so std panics "invalid argument (os error 22)".
+  `pthread_mutex_init` only stamps the magic, so **every** VxWorks pthread mutex
+  materialises its semaphore on first lock and eager init is no protection.
+  Confirmed with `--wrap=semMCreate --wrap=pthread_mutex_lock`:
+  `semMCreate=NULL nth_null=1 succeeded_before=588`, then `lock rc=22`, then the
+  fatal panic on `CAS-client 48`. So **the failing allocation is a VxWorks
+  semaphore object, not mimalloc heap** — which is why this arm reports no byte
+  count while the aborts above do; two allocators fail at the same wall. There
+  is no single guilty mutex: it is whichever `std::sync::Mutex` a freshly leased
+  worker touches first. The budget number is **588 live semaphores** at 49 sets
+  / 98 workers / 48 connections, and it is **transient** — creations passed
+  1,024 afterwards — so a bound must throttle creation rate, not only cap a
+  total.
+* **A panicking worker leaks its pool set permanently.** `BUSY=2 SETS=50
+  WORKERS=100 CONNS=0` — nothing returns a `SetLease` whose worker died, so
+  capacity drops permanently by one set per panic. `WorkerPool` accounting,
+  shared with `armv7-rtems-eabihf`, so outside this row's scope.
+* ~~**Connection establishment knees 180× at ~80 concurrent clients.**~~
+  **Root-caused and fixed** — same defect as the census truncation below; see
+  that bullet.
+* **Status PVs are lagging indicators under load — but my band-ordering
+  explanation for it was wrong.** I attributed the 402 s reporter silence to
+  pooled workers banding at 179/180 against `status-pv`/`scan-owner`/`c6-probe`
+  at 189. That is contradicted: with the census registry fixed, the same 282
+  thread creations take 10.4 s with **unbroken reporter sequence numbers** and
+  no starvation at all. The reporter was blocked on the registry mutex the
+  sweeps held, not starved by priority. What survives is the weaker and still
+  load-bearing claim: the status PVs are scan-driven, so a burst that completes
+  faster than the scan is sampled through pre-burst values — measured this
+  round, a 0.9 s burst of 40 read `CONN_CNT=0.0`, and the same burst held 90 s
+  read `CONN_CNT=40.0`. **Any row that counts something under load still needs
+  a client-side derivation beside the PV**, for scan latency rather than for
+  band starvation.
+* ~~**The task census truncates before a saturated pool.**~~ **Fixed** — and it
+  was the same defect as the 180× handshake knee above, not two. `MAX_TASKS =
+  192` in `crates/epics-rtems-boot/src/stats/vxworks.rs` is reached at
+  `19 + 2 × (n + 5) = 192`, n = 81.5, exactly the (80, 88] bracket the knee was
+  measured in; past it every `insert()` ran a full `retain_live()` sweep — one
+  `taskInfoGet` per entry under the registry mutex — reclaiming nothing, at
+  3.674 s a sweep and two sweeps per connection. The registry now grows and
+  `SWEEP_THRESHOLD_MIN` keeps only its sweep-trigger job. On target the
+  141-client ramp fell **402 s → 10.4 s** and the saturated census reads
+  `count=301 capacity=unbounded dropped=0`. The RTEMS shim's
+  `EPICS_RTEMS_DUMP_MAX_TASKS = 192` (`csrc/rtems_stats.c:148`) has the same
+  symptom and **cannot** take this fix: its arrays are filled inside a
+  `rtems_task_iterate` visitor where allocating is unsafe. Open, on that target.
+* **The CA client pool never shrinks — reclassified from "by design" to a
+  defect.** C `rsrv` creates a `CAS-client` thread per accept
+  (`caservertask.c:109`) and tears both threads down in `destroy_tcp_client`, so
+  its steady-state retention is zero. Ours holds `SETS=45 WORKERS=90` with
+  `BUSY=0 CONNS=0` after every client has left; descriptors, connections and
+  heap all come back, the threads and their reservation do not. Against the
+  ~248 MB ceiling above, 42 retained sets are 53 % of the guest's entire
+  reservation held permanently at zero clients — a transient burst becomes a
+  permanent exhaustion. Counterweight: the pool exists to bound the RTEMS 128 B
+  per-`std::thread` leak, and the VxWorks thread-exit leak is unmeasured (it
+  cannot be measured through a pool that never destroys a thread). Even granting
+  the RTEMS figure, retaining a thread spends 3,145,728 B to avoid 128 B.
+  **Proposed structural fix, not made, awaiting sign-off:** bound the pool by a
+  reservation budget rather than by `CAS_CLIENT_POOL_CAPACITY = 141`, which on
+  the `~958MB` guest is never the binding term — so the IOC walks past the real
+  ceiling into a failing `pthread_create`, whose outcome ranges from a clean
+  refusal to an RTP abort.
+* **Refusal `errlog` records are dropped without a discard notice.** Both walls
+  logged every refusal through `epics_ca_rs::server::blocking`'s `WARN` and
+  counted every one in `POOLPROBE REFUSED=`, while the `errlog` leg printed 4 of
+  8 on one guest and 3 of 4 on the other and emitted no `messages were
+  discarded` line. The `errlog` counter itself is right (it labels the 8th
+  refusal `#8`), so the loss is after the call.
 * **`MEM_FREE`, `MEM_MAX`, `MEM_BLK` stay `NaN`** until either mimalloc grows a
   public free-bytes accessor or a defensible source appears. §3.1 is the
   standing rejection, not a TODO.

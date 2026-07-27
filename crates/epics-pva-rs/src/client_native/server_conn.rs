@@ -520,7 +520,7 @@ impl ServerConn {
     /// the triple at all.
     ///
     /// It is *not* a second protocol. It hands
-    /// [`run_handshake_and_spawn`](Self::run_handshake_and_spawn) the same
+    /// `run_handshake_and_spawn` the same
     /// `DynRead`/`DynWrite` the other two do, built from
     /// `runtime::blocking_io`'s adapters, so the handshake, the reader task's
     /// frame loop, the writer task, the heartbeat and every operation state
@@ -592,7 +592,7 @@ impl ServerConn {
 
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
-    /// [`connect`] and [`connect_tls`].
+    /// [`Self::connect`] and [`Self::connect_tls`].
     async fn run_handshake_and_spawn(
         target: SocketAddr,
         mut reader: DynRead,

@@ -217,7 +217,7 @@ pub struct MonitorOptions {
 /// server-side monitor queue starts with, before the client's
 /// `record._options.queueSize` gets a say. It is a PER-OPERATION
 /// initializer, not a server-wide capacity: pvxs has no server knob for
-/// it at all, and [`crate::server_native::runtime::PvaServerConfig::monitor_queue_depth`]
+/// it at all, and [`crate::server_native::PvaServerConfig::monitor_queue_depth`]
 /// is exactly this initializer made configurable.
 pub const DEFAULT_MONITOR_QUEUE_LIMIT: u32 = 4;
 
@@ -449,7 +449,7 @@ pub struct ChannelInvalidator {
 
 impl ChannelInvalidator {
     /// A fresh invalidator with no subscribers. The server creates one per
-    /// [`crate::server_native::PvaServer`] and hands a clone to the source
+    /// `PvaServer` and hands a clone to the source
     /// (which `publish`es) and to every per-connection task (which
     /// `subscribe`s).
     pub fn new() -> Self {
@@ -1480,7 +1480,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// Register the server's [`ChannelInvalidator`] with this source. The
-    /// server creates one per [`crate::server_native::PvaServer`] and hands
+    /// server creates one per `PvaServer` and hands
     /// it here before accepting connections. A source that can invalidate a
     /// channel out-of-band keeps the handle and `publish`es the PV name of
     /// every channel that must be force-disconnected; each per-connection

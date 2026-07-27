@@ -30,6 +30,13 @@
 //! processes: 0   2   4   6
 //! MCNT:      0   2   0   2      <- zeroed by the post on cycle 4
 //! ```
+//!
+//! What is counted here is `db_post_events` CALLS, not monitor deliveries. VAL
+//! is an array field, so C queues it by reference and refuses a second entry for
+//! the same monitor (`dbEvent.c:786-799`) — an undrained C monitor sees one
+//! delivery however many times the record posts, and reads the current bins when
+//! it is finally delivered. The port's queue does the same, so a burst of posts
+//! shows up as one held entry plus `ncollapse`.
 
 use std::collections::HashSet;
 
@@ -110,12 +117,13 @@ async fn mdel_rate_limits_the_val_monitor() {
         process(&db, "HG").await;
     }
 
+    let collapsed = val_rx.queue().ncollapse(1);
     let mut events = Vec::new();
     while let Ok(ev) = val_rx.try_recv() {
         events.push(ev);
     }
     assert_eq!(
-        events.len(),
+        events.len() as u64 + collapsed,
         1,
         "MDEL=3 over 6 processes posts VAL once (on the cycle where mcnt=4 > 3)"
     );
@@ -154,10 +162,16 @@ async fn the_default_mdel_of_zero_posts_every_process() {
         process(&db, "HG0").await;
     }
 
-    let mut n = 0;
+    let collapsed = val_rx.queue().ncollapse(1);
+    let mut n = 0u64;
     while val_rx.try_recv().is_ok() {
         n += 1;
     }
-    assert_eq!(n, 3, "MDEL=0: every process posts");
+    assert_eq!(
+        n + collapsed,
+        3,
+        "MDEL=0: every process posts (the array monitor holds one entry and \
+         counts the rest as collapses, exactly as C's by-reference queue does)"
+    );
     assert_eq!(mcnt(&db, "HG0").await, 0.0, "each post zeroes MCNT");
 }

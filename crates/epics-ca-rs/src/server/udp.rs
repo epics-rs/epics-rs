@@ -436,7 +436,7 @@ impl SearchReplyBatch {
     /// or `None` when empty. The blocking responder
     /// (`crate::server::blocking`) calls this to emit the final datagram
     /// after [`parse_search_datagram`] returns; the async responder does the
-    /// equivalent through [`flush_send_buf`]. Encapsulates the private batch
+    /// equivalent through `flush_send_buf`. Encapsulates the private batch
     /// fields so the shaping stays in one place.
     pub(crate) fn shape_trailing(&self) -> Option<Vec<u8>> {
         shape_search_reply_dg(&self.send_buf, self.client_minor, self.client_seq)
@@ -447,7 +447,7 @@ impl SearchReplyBatch {
     /// (`crate::server::blocking`) calls this to flush at a coalescing-group
     /// boundary — a recv-queue drain (FIONREAD == 0), a peer change, or
     /// shutdown — which is byte-equivalent to the async responder's
-    /// [`flush_send_buf`] (shape + `send_buf.clear()`) followed by the
+    /// `flush_send_buf` (shape + `send_buf.clear()`) followed by the
     /// peer-change `client_seq`/`client_minor` reset (`recv_loop`,
     /// udp.rs:846-849). Resetting the whole batch keeps the invariant "a
     /// non-empty batch's `client_*` echo state belongs to its own replies"
@@ -462,7 +462,7 @@ impl SearchReplyBatch {
 /// Parse one inbound UDP datagram's CA messages (VERSION + SEARCH),
 /// appending SEARCH-reply bytes to `batch`. This is the shared
 /// decode/respond core of the CA UDP name-search responder: the async
-/// reactor front-end ([`recv_loop`]) and the blocking thread-per-client
+/// reactor front-end (`recv_loop`) and the blocking thread-per-client
 /// front-end (`crate::server::blocking`, the embedded-target server) both
 /// call it, so a search reply is byte-identical on either path.
 ///
@@ -915,7 +915,7 @@ async fn recv_loop(
 
 /// Shape the final on-wire bytes of one accumulated SEARCH-reply batch —
 /// the pure, I/O-free core of `cas_send_dg_msg` (`caserverio.c:185-201`).
-/// Shared by the async responder ([`flush_send_buf`]) and the blocking
+/// Shared by the async responder (`flush_send_buf`) and the blocking
 /// thread-per-client responder (`crate::server::blocking`), so a reply is
 /// byte-identical on either front-end.
 ///

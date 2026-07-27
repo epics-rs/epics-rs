@@ -64,7 +64,7 @@ fn subscribe(db: &PvDatabase, rec: &str, field: &str, dbf: DbFieldType) -> Event
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        out.push(ev.snapshot.value);
+        out.push(ev.snapshot.value.clone());
     }
     out
 }

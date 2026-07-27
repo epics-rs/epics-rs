@@ -2,11 +2,11 @@
 //! the `std::net` blocking driver's monitor path.
 //!
 //! [`ServerStats`] is pure atomics (no runtime dependency), so it lives in its
-//! own module rather than the host-only [`super::ca_server`] orchestrator — the
+//! own module rather than the host-only `super::ca_server` orchestrator — the
 //! RTEMS blocking driver (`server::blocking`) threads the same counters through
 //! the shared `tcp`/`monitor` delivery logic.
 
-/// Lightweight live-connection counters surfaced by [`super::CaServer::stats`]
+/// Lightweight live-connection counters surfaced by `CaServer::stats`
 /// and the `casr` iocsh command. Mirrors RSRV's `casr` output at the
 /// summary level — total connects / disconnects since startup, plus
 /// the running active count derived from their delta.

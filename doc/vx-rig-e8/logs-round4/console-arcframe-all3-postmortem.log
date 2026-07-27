@@ -1,0 +1,865 @@
+Instantiating /ram0 as rawFs, device = 0x1
+Instantiating /ram0 as rawFs,  device = 0x1
+Formatting /ram0 for HRFS v1.2
+Formatting...OK.
+Target Name: vxTarget 
+Instantiating /tmp as rawFs, device = 0x10001
+Instantiating /tmp as rawFs,  device = 0x10001
+Formatting /tmp for HRFS v1.2
+Formatting...OK.
+ 
+ _________            _________
+ \........\          /......../
+  \........\        /......../
+   \........\      /......../
+    \........\    /......../
+     \........\   \......./
+      \........\   \...../              VxWorks SMP 64-bit
+       \........\   \.../
+        \........\   \./     Release version: 26.03
+         \........\   -      Build date: May  6 2026 15:25:23
+          \........\
+           \......./         Copyright Wind River Systems, Inc.
+            \...../   -                 1984-2026
+             \.../   /.\
+              \./   /...\
+               -   -------
+
+                   Board: x86_64 Processor (ACPI_BOOT_OP) SMP/SMT
+               CPU Count: 1
+          OS Memory Size: ~958MB
+        ED&R Policy Mode: Deployed
+     Debug Agent: Started (always)
+         Stop Mode Agent: Not started
+
+Instantiating /ram as rawFs,  device = 0x20001
+Formatting /ram for DOSFS
+Instantiating /ram as rawFs, device = 0x20001
+Formatting...Retrieved old volume params with %38 confidence:
+Volume Parameters: FAT type: FAT32, sectors per cluster 0
+  0 FAT copies, 0 clusters, 0 sectors per FAT
+  Sectors reserved 0, hidden 0, FAT sectors 0
+  Root dir entries 0, sysId (null)  , serial number 290000
+  Label:"           " ...
+Disk with 64 sectors of 512 bytes will be formatted with:
+Volume Parameters: FAT type: FAT12, sectors per cluster 1
+  2 FAT copies, 54 clusters, 1 sectors per FAT
+  Sectors reserved 1, hidden 0, FAT sectors 2
+  Root dir entries 112, sysId VXDOS12 , serial number 290000
+  Label:"           " ...
+OK.
+
+ Adding 28098 symbols for standalone.
+
+-> rtpSp "/host.host/realtime-ca-ioc.vxe"
+value = -140737341284352 = 0xffff800008c42000 = _sysTableEnd + 0xffff800008834000
+-> epics-rs: lock protocol: PI is not enabled, RT scheduling AllowRealtime
+iocInit: 1 non-local DB link(s) made external
+iocInit: 4 external CP link subscriptions (3 PVs warmed)
+iocInit: 1 external link opens staged
+realtime-ca-ioc: serving 64 records on CA port 5064 (TCP + UDP search), RTEMS execution model, no tokio runtime
+PRIOPROBE label=cbLow epics=59 applied=Realtime getsched_rc=0 policy=1 posix=115 taskprio_rc=0 vx=140 expect_posix=115 expect_vx=140
+PRIOPROBE label=cbMedium epics=64 applied=Realtime getsched_rc=0 policy=1 posix=120 taskprio_rc=0 vx=135 expect_posix=120 expect_vx=135
+DIALPROBE submit n=1 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+PRIOPROBE label=CAC-dial 0 epics=49 applied=Realtime getsched_rc=0 policy=1 posix=105 taskprio_rc=0 vx=150 expect_posix=105 expect_vx=150
+PRIOPROBE label=cbHigh epics=71 applied=Realtime getsched_rc=0 policy=1 posix=127 taskprio_rc=0 vx=128 expect_posix=127 expect_vx=128
+PRIOPROBE label=cbTimer epics=70 applied=Realtime getsched_rc=0 policy=1 posix=126 taskprio_rc=0 vx=129 expect_posix=126 expect_vx=129
+DIALPROBE resolve n=1 target=10.0.2.2:15076 elapsed_ms=50 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+PRIOPROBE label=scanOnce epics=67 applied=Realtime getsched_rc=0 policy=1 posix=123 taskprio_rc=0 vx=132 expect_posix=123 expect_vx=132
+PRIOPROBE label=scan-owner epics=10 applied=Realtime getsched_rc=0 policy=1 posix=66 taskprio_rc=0 vx=189 expect_posix=66 expect_vx=189
+PRIOPROBE label=scan-10 epics=60 applied=Realtime getsched_rc=0 policy=1 posix=116 taskprio_rc=0 vx=139 expect_posix=116 expect_vx=139
+PRIOPROBE label=scan-5 epics=61 applied=Realtime getsched_rc=0 policy=1 posix=117 taskprio_rc=0 vx=138 expect_posix=117 expect_vx=138
+PRIOPROBE label=scan-2 epics=62 applied=Realtime getsched_rc=0 policy=1 posix=118 taskprio_rc=0 vx=137 expect_posix=118 expect_vx=137
+PRIOPROBE label=scan-1 epics=63 applied=Realtime getsched_rc=0 policy=1 posix=119 taskprio_rc=0 vx=136 expect_posix=119 expect_vx=136
+PRIOPROBE label=scan-0.5 epics=64 applied=Realtime getsched_rc=0 policy=1 posix=120 taskprio_rc=0 vx=135 expect_posix=120 expect_vx=135
+PRIOPROBE label=scan-0.2 epics=65 applied=Realtime getsched_rc=0 policy=1 posix=121 taskprio_rc=0 vx=134 expect_posix=121 expect_vx=134
+PRIOPROBE label=scan-0.1 epics=66 applied=Realtime getsched_rc=0 policy=1 posix=122 taskprio_rc=0 vx=133 expect_posix=122 expect_vx=133
+PRIOPROBE label=status-pv epics=10 applied=Realtime getsched_rc=0 policy=1 posix=66 taskprio_rc=0 vx=189 expect_posix=66 expect_vx=189
+PRIOPROBE label=CAS-TCP epics=18 applied=Realtime getsched_rc=0 policy=1 posix=74 taskprio_rc=0 vx=181 expect_posix=74 expect_vx=181
+PRIOPROBE label=CAS-UDP epics=16 applied=Realtime getsched_rc=0 policy=1 posix=72 taskprio_rc=0 vx=183 expect_posix=72 expect_vx=183
+realtime-ca-ioc: calink resolver installed — 4/4 ca:// record links registered (UPSTREAM:AI, UPSTREAM:AO, UPSTREAM:FAST, UPSTREAM:OTHER); ` CA`-modified and ca://... INP/OUT resolve over EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out on this target)
+realtime-ca-ioc: RTEMS:AO
+realtime-ca-ioc: RTEMS:CA:C1
+realtime-ca-ioc: RTEMS:CA:C2
+realtime-ca-ioc: RTEMS:CA:C3
+realtime-ca-ioc: RTEMS:CA:C4
+realtime-ca-ioc: RTEMS:CA:C5
+realtime-ca-ioc: RTEMS:CA:C6
+realtime-ca-ioc: RTEMS:CA:C7
+realtime-ca-ioc: RTEMS:CA:C8
+realtime-ca-ioc: RTEMS:CA:DOWN
+realtime-ca-ioc: RTEMS:CA:DOWN2
+realtime-ca-ioc: RTEMS:CA:FAST
+realtime-ca-ioc: RTEMS:CA:OTHER
+realtime-ca-ioc: RTEMS:CA:TICK
+realtime-ca-ioc: RTEMS:CA:UPLNK
+realtime-ca-ioc: RTEMS:E8:CMP
+realtime-ca-ioc: RTEMS:E8:F1
+realtime-ca-ioc: RTEMS:E8:F2
+realtime-ca-ioc: RTEMS:E8:F3
+realtime-ca-ioc: RTEMS:E8:F4
+realtime-ca-ioc: RTEMS:E8:F5
+realtime-ca-ioc: RTEMS:E8:F6
+realtime-ca-ioc: RTEMS:E8:F7
+realtime-ca-ioc: RTEMS:E8:F8
+realtime-ca-ioc: RTEMS:E8:FAN
+realtime-ca-ioc: RTEMS:E8:H
+realtime-ca-ioc: RTEMS:E8:L1
+realtime-ca-ioc: RTEMS:E8:L10
+realtime-ca-ioc: RTEMS:E8:L11
+realtime-ca-ioc: RTEMS:E8:L12
+realtime-ca-ioc: RTEMS:E8:L13
+realtime-ca-ioc: RTEMS:E8:L14
+realtime-ca-ioc: RTEMS:E8:L15
+realtime-ca-ioc: RTEMS:E8:L16
+realtime-ca-ioc: RTEMS:E8:L17
+realtime-ca-ioc: RTEMS:E8:L18
+realtime-ca-ioc: RTEMS:E8:L19
+realtime-ca-ioc: RTEMS:E8:L2
+realtime-ca-ioc: RTEMS:E8:L20
+realtime-ca-ioc: RTEMS:E8:L21
+realtime-ca-ioc: RTEMS:E8:L22
+realtime-ca-ioc: RTEMS:E8:L23
+realtime-ca-ioc: RTEMS:E8:L24
+realtime-ca-ioc: RTEMS:E8:L25
+realtime-ca-ioc: RTEMS:E8:L26
+realtime-ca-ioc: RTEMS:E8:L27
+realtime-ca-ioc: RTEMS:E8:L28
+realtime-ca-ioc: RTEMS:E8:L29
+realtime-ca-ioc: RTEMS:E8:L3
+realtime-ca-ioc: RTEMS:E8:L30
+realtime-ca-ioc: RTEMS:E8:L31
+realtime-ca-ioc: RTEMS:E8:L32
+realtime-ca-ioc: RTEMS:E8:L4
+realtime-ca-ioc: RTEMS:E8:L5
+realtime-ca-ioc: RTEMS:E8:L6
+realtime-ca-ioc: RTEMS:E8:L7
+realtime-ca-ioc: RTEMS:E8:L8
+realtime-ca-ioc: RTEMS:E8:L9
+realtime-ca-ioc: RTEMS:E8:SA
+realtime-ca-ioc: RTEMS:E8:WF
+realtime-ca-ioc: RTEMS:E8:WF2
+realtime-ca-ioc: RTEMS:E8:WFBIG
+realtime-ca-ioc: RTEMS:LO
+realtime-ca-ioc: RTEMS:MSG
+C6 probe: tick task on the callback band writing RTEMS:CA:TICK every 200 ms
+C6 probe: EPICS_CA_NAME_SERVERS=10.0.2.2:15076 (compiled in), EPICS_CA_ADDR_LIST empty, EPICS_CA_AUTO_ADDR_LIST=NO; reporting every 10 s
+PRIOPROBE label=c6-probe epics=10 applied=Realtime getsched_rc=0 policy=1 posix=66 taskprio_rc=0 vx=189 expect_posix=66 expect_vx=189
+FDPROBE seq=1 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=1 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=1 links=4 circuits=Some(0)
+C6 seq=1 dialpool workers=1 attempts=1 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MONPROBE seq=1 COLLAPSED=0
+C6 seq=1 link pv=UPSTREAM:AI connected=false
+C6 seq=1 link pv=UPSTREAM:AO connected=false
+C6 seq=1 link pv=UPSTREAM:FAST connected=false
+C6 seq=1 link pv=UPSTREAM:OTHER connected=false
+C6 seq=1 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=1 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=1 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=1 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=1 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=1 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=2 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=2 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=2 links=4 circuits=Some(0)
+C6 seq=2 dialpool workers=1 attempts=1 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MONPROBE seq=2 COLLAPSED=0
+C6 seq=2 link pv=UPSTREAM:AI connected=false
+C6 seq=2 link pv=UPSTREAM:AO connected=false
+C6 seq=2 link pv=UPSTREAM:FAST connected=false
+C6 seq=2 link pv=UPSTREAM:OTHER connected=false
+C6 seq=2 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=2 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=2 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=2 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=2 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=2 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+DIALPROBE submit n=2 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=2 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=3 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=3 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=3 links=4 circuits=Some(0)
+C6 seq=3 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MONPROBE seq=3 COLLAPSED=0
+C6 seq=3 link pv=UPSTREAM:AI connected=false
+C6 seq=3 link pv=UPSTREAM:AO connected=false
+C6 seq=3 link pv=UPSTREAM:FAST connected=false
+C6 seq=3 link pv=UPSTREAM:OTHER connected=false
+C6 seq=3 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=3 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=3 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=3 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=3 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=3 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=4 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=4 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=4 links=4 circuits=Some(0)
+C6 seq=4 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MONPROBE seq=4 COLLAPSED=0
+C6 seq=4 link pv=UPSTREAM:AI connected=false
+C6 seq=4 link pv=UPSTREAM:AO connected=false
+C6 seq=4 link pv=UPSTREAM:FAST connected=false
+C6 seq=4 link pv=UPSTREAM:OTHER connected=false
+C6 seq=4 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=4 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=4 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=4 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=4 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=4 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=5 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=5 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=5 links=4 circuits=Some(0)
+C6 seq=5 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MONPROBE seq=5 COLLAPSED=0
+C6 seq=5 link pv=UPSTREAM:AI connected=false
+C6 seq=5 link pv=UPSTREAM:AO connected=false
+C6 seq=5 link pv=UPSTREAM:FAST connected=false
+C6 seq=5 link pv=UPSTREAM:OTHER connected=false
+C6 seq=5 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=5 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=5 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=5 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=5 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=5 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+PRIOPROBE label=CAS-client 0 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+PRIOPROBE label=CAS-event 0 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+PRIOPROBE label=CAS-client 1 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+PRIOPROBE label=CAS-event 1 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+PRIOPROBE label=CAS-client 2 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+PRIOPROBE label=CAS-event 2 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+PRIOPROBE label=CAS-client 3 epics=20 applied=Realtime getsched_rc=0 policy=1 posix=76 taskprio_rc=0 vx=179 expect_posix=76 expect_vx=179
+DIALPROBE submit n=3 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=3 target=10.0.2.2:15076 elapsed_ms=16 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+INFO  epics_base_rs::errlog: dbProcess: RTEMS:E8:L16 not processed, link chain depth limit 16 exceeded
+
+DIALPROBE submit n=4 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=4 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+DIALPROBE submit n=5 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=5 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+DIALPROBE submit n=6 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=6 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+DIALPROBE submit n=7 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=7 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+PRIOPROBE label=CAS-event 3 epics=19 applied=Realtime getsched_rc=0 policy=1 posix=75 taskprio_rc=0 vx=180 expect_posix=75 expect_vx=180
+DIALPROBE submit n=8 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=8 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=6 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=6 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=6 links=4 circuits=Some(0)
+C6 seq=6 dialpool workers=1 attempts=8 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=215539712
+MONPROBE seq=6 COLLAPSED=448
+C6 seq=6 link pv=UPSTREAM:AI connected=false
+C6 seq=6 link pv=UPSTREAM:AO connected=false
+C6 seq=6 link pv=UPSTREAM:FAST connected=false
+C6 seq=6 link pv=UPSTREAM:OTHER connected=false
+C6 seq=6 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=6 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=6 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=6 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=6 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=6 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDCENSUS begin tag=c6-6
+FDCENSUS tag=c6-6 fd=0 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-6 fd=1 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-6 fd=2 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-6 fd=3 kind=tcp so_type=1 listening=1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS tag=c6-6 fd=4 kind=udp so_type=2 listening=-1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS tag=c6-6 fd=5 kind=tcp so_type=1 listening=0 local=10.0.2.15:5064 peer=10.0.2.2:40268 mode=0140666
+FDCENSUS tag=c6-6 fd=6 kind=tcp so_type=1 listening=0 local=10.0.2.15:5064 peer=10.0.2.2:40284 mode=0140666
+FDCENSUS tag=c6-6 fd=7 kind=tcp so_type=1 listening=0 local=10.0.2.15:5064 peer=10.0.2.2:40296 mode=0140666
+FDCENSUS tag=c6-6 fd=8 kind=tcp so_type=1 listening=0 local=10.0.2.15:5064 peer=10.0.2.2:40306 mode=0140666
+FDCENSUS end tag=c6-6 open=9 max=1000
+TASKDUMP begin tag=c6-6 count=27 capacity=unbounded dropped=0 source=registry
+TASKDUMP scope tag=c6-6 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+TASKDUMP tag=c6-6 id=0x00010000 prio=220 name=iRealtime-ca-ioc stack_high=19728 stack_margin=45808
+TASKDUMP tag=c6-6 id=0x00010017 prio=140 name=cbLow stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-6 id=0x0001001b prio=135 name=cbMedium stack_high=206800 stack_margin=1890352
+TASKDUMP tag=c6-6 id=0x0001005f prio=150 name=CAC-dial 0 stack_high=3248 stack_margin=521040
+TASKDUMP tag=c6-6 id=0x0001001f prio=128 name=cbHigh stack_high=3680 stack_margin=2093472
+TASKDUMP tag=c6-6 id=0x00010023 prio=129 name=cbTimer stack_high=3456 stack_margin=1045120
+TASKDUMP tag=c6-6 id=0x00010027 prio=132 name=scanOnce stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-6 id=0x00010034 prio=189 name=scan-owner stack_high=6664 stack_margin=1041912
+TASKDUMP tag=c6-6 id=0x00010081 prio=139 name=scan-10 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010085 prio=138 name=scan-5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010089 prio=137 name=scan-2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x0001008d prio=136 name=scan-1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010091 prio=135 name=scan-0.5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010095 prio=134 name=scan-0.2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010099 prio=133 name=scan-0.1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-6 id=0x00010038 prio=189 name=status-pv stack_high=4176 stack_margin=520112
+TASKDUMP tag=c6-6 id=0x0001003c prio=181 name=CAS-TCP stack_high=5568 stack_margin=1043008
+TASKDUMP tag=c6-6 id=0x00010040 prio=183 name=CAS-UDP stack_high=5056 stack_margin=1043520
+TASKDUMP tag=c6-6 id=0x000100a4 prio=189 name=c6-probe stack_high=4544 stack_margin=1044032
+TASKDUMP tag=c6-6 id=0x000300fd prio=179 name=CAS-client 0 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-6 id=0x00040046 prio=180 name=CAS-event 0 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-6 id=0x00040049 prio=179 name=CAS-client 1 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-6 id=0x000400aa prio=180 name=CAS-event 1 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-6 id=0x000400b4 prio=179 name=CAS-client 2 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-6 id=0x000400b8 prio=180 name=CAS-event 2 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-6 id=0x000400c0 prio=179 name=CAS-client 3 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-6 id=0x000400c4 prio=180 name=CAS-event 3 stack_high=7176 stack_margin=1041400
+TASKDUMP end tag=c6-6
+STACKUSE begin tag=c6-6 count=27 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-6 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-6 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-6 id=0x00010017 name=cbLow size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-6 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-6 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-6 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-6 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-6 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-6 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-6 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010038 name=status-pv size=524288 current=1520 high=4176 margin=520112
+STACKUSE tag=c6-6 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=5568 margin=1043008
+STACKUSE tag=c6-6 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-6 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-6 id=0x000300fd name=CAS-client 0 size=2097152 current=6096 high=65400 margin=2031752
+STACKUSE tag=c6-6 id=0x00040046 name=CAS-event 0 size=1048576 current=2736 high=7176 margin=1041400
+STACKUSE tag=c6-6 id=0x00040049 name=CAS-client 1 size=2097152 current=6096 high=65400 margin=2031752
+STACKUSE tag=c6-6 id=0x000400aa name=CAS-event 1 size=1048576 current=2736 high=7176 margin=1041400
+STACKUSE tag=c6-6 id=0x000400b4 name=CAS-client 2 size=2097152 current=6096 high=65400 margin=2031752
+STACKUSE tag=c6-6 id=0x000400b8 name=CAS-event 2 size=1048576 current=2736 high=7176 margin=1041400
+STACKUSE tag=c6-6 id=0x000400c0 name=CAS-client 3 size=2097152 current=6096 high=65400 margin=2031752
+STACKUSE tag=c6-6 id=0x000400c4 name=CAS-event 3 size=1048576 current=2736 high=7176 margin=1041400
+STACKUSE end tag=c6-6
+DIALPROBE submit n=9 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=9 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=7 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=7 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=7 links=4 circuits=Some(0)
+C6 seq=7 dialpool workers=1 attempts=9 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=214425600
+MONPROBE seq=7 COLLAPSED=448
+C6 seq=7 link pv=UPSTREAM:AI connected=false
+C6 seq=7 link pv=UPSTREAM:AO connected=false
+C6 seq=7 link pv=UPSTREAM:FAST connected=false
+C6 seq=7 link pv=UPSTREAM:OTHER connected=false
+C6 seq=7 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=7 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=7 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=7 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=7 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=7 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=8 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=8 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=8 links=4 circuits=Some(0)
+C6 seq=8 dialpool workers=1 attempts=9 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=214425600
+MONPROBE seq=8 COLLAPSED=448
+C6 seq=8 link pv=UPSTREAM:AI connected=false
+C6 seq=8 link pv=UPSTREAM:AO connected=false
+C6 seq=8 link pv=UPSTREAM:FAST connected=false
+C6 seq=8 link pv=UPSTREAM:OTHER connected=false
+C6 seq=8 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=8 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=8 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=8 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=8 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=8 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+DIALPROBE submit n=10 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=10 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=9 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=9 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=9 links=4 circuits=Some(0)
+C6 seq=9 dialpool workers=1 attempts=10 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=214425600
+MONPROBE seq=9 COLLAPSED=448
+C6 seq=9 link pv=UPSTREAM:AI connected=false
+C6 seq=9 link pv=UPSTREAM:AO connected=false
+C6 seq=9 link pv=UPSTREAM:FAST connected=false
+C6 seq=9 link pv=UPSTREAM:OTHER connected=false
+C6 seq=9 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=9 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=9 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=9 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=9 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=9 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=10 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=10 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=10 links=4 circuits=Some(0)
+C6 seq=10 dialpool workers=1 attempts=10 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=214425600
+MONPROBE seq=10 COLLAPSED=448
+C6 seq=10 link pv=UPSTREAM:AI connected=false
+C6 seq=10 link pv=UPSTREAM:AO connected=false
+C6 seq=10 link pv=UPSTREAM:FAST connected=false
+C6 seq=10 link pv=UPSTREAM:OTHER connected=false
+C6 seq=10 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=10 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=10 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=10 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=10 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=10 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+DIALPROBE submit n=11 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=11 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=11 FD_CNT=9 FD_MAX=1000 CA_CONN_CNT=4
+POOLPROBE seq=11 BUSY=4 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=4
+C6 seq=11 links=4 circuits=Some(0)
+C6 seq=11 dialpool workers=1 attempts=11 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=214425600
+MONPROBE seq=11 COLLAPSED=448
+C6 seq=11 link pv=UPSTREAM:AI connected=false
+C6 seq=11 link pv=UPSTREAM:AO connected=false
+C6 seq=11 link pv=UPSTREAM:FAST connected=false
+C6 seq=11 link pv=UPSTREAM:OTHER connected=false
+C6 seq=11 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=11 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=11 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=11 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=11 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=11 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=12 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=12 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=12 links=4 circuits=Some(0)
+C6 seq=12 dialpool workers=1 attempts=11 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=12 COLLAPSED=448
+C6 seq=12 link pv=UPSTREAM:AI connected=false
+C6 seq=12 link pv=UPSTREAM:AO connected=false
+C6 seq=12 link pv=UPSTREAM:FAST connected=false
+C6 seq=12 link pv=UPSTREAM:OTHER connected=false
+C6 seq=12 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=12 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=12 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=12 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=12 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=12 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDCENSUS begin tag=c6-12
+FDCENSUS tag=c6-12 fd=0 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-12 fd=1 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-12 fd=2 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-12 fd=3 kind=tcp so_type=1 listening=1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS tag=c6-12 fd=4 kind=udp so_type=2 listening=-1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS end tag=c6-12 open=5 max=1000
+TASKDUMP begin tag=c6-12 count=27 capacity=unbounded dropped=0 source=registry
+TASKDUMP scope tag=c6-12 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+TASKDUMP tag=c6-12 id=0x00010000 prio=220 name=iRealtime-ca-ioc stack_high=19728 stack_margin=45808
+TASKDUMP tag=c6-12 id=0x00010017 prio=140 name=cbLow stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-12 id=0x0001001b prio=135 name=cbMedium stack_high=206800 stack_margin=1890352
+TASKDUMP tag=c6-12 id=0x0001005f prio=150 name=CAC-dial 0 stack_high=3248 stack_margin=521040
+TASKDUMP tag=c6-12 id=0x0001001f prio=128 name=cbHigh stack_high=3680 stack_margin=2093472
+TASKDUMP tag=c6-12 id=0x00010023 prio=129 name=cbTimer stack_high=3456 stack_margin=1045120
+TASKDUMP tag=c6-12 id=0x00010027 prio=132 name=scanOnce stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-12 id=0x00010034 prio=189 name=scan-owner stack_high=6664 stack_margin=1041912
+TASKDUMP tag=c6-12 id=0x00010081 prio=139 name=scan-10 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010085 prio=138 name=scan-5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010089 prio=137 name=scan-2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x0001008d prio=136 name=scan-1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010091 prio=135 name=scan-0.5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010095 prio=134 name=scan-0.2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010099 prio=133 name=scan-0.1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-12 id=0x00010038 prio=189 name=status-pv stack_high=4176 stack_margin=520112
+TASKDUMP tag=c6-12 id=0x0001003c prio=181 name=CAS-TCP stack_high=5568 stack_margin=1043008
+TASKDUMP tag=c6-12 id=0x00010040 prio=183 name=CAS-UDP stack_high=5056 stack_margin=1043520
+TASKDUMP tag=c6-12 id=0x000100a4 prio=189 name=c6-probe stack_high=4544 stack_margin=1044032
+TASKDUMP tag=c6-12 id=0x000300fd prio=179 name=CAS-client 0 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-12 id=0x00040046 prio=180 name=CAS-event 0 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-12 id=0x00040049 prio=179 name=CAS-client 1 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-12 id=0x000400aa prio=180 name=CAS-event 1 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-12 id=0x000400b4 prio=179 name=CAS-client 2 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-12 id=0x000400b8 prio=180 name=CAS-event 2 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-12 id=0x000400c0 prio=179 name=CAS-client 3 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-12 id=0x000400c4 prio=180 name=CAS-event 3 stack_high=7176 stack_margin=1041400
+TASKDUMP end tag=c6-12
+STACKUSE begin tag=c6-12 count=27 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-12 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-12 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-12 id=0x00010017 name=cbLow size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-12 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-12 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-12 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-12 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-12 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-12 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-12 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010038 name=status-pv size=524288 current=1520 high=4176 margin=520112
+STACKUSE tag=c6-12 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=5568 margin=1043008
+STACKUSE tag=c6-12 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-12 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-12 id=0x000300fd name=CAS-client 0 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-12 id=0x00040046 name=CAS-event 0 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-12 id=0x00040049 name=CAS-client 1 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-12 id=0x000400aa name=CAS-event 1 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-12 id=0x000400b4 name=CAS-client 2 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-12 id=0x000400b8 name=CAS-event 2 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-12 id=0x000400c0 name=CAS-client 3 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-12 id=0x000400c4 name=CAS-event 3 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE end tag=c6-12
+DIALPROBE submit n=12 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=12 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=13 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=13 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=13 links=4 circuits=Some(0)
+C6 seq=13 dialpool workers=1 attempts=12 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=13 COLLAPSED=448
+C6 seq=13 link pv=UPSTREAM:AI connected=false
+C6 seq=13 link pv=UPSTREAM:AO connected=false
+C6 seq=13 link pv=UPSTREAM:FAST connected=false
+C6 seq=13 link pv=UPSTREAM:OTHER connected=false
+C6 seq=13 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=13 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=13 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=13 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=13 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=13 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=14 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=14 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=14 links=4 circuits=Some(0)
+C6 seq=14 dialpool workers=1 attempts=12 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=14 COLLAPSED=448
+C6 seq=14 link pv=UPSTREAM:AI connected=false
+C6 seq=14 link pv=UPSTREAM:AO connected=false
+C6 seq=14 link pv=UPSTREAM:FAST connected=false
+C6 seq=14 link pv=UPSTREAM:OTHER connected=false
+C6 seq=14 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=14 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=14 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=14 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=14 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=14 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+rtpShow
+
+       NAME                  ID              STATE       OPTIONS   TASK CNT
+-------------------- ------------------ --------------- ---------- --------
+< ealtime-ca-ioc.vxe 0xffff800008c42000 STATE_NORMAL           0x1       27
+
+RTP address space: overlapped
+RTP code region:   8796090925056 bytes (0x200000-0x80000000000)
+
+value = 1 = 0x1
+-> FDPROBE seq=15 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=15 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=15 links=4 circuits=Some(0)
+C6 seq=15 dialpool workers=1 attempts=12 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=15 COLLAPSED=448
+C6 seq=15 link pv=UPSTREAM:AI connected=false
+C6 seq=15 link pv=UPSTREAM:AO connected=false
+C6 seq=15 link pv=UPSTREAM:FAST connected=false
+C6 seq=15 link pv=UPSTREAM:OTHER connected=false
+C6 seq=15 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=15 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=15 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=15 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=15 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=15 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+edrShow
+ERROR LOG
+=========
+Log Size:         12288 bytes (0 pages)
+Record Size:      4096 bytes
+Max Records:      2
+CPU Type:         0xc1
+Errors Missed:    0 (old) + 0 (recent)
+Error count:      1
+Boot count:       1
+Generation count: 1
+
+==[1/1]==============================================================
+Severity/Facility:   INFO/BOOT
+Boot Cycle:          1
+OS Version:          7
+CPU Number:          0
+Time:                Thu Jan  1 00:00:00 1970 (ticks = 0)
+Task:                "tRootTask" (0xffffffff9f104000)
+Injection Point:     ../../qemuVsb/krnl/configlette/edrStub.c:122
+
+System Booted - cold boot
+value = 0 = 0x0
+-> DIALPROBE submit n=13 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=13 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=16 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=16 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=16 links=4 circuits=Some(0)
+C6 seq=16 dialpool workers=1 attempts=13 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=16 COLLAPSED=448
+C6 seq=16 link pv=UPSTREAM:AI connected=false
+C6 seq=16 link pv=UPSTREAM:AO connected=false
+C6 seq=16 link pv=UPSTREAM:FAST connected=false
+C6 seq=16 link pv=UPSTREAM:OTHER connected=false
+C6 seq=16 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=16 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=16 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=16 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=16 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=16 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=17 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=17 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=17 links=4 circuits=Some(0)
+C6 seq=17 dialpool workers=1 attempts=13 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=17 COLLAPSED=448
+C6 seq=17 link pv=UPSTREAM:AI connected=false
+C6 seq=17 link pv=UPSTREAM:AO connected=false
+C6 seq=17 link pv=UPSTREAM:FAST connected=false
+C6 seq=17 link pv=UPSTREAM:OTHER connected=false
+C6 seq=17 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=17 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=17 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=17 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=17 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=17 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=18 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=18 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=18 links=4 circuits=Some(0)
+C6 seq=18 dialpool workers=1 attempts=13 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=18 COLLAPSED=448
+C6 seq=18 link pv=UPSTREAM:AI connected=false
+C6 seq=18 link pv=UPSTREAM:AO connected=false
+C6 seq=18 link pv=UPSTREAM:FAST connected=false
+C6 seq=18 link pv=UPSTREAM:OTHER connected=false
+C6 seq=18 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=18 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=18 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=18 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=18 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=18 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDCENSUS begin tag=c6-18
+FDCENSUS tag=c6-18 fd=0 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-18 fd=1 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-18 fd=2 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-18 fd=3 kind=tcp so_type=1 listening=1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS tag=c6-18 fd=4 kind=udp so_type=2 listening=-1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS end tag=c6-18 open=5 max=1000
+TASKDUMP begin tag=c6-18 count=27 capacity=unbounded dropped=0 source=registry
+TASKDUMP scope tag=c6-18 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+TASKDUMP tag=c6-18 id=0x00010000 prio=220 name=iRealtime-ca-ioc stack_high=19728 stack_margin=45808
+TASKDUMP tag=c6-18 id=0x00010017 prio=140 name=cbLow stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-18 id=0x0001001b prio=135 name=cbMedium stack_high=206800 stack_margin=1890352
+TASKDUMP tag=c6-18 id=0x0001005f prio=150 name=CAC-dial 0 stack_high=3248 stack_margin=521040
+TASKDUMP tag=c6-18 id=0x0001001f prio=128 name=cbHigh stack_high=3680 stack_margin=2093472
+TASKDUMP tag=c6-18 id=0x00010023 prio=129 name=cbTimer stack_high=3456 stack_margin=1045120
+TASKDUMP tag=c6-18 id=0x00010027 prio=132 name=scanOnce stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-18 id=0x00010034 prio=189 name=scan-owner stack_high=6664 stack_margin=1041912
+TASKDUMP tag=c6-18 id=0x00010081 prio=139 name=scan-10 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010085 prio=138 name=scan-5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010089 prio=137 name=scan-2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x0001008d prio=136 name=scan-1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010091 prio=135 name=scan-0.5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010095 prio=134 name=scan-0.2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010099 prio=133 name=scan-0.1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-18 id=0x00010038 prio=189 name=status-pv stack_high=4176 stack_margin=520112
+TASKDUMP tag=c6-18 id=0x0001003c prio=181 name=CAS-TCP stack_high=5568 stack_margin=1043008
+TASKDUMP tag=c6-18 id=0x00010040 prio=183 name=CAS-UDP stack_high=5056 stack_margin=1043520
+TASKDUMP tag=c6-18 id=0x000100a4 prio=189 name=c6-probe stack_high=4544 stack_margin=1044032
+TASKDUMP tag=c6-18 id=0x000300fd prio=179 name=CAS-client 0 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-18 id=0x00040046 prio=180 name=CAS-event 0 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-18 id=0x00040049 prio=179 name=CAS-client 1 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-18 id=0x000400aa prio=180 name=CAS-event 1 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-18 id=0x000400b4 prio=179 name=CAS-client 2 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-18 id=0x000400b8 prio=180 name=CAS-event 2 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-18 id=0x000400c0 prio=179 name=CAS-client 3 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-18 id=0x000400c4 prio=180 name=CAS-event 3 stack_high=7176 stack_margin=1041400
+TASKDUMP end tag=c6-18
+STACKUSE begin tag=c6-18 count=27 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-18 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-18 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-18 id=0x00010017 name=cbLow size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-18 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-18 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-18 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-18 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-18 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-18 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-18 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-18 id=0x00010038 name=status-pv size=524288 current=1520 high=4176 margin=520112
+STACKUSE tag=c6-18 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=5568 margin=1043008
+STACKUSE tag=c6-18 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-18 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-18 id=0x000300fd name=CAS-client 0 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-18 id=0x00040046 name=CAS-event 0 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-18 id=0x00040049 name=CAS-client 1 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-18 id=0x000400aa name=CAS-event 1 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-18 id=0x000400b4 name=CAS-client 2 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-18 id=0x000400b8 name=CAS-event 2 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-18 id=0x000400c0 name=CAS-client 3 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-18 id=0x000400c4 name=CAS-event 3 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE end tag=c6-18
+DIALPROBE submit n=14 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=14 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=19 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=19 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=19 links=4 circuits=Some(0)
+C6 seq=19 dialpool workers=1 attempts=14 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=19 COLLAPSED=448
+C6 seq=19 link pv=UPSTREAM:AI connected=false
+C6 seq=19 link pv=UPSTREAM:AO connected=false
+C6 seq=19 link pv=UPSTREAM:FAST connected=false
+C6 seq=19 link pv=UPSTREAM:OTHER connected=false
+C6 seq=19 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=19 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=19 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=19 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=19 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=19 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=20 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=20 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=20 links=4 circuits=Some(0)
+C6 seq=20 dialpool workers=1 attempts=14 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=20 COLLAPSED=448
+C6 seq=20 link pv=UPSTREAM:AI connected=false
+C6 seq=20 link pv=UPSTREAM:AO connected=false
+C6 seq=20 link pv=UPSTREAM:FAST connected=false
+C6 seq=20 link pv=UPSTREAM:OTHER connected=false
+C6 seq=20 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=20 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=20 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=20 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=20 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=20 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=21 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=21 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=21 links=4 circuits=Some(0)
+C6 seq=21 dialpool workers=1 attempts=14 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=21 COLLAPSED=448
+C6 seq=21 link pv=UPSTREAM:AI connected=false
+C6 seq=21 link pv=UPSTREAM:AO connected=false
+C6 seq=21 link pv=UPSTREAM:FAST connected=false
+C6 seq=21 link pv=UPSTREAM:OTHER connected=false
+C6 seq=21 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=21 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=21 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=21 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=21 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=21 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+DIALPROBE submit n=15 target=10.0.2.2:15076 workers=1 queued=1 dialing=0
+DIALPROBE resolve n=15 target=10.0.2.2:15076 elapsed_ms=0 outcome=error:connection refused (os error 61)
+WARN  epics_ca_rs::client::transport: TCP connect failed server=10.0.2.2:15076 error=connection refused (os error 61)
+FDPROBE seq=22 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=22 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=22 links=4 circuits=Some(0)
+C6 seq=22 dialpool workers=1 attempts=15 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=22 COLLAPSED=448
+C6 seq=22 link pv=UPSTREAM:AI connected=false
+C6 seq=22 link pv=UPSTREAM:AO connected=false
+C6 seq=22 link pv=UPSTREAM:FAST connected=false
+C6 seq=22 link pv=UPSTREAM:OTHER connected=false
+C6 seq=22 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=22 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=22 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=22 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=22 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=22 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=23 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=23 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=23 links=4 circuits=Some(0)
+C6 seq=23 dialpool workers=1 attempts=15 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=23 COLLAPSED=448
+C6 seq=23 link pv=UPSTREAM:AI connected=false
+C6 seq=23 link pv=UPSTREAM:AO connected=false
+C6 seq=23 link pv=UPSTREAM:FAST connected=false
+C6 seq=23 link pv=UPSTREAM:OTHER connected=false
+C6 seq=23 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=23 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=23 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=23 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=23 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=23 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDPROBE seq=24 FD_CNT=5 FD_MAX=1000 CA_CONN_CNT=0
+POOLPROBE seq=24 BUSY=0 SETS=4 CAP=141 WORKERS=8 REFUSED=0 CONNS=0
+C6 seq=24 links=4 circuits=Some(0)
+C6 seq=24 dialpool workers=1 attempts=15 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=204988416
+MONPROBE seq=24 COLLAPSED=448
+C6 seq=24 link pv=UPSTREAM:AI connected=false
+C6 seq=24 link pv=UPSTREAM:AO connected=false
+C6 seq=24 link pv=UPSTREAM:FAST connected=false
+C6 seq=24 link pv=UPSTREAM:OTHER connected=false
+C6 seq=24 record RTEMS:CA:DOWN VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=24 record RTEMS:CA:DOWN2 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=24 record RTEMS:CA:UPLNK VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=24 record RTEMS:CA:FAST VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=24 record RTEMS:CA:C8 VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+C6 seq=24 record RTEMS:CA:OTHER VAL=Ok("0") SEVR=Ok("3") STAT=Ok("17")
+FDCENSUS begin tag=c6-24
+FDCENSUS tag=c6-24 fd=0 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-24 fd=1 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-24 fd=2 kind=chardev mode=020666 rdev=0
+FDCENSUS tag=c6-24 fd=3 kind=tcp so_type=1 listening=1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS tag=c6-24 fd=4 kind=udp so_type=2 listening=-1 local=0.0.0.0:5064 peer=none(errno=57) mode=0140666
+FDCENSUS end tag=c6-24 open=5 max=1000
+TASKDUMP begin tag=c6-24 count=27 capacity=unbounded dropped=0 source=registry
+TASKDUMP scope tag=c6-24 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+TASKDUMP tag=c6-24 id=0x00010000 prio=220 name=iRealtime-ca-ioc stack_high=19728 stack_margin=45808
+TASKDUMP tag=c6-24 id=0x00010017 prio=140 name=cbLow stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-24 id=0x0001001b prio=135 name=cbMedium stack_high=206800 stack_margin=1890352
+TASKDUMP tag=c6-24 id=0x0001005f prio=150 name=CAC-dial 0 stack_high=3248 stack_margin=521040
+TASKDUMP tag=c6-24 id=0x0001001f prio=128 name=cbHigh stack_high=3680 stack_margin=2093472
+TASKDUMP tag=c6-24 id=0x00010023 prio=129 name=cbTimer stack_high=3456 stack_margin=1045120
+TASKDUMP tag=c6-24 id=0x00010027 prio=132 name=scanOnce stack_high=3392 stack_margin=2093760
+TASKDUMP tag=c6-24 id=0x00010034 prio=189 name=scan-owner stack_high=6664 stack_margin=1041912
+TASKDUMP tag=c6-24 id=0x00010081 prio=139 name=scan-10 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010085 prio=138 name=scan-5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010089 prio=137 name=scan-2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x0001008d prio=136 name=scan-1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010091 prio=135 name=scan-0.5 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010095 prio=134 name=scan-0.2 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010099 prio=133 name=scan-0.1 stack_high=4544 stack_margin=2092608
+TASKDUMP tag=c6-24 id=0x00010038 prio=189 name=status-pv stack_high=4176 stack_margin=520112
+TASKDUMP tag=c6-24 id=0x0001003c prio=181 name=CAS-TCP stack_high=5568 stack_margin=1043008
+TASKDUMP tag=c6-24 id=0x00010040 prio=183 name=CAS-UDP stack_high=5056 stack_margin=1043520
+TASKDUMP tag=c6-24 id=0x000100a4 prio=189 name=c6-probe stack_high=4544 stack_margin=1044032
+TASKDUMP tag=c6-24 id=0x000300fd prio=179 name=CAS-client 0 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-24 id=0x00040046 prio=180 name=CAS-event 0 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-24 id=0x00040049 prio=179 name=CAS-client 1 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-24 id=0x000400aa prio=180 name=CAS-event 1 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-24 id=0x000400b4 prio=179 name=CAS-client 2 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-24 id=0x000400b8 prio=180 name=CAS-event 2 stack_high=7176 stack_margin=1041400
+TASKDUMP tag=c6-24 id=0x000400c0 prio=179 name=CAS-client 3 stack_high=65400 stack_margin=2031752
+TASKDUMP tag=c6-24 id=0x000400c4 prio=180 name=CAS-event 3 stack_high=7176 stack_margin=1041400
+TASKDUMP end tag=c6-24
+STACKUSE begin tag=c6-24 count=27 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-24 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-24 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-24 id=0x00010017 name=cbLow size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-24 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-24 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-24 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-24 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-24 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3392 margin=2093760
+STACKUSE tag=c6-24 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-24 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-24 id=0x00010038 name=status-pv size=524288 current=1520 high=4176 margin=520112
+STACKUSE tag=c6-24 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=5568 margin=1043008
+STACKUSE tag=c6-24 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-24 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-24 id=0x000300fd name=CAS-client 0 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-24 id=0x00040046 name=CAS-event 0 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-24 id=0x00040049 name=CAS-client 1 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-24 id=0x000400aa name=CAS-event 1 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-24 id=0x000400b4 name=CAS-client 2 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-24 id=0x000400b8 name=CAS-event 2 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE tag=c6-24 id=0x000400c0 name=CAS-client 3 size=2097152 current=1536 high=65400 margin=2031752
+STACKUSE tag=c6-24 id=0x000400c4 name=CAS-event 3 size=1048576 current=1536 high=7176 margin=1041400
+STACKUSE end tag=c6-24

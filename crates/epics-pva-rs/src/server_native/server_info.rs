@@ -33,7 +33,7 @@
 //! `server` PV is reachable by direct connect but invisible to
 //! broadcast discovery.
 //!
-//! Registered automatically by [`crate::server_native::PvaServer::start`]
+//! Registered automatically by `PvaServer::start`
 //! at `order = -1`, BEFORE default-order (0) user sources, so the
 //! reserved `server` name reaches diagnostics (pvxs parity). It claims
 //! only `server`, so all other names still fall through to user sources;

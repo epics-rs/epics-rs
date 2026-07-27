@@ -41,6 +41,69 @@
 //! * MUST NOT: any pending event live outside `SubQ::events`. There is no side
 //!   slot; a monitor's newest event is `events.back()` — C's `*pLastLog` —
 //!   whether it got there by append or by in-place replace.
+//! * MUST: a subscription that has ever carried a value too wide for C's
+//!   `union native_value` holds at most ONE pending entry (`latest_only`).
+//!   This is what bounds the queue in **bytes**, not just in entries — see
+//!   below.
+//!
+//! # Why an entry bound is not a memory bound
+//!
+//! C's ring bounds entries: `EVENTQUESIZE` of them, `EVENTENTRIES` reserved
+//! per monitor. It gets away with that because an entry is a fixed-size
+//! `db_field_log`. For anything wider than `union native_value` — every array
+//! field — `db_create_field_log` (`dbEvent.c:726-732`) takes the
+//! `dbfl_type_ref` branch and copies **nothing**:
+//!
+//! ```c
+//! pLog->type = dbfl_type_ref;
+//! /* don't make a copy yet, just reference the field value */
+//! pLog->u.r.field = dbChannelField(chan);
+//! /* indicate field value still owned by record */
+//! pLog->dtor = NULL;
+//! ```
+//!
+//! and `db_queue_event_log` then refuses to queue a second one
+//! (`dbEvent.c:786-799`), because a reference already queued will read the
+//! record's current value when it is finally delivered:
+//!
+//! ```c
+//! /* if we have an event on the queue and both the last
+//!  * event on the queue and the current event reference
+//!  * a record field, simply ignore duplicate events.
+//!  */
+//! if (pevent->npend > 0u
+//!         && !dbfl_has_copy(*pevent->pLastLog)
+//!         && !dbfl_has_copy(pLog)) {
+//!     db_delete_field_log(pLog);
+//!     UNLOCKEVQUE (ev_que);
+//!     return;
+//! }
+//! ```
+//!
+//! So in C a 1 MiB waveform monitor costs one ~100-byte field log, for ever.
+//!
+//! The port cannot store a reference: [`MonitorEvent`] owns its `Snapshot`, and
+//! `dbfl_has_copy` is therefore always true. Ported literally, the entry bound
+//! alone let ONE subscription hold `size - replace_threshold` = 108 whole array
+//! copies before the replace branch engaged — 108 MiB for that same waveform,
+//! per monitor, per circuit. On an embedded target that is not a slow leak but
+//! an allocation failure, and a failed allocation in Rust aborts the process
+//! where C's `freeListCalloc` would merely return NULL.
+//!
+//! Hence `SubQ::latest_only`, C's `useValque == FALSE` reached from the value
+//! rather than from the channel: the first post whose value does not satisfy
+//! [`EpicsValue::queues_by_value`](crate::types::EpicsValue::queues_by_value) latches the subscription into keep-only-the-
+//! latest, and from then on a post with an entry already pending overwrites it
+//! instead of appending. Two consequences, both C's:
+//!
+//! * the subscription's queued bytes are bounded by ONE snapshot, exactly as
+//!   C's are bounded by one field log plus the record's own field;
+//! * the client still receives the newest value, which is what C's surviving
+//!   reference would have read at delivery time.
+//!
+//! The latch is one-way because C's is: `useValque` is decided once, from the
+//! channel's declared element count, and never revisited — a waveform whose
+//! `NORD` happens to fall to 1 does not become queueable in C either.
 //!
 //! # The two decisions, each in exactly one place
 //!
@@ -67,10 +130,15 @@
 //!   one circuit is not fixed. Every quantity C's queue behaviour depends on —
 //!   ring occupancy, `nDuplicates`, `quota`, per-monitor `npend`/`pLastLog` —
 //!   is shared and accounted exactly as in C.
-//! * C's `db_queue_event_log` early-drops a post when both the queued and the
-//!   incoming field log are by-reference with no copy (`dbEvent.c:794-800`).
-//!   Every event here carries an owned `Snapshot` (C `dbfl_has_copy` is always
-//!   true), so that branch cannot be reached.
+//! * C's early-drop (`dbEvent.c:786-799`) keeps the entry already queued and
+//!   discards the incoming one, because the queued one is a live reference.
+//!   The port's entries are owned copies, so keeping the older one would
+//!   deliver a stale value; the latest-only branch keeps the INCOMING event
+//!   instead. The queue depth, and therefore the memory, is C's either way,
+//!   and so is the value the client ends up seeing.
+//! * That branch does not raise `nreplace`, matching C: C's early-drop is not
+//!   a replacement and `dbel` reports 0 discards for a by-reference monitor.
+//!   The port counts it separately as [`EvQue::ncollapse`].
 //! * When a post replaces `*pLastLog`, C frees the displaced field log and with
 //!   it its `mask`. The port ORs the displaced mask into the survivor so a
 //!   class-narrowing consumer still learns which `DBE_*` classes changed since
@@ -134,6 +202,11 @@ pub enum PostOutcome {
     /// so `*pLastLog` was overwritten. The displaced value is never delivered —
     /// one lost monitor event (C `nreplace`).
     Replaced,
+    /// C early-drop branch (`dbEvent.c:786-799`): this subscription keeps only
+    /// its latest entry because it carries values too wide for C's
+    /// `union native_value`, and one was already pending. Depth did not grow.
+    /// Not counted in `nreplace` — C does not count it either.
+    Collapsed,
     /// The subscription is gone (reader dropped, or never attached). Nothing was
     /// queued — the `mpsc::Sender::try_send`-on-closed-channel case.
     Closed,
@@ -146,6 +219,15 @@ struct SubQ {
     events: VecDeque<MonitorEvent>,
     /// C `nreplace` — posts that overwrote `*pLastLog`.
     nreplace: u64,
+    /// C `useValque == FALSE` (`dbEvent.c:492-500`), latched from the first
+    /// value this subscription carried that does not fit `union native_value`.
+    /// While set, the subscription holds at most one pending entry — the rule
+    /// that bounds the queue in bytes (see the module header).
+    latest_only: bool,
+    /// Posts absorbed by the latest-only rule. C's early-drop keeps no counter
+    /// of its own; this one exists so an operator can see that a wide-value
+    /// monitor is shedding updates rather than silently falling behind.
+    ncollapse: u64,
     /// The producer row (`EventSink`) is gone: no further posts can arrive. The
     /// reader still drains what is queued and then sees end-of-stream, exactly
     /// as an `mpsc::Receiver` does when the last `Sender` drops.
@@ -159,9 +241,29 @@ impl SubQ {
         Self {
             events: VecDeque::new(),
             nreplace: 0,
+            latest_only: false,
+            ncollapse: 0,
             producer_gone: false,
             reader_gone: false,
         }
+    }
+
+    /// C `*pevent->pLastLog = pLog` — overwrite this monitor's newest queued
+    /// entry in place. Ring occupancy and `nDuplicates` are untouched by
+    /// construction, so both callers (the flow-control replace and the
+    /// latest-only collapse) stay symmetric without touching queue counters.
+    ///
+    /// Requires `!self.events.is_empty()`; both callers test `npend > 0`.
+    fn overwrite_last(&mut self, event: MonitorEvent) {
+        let last = self
+            .events
+            .back_mut()
+            .expect("npend > 0 ⇒ this monitor has a last log");
+        let displaced = last.mask;
+        *last = event;
+        // The displaced VALUE is gone (C frees it); its event class is kept —
+        // see the module's documented deviations.
+        last.mask |= displaced;
     }
 }
 
@@ -184,7 +286,7 @@ struct QueInner {
     /// queue. The poll-based twin of the `Notify` waiter list: a consumer
     /// that multiplexes MANY subscriptions from ONE task (the QSRV group
     /// drain) parks here instead of holding a `Notified` future per queue.
-    /// Flushed — woken and cleared — by [`EvQue::wake_readers`], the single
+    /// Flushed — woken and cleared — by `EvQue::wake_readers`, the single
     /// owner of reader wakeup, on every transition that can make a parked
     /// read Ready.
     poll_wakers: Vec<std::task::Waker>,
@@ -328,18 +430,26 @@ impl EvQue {
                 return PostOutcome::Closed;
             }
             let npend = sub.events.len();
-            if npend > 0 && (flow_on || ring_space <= threshold) {
+            // C `db_add_event`'s `useValque` decision (`dbEvent.c:492-500`),
+            // taken from the value because the port has no channel here. It is
+            // a latch, not a per-post test: C decides once per subscription and
+            // never revisits it.
+            if !event.snapshot.value.queues_by_value() {
+                sub.latest_only = true;
+            }
+            if sub.latest_only && npend > 0 {
+                // C `db_queue_event_log`'s early-drop (`dbEvent.c:786-799`).
+                // C keeps the queued reference and frees the incoming log; the
+                // port keeps the incoming snapshot, because its queued one is a
+                // copy that would deliver a stale value where C's reference
+                // reads the record. Depth is C's — one entry — either way.
+                sub.overwrite_last(event);
+                sub.ncollapse += 1;
+                PostOutcome::Collapsed
+            } else if npend > 0 && (flow_on || ring_space <= threshold) {
                 // C: `db_delete_field_log(*pLastLog); *pLastLog = pLog;` — the
                 // ring does not grow and the earlier distinct entries stay put.
-                let last = sub
-                    .events
-                    .back_mut()
-                    .expect("npend > 0 ⇒ this monitor has a last log");
-                let displaced = last.mask;
-                *last = event;
-                // The displaced VALUE is gone (C frees it); its event class is
-                // kept — see the module's documented deviations.
-                last.mask |= displaced;
+                sub.overwrite_last(event);
                 sub.nreplace += 1;
                 PostOutcome::Replaced
             } else {
@@ -397,7 +507,7 @@ impl EvQue {
 
     /// Poll-based [`Self::next`]: the same gate and the same delivery, but
     /// instead of suspending on the queue's `Notify` it registers `cx`'s
-    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`].
+    /// waker in [`QueInner::poll_wakers`] and returns [`Poll::Pending`](std::task::Poll::Pending).
     ///
     /// This is what lets ONE task await MANY subscriptions — the QSRV group
     /// drain polls each of its member readers in turn and parks once, its
@@ -406,7 +516,7 @@ impl EvQue {
     /// [`Self::wake_readers`] under the same lock, so a post landing between
     /// the check and the `Pending` return cannot be lost.
     ///
-    /// [`Poll::Ready`]`(None)` matches [`Self::next`]'s `None`: the
+    /// [`Poll::Ready`](std::task::Poll::Ready)`(None)` matches [`Self::next`]'s `None`: the
     /// subscription is detached, or its producer is gone and the queue
     /// drained. An entry withheld by EVENTS_OFF parks exactly where
     /// [`Self::next`] suspends (`flowCtrlMode && nDuplicates == 0`, no drain
@@ -513,6 +623,19 @@ impl EvQue {
     /// C `npend` for one monitor — entries queued and not yet delivered.
     pub fn npend(&self, sid: u32) -> usize {
         self.lock().subs.get(&sid).map_or(0, |s| s.events.len())
+    }
+
+    /// Posts this monitor absorbed under the latest-only rule — the port's
+    /// counter for C's uncounted early-drop (`dbEvent.c:786-799`).
+    pub fn ncollapse(&self, sid: u32) -> u64 {
+        self.lock().subs.get(&sid).map_or(0, |s| s.ncollapse)
+    }
+
+    /// C `useValque == FALSE` for one monitor: it has carried a value too wide
+    /// for `union native_value`, so it keeps only its latest entry. C reports
+    /// the same state as "queueing disabled" in `dbel` (`dbEvent.c:224-226`).
+    pub fn latest_only(&self, sid: u32) -> bool {
+        self.lock().subs.get(&sid).is_some_and(|s| s.latest_only)
     }
 
     /// C `quota` — ring entries reserved by the monitors attached here.
@@ -649,7 +772,7 @@ impl EventReader {
     /// `None`, `Poll::Pending` with `cx`'s waker registered on the queue
     /// where `recv()` suspends. For consumers that multiplex many
     /// subscriptions from one task (the QSRV group drain) — the waker stays
-    /// registered until [`EvQue::wake_readers`] flushes it, so a caller that
+    /// registered until `EvQue::wake_readers` flushes it, so a caller that
     /// polled several readers and parked is woken by whichever queue changes
     /// first.
     pub fn poll_recv(
@@ -727,7 +850,12 @@ mod tests {
 
     fn ev(v: i32) -> MonitorEvent {
         MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::Long(v),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            )),
             origin: 0,
             mask: EventMask::VALUE,
         }
@@ -1128,5 +1256,127 @@ mod tests {
             std::task::Poll::Ready(Some(event)) => assert_eq!(val(&event), 5),
             other => panic!("expected the withheld entry after EVENTS_ON, got {other:?}"),
         }
+    }
+
+    /// A value too wide for C's `union native_value`: a 32-element waveform
+    /// post, tagged with `v` in element 0 so delivery order is checkable.
+    fn wide(v: i32) -> MonitorEvent {
+        let mut arr = vec![0.0f64; 32];
+        arr[0] = v as f64;
+        MonitorEvent {
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::DoubleArray(arr),
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+            )),
+            origin: 0,
+            mask: EventMask::VALUE,
+        }
+    }
+
+    fn wide_val(e: &MonitorEvent) -> i32 {
+        match e.snapshot.value {
+            EpicsValue::DoubleArray(ref arr) => arr[0] as i32,
+            ref other => panic!("expected DoubleArray, got {other:?}"),
+        }
+    }
+
+    /// The memory bound, at the boundary that used to break it: ring space is
+    /// ABOVE the replace threshold, which is precisely where a narrow monitor
+    /// appends (see `ring_space_above_threshold_appends_distinct_entries`).
+    /// A wide-value monitor must NOT append there — C's early-drop
+    /// (`dbEvent.c:786-799`) caps it at one entry regardless of ring space,
+    /// and that cap is what keeps 108 whole array copies from accumulating.
+    #[epics_macros_rs::epics_test]
+    async fn wide_value_holds_one_entry_however_much_ring_space_is_free() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 1);
+        assert_eq!(
+            sink.post(wide(0)),
+            PostOutcome::Appended { first_event: true },
+            "npend == 0 appends: C has no queued log to drop against"
+        );
+        let posts = event_que_size() * 4;
+        for v in 1..posts as i32 {
+            assert_eq!(
+                sink.post(wide(v)),
+                PostOutcome::Collapsed,
+                "post {v} landed on a non-empty wide-value monitor"
+            );
+        }
+        assert_eq!(reader.npend(), 1, "one snapshot's worth of memory, no more");
+        assert_eq!(reader.queue().n_duplicates(), 0);
+        assert_eq!(
+            reader.queue().nreplace(1),
+            0,
+            "C's early-drop is not a replacement and raises no nreplace"
+        );
+        assert_eq!(reader.queue().ncollapse(1), posts as u64 - 1);
+        assert_eq!(
+            wide_val(&reader.recv().await.unwrap()),
+            posts as i32 - 1,
+            "the client sees the newest value, as C's surviving reference would"
+        );
+        assert!(matches!(reader.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// The latch is one-way, as C's `useValque` is: once a monitor has carried
+    /// a wide value it keeps only the latest even for a narrow post. Without
+    /// this a waveform whose element count dips to a scalar would start
+    /// appending again — C never does, because it decided from the channel's
+    /// declared element count.
+    #[epics_macros_rs::epics_test]
+    async fn wide_value_latch_is_one_way() {
+        let user = EventUser::new();
+        let (sink, reader) = attach(&user, 1);
+        sink.post(wide(0));
+        assert!(reader.queue().latest_only(1));
+        assert_eq!(sink.post(ev(7)), PostOutcome::Collapsed);
+        assert_eq!(sink.post(ev(8)), PostOutcome::Collapsed);
+        assert_eq!(reader.npend(), 1);
+        assert!(reader.queue().latest_only(1));
+    }
+
+    /// The other side of the boundary: a narrow backlog already queued when the
+    /// first wide value arrives. The wide post overwrites the tail rather than
+    /// appending, so the queue holds at most one wide snapshot and the earlier
+    /// distinct narrow entries still go out — the invariant is on wide entries,
+    /// not on depth.
+    #[epics_macros_rs::epics_test]
+    async fn wide_post_onto_a_narrow_backlog_takes_the_tail() {
+        let user = EventUser::new();
+        let (sink, mut reader) = attach(&user, 1);
+        for v in 1..=3 {
+            assert!(matches!(sink.post(ev(v)), PostOutcome::Appended { .. }));
+        }
+        assert_eq!(sink.post(wide(9)), PostOutcome::Collapsed);
+        assert_eq!(reader.npend(), 3, "depth unchanged: the tail was replaced");
+        assert_eq!(val(&reader.try_recv().unwrap()), 1);
+        assert_eq!(val(&reader.try_recv().unwrap()), 2);
+        assert_eq!(
+            wide_val(&reader.try_recv().unwrap()),
+            9,
+            "the third entry is the wide value that displaced ev(3)"
+        );
+        // A second wide post can only land on an empty or already-wide tail, so
+        // two wide snapshots are never pending at once.
+        sink.post(wide(10));
+        sink.post(wide(11));
+        assert_eq!(reader.npend(), 1);
+    }
+
+    /// A monitor that never carries a wide value is untouched by the rule —
+    /// `latest_only` stays clear and the C append/replace ring is unchanged.
+    #[epics_macros_rs::epics_test]
+    async fn narrow_only_monitor_keeps_the_ring_discipline() {
+        let user = EventUser::new();
+        let (sink, reader) = attach(&user, 1);
+        for v in 1..=3 {
+            assert!(matches!(sink.post(ev(v)), PostOutcome::Appended { .. }));
+        }
+        assert!(!reader.queue().latest_only(1));
+        assert_eq!(reader.queue().ncollapse(1), 0);
+        assert_eq!(reader.npend(), 3);
     }
 }

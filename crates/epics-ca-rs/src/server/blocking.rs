@@ -28,7 +28,7 @@
 //!
 //! "Thread-per-client" describes the I/O model, not the thread lifecycle. A
 //! client runs on two threads — the C `camsgtask` receiver and its `event_task`
-//! sender — but it **borrows** them, as one set, from [`CAS_CLIENT_POOL`]; it
+//! sender — but it **borrows** them, as one set, from `CAS_CLIENT_POOL`; it
 //! creates neither. Every `std::thread` *creation* leaves 176–179 B behind
 //! permanently on RTEMS 6, so a driver that created two per accept leaked
 //! without a ceiling (`doc/rtems-connection-worker-pool-design.md`). Borrowing
@@ -38,7 +38,7 @@
 //! the one refusal, taken after `accept` with the socket still open, where C
 //! `rsrv` takes its own (`caservertask.c:1240-1250`). The pool's capacity is
 //! deliberately **one below** the target's descriptor wall so that refusal has
-//! a descriptor to happen on; see [`CAS_CLIENT_POOL_CAPACITY`], where the
+//! a descriptor to happen on; see `CAS_CLIENT_POOL_CAPACITY`, where the
 //! measurement that forced the "one below" is cited.
 //!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
@@ -261,19 +261,72 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 /// * `client` is the TCP receiver, C `camsgtask`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackBig)` at
 ///   `rsrv/caservertask.c:109-111` and at `epicsThreadPriorityCAServerLow`
-///   (`:109`). It runs the full CA command dispatch into the database, so
-///   `Big` is the parity answer, not merely a safe one.
+///   (`:109`). It runs the full CA command dispatch into the database.
+///
+///   **`Big` is C's *class*, but on VxWorks it is not C's *size*, and the
+///   difference is 95×.** [`StackSizeClass::bytes`] implements C's POSIX table
+///   (`libcom/src/osi/os/posix/osdThread.c:506-509`, `STACK_SIZE(f) = f *
+///   0x10000 * sizeof(void *)` over `{1, 2, 4}`), so `Big` is 2,097,152 B on a
+///   64-bit target. C on VxWorks uses an entirely different table
+///   (`libcom/src/osi/os/vxWorks/osdThread.c:63-64`, `{4000, 6000, 11000} *
+///   ARCH_STACK_FACTOR`, and `ARCH_STACK_FACTOR` is 2 for x86_64), so C's
+///   `epicsThreadStackBig` there is **22,000 B**.
+///
+///   We cannot follow C's VxWorks number: the `CAS-client` high-water MEASURED
+///   on `x86_64-wrs-vxworks` is **65,912 B**, three times C's whole `Big`
+///   allowance. That is the port's own cost — `park_on` pins each connection's
+///   async state machine onto this stack — and it is what the class table, not
+///   the class name, has to cover. See §15 of
+///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B proved
+///   invariant across payloads from 8 B to 1,048,576 B, the
+///   `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes, `subArray`, `compress`, the FLNK
+///   recursion at its `MAX_LINK_DEPTH` cap, and six monitors per connection.
+///
+///   **The class is `Medium`, decided from a measurement on BOTH targets this
+///   roster serves.** The second one closed the gap that used to hold this at
+///   `Big`: `armv7-rtems-eabihf` measures **24,432 B**, converged over a
+///   4-client/400-round and an 8-client/500-round run, and inclusive of the
+///   inline FLNK chain. Headroom against `Medium`, which is pointer-width
+///   scaled (`STACK_SIZE(f) = f * 0x10000 * sizeof(void *)`):
+///
+///   | target | high-water | `Medium` | headroom |
+///   |---|---|---|---|
+///   | `x86_64-wrs-vxworks` | 65,912 B | 1,048,576 B | 15.9× |
+///   | `armv7-rtems-eabihf` | 24,432 B | 524,288 B | 21.5× |
+///
+///   Both numbers are only *bounds* because the FLNK recursion is bounded. The
+///   armv7 measurement puts one inline FLNK hop at ~1,934 B and the chainless
+///   floor at 8,960 B, so this high-water rises LINEARLY with the depth of the
+///   user's link graph. `MAX_LINK_DEPTH` is what caps it — and it is now a cap
+///   that announces itself rather than truncating in silence
+///   (`PvDatabase::refuse_bounded_entry`), so it cannot be raised or removed
+///   without the change being visible. **Raising or removing that bound reopens
+///   this stack to the user's DB depth and invalidates both numbers above**;
+///   at ~1,934 B/hop, `Medium` on armv7 covers roughly 266 hops of headroom and
+///   the x86_64 side about half that per byte of pointer width.
+///
+///   What the class buys: reservation, not usage, is the binding resource on
+///   VxWorks (a thread costs its declared stack plus ~1 MiB of reserved address
+///   space), and the measured wall moves **47 → 59** concurrent clients at
+///   `Medium`.
 /// * `event` is the per-client monitor sender, C's `event_task`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
-///   one class below the receiver, because it formats and sends queued events
-///   rather than dispatching commands — and banded one level below it
+///   because it formats and sends queued events rather than dispatching
+///   commands — and banded one level below the receiver
 ///   (`caservertask.c:560`, computed at `:1508`) so a client that stops
 ///   reading cannot starve command dispatch.
+///
+///   This one stays at C's class on one measurement, not two: `CAS-event` on
+///   `armv7-rtems-eabihf` is **3,816 B** (137.4× headroom against that
+///   target's `Medium` of 524,288 B), and no `CAS-event` high-water has been
+///   measured on `x86_64-wrs-vxworks`. Dropping it to `Small` would be a
+///   one-target decision, and this role is not what moves the wall — the
+///   receiver's class is 4× larger in bytes reserved.
 fn client_roster() -> [WorkerRole; 2] {
     [
         WorkerRole {
             suffix: "client",
-            stack: StackSizeClass::Big,
+            stack: StackSizeClass::Medium,
             priority: ThreadPriority::CaServerLow,
         },
         WorkerRole {
@@ -410,7 +463,7 @@ impl BlockingCaServer {
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
     /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
-    /// now stops one short of that, at [`CAS_CLIENT_POOL_CAPACITY`] = 141, so
+    /// now stops one short of that, at `CAS_CLIENT_POOL_CAPACITY` = 141, so
     /// the descriptor client #142 needs to *hear why* is still there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
@@ -422,10 +475,10 @@ impl BlockingCaServer {
     ///
     /// Each accepted connection **borrows** its two threads — the C `camsgtask`
     /// receiver (`caservertask.c:109`) and its event sender — as one set from
-    /// [`CAS_CLIENT_POOL`]; it creates none. Nobody joins a client, and a client
+    /// `CAS_CLIENT_POOL`; it creates none. Nobody joins a client, and a client
     /// returns its set when it disconnects. Borrowing is also the admission
     /// point: a set that cannot be borrowed is a client that cannot be served,
-    /// and is refused through [`refuse_client`] with the socket still open.
+    /// and is refused through `refuse_client` with the socket still open.
     pub fn serve(&self) {
         // The band belongs to the loop, not to whoever spawned the thread:
         // `serve` is what actually blocks here, on every path that reaches it.
@@ -1857,14 +1910,25 @@ mod tests {
             &prod[at..]
         };
         let roster = &roster[..roster.find("\n}").expect("client_roster body")];
-        for class in ["StackSizeClass::Big", "StackSizeClass::Medium"] {
-            assert!(
-                roster.contains(class),
-                "the per-client worker roster must state `{class}`: C creates \
-                 the receiver with epicsThreadStackBig (caservertask.c:109-111) \
-                 and the event task with epicsThreadStackMedium (dbEvent.c:1117)"
-            );
-        }
+        // Every role states a class — checked by counting declarations against
+        // roles, not by naming the classes. Naming them is what this guard used
+        // to do (`Big` for the receiver, from C's
+        // `epicsThreadGetStackSize(epicsThreadStackBig)`,
+        // `caservertask.c:109-111`), and it was the wrong invariant: C's class
+        // NAMES do not carry C's VxWorks byte SIZES (C's `Big` there is
+        // 22,000 B, ours is 2,097,152 B), so the class has to be chosen from
+        // the measured high-water on every target this roster serves. The
+        // reasoning for the current choice is on `client_roster` itself. What
+        // must not regress is a role with no class at all, which is two threads
+        // per client at std's 2 MiB default.
+        let roles = roster.matches("WorkerRole {").count();
+        let classes = roster.matches("stack: StackSizeClass::").count();
+        assert_eq!(
+            classes, roles,
+            "every per-client worker role must state a stack class: {roles} \
+             roles, {classes} classes"
+        );
+        assert!(roles >= 2, "the roster lost a role: {roles}");
     }
 
     /// The RTEMS IOC installs a console subscriber before it does anything
@@ -2337,7 +2401,7 @@ mod tests {
         let mut reply = None;
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_READ_NOTIFY {
-                reply = Some(f);
+                reply = Some(f.to_vec());
             }
         }
         reply.expect("reference produced a READ_NOTIFY reply")
@@ -3402,7 +3466,7 @@ mod tests {
     fn drain_one_event_add(drain: &mut OutboxDrain) -> Vec<u8> {
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_EVENT_ADD {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("outbox held no CA_PROTO_EVENT_ADD frame");
@@ -3869,7 +3933,7 @@ mod tests {
 
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("reference produced no WRITE_NOTIFY completion frame");

@@ -1,0 +1,7 @@
+poolM3	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: REFUSED_BY_SERVER(CA	POOLPROBE seq=1 BUSY=0 SETS=58 CAP=141 WORKERS=116 REFUSED=4 CONNS=0	faultlines=0	max=SETS=58
+nopoolM3	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: OTHER(TimeoutError	POOLPROBE seq=1 BUSY=59 SETS=59 CAP=141 WORKERS=118 REFUSED=0 CONNS=58	faultlines=3	max=SETS=59
+poolM4	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: REFUSED_BY_SERVER(CA	POOLPROBE seq=1 BUSY=0 SETS=58 CAP=141 WORKERS=116 REFUSED=4 CONNS=0	faultlines=0	max=SETS=58
+nopoolM4	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: REFUSED_BY_SERVER(CA	POOLPROBE seq=1 BUSY=0 SETS=58 CAP=141 WORKERS=116 REFUSED=4 CONNS=0	faultlines=0	max=SETS=58
+poolM5	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: REFUSED_BY_SERVER(CA	POOLPROBE seq=1 BUSY=0 SETS=58 CAP=141 WORKERS=116 REFUSED=4 CONNS=0	faultlines=0	max=SETS=58
+nopoolM5	client-side served = 53 ramp + 5 monitor = 58	first failure verbatim: REFUSED_BY_SERVER(CA	POOLPROBE seq=1 BUSY=0 SETS=58 CAP=141 WORKERS=116 REFUSED=4 CONNS=0	faultlines=0	max=SETS=58
+ARMS-DONE

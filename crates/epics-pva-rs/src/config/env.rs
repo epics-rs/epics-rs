@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 // Only the interface-enumeration surface is v4-specific, and that is
-// host-only (not `epics_embedded_target`) — see [`Config`].
+// host-only (not `epics_embedded_target`) — see `Config`.
 #[cfg(not(epics_embedded_target))]
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -766,7 +766,7 @@ pub fn auto_beacon_addr_list_enabled_opt() -> Option<bool> {
 }
 
 /// `EPICS_PVAS_BEACON_PERIOD` — default 15s. Controls the *short*
-/// burst-interval; see [`crate::server_native::runtime::PvaServerConfig`]
+/// burst-interval; see [`crate::server_native::PvaServerConfig`]
 /// for the burst-then-slowdown semantics. Rust extension — pvxs has no
 /// configurable beacon interval (fixed 15s/180s, `server.cpp:45-46`).
 ///
@@ -838,7 +838,7 @@ pub fn max_channels_per_connection_opt() -> Option<usize> {
 /// `EPICS_PVAS_MAX_OPS_PER_CHANNEL` — server cap on concurrent
 /// in-flight operations (GET / PUT / MONITOR / RPC INITs awaiting their
 /// matching DESTROY) per single channel. Default 64. See
-/// [`crate::server_native::runtime::PvaServerConfig::max_ops_per_channel`]
+/// [`crate::server_native::PvaServerConfig::max_ops_per_channel`]
 /// for rationale.
 pub fn max_ops_per_channel() -> usize {
     max_ops_per_channel_opt().unwrap_or(64)
@@ -1413,7 +1413,7 @@ pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<So
 /// configured `EPICS_PVA_CONN_TMO` of 30 s yields a 40 s effective
 /// inactivity timeout, so the server's reap window does not race a Java
 /// client's 30 s echo cadence. The raw env parser [`conn_timeout_secs`]
-/// keeps the *configured* seconds; [`Config`] is the effective-timeout
+/// keeps the *configured* seconds; `Config` is the effective-timeout
 /// owner that applies this scale (`parse_timeout`, `config.cpp:211-227`).
 const TMO_SCALE: f64 = 4.0 / 3.0;
 
@@ -1436,7 +1436,7 @@ fn enforce_timeout(tmo: &mut f64) {
 /// bound echo to range [1, 15]".
 ///
 /// SINGLE OWNER of "effective TCP timeout → echo period". Both the
-/// env-derived [`crate::client_native::server_conn::heartbeat_interval`] and the
+/// env-derived `client_native::server_conn::heartbeat_interval` and the
 /// per-connection heartbeat task (which uses the builder-supplied
 /// `tcp_timeout`) derive their cadence here, so a connection cannot echo on
 /// a different clock than the API says it does.
@@ -1476,7 +1476,7 @@ pub fn effective_tcp_timeout_secs(configured: f64) -> f64 {
 
 /// Wrap interface IPs as modifier-less [`Endpoint`]s (port 0 — a bind
 /// interface carries no destination port). Bridges the `Vec<IpAddr>`
-/// interface parsers to [`Config`]'s endpoint-typed `interfaces` field.
+/// interface parsers to `Config`'s endpoint-typed `interfaces` field.
 ///
 /// This and the next two helpers exist only for [`Config::expand`], so
 /// they carry the same host-only gate it does.

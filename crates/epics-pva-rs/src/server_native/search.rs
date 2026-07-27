@@ -3,10 +3,10 @@
 //! The protocol half of the discovery exchange: decode a SEARCH frame,
 //! decide which CIDs this server answers for a given requester, and build
 //! the reply frame. No socket, no async I/O — the bytes arrive from
-//! [`super::udp`] on a datagram and from [`super::tcp`] on an established
+//! `super::udp` on a datagram and from [`super::tcp`] on an established
 //! circuit, and both hand them here.
 //!
-//! It lives beside the sources rather than inside [`super::udp`] because
+//! It lives beside the sources rather than inside `super::udp` because
 //! the TCP-circuit SEARCH handler needs exactly these three entry points
 //! (`parse_search_request`, `matched_cids_for_requester`,
 //! `build_search_response_proto`) while `udp` itself is host-only —

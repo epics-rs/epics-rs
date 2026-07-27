@@ -410,7 +410,8 @@ impl DbSubscription {
 
     /// Non-blocking [`Self::recv_snapshot`].
     pub fn try_recv_snapshot(&mut self) -> Result<crate::server::snapshot::Snapshot, TryRecvError> {
-        self.try_next_event().map(|e| e.snapshot)
+        self.try_next_event()
+            .map(|e| std::sync::Arc::unwrap_or_clone(e.snapshot))
     }
 
     /// Non-blocking [`Self::recv_event`].
@@ -429,7 +430,7 @@ impl DbSubscription {
     /// Silently skips events matching `ignore_origin`.
     pub async fn recv(&mut self) -> Option<EpicsValue> {
         let event = self.next_event().await?;
-        Some(event.snapshot.value)
+        Some(event.snapshot.value.clone())
     }
 
     /// Wait for the next change, returning the full Snapshot with metadata.
@@ -437,7 +438,7 @@ impl DbSubscription {
     /// Silently skips events matching `ignore_origin`.
     pub async fn recv_snapshot(&mut self) -> Option<crate::server::snapshot::Snapshot> {
         let event = self.next_event().await?;
-        Some(event.snapshot)
+        Some(std::sync::Arc::unwrap_or_clone(event.snapshot))
     }
 
     /// Wait for the next change, returning the full [`MonitorEvent`] —

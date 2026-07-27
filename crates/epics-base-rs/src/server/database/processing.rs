@@ -16,6 +16,81 @@ use super::{PvDatabase, apply_timestamp};
 /// ...)` and `epicsStrSnPrintEscaped(..., STRING_SIZE-1, ...)` enforce in C.
 const STRING_FIELD_MAX_LEN: usize = 39;
 
+/// **The single owner of "this record's processing cycle was refused."**
+///
+/// C publishes a refused cycle exactly once, in `dbProcess`'s `MAX_LOCK`
+/// branch (`dbAccess.c:544-556`):
+///
+/// ```c
+/// recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM, "Async in progress");
+/// monitor_mask = recGblResetAlarms(precord);
+/// monitor_mask |= DBE_VALUE|DBE_LOG;
+/// db_post_events(precord, ((char *)precord) + pdbFldDes->offset, monitor_mask);
+/// ```
+///
+/// so a refusal is never a silent success: the record carries SCAN_ALARM /
+/// INVALID with the reason in `AMSG`, and the transition is posted. Every
+/// refusal the port can make routes through here — C's `MAX_LOCK` re-entry and
+/// the port's own `MAX_LINK_DEPTH` / `MAX_LINK_OPS` bounds, which C does not
+/// have at all and which must therefore be at least as audible as C's.
+///
+/// Returns the post set for the caller to hand to `notify_from_snapshot` after
+/// releasing the write guard, or `None` when the record already carries this
+/// refusal — C's `if (precord->stat == SCAN_ALARM) goto all_done`, which is
+/// what keeps a repeatedly refused record from re-posting every cycle.
+fn scan_alarm_refusal(
+    instance: &mut RecordInstance,
+    msg: &str,
+) -> Option<crate::server::record::ProcessSnapshot> {
+    use crate::server::recgbl::EventMask;
+    if instance.common.stat == crate::server::recgbl::alarm_status::SCAN_ALARM
+        && instance.common.sevr >= crate::server::record::AlarmSeverity::Invalid
+    {
+        return None;
+    }
+    crate::server::recgbl::rec_gbl_set_sevr_msg(
+        &mut instance.common,
+        crate::server::recgbl::alarm_status::SCAN_ALARM,
+        crate::server::record::AlarmSeverity::Invalid,
+        msg,
+    );
+    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+    // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec, &VAL,
+    // DBE_VALUE|DBE_LOG)` plus recGblResetAlarms' `val_mask = DBE_ALARM` for
+    // the fresh transition). The alarm fields carry their C per-field masks
+    // (recGbl.c:201-220): this only runs on a fresh SCAN_ALARM/INVALID raise,
+    // so sevr AND stat both moved — SEVR posts DBE_VALUE, STAT/AMSG post the
+    // shared `stat_mask` = DBE_ALARM|DBE_VALUE.
+    let stat_mask = EventMask::ALARM | EventMask::VALUE;
+    let mut changed_fields = Vec::new();
+    if let Some(val) = instance.record.val() {
+        changed_fields.push((
+            "VAL".to_string(),
+            val,
+            EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+        ));
+    }
+    changed_fields.push((
+        "SEVR".to_string(),
+        EpicsValue::Short(instance.common.sevr as i16),
+        EventMask::VALUE,
+    ));
+    changed_fields.push((
+        "STAT".to_string(),
+        EpicsValue::Short(instance.common.stat as i16),
+        stat_mask,
+    ));
+    // Include AMSG so subscribers reading the alarm text observe the reason
+    // alongside the SCAN_ALARM transition (C `recGbl.c:210-211` posts STAT and
+    // AMSG together when `stat_mask` is non-zero).
+    changed_fields.push((
+        "AMSG".to_string(),
+        EpicsValue::String(instance.common.amsg.clone().into()),
+        stat_mask,
+    ));
+    Some(crate::server::record::ProcessSnapshot { changed_fields })
+}
+
 /// Cut a string-link value to the C field width (see [`STRING_FIELD_MAX_LEN`]).
 fn truncate_string_field(s: PvString) -> PvString {
     let bytes = s.as_bytes();
@@ -25,7 +100,7 @@ fn truncate_string_field(s: PvString) -> PvString {
     PvString::from_bytes(&bytes[..STRING_FIELD_MAX_LEN])
 }
 
-/// The DBR_STRING view of a [`Record::string_input_links`] source, C
+/// The DBR_STRING view of a [`Record::string_input_links`](crate::server::record::Record::string_input_links) source, C
 /// `sCalcoutRecord.c::fetch_values` (895-937).
 ///
 /// A `DBF_CHAR`/`DBF_UCHAR` source of more than one element is the one type C
@@ -499,7 +574,7 @@ enum SimOutcome {
     /// real process cycle, but skips the (already-substituted) body.
     Simulated,
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
-    /// body ([`Record::simulation_substitutes_input_stage`]) — swait. The SIOL
+    /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
     /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
     /// have already happened here (C `swaitRecord.c:415-421`, which precedes the
     /// OOPT switch); the caller runs the record body with its input-link fetch
@@ -528,7 +603,7 @@ enum SimOutcome {
     IllegalMode { is_output: bool },
     /// The SIML read FAILED and the record's support ABORTS on it — C
     /// `writeValue` returns before performing any I/O
-    /// ([`Record::aborts_on_failed_siml_read`]; `busy` is the only one):
+    /// ([`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read); `busy` is the only one):
     ///
     /// ```c
     /// status=dbGetLink(&prec->siml,DBR_USHORT, &prec->simm,0,0);
@@ -563,7 +638,7 @@ enum SimOutcome {
     /// this cycle (C `process()` returns 0 on the async-start pass). The
     /// SIOL round-trip + alarm/monitor tail run on the continuation, which
     /// re-enters with `is_continuation = true` and takes the synchronous
-    /// branch. The wrapped [`Duration`] is the `SDLY` delay.
+    /// branch. The wrapped [`Duration`](std::time::Duration) is the `SDLY` delay.
     DeferRead(std::time::Duration),
 }
 
@@ -723,7 +798,7 @@ impl PvDatabase {
     ///
     /// Synchronous: the gate is already held by the caller, so this entry has
     /// nothing to wait for. It goes straight to
-    /// [`Self::process_record_with_links_body`], which is where the H6
+    /// `process_record_with_links_body`, which is where the H6
     /// no-suspension contract lives.
     pub fn process_record_with_links_already_locked(
         &self,
@@ -835,7 +910,7 @@ impl PvDatabase {
 
     /// Schedule a delayed re-process of `name` — the single owner of the
     /// "mint a fresh [`AsyncToken`], sleep, then fire" pattern. Used by both
-    /// [`ProcessAction::ReprocessAfter`] (record-driven owner re-entry: ODLY
+    /// [`ProcessAction::ReprocessAfter`](crate::server::record::ProcessAction::ReprocessAfter) (record-driven owner re-entry: ODLY
     /// output delay, swait, sequence DLYn) and the `SDLY` async-simulation
     /// defer ([`SimOutcome::DeferRead`]). Minting advances the record's
     /// generation so a newer schedule supersedes any pending one; a stale
@@ -853,12 +928,12 @@ impl PvDatabase {
     }
 
     /// (Re)arm a record's monitor watchdog — the single owner of the
-    /// [`Record::watchdog_interval`] / [`Record::watchdog_fire`] tick, and the
+    /// [`Record::watchdog_interval`](crate::server::record::Record::watchdog_interval) / [`Record::watchdog_fire`](crate::server::record::Record::watchdog_fire) tick, and the
     /// port of C `histogramRecord.c::wdogInit` + `wdogCallback` (:102-152).
     ///
     /// Called from exactly two places, C's own two `wdogInit` call sites: once
     /// per record at `iocInit` (C `init_record` pass 1, `:168`) and from
-    /// [`ProcessAction::ArmWatchdog`], which a record's `special()` emits when
+    /// [`ProcessAction::ArmWatchdog`](crate::server::record::ProcessAction::ArmWatchdog), which a record's `special()` emits when
     /// a put changed the period (histogram SDEL, `:266-268`).
     ///
     /// Arming bumps the record's `watchdog_generation`, so a tick already in
@@ -1238,12 +1313,21 @@ impl PvDatabase {
     ///
     /// Factored out so the gate-taking entry
     /// ([`Self::process_record_with_links_inner`]) and the two gate-free
-    /// entries ([`Self::process_record_with_links_body`]'s direct callers)
+    /// entries (`process_record_with_links_body`'s direct callers)
     /// run it in the SAME order relative to the gate: bail decisions are made
     /// before any waiting, exactly as they were when this was open-coded.
     ///
-    /// `Ok(None)` is a silent bail (depth, ops budget, cycle); `Err` is C's
-    /// `S_db_notFound`.
+    /// `Ok(None)` is "this entry did not run"; `Err` is C's `S_db_notFound`.
+    ///
+    /// Only ONE of those non-runs is silent, and it is the one C's is: the
+    /// cycle guard. Both resource bounds go through
+    /// [`Self::refuse_bounded_entry`], which raises the record's alarm and
+    /// logs before it hands back the `Ok(None)` — so a bound cannot be
+    /// written as a bare `return Ok(None)` here.
+    ///
+    /// Every `Ok(None)` is built by [`Self::entry_did_not_run`], which is
+    /// also where the put-notify wait-set is released, so a non-run cannot
+    /// strand a CA `WRITE_NOTIFY`.
     fn process_entry_prelude(
         &self,
         name: &str,
@@ -1260,21 +1344,27 @@ impl PvDatabase {
         let name: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
 
         if depth >= MAX_LINK_DEPTH {
-            eprintln!("link chain depth limit reached at record {name}");
-            return Ok(None);
+            return self
+                .refuse_bounded_entry(&name, &format!("link chain depth limit {MAX_LINK_DEPTH}"));
         }
         if visited.len() >= MAX_LINK_OPS {
-            eprintln!("link chain ops budget exhausted at record {name}");
-            return Ok(None);
+            return self
+                .refuse_bounded_entry(&name, &format!("link chain ops limit {MAX_LINK_OPS}"));
         }
-        if !visited.insert(name.clone()) {
-            return Ok(None); // Cycle detected, skip
-        }
-
         let rec = {
             let records = self.inner.records.read();
             records.get(&name).cloned()
         };
+
+        if !visited.insert(name.clone()) {
+            // C has no counterpart to raise here: `processTarget`
+            // (`dbDbLink.c:436`) stops a cycle with `psrc->pact = TRUE` and
+            // `dbProcess` returns 0 for an already-active record without any
+            // alarm until MAX_LOCK. Re-reaching a record inside one cascade is
+            // ordinary FLNK-graph shape, not a refusal, so this stays SILENT —
+            // but silent is about the alarm, not about the wait-set.
+            return self.entry_did_not_run(rec.as_ref());
+        }
 
         match rec {
             Some(r) => Ok(Some((name, r))),
@@ -1282,10 +1372,121 @@ impl PvDatabase {
         }
     }
 
+    /// The prelude's ONE "this entry did not run its cycle" exit — C
+    /// `dbProcess`'s `all_done` with `callNotifyCompletion = TRUE`.
+    ///
+    /// `join_put_notify` (C `dbNotifyAdd`) is called by the link dispatcher
+    /// on the will-process branch, *before* the recursion enters the prelude:
+    ///
+    /// ```text
+    /// links.rs:1427   let pact = tg.is_processing();
+    /// links.rs:1428   if !pact { tg.common.putf = src_putf;
+    /// links.rs:1430              join_put_notify(&mut tg, src_notify); }   // ws.enter()
+    /// links.rs:1440   self.process_record_with_links_recursive(target, visited, depth + 1)
+    /// ```
+    ///
+    /// So by the time a bound, or the cycle guard, decides the entry will not
+    /// run, the target is already counted in the wait-set — and nothing
+    /// downstream will ever `leave` for it, because the only `leave`s are on
+    /// paths that ran a cycle. The set never drains, the completion oneshot
+    /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply
+    /// (measured on x86_64-wrs-vxworks: the first put into a chain past
+    /// `MAX_LINK_DEPTH` never replied over 90s, and `RTEMS:E8:L16` was left
+    /// holding a wait-set that could never drain — after which every later put
+    /// completed, because `join_put_notify`'s `notify.is_none()` guard stops a
+    /// record that already holds a stale set from joining a live one).
+    ///
+    /// C decides this per exit path with one flag and one finalizer
+    /// (`dbAccess.c:495` `callNotifyCompletion = FALSE`, `:577` disabled,
+    /// `:599` no RSET, `:620-623` `all_done`), and the pact branch
+    /// (`:552-556`) deliberately does NOT set it: a record whose own cycle is
+    /// running owns its completion. The same split holds here — hence the
+    /// `is_processing` test, which is C's `if (precord->pact)`, not a guard
+    /// bolted on.
+    fn entry_did_not_run(
+        &self,
+        rec: Option<&Arc<parking_lot::RwLock<RecordInstance>>>,
+    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
+        if let Some(rec) = rec {
+            let notify = {
+                let mut instance = rec.write();
+                if instance.is_processing() {
+                    None
+                } else {
+                    instance.notify.take()
+                }
+            };
+            // `leave` fires the completion oneshot when it empties the set, so
+            // it runs outside the record lock — same as the SDIS-disable bail.
+            if let Some(ws) = notify {
+                ws.leave();
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refuse a process entry that hit one of the port's own resource bounds,
+    /// and make the refusal audible before returning it.
+    ///
+    /// C has no depth counter and no ops budget: `processTarget`
+    /// (`dbDbLink.c:427-436`) only marks the source `pact` and recurses, so a
+    /// chain of any length runs and only a genuine cycle stops. The port keeps
+    /// bounds because each link level is a `Pin<Box<dyn Future>>` on the
+    /// calling thread's stack and an unbounded chain is a stack overflow on an
+    /// embedded target — but a bound C does not have must not be quieter than
+    /// the refusal C does have. So the record ends in SCAN_ALARM / INVALID with
+    /// the reason in `AMSG` ([`scan_alarm_refusal`], C `dbAccess.c:544-556`),
+    /// and the reason goes to `errlog` where an operator reads it, not to a
+    /// bare `eprintln!` that no IOC log ever sees.
+    ///
+    /// Returns the prelude's "did not run" value so that the only way to write
+    /// a bound bail is through this function.
+    fn refuse_bounded_entry(
+        &self,
+        name: &str,
+        why: &str,
+    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
+        let rec = {
+            let records = self.inner.records.read();
+            records.get(name).cloned()
+        };
+        // The record the chain could not reach may not exist — a dangling FLNK
+        // at the bound. The refusal is still reported; there is simply nothing
+        // to raise it on.
+        let repeat = match &rec {
+            Some(rec) => {
+                let snapshot = {
+                    let mut instance = rec.write();
+                    scan_alarm_refusal(&mut instance, why)
+                };
+                match snapshot {
+                    Some(snapshot) => {
+                        rec.read().notify_from_snapshot(&snapshot);
+                        false
+                    }
+                    // Already refused and still in SCAN_ALARM/INVALID: C posts
+                    // nothing on a repeat, and repeating the log line for every
+                    // put into the same over-long chain would drown the first
+                    // one. Only the alarm and the log are debounced — the
+                    // wait-set release below is not, because every refused
+                    // entry joined its own put-notify.
+                    None => true,
+                }
+            }
+            None => false,
+        };
+        if !repeat {
+            crate::runtime::log::errlog_printf(&format!(
+                "dbProcess: {name} not processed, {why} exceeded\n"
+            ));
+        }
+        self.entry_did_not_run(rec.as_ref())
+    }
+
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.
     ///
     /// Everything after the guard is bound lives in
-    /// [`Self::process_record_with_links_body`], which is a plain `fn`: the
+    /// `process_record_with_links_body`, which is a plain `fn`: the
     /// L1 gate-held region contains zero suspension points by construction,
     /// which is what C's `dbProcess` gives for free (`dbScanLock` is a
     /// blocking mutex and the whole cycle between lock and unlock is
@@ -1412,56 +1613,12 @@ impl PvDatabase {
                     // Bail out without raising alarm yet.
                     return Ok(());
                 }
-                // Raise SCAN_ALARM/INVALID, reset alarm transition,
-                // and post VAL monitor (DBE_VALUE | DBE_LOG).
-                crate::server::recgbl::rec_gbl_set_sevr_msg(
-                    &mut instance.common,
-                    crate::server::recgbl::alarm_status::SCAN_ALARM,
-                    crate::server::record::AlarmSeverity::Invalid,
-                    "Async in progress",
-                );
-                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-                // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec,
-                // &VAL, DBE_VALUE|DBE_LOG)` plus recGblResetAlarms'
-                // `val_mask = DBE_ALARM` for the fresh transition). The
-                // alarm fields carry their C per-field masks
-                // (recGbl.c:201-220): this guard only runs on a fresh
-                // SCAN_ALARM/INVALID raise, so sevr AND stat both moved —
-                // SEVR posts DBE_VALUE, STAT/AMSG post the shared
-                // `stat_mask` = DBE_ALARM|DBE_VALUE.
-                use crate::server::recgbl::EventMask;
-                let stat_mask = EventMask::ALARM | EventMask::VALUE;
-                let mut changed_fields = Vec::new();
-                if let Some(val) = instance.record.val() {
-                    changed_fields.push((
-                        "VAL".to_string(),
-                        val,
-                        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-                    ));
-                }
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(instance.common.sevr as i16),
-                    EventMask::VALUE,
-                ));
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(instance.common.stat as i16),
-                    stat_mask,
-                ));
-                // Include AMSG so subscribers reading the alarm text
-                // observe "Async in progress" alongside the SCAN_ALARM
-                // transition (C `recGbl.c:210-211` posts STAT and AMSG
-                // together when `stat_mask` is non-zero).
-                changed_fields.push((
-                    "AMSG".to_string(),
-                    EpicsValue::String(instance.common.amsg.clone().into()),
-                    stat_mask,
-                ));
-                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
+                let snapshot = scan_alarm_refusal(&mut instance, "Async in progress");
                 drop(instance);
-                let inst = rec.read();
-                inst.notify_from_snapshot(&snapshot);
+                if let Some(snapshot) = snapshot {
+                    let inst = rec.read();
+                    inst.notify_from_snapshot(&snapshot);
+                }
                 return Ok(());
             }
             // Not pact: reset lcnt (mirrors C `else { precord->lcnt = 0; }`
@@ -4004,7 +4161,7 @@ impl PvDatabase {
     /// On a non-retry, disconnected link the lset returns `Err`; pvxs
     /// raises `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` on
     /// the owning record (`pvxs/ioc/pvalink_lset.cpp:677-679`). This raises
-    /// the same *pending* LINK/INVALID alarm via [`rec_gbl_set_sevr_msg`],
+    /// the same *pending* LINK/INVALID alarm via [`rec_gbl_set_sevr_msg`](crate::server::recgbl::rec_gbl_set_sevr_msg),
     /// promoted by the next `recGblResetAlarms` — exactly as the C late-set
     /// inside `recGblFwdLink` (after the record's own alarm/monitor stage)
     /// is.
@@ -4063,11 +4220,11 @@ impl PvDatabase {
     /// ends with `recGblInheritSevrMsg` (`dbDbLink.c:228-232`), so an
     /// `field(INP,"SRC MS")` on a compress / aao-DOL / epid link raises the
     /// READER to the source's severity. That inheritance runs here too, through
-    /// [`Database::input_link_inheritance`] — the same owner the multi-input
+    /// `input_link_inheritance` — the same owner the multi-input
     /// fetch uses.
     ///
     /// The DBR class of the read is the RECORD's
-    /// ([`Record::input_link_read_as`], C's `dbGetLink` `dbrType` argument),
+    /// ([`Record::input_link_read_as`](crate::server::record::Record::input_link_read_as), C's `dbGetLink` `dbrType` argument),
     /// resolved from the SOURCE's metadata by the same owner the OUT side uses
     /// ([`Self::resolve_out_target`]): a record that switches on the source's
     /// DBF class (sseq `DOLn`, `sseqRecord.c:640-705`) gets the value C's
@@ -4197,10 +4354,10 @@ impl PvDatabase {
     }
 
     /// Resolve one OUT link's TARGET and hand it to the record ahead of
-    /// `process()` — [`ProcessAction::ResolveOutTarget`].
+    /// `process()` — [`ProcessAction::ResolveOutTarget`](crate::server::record::ProcessAction::ResolveOutTarget).
     ///
     /// The record's own link string is the input, so an empty/constant `LNKn`
-    /// resolves to [`OutTarget::UNRESOLVED`] and the record sees "no target",
+    /// resolves to [`OutTarget::UNRESOLVED`](crate::server::record::OutTarget::UNRESOLVED) and the record sees "no target",
     /// which is the answer C's `default:` arm acts on.
     fn resolve_out_target_into_record(
         &self,
@@ -5208,7 +5365,7 @@ impl PvDatabase {
     ///
     /// Returns the SIML-read status the record's `readValue`/`writeValue` sees:
     /// `true` when the read FAILED. Only a record that declares
-    /// [`Record::aborts_on_failed_siml_read`] (busy) acts on it — see that hook
+    /// [`Record::aborts_on_failed_siml_read`](crate::server::record::Record::aborts_on_failed_siml_read) (busy) acts on it — see that hook
     /// for why the other two families do not.
     pub(crate) fn rec_gbl_get_simm(
         &self,
@@ -5320,11 +5477,11 @@ impl PvDatabase {
     /// `devWfSoft.c:42`, `devSASoft.c` (arrays, via `dbLoadLinkArray`). The
     /// raw variants (`devAiSoftRaw.c`, `devBiSoftRaw.c`, `devMbbiSoftRaw.c`)
     /// load into RVAL instead and let the record's own RVAL→VAL conversion
-    /// run — hence the [`Record::raw_soft_input`] arm, the same sink the
+    /// run — hence the [`Record::raw_soft_input`](crate::server::record::Record::raw_soft_input) arm, the same sink the
     /// process-time path uses for `Raw Soft Channel`.
     ///
     /// This is the other half of the rule
-    /// [`super::links::PvDatabase::read_link_value_soft`] enforces (a constant
+    /// [`PvDatabase::read_link_value_soft`](super::PvDatabase::read_link_value_soft) enforces (a constant
     /// delivers NOTHING at process): without the init load a `field(INP, "5")`
     /// ai would never see 5 at all; without the process-time skip the constant
     /// would clobber the record's VAL on every scan.
@@ -5334,7 +5491,7 @@ impl PvDatabase {
     ///
     /// **This is THE init-seed owner.** Beyond the device-support INP above it
     /// applies the record's own `recGblInitConstantLink` table,
-    /// [`Record::constant_init_links`] — calc/calcout/sub/sel/aSub/scalcout/
+    /// [`Record::constant_init_links`](crate::server::record::Record::constant_init_links) — calc/calcout/sub/sel/aSub/scalcout/
     /// acalcout/transform `INPA..L → A..L`, sel `NVL → SELN`, fanout/dfanout/
     /// seq `SELL → SELN`, seq `DOLn → DOn`, aSub `SUBL → SNAM`, and the
     /// `DOL → VAL` seeds that also clear UDF. Every one of those links is

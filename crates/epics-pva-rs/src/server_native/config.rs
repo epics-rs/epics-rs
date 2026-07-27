@@ -1,7 +1,7 @@
 //! [`PvaServerConfig`] — the server's configuration record.
 //!
 //! Target-neutral, and deliberately its own module rather than part of
-//! [`super::runtime`]. The config is named in the signature of eight
+//! `super::runtime`. The config is named in the signature of eight
 //! production functions in [`super::tcp`], which is protocol code with no
 //! socket in it and therefore has to compile for RTEMS; `runtime` is the
 //! host-only async driver that binds the listeners. Leaving the config in
@@ -12,9 +12,11 @@
 //! *how* to behave once bound; `runtime` (host) and the blocking driver
 //! (RTEMS) each read the same record.
 //!
-//! [`super::runtime`] re-exports `PvaServerConfig`, so every existing
+//! `super::runtime` also re-exports `PvaServerConfig`, so every existing
 //! `server_native::runtime::PvaServerConfig` path still resolves on a hosted
-//! build.
+//! build. The short `server_native::PvaServerConfig` comes from HERE, not
+//! from `runtime`: routing it through the host-only module deleted the name
+//! on every embedded target even though this module compiles for all of them.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -57,7 +59,7 @@ pub struct PvaServerConfig {
     /// requested port collides with the bound plaintext port the runtime
     /// skips the second bind and serves TLS on the shared port via the
     /// first-byte dispatch in
-    /// [`crate::server_native::tcp::run_tcp_server_on_listener`]. Default
+    /// `tcp::run_tcp_server_on_listener`. Default
     /// `5076` (pvxs `netcommon.h:133`); parsed from
     /// `EPICS_PVAS_TLS_PORT` / `EPICS_PVA_TLS_PORT` by [`Self::with_env`].
     pub tls_port: u16,
@@ -66,7 +68,7 @@ pub struct PvaServerConfig {
     /// beacons carry the same 12 bytes.
     ///
     /// **Whatever you put here is not what gets served.** Every server
-    /// constructor — [`PvaServer::start`](crate::server_native::PvaServer)
+    /// constructor — `PvaServer::start`
     /// and `BlockingPvaServer::bind` — overwrites this field with
     /// `search_engine::random_guid()` before any thread or task can read it,
     /// or **fails to construct** if the platform has no entropy source. So
@@ -79,7 +81,7 @@ pub struct PvaServerConfig {
     /// stopped being true the moment a second server constructor existed.)
     ///
     /// The one exception is the low-level
-    /// [`run_tcp_server_on_listener`](crate::server_native::tcp::run_tcp_server_on_listener)
+    /// `run_tcp_server_on_listener`
     /// family, which serves the config verbatim because it is one listener of
     /// several and re-randomizing per listener would give a single server
     /// several identities. A caller driving those directly owns the GUID and
@@ -425,8 +427,8 @@ impl PvaServerConfig {
     /// `Config::isolated()` (config.cpp:445). The OS picks free TCP
     /// and UDP ports; auto-beacon is disabled so the server doesn't
     /// leak datagrams onto the LAN. Matching client side: point a
-    /// [`crate::client_native::PvaClient`] at the returned loopback
-    /// address via [`crate::client_native::PvaClientBuilder::server_addr`].
+    /// `client_native::PvaClient` at the returned loopback
+    /// address via `client_native::PvaClientBuilder::server_addr`.
     pub fn isolated() -> Self {
         Self {
             tcp_port: 0,

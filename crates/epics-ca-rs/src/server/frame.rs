@@ -122,6 +122,59 @@ impl FrameBuf {
     }
 }
 
+/// Size a DBR reply's payload to the requested element count and return the
+/// element count its header must carry.
+///
+/// This is the single implementation of C `read_reply`'s reply sizing
+/// (`rsrv/camessage.c:507-571`), which
+///
+/// * treats `mp->m_count == 0` as "all available elements" (autosize) and
+///   frames the reply at the live count;
+/// * otherwise writes the ORIGINAL request count into the header and sizes the
+///   payload to `dbr_size_n(type, request_count)` — zero-filling when the
+///   request asks for more elements than the value holds, and framing at the
+///   request count when the value decoded wider.
+///
+/// `DBR_CLASS_NAME` is the one type outside that rule: its wire payload is a
+/// single fixed 40-byte string whatever the record's element count is, and it
+/// is never padded or truncated to a request count (CA-268 — a waveform's
+/// `snapshot.value.count()` of N would make C clients parse `40 * N` body
+/// bytes and fail).
+///
+/// Every CA reply that carries an encoded DBR payload sizes it here: the
+/// steady-state monitor producer, the initial / access-restore monitor
+/// snapshot, `EVENT_ADD` delivery in `monitor::send_event`, and the
+/// `READ` / `READ_NOTIFY` reply. The one caller with a rule of its own is a
+/// *deprecated* `CA_PROTO_READ` with `count == 0`, which C `read_action`
+/// (unlike `read_reply`) frames at count 0 with a value-less body; that
+/// caller applies its own case first and delegates every other count here.
+pub(crate) fn size_dbr_reply(
+    frame: &mut FrameBuf,
+    data_type: u16,
+    actual_count: u32,
+    requested_count: u32,
+) -> u32 {
+    if data_type == epics_base_rs::types::DBR_CLASS_NAME {
+        return 1;
+    }
+    if requested_count == 0 {
+        return actual_count;
+    }
+    if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
+        // Plain types (0-6) have no metadata; STS / TIME / GR / CTRL slot
+        // metadata before the value array. `dbr_buffer_size(_, _, 0)` returns
+        // just the metadata size, so this is `dbr_size_n(type, count)`.
+        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
+        let target_size = meta_size + (requested_count as usize) * native.element_size();
+        if requested_count > actual_count {
+            frame.zero_extend_payload(target_size);
+        } else if requested_count < actual_count && frame.payload_len() > target_size {
+            frame.truncate_payload(target_size);
+        }
+    }
+    requested_count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +215,103 @@ mod tests {
         assert_eq!(frame.len(), 24 + n);
         assert_eq!(&frame[..24], &hdr_bytes[..]);
         assert!(frame[24..].iter().all(|b| *b == 0xAB));
+    }
+
+    /// Encode `value` as `dbr_type` straight into a fresh `FrameBuf` — the
+    /// native-type path where `encode_dbr_into` appends into the reserved
+    /// buffer with no intermediate `Vec`.
+    fn encoded(dbr_type: u16, value: epics_base_rs::types::EpicsValue) -> (FrameBuf, u32) {
+        let count = value.count() as u32;
+        let snapshot = epics_base_rs::server::snapshot::Snapshot::new(
+            value,
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let mut frame = FrameBuf::new(0);
+        epics_base_rs::types::encode_dbr_into(frame.dst(), dbr_type, &snapshot)
+            .expect("native-type encode must succeed");
+        (frame, count)
+    }
+
+    /// The four `requested_count` boundaries against a native 4-element
+    /// `DBR_LONG` array, on the zero-copy encode path: below, equal, above,
+    /// and 0 (autosize). A plain DBR type has no metadata, so the payload is
+    /// exactly `count * 4` and the reshaping is directly checkable.
+    #[test]
+    fn size_dbr_reply_covers_every_requested_count_boundary() {
+        use epics_base_rs::types::{DBR_LONG, EpicsValue};
+
+        let elems = || EpicsValue::LongArray(vec![1, 2, 3, 4]);
+
+        // requested < native: framed at the request count, and the surviving
+        // bytes are the leading elements (nothing shifted).
+        let (mut frame, actual) = encoded(DBR_LONG, elems());
+        assert_eq!((actual, frame.payload_len()), (4, 16));
+        assert_eq!(size_dbr_reply(&mut frame, DBR_LONG, actual, 2), 2);
+        assert_eq!(frame.payload_len(), 8);
+        assert_eq!(frame.payload(), &[0, 0, 0, 1, 0, 0, 0, 2]);
+
+        // requested == native: neither branch fires, payload untouched.
+        let (mut frame, actual) = encoded(DBR_LONG, elems());
+        assert_eq!(size_dbr_reply(&mut frame, DBR_LONG, actual, 4), 4);
+        assert_eq!(frame.payload_len(), 16);
+        assert_eq!(
+            frame.payload(),
+            &[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4]
+        );
+
+        // requested > native: zero-filled up to `dbr_size_n(type, request)`.
+        let (mut frame, actual) = encoded(DBR_LONG, elems());
+        assert_eq!(size_dbr_reply(&mut frame, DBR_LONG, actual, 6), 6);
+        assert_eq!(frame.payload_len(), 24);
+        assert_eq!(&frame.payload()[16..], &[0; 8]);
+
+        // requested == 0: autosize — header carries the live count and the
+        // payload is left at its encoded shape.
+        let (mut frame, actual) = encoded(DBR_LONG, elems());
+        assert_eq!(size_dbr_reply(&mut frame, DBR_LONG, actual, 0), 4);
+        assert_eq!(frame.payload_len(), 16);
+    }
+
+    /// A compound DBR type's metadata sits before the value array, so the
+    /// target size must be `meta + count * element_size`. Ignoring the
+    /// metadata would truncate a request count below the native count *into*
+    /// the STS/TIME header.
+    #[test]
+    fn size_dbr_reply_counts_the_metadata_before_the_value_array() {
+        use epics_base_rs::types::{DBR_TIME_LONG, EpicsValue};
+
+        let native = epics_base_rs::types::native_type_for_dbr(DBR_TIME_LONG).unwrap();
+        let meta = epics_base_rs::types::dbr_buffer_size(DBR_TIME_LONG, native, 0);
+        assert!(meta > 0, "DBR_TIME_LONG must carry metadata");
+
+        let (mut frame, actual) = encoded(DBR_TIME_LONG, EpicsValue::LongArray(vec![1, 2, 3, 4]));
+        assert_eq!(frame.payload_len(), meta + 16);
+        assert_eq!(size_dbr_reply(&mut frame, DBR_TIME_LONG, actual, 1), 1);
+        assert_eq!(frame.payload_len(), meta + 4);
+
+        let (mut frame, actual) = encoded(DBR_TIME_LONG, EpicsValue::LongArray(vec![1, 2, 3, 4]));
+        assert_eq!(size_dbr_reply(&mut frame, DBR_TIME_LONG, actual, 5), 5);
+        assert_eq!(frame.payload_len(), meta + 20);
+    }
+
+    /// CA-268: `DBR_CLASS_NAME` reports count 1 and its payload is never
+    /// reshaped — for any request count, including autosize.
+    #[test]
+    fn size_dbr_reply_leaves_class_name_at_one_element() {
+        use epics_base_rs::types::DBR_CLASS_NAME;
+
+        for requested in [0u32, 1, 4, 9] {
+            let mut frame = FrameBuf::new(0);
+            frame.dst().extend_from_slice(&[0xCD; 40]);
+            assert_eq!(size_dbr_reply(&mut frame, DBR_CLASS_NAME, 7, requested), 1);
+            assert_eq!(
+                frame.payload_len(),
+                40,
+                "CLASS_NAME payload reshaped at requested={requested}",
+            );
+        }
     }
 
     /// `align_payload` pads to the 8-byte boundary the C client's TCP parser

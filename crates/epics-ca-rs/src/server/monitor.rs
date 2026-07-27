@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::LongStringMode;
-use super::frame::FrameBuf;
+use super::frame::{FrameBuf, size_dbr_reply};
 use super::outbox::Outbox;
 use super::stats::ServerStats;
 use crate::protocol::*;
@@ -135,40 +135,17 @@ pub(crate) fn send_event(
     let mut frame = FrameBuf::new(0);
     encode_dbr_into(frame.dst(), data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
-    // CA-268: DBR_CLASS_NAME wire payload is always one fixed 40-byte
-    // string regardless of the underlying value count. Same override
-    // already applied at the GET / send_monitor_snapshot / RecordField
-    // event loop sites. SimplePv channels carry no record_type, so
-    // class_name stays None and the body is 40 zero bytes — matches
-    // IOC behaviour for synthetic channels.
-    //
-    // when the EVENT_ADD request set an explicit count, every
-    // monitor delivery echoes that count and zero-pads the payload up
-    // to `dbr_buffer_size(type, native, count)` (C `read_reply`
-    // `rsrv/camessage.c:507-571` parity). The helper returns the
-    // header count to use; `data_count == 0` means autosize (use the
-    // live snapshot count).
-    // Enforce request count in BOTH directions —
-    // pad when requested > actual AND truncate when requested <
-    // actual. C `read_reply` (`rsrv/camessage.c:507-571`) sizes
-    // the payload to `dbr_size_n(type, request_count)` either way.
-    let actual_count = snapshot.value.count() as u32;
-    let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
-        1
-    } else if data_count == 0 {
-        actual_count
-    } else if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
-        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
-        let target_size = meta_size + (data_count as usize) * native.element_size();
-        if data_count > actual_count {
-            frame.zero_extend_payload(target_size);
-        } else if data_count < actual_count && frame.payload_len() > target_size {
-            frame.truncate_payload(target_size);
-        }
-        data_count
-    } else {
-        data_count
-    };
+    // Size the payload and pick the header count — `size_dbr_reply` owns the
+    // rule (autosize, request-count pad/truncate, and the DBR_CLASS_NAME
+    // fixed single element). A SimplePv channel carries no record_type, so
+    // its CLASS_NAME body is 40 zero bytes, matching an IOC's synthetic
+    // channels.
+    let element_count = size_dbr_reply(
+        &mut frame,
+        data_type,
+        snapshot.value.count() as u32,
+        data_count,
+    );
     frame.align_payload();
 
     let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);

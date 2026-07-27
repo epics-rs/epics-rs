@@ -232,7 +232,7 @@ use crate::server::outbox::Outbox;
 #[cfg(not(epics_embedded_target))]
 use crate::server::recv::{Admit, RecvAccumulator, Refused};
 // `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
-use crate::server::frame::FrameBuf;
+use crate::server::frame::{FrameBuf, size_dbr_reply};
 #[cfg(not(epics_embedded_target))]
 use crate::server::outbox::OutboxDrain;
 use epics_base_rs::error::CaResult;
@@ -504,7 +504,7 @@ struct ChannelEntry {
     /// equivalent. Every request's wire element count is clamped to this
     /// ceiling on READ / READ_NOTIFY / EVENT_ADD so an oversized
     /// `m_count` cannot drive the reply zero-fill
-    /// ([`pad_dbr_to_requested_count`] / the steady-state monitor
+    /// (`size_dbr_reply` / the steady-state monitor
     /// producer) past the channel's real capacity. Mirrors epics-base
     /// PR #934's `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
     /// mp->m_count = dbChannelFinalElements(pciu->dbch);` clamp. This is
@@ -2983,7 +2983,7 @@ pub(crate) async fn dispatch_message(
 
             // PR #934 (epics-base) parity: clamp the wire element count to
             // the channel's final element count so an oversized `m_count`
-            // cannot drive the reply zero-fill (`pad_dbr_to_requested_count`)
+            // cannot drive the reply zero-fill (`size_dbr_reply`)
             // past the channel's real capacity. C `read_action`
             // (`camessage.c`) / `read_notify_action`:
             // `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
@@ -4704,7 +4704,7 @@ pub(crate) async fn register_subscription(
     // PR #934 (epics-base) parity: clamp the wire element count to
     // the channel's final element count BEFORE it is stored on the
     // subscription (`SubscriptionEntry::data_count`), so neither the
-    // initial snapshot (`pad_dbr_to_requested_count`) nor every
+    // initial snapshot (`size_dbr_reply`) nor every
     // steady-state monitor delivery (the producer in `monitor.rs`)
     // can zero-fill past the channel's real capacity. C
     // `event_add_action`:
@@ -4926,7 +4926,7 @@ pub(crate) async fn register_subscription(
                             // when `requested_count` exceeds
                             // the live element count and
                             // truncates when it is smaller, via
-                            // `pad_dbr_to_requested_count` (C
+                            // `size_dbr_reply` (C
                             // `read_reply` parity). The
                             // producer task already
                             // pads/truncates future updates
@@ -5164,7 +5164,7 @@ pub(crate) async fn register_subscription(
                     // directions — `send_monitor_snapshot`
                     // pads an over-requested count and
                     // truncates an under-requested one via
-                    // `pad_dbr_to_requested_count`.
+                    // `size_dbr_reply`.
                     send_monitor_snapshot(
                         writer,
                         sub_id,
@@ -5292,29 +5292,19 @@ pub(crate) async fn register_subscription(
                         }
                         // CA-268: see GET path note — fixed 1.
                         //
-                        // C `read_reply`
-                        // (`rsrv/camessage.c:507-571`) uses the
-                        // ORIGINAL request count as the header
-                        // value (autosize=0 case) and pads the
-                        // payload up to `dbr_size_n(type,
-                        // request_count)`. Pre-fix Rust used
-                        // the live `snapshot.value.count()`,
-                        // so an EVENT_ADD with explicit
-                        // `count=1` on a waveform received the
-                        // full N-element waveform on every
-                        // update instead of just one element.
-                        let actual_count = event.snapshot.value.count() as u32;
-                        let element_count =
-                            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                1
-                            } else {
-                                pad_dbr_to_requested_count(
-                                    &mut frame,
-                                    actual_count,
-                                    requested_count,
-                                    requested_type,
-                                )
-                            };
+                        // Pre-fix Rust framed every update at the
+                        // live `snapshot.value.count()`, so an
+                        // EVENT_ADD with explicit `count=1` on a
+                        // waveform received the full N-element
+                        // waveform on every update instead of just
+                        // one element. `size_dbr_reply` owns the
+                        // request-count rule.
+                        let element_count = size_dbr_reply(
+                            &mut frame,
+                            requested_type,
+                            event.snapshot.value.count() as u32,
+                            requested_count,
+                        );
                         frame.align_payload();
 
                         let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -5734,20 +5724,13 @@ fn try_get_read_snapshot_local(
 /// `CA_PROTO_EVENT_ADD` frame.
 ///
 /// `requested_count` is the element count from the originating
-/// `CA_PROTO_EVENT_ADD` request. The encoded DBR payload is routed
-/// through [`pad_dbr_to_requested_count`] so a request count *larger*
-/// than the live element count is zero-padded to the requested shape
-/// — and a smaller count is truncated — exactly as the READ path and
-/// the steady-state monitor producer already do. Without this the
-/// first monitor frame (and the access-restore frame) was framed at
-/// `snapshot.value.count()`, so a client requesting more elements
-/// than the PV currently holds saw a count/size discontinuity
-/// between the initial frame and later padded updates. C `read_reply`
-/// frames non-autosize monitor events at the requested count and
-/// zero-fills missing elements (`rsrv/camessage.c:507-571`).
-///
-/// `requested_count == 0` is autosize: the frame keeps the live
-/// element count.
+/// `CA_PROTO_EVENT_ADD` request; the encoded DBR payload is sized by
+/// `size_dbr_reply`, exactly as the READ path and the steady-state
+/// monitor producer are. Without that the first monitor frame (and
+/// the access-restore frame) was framed at `snapshot.value.count()`,
+/// so a client requesting more elements than the PV currently holds
+/// saw a count/size discontinuity between the initial frame and
+/// later padded updates.
 fn send_monitor_snapshot(
     writer: &Outbox,
     sub_id: u32,
@@ -5761,21 +5744,14 @@ fn send_monitor_snapshot(
     // `server::frame` for the C `cas_copy_in_header` shape this ports.
     let mut frame = FrameBuf::new(0);
     encode_dbr_into(frame.dst(), data_type, snapshot)?;
-    // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
-    // string regardless of underlying value count — and is never
-    // padded/truncated to a requested element count.
-    let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
-        1
-    } else {
-        // pad (or truncate) the encoded DBR to the requested
-        // element count before the 8-byte alignment resize, so the
-        // header count and payload shape match a non-autosize
-        // request. `pad_dbr_to_requested_count` returns the header
-        // element count to use (`requested_count` when non-zero,
-        // the live `actual_count` for autosize).
-        let actual_count = snapshot.value.count() as u32;
-        pad_dbr_to_requested_count(&mut frame, actual_count, requested_count, data_type)
-    };
+    // Size the payload to the request count *before* the 8-byte alignment
+    // resize, so the header count and the payload shape agree.
+    let element_count = size_dbr_reply(
+        &mut frame,
+        data_type,
+        snapshot.value.count() as u32,
+        requested_count,
+    );
     frame.align_payload();
 
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -5973,7 +5949,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
             // `send_monitor_snapshot` pads when the request asked
             // for more elements than the PV currently holds and
             // truncates when it asked for fewer, via
-            // `pad_dbr_to_requested_count` — so the access-restore
+            // `size_dbr_reply` — so the access-restore
             // frame matches the request shape and later padded
             // updates. C `read_reply` always honours the stored
             // request count; pre-fix Rust framed the restore event
@@ -6254,25 +6230,19 @@ fn build_read_reply(
             // to the autosize sizing so the header count still
             // matches the payload rather than shipping count=0
             // with a value-bearing body.
-            Err(_) => pad_dbr_to_requested_count(
-                &mut frame,
-                actual_count,
-                requested_count,
-                requested_type,
-            ),
+            // Unreachable for a type that already encoded above
+            // (<= LAST_BUFFER_TYPE), and unreachable for
+            // DBR_CLASS_NAME (whose native lookup succeeds). If it
+            // ever weren't, fall through to the shared sizing so the
+            // header count still matches the payload rather than
+            // shipping count=0 with a value-bearing body.
+            Err(_) => size_dbr_reply(&mut frame, requested_type, actual_count, requested_count),
         }
-    } else if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-        // CA-268: DBR_CLASS_NAME wire payload is always one fixed
-        // 40-byte string. element_count must be 1 regardless of
-        // the underlying record's value count — for waveform
-        // records, snapshot.value.count() can be N, which would
-        // make C clients parse 40 * N bytes of body and fail.
-        // This applies to the READ_NOTIFY / EVENT_ADD path and to
-        // ordinary deprecated reads with count!=0; the deprecated
-        // count==0 case is handled above (C ships count=0).
-        1
     } else {
-        pad_dbr_to_requested_count(&mut frame, actual_count, requested_count, requested_type)
+        // Every other count — including DBR_CLASS_NAME's fixed single
+        // element — is the shared `read_reply` sizing. Only the
+        // deprecated-READ count==0 case above deviates from it.
+        size_dbr_reply(&mut frame, requested_type, actual_count, requested_count)
     };
     // Deprecated CA_PROTO_READ (cmd 3) contracts a scalar
     // DBR_STRING payload to its NUL-terminated length before the
@@ -6340,40 +6310,6 @@ fn build_read_reply(
     // reach the connection loop's socket writer and mis-frame the
     // following messages. Same shape as the monitor path (`monitor.rs`).
     Ok(frame.seal(&resp))
-}
-
-/// Resize an encoded DBR payload to the requested element count.
-/// C `read_reply` (`rsrv/camessage.c:507-571`) sets the response
-/// header count to `mp->m_count` (non-autosize) and sizes the
-/// payload to `dbr_size_n(type, request_count)`: extra bytes are
-/// zero-filled, and a response that decoded fewer elements than
-/// requested is still framed at the request count. This refinement
-/// covers BOTH directions: pad when requested > actual, truncate
-/// when requested < actual. Returns the header element count to
-/// use (`requested_count` when non-zero, `actual_count` when
-/// zero / autosize).
-fn pad_dbr_to_requested_count(
-    frame: &mut FrameBuf,
-    actual_count: u32,
-    requested_count: u32,
-    data_type: u16,
-) -> u32 {
-    if requested_count == 0 {
-        return actual_count;
-    }
-    if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
-        // Plain types (0-6) have no metadata; STS / TIME / GR /
-        // CTRL slot metadata before the value array.
-        // `dbr_buffer_size(_, _, 0)` returns just the metadata size.
-        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
-        let target_size = meta_size + (requested_count as usize) * native.element_size();
-        if requested_count > actual_count {
-            frame.zero_extend_payload(target_size);
-        } else if requested_count < actual_count && frame.payload_len() > target_size {
-            frame.truncate_payload(target_size);
-        }
-    }
-    requested_count
 }
 
 /// Send a CA_PROTO_ERROR response with the original header echoed
@@ -8799,7 +8735,7 @@ mod deprecated_read_autosize_tests {
     /// SECURITY — epics-base PR #934 (Item 2) parity. An oversized wire
     /// element count on READ_NOTIFY must clamp to the channel's final
     /// element count, never drive the reply zero-fill
-    /// (`pad_dbr_to_requested_count`) to a `count * element_size`
+    /// (`size_dbr_reply`) to a `count * element_size`
     /// allocation. Pre-fix an extended-header count of 0xFFFFFFFF on a
     /// DBR_DOUBLE channel sized the reply to ~34 GB and the `Vec` zero-fill
     /// aborted the whole process — a remote, unauthenticated DoS.

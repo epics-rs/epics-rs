@@ -98,7 +98,7 @@ pub struct RawEvent {
 /// The broadcast ring has overwritten the dropped events, so their individual
 /// changed bitsets are unrecoverable — but their EFFECT is not: the channel
 /// cache's `latest` is the merge of every upstream event
-/// ([`ChannelEntry::snapshot`], the same whole-structure element a monitor seed
+/// ([`crate::pva_gateway::channel_cache::UpstreamEntry::snapshot`], the same whole-structure element a monitor seed
 /// is built from). Re-framing from it delivers every accumulated value with
 /// every leaf marked changed — a superset of pva2pva's accumulated bitset, and
 /// the same values. No transition can be lost, and the subscriber needs no
@@ -139,7 +139,7 @@ fn reframe_raw_body_after_lag(
     Some(bytes::Bytes::from(body))
 }
 
-/// Lost-leaf paths to record in a cooked [`MonitorUpdate::overrun`] after a
+/// Lost-leaf paths to record in a cooked [`epics_pva_rs::server_native::source::MonitorUpdate::overrun`] after a
 /// fanout broadcast lag — the port's own loss accounting, mirroring pva2pva
 /// unioning the surviving element's changed leaves into the overrun bitset on
 /// downstream overflow (`overrun |= changed & lastelem->changed`,
@@ -150,7 +150,7 @@ fn reframe_raw_body_after_lag(
 /// as top-level fields. A non-structure value (no gateway PV produces one)
 /// reports no overrun.
 ///
-/// Unlike [`mark_raw_body_local_overrun`], which writes into the raw body the
+/// Unlike `reframe_raw_body_after_lag`, which writes into the raw body the
 /// forwarder puts on the wire, this set stays SERVER-SIDE: every cooked MONITOR
 /// DATA frame ends in a hard-empty overrun bitset, as pvxs's does
 /// (`servermon.cpp:174-176`). See `MonitorUpdate::overrun`.
@@ -288,7 +288,7 @@ pub struct GatewayChannelSource {
     /// unseen PV. Pass through to `ChannelCache::lookup`.
     pub connect_timeout: Duration,
     /// Cache policy applied to every *per-credential* upstream cache
-    /// built lazily in [`Self::upstream_cache_for`]. The shared
+    /// built lazily in `upstream_cache_for`. The shared
     /// `cache` is constructed by the caller (`gateway.rs` /
     /// `multi_gateway.rs`) with the configured policy; these fields
     /// carry the SAME policy to credentialed caches so a site that
@@ -349,7 +349,7 @@ pub struct GatewayChannelSource {
     acf: AcfCell,
     /// PV→ASG resolver. Defaults to `DEFAULT` for every name; sites
     /// that want per-PV ASG granularity replace this via
-    /// [`set_asg_resolver`].
+    /// [`GatewayChannelSource::set_asg_resolver`].
     ///
     /// Wrapped in `RwLock` so the resolver can
     /// be hot-swapped at runtime — the gateway is typically handed
@@ -359,7 +359,7 @@ pub struct GatewayChannelSource {
     asg_resolver: Arc<RwLock<AsgResolver>>,
     /// Type-state-enforced access gate. The closure
     /// captures the `asg_resolver` cell so a hot-swap of the
-    /// resolver via [`set_asg_resolver`] is visible on the next
+    /// resolver via [`GatewayChannelSource::set_asg_resolver`] is visible on the next
     /// `check`. ASL is fixed at 0 for gateway-side checks — the
     /// upstream record's ASL is not visible to the gateway and the
     /// site policy on the gateway is expected to use UAG/HAG
@@ -382,7 +382,7 @@ pub struct GatewayChannelSource {
     /// Server-wide channel invalidator, wired once by
     /// the native server through [`ChannelSource::set_channel_invalidator`].
     /// Stored so it reaches not only the shared [`Self::cache`] but every
-    /// per-credential cache built lazily in [`Self::upstream_cache_for`] —
+    /// per-credential cache built lazily in `upstream_cache_for` —
     /// each must publish onto the SAME server-wide invalidator so an operator
     /// `<prefix>:drop` / `:flush` disconnects downstream channels regardless
     /// of which cache held the entry. `Arc<OnceLock<…>>` so all `Clone`s of

@@ -84,7 +84,7 @@ struct Args {
     config: Option<PathBuf>,
 
     /// Validate the config file and exit without binding any socket
-    /// (mirrors pva2pva `-C`). Requires <CONFIG>.
+    /// (mirrors pva2pva `-C`). Requires `<CONFIG>`.
     #[arg(short = 'C', long = "check-config")]
     check_config: bool,
 

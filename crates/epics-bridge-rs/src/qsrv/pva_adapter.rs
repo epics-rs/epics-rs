@@ -165,7 +165,7 @@ pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandl
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
 }
 
-/// Convert a native-PVA [`ChannelContext`] to a [`ClientCreds`] for
+/// Convert a native-PVA [`epics_pva_rs::server_native::source::ChannelContext`] to a [`ClientCreds`] for
 /// `BridgeProvider::create_channel_with_creds`.
 ///
 /// Carries method/authority/roles through so `AcfAccessControl` can
@@ -402,7 +402,7 @@ async fn open_monitor(
 }
 
 /// Spawn the forward task that drains a started DB/group monitor's
-/// `poll()` into a cooked [`MonitorUpdate`] stream. Shared by
+/// `poll()` into a cooked [`epics_pva_rs::server_native::source::MonitorUpdate`] stream. Shared by
 /// `subscribe_checked_opts_marked` and the gated `subscribe_seeded` so the
 /// poll→update conversion lives once. The task ends (and `stop()`s the
 /// monitor, dropping its `DbSubscription`s) when the downstream receiver is
@@ -913,7 +913,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// MONITOR seed entry the native PVA server actually uses. QSRV
     /// overrides it (rather than relying on the default
     /// `subscribe_checked_opts_marked` + `get_value` wrapper) so a
-    /// DB/group monitor can return a per-op [`MonitorGate`] on the seed:
+    /// DB/group monitor can return a per-op `MonitorGate` on the seed:
     /// the wire layer drives it on this op's MONITOR START/STOP edge, and
     /// the gate `db_event_disable`/`db_event_enable`s the backing
     /// `DbSubscription`s — pvxs `onStart(false)` parity
@@ -1332,7 +1332,7 @@ pub struct QsrvMount {
 /// route other than the iocsh command — which on the RTEMS target is the
 /// only route there is, because the target has no iocsh and therefore
 /// nothing ever pushes onto the base startup queue
-/// [`take_group_load_requests`](epics_base_rs::server::ioc_app::take_group_load_requests)
+/// [`epics_base_rs::server::ioc_app::take_group_load_requests`]
 /// drains. The target's command line *is* its st.cmd, so a `.json`
 /// argument becomes a `GroupLoadRequest` here and reaches exactly the same
 /// loader the host's `dbLoadGroup` feeds. The host runner passes an empty
@@ -1405,7 +1405,7 @@ pub async fn build_qsrv_mount(
 /// installer — a database with no PVA links stays fully serviceable,
 /// and the shared PVA client is created lazily per link, so there is
 /// no init failure to abort the IOC on. The gate reads the shared
-/// [`qsrv2_decision`] (silent), so this seam and the runner's
+/// `qsrv2_decision` (silent), so this seam and the runner's
 /// `qsrv2_enabled` print always agree on the same one decision; the
 /// authoritative startup diagnostic is emitted once by the runner.
 pub async fn pvalink_link_set_install(
@@ -1428,7 +1428,7 @@ pub async fn pvalink_link_set_install(
 
 /// Runs a combined CA + PVA IOC with QSRV bridge.
 ///
-/// Designed as a protocol runner for [`IocApplication::run`]. Starts a CA
+/// Designed as a protocol runner for [`epics_base_rs::server::ioc_app::IocApplication::run`]. Starts a CA
 /// server in the background, creates a `QsrvPvStore` wrapping the database,
 /// registers any native PVA PVs (NTNDArray from NDPluginPva), then runs the
 /// PVA server with an interactive iocsh shell.
@@ -1585,7 +1585,7 @@ pub async fn run_ca_pva_qsrv_ioc(
 ///  1. DB `info(Q:group, ...)` records (`loadConfigFromDb`) — every record
 ///     carrying the tag contributes its group definition.
 ///  2. Queued `dbLoadGroup` files (`loadConfigFiles`) — drained from the
-///     base startup queue ([`take_group_load_requests`]) in st.cmd order,
+///     base startup queue ([`epics_base_rs::server::ioc_app::take_group_load_requests`]) in st.cmd order,
 ///     followed by `extra` (the caller-supplied requests described on
 ///     [`build_qsrv_mount`]). On the host exactly the first list is
 ///     populated; on the RTEMS target, which has no iocsh to run the

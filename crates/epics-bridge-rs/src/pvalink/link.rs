@@ -1194,10 +1194,10 @@ impl PvaLink {
     /// link's `sevr` mode, so a default `NMS` link still reports its
     /// remote severity here even though it leaves the owning record
     /// unraised. The status is derived from severity by
-    /// [`RemoteAlarm::from_severity_message`].
+    /// [`epics_base_rs::server::database::RemoteAlarm::from_severity_message`].
     ///
     /// Crucially it reports the value-read-LATCHED snapshot
-    /// ([`Self::latch_alarm_snapshot`]), not the live cached monitor
+    /// (`Self::latch_alarm_snapshot`), not the live cached monitor
     /// alarm. pvxs `snap_severity` is initialized to `INVALID_ALARM`
     /// with a blank message (`pvxs/ioc/pvalink.h:250`) and only
     /// `pvaGetValue` updates it; so a connected link that has never been
@@ -1387,7 +1387,7 @@ impl PvaLink {
     ///
     /// `None` otherwise (no cached value / no timeStamp slot). The
     /// metadata getter `pvaGetTimeStampTag` stays gated through
-    /// `CHECK_VALID` via [`Self::monitor_disconnected_stale`] in
+    /// `CHECK_VALID` via `Self::monitor_disconnected_stale` in
     /// [`Self::link_metadata`] — only this value-read hook adopts the
     /// disconnect time.
     pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
@@ -1662,7 +1662,7 @@ impl PvaLink {
     }
 }
 
-/// True iff a [`PvaError`] indicates the upstream is currently
+/// True iff a [`epics_pva_rs::PvaError`] indicates the upstream is currently
 /// unreachable (as opposed to a value-level rejection). Used to
 /// decide whether a `retry` link should queue the Put (B4).
 ///

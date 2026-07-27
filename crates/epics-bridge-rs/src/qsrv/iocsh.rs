@@ -813,11 +813,11 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
 /// every group (pvxs `!pattern[0]`). `level > 0` prints the atomic flag
 /// and member count; `level > 1` prints one line per member as
 /// `  <fieldName>\t<mappingName><id><chan><has triggers>` — the mapping
-/// token comes from [`FieldMapping::pvxs_name`] (lowercase, matching
+/// token comes from [`super::pvif::FieldMapping::pvxs_name`] (lowercase, matching
 /// `MappingInfo::name`, `typeutils.cpp:65`), not Rust `Debug`. The
 /// ` has triggers` suffix and the `level > 2` per-trigger-target lines are
 /// both derived from the one resolved trigger set
-/// ([`GroupPvDef::resolved_trigger_targets`]) so they can never disagree,
+/// ([`super::group_config::GroupPvDef::resolved_trigger_targets`]) so they can never disagree,
 /// exactly as pvxs derives both from `field.triggers`.
 fn pvxgl_lines(
     groups: &std::collections::HashMap<String, super::group_config::GroupPvDef>,

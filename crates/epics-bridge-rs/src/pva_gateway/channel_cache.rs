@@ -152,7 +152,7 @@ struct EntryState {
     /// It carries no mark set of its own, because a monitor seed built from
     /// it does not declare one: pva2pva's seed is `elem->changedBitSet->set(0)`
     /// — the ROOT bit, "all changed" (`moncache.cpp:304-312`). See
-    /// [`monitor_seed`], the one owner of that rule.
+    /// `monitor_seed`, the one owner of that rule.
     latest: Option<PvField>,
     /// Type descriptor learned from the first INIT response.
     introspection: Option<FieldDesc>,
@@ -199,7 +199,7 @@ struct MonitorEventOutcome {
     /// upstream event's changed bitset onto each downstream element
     /// (`moncache.cpp:142` `*lastelem->changedBitSet = *update->changedBitSet`,
     /// `:189` the per-user copy). The SEED is a different rule entirely — the
-    /// root bit, see [`monitor_seed`].
+    /// root bit, see `monitor_seed`.
     marked: Option<Vec<String>>,
 }
 
@@ -360,7 +360,7 @@ fn signal_disconnect_boundary(
 impl UpstreamEntry {
     /// The downstream monitor seed for this entry's cached snapshot — the
     /// merged upstream value, declared whole-structure, or `None` when no
-    /// upstream event has arrived yet. See [`monitor_seed`] for the rule and
+    /// upstream event has arrived yet. See `monitor_seed` for the rule and
     /// its pva2pva citation; this is a thin accessor so that rule has exactly
     /// one owner.
     pub fn snapshot(&self) -> Option<SourceRead> {
@@ -429,7 +429,7 @@ impl UpstreamEntry {
     /// because non-monitor ops never consult this cache.
     ///
     /// Pure read — it does NOT consume the grace; only `cleanup_tick` resets
-    /// `drop_poke`. The cache-full emergency sweep in [`Self::lookup`] used
+    /// `drop_poke`. The cache-full emergency sweep in [`ChannelCache::lookup`] used
     /// `Arc::strong_count > 1`, which does not mean "has a subscriber": a
     /// subscribed-but-not-mid-lookup entry had `strong_count == 1` and was
     /// wrongly swept — silently killing the shared upstream monitor for
@@ -1440,7 +1440,7 @@ impl ChannelCache {
     }
 
     /// Wire the server-wide channel invalidator (see the
-    /// [`Self::invalidator`] field). Called by the bound
+    /// `invalidator` field). Called by the bound
     /// `GatewayChannelSource` when the native server hands it the handle.
     /// Idempotent — a second set is ignored (`OnceLock`), so
     /// re-registration of the shared cache on `<prefix>:reload` is

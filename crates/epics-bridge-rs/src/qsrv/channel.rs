@@ -64,7 +64,7 @@ impl Default for PutOptions {
 /// must never reach the value subscription — the property
 /// subscription is opened separately and unconditionally
 /// (singlesource.cpp:161-167). EPICS `DBE_*` bit values coincide with
-/// [`EventMask`] bits (VALUE=1, ARCHIVE/LOG=2, ALARM=4), so the raw
+/// [`epics_base_rs::server::recgbl::EventMask`] bits (VALUE=1, ARCHIVE/LOG=2, ALARM=4), so the raw
 /// client mask maps straight through.
 fn dbe_value_class_mask(raw: u16) -> u16 {
     use epics_base_rs::server::recgbl::EventMask;
@@ -316,7 +316,7 @@ impl PutOptions {
     ///
     /// `log` is the operation's [`RemoteLog`]: a `process` value pvxs
     /// cannot interpret is reported to the client rather than silently
-    /// defaulted (see [`process_mode_from_field`]).
+    /// defaulted (see `process_mode_from_field`).
     pub fn from_pv_request(request: &PvStructure, log: &RemoteLog) -> Self {
         let mut opts = Self::default();
 
@@ -484,7 +484,7 @@ pub struct BridgeChannel {
     /// chain (`ioc/singlesource.cpp:278-292`, `localfieldlog.cpp:15-24`).
     /// The monitor path installs the chain on its subscription; the GET
     /// path applies it in read context via
-    /// [`FilterChain::apply_to_read_value`]. PUT writes the raw value
+    /// [`FilterChain::apply_to_read_value`](epics_base_rs::server::database::filters::FilterChain::apply_to_read_value). PUT writes the raw value
     /// (filters are read-side only).
     channel_filters: std::sync::Arc<epics_base_rs::server::database::filters::FilterChain>,
     /// An INDEPENDENT re-parse of the same channel-filter suffix, for the

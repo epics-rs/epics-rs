@@ -230,7 +230,7 @@ impl PvaLinkResolver {
 
     /// Open / cache a link for `pv_name` in INP+monitor mode. Mirrors
     /// pvxs `pvalinkOpen` (pvalink_channel.cpp). After this returns,
-    /// later calls to [`Self::resolve`] for the same name will read
+    /// later calls to [`LinkSet::get_cached_value`] for the same name will read
     /// the cached monitor value (no async block).
     ///
     /// Honors any link options previously registered for `pv_name`

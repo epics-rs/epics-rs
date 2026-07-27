@@ -366,7 +366,7 @@ impl DialPool {
     /// The other half of the bound: `worker_count()` alone cannot distinguish
     /// "four workers, nothing queued" from "four workers, every one pinned and
     /// a fifth dial waiting" — which is the state
-    /// [`MAX_DIAL_WORKERS`](self::MAX_DIAL_WORKERS) exists to produce and the
+    /// [`MAX_DIAL_WORKERS`] exists to produce and the
     /// only state in which the queueing it documents is observable.
     pub fn queue_depth(&self) -> (usize, usize) {
         let q = self.lock();
@@ -882,8 +882,8 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 ///
 /// # The deadline holds on every target, by construction
 ///
-/// This function owns its bound end to end. [`wait_writable`] does every wait,
-/// against `deadline`; [`write_some`] cannot park, whatever the socket's
+/// This function owns its bound end to end. `wait_writable` does every wait,
+/// against `deadline`; `write_some` cannot park, whatever the socket's
 /// options say. Between them there is no call in this loop that can outlast
 /// `send_timeout`, and nothing a caller does or fails to do can disarm it.
 ///

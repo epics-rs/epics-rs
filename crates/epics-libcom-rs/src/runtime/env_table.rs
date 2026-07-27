@@ -6,7 +6,7 @@
 //! drift and runs as part of `cargo nextest run -p env-codegen`.
 //!
 //! This module is the workspace's ONLY declaration of an EPICS environment
-//! default. [`EnvParam`](super::env::EnvParam) cannot be constructed outside
+//! default. [`EnvParam`] cannot be constructed outside
 //! `epics-libcom-rs`, and none of its accessors take a `default` argument, so a
 //! caller has no way to introduce a second one.
 

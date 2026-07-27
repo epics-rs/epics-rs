@@ -254,7 +254,7 @@ impl BlockingBridge {
 /// builds: a fresh current-thread runtime with IO and time enabled. On
 /// `exec_backend` (the RTEMS target, or a host run with
 /// `--features rtems-exec-model`) no tokio runtime exists to build, so the
-/// test thread itself drives the future via [`park_on`], and everything the
+/// test thread itself drives the future via `park_on`, and everything the
 /// body spawns or sleeps on lands on the process-global background executor
 /// (lazily initialised on first use) — the same seam the RTEMS boot path
 /// exercises. A test written with `#[epics_test]` therefore needs no
@@ -953,11 +953,11 @@ pub enum RtPolicy {
 ///     (VxWorks 7, `x86_64-wrs-vxworks`), 11 of 11 measured threads landed
 ///     `PriorityApplied::Realtime` via `SCHED_FIFO`, exactly one scheduler
 ///     call each, at `posix = 56 + epics` — the same POSIX value RTEMS gets
-///     (see [`map_epics_priority_rtems`]) — which VxWorks's own POSIX layer
+///     (see `map_epics_priority_rtems`) — which VxWorks's own POSIX layer
 ///     then inverts into its native task-priority space at `vx = 199 -
 ///     epics`, exact: EPICS base's own vxWorks-port formula
 ///     (`vxWorks/osdThread.c:99`), reached by construction rather than by
-///     restating it (see [`map_epics_priority_vxworks`]).
+///     restating it (see `map_epics_priority_vxworks`).
 ///
 /// An explicit value still wins in **both** directions on every target, so
 /// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS or VxWorks.

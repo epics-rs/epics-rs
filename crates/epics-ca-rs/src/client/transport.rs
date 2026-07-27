@@ -471,7 +471,21 @@ pub(super) enum WatchdogExpiry {
 /// ([`RecvBodyPolicy`]).
 ///
 /// **Invariant:** every CA TCP connection this client opens is retired if its
-/// peer answers nothing within `echo_idle_secs() + ECHO_TIMEOUT_SECS`.
+/// peer answers nothing within `echo_idle_secs() + ECHO_TIMEOUT_SECS`, and
+/// retiring it releases the descriptor *then* — a circuit is never held open
+/// past its own verdict.
+///
+/// The second half needs its own owner, because a descriptor outlives the
+/// watchdog's verdict until **both** halves are dropped, and the watchdog only
+/// ends the reader:
+///
+/// * data circuit — [`spawn_guarded_pump`]'s [`CircuitDeathGuard`] reports
+///   whichever pump exits first, and `run_transport_manager` drops the
+///   `ServerConnection`, whose `Drop` aborts the sibling task.
+/// * name-service circuit — `search::serve_nameserver_circuit` *is* the
+///   circuit's scope: both halves are its locals and the reconnect backoff is
+///   in its caller, so returning releases them. Held inside that scope instead,
+///   the send half survived the retirement by a full `EPICS_CA_CONN_TMO`.
 ///
 /// It is inherited rather than opted into: [`split_circuit`] hands one back
 /// with the two halves, so the reader of a dialled circuit cannot be obtained

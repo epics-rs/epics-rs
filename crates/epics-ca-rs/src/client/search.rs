@@ -1201,248 +1201,17 @@ async fn run_nameserver_connection(
             continue;
         };
 
-        // The watchdog arrives with the halves — see
-        // `transport::CircuitWatchdog`. This circuit is retired on the same
-        // `echo_idle_secs() + ECHO_TIMEOUT_SECS` bound a data circuit is,
-        // because it is the same rule object, not a second copy of the rule.
-        let (mut reader, mut writer, mut watchdog) = super::transport::split_circuit(stream);
-
-        // Send initial VERSION + HOST_NAME + CLIENT_NAME so the nameserver
-        // accepts our search frames (mirrors transport.rs handshake).
-        // libca handshake order (`tcpiiu.cpp:755-762`):
-        // VERSION → CLIENT_NAME → HOST_NAME. Mirror exactly.
-        let mut handshake = Vec::new();
-        let mut version = CaHeader::new(CA_PROTO_VERSION);
-        version.count = CA_MINOR_VERSION;
-        handshake.extend_from_slice(&version.to_bytes());
-        let user = epics_base_rs::runtime::env::get("USER")
-            .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
-            .unwrap_or_else(|| "unknown".to_string());
-        // extended-form headers when the USER / hostname
-        // payload exceeds 16-bit postsize (libca's
-        // `insertRequestHeader` parity). See the matching note in
-        // `client/transport.rs` connect path.
-        handshake.extend_from_slice(&super::transport::build_identity_frame(
-            CA_PROTO_CLIENT_NAME,
-            &user,
-        ));
-        handshake.extend_from_slice(&super::transport::build_identity_frame(
-            CA_PROTO_HOST_NAME,
-            &epics_base_rs::runtime::env::hostname(),
-        ));
-        if writer.write_all(&handshake).await.is_err() {
-            epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
-            continue;
-        }
-
-        let resp_tx = response_tx.clone();
-        // The watchdog lives with the reader and the writer lives with the
-        // pump, so the probe crosses between them. That is the shape
-        // `read_loop` already has — it holds the watchdog and pushes the echo
-        // bytes out through `write_tx` — and it is why the reader can own the
-        // liveness rule without owning the socket's send half.
-        let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<()>();
-        let read_task = epics_base_rs::runtime::task::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            let mut accumulated: Vec<u8> = Vec::new();
-            // The client's one receive-side body limit
-            // (`transport::RecvBodyPolicy`), shared with the upstream
-            // circuit's `read_loop`. C applies `processIncoming`'s
-            // over-`EPICS_CA_MAX_ARRAY_BYTES` ignore-and-drain to a
-            // name-service `tcpiiu` exactly as to a data one; pre-fix this
-            // reader had no limit at all, so with
-            // `EPICS_CA_AUTO_ARRAY_BYTES=NO` one 24-byte extended header
-            // from a misbehaving name server could grow `accumulated`
-            // toward the announced 4 GiB while the data circuit refused
-            // the same frame.
-            let mut body_policy = super::transport::RecvBodyPolicy::new();
-            loop {
-                watchdog.note_iteration();
-                let n = tokio::select! {
-                    _ = epics_base_rs::runtime::task::sleep_until(watchdog.deadline()),
-                        if watchdog.is_armed() =>
-                    {
-                        match watchdog.expired() {
-                            super::transport::WatchdogExpiry::SendEcho {
-                                suspend_wake,
-                                wall_skip,
-                            } => {
-                                if suspend_wake {
-                                    tracing::info!(
-                                        nameserver = %addr,
-                                        wall_skip_secs = wall_skip.as_secs(),
-                                        "suspend wake detected; probing with shortened \
-                                         echo timeout"
-                                    );
-                                }
-                                // The pump writes it; a closed channel means
-                                // the pump is already gone.
-                                if echo_tx.send(()).is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
-                            super::transport::WatchdogExpiry::Unresponsive => {
-                                // The probe went unanswered. C reaches the same
-                                // verdict on a name-service `tcpiiu` — its
-                                // `recvDog` is armed with no `isNameService()`
-                                // branch — and this port's recovery for a
-                                // name server is the redial its outer loop
-                                // already owns, on the one CONN_TMO knob.
-                                tracing::warn!(
-                                    nameserver = %addr,
-                                    bound_secs = super::transport::CircuitWatchdog::retire_bound()
-                                        .as_secs(),
-                                    "EPICS_CA_NAME_SERVERS peer did not answer \
-                                     CA_PROTO_ECHO; retiring the circuit"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    read_result = reader.read(&mut buf) => match read_result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    },
-                };
-                // Any byte proves the peer is alive, an ECHO reply included.
-                watchdog.data_arrived();
-                accumulated.extend_from_slice(&buf[..n]);
-                // Bytes owed to an already-refused oversize message are
-                // consumed before framing resumes.
-                if body_policy.drain_refused(&mut accumulated) {
-                    continue;
-                }
-                // Forward only the prefix that contains complete CA
-                // messages. Without this framing, the kernel splitting a
-                // server response across read syscalls causes the
-                // dispatcher to miss leading frames (when the partial
-                // buffer is < 16 bytes) and misalign subsequent parses.
-                //
-                // Where the message boundaries are is NOT decided here —
-                // `transport::next_frame` is the client's one framing step,
-                // shared with the upstream circuit's `read_loop`
-                // (`doc/calink-rtems-design.md` §6 C2: "one seam, two
-                // callers"). This loop only measures how long a prefix of
-                // whole messages it can hand on.
-                let mut consumed = 0usize;
-                // Distinguishes "wait for more bytes" from "the bytes we
-                // have are definitively malformed". Pre-fix every exit path
-                // used the same `break`, so a parse error or a misaligned
-                // `m_postsize` left the bad prefix sitting at the head of
-                // `accumulated`; the next socket read appended fresh bytes
-                // but the inner loop re-parsed the same bad prefix on every
-                // iteration, wedging the circuit. C client
-                // `tcpiiu.cpp::processIncoming:1197-1202` returns `false` on
-                // a misaligned payload — the surrounding tcpiiu shuts the
-                // connection. We mirror by exiting the outer read loop,
-                // which drops the read_task and lets the reconnect path
-                // rebuild.
-                let mut bad_frame = None;
-                loop {
-                    match super::transport::next_frame(&accumulated[consumed..]) {
-                        super::transport::Frame::Incomplete => break,
-                        super::transport::Frame::Malformed(e) => {
-                            bad_frame = Some(e);
-                            break;
-                        }
-                        super::transport::Frame::Header {
-                            hdr_size, body_len, ..
-                        } => {
-                            let msg_size = hdr_size + body_len;
-                            // Over-limit message: ignored, never fatal —
-                            // the same `RecvBodyPolicy` rule as the data
-                            // circuit. Ship the clean prefix first so the
-                            // refused bytes never reach the dispatcher,
-                            // then drop the message (across reads if its
-                            // body is still arriving).
-                            if body_policy.refuses(addr, body_len) {
-                                if consumed > 0 {
-                                    let frame_bytes = accumulated[..consumed].to_vec();
-                                    let _ = resp_tx.send((frame_bytes, addr));
-                                    accumulated.drain(..consumed);
-                                    consumed = 0;
-                                }
-                                if msg_size <= accumulated.len() {
-                                    accumulated.drain(..msg_size);
-                                    continue;
-                                }
-                                body_policy.owe(msg_size - accumulated.len());
-                                accumulated.clear();
-                                break;
-                            }
-                            if accumulated.len() - consumed < msg_size {
-                                break;
-                            }
-                            consumed += msg_size;
-                        }
-                    }
-                }
-                if consumed > 0 {
-                    let frame_bytes = accumulated[..consumed].to_vec();
-                    let _ = resp_tx.send((frame_bytes, addr));
-                    accumulated.drain(..consumed);
-                }
-                if let Some(reason) = bad_frame {
-                    tracing::warn!(
-                        addr = ?addr,
-                        %reason,
-                        "TCP nameserver framing error; closing circuit \
-                         (C tcpiiu.cpp:1197-1202 parity)"
-                    );
-                    break;
-                }
-            }
-        });
-
-        // Pipe outgoing search frames to the TCP writer until the reader
-        // task ends or the channel closes.
-        // Closed outgoing channel = client shutdown. Track it so we
-        // fall through to read_task cleanup, then exit the outer
-        // reconnect loop. Earlier code `return`-ed directly which
-        // skipped the cleanup and leaked the read task per
-        // nameserver on every shutdown.
-        let mut shutdown = false;
-        'pump: loop {
-            tokio::select! {
-                msg = outgoing_rx.recv() => {
-                    let Some(bytes) = msg else {
-                        shutdown = true;
-                        break 'pump;
-                    };
-                    if writer.write_all(&bytes).await.is_err() {
-                        break 'pump;
-                    }
-                }
-                probe = echo_rx.recv() => {
-                    // The reader's watchdog asked for a probe. Pre-fix this
-                    // arm was a hardcoded 60 s `sleep` whose echo nobody ever
-                    // looked for a reply to, which is why a name server that
-                    // accepted and went silent was held indefinitely.
-                    if probe.is_none() {
-                        // Reader gone; the `read_task.is_finished()` check
-                        // below ends the pump.
-                        break 'pump;
-                    }
-                    let echo = CaHeader::new(CA_PROTO_ECHO);
-                    if writer.write_all(&echo.to_bytes()).await.is_err() {
-                        break 'pump;
-                    }
-                }
-            }
-            if read_task.is_finished() {
-                break 'pump;
-            }
-        }
-        read_task.abort();
-        let _ = read_task.await;
-
-        if shutdown {
+        match serve_nameserver_circuit(addr, stream, &mut outgoing_rx, &response_tx).await {
             // Outgoing channel closed → no more senders ever → don't
             // reconnect; exit the per-nameserver task.
-            return;
+            NameserverCircuitEnd::Shutdown => return,
+            NameserverCircuitEnd::Retired => {}
         }
 
+        // Both halves of the circuit were locals of the call above, so they are
+        // already gone here — the descriptor is released at the instant the
+        // circuit is retired, not one reconnect interval later.
+        //
         // Same cadence as a failed connect, whichever half gave out: one knob
         // (CONN_TMO), so a nameserver that accepts and immediately drops — or
         // one the watchdog just retired for not answering CA_PROTO_ECHO —
@@ -1453,6 +1222,281 @@ async fn run_nameserver_connection(
         epics_base_rs::runtime::task::sleep(super::transport::connection_timeout()).await;
     }
 }
+
+/// Why a name-service circuit ended, and therefore whether to redial.
+enum NameserverCircuitEnd {
+    /// The outgoing channel closed: the client is shutting down and no sender
+    /// can ever appear again.
+    Shutdown,
+    /// The circuit is gone — the watchdog retired it, a half failed, or the
+    /// peer sent a frame this client will not parse. Redial after CONN_TMO.
+    Retired,
+}
+
+/// Serve one dialled name-service circuit until it ends.
+///
+/// **This function is the circuit's lifetime.** Both halves and the
+/// [`CircuitWatchdog`](super::transport::CircuitWatchdog) are locals of it, so
+/// returning releases the descriptor — there is no reachable state in which the
+/// watchdog has retired the circuit and the socket is still open. That is why
+/// the reconnect backoff lives in the caller: written here it would hold the
+/// send half across `EPICS_CA_CONN_TMO`, which on a hosted build (`into_split`,
+/// no shutdown-on-reader-drop) keeps the connection ESTABLISHED for 30 s after
+/// the peer was declared unresponsive, and on the blocking backend keeps the
+/// descriptor allocated for the same 30 s after `ReaderPumpGuard` has already
+/// shut the socket down.
+///
+/// The data circuit gets the same guarantee from a different owner:
+/// `transport::spawn_guarded_pump`'s `CircuitDeathGuard` reports the first half
+/// to exit, and the transport manager drops the whole `ServerConnection`, which
+/// aborts the other half.
+async fn serve_nameserver_circuit(
+    addr: SocketAddr,
+    stream: super::transport::CaCircuit,
+    outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
+    response_tx: &mpsc::UnboundedSender<ParsedDatagram>,
+) -> NameserverCircuitEnd {
+    // The watchdog arrives with the halves — see
+    // `transport::CircuitWatchdog`. This circuit is retired on the same
+    // `echo_idle_secs() + ECHO_TIMEOUT_SECS` bound a data circuit is,
+    // because it is the same rule object, not a second copy of the rule.
+    let (mut reader, mut writer, mut watchdog) = super::transport::split_circuit(stream);
+
+    // Send initial VERSION + HOST_NAME + CLIENT_NAME so the nameserver
+    // accepts our search frames (mirrors transport.rs handshake).
+    // libca handshake order (`tcpiiu.cpp:755-762`):
+    // VERSION → CLIENT_NAME → HOST_NAME. Mirror exactly.
+    let mut handshake = Vec::new();
+    let mut version = CaHeader::new(CA_PROTO_VERSION);
+    version.count = CA_MINOR_VERSION;
+    handshake.extend_from_slice(&version.to_bytes());
+    let user = epics_base_rs::runtime::env::get("USER")
+        .or_else(|| epics_base_rs::runtime::env::get("USERNAME"))
+        .unwrap_or_else(|| "unknown".to_string());
+    // extended-form headers when the USER / hostname
+    // payload exceeds 16-bit postsize (libca's
+    // `insertRequestHeader` parity). See the matching note in
+    // `client/transport.rs` connect path.
+    handshake.extend_from_slice(&super::transport::build_identity_frame(
+        CA_PROTO_CLIENT_NAME,
+        &user,
+    ));
+    handshake.extend_from_slice(&super::transport::build_identity_frame(
+        CA_PROTO_HOST_NAME,
+        &epics_base_rs::runtime::env::hostname(),
+    ));
+    if writer.write_all(&handshake).await.is_err() {
+        return NameserverCircuitEnd::Retired;
+    }
+
+    let resp_tx = response_tx.clone();
+    // The watchdog lives with the reader and the writer lives with the
+    // pump, so the probe crosses between them. That is the shape
+    // `read_loop` already has — it holds the watchdog and pushes the echo
+    // bytes out through `write_tx` — and it is why the reader can own the
+    // liveness rule without owning the socket's send half.
+    let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<()>();
+    let read_task = epics_base_rs::runtime::task::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        let mut accumulated: Vec<u8> = Vec::new();
+        // The client's one receive-side body limit
+        // (`transport::RecvBodyPolicy`), shared with the upstream
+        // circuit's `read_loop`. C applies `processIncoming`'s
+        // over-`EPICS_CA_MAX_ARRAY_BYTES` ignore-and-drain to a
+        // name-service `tcpiiu` exactly as to a data one; pre-fix this
+        // reader had no limit at all, so with
+        // `EPICS_CA_AUTO_ARRAY_BYTES=NO` one 24-byte extended header
+        // from a misbehaving name server could grow `accumulated`
+        // toward the announced 4 GiB while the data circuit refused
+        // the same frame.
+        let mut body_policy = super::transport::RecvBodyPolicy::new();
+        loop {
+            watchdog.note_iteration();
+            let n = tokio::select! {
+                _ = epics_base_rs::runtime::task::sleep_until(watchdog.deadline()),
+                    if watchdog.is_armed() =>
+                {
+                    match watchdog.expired() {
+                        super::transport::WatchdogExpiry::SendEcho {
+                            suspend_wake,
+                            wall_skip,
+                        } => {
+                            if suspend_wake {
+                                tracing::info!(
+                                    nameserver = %addr,
+                                    wall_skip_secs = wall_skip.as_secs(),
+                                    "suspend wake detected; probing with shortened \
+                                     echo timeout"
+                                );
+                            }
+                            // The pump writes it; a closed channel means
+                            // the pump is already gone.
+                            if echo_tx.send(()).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        super::transport::WatchdogExpiry::Unresponsive => {
+                            // The probe went unanswered. C reaches the same
+                            // verdict on a name-service `tcpiiu` — its
+                            // `recvDog` is armed with no `isNameService()`
+                            // branch — and this port's recovery for a
+                            // name server is the redial its outer loop
+                            // already owns, on the one CONN_TMO knob.
+                            tracing::warn!(
+                                nameserver = %addr,
+                                bound_secs = super::transport::CircuitWatchdog::retire_bound()
+                                    .as_secs(),
+                                "EPICS_CA_NAME_SERVERS peer did not answer \
+                                 CA_PROTO_ECHO; retiring the circuit"
+                            );
+                            break;
+                        }
+                    }
+                }
+                read_result = reader.read(&mut buf) => match read_result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                },
+            };
+            // Any byte proves the peer is alive, an ECHO reply included.
+            watchdog.data_arrived();
+            accumulated.extend_from_slice(&buf[..n]);
+            // Bytes owed to an already-refused oversize message are
+            // consumed before framing resumes.
+            if body_policy.drain_refused(&mut accumulated) {
+                continue;
+            }
+            // Forward only the prefix that contains complete CA
+            // messages. Without this framing, the kernel splitting a
+            // server response across read syscalls causes the
+            // dispatcher to miss leading frames (when the partial
+            // buffer is < 16 bytes) and misalign subsequent parses.
+            //
+            // Where the message boundaries are is NOT decided here —
+            // `transport::next_frame` is the client's one framing step,
+            // shared with the upstream circuit's `read_loop`
+            // (`doc/calink-rtems-design.md` §6 C2: "one seam, two
+            // callers"). This loop only measures how long a prefix of
+            // whole messages it can hand on.
+            let mut consumed = 0usize;
+            // Distinguishes "wait for more bytes" from "the bytes we
+            // have are definitively malformed". Pre-fix every exit path
+            // used the same `break`, so a parse error or a misaligned
+            // `m_postsize` left the bad prefix sitting at the head of
+            // `accumulated`; the next socket read appended fresh bytes
+            // but the inner loop re-parsed the same bad prefix on every
+            // iteration, wedging the circuit. C client
+            // `tcpiiu.cpp::processIncoming:1197-1202` returns `false` on
+            // a misaligned payload — the surrounding tcpiiu shuts the
+            // connection. We mirror by exiting the outer read loop,
+            // which drops the read_task and lets the reconnect path
+            // rebuild.
+            let mut bad_frame = None;
+            loop {
+                match super::transport::next_frame(&accumulated[consumed..]) {
+                    super::transport::Frame::Incomplete => break,
+                    super::transport::Frame::Malformed(e) => {
+                        bad_frame = Some(e);
+                        break;
+                    }
+                    super::transport::Frame::Header {
+                        hdr_size, body_len, ..
+                    } => {
+                        let msg_size = hdr_size + body_len;
+                        // Over-limit message: ignored, never fatal —
+                        // the same `RecvBodyPolicy` rule as the data
+                        // circuit. Ship the clean prefix first so the
+                        // refused bytes never reach the dispatcher,
+                        // then drop the message (across reads if its
+                        // body is still arriving).
+                        if body_policy.refuses(addr, body_len) {
+                            if consumed > 0 {
+                                let frame_bytes = accumulated[..consumed].to_vec();
+                                let _ = resp_tx.send((frame_bytes, addr));
+                                accumulated.drain(..consumed);
+                                consumed = 0;
+                            }
+                            if msg_size <= accumulated.len() {
+                                accumulated.drain(..msg_size);
+                                continue;
+                            }
+                            body_policy.owe(msg_size - accumulated.len());
+                            accumulated.clear();
+                            break;
+                        }
+                        if accumulated.len() - consumed < msg_size {
+                            break;
+                        }
+                        consumed += msg_size;
+                    }
+                }
+            }
+            if consumed > 0 {
+                let frame_bytes = accumulated[..consumed].to_vec();
+                let _ = resp_tx.send((frame_bytes, addr));
+                accumulated.drain(..consumed);
+            }
+            if let Some(reason) = bad_frame {
+                tracing::warn!(
+                    addr = ?addr,
+                    %reason,
+                    "TCP nameserver framing error; closing circuit \
+                     (C tcpiiu.cpp:1197-1202 parity)"
+                );
+                break;
+            }
+        }
+    });
+
+    // Pipe outgoing search frames to the TCP writer until the reader
+    // task ends or the channel closes.
+    // Closed outgoing channel = client shutdown. Track it so we
+    // fall through to read_task cleanup, then exit the outer
+    // reconnect loop. Earlier code `return`-ed directly which
+    // skipped the cleanup and leaked the read task per
+    // nameserver on every shutdown.
+    let mut shutdown = false;
+    'pump: loop {
+        tokio::select! {
+            msg = outgoing_rx.recv() => {
+                let Some(bytes) = msg else {
+                    shutdown = true;
+                    break 'pump;
+                };
+                if writer.write_all(&bytes).await.is_err() {
+                    break 'pump;
+                }
+            }
+            probe = echo_rx.recv() => {
+                // The reader's watchdog asked for a probe. Pre-fix this
+                // arm was a hardcoded 60 s `sleep` whose echo nobody ever
+                // looked for a reply to, which is why a name server that
+                // accepted and went silent was held indefinitely.
+                if probe.is_none() {
+                    // Reader gone; the `read_task.is_finished()` check
+                    // below ends the pump.
+                    break 'pump;
+                }
+                let echo = CaHeader::new(CA_PROTO_ECHO);
+                if writer.write_all(&echo.to_bytes()).await.is_err() {
+                    break 'pump;
+                }
+            }
+        }
+        if read_task.is_finished() {
+            break 'pump;
+        }
+    }
+    read_task.abort();
+    let _ = read_task.await;
+    if shutdown {
+        NameserverCircuitEnd::Shutdown
+    } else {
+        NameserverCircuitEnd::Retired
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Request handling
@@ -3310,6 +3354,77 @@ mod tests {
         assert!(
             elapsed <= budget,
             "redial took {elapsed:?}, past the {budget:?} the bound allows"
+        );
+    }
+
+    /// Retiring the circuit releases the socket *then*, not one reconnect
+    /// interval later.
+    ///
+    /// The watchdog ends the reader, but a CA circuit's descriptor lives until
+    /// **both** halves are gone. While the reconnect backoff sat in the same
+    /// scope as the halves, the send half stayed alive across
+    /// `EPICS_CA_CONN_TMO`: on a hosted build (`into_split`, which has no
+    /// shutdown-on-reader-drop) the connection stayed ESTABLISHED for 30 s
+    /// after the peer had been declared unresponsive, and on the blocking
+    /// backend the descriptor stayed allocated for the same 30 s after
+    /// `ReaderPumpGuard` had already shut the socket down — which is what a
+    /// descriptor census on target sees. `serve_nameserver_circuit` owns the
+    /// halves and the backoff is in its caller, so returning releases them.
+    ///
+    /// Measured from the peer, which is where the difference is observable: the
+    /// FIN must arrive on the bound, not on the bound plus the redial cadence.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(start_paused = true)]
+    async fn retiring_a_name_service_circuit_closes_it_before_the_backoff() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock name-server listener bind");
+        let ns_addr = ns_listener.local_addr().expect("mock name-server addr");
+
+        // Accept once and report how long that first connection stayed open.
+        let (eof_tx, mut eof_rx) = mpsc::unbounded_channel::<Duration>();
+        let _ns_handle = tokio::spawn(async move {
+            let Ok((mut stream, _peer)) = ns_listener.accept().await else {
+                return;
+            };
+            let accepted_at = tokio::time::Instant::now();
+            let mut buf = vec![0u8; 8192];
+            // Drain and answer nothing until the client closes on us.
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = eof_tx.send(accepted_at.elapsed());
+        });
+
+        let (_req_tx, req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
+        let engine = name_servers_only_search_engine(
+            vec![ns_addr],
+            req_rx,
+            resp_tx,
+            std::sync::Arc::new(dashmap::DashMap::new()),
+        )
+        .expect("name-servers-only engine must build with a non-empty NS list");
+        let _engine_handle = tokio::spawn(engine);
+
+        let bound = crate::client::transport::CircuitWatchdog::retire_bound();
+        let backoff = crate::client::transport::connection_timeout();
+        // Generous enough to absorb the dial and the probe round trip, and
+        // still far below the `bound + backoff` the pre-fix scope produced.
+        let allowed = bound + Duration::from_secs(10);
+        let held = tokio::time::timeout(bound + backoff + Duration::from_secs(30), eof_rx.recv())
+            .await
+            .expect("the retired circuit must close; the peer saw no FIN at all")
+            .expect("eof channel closed");
+        assert!(
+            held <= allowed,
+            "the socket outlived its retirement by the reconnect backoff: held \
+             {held:?}, bound {bound:?}, backoff {backoff:?}"
         );
     }
 

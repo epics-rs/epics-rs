@@ -260,9 +260,14 @@ impl Subscriber {
     /// event to this monitor's event queue, which owns C's append-vs-replace
     /// decision (`db_queue_event_log`), and apply the one piece of accounting
     /// that lives outside the queue — the counter for a value that a later post
-    /// displaced before the consumer ever saw it (C `nreplace`).
+    /// displaced before the consumer ever saw it (C `nreplace`, plus the
+    /// latest-only collapse that C leaves uncounted; both mean one value the
+    /// consumer will never see).
     pub(crate) fn post(&self, event: MonitorEvent) {
-        if self.sink.post(event) == PostOutcome::Replaced {
+        if matches!(
+            self.sink.post(event),
+            PostOutcome::Replaced | PostOutcome::Collapsed
+        ) {
             DROPPED_MONITOR_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
     }

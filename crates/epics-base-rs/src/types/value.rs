@@ -5,6 +5,12 @@ use super::DbFieldType;
 use super::PvString;
 use super::c_cast;
 
+/// `sizeof(union native_value)` (C `dbFldTypes.h`) — the widest member is
+/// `char [MAX_STRING_SIZE]`, so 40 bytes. The cut-off C uses to decide whether
+/// a monitor event queue may hold a value inline; see
+/// [`EpicsValue::queues_by_value`].
+pub const NATIVE_VALUE_BYTES: usize = 40;
+
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
 pub enum EpicsValue {
@@ -731,6 +737,48 @@ impl EpicsValue {
                 | Self::CharArray(_)
                 | Self::StringArray(_)
         )
+    }
+
+    /// C `db_add_event`'s `useValque` test (`dbEvent.c:492-500`): may a monitor
+    /// event queue hold this value *by value*, or must it keep only the latest?
+    ///
+    /// ```c
+    /// if (dbChannelElements(chan) == 1 &&
+    ///     dbChannelSpecial(chan) != SPC_DBADDR &&
+    ///     dbChannelFieldSize(chan) <= sizeof(union native_value)) {
+    ///     pevent->useValque = TRUE;
+    /// }
+    /// else {
+    ///     pevent->useValque = FALSE;
+    /// }
+    /// ```
+    ///
+    /// C's `union native_value` (`dbFldTypes.h`) is at most one
+    /// `char[MAX_STRING_SIZE]`, so "queueable by value" means "fits in 40
+    /// bytes". Anything wider is stored by reference
+    /// (`db_create_field_log`'s `dbfl_type_ref` branch, which copies nothing
+    /// and points at the record's own field), and C then refuses to queue a
+    /// second one — `dbel` reports such a subscription as
+    /// "queueing disabled".
+    ///
+    /// The port cannot store a reference (every event carries an owned
+    /// [`crate::server::snapshot::Snapshot`]), so this predicate is what keeps
+    /// its memory profile C's: see
+    /// [`crate::server::event_queue`]'s latest-only rule.
+    pub fn queues_by_value(&self) -> bool {
+        match self {
+            // C: `dbChannelElements(chan) == 1` fails for every array field,
+            // whatever its current element count.
+            v if v.is_array() => false,
+            // The two scalar variants with heap-allocated payloads: a
+            // long-string `DBR_STRING` can exceed MAX_STRING_SIZE, and the
+            // transient NTEnum carrier holds a whole label vector.
+            Self::String(s) => s.len() <= NATIVE_VALUE_BYTES,
+            Self::EnumWithChoices { .. } => false,
+            // Every remaining variant is a fixed-width scalar of at most 8
+            // bytes.
+            _ => true,
+        }
     }
 
     /// Get the element count for this value.
@@ -1908,5 +1956,33 @@ mod enum_with_choices_tests {
         }
         // Out-of-range: ASCII decimal index.
         assert_eq!(EpicsValue::enum_index_label(&choices, 9).as_bytes(), b"9");
+    }
+
+    /// Boundaries of C's `useValque` test, one case per boundary: a fixed-width
+    /// scalar, a string exactly `sizeof(union native_value)`, one byte past it,
+    /// the heap-carrying enum variant, and an array at its smallest — a
+    /// one-element array is still an array field in C (`dbChannelElements`
+    /// reads the declared NELM, not the current NORD).
+    #[test]
+    fn queues_by_value_boundaries() {
+        assert!(EpicsValue::Double(1.0).queues_by_value());
+        assert!(
+            EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES]))
+                .queues_by_value()
+        );
+        assert!(
+            !EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES + 1]))
+                .queues_by_value()
+        );
+        assert!(
+            !EpicsValue::EnumWithChoices {
+                index: 0,
+                choices: vec![],
+            }
+            .queues_by_value()
+        );
+        assert!(!EpicsValue::DoubleArray(vec![1.0]).queues_by_value());
+        assert!(!EpicsValue::DoubleArray(vec![]).queues_by_value());
+        assert!(!EpicsValue::CharArray(vec![0u8; 1]).queues_by_value());
     }
 }

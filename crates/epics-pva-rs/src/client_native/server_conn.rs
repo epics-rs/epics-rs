@@ -520,7 +520,7 @@ impl ServerConn {
     /// the triple at all.
     ///
     /// It is *not* a second protocol. It hands
-    /// [`run_handshake_and_spawn`](Self::run_handshake_and_spawn) the same
+    /// `run_handshake_and_spawn` the same
     /// `DynRead`/`DynWrite` the other two do, built from
     /// `runtime::blocking_io`'s adapters, so the handshake, the reader task's
     /// frame loop, the writer task, the heartbeat and every operation state

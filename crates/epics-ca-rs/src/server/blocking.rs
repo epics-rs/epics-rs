@@ -261,8 +261,31 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 /// * `client` is the TCP receiver, C `camsgtask`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackBig)` at
 ///   `rsrv/caservertask.c:109-111` and at `epicsThreadPriorityCAServerLow`
-///   (`:109`). It runs the full CA command dispatch into the database, so
-///   `Big` is the parity answer, not merely a safe one.
+///   (`:109`). It runs the full CA command dispatch into the database.
+///
+///   **`Big` is C's *class*, but on VxWorks it is not C's *size*, and the
+///   difference is 95×.** [`StackSizeClass::bytes`] implements C's POSIX table
+///   (`libcom/src/osi/os/posix/osdThread.c:506-509`, `STACK_SIZE(f) = f *
+///   0x10000 * sizeof(void *)` over `{1, 2, 4}`), so `Big` is 2,097,152 B on a
+///   64-bit target. C on VxWorks uses an entirely different table
+///   (`libcom/src/osi/os/vxWorks/osdThread.c:63-64`, `{4000, 6000, 11000} *
+///   ARCH_STACK_FACTOR`, and `ARCH_STACK_FACTOR` is 2 for x86_64), so C's
+///   `epicsThreadStackBig` there is **22,000 B**.
+///
+///   We cannot follow C's VxWorks number: the `CAS-client` high-water MEASURED
+///   on `x86_64-wrs-vxworks` is **65,912 B**, three times C's whole `Big`
+///   allowance. That is the port's own cost — `park_on` pins each connection's
+///   async state machine onto this stack — and it is what the class table, not
+///   the class name, has to cover. See §15 of
+///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B is 3.14 %
+///   of `Big` and proved invariant across payloads from 8 B to 1,048,576 B, the
+///   `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes, `subArray`, `compress`, the FLNK
+///   recursion at its `MAX_LINK_DEPTH` cap, and six monitors per connection.
+///   Reservation, not usage, is the binding resource on that target, and the
+///   measured wall moves 47 → 59 concurrent clients if this drops to `Medium`
+///   (15.9× headroom on the measured worst case). The reason it still says
+///   `Big` is that this roster is shared with `armv7-rtems-eabihf`, where no
+///   `CAS-client` stack high-water has ever been measured.
 /// * `event` is the per-client monitor sender, C's `event_task`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
 ///   one class below the receiver, because it formats and sends queued events

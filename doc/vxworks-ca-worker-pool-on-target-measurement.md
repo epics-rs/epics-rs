@@ -1347,3 +1347,22 @@ arm.
   SETS=49 CONNS=0` after every client left, i.e. one set held forever by the
   thread that panicked.
 
+## 19. Known opens after this round
+
+1. **`CAS-client` `StackSizeClass::Big` → `Medium`** — justified by §15 on
+   `x86_64-wrs-vxworks` (65,912 B measured, 15.9× margin at `Medium`, wall
+   47 → 59). Blocked on an `armv7-rtems-eabihf` `CAS-client` high-water,
+   which has never been measured; the roster is shared and `Medium` is
+   524,288 B there. One-line change in `client_roster`.
+2. **`MAX_LINK_DEPTH = 16` truncates legal FLNK chains silently** (§16) —
+   C has no such bound. Needs a decision, not a constant bump, because each
+   level is a heap-allocated boxed future.
+3. **A monitored large array can abort the RTP** (§17) — needs a bounded
+   per-subscriber event queue with an overflow policy, in `epics-base-rs`.
+4. **Semaphore exhaustion kills a worker thread and leaks its set** (§18) —
+   input to the reservation-budget work; the budget must count semaphore
+   objects and throttle creation rate.
+5. **`put_chain` `WRITE_NOTIFY` latency outlier** — 30.750 s and 30.030 s
+   worst case in two runs (1 failure of 40 each), but 0.036 s / 0.057 s
+   worst over 80 and 48 in two later runs on the same build. Not
+   reproducible on demand; cause unknown, recorded rather than explained.

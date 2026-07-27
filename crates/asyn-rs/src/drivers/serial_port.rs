@@ -1,9 +1,9 @@
 //! Serial port driver (drvAsynSerialPort equivalent).
 //!
-//! Uses `libc` termios directly for serial I/O, so it is mounted only where
-//! those bindings exist: unix **excluding** RTEMS and VxWorks, whose `libc`
-//! declares `struct termios` without the constants this file needs. See
-//! `drivers/mod.rs` for the gate and what a VxWorks backend would take.
+//! Uses `libc` termios directly for serial I/O, so it is mounted where those
+//! bindings exist: unix **excluding** RTEMS, whose `libc` declares a
+//! `struct termios` of the wrong shape entirely. See `drivers/mod.rs` for the
+//! gate. Everything a target can differ about lives in [`platform`].
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -18,6 +18,119 @@ use crate::{asyn_trace, asyn_trace_io};
 
 use super::option_parse::{bad_number, parse_yn_option, sscanf_int, sscanf_uint};
 use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+
+/// The termios facilities this driver needs, resolved once per target.
+///
+/// This module is the only place in the file that names a target. Two kinds
+/// of difference live here and nowhere else:
+///
+/// * a constant the platform *has* but `libc` does not bind — named from the
+///   SDK header it comes from, with the citation;
+/// * a facility the platform genuinely *lacks* — an [`Option`] (or an
+///   `Option`-returning call), so every consumer refuses the corresponding
+///   asyn option through [`option_unsupported_here`] instead of silently
+///   doing nothing.
+///
+/// That second shape is the point. A missing bit is not an absent line of
+/// code, it is a *refusal*, and making it an `Option` means the refusal is
+/// the same statement at every site rather than a `#[cfg]` at each one that
+/// the next platform has to be added to individually.
+///
+/// # VxWorks: why the POSIX path and not C's
+///
+/// C's vxWorks branch drives the line through `ioctl(SIO_HW_OPTS_SET)` on a
+/// *fake* `struct termios { int c_cflag; }` (`drvAsynSerialPort.c:43-62`),
+/// because it predates VxWorks 7's POSIX termios. Consequences C then has to
+/// live with: `crtscts` is aliased onto `CLOCAL` ("vxWorks uses CLOCAL when
+/// it should use CRTSCTS", `:425-431`) since `sioLibCommon.h` has no
+/// flow-control bit, and `ixoff` is refused outright (`:488-490`).
+///
+/// This driver takes VxWorks 7's real `<termios.h>` instead, which the RTP
+/// sysroot exposes and `libc` binds ABI-correctly (`struct termios` field for
+/// field, `NCCS == 20`, `VMIN == 16`). There `CRTSCTS` (`CCTS_OFLOW |
+/// CRTS_IFLOW`) and `IXOFF` are real, distinct bits, so honouring them costs
+/// nothing and keeps asyn's documented option contract — whereas C's aliasing
+/// would make `crtscts` and `clocal` silently overwrite each other. `ixany`
+/// stays refused because VxWorks genuinely has no such bit: the same
+/// conclusion C reaches, reached by the same test.
+///
+/// Note the `c_cflag` bits are *not* Linux's — VxWorks uses the `sioLib`
+/// numbering (`CS8 == 0xc`, `CLOCAL == 0x1`, `PARENB == 0x40`). They are
+/// taken from `libc`, which was checked field for field against
+/// `wrsdk-vxworks7/vxsdk/sysroot/usr/h/published/UTILS_UNIX/termios.h`.
+mod platform {
+    #[cfg(not(target_os = "vxworks"))]
+    mod imp {
+        /// Hardware flow control.
+        pub const CRTSCTS: libc::tcflag_t = libc::CRTSCTS;
+        /// Do not make the serial line this process's controlling terminal.
+        pub const O_NOCTTY: libc::c_int = libc::O_NOCTTY;
+        /// Discard both queues — C `connectIt` (`drvAsynSerialPort.c:729`).
+        pub const FLUSH_IO: libc::c_int = libc::TCIOFLUSH;
+        /// Any character restarts paused output.
+        pub const IXANY: Option<libc::tcflag_t> = Some(libc::IXANY);
+        /// `c_cc` indices of the XON/XOFF characters.
+        pub const SOFT_FLOW_CHARS: Option<(usize, usize)> = Some((libc::VSTART, libc::VSTOP));
+
+        /// Block until queued output has actually been transmitted.
+        pub fn drain(fd: libc::c_int) -> Option<std::io::Result<()>> {
+            Some(if unsafe { libc::tcdrain(fd) } < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(target_os = "vxworks")]
+    mod imp {
+        /// `CCTS_OFLOW | CRTS_IFLOW`, `termios.h:114-116`. Present in the SDK
+        /// header, absent from `libc`'s VxWorks module, so it is named here.
+        pub const CRTSCTS: libc::tcflag_t = 0x0001_0000 | 0x0002_0000;
+        /// `_FNOCTTY`, `sys/fcntlcom.h:76` via `:109`. Same story: the SDK
+        /// defines it, `libc` does not bind it. VxWorks has no controlling
+        /// terminal to acquire, but `open` still accepts the flag, and C
+        /// passes it unconditionally (`drvAsynSerialPort.c:707`).
+        pub const O_NOCTTY: libc::c_int = 0x8000;
+        /// VxWorks defines no both-queues selector — `termios.h:102` has
+        /// `TCIFLUSH` alone. Discarding the input queue is the half that
+        /// matters at connect (stale bytes from before the line was
+        /// configured); C skips this flush entirely on vxWorks
+        /// (`drvAsynSerialPort.c:728-740` is `#ifndef vxWorks`), so doing the
+        /// input half is strictly closer to the hosted behaviour than C is.
+        pub const FLUSH_IO: libc::c_int = libc::TCIFLUSH;
+        /// No `IXANY` bit exists on VxWorks — the SDK's input-flag block
+        /// (`termios.h:70-81`) goes straight from `IXON` to `IXOFF`. C refuses
+        /// the option here too (`drvAsynSerialPort.c:469-471`).
+        pub const IXANY: Option<libc::tcflag_t> = None;
+        /// No `VSTART`/`VSTOP` indices exist: VxWorks `c_cc` runs `VINTR`,
+        /// `VQUIT`, `VERASE`, `VKILL`, `VEOF`, `VMIN`, `VTIME` and nothing
+        /// else (`termios.h:59-68`). The XON/XOFF characters are fixed in the
+        /// tty layer rather than programmable.
+        pub const SOFT_FLOW_CHARS: Option<(usize, usize)> = None;
+
+        /// VxWorks has no `tcdrain` (nor any drain-shaped ioctl — `FIOWFLUSH`
+        /// *discards* the write queue rather than waiting for it), so this
+        /// reports the gap instead of pretending to have drained.
+        pub fn drain(_fd: libc::c_int) -> Option<std::io::Result<()>> {
+            None
+        }
+    }
+
+    pub use imp::*;
+}
+
+/// C's refusal for an asyn option the platform's termios has no bit for:
+/// `"Option ixany not supported on vxWorks"` (`drvAsynSerialPort.c:469-471`,
+/// and `:488-490` for `ixoff`). Refusing is what C does, and it is the only
+/// honest answer — accepting the key and dropping it would let `getOption`
+/// report a line state the hardware was never told about.
+fn option_unsupported_here(key: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("Option {key} not supported on {}", std::env::consts::OS),
+    }
+}
 
 impl SerialConfig {
     /// Apply this configuration to a raw termios struct.
@@ -66,18 +179,21 @@ impl SerialConfig {
             StopBits::Two => t.c_cflag |= libc::CSTOPB,
         }
 
-        // Flow control
+        // Flow control. `IXANY` is only in the *clear* masks, so a platform
+        // without the bit (`None`) needs no refusal here — there is nothing
+        // to clear, and neither mode ever sets it.
+        let ixany = platform::IXANY.unwrap_or(0);
         match self.flow_control {
             FlowControl::None => {
-                t.c_cflag &= !libc::CRTSCTS;
-                t.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+                t.c_cflag &= !platform::CRTSCTS;
+                t.c_iflag &= !(libc::IXON | libc::IXOFF | ixany);
             }
             FlowControl::Hardware => {
-                t.c_cflag |= libc::CRTSCTS;
-                t.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+                t.c_cflag |= platform::CRTSCTS;
+                t.c_iflag &= !(libc::IXON | libc::IXOFF | ixany);
             }
             FlowControl::Software => {
-                t.c_cflag &= !libc::CRTSCTS;
+                t.c_cflag &= !platform::CRTSCTS;
                 t.c_iflag |= libc::IXON | libc::IXOFF;
             }
         }
@@ -95,6 +211,9 @@ impl SerialConfig {
 /// non-standard ones. Elsewhere (Linux, where the codes are small encoded
 /// integers) C maps the known standard rates with a `switch` and returns
 /// asynError ("Unsupported data rate", lines 340-343) for anything outside it.
+///
+/// VxWorks is in the first group (`B300 == 300`, `B9600 == 9600` —
+/// `termios.h:22-52`), so it accepts arbitrary rates exactly as C does there.
 fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
     #[cfg(any(
         target_os = "macos",
@@ -102,7 +221,8 @@ fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
-        target_os = "dragonfly"
+        target_os = "dragonfly",
+        target_os = "vxworks"
     ))]
     {
         // Bxxx == literal rate: the baud value is itself a valid speed code.
@@ -116,7 +236,8 @@ fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
-        target_os = "dragonfly"
+        target_os = "dragonfly",
+        target_os = "vxworks"
     )))]
     {
         Some(match baud {
@@ -175,6 +296,37 @@ fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
         })
     }
 }
+
+/// The target list above selects *code*, but the question it answers is a
+/// property of `libc`'s constants, and C asks it as exactly that — a
+/// preprocessor test rather than a platform list
+/// (`drvAsynSerialPort.c:272-273`):
+///
+/// ```c
+/// #if (defined(B300) && (B300 == 300) && defined(B9600) && (B9600 == 9600))
+/// ```
+///
+/// The two cannot be collapsed here: the arms reference different constant
+/// sets, so which one compiles has to be a `cfg`. What can be removed is the
+/// chance of them disagreeing. This fails the build on any target where the
+/// list claims one thing and the constants say the other — which is what
+/// silently mapping a rate through the wrong branch would otherwise cost:
+/// arbitrary rates rejected where they are legal, or `9600` programmed as
+/// speed code 13.
+const _: () = assert!(
+    (libc::B300 == 300 && libc::B9600 == 9600)
+        == cfg!(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "vxworks"
+        )),
+    "baud_to_speed's target list disagrees with this platform's Bxxx codes: \
+     add or remove this target, do not leave the branch mismatched"
+);
 
 #[allow(dead_code)]
 fn speed_to_baud(speed: libc::speed_t) -> u32 {
@@ -520,9 +672,13 @@ fn seed_termios(config: &SerialConfig) -> AsynResult<libc::termios> {
     // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
     // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
     // untouched, so without this FlowControl::Software (IXON|IXOFF)
-    // would drive flow with NUL bytes instead of ^Q/^S.
-    t.c_cc[libc::VSTART] = 0x11; // ^Q
-    t.c_cc[libc::VSTOP] = 0x13; // ^S
+    // would drive flow with NUL bytes instead of ^Q/^S. Where the
+    // platform has no such indices the characters are not ours to
+    // choose — see `platform::SOFT_FLOW_CHARS`.
+    if let Some((vstart, vstop)) = platform::SOFT_FLOW_CHARS {
+        t.c_cc[vstart] = 0x11; // ^Q
+        t.c_cc[vstop] = 0x13; // ^S
+    }
     config.apply_to_termios(&mut t)?;
     Ok(t)
 }
@@ -631,13 +787,16 @@ impl DrvAsynSerialPort {
     /// transmitted (POSIX `tcdrain`). Useful immediately before
     /// [`Self::send_break`] so the BREAK signal isn't preceded by
     /// unflushed user data.
+    ///
+    /// Errors where the platform has no drain at all (VxWorks), rather
+    /// than returning `Ok(())` for an operation that did not happen.
     pub fn drain_output(&self) -> AsynResult<()> {
         let fd = self.io.fd_or_err()?;
-        let ret = unsafe { libc::tcdrain(fd) };
-        if ret < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        match platform::drain(fd) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(AsynError::Io(e)),
+            None => Err(option_unsupported_here("drain")),
         }
-        Ok(())
     }
 
     fn get_current_termios(&self) -> AsynResult<libc::termios> {
@@ -710,7 +869,7 @@ impl PortDriver for DrvAsynSerialPort {
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+                libc::O_RDWR | platform::O_NOCTTY | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -746,7 +905,7 @@ impl PortDriver for DrvAsynSerialPort {
             // accumulated in the kernel input/output buffers before the port
             // was configured, so the first read/write starts from a clean
             // device state. C does this right before turning blocking back on.
-            unsafe { libc::tcflush(fd, libc::TCIOFLUSH) };
+            unsafe { libc::tcflush(fd, platform::FLUSH_IO) };
 
             // 4. Restore blocking mode
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1016,9 +1175,9 @@ impl PortDriver for DrvAsynSerialPort {
             }
             "crtscts" => {
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_cflag |= libc::CRTSCTS;
+                    self.termios.c_cflag |= platform::CRTSCTS;
                 } else {
-                    self.termios.c_cflag &= !libc::CRTSCTS;
+                    self.termios.c_cflag &= !platform::CRTSCTS;
                 }
             }
             "ixon" => {
@@ -1036,10 +1195,15 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "ixany" => {
+                // C validates the value before the platform check on POSIX,
+                // but refuses `ixany` on vxWorks without looking at it at all
+                // (drvAsynSerialPort.c:466-471) — the refusal is about the
+                // key, not the value, so it comes first.
+                let bit = platform::IXANY.ok_or_else(|| option_unsupported_here("ixany"))?;
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_iflag |= libc::IXANY;
+                    self.termios.c_iflag |= bit;
                 } else {
-                    self.termios.c_iflag &= !libc::IXANY;
+                    self.termios.c_iflag &= !bit;
                 }
             }
             "break" => {
@@ -1062,8 +1226,13 @@ impl PortDriver for DrvAsynSerialPort {
                     // tcdrain/tcsendbreak on the dead fd and returns asynError.
                     let fd = self.io.fd_or_err()?;
                     // Drain output first (C parity: tcdrain before tcsendbreak).
-                    if unsafe { libc::tcdrain(fd) } < 0 {
-                        return Err(AsynError::Io(std::io::Error::last_os_error()));
+                    // Where the platform has no drain the BREAK still goes out
+                    // — only the guarantee that queued bytes precede it is
+                    // lost. C weighs it the same way, ignoring tcdrain's return
+                    // entirely (drvAsynSerialPort.c:526), so a missing drain is
+                    // not grounds to refuse the break.
+                    if let Some(res) = platform::drain(fd) {
+                        res.map_err(AsynError::Io)?;
                     }
                     let ret = unsafe { libc::tcsendbreak(fd, duration) };
                     if ret < 0 {
@@ -1146,7 +1315,7 @@ impl PortDriver for DrvAsynSerialPort {
                 "N"
             }
             .to_string()),
-            "crtscts" => Ok(if self.termios.c_cflag & libc::CRTSCTS != 0 {
+            "crtscts" => Ok(if self.termios.c_cflag & platform::CRTSCTS != 0 {
                 "Y"
             } else {
                 "N"
@@ -1169,10 +1338,15 @@ impl PortDriver for DrvAsynSerialPort {
                 "N"
             }
             .to_string()),
-            "ixany" => Ok(if self.termios.c_iflag & libc::IXANY != 0 {
-                "Y"
-            } else {
-                "N"
+            // Asymmetric with `set_option` on purpose, and C is asymmetric the
+            // same way: `setOption` refuses `ixany` on vxWorks
+            // (drvAsynSerialPort.c:466-471) while `getOption` answers a
+            // hard-coded 'N' (:189-190) rather than erroring. Both are true
+            // statements about a line that has no such bit — the option cannot
+            // be turned on, and it is not on.
+            "ixany" => Ok(match platform::IXANY {
+                Some(bit) if self.termios.c_iflag & bit != 0 => "Y",
+                _ => "N",
             }
             .to_string()),
             // C getOption (drvAsynSerialPort.c:204-207): "break" is a momentary
@@ -2630,6 +2804,67 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
         assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
+    }
+
+    /// Boundary: this host HAS every termios facility, so `platform` must
+    /// report every one of them present.
+    ///
+    /// The `None` arms exist for VxWorks and cannot be exercised here — but
+    /// the failure this guards against is the opposite direction and is very
+    /// much reachable: widen `platform`'s `cfg` by one target, or invert it,
+    /// and a hosted build silently starts refusing `ixany`, stops seeding
+    /// ^Q/^S, and answers `drain_output` with an error. Nothing else would
+    /// fail, because every consumer handles `None` as a legitimate answer.
+    /// So the assertion is that `None` is *not* legitimate here.
+    #[test]
+    fn platform_reports_every_facility_present_on_this_host() {
+        assert_eq!(
+            platform::IXANY,
+            Some(libc::IXANY),
+            "hosted unix has an IXANY bit"
+        );
+        assert_eq!(
+            platform::SOFT_FLOW_CHARS,
+            Some((libc::VSTART, libc::VSTOP)),
+            "hosted unix has programmable XON/XOFF characters"
+        );
+        assert_eq!(
+            platform::CRTSCTS,
+            libc::CRTSCTS,
+            "the seam must be transparent where libc has the bit"
+        );
+        assert_eq!(platform::O_NOCTTY, libc::O_NOCTTY);
+        assert_eq!(
+            platform::FLUSH_IO,
+            libc::TCIOFLUSH,
+            "hosted unix can discard both queues at once"
+        );
+        // A closed fd: `drain` must still answer `Some` (the platform *has*
+        // tcdrain), reporting EBADF rather than the `None` that means "no
+        // such call exists here".
+        assert!(
+            matches!(platform::drain(-1), Some(Err(_))),
+            "hosted unix has tcdrain; -1 must fail as an fd, not as a facility"
+        );
+    }
+
+    /// The refusal `platform`'s `None` arms lean on, checked for shape here
+    /// since the arms themselves only compile on VxWorks. C's wording is
+    /// "Option ixany not supported on vxWorks" (drvAsynSerialPort.c:469-471).
+    #[test]
+    fn unsupported_option_names_the_key_and_the_platform() {
+        let msg = match option_unsupported_here("ixany") {
+            AsynError::Status { status, message } => {
+                assert_eq!(status, AsynStatus::Error);
+                message
+            }
+            other => panic!("expected a Status error, got {other:?}"),
+        };
+        assert!(msg.contains("ixany"), "must name the option: {msg}");
+        assert!(
+            msg.contains(std::env::consts::OS),
+            "must name the platform: {msg}"
+        );
     }
 
     /// DRV-35: C setOption (drvAsynSerialPort.c:601-604) restores the previous

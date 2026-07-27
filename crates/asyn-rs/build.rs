@@ -29,7 +29,7 @@ fn main() {
 
     // Whether `drivers::serial_port` exists at all, as opposed to which of the
     // two backends it is. Emitted as one name rather than left as
-    // `any(all(unix, not(epics_embedded_target)), windows)` repeated at each
+    // `any(all(unix, not(target_os = "rtems")), windows)` repeated at each
     // caller: `iocsh` needs the answer in four places, and a predicate spelled
     // out four times is four places for the next backend to be added to three
     // of them. `drivers::mod` still spells out the arms, because there the
@@ -37,9 +37,15 @@ fn main() {
     //
     // CARGO_CFG_TARGET_FAMILY is comma-separated for targets in more than one
     // family, so this is a membership test, not an equality test.
+    //
+    // NOT `epics_embedded_target`: VxWorks has the backend (its `libc` binds
+    // VxWorks 7's POSIX termios ABI-correctly), RTEMS does not (`libc`'s
+    // newlib `struct termios` is the Linux shape, so it would compile and
+    // write to the wrong offsets). The predicate must therefore name RTEMS,
+    // and `drivers::mod` states the evidence.
     let unix = target_family.split(',').any(|f| f == "unix");
     let windows = target_family.split(',').any(|f| f == "windows");
-    if (unix && !embedded) || windows {
+    if (unix && target_os != "rtems") || windows {
         println!("cargo::rustc-cfg=asyn_serial_backend");
     }
 

@@ -1311,7 +1311,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 
 /// Map an EPICS priority onto an RTEMS **POSIX** SCHED_FIFO priority.
 ///
-/// A distinct function from [`map_epics_priority`] on purpose: the two have
+/// A distinct function from `map_epics_priority` on purpose: the two have
 /// different *shapes*, not different endpoints. Expressing this one as the
 /// hosted linear map with `min`/`max` retuned would re-introduce the linear
 /// map the moment somebody adjusted a constant, and the linear map is the
@@ -1356,7 +1356,7 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 ///
 /// **Measurement-backed**, not derived: on the bring-up box (VxWorks 7,
 /// `x86_64-wrs-vxworks`), setting `posix = 56 + epics` — the identical POSIX
-/// value [`map_epics_priority_rtems`] computes for RTEMS — landed 11 of 11
+/// value `map_epics_priority_rtems` computes for RTEMS — landed 11 of 11
 /// measured threads at `PriorityApplied::Realtime`, one scheduler call each.
 /// VxWorks's own POSIX layer then inverts that POSIX value into its native
 /// task-priority space, and the result observed there was `vx = 199 -
@@ -1365,8 +1365,8 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// different route (we set the POSIX value; VxWorks inverts it, rather than
 /// us computing the native value directly as C's own port does).
 ///
-/// Deliberately **not** implemented by calling [`rtems_core_priority`] /
-/// [`map_epics_priority_rtems`]: those compute an RTEMS **core** priority
+/// Deliberately **not** implemented by calling `rtems_core_priority` /
+/// `map_epics_priority_rtems`: those compute an RTEMS **core** priority
 /// through `RTEMS_MAXIMUM_PRIORITY`, an RTEMS kernel constant measured on the
 /// RTEMS bring-up guest — machinery VxWorks has no equivalent of. The two
 /// happen to land on the same POSIX number; this restates the `56 + epics`

@@ -1271,3 +1271,79 @@ implementation. Not fixed here: the fix is a bounded per-subscriber event
 queue with a documented overflow policy, which is `epics-base-rs` event-queue
 work outside this row. Listed in §19.
 
+## 18. The wall-abort mutex `EINVAL` is `semMCreate` returning NULL
+
+§13 reproduced this and left the root cause open. It is now root-caused
+statically *and* confirmed on target, and the failing allocation is named.
+
+### 18.1 The static chain, from the SDK
+
+Disassembling `pthreadLib.o` out of
+`$SDK/vxsdk/sysroot/usr/lib/common/libc.a`: `std::sync::Mutex::new` stores
+`PTHREAD_MUTEX_INITIALIZER`; the first `lock()` reaches
+`pthread_mutex_lock+0x34`, which tests the magic `0xec542a37` and calls
+`pthreadMutexInitComplete` → `pthreadMutexInit` → **`semMCreate`**. When
+`semMCreate` returns NULL that path does a `semGive` and returns
+`0x16` — **`EINVAL`, not `ENOMEM`** — which `InitComplete` passes through and
+`pthread_mutex_lock` returns verbatim, so std panics with "invalid argument
+(os error 22)".
+
+`pthread_mutex_init` only *stamps* the magic and never calls `semMCreate`
+itself, so **every** VxWorks pthread mutex materialises its semaphore on
+first lock. Eager initialisation is not a workaround.
+
+### 18.2 Confirmed on target
+
+Built with `--wrap=semMCreate --wrap=pthread_mutex_lock`
+(`doc/vx-rig-e8/build-e8.sh wrap`) and ramped to the wall on a cold RTP at
+`1024M`. The interposers are allocation-free and lock-free by construction —
+they run inside the failing path, so a `format!` would call the allocator
+that is refusing and an `eprintln!` would lock the kind of object whose
+creation just failed. Verbatim:
+
+```
+MTXPROBE semaphores_created=1
+MTXPROBE semaphores_created=512
+MTXPROBE semMCreate=NULL nth_null=1 succeeded_before=588 options=0x225
+MTXPROBE lock rc=22 mutex=0xec90050 nth_fail=1 sem_ok=588 sem_null=1
+MTXPROBE semaphores_created=1024
+```
+
+and the consequence:
+
+```
+ERROR epics_base_rs::errlog: sevr=fatal panic on thread `CAS-client 48` at
+.../std/src/sys/pal/unix/sync/mutex.rs:69: failed to lock mutex: invalid
+argument (os error 22) -- that thread is gone and nothing restarts it; the
+IOC keeps listening and keeps answering searches, so from outside it still
+looks healthy
+```
+
+The wall itself: 43 ramp + 5 monitor = **48** concurrent, refused with
+`EAGAIN` (`REFUSED=2`), consistent with the 47 of §10.1's `Big`/`Medium`
+arm.
+
+### 18.3 What this tells the reservation budget
+
+* **The failing allocation is a VxWorks semaphore object**, not mimalloc
+  heap. That is why §17 and the E11 abort report a *byte* count from
+  mimalloc while this one reports none: two different allocators fail at the
+  same wall, and a budget that counts only heap bytes will not see this one.
+* **Which mutex: whichever a freshly leased worker locks first.** There is no
+  single guilty mutex — the census registry is exonerated (§13), and the
+  identity `0xec90050` is simply the first `Mutex` that thread touched. Any
+  `std::sync::Mutex` reached first on a new thread is the trigger.
+* **The count is the budget number: 588 live semaphores**, at 49 leased sets
+  / 98 workers / 48 connections. Every pooled worker pair therefore costs
+  semaphores as well as stack reservation and a descriptor.
+* **It is transient, not a hard ceiling.** Creations resumed and passed 1,024
+  after the single NULL (`nth_null=1`, `nth_fail=1` for the whole run). So
+  the trigger is a *burst* of thread creations outrunning reclamation, which
+  means a budget bound has to throttle the creation rate, not only cap the
+  total.
+* **The `EAGAIN` spawn gate does not protect against it** — both fired in the
+  same wall event.
+* **A pool set leaks per occurrence**, confirming §14: `POOLPROBE BUSY=1
+  SETS=49 CONNS=0` after every client left, i.e. one set held forever by the
+  thread that panicked.
+

@@ -3126,6 +3126,16 @@ mod tests {
     /// the point: it is the owner, not the caller, that has to refuse. The
     /// failure this reproduces was measured on RTEMS, where the rate reached
     /// `cfsetospeed` and was dropped.
+    ///
+    /// Runs where the speed argument is an encoded code, because that is where
+    /// a refusable input exists. On the rate-valued hosts — macOS and the BSDs
+    /// — `cfsetospeed` is an assignment to `c_ospeed` that validates nothing
+    /// and returns 0 for any value, so no `bogus` can reach the error arm; C
+    /// accepts every rate there too (`baudCode = baud`). RTEMS is nominally in
+    /// that group but its `cfsetospeed` does enforce a rate table, which is
+    /// what this reproduces — asserted on target, since RTEMS runs no
+    /// `cargo test`.
+    #[cfg(not(asyn_baud_code_is_rate))]
     #[test]
     fn a_speed_the_platform_refuses_is_an_error_not_a_silent_no_op() {
         let mut t: platform::termios = unsafe { std::mem::zeroed() };

@@ -4,9 +4,14 @@
 // runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
 // DOWN, never up, without running the survivors under the feature.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): the flavored tests drive the TCP transport
+// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the TCP transport
 // over tokio::net, which needs the reactor. These run and pass in the
 // feature-ON suite on the tokio driver.
+//
+// 9 -> 11 for `write_identity_tests`, which arrived with the fix binding a
+// write exception to its request rather than to the channel. Both were run
+// under `--features rtems-exec-model` before this count moved, per the
+// ratchet rule above, and both pass.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]

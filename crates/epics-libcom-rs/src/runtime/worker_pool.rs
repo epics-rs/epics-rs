@@ -1883,15 +1883,16 @@ mod tests {
     /// indistinguishable by `kind()` alone, and so is what `AcquireError`
     /// exists to undo.
     ///
-    /// Unix-only because the errno table is. Raw code 11 is `ERROR_BAD_FORMAT`
-    /// on Windows, where it decodes as `Uncategorized` and where thread
-    /// exhaustion never surfaces as `EAGAIN` in the first place — asserting it
-    /// there would be asserting a different platform's fact.
+    /// Unix-only because the errno table is, and `libc::EAGAIN` rather than a
+    /// literal for the same reason: the number is 11 on Linux but 35 on the
+    /// BSDs and macOS, where 11 is `EDEADLK` and decodes as `Deadlock`.
+    /// Windows has no `EAGAIN` here at all — thread exhaustion never surfaces
+    /// as one — so there is nothing to assert there.
     #[cfg(unix)]
     #[test]
     fn eagain_still_decodes_as_would_block() {
         assert_eq!(
-            io::Error::from_raw_os_error(11).kind(),
+            io::Error::from_raw_os_error(libc::EAGAIN).kind(),
             io::ErrorKind::WouldBlock,
             "EAGAIN decodes as WouldBlock — the collapse `AcquireError` exists \
              to undo. If this ever stops holding, say so here rather than in a \

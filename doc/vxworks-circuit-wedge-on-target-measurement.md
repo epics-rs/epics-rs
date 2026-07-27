@@ -272,7 +272,9 @@ is a fresh SYN rather than a retained socket. None of the eight ever shows
 
 That one-census survival is taken apart in [§3.5](#35-the-name-service-socket-correct-lifetime-here-and-the-wedge-it-is-not-covered-against):
 it is correct lifetime on this cut, and the reason it is correct is not the one
-that retires the data circuit.
+that retires the data circuit. §3.6 re-cuts the same link once the
+name-service circuit has a liveness rule of its own and measures what
+retires each of the two sockets then.
 
 **One VxWorks-specific reading note.** On RTEMS the zombie censused as
 `peer=none mode=0140000`, and it was the `mode` that distinguished it: a live
@@ -520,6 +522,57 @@ name server is a `tcpiiu` in C it is counted by
 `ca_get_ioc_connection_count()`, whereas our `circuits=` counts data circuits
 only — this run reported `circuits=Some(0)` on all 47 censuses while holding a
 name-service TCP connection for most of them.
+
+### 3.6 The same cut, once both circuits have a liveness rule
+
+§3.3 read the name-service socket's extra census as correct-but-differently-
+caused. With the rule of §3.5 in place that reading is testable, so the cut was
+run again — twice, on images that differ by one change, with the cut placed
+2 s after the `c6-12` census both times so the phase cannot account for
+anything. `FDPROBE` prints `FD_CNT` every 10 s, which is the resolution these
+readings are made at; `FDCENSUS` every 60 s names the descriptors.
+
+**A — `wedge-fix2.vxe`, `705cffda`.** Cut 06:51:39 UTC.
+
+```
+FDPROBE seq=15 FD_CNT=7        FDCENSUS c6-12: fd=5 local=…:56170  fd=6 local=…:60577
+FDPROBE seq=16 FD_CNT=6        FDCENSUS c6-18: fd=6 local=…:60577          open=6
+FDPROBE seq=25 FD_CNT=6        FDCENSUS c6-24: fd=5 local=…:51891 (fresh)  open=6
+FDPROBE seq=26 FD_CNT=5
+```
+
+**B — `wedge-ctl2.vxe`, `17b5371f`,** identical but for the reconnect backoff
+sitting inside the circuit's own scope, so the send half outlives the verdict.
+Cut 06:59:47 UTC.
+
+```
+FDPROBE seq=18 FD_CNT=7        FDCENSUS c6-12: fd=5 local=…:56739  fd=6 local=…:52804
+FDPROBE seq=19 FD_CNT=6        FDCENSUS c6-18: fd=5 local=…:56739 peer=none(errno=57)
+                                               fd=6 local=…:52804          open=7
+FDPROBE seq=25 FD_CNT=6        FDCENSUS c6-24: fd=5 local=…:56086 (fresh)  open=6
+FDPROBE seq=26 FD_CNT=5
+```
+
+The name-service descriptor is released at `seq=16` in A and `seq=19` in B —
+three probes, **30 s**, exactly `EPICS_CA_CONN_TMO`. B is the §3.3 signature
+reproduced under a controlled change: at `c6-18` the original name-service port
+is still censused, and it censuses `peer=none(errno=57)` — the socket the
+reader's guard already shut, its descriptor still allocated because the send
+half is parked in the backoff. That line appears **once in B and zero times in
+A**, on non-listener descriptors, across both whole runs.
+
+**The data circuit is unchanged by this, and is now the later of the two.**
+`FD_CNT` falls to 5 at `seq=26` in both runs — 138 s after the cut in A. That
+is not a second instance of the same hole: its own watchdog reached the same
+verdict on the same 35 s bound (`WARN … circuit unresponsive (echo timeout)`
+one line after the name server's), and the socket is then *kept* on purpose.
+C does the same — `unresponsiveCircuitNotify` (`tcpiiu.cpp:899-941`) moves the
+circuit's channels to `unrespCircuit`, cancels both watchdogs and holds the
+descriptor — and what finally closes it here is the send failing, which on
+VxWorks takes until `error=host unreachable (os error 65)` comes back. So the
+two sockets do **not** leave in the same census, and after this fix the
+difference is C's deliberate asymmetry between a circuit with channels and one
+without, not a rule that arrives late on one of them.
 
 ## 4. Attribution: this is a blackhole, not a forged RST
 
@@ -1246,7 +1299,21 @@ echo 'rtpSp "/host.host/silentns-fix.vxe"' > snsfix-con.in
 grep -a nameserver snsfix-console.log ; cat silentns-fix.log
 ```
 
-Artefacts on the box under `~/vx-rig-e9/`: `lad-console.log`,
+The §3.6 A/B is the outage recipe with the cut placed by hand two seconds
+after a census, so both runs share the phase, and with the control built from
+a branch that differs by one hunk:
+
+```
+./upstream-e9.sh
+./build-vx-ca.sh wedge-fix2.vxe 10.0.2.2:45064 FETCH_HEAD
+./boot-e9.sh wedge-fix2.vxe lf2 ; echo 'rtpSp "/host.host/wedge-fix2.vxe"' > lf2-con.in
+until grep -aq 'FDCENSUS end tag=c6-12' lf2-console.log; do sleep 5; done
+python3 mon-e9.py /tmp/vxmon-e9a.sock 'set_link n1 off'
+# control: same three commands against branch e9/control-ns-scope, tag cf2
+```
+
+Artefacts on the box under `~/vx-rig-e9/`: `lf2-console.log` and
+`cf2-console.log` for the §3.6 A/B; `lad-console.log`,
 `lad-phases.txt`, `lad-cut.txt`, `lad-restore.txt` and the `ctl-*`
 counterparts for the outage A/B; `wd-console.log` and `deafpeer.log` for §5.1;
 `sns-console.log` and `silentns.log` for the §3.5 defect, `snsfix-console.log`

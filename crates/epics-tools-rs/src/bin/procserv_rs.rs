@@ -178,7 +178,7 @@ mod app {
 
         /// Executable to launch instead of the positional command
         /// (`-e` / `--exec`, C `childExec`, procServ.cc:295-296,459-462).
-        /// The child still presents argv[0] = the command, so a wrapper
+        /// The child still presents `argv[0]` = the command, so a wrapper
         /// runs under the original command line. Default: exec the
         /// command itself.
         #[arg(short = 'e', long = "exec", value_name = "PATH")]

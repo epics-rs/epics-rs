@@ -35,8 +35,8 @@ pub mod codes {
 }
 
 /// Output of one feed into [`TelnetParser::feed`]. The supervisor
-/// task forwards `Data` to [`super::client::ClientConnection`]'s
-/// input handler and writes `Reply` back to the socket.
+/// task forwards `Data` to the read task [`super::client::spawn_client`]
+/// starts, and writes `Reply` back to the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelnetEvent {
     /// Plain user data (IAC sequences stripped, IAC-IAC unescaped).
@@ -320,7 +320,7 @@ fn send_neg(reply: &mut Vec<u8>, cmd: u8, opt: u8) {
 /// Mirrors C procServ's `telnet_negotiate` calls in `clientItem::clientItem`
 /// (`clientFactory.cc:167-174`): per option in table order, request `DO`
 /// (him) then advertise `WILL` (us). For procServ this is `WILL ECHO` then
-/// `DO LINEMODE`. Derived from the same [`TELOPTS`] table the parser seeds its
+/// `DO LINEMODE`. Derived from the same `TELOPTS` table the parser seeds its
 /// RFC1143 state from, so the offered bytes and the seeded state cannot drift.
 pub fn initial_negotiation() -> Vec<u8> {
     let mut out = Vec::new();

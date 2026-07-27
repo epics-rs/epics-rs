@@ -64,17 +64,17 @@ pub struct KeyBindings {
 pub struct ChildConfig {
     /// Executable name (display only; goes into welcome banner).
     pub name: String,
-    /// The positional command. Used as argv[0] presented to the child,
+    /// The positional command. Used as `argv[0]` presented to the child,
     /// and as the exec target unless [`Self::child_exec`] overrides it.
     pub program: PathBuf,
     /// Remaining argv.
     pub args: Vec<String>,
     /// Override executable to `exec` instead of [`Self::program`]
     /// (`--exec`). `None` ⇒ exec `program` itself (the default). When
-    /// set, the child still sees argv[0] = `program`, so it runs a
+    /// set, the child still sees `argv[0]` = `program`, so it runs a
     /// different binary while presenting the original command line —
-    /// C `childExec` (`procServ.cc:62,295-296,459-462`). C's argv[0]
-    /// quirk (the token before the command) is not reproduced; argv[0]
+    /// C `childExec` (`procServ.cc:62,295-296,459-462`). C's `argv[0]`
+    /// quirk (the token before the command) is not reproduced; `argv[0]`
     /// is the command's arg0, matching the documented intent.
     pub child_exec: Option<PathBuf>,
     /// Working directory for the child (optional `--chdir`).

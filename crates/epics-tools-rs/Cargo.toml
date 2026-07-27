@@ -30,9 +30,13 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
-# Unix-only: forkpty + signal forwarding. The whole crate is `#[cfg(unix)]`
-# at the lib root; on non-Unix targets it compiles to an empty crate so
-# workspace builds still succeed (matches C procServ's Unix-only posture).
+# forkpty + signal forwarding. `cfg(unix)` here means "libc and nix are in the
+# graph", which is the question a Cargo target table can answer and is true on
+# every unix. Whether this platform can actually supervise a child process is a
+# different question with one owner, `build.rs`, which emits
+# `procserv_host_platform` and refuses the build on a unix target that lacks
+# the facilities; a Cargo target table cannot see a build-script cfg, and
+# restating the rule here would put it in two places.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process", "term", "fs", "resource", "user"] }
 libc = "0.2"

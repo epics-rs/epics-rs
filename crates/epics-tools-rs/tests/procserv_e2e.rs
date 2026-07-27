@@ -5,11 +5,11 @@
 //! socket. Exercises the same code paths the daemon binary uses,
 //! minus the daemonize step.
 //!
-//! These tests are gated to the `procserv` feature and `cfg(unix)`
-//! (forkpty), matching the `procserv` module's own gate, and depend on
-//! `/bin/cat` / `/bin/echo` being present.
+//! These tests are gated to the `procserv` feature and
+//! `procserv_host_platform` (forkpty), matching the `procserv` module's
+//! own gate, and depend on `/bin/cat` / `/bin/echo` being present.
 
-#![cfg(all(feature = "procserv", unix))]
+#![cfg(all(feature = "procserv", procserv_host_platform))]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

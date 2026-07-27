@@ -726,6 +726,63 @@ tree the same test passes in **0.208 s**.
 
 Committed as `df8d65a8` (the fix) and `facf496a` (the on-target probe).
 
+### 5.2 Re-measured at `c16528b4`, and the one site the fix does not cover
+
+§5.1's transcript was taken on an image built from `facf496a`. Re-run on
+`c16528b4` (image `wd2.vxe`, 7,420,640 bytes, same `deafpeer-e9.py` on
+`10.0.2.2:46064`, same 8 MiB frame under a 2000 ms deadline), verbatim:
+
+```
+WDPROBE begin peer=10.0.2.2:46064 frame_bytes=8388608 send_timeout_ms=2000
+WDPROBE ctl so_sndtimeo=error kind=Uncategorized os=Some(42) msg=no protocol option (os error 42)
+WDPROBE ctl writing
+WDPROBE fix returned elapsed_ms=2016 outcome=Err((TimedOut, None))
+WDPROBE mark t_ms=17150 ctl_returned=false
+WDPROBE mark t_ms=27183 ctl_returned=false
+WDPROBE mark t_ms=37216 ctl_returned=false
+WDPROBE mark t_ms=47250 ctl_returned=false
+WDPROBE mark t_ms=57283 ctl_returned=false
+WDPROBE mark t_ms=67316 ctl_returned=false
+WDPROBE mark t_ms=77350 ctl_returned=false
+WDPROBE mark t_ms=87383 ctl_returned=false
+WDPROBE mark t_ms=97416 ctl_returned=false
+WDPROBE mark t_ms=107450 ctl_returned=false
+WDPROBE mark t_ms=117483 ctl_returned=false
+WDPROBE end t_ms=127516 ctl_returned=false
+```
+
+The host peer logged both accepts (`held=2`), so both legs reached the same
+never-reading socket; only one of them is left in the descriptor census, the
+control leg's, and the fixed leg's is gone because it returned:
+
+```
+FDCENSUS tag=c6-18 fd=7 kind=tcp so_type=1 listening=0 local=10.0.2.15:50313 peer=10.0.2.2:46064 mode=0140666
+FDCENSUS end tag=c6-18 open=8 max=1000
+TASKDUMP tag=c6-18 id=0x000100ef prio=189 name=c6-wd-ctl stack_high=3504 stack_margin=1045072
+```
+
+The parked control task is alive, not crashed, and the console carries zero
+panics for the whole run. `elapsed_ms=2016` reproduces §5.1's figure to the
+millisecond.
+
+**The sweep this re-run was for found one site the seam does not reach.** The
+CA *blocking* server owns its sockets directly instead of taking them through
+`drive_socket_blocking`, and writes to them with a plain blocking `write_all`
+under no deadline on any target:
+
+* `crates/epics-ca-rs/src/server/blocking.rs:934` — `write_frame_locked`
+* `crates/epics-ca-rs/src/server/blocking.rs:949` — `drain_outbox_locked`
+* `crates/epics-ca-rs/src/server/blocking.rs:490` — the post-`accept` refusal write
+
+The first two hold the per-client send lock across that write, so a client that
+completes the handshake and stops reading parks both of that client's threads
+and never returns its `CAS_CLIENT_POOL` lease. This is the same defect §5.1
+closed for the client seam, in a file this row does not own; it is reported to
+the panel that does rather than fixed here. `crates/epics-ca-rs/src/server/
+tcp.rs:1475` is *not* the same defect — the socket there is a non-blocking tokio
+one, the option is documented as inert on it, and the real bound is the
+`runtime::task::timeout` around `dispatch_message`.
+
 ## 6. Verdict
 
 **The pass criterion is met.** It was: the control image holds the fd across

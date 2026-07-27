@@ -269,7 +269,7 @@ pub(crate) enum ChannelTarget {
 /// wire-type error and can never be reported as one.
 ///
 /// Constructing the reply status only through this type is what keeps that
-/// true: [`CaError::to_eca_status`] is the client-side table, where
+/// true: [`CaError::to_eca_status`](epics_base_rs::error::CaError::to_eca_status) is the client-side table, where
 /// `ECA_BADTYPE` is a legitimate answer, and calling it on a put reply is
 /// how the port came to tell a `caput` of `32768` into a `DBF_SHORT` field
 /// "The data type specified is invalid" where C says "Channel write request
@@ -794,7 +794,7 @@ impl ClientState {
 
     /// Decide this circuit's ACF host identity + mTLS auth context, once,
     /// from the connection itself. C decides the same in `create_tcp_client`
-    /// (`caservertask.c:1425-1437`). Extracted from [`handle_client`] so the
+    /// (`caservertask.c:1425-1437`). Extracted from `handle_client` so the
     /// async loop and the blocking thread-per-client driver
     /// (`crate::server::blocking`) derive identity byte-identically. See
     /// [`HostIdentity`].
@@ -4523,7 +4523,7 @@ async fn get_read_snapshot(
 /// How [`register_subscription`] wires delivery of a freshly-registered
 /// subscription. The async TCP server spawns a producer task per subscription;
 /// the blocking (RTEMS) driver has no async runtime, so it takes the raw
-/// [`EventReader`] and multiplexes every subscription on one event thread.
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) and multiplexes every subscription on one event thread.
 #[derive(Clone, Copy)]
 pub(crate) enum SubscriptionDelivery {
     /// C `event_add_action` async path: spawn the producer task.
@@ -4561,7 +4561,7 @@ pub(crate) struct SpawnedSubscription {
 }
 
 /// A registered-but-not-spawned subscription handed to the blocking driver's
-/// event thread. Carries the live [`EventReader`] plus everything
+/// event thread. Carries the live [`EventReader`](epics_base_rs::server::event_queue::EventReader) plus everything
 /// [`run_event_task`] needs to frame deliveries byte-identically to the async
 /// producer.
 pub(crate) struct RegisteredSubscription {
@@ -4595,7 +4595,7 @@ pub(crate) struct CancelInfo {
 /// caller owns those. In [`SubscriptionDelivery::AsyncSpawn`] mode it spawns
 /// the monitor producer task and returns [`SubscriptionOutcome::Spawned`];
 /// in [`SubscriptionDelivery::HandOff`] mode it returns the live
-/// [`EventReader`] as [`SubscriptionOutcome::HandedOff`] before spawning, so
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) as [`SubscriptionOutcome::HandedOff`] before spawning, so
 /// the blocking driver's single event thread can multiplex it (the driver
 /// has no async runtime to spawn onto). `channel_sub_count` and
 /// `sub_id_in_use` are read from the caller's own subscription registry so
@@ -5490,7 +5490,7 @@ enum EventStep {
 /// Await the next event across every active subscription, every pending
 /// write-completion, and the control channel, in one `select`. C's `event_task`
 /// blocks on one semaphore per `event_user`; here the per-subscription
-/// [`EventReader`]s and the WRITE_NOTIFY completion oneshots are multiplexed with
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader)s and the WRITE_NOTIFY completion oneshots are multiplexed with
 /// `select_all`, and the control channel lets the dispatch thread add/cancel
 /// subscriptions, hand over write completions, and signal shutdown.
 /// `EventReader::recv` is cancel-safe and an unfired oneshot polled by `&mut`
@@ -5546,7 +5546,7 @@ async fn next_event_step(
 /// send lock the dispatch thread holds (C `client->lock`, `server.h:221`).
 /// `db_post_events` stays enqueue-only; this thread is the sole consumer.
 ///
-/// It multiplexes every subscription's [`EventReader`] (added via the control
+/// It multiplexes every subscription's [`EventReader`](epics_base_rs::server::event_queue::EventReader) (added via the control
 /// channel by the dispatch thread on EVENT_ADD, removed on EVENT_CANCEL) and
 /// frames each delivery with [`super::monitor::send_event`] — the same builder
 /// the async `spawn_monitor_sender` uses — so a blocking-driver monitor update
@@ -5697,7 +5697,7 @@ pub(crate) async fn run_event_task<W>(
 ///   with no read hook, i.e. every cached / non-gateway PV). No `.await`, no
 ///   reactor. `inner` is the `Option<Snapshot>` the async path also yields:
 ///   `Some(snap)` for a value, `None` for an absent record field.
-/// - `None` — a gateway `-no_cache` [`ReadHook`] is installed, whose upstream
+/// - `None` — a gateway `-no_cache` [`ReadHook`](epics_base_rs::server::pv::ReadHook) is installed, whose upstream
 ///   GET is genuine network I/O; the caller must fall back to the async
 ///   [`get_read_snapshot`]. Only `SimplePv` can reach this.
 ///

@@ -3,7 +3,8 @@
 //! Uses `libc` termios directly for serial I/O, so it is mounted where those
 //! bindings exist: unix **excluding** RTEMS, whose `libc` declares a
 //! `struct termios` of the wrong shape entirely. See `drivers/mod.rs` for the
-//! gate. Everything a target can differ about lives in [`platform`].
+//! gate. Everything a target can differ about lives in the private
+//! `platform` module below.
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -485,23 +486,15 @@ impl OctetNext for SerialIoState {
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let fd = self.fd_or_err()?;
 
-        // The driver fd is blocking (connect restores O_NONBLOCK off so reads
-        // can block on poll). A blocking `write(fd, all_remaining)` would not
+        // No blocking-mode toggle here: the fd is non-blocking for its whole
+        // life (see `connect`). A blocking `write(fd, all_remaining)` would not
         // return until the *entire* buffer is accepted by the kernel, so a
-        // stalled or slow peer blocks the write past the timeout regardless of
-        // the poll below — C instead unblocks a stuck write from its timeout
-        // timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649). This driver has
-        // no such timer, so make the fd non-blocking for the duration of the
-        // write: each `write` then returns immediately with what fit (or EAGAIN)
-        // and the poll/deadline loop bounds the whole write. Blocking mode is
-        // restored on every exit path.
-        let prev_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if prev_flags < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags | libc::O_NONBLOCK) } < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
+        // stalled or slow peer would block the write past the timeout
+        // regardless of the poll below — C instead unblocks a stuck write from
+        // its timeout timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649).
+        // This driver has no such timer; a permanently non-blocking fd is what
+        // replaces it, so each `write` returns immediately with what fit (or
+        // EAGAIN) and the poll/deadline loop bounds the whole write.
 
         // C parity (drvAsynSerialPort.c:815-842): writeIt arms a single timer
         // for the whole writeTimeout *before* the loop and breaks when it fires,
@@ -580,8 +573,6 @@ impl OctetNext for SerialIoState {
             }
         };
 
-        // Restore blocking mode on every exit path (success, timeout, error).
-        unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags) };
         match result {
             Ok(()) => Ok(total),
             Err(e) => Err(e.with_partial_write(total)),
@@ -904,17 +895,29 @@ impl PortDriver for DrvAsynSerialPort {
             // C parity (drvAsynSerialPort.c:729): discard any bytes that
             // accumulated in the kernel input/output buffers before the port
             // was configured, so the first read/write starts from a clean
-            // device state. C does this right before turning blocking back on.
+            // device state.
             unsafe { libc::tcflush(fd, platform::FLUSH_IO) };
 
-            // 4. Restore blocking mode
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
+            // 4. The fd STAYS non-blocking, for its whole life.
+            //
+            // C turns blocking back on here (drvAsynSerialPort.c:731-739),
+            // because its reads are bounded by termios VMIN/VTIME and its
+            // writes by an epicsTimer that fires tcflush(TCOFLUSH) at a stuck
+            // one. This driver has neither: every read and every write is
+            // gated by `poll` with the caller's deadline (see `OctetNext for
+            // SerialIoState`), which is the deviation `seed_termios` already
+            // documents. Under that model blocking mode buys nothing — a
+            // `read` only ever runs after `poll` reported POLLIN, and EAGAIN
+            // is already a retry — while a blocking `write` would sit past
+            // the deadline with no timer to break it.
+            //
+            // So the state is uniform rather than toggled: `write` used to
+            // flip the fd non-blocking and back on every call, which meant
+            // the fd's mode depended on where you looked from. One mode for
+            // the fd's whole life removes that, and with it the
+            // `fcntl(F_GETFL)` that VxWorks answers -1 to — measured on
+            // target, and the reason C skips this very block there
+            // (`#ifndef vxWorks`, :728). One rule, no platform branch.
             Ok(())
         })();
         if let Err(e) = setup {
@@ -2804,6 +2807,56 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
         assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
+    }
+
+    /// Invariant: the serial fd is non-blocking for its whole life — at every
+    /// point an observer can look, not just inside `write`.
+    ///
+    /// The three boundaries are right after `connect` (which used to clear
+    /// O_NONBLOCK), after a `write` (which used to set it and restore it), and
+    /// after a `read`. Checking all three is the point: the defect this
+    /// replaces was not a wrong mode, it was a mode that *depended on where
+    /// you looked from*, and only a per-boundary check catches that.
+    #[test]
+    fn pty_fd_is_non_blocking_at_every_boundary() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_nonblock", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        let fd = drv.io.fd.expect("connected");
+
+        let nonblocking = |where_: &str| {
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(fl >= 0, "F_GETFL failed at {where_}");
+            assert_ne!(
+                fl & libc::O_NONBLOCK,
+                0,
+                "fd must be non-blocking {where_}, flags=0x{fl:x}"
+            );
+        };
+
+        nonblocking("after connect");
+
+        let mut user = AsynUser {
+            timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        drv.write_octet(&mut user, b"probe\n").unwrap();
+        nonblocking("after write");
+
+        // The read times out (nothing is driving the master end); what matters
+        // is the fd's mode on the way out, not the outcome.
+        let mut buf = [0u8; 8];
+        let _ = drv.read_octet(&user, &mut buf);
+        nonblocking("after read");
     }
 
     /// Boundary: this host HAS every termios facility, so `platform` must

@@ -159,7 +159,7 @@ pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
         .insert(pv_name.to_string(), handle);
 }
 
-/// Take all registered native PVA PVs. Called by [`run_ca_pva_qsrv_ioc`]
+/// Take all registered native PVA PVs. Called by `run_ca_pva_qsrv_ioc`
 /// to wire them into `QsrvPvStore`.
 pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
@@ -1308,7 +1308,7 @@ pub struct QsrvMount {
 ///
 /// **This is the single owner of that sequence.** Both entry points that can
 /// serve QSRV go through it: the host dual-protocol runner
-/// ([`run_ca_pva_qsrv_ioc`]) and the RTEMS target IOC, which has no iocsh, no
+/// (`run_ca_pva_qsrv_ioc`) and the RTEMS target IOC, which has no iocsh, no
 /// `IocApplication` and no CA server and so could not reach the runner. Two
 /// hand-rolled copies of "decide, build, load groups, wrap" is how the two
 /// would come to disagree about whether `PVXS_QSRV_ENABLE` is honoured or

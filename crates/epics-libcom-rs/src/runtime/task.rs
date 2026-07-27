@@ -1350,7 +1350,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 /// see `rtems_priority_map_stays_below_the_libbsd_network_band`, which
 /// asserts the non-strict `core >= 100` this tie actually produces.
 #[cfg(any(target_os = "rtems", test))]
-fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
@@ -1376,7 +1376,7 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// change to the RTEMS core-priority mechanism cannot silently move the
 /// VxWorks value with it.
 #[cfg(any(target_os = "vxworks", test))]
-fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
     56 + epics_priority.min(99) as i32
 }
 

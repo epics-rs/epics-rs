@@ -773,8 +773,11 @@ mod ioc {
                 .stack_size(StackSizeClass::Medium.bytes())
                 .spawn(move || {
                     let _charge = charge;
-                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
-                        epics_base_rs::runtime::task::ThreadPriority::Low,
+                    // The band is the role's. A console reporter that stops
+                    // when the IOC is loaded reports on the wrong half of the
+                    // run — see `runtime::ioc_role`.
+                    let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
+                        epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                     );
                     let mut seq = 0u32;
                     loop {
@@ -931,6 +934,32 @@ mod tests {
              so it admits clients against memory that is already gone: \
              {unpaid:?}. Take a `ThreadCharge::fixed` before the `spawn` and \
              move it into the body."
+        );
+    }
+
+    /// This entry point takes bands by role and names none of its own.
+    ///
+    /// The bring-up probe named `ThreadPriority::Low` here until the ramp
+    /// measurement showed it emitting 4 ticks in 444 s instead of ~44 while
+    /// the CA server ran at `CaServerLow-4..CaServerLow`. The serving threads
+    /// take their bands from `epics_ca_rs::server::blocking`'s named
+    /// constants, which is why they were never the ones that stopped.
+    #[test]
+    fn this_entry_point_names_no_scheduling_band() {
+        let src = include_str!("realtime-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            !prod.contains(concat!("Thread", "Priority")),
+            "this file must not name a scheduling band — ask \
+             `runtime::ioc_role` for one by role"
+        );
+        assert!(
+            prod.contains("IocRole::ConsoleCensus"),
+            "the bring-up probe must enter its thread as \
+             `IocRole::ConsoleCensus`"
         );
     }
 

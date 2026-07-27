@@ -212,6 +212,10 @@ struct PoolInner {
     /// for every production pool, so a release cannot land anywhere but where
     /// its reservation came from.
     reservation: &'static Reservation,
+    /// The object-arena gate — [`materialise_set_mutex`] in every production
+    /// pool. A field so a test can make the target refuse, which is the one
+    /// thing a host cannot be made to do.
+    materialise: fn(&Mutex<SetState>) -> bool,
     reg: Mutex<Registry>,
 }
 
@@ -775,6 +779,73 @@ fn thread_reservation(role: &WorkerRole) -> usize {
     thread_reservation_bytes(role.stack)
 }
 
+/// The target refused to materialise a kernel object a mutex needs.
+///
+/// # The defect this closes
+///
+/// A VxWorks pthread mutex has no kernel `SEMAPHORE` until its **first lock**:
+/// `pthread_mutex_init` only stamps the magic, and `pthreadMutexInit` calls
+/// `semMCreate` from inside `pthread_mutex_lock`. When that returns NULL the
+/// chain hands back `0x16` — `EINVAL`, not `ENOMEM` — and `std::sync::Mutex`
+/// turns it into "failed to lock mutex: invalid argument (os error 22)" and
+/// **panics**. Measured on target at 588 live semaphores with 49 sets / 98
+/// workers / 48 connections; the panicking worker took its set with it.
+///
+/// It is not a total. Creation resumed past 1,024 objects after that NULL, so
+/// the arena is a *transient* refusal and a byte or count budget is the wrong
+/// shape for it — there is no per-thread figure to add to
+/// [`PER_THREAD_OBJECT_ARENA`], and a cap set at 588 would refuse connections a
+/// moment later than the target would have served them. What a transient
+/// refusal needs is for the *rate* of creation to bend to the target, which is
+/// what this gate does: the pool asks for the object at a point where "no"
+/// costs one refusal, and the client's retry is the pacing.
+///
+/// # Why this is not its own [`AcquireError`] variant
+///
+/// It rides as the payload of [`AcquireError::SpawnFailed`], whose meaning it
+/// shares exactly — *the target said no*, and the pool's own bounds were never
+/// reached. A consumer that needs to tell an arena refusal from a stack refusal
+/// downcasts, so the discriminator is a type rather than the message prose that
+/// [`AcquireError`] exists to stop consumers parsing.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectArenaExhausted {
+    /// How many objects the set needed — one per worker.
+    pub objects: usize,
+}
+
+impl std::fmt::Display for ObjectArenaExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the target could not create the kernel mutex objects for a set of \
+             {} workers; this is transient, and a client that retries will be \
+             admitted once the target has objects again",
+            self.objects
+        )
+    }
+}
+
+impl std::error::Error for ObjectArenaExhausted {}
+
+/// The gate itself: materialise the set's own state mutex, on the thread that
+/// can still refuse.
+///
+/// Not a throwaway probe — this is the very mutex every worker in the set locks
+/// on entry and again in [`WorkerExit`], so taking its object here *removes* the
+/// failure site rather than sampling near it. `try_lock` and not `lock`: the
+/// mutex is one statement old and unreachable by any other thread, so `false`
+/// cannot mean contention, and `try_lock` reports the target's refusal as a
+/// value where `lock` would panic.
+///
+/// What it does not cover: the objects `std` materialises inside the *spawned*
+/// thread — the parker behind a blocking `recv`, above all — which no code on
+/// this side of `Builder::spawn` can take in advance. The gate narrows the
+/// window and paces the burst that opens it; it does not close it, and the
+/// set-retirement path in [`WorkerExit`] is what keeps the residue survivable.
+fn materialise_set_mutex(state: &Mutex<SetState>) -> bool {
+    state.try_lock().is_ok()
+}
+
 /// One thread's charge against the process account, held for exactly as long as
 /// the thread is.
 ///
@@ -973,6 +1044,24 @@ impl<const N: usize> WorkerPool<N> {
         capacity: usize,
         reservation: &'static Reservation,
     ) -> Self {
+        Self::with_reservation_and_gate(
+            name_prefix,
+            roster,
+            capacity,
+            reservation,
+            materialise_set_mutex,
+        )
+    }
+
+    /// [`Self::with_reservation`] with the object-arena gate injected, so a host
+    /// test can exercise the refusal a target produces.
+    fn with_reservation_and_gate(
+        name_prefix: &'static str,
+        roster: [WorkerRole; N],
+        capacity: usize,
+        reservation: &'static Reservation,
+        materialise: fn(&Mutex<SetState>) -> bool,
+    ) -> Self {
         let set_reservation = roster.iter().map(thread_reservation).sum();
         Self {
             inner: Arc::new(PoolInner {
@@ -981,6 +1070,7 @@ impl<const N: usize> WorkerPool<N> {
                 capacity,
                 set_reservation,
                 reservation,
+                materialise,
                 reg: Mutex::new(Registry {
                     idle: VecDeque::new(),
                     all: Vec::new(),
@@ -1123,6 +1213,17 @@ impl<const N: usize> WorkerPool<N> {
                 live_workers: N,
             }),
         });
+
+        // The object-arena gate. Nothing has been created yet, so refusing here
+        // costs the caller a refusal and the target nothing.
+        if !(self.inner.materialise)(&set.state) {
+            let unspawned: usize = self.inner.roster.iter().map(thread_reservation).sum();
+            self.inner.reservation.release(unspawned);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                ObjectArenaExhausted { objects: N },
+            ));
+        }
 
         let mut joins: Vec<JoinHandle<()>> = Vec::with_capacity(N);
         for (slot, rx) in receivers.into_iter().enumerate() {
@@ -1829,5 +1930,64 @@ mod tests {
             before,
             "and must be back where it started once the thread is gone"
         );
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a target that cannot materialise a set's mutex object refuse the
+    /// connection. MUST NOT: the pool create a thread that will meet that
+    /// refusal as a `std` panic, or keep the memory of a set it did not build.
+    ///
+    /// The defect this pins: on VxWorks every pthread mutex materialises its
+    /// `SEMAPHORE` on first lock, so a freshly leased worker's first
+    /// `std::sync::Mutex::lock` panicked with `EINVAL` at 588 live objects and
+    /// took its set with it. A host cannot be made to exhaust that arena, so
+    /// the gate is injected — what is under test is the *refusal path*: no
+    /// thread, no leaked byte, no leaked slot, and a cause a consumer can
+    /// recognise by type.
+    #[test]
+    fn a_target_that_refuses_a_mutex_object_refuses_the_connection() {
+        static ARENA: Reservation = Reservation::new(8 * HOST_SET);
+        fn arena_empty(_: &Mutex<SetState>) -> bool {
+            false
+        }
+        let pool: WorkerPool<2> =
+            WorkerPool::with_reservation_and_gate("test-arena", roster2(), 8, &ARENA, arena_empty);
+        let before = ARENA.held();
+
+        let refused = pool.acquire().err().expect("the arena refuses the set");
+        let AcquireError::SpawnFailed(ref e) = refused else {
+            panic!("an arena refusal is the target saying no: {refused:?}");
+        };
+        let arena = e
+            .get_ref()
+            .and_then(|src| src.downcast_ref::<ObjectArenaExhausted>())
+            .expect("the cause must be recognisable by type, not by prose");
+        assert_eq!(arena.objects, 2, "one object per worker in the set");
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::WouldBlock,
+            "a transient refusal is retryable, and a client's retry is the pacing"
+        );
+
+        assert_eq!(pool.worker_count(), 0, "a refusal must create no thread");
+        assert_eq!(
+            ARENA.held(),
+            before,
+            "the set's memory must go back: it was reserved for threads that do \
+             not exist"
+        );
+
+        // And the slot: a refused grow must not consume capacity, or eight
+        // transient refusals would close a pool of eight for good.
+        let ok: WorkerPool<2> = WorkerPool::with_reservation_and_gate(
+            "test-arena-recovers",
+            roster2(),
+            1,
+            &ARENA,
+            materialise_set_mutex,
+        );
+        let _lease = ok.acquire().expect("a target with objects admits");
+        assert!(pool.acquire().is_err(), "still refusing");
     }
 }

@@ -299,7 +299,7 @@ impl ParamEntry {
 pub struct ParamList {
     max_addr: usize,
     multi_device: bool,
-    /// params[addr][index] = ParamEntry
+    /// `params[addr][index] = ParamEntry`
     params: Vec<Vec<ParamEntry>>,
     name_to_index: HashMap<String, usize>,
 }

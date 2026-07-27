@@ -222,7 +222,7 @@ enum CDispatch {
     /// (:1541-1546) is unconditional, and only `checkPortConnect` is conditioned
     /// on the priority and reason (:1536-1538). The request's own user
     /// ([`AsynUser::connect_check`]) selects the connected waiver;
-    /// [`PortDriverBase::check_queue`] enforces the split, so nothing can waive
+    /// [`crate::port::PortDriverBase::check_queue`] enforces the split, so nothing can waive
     /// the enabled half.
     ///
     /// This is also the only class the block holder can stall: C's
@@ -1288,7 +1288,7 @@ impl PortActor {
     /// `asynOctetBase::readIt` (asynOctetBase.c:224-238), which is interposed
     /// directly on the driver and therefore sits *below* the EOS layer — so it
     /// runs per lower-level read, on the raw driver chunk. That position is
-    /// [`crate::port::DriverOctetLink::read`]; firing it here instead handed
+    /// `DriverOctetLink::read`; firing it here instead handed
     /// interrupt users the post-EOS message and the EOS eomReason (R19-112).
     fn octet_read(
         &mut self,
@@ -1944,7 +1944,7 @@ fn combine_read_alarm(status: AsynStatus, alarm_status: u16, alarm_severity: u16
 ///
 /// The values are the `menuAlarmStat.dbd` / `menuAlarmSevr.dbd` ordinals, fixed
 /// by `libcom/src/misc/alarm.h:62-85` and part of the EPICS record ABI.
-/// [`tests::asyn_alarm_codes_match_epics_base`] holds them to
+/// `tests::asyn_alarm_codes_match_epics_base` holds them to
 /// `epics_base_rs`'s under the `epics` feature, so a drift on either side is a
 /// test failure rather than a silently wrong ALARM/SEVR field.
 mod alarm {

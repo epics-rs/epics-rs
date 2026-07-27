@@ -1,5 +1,122 @@
 # Changelog
 
+## v0.25.2 — 2026-07-28
+
+Patch release. Three on-target rounds on the VxWorks 7 guest and the armv7
+RTEMS 6 board turned the embedded port's open questions into measurements, and
+the defects those measurements exposed are fixed here. Thread admission is now
+bounded by reserved address space rather than by a heap figure the target
+cannot answer; a bounded socket write no longer rests on `MSG_DONTWAIT`, a flag
+Darwin ignores and VxWorks was never measured honouring; the CA server frames a
+DBR reply in one reused buffer, as C does. `asyn-rs` gains a VxWorks serial
+backend and declares the RTEMS termios ABI against the BSP headers instead of
+trusting `libc` for it. `cargo doc -D warnings` becomes a gate on the host and
+on both embedded targets, private items included. Workspace version 0.25.1 ->
+0.25.2.
+
+### Thread admission is bounded by reserved address space
+
+- **The CA connection wall is an address-space ceiling, not a heap one.** On
+  VxWorks each admitted client reserves its declared stack plus roughly 1 MiB,
+  and the wall moves linearly with guest RAM (0.2058 clients/MB, R² = 0.998,
+  ≈ 4.86 MB/client) until the pool's own cap binds — so 1024 MB versus 1280 MB
+  is no threshold. No RTP query tracks that ceiling: `sysctl` answers `ENOENT`,
+  `memFindMax` sits flat at 256 KiB, and there is no `getrlimit`; an `mmap`
+  ladder matches the wall to the byte. `WorkerPool` therefore bounds admission
+  against a declared reservation budget — `EPICS_RS_POOL_RESERVATION_MB`,
+  defaulting to 160 MiB on both embedded targets — rather than against a number
+  the target will not give. On RTEMS, where `malloc_free_space` does answer,
+  the boot check confirms or clamps that default instead of taking it on faith.
+
+- **Thread memory is charged per target, not by an `embedded` flag.**
+  `ThreadMemoryTarget` replaces the boolean: RTEMS's measured per-thread
+  overhead is 0 and VxWorks's is 1 MiB, and the shared flag had been charging
+  RTEMS the VxWorks figure, costing it 3× its admission.
+
+- **A set now retires with its worker.** A panicking worker used to leak its
+  pool set; the set and its thread handles are retired together. `WorkerPool`
+  also asks the target for a set's mutex object before spawning, because a
+  VxWorks pthread mutex allocates its semaphore lazily on *first lock* and
+  reports exhaustion as `EINVAL`, so `std::sync::Mutex` panics "invalid
+  argument" — root-caused on target to `semMCreate` returning NULL at 588
+  semaphores.
+
+- Every fixed IOC thread, including the CA and PVA entry points, is charged to
+  the pool's account, and a refusal names the admission gate that refused
+  rather than an errno. `AcquireError` keeps a full pool and a refused spawn
+  distinct.
+
+### A bounded write no longer rests on `MSG_DONTWAIT`
+
+`epics-libcom-rs::runtime::blocking_io::write_frame_deadline` and
+`asyn-rs`'s `write_with_retry` both bounded a frame write with `poll(POLLOUT)`
+plus a send that could not park, the second half resting on `MSG_DONTWAIT`.
+XNU decides whether `sosend` sleeps from the socket's own `SS_NBIO`, so on
+macOS the send blocked to completion and the deadline did not hold. VxWorks 7
+implements no `SO_SNDTIMEO` to fall back on (`ENOPROTOOPT`, measured on
+target), so where this code was written to run the bound rested on an untested
+assumption. Both crates now own the socket's blocking mode at the single site
+where a socket becomes live, and poll both directions — C's shape under
+`USE_POLL`. `doc/darwin-send-dontwait-gap.md` carries the measurement.
+
+### CA server and client
+
+- One send buffer is reused across deliveries and a DBR reply is framed in it
+  with C's reserve-in-place, replacing a per-reply allocation; the two
+  implementations of `read_reply` sizing are merged into one.
+- The CAS-client stack class drops to Medium on two measurements: armv7-RTEMS
+  high-water of 24,432 B for CAS-client and 3,816 B for CAS-event against a
+  realistic record set, and 65,912 B on VxWorks against C-on-VxWorks's `Big` at
+  22,000 B.
+- A refused client is announced exactly once. The refusal status is constrained
+  by the protocol rather than chosen freely — only `CA_K_WARNING` statuses are
+  safe for libca and `ECA_MAXIOC` aborts the client — so the gate that refused
+  rides in the diagnostic text.
+- Client: a server exception is raised on the circuit's receive path; a write
+  exception's identity binds to the request rather than the channel; a
+  name-service circuit takes the same liveness rule as a data circuit and
+  releases its socket before the backoff.
+
+### asyn-rs on the embedded targets
+
+- The serial backend is one seam with three arms. VxWorks binds `sioLib`
+  numbering, and RTEMS declares its own termios ABI against
+  `arm-rtems6/include/sys/_termios.h` in the BSP sysroot, because `libc` adds a
+  `c_line` member RTEMS does not have and drops the speed fields — 102 errors
+  and 0 bound flag constants before the ABI was owned locally.
+  `cfset[io]speed` now reports what it refuses instead of dropping it.
+- `unix://` is refused on VxWorks at parse time, matching C's `HAS_AF_UNIX`,
+  and the serial fd stays non-blocking for its whole life.
+- `epics-libcom-rs` gains `runtime::socket`, through which asyn's IP drivers are
+  routed, so the two crates no longer carry separate socket surfaces.
+
+### Record processing and the runtime
+
+- A put-notify wait-set is released when a chain entry is refused, and a
+  link-chain bound refusal raises an alarm instead of truncating a legal `FLNK`
+  chain silently.
+- One `Snapshot` is shared across a post's subscribers, and a wide-value
+  monitor is capped at one queued entry.
+- A dropped `Sleep` cancels its `delayed_timer` entry. The bring-up census and
+  the diagnostic threads get band owners in `ioc_role`, the census below client
+  service.
+
+### Documentation gate
+
+`cargo doc` runs with `-D warnings` on the host and on both embedded targets,
+documenting private items on every row, and `asyn-rs` joins the
+`rustdoc-embedded` closure. The intra-doc links that had never resolved are
+resolved across every crate; where public documentation cited a crate-private
+item, the citation became a code span rather than a link.
+`doc/rustdoc-embedded-only-census.md` records which citations exist only on an
+embedded row.
+
+### Removed
+
+`epics-libcom-rs::runtime::blocking_io::SEND_TICKS_PER_DEADLINE` and
+`send_tick_for`, which existed to divide a caller's deadline into socket send
+timeouts. `write_frame_deadline` now owns its bound, so neither has a caller.
+
 ## v0.25.1 — 2026-07-26
 
 Patch release. VxWorks 7 (`x86_64-wrs-vxworks`) joins RTEMS 6 as a supported

@@ -1912,8 +1912,7 @@ impl PortActor {
 /// condition with READ_ALARM as the asynError/default condition and INVALID
 /// as the severity.
 fn combine_read_alarm(status: AsynStatus, alarm_status: u16, alarm_severity: u16) -> (u16, u16) {
-    use epics_base_rs::server::recgbl::alarm_status as al;
-    use epics_base_rs::server::record::AlarmSeverity;
+    use alarm as al;
     let stat_default = match status {
         AsynStatus::Success => return (alarm_status, alarm_severity),
         AsynStatus::Timeout => al::TIMEOUT_ALARM,
@@ -1927,12 +1926,37 @@ fn combine_read_alarm(status: AsynStatus, alarm_status: u16, alarm_severity: u16
     } else {
         alarm_status
     };
-    let sevr = if alarm_severity == AlarmSeverity::NoAlarm as u16 {
-        AlarmSeverity::Invalid as u16
+    let sevr = if alarm_severity == al::SEV_NO_ALARM {
+        al::SEV_INVALID
     } else {
         alarm_severity
     };
     (stat, sevr)
+}
+
+/// The EPICS alarm condition and severity codes this mapping produces.
+///
+/// Owned here rather than imported from `epics_base_rs` because the mapping is
+/// asyn's, not base's: C keeps `asynStatusToEpicsAlarm` in asyn's own
+/// `asynEpicsUtils.c:234-265` and takes only the *numbers* from base's
+/// `alarm.h`. Importing them instead made a core module depend on the optional
+/// `epics` feature, which is why `--no-default-features` never compiled.
+///
+/// The values are the `menuAlarmStat.dbd` / `menuAlarmSevr.dbd` ordinals, fixed
+/// by `libcom/src/misc/alarm.h:62-85` and part of the EPICS record ABI.
+/// [`tests::asyn_alarm_codes_match_epics_base`] holds them to
+/// `epics_base_rs`'s under the `epics` feature, so a drift on either side is a
+/// test failure rather than a silently wrong ALARM/SEVR field.
+mod alarm {
+    pub const NO_ALARM: u16 = 0;
+    pub const READ_ALARM: u16 = 1;
+    pub const COMM_ALARM: u16 = 9;
+    pub const TIMEOUT_ALARM: u16 = 10;
+    pub const HW_LIMIT_ALARM: u16 = 11;
+    pub const DISABLE_ALARM: u16 = 18;
+
+    pub const SEV_NO_ALARM: u16 = 0;
+    pub const SEV_INVALID: u16 = 3;
 }
 
 #[cfg(test)]
@@ -2019,13 +2043,32 @@ mod tests {
         assert_eq!(result.int_val, Some(42));
     }
 
+    /// The owned codes in [`super::alarm`] are the EPICS record ABI, so they
+    /// must equal `epics_base_rs`'s wherever both exist. Gated on `epics`
+    /// because that is the only configuration in which base is linked at all —
+    /// the point of owning them is that the mapping compiles without it.
+    #[cfg(feature = "epics")]
+    #[test]
+    fn asyn_alarm_codes_match_epics_base() {
+        use epics_base_rs::server::recgbl::alarm_status as base;
+        use epics_base_rs::server::record::AlarmSeverity;
+        assert_eq!(super::alarm::NO_ALARM, base::NO_ALARM);
+        assert_eq!(super::alarm::READ_ALARM, base::READ_ALARM);
+        assert_eq!(super::alarm::COMM_ALARM, base::COMM_ALARM);
+        assert_eq!(super::alarm::TIMEOUT_ALARM, base::TIMEOUT_ALARM);
+        assert_eq!(super::alarm::HW_LIMIT_ALARM, base::HW_LIMIT_ALARM);
+        assert_eq!(super::alarm::DISABLE_ALARM, base::DISABLE_ALARM);
+        assert_eq!(super::alarm::SEV_NO_ALARM, AlarmSeverity::NoAlarm as u16);
+        assert_eq!(super::alarm::SEV_INVALID, AlarmSeverity::Invalid as u16);
+    }
+
     #[test]
     fn combine_read_alarm_matches_c_status_to_epics_alarm() {
-        use epics_base_rs::server::recgbl::alarm_status as al;
-        use epics_base_rs::server::record::AlarmSeverity;
-        let none = AlarmSeverity::NoAlarm as u16;
-        let major = AlarmSeverity::Major as u16;
-        let invalid = AlarmSeverity::Invalid as u16;
+        use super::alarm as al;
+        let none = al::SEV_NO_ALARM;
+        // MAJOR_ALARM — `epicsSevMajor`, alarm.h:42.
+        let major = 2u16;
+        let invalid = al::SEV_INVALID;
         // Success: the explicit alarm passes through unchanged (incl. clean).
         assert_eq!(
             combine_read_alarm(AsynStatus::Success, al::NO_ALARM, none),
@@ -2065,8 +2108,7 @@ mod tests {
 
     #[test]
     fn actor_read_surfaces_param_status_alarm() {
-        use epics_base_rs::server::recgbl::alarm_status as al;
-        use epics_base_rs::server::record::AlarmSeverity;
+        use super::alarm as al;
         // A defined param flagged setParamStatus(Error) with no explicit
         // setParamAlarm: the read must surface READ_ALARM/INVALID (C
         // devAsynInt32.c:844-847), not a clean (UDF-clearing) read.
@@ -2082,7 +2124,7 @@ mod tests {
         let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
         assert_eq!(result.int_val, Some(5));
         assert_eq!(result.alarm_status, al::READ_ALARM);
-        assert_eq!(result.alarm_severity, AlarmSeverity::Invalid as u16);
+        assert_eq!(result.alarm_severity, al::SEV_INVALID);
         // The transport status is also carried as aux_status (distinct from the
         // op-level `status`, which stays Success) so device support can gate the
         // value store on it — C processAi (devAsynInt32.c:848-855).

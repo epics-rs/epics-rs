@@ -99,7 +99,7 @@ impl PortManager {
                 return Err(AsynError::PortAlreadyRegistered(name));
             }
         }
-        if crate::asyn_record::get_port(&name).is_some() {
+        if crate::registry::get_port(&name).is_some() {
             return Err(AsynError::PortAlreadyRegistered(name));
         }
         // The manager's services, not the config's default global ones — a
@@ -120,7 +120,7 @@ impl PortManager {
         // claim means a concurrent registrant won between the pre-flight
         // and here: drop the runtime we just built and report the
         // duplicate.
-        if let Err(e) = crate::asyn_record::register_port(
+        if let Err(e) = crate::registry::register_port(
             &name,
             handle.port_handle().clone(),
             self.services.trace().clone(),
@@ -150,7 +150,7 @@ impl PortManager {
         if let Some(handle) = self.port_handles.lock().get(name).cloned() {
             return Ok(handle);
         }
-        crate::asyn_record::get_port(name)
+        crate::registry::get_port(name)
             .map(|entry| entry.handle)
             .ok_or_else(|| AsynError::PortNotFound(name.to_string()))
     }
@@ -204,7 +204,7 @@ impl PortManager {
         // A port this manager published must not outlive it in the registry,
         // or the name would keep resolving to a handle whose runtime is gone.
         if was_ours {
-            crate::asyn_record::unregister_port(name);
+            crate::registry::unregister_port(name);
         }
         if let Some(runtime_handle) = runtime {
             runtime_handle.shutdown();
@@ -236,7 +236,7 @@ impl PortManager {
     pub fn list_port_names(&self) -> Vec<String> {
         let mut names: std::collections::BTreeSet<String> =
             self.port_handles.lock().keys().cloned().collect();
-        names.extend(crate::asyn_record::port_names());
+        names.extend(crate::registry::port_names());
         names.into_iter().collect()
     }
 }
@@ -387,7 +387,7 @@ mod tests {
             Arc::new(crate::interrupt::InterruptManager::new(4)),
             crate::port_actor::ActorId::new(),
         );
-        crate::asyn_record::register_port(
+        crate::registry::register_port(
             "extowned",
             ext,
             Arc::new(crate::trace::TraceManager::new()),
@@ -403,8 +403,8 @@ mod tests {
             Ok(_) => panic!("registration over a process-registry name must fail"),
         }
         // The externally published entry survives the rejected attempt.
-        assert!(crate::asyn_record::get_port("extowned").is_some());
-        crate::asyn_record::unregister_port("extowned");
+        assert!(crate::registry::get_port("extowned").is_some());
+        crate::registry::unregister_port("extowned");
     }
 
     #[test]

@@ -571,7 +571,7 @@ mod tests {
                 "the manager must not hold a handle for a port that was never created"
             );
             assert!(
-                crate::asyn_record::get_port(PORT).is_none(),
+                crate::registry::get_port(PORT).is_none(),
                 "the process registry must not hold a port that was never created"
             );
             println!("{DONE}");

@@ -157,19 +157,16 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # the same selection the CA ratchet below measures, so the probe and the built
 # binary agree by construction rather than by two people remembering.
 #
-# `asyn-rs`'s entry is the exception to the paragraph above: it is a WORKAROUND,
-# not a statement that `epics` is this crate's target configuration. `asyn-rs`
-# under `--no-default-features` has never compiled on any platform — 7 errors,
-# all `E0433`, reproducible on host x86_64 Linux: `port_actor.rs:1915` and
-# `:1916` cannot resolve `epics_base_rs`, and `manager.rs:102`, `:123`, `:153`,
-# `:207`, `:239` cannot find `asyn_record` in the crate root, because the
-# `epics` feature is not honoured in the code. The empty selection is what this
-# gate would otherwise use here, so the fix is to repair those 7 at source and
-# DELETE this entry, not to keep tuning it.
+# `asyn-rs` belongs with the first five: the empty selection IS its target
+# configuration. It briefly carried `[asyn-rs]="epics"` as a stated workaround,
+# because `--no-default-features` had never compiled the crate on any platform
+# (7 `E0433`s). Fixed at source — the port registry moved out of `asyn_record`
+# into the core `registry` module, and the alarm-code mapping stopped importing
+# `epics_base_rs` — so the entry is deleted, which is what the workaround
+# comment said to do rather than re-tune it.
 declare -A CRATE_FEATURES=(
     [epics-bridge-rs]="qsrv-core,pvalink"
     [epics-ca-rs]="client-core"
-    [asyn-rs]="epics"
 )
 
 # Binaries built for the target, as `crate:bin` pairs.

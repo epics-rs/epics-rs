@@ -1,7 +1,27 @@
-//! Port registry for asynRecord — maps port names to handles.
+//! The process-wide asyn port registry: the single claim on a port name.
 //!
-//! Provides both a shared `PortRegistry` instance (preferred) and
-//! a global static fallback for backward compatibility.
+//! This is the list C `asynManager` keeps as `pasynBase->asynPortList`
+//! (`asynManager.c:2082-2095`), and it answers the same question for the same
+//! callers: `drvAsyn*PortConfigure`, areaDetector plugin ports, hand-registered
+//! driver ports and every port published through a
+//! [`crate::manager::PortManager`]. `asynReport` with no port argument
+//! enumerates exactly this.
+//!
+//! # Why it lives in the core and not under `asyn_record`
+//!
+//! It used to be `asyn_record::registry`, which put the framework's own name
+//! claim inside the module that exists only when the `epics` feature is on. The
+//! consequence was not a style problem: [`crate::manager`] is core and must
+//! claim a name, so it reached into a gated module, and `--no-default-features`
+//! could not compile the crate at all — five `E0433`s that had been there since
+//! the module was written, because nothing ever built that configuration.
+//!
+//! Nothing here names `epics_base_rs` or any record type; it is `HashMap`,
+//! `Mutex` and this crate's own `PortHandle`. The two functions that genuinely
+//! did belong to the record layer — the `asyn` record-type factory and its
+//! legacy global registration — stayed behind in [`crate::asyn_record`], which
+//! re-exports these names so existing `asyn_record::get_port` callers are
+//! unchanged.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -10,8 +30,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::error::{AsynError, AsynResult};
 use crate::port_handle::PortHandle;
 use crate::trace::TraceManager;
-
-// ===== Port Registry =====
 
 /// Entry in the port registry.
 #[derive(Clone)]
@@ -123,22 +141,6 @@ pub fn port_names() -> Vec<String> {
 pub fn unregister_port(name: &str) {
     global_registry().remove(name);
 }
-
-/// Return the asyn record type factory for injection into IocBuilder.
-pub fn asyn_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
-    ("asyn", Box::new(|| Box::new(super::AsynRecord::default())))
-}
-
-/// Register the "asyn" record type via the global registry (legacy).
-/// Prefer `asyn_record_factory()` with `IocBuilder::register_record_type()`.
-pub fn register_asyn_record_type() {
-    epics_base_rs::server::db_loader::register_record_type(
-        "asyn",
-        Box::new(|| Box::new(super::AsynRecord::default())),
-    );
-}
-
-// ===== Transfer Mode =====
 
 #[cfg(test)]
 mod tests {

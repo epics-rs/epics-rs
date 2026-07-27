@@ -1610,6 +1610,10 @@ mod tests {
         crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
     }
 
+    /// Gated with its only caller,
+    /// `eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes`, which
+    /// needs `crate::iocsh` and so exists only under `epics`.
+    #[cfg(feature = "epics")]
     fn chain_read_eom(
         drv: &mut DrvAsynIPPort,
         user: &AsynUser,
@@ -3127,6 +3131,11 @@ mod tests {
     ///     is silently dropped from the read.
     ///
     /// Assert the 3 bytes. Under the inverted chain this returns 2 and fails.
+    ///
+    /// Gated on `epics`: the interpose order under test is the one
+    /// `crate::iocsh::build_configured_ip_port` installs, and `iocsh` is part
+    /// of the EPICS surface. The driver itself needs no feature.
+    #[cfg(feature = "epics")]
     #[test]
     fn eos_pushed_after_com_sits_above_it_and_sees_unstuffed_bytes() {
         use crate::interpose::com::IAC;

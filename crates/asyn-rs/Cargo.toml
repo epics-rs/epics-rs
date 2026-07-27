@@ -88,3 +88,26 @@ epics-ca-rs = { workspace = true }
 [[bench]]
 name = "throughput"
 harness = false
+
+# Integration tests of the EPICS-IOC surface — the record device support, the
+# iocsh commands, and `epics_base_rs`'s database — so they exist only when that
+# surface does. Declared as `required-features` rather than `#![cfg(feature =
+# "epics")]` inside each file: cargo then SKIPS the target, instead of
+# compiling a file whose contents have been cfg'd away to nothing, which reads
+# as a passing test that never ran. The other six files in `tests/` name only
+# the framework and are auto-discovered unchanged.
+[[test]]
+name = "iocsh_port_is_traceable"
+required-features = ["epics"]
+
+[[test]]
+name = "ip_server_port_accepts"
+required-features = ["epics"]
+
+[[test]]
+name = "port_runtime_lifetime"
+required-features = ["epics"]
+
+[[test]]
+name = "process_gate_tests"
+required-features = ["epics"]

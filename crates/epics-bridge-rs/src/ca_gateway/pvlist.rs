@@ -250,7 +250,7 @@ impl PvList {
     ///   (`gateAs.cc:504-507` — the unresolved host is simply not appended).
     ///   If a rule's hosts **all** fail to resolve, its `from_hosts` ends
     ///   empty and the rule is thereafter treated as a **global** deny by
-    ///   [`Self::is_global_deny`] — fail-**closed**, matching canonical
+    ///   `Self::is_global_deny` — fail-**closed**, matching canonical
     ///   ca-gateway (`USE_DENYFROM`), whose two-pass parser re-parses the
     ///   host-stripped line into the global `deny_list` (`gateAs.cc:540-556`).
     ///

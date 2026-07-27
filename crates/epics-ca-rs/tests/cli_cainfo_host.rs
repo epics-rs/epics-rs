@@ -20,6 +20,11 @@
 // reaches tokio I/O with no reactor. Inapplicable under the executor
 // backend; the RTEMS model has no async CLI client.
 #![cfg(not(feature = "rtems-exec-model"))]
+// …and `client`, because the reverse-resolved name IS the `hostname` module
+// (`lib.rs`, `#[cfg(feature = "client")]`). `client-core` naming a peer by its
+// dotted address is that feature's stated behaviour, not a regression, so this
+// file asserts something only the full client claims.
+#![cfg(feature = "client")]
 
 use std::process::Command;
 

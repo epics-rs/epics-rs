@@ -361,18 +361,18 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     // The posted values must be the reconciled ones, not stale.
     let expected_pr1 = QuantizingDriver::quantize(12_500_000); // NINT(1.0*1.25e7)
     assert_eq!(
-        pr1_evt.snapshot.value,
+        pr1_evt.snapshot.value.clone(),
         // PR1 is DBF_ULONG (scalerRecord.dbd:945) -> native EpicsValue::ULong.
         EpicsValue::ULong(expected_pr1),
         "posted PR1 must be the driver-programmed (quantized) preset"
     );
     assert_eq!(
-        freq_evt.snapshot.value,
+        freq_evt.snapshot.value.clone(),
         EpicsValue::Double(QuantizingDriver::DRIVER_FREQ),
         "posted FREQ must be the driver's actual clock"
     );
     let expected_tp = expected_pr1 as f64 / QuantizingDriver::DRIVER_FREQ;
-    match tp_evt.snapshot.value {
+    match tp_evt.snapshot.value.clone() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "posted TP must be recomputed from effective PR1/FREQ: got {v}, want {expected_tp}"
@@ -558,7 +558,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
          old_pr1 must be captured BEFORE the :409-410 guard",
     );
     let expected_tp = 10_000_001_f64 / freq; // pr1 / freq, C:426
-    match tp_evt.snapshot.value {
+    match tp_evt.snapshot.value.clone() {
         EpicsValue::Double(v) => assert!(
             (v - expected_tp).abs() < 1e-12,
             "TP must be recomputed from the guard-adjusted PR1/FREQ: got {v}, want {expected_tp}"

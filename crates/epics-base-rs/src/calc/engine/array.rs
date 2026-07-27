@@ -1362,7 +1362,7 @@ impl Extremum {
 
 /// C's vararg `MAX()`/`MIN()` (`aCalcPerform.c:1155-1191`) — one opcode with two
 /// branches, chosen by whether ANY argument is an array (`:1159`, `j |=
-/// isArray(ps-i)`). The port answered a scalar built from each argument's a[0] in
+/// isArray(ps-i)`). The port answered a scalar built from each argument's `a[0]` in
 /// both, so a record's AVAL got a broadcast scalar instead of the element-wise
 /// extremum.
 ///
@@ -1371,7 +1371,7 @@ impl Extremum {
 ///
 /// * the result cell is the FIRST argument's — it keeps that argument's window,
 ///   and a scalar first argument brings `toArray`'s cleared window (and its NaN->0
-///   fill) with it. Compiled C, arraySize 6, AA=[1,5,2,8,3,9]:
+///   fill) with it. Compiled C, arraySize 6, `AA=[1,5,2,8,3,9]`:
 ///   `AVG(MAX(AA[1,3],0))` is 5 (the 3-element window survives) while
 ///   `AVG(MAX(0,AA[1,3]))` is 2.5 (the promoted scalar's window is the whole
 ///   buffer, so the fold's zero tail counts).
@@ -1480,7 +1480,7 @@ fn unary(
 ///
 /// The seed `a[firstEl]` is read unconditionally, so an EMPTY window still sums to
 /// `a[0]` rather than to 0 — the divergence from `window().iter().sum()` that
-/// keeps `AVG(AA[2,1])` a NaN (a[0]/0) instead of a 0/0-free 0.
+/// keeps `AVG(AA[2,1])` a NaN (`a[0]`/0) instead of a 0/0-free 0.
 fn window_sum(cell: &ArrayCell) -> f64 {
     let seed = cell.buf().first().copied().unwrap_or(0.0);
     seed + cell.window().iter().skip(1).sum::<f64>()

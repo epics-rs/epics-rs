@@ -58,7 +58,7 @@ pub struct ClientCreds {
 /// this client write" (`allowed`) and "did the matched ACF/ASG rule
 /// carry `TRAPWRITE`" (`rule_was_trap`). The QSRV PUT path emits the
 /// `asTrapWrite` put-log event iff `rule_was_trap`, and never re-derives
-/// the trap flag at the emission site (see [`super::trap_write`]).
+/// the trap flag at the emission site (see `super::trap_write`).
 ///
 /// Mirrors C `asComputePvt` tracking `access` and `trapMask` together
 /// (`asLibRoutines.c:983-1048`) and pvxs `SecurityClient` exposing both
@@ -118,7 +118,7 @@ pub trait AccessControl: Send + Sync {
     /// Authorize a write and surface the matched ACF/ASG rule's
     /// `TRAPWRITE` flag in one result — the single source the QSRV PUT
     /// path uses both to gate the write and to decide `asTrapWrite`
-    /// put-logging (see [`WriteGrant`] and [`super::trap_write`]).
+    /// put-logging (see [`WriteGrant`] and `super::trap_write`).
     ///
     /// Default: forward to [`Self::can_write_creds`] with
     /// `rule_was_trap = false` — an impl with no ACF rule has no trap
@@ -137,7 +137,7 @@ pub trait AccessControl: Send + Sync {
 pub struct AllowAllAccess;
 impl AccessControl for AllowAllAccess {}
 
-/// AccessControl backed by an epics-base [`AccessSecurityConfig`].
+/// AccessControl backed by an epics-base [`epics_base_rs::server::access_security::AccessSecurityConfig`].
 ///
 /// Bridges qsrv's per-channel access checks to epics-base ACF
 /// (UAG/HAG/RULE/METHOD/AUTHORITY) so a `BridgeProvider` configured
@@ -710,7 +710,7 @@ struct GroupFileEntry {
 /// Wraps an `Arc<RwLock<Arc<dyn AccessControl>>>` shared with the
 /// owning [`BridgeProvider`] — `set_access_control` swaps the inner
 /// `Arc` and existing AccessContexts pick up the new policy on their
-/// next [`can_read`] / [`can_write`] call.
+/// next [`AccessControl::can_read`] / [`AccessControl::can_write`] call.
 struct LiveAccessProxy {
     cell: Arc<parking_lot::RwLock<Arc<dyn AccessControl>>>,
 }
@@ -1222,7 +1222,7 @@ impl BridgeProvider {
 
     /// Resolve a single member of a group by `(group_name, field)`.
     /// Returns the backing record name (`record.field`) and the
-    /// member's [`super::group_config::FieldMapping`] so callers can
+    /// member's [`super::pvif::FieldMapping`] so callers can
     /// route a get/put through the existing single-record path.
     /// Mirrors pvxs `getGroupField` / `putGroupField`
     /// (groupsource.cpp:408/497) at the lookup level — the actual
@@ -1238,7 +1238,7 @@ impl BridgeProvider {
         Some((m.channel.clone(), m.mapping))
     }
 
-    /// Read a single field of a group as an [`EpicsValue`]. Mirrors
+    /// Read a single field of a group as an [`epics_base_rs::types::EpicsValue`]. Mirrors
     /// pvxs `getGroupField`. Returns `None` when the group/field
     /// pair is unknown or the backing record can't be read.
     pub async fn get_group_field(
@@ -1370,7 +1370,7 @@ impl BridgeProvider {
     /// authenticated user/host. The trait method [`ChannelProvider::create_channel`]
     /// delegates to this with empty identity (anonymous mode). For full
     /// credential pass-through (method/authority/roles) use
-    /// [`create_channel_with_creds`].
+    /// [`Self::create_channel_with_creds`].
     pub async fn create_channel_for(
         &self,
         name: &str,

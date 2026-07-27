@@ -273,3 +273,220 @@ jobs:
           echo "::endgroup::"
         done
         echo "exec-backend stress: $iterations/$iterations iterations green"
+
+  # Nothing in this file ran `cargo doc` before this job, so every rustdoc lint
+  # — `broken_intra_doc_links` above all — was advisory on a developer's
+  # terminal and enforced nowhere. Four panels closed the accumulated
+  # population by hand in one round; with no gate it regrows on the next
+  # commit, which is what this job is for.
+  #
+  # WHY THE CRITERION IS `exit 0` AND NOT A WARNING COUNT
+  #
+  # Fixing one link lets rustdoc reach the items behind it and report what they
+  # were hiding, so any single run's list is a surface, not a population:
+  # epics-libcom-rs was cited at 8 warnings, measured at 13, and closed at 12
+  # over repeated re-runs. Only "the command exited 0" is stable under that.
+  #
+  # WHY THREE ROWS AND NOT ONE
+  #
+  # A doc run under one feature resolution never sees a link that only compiles
+  # under another. Measured across twelve configurations (default,
+  # `rtems-exec-model`, `linux-rt`, both, `--all-features`,
+  # `--no-default-features`, each with and without `--document-private-items`):
+  # 353 distinct diagnostic sites in this workspace, and NO single
+  # configuration reaches all of them. Exhaustive search over the twelve puts
+  # the smallest covering set at two; the three below cover all 353.
+  #
+  #   * `--all-features --document-private-items` — every cargo feature on.
+  #     Reports 15 sites the other two rows do not.
+  #   * `--no-default-features --document-private-items` — every cargo feature
+  #     off. Reports 19 the other two do not: the `epics-bridge-rs` and
+  #     `epics-tools-rs` lib docs are compiled only here.
+  #   * `--document-private-items` at default features — reports 0 that the
+  #     other two miss TODAY, and is kept for a class that is not
+  #     hypothetical. `--all-features` turns on `rtems-exec-model`, which is
+  #     `exec_backend`, so every `#[cfg(tokio_backend)]` item is compiled out
+  #     of the first row; `--no-default-features` compiles the whole CA
+  #     `client` module out of the second. `client/transport.rs:394` was a
+  #     `tokio_backend`-only doc that this row and no other of the twelve
+  #     reported; it is closed earlier on this branch, which is why the row
+  #     now reports nothing of its own.
+  #
+  # DROPPED — 9 of the 12, each measured to contribute zero sites the three
+  # rows above do not already report: `rtems-exec-model`, `linux-rt` and the
+  # two together (with and without `--document-private-items`, 6 rows);
+  # `--all-features` and `--no-default-features` without private items (2);
+  # and plain default features without private items (1). Every named feature
+  # is a subset of what `--all-features` turns on, which is why dropping them
+  # is a measurement and not a budget cut.
+  #
+  # `--document-private-items` on all three rows: private docs are what a
+  # contributor reads, and turning it on takes the population from 191 sites
+  # to 319.
+  #
+  # Target selection stays at cargo's default (lib + bins). `--examples` was
+  # measured to add 0 sites, and `cargo doc` has no `--tests` flag at all — so
+  # `crates/*/tests/**` is outside any rustdoc gate. Stated here rather than
+  # left to be assumed.
+  #
+  # `--keep-going` so one broken crate does not hide the rest. It does not
+  # change the exit status, which is the only thing this gate reads.
+  #
+  # THIS JOB IS RED THE DAY IT LANDS: the workspace-wide sweep that closes the
+  # crates nobody has written yet is still in flight. The check is added ahead
+  # of that sweep on purpose — a gate that arrives after the cleanup gates
+  # nothing that has not already regrown.
+  rustdoc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rustdoc
+    - name: rustdoc (--all-features, private items)
+      run: cargo doc --no-deps --keep-going --workspace --all-features --document-private-items
+      env:
+        RUSTDOCFLAGS: -D warnings
+    - name: rustdoc (--no-default-features, private items)
+      run: cargo doc --no-deps --keep-going --workspace --no-default-features --document-private-items
+      env:
+        RUSTDOCFLAGS: -D warnings
+    - name: rustdoc (default features, private items)
+      run: cargo doc --no-deps --keep-going --workspace --document-private-items
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+  # The host job above cannot see a link that only exists on an embedded
+  # target, and that is not a small remainder: documenting the RTEMS closure
+  # reports 120 sites, 51 of which NO host reading produces — not under any of
+  # the twelve feature configurations, and not under the same six crates built
+  # with the same per-crate features on the host either (that second control is
+  # what separates "target-gated" from "a feature row the sweep missed"). They
+  # are the docs of everything behind `epics_embedded_target`: the PVA
+  # `server_native` blocking stack, the CA server's target stats, the socket
+  # half of `epics-libcom-rs::net`, `epics-rtems-boot`. A host-only gate would
+  # report green over all 51.
+  #
+  # No hardware and no BSP: `cargo doc` compiles metadata, exactly as the
+  # `rtems-closure` and `vxworks-census` jobs' `cargo check` does, so this
+  # needs the same nightly + rust-src and nothing more.
+  #
+  # WHY RTEMS RUNS WITH `RTEMS_USE_STOCK_SPEC=1`
+  #
+  # `.cargo/config.toml` reroutes `--target armv7-rtems-eabihf` through the
+  # generated has-thread-local spec using `build.rustc-wrapper`, and cargo has
+  # no rustdoc-wrapper: `-Zbuild-std` compiles std through the wrapper for the
+  # custom spec's hashed triple while rustdoc asks for the builtin one, so the
+  # run dies on `E0461: couldn't find crate compiler_builtins with expected
+  # target triple armv7-rtems-eabihf` (measured, both with and without a clean
+  # target dir). The stock spec is the right answer for a DOC gate specifically:
+  # the deviation's only effect is `has-thread-local`, which flips
+  # `cfg(target_thread_local)`, and no source file in `crates/` mentions that
+  # cfg — so no doc link can resolve differently under it. That is a fact about
+  # today's tree, and the day a `cfg(target_thread_local)` lands in `crates/`
+  # this gate stops covering the image's configuration.
+  #
+  # BOTH TARGETS, though VxWorks was measured to add 0 sites over RTEMS today
+  # (119 vs 120; the difference is `epics-rtems-boot`, which the VxWorks row
+  # does not build). That zero is an accident of the two sharing the
+  # `epics_embedded_target` gate — 6 cfg predicates in `crates/` name
+  # `target_os = "vxworks"` without naming rtems, so a VxWorks-only doc link is
+  # representable and would go unreported by an RTEMS-only job. Two targets
+  # cost ~35 s each warm.
+  #
+  # The VxWorks row carries `scripts/libc-std-patch.sh` for the same reason
+  # `vxworks-check.sh` does — a manifest `[patch.crates-io]` never reaches the
+  # `-Zbuild-std` graph, so std compiles against rust-src's stock libc and
+  # fails on `killpg` — and drops `--locked` and restores `Cargo.lock`
+  # afterwards for the same reason: a config-added patch entry needs a lock
+  # bookkeeping write that `--locked` refuses.
+  #
+  # `--document-private-items` on both rows, matching the host job. Without it
+  # these rows structurally cannot see a private item that exists only on one
+  # target, and that is the whole shape of the priority map:
+  # `map_epics_priority`, `map_epics_priority_rtems`, `map_epics_priority_vxworks`
+  # and `rtems_core_priority` are each private and each gated to one
+  # `target_os`, so a doc under one gate citing an item under another resolves
+  # in no configuration. Measured on `epics-libcom-rs` at this commit: 0 sites
+  # without the flag on either target, 1 (RTEMS) and 3 (VxWorks) with it.
+  #
+  # Red the day it lands, like the host job: 233 sites on RTEMS and 234 on
+  # VxWorks at this commit, plus `asyn-rs`, whose row does not reach rustdoc.
+  rustdoc-embedded:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        components: rust-src
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: rustdoc-embedded
+    # The closure and the per-crate features are the ones `scripts/rtems-check.sh`
+    # and `scripts/vxworks-check.sh` compile. Kept as `--lib`: the host CLI
+    # binaries do not build for either target and were never meant to, which is
+    # the same reason those scripts name their target binaries one by one.
+    #
+    # `asyn-rs` joined that closure in `8ea3459f`, and its `epics` selection is
+    # the scripts' `CRATE_FEATURES[asyn-rs]`. Its row cannot pass yet on any
+    # tree where `asyn-rs` still names `socket2` as a production dependency:
+    # `socket2` does not compile for either triple (20 errors on
+    # `armv7-rtems-eabihf`, 12 on `x86_64-wrs-vxworks`, measured), so the row
+    # dies before rustdoc runs. It goes green with the same `runtime::socket`
+    # swap the two gate scripts already depend on.
+    - name: rustdoc for armv7-rtems-eabihf
+      env:
+        RUSTDOCFLAGS: -D warnings
+        RTEMS_USE_STOCK_SPEC: "1"
+      run: |
+        set -u
+        rc=0
+        for crate in epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs \
+                     epics-rtems-boot epics-bridge-rs asyn-rs; do
+          feats=()
+          case "$crate" in
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-ca-rs)     feats=(--features client-core) ;;
+            asyn-rs)         feats=(--features epics) ;;
+          esac
+          echo "::group::$crate --lib (armv7-rtems-eabihf)"
+          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+            -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
+            -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
+          echo "::endgroup::"
+        done
+        exit "$rc"
+    - name: rustdoc for x86_64-wrs-vxworks
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: |
+        set -u
+        cp Cargo.lock Cargo.lock.rustdoc-bak
+        trap 'mv -f Cargo.lock.rustdoc-bak Cargo.lock' EXIT
+        cfg=()
+        while IFS= read -r line; do cfg+=(--config "$line"); done \
+          < <(./scripts/libc-std-patch.sh nightly)
+        rc=0
+        for crate in epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs \
+                     epics-rtems-boot epics-bridge-rs asyn-rs; do
+          feats=()
+          case "$crate" in
+            epics-bridge-rs) feats=(--features qsrv-core,pvalink) ;;
+            epics-ca-rs)     feats=(--features client-core) ;;
+            asyn-rs)         feats=(--features epics) ;;
+          esac
+          echo "::group::$crate --lib (x86_64-wrs-vxworks)"
+          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+            "${cfg[@]}" -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
+            -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
+          echo "::endgroup::"
+        done
+        exit "$rc"

@@ -23,6 +23,7 @@ use crate::drivers::ftdi::DrvAsynFtdiPort;
 use crate::drivers::ip_port::DrvAsynIPPort;
 use crate::drivers::ip_server_port::{DrvAsynIPServerPort, IpServerConfig};
 use crate::drivers::prologix::DrvAsynPrologixPort;
+#[cfg(asyn_serial_backend)]
 use crate::drivers::serial_port::DrvAsynSerialPort;
 use crate::drivers::usbtmc::DrvAsynUsbtmcPort;
 use crate::drivers::vxi11::DrvVxi11Port;
@@ -1345,6 +1346,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // configure it in the next line of the same script.
     out.push(drv_asyn_ip_port_configure_command(services.clone()));
     out.push(drv_asyn_ip_server_port_configure_command(services.clone()));
+    // Absent where no serial backend is built: registering a
+    // `drvAsynSerialPortConfigure` that cannot create a port would make a
+    // startup script appear to work and then fail at connect.
+    #[cfg(asyn_serial_backend)]
     out.push(drv_asyn_serial_port_configure_command(services.clone()));
     out.push(drv_asyn_ftdi_port_configure_command(services.clone()));
     out.push(vxi11_configure_command(services.clone()));
@@ -1447,20 +1452,6 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
     )
 }
 
-/// Build the `drvAsynSerialPortConfigure` iocsh command.
-///
-/// C parity: `drvAsynSerialPort.c::drvAsynSerialPortConfigure(portName,
-/// ttyName, priority, noAutoConnect, noProcessEos)`. `ttyName` is the
-/// serial device path (see [`DrvAsynSerialPort::new`]).
-///
-/// The created port is registered in the [`crate::asyn_record`] port
-/// registry so `asynRecord` device support resolves it by name. As with
-/// the IP command, `priority` is accepted for startup-script
-/// compatibility but has no effect (the Rust runtime schedules port
-/// actors uniformly); `noAutoConnect` and `noProcessEos` are honored —
-/// by default an EOS interpose is installed (C
-/// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
-/// suppressed by a nonzero `noProcessEos`.
 /// Build the `drvAsynIPServerPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynIPServerPort.c::drvAsynIPServerPortConfigure(portName,
@@ -1609,6 +1600,21 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
     )
 }
 
+/// Build the `drvAsynSerialPortConfigure` iocsh command.
+///
+/// C parity: `drvAsynSerialPort.c::drvAsynSerialPortConfigure(portName,
+/// ttyName, priority, noAutoConnect, noProcessEos)`. `ttyName` is the
+/// serial device path (see [`DrvAsynSerialPort::new`]).
+///
+/// The created port is registered in the [`crate::asyn_record`] port
+/// registry so `asynRecord` device support resolves it by name. As with
+/// the IP command, `priority` is accepted for startup-script
+/// compatibility but has no effect (the Rust runtime schedules port
+/// actors uniformly); `noAutoConnect` and `noProcessEos` are honored —
+/// by default an EOS interpose is installed (C
+/// `drvAsynSerialPort.c:1126` enables EOS processing in octetBase),
+/// suppressed by a nonzero `noProcessEos`.
+#[cfg(asyn_serial_backend)]
 pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> CommandDef {
     CommandDef::new(
         "drvAsynSerialPortConfigure",
@@ -3351,6 +3357,7 @@ mod tests {
     /// `drvAsynSerialPortConfigure` creates a serial octet port and
     /// registers it in the asyn_record registry. `DrvAsynSerialPort::new`
     /// only parses the tty path (no open), so no device is needed.
+    #[cfg(asyn_serial_backend)]
     #[test]
     fn drv_asyn_serial_port_configure_registers_port() {
         let cmd = drv_asyn_serial_port_configure_command(PortServices::new(Arc::new(

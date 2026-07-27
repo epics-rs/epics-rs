@@ -1,0 +1,276 @@
+-> MTXPROBE semaphores_created=1
+POOLPROBE seq=1 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=1 dialpool workers=1 attempts=1 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+POOLPROBE seq=2 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=2 dialpool workers=1 attempts=1 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+POOLPROBE seq=3 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=3 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+POOLPROBE seq=4 BUSY=0 SETS=0 CAP=141 WORKERS=0 REFUSED=0 CONNS=0
+C6 seq=4 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=43278336
+MTXPROBE semaphores_created=512
+MTXPROBE semMCreate=NULL nth_null=1 succeeded_before=588 options=0x225
+MTXPROBE lock rc=22 mutex=0xec90050 nth_fail=1 sem_ok=588 sem_null=1
+ERROR epics_base_rs::errlog: sevr=fatal panic on thread `CAS-client 48` at /home/coding-agent/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/pal/unix/sync/mutex.rs:69: failed to lock mutex: invalid argument (os error 22) -- that thread is gone and nothing restarts it; the IOC keeps listening and keeps answering searches, so from outside it still looks healthy
+POOLPROBE seq=5 BUSY=48 SETS=49 CAP=141 WORKERS=98 REFUSED=0 CONNS=48
+C6 seq=5 dialpool workers=1 attempts=2 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=6 BUSY=48 SETS=49 CAP=141 WORKERS=98 REFUSED=0 CONNS=48
+C6 seq=6 dialpool workers=1 attempts=3 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+STACKUSE begin tag=c6-6 count=117 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-6 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-6 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-6 id=0x00010017 name=cbLow size=2097152 current=1008 high=3520 margin=2093632
+STACKUSE tag=c6-6 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-6 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-6 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-6 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-6 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3520 margin=2093632
+STACKUSE tag=c6-6 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-6 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4672 margin=2092480
+STACKUSE tag=c6-6 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-6 id=0x00010038 name=status-pv size=524288 current=1520 high=4728 margin=519560
+STACKUSE tag=c6-6 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=6016 margin=1042560
+STACKUSE tag=c6-6 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-6 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-6 id=0x000300cb name=CAS-client 0 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-6 id=0x000300cf name=CAS-event 0 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00030053 name=CAS-client 1 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-6 id=0x000300a8 name=CAS-event 1 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000300e5 name=CAS-client 2 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-6 id=0x000300e9 name=CAS-event 2 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000300f2 name=CAS-client 3 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-6 id=0x000300f6 name=CAS-event 3 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000300fe name=CAS-client 4 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-6 id=0x00040064 name=CAS-event 4 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00040049 name=CAS-client 5 size=2097152 current=6096 high=13384 margin=2083768
+STACKUSE tag=c6-6 id=0x000400aa name=CAS-event 5 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000400b4 name=CAS-client 6 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000400b8 name=CAS-event 6 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000400c1 name=CAS-client 7 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000400c5 name=CAS-event 7 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010103 name=CAS-client 8 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010107 name=CAS-event 8 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001010f name=CAS-client 9 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010113 name=CAS-event 9 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001011b name=CAS-client 10 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001011f name=CAS-event 10 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010127 name=CAS-client 11 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001012b name=CAS-event 11 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010134 name=CAS-client 12 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010138 name=CAS-event 12 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010140 name=CAS-client 13 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010144 name=CAS-event 13 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001014c name=CAS-client 14 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010150 name=CAS-event 14 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010158 name=CAS-client 15 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001015c name=CAS-event 15 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010164 name=CAS-client 16 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010168 name=CAS-event 16 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010170 name=CAS-client 17 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010174 name=CAS-event 17 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001017d name=CAS-client 18 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010181 name=CAS-event 18 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010189 name=CAS-client 19 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001018d name=CAS-event 19 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010195 name=CAS-client 20 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010199 name=CAS-event 20 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101a1 name=CAS-client 21 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101a5 name=CAS-event 21 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101ad name=CAS-client 22 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101b1 name=CAS-event 22 size=1048576 current=2736 high=5920 margin=1042656
+STACKUSE tag=c6-6 id=0x000101ba name=CAS-client 23 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101be name=CAS-event 23 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101c6 name=CAS-client 24 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101ca name=CAS-event 24 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101d2 name=CAS-client 25 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101d6 name=CAS-event 25 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101de name=CAS-client 26 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101e2 name=CAS-event 26 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101ea name=CAS-client 27 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101ee name=CAS-event 27 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000101f7 name=CAS-client 28 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000101fb name=CAS-event 28 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000201b5 name=CAS-client 29 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010203 name=CAS-event 29 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001020b name=CAS-client 30 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001020f name=CAS-event 30 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010217 name=CAS-client 31 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001021b name=CAS-event 31 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010224 name=CAS-client 32 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010228 name=CAS-event 32 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010230 name=CAS-client 33 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010234 name=CAS-event 33 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001023c name=CAS-client 34 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010241 name=CAS-event 34 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010249 name=CAS-client 35 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001024d name=CAS-event 35 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010255 name=CAS-client 36 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010259 name=CAS-event 36 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010261 name=CAS-client 37 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010265 name=CAS-event 37 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001026e name=CAS-client 38 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010272 name=CAS-event 38 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001027a name=CAS-client 39 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001027e name=CAS-event 39 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010286 name=CAS-client 40 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x0001028a name=CAS-event 40 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x00010292 name=CAS-client 41 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x00010296 name=CAS-event 41 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x0001029e name=CAS-client 42 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102a2 name=CAS-event 42 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102aa name=CAS-client 43 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102af name=CAS-event 43 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102b7 name=CAS-client 44 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102bb name=CAS-event 44 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102c3 name=CAS-client 45 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102c7 name=CAS-event 45 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102cf name=CAS-client 46 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102d3 name=CAS-event 46 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102dc name=CAS-client 47 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-6 id=0x000102e0 name=CAS-event 47 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-6 id=0x000102e8 state=gone
+STACKUSE tag=c6-6 id=0x000102ec name=CAS-event 48 size=1048576 current=1536 high=3200 margin=1045376
+STACKUSE end tag=c6-6
+POOLPROBE seq=7 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=7 dialpool workers=1 attempts=3 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=8 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=8 dialpool workers=1 attempts=3 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=9 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=9 dialpool workers=1 attempts=4 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=10 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=10 dialpool workers=1 attempts=4 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=11 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=11 dialpool workers=1 attempts=4 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=12 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=12 dialpool workers=1 attempts=5 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+MTXPROBE semaphores_created=1024
+STACKUSE begin tag=c6-12 count=117 capacity=unbounded dropped=0 source=registry
+STACKUSE scope tag=c6-12 lists only threads that called runtime::task::enter_ioc_thread, plus main; VxWorks has no RTP task enumerator (taskIdListGet is kernel-only), so a std::thread spawned outside the runtime seam is invisible here
+STACKUSE tag=c6-12 id=0x00010000 name=iRealtime-ca-ioc size=65536 current=8032 high=19728 margin=45808
+STACKUSE tag=c6-12 id=0x00010017 name=cbLow size=2097152 current=1008 high=3520 margin=2093632
+STACKUSE tag=c6-12 id=0x0001001b name=cbMedium size=2097152 current=1008 high=206800 margin=1890352
+STACKUSE tag=c6-12 id=0x0001005f name=CAC-dial 0 size=524288 current=1024 high=3248 margin=521040
+STACKUSE tag=c6-12 id=0x0001001f name=cbHigh size=2097152 current=1008 high=3680 margin=2093472
+STACKUSE tag=c6-12 id=0x00010023 name=cbTimer size=1048576 current=1152 high=3456 margin=1045120
+STACKUSE tag=c6-12 id=0x00010027 name=scanOnce size=2097152 current=1008 high=3520 margin=2093632
+STACKUSE tag=c6-12 id=0x00010034 name=scan-owner size=1048576 current=2096 high=6664 margin=1041912
+STACKUSE tag=c6-12 id=0x00010081 name=scan-10 size=2097152 current=2240 high=4672 margin=2092480
+STACKUSE tag=c6-12 id=0x00010085 name=scan-5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010089 name=scan-2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x0001008d name=scan-1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010091 name=scan-0.5 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010095 name=scan-0.2 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010099 name=scan-0.1 size=2097152 current=2240 high=4544 margin=2092608
+STACKUSE tag=c6-12 id=0x00010038 name=status-pv size=524288 current=1520 high=4728 margin=519560
+STACKUSE tag=c6-12 id=0x0001003c name=CAS-TCP size=1048576 current=2384 high=6016 margin=1042560
+STACKUSE tag=c6-12 id=0x00010040 name=CAS-UDP size=1048576 current=2528 high=5056 margin=1043520
+STACKUSE tag=c6-12 id=0x000100a4 name=c6-probe size=1048576 current=2000 high=4544 margin=1044032
+STACKUSE tag=c6-12 id=0x000300cb name=CAS-client 0 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-12 id=0x000300cf name=CAS-event 0 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00030053 name=CAS-client 1 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-12 id=0x000300a8 name=CAS-event 1 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000300e5 name=CAS-client 2 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-12 id=0x000300e9 name=CAS-event 2 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000300f2 name=CAS-client 3 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-12 id=0x000300f6 name=CAS-event 3 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000300fe name=CAS-client 4 size=2097152 current=6096 high=12160 margin=2084992
+STACKUSE tag=c6-12 id=0x00040064 name=CAS-event 4 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00040049 name=CAS-client 5 size=2097152 current=6096 high=13384 margin=2083768
+STACKUSE tag=c6-12 id=0x000400aa name=CAS-event 5 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000400b4 name=CAS-client 6 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000400b8 name=CAS-event 6 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000400c1 name=CAS-client 7 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000400c5 name=CAS-event 7 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010103 name=CAS-client 8 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010107 name=CAS-event 8 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001010f name=CAS-client 9 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010113 name=CAS-event 9 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001011b name=CAS-client 10 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001011f name=CAS-event 10 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010127 name=CAS-client 11 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001012b name=CAS-event 11 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010134 name=CAS-client 12 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010138 name=CAS-event 12 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010140 name=CAS-client 13 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010144 name=CAS-event 13 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001014c name=CAS-client 14 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010150 name=CAS-event 14 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010158 name=CAS-client 15 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001015c name=CAS-event 15 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010164 name=CAS-client 16 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010168 name=CAS-event 16 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010170 name=CAS-client 17 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010174 name=CAS-event 17 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001017d name=CAS-client 18 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010181 name=CAS-event 18 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010189 name=CAS-client 19 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001018d name=CAS-event 19 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010195 name=CAS-client 20 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010199 name=CAS-event 20 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101a1 name=CAS-client 21 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101a5 name=CAS-event 21 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101ad name=CAS-client 22 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101b1 name=CAS-event 22 size=1048576 current=2736 high=5920 margin=1042656
+STACKUSE tag=c6-12 id=0x000101ba name=CAS-client 23 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101be name=CAS-event 23 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101c6 name=CAS-client 24 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101ca name=CAS-event 24 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101d2 name=CAS-client 25 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101d6 name=CAS-event 25 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101de name=CAS-client 26 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101e2 name=CAS-event 26 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101ea name=CAS-client 27 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101ee name=CAS-event 27 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000101f7 name=CAS-client 28 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000101fb name=CAS-event 28 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000201b5 name=CAS-client 29 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010203 name=CAS-event 29 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001020b name=CAS-client 30 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001020f name=CAS-event 30 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010217 name=CAS-client 31 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001021b name=CAS-event 31 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010224 name=CAS-client 32 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010228 name=CAS-event 32 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010230 name=CAS-client 33 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010234 name=CAS-event 33 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001023c name=CAS-client 34 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010241 name=CAS-event 34 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010249 name=CAS-client 35 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001024d name=CAS-event 35 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010255 name=CAS-client 36 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010259 name=CAS-event 36 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010261 name=CAS-client 37 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010265 name=CAS-event 37 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001026e name=CAS-client 38 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010272 name=CAS-event 38 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001027a name=CAS-client 39 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001027e name=CAS-event 39 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010286 name=CAS-client 40 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x0001028a name=CAS-event 40 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x00010292 name=CAS-client 41 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x00010296 name=CAS-event 41 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x0001029e name=CAS-client 42 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102a2 name=CAS-event 42 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102aa name=CAS-client 43 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102af name=CAS-event 43 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102b7 name=CAS-client 44 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102bb name=CAS-event 44 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102c3 name=CAS-client 45 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102c7 name=CAS-event 45 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102cf name=CAS-client 46 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102d3 name=CAS-event 46 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102dc name=CAS-client 47 size=2097152 current=6096 high=13240 margin=2083912
+STACKUSE tag=c6-12 id=0x000102e0 name=CAS-event 47 size=1048576 current=2736 high=5968 margin=1042608
+STACKUSE tag=c6-12 id=0x000102e8 state=gone
+STACKUSE tag=c6-12 id=0x000102ec name=CAS-event 48 size=1048576 current=1536 high=3200 margin=1045376
+STACKUSE end tag=c6-12
+POOLPROBE seq=13 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=13 dialpool workers=1 attempts=5 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=14 BUSY=49 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=48
+C6 seq=14 dialpool workers=1 attempts=6 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096
+POOLPROBE seq=15 BUSY=1 SETS=49 CAP=141 WORKERS=98 REFUSED=2 CONNS=0
+C6 seq=15 dialpool workers=1 attempts=6 queued=0 dialing=0 MEM_FREE=-1 MEM_USED=69636096

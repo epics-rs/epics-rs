@@ -188,8 +188,8 @@ pub(super) fn register_task() {
 /// censuses interleaving on one console cost nothing to tell apart if every
 /// line is self-identifying, and a repeated key costs a scraper nothing.
 pub(super) fn dump_tasks(tag: &str) {
-    let (ids, dropped) = registry().snapshot();
-    census_header("TASKDUMP", tag, ids.len(), dropped);
+    let ids = registry().snapshot();
+    census_header("TASKDUMP", tag, ids.len());
     for id in &ids {
         match task_info(*id) {
             Some(d) => println!(
@@ -223,8 +223,8 @@ pub(super) fn dump_tasks(tag: &str) {
 /// measurement is the same — `td_stackHigh` is the high-water mark the RTEMS
 /// checker reports — but the rows are `key=value` rather than that table.
 pub(super) fn stack_report(tag: &str) {
-    let (ids, dropped) = registry().snapshot();
-    census_header("STACKUSE", tag, ids.len(), dropped);
+    let ids = registry().snapshot();
+    census_header("STACKUSE", tag, ids.len());
     for id in &ids {
         match task_info(*id) {
             Some(d) => println!(
@@ -249,11 +249,15 @@ pub(super) fn stack_report(tag: &str) {
 /// RTP's thread table will under-count and not know it. The RTEMS block carries
 /// no such line because `rtems_task_iterate` really does see everything.
 ///
-/// `dropped` is printed even when zero, so a truncated census cannot be
-/// mistaken for a complete one — a cap that stays quiet reads as coverage.
-fn census_header(kind: &str, tag: &str, count: usize, dropped: u32) {
+/// `capacity` and `dropped` are constants here rather than readings, and are
+/// printed anyway. They were a real cap and a real refusal count until the
+/// registry was made growable; the keys stay so this block and the RTEMS one —
+/// which still truncates, and must still be able to say so — parse the same
+/// way. `capacity=unbounded` is the claim a reader needs: a `count` from this
+/// census is the whole registry, never a prefix of it.
+fn census_header(kind: &str, tag: &str, count: usize) {
     println!(
-        "{kind} begin tag={tag} count={count} capacity={MAX_TASKS} dropped={dropped} \
+        "{kind} begin tag={tag} count={count} capacity=unbounded dropped=0 \
          source=registry"
     );
     println!(
@@ -437,12 +441,24 @@ fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
-/// The census registry: every thread that announced itself, by `TASK_ID`.
+/// When to compact the registry — *not* a ceiling on it.
 ///
-/// Capacity is fixed and matches the RTEMS shim's `EPICS_RTEMS_DUMP_MAX_TASKS`,
-/// so the two targets truncate at the same count rather than at whatever each
-/// happened to allocate.
-const MAX_TASKS: usize = 192;
+/// This was `MAX_TASKS`, a fixed capacity chosen to match the RTEMS shim's
+/// `EPICS_RTEMS_DUMP_MAX_TASKS` so the two targets truncated at the same count.
+/// A supported configuration exceeds it: 141 concurrent CA clients need
+/// `CAS_CLIENT_POOL_CAPACITY × 2` = 282 worker slots on their own, so a
+/// saturated IOC censused 192 of 301 tasks and reported `dropped=109`
+/// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.3). A capacity a
+/// supported configuration exceeds is not a capacity, and the truncation landed
+/// exactly where the census is most worth reading.
+///
+/// So the registry grows instead, and this number keeps only its second job:
+/// the point at which exited tasks are swept. The RTEMS shim cannot follow —
+/// its array is filled inside a `rtems_task_iterate` visitor, where allocating
+/// is not safe — but nothing here runs in that context: `register_task` is
+/// called from `enter_ioc_thread` at thread startup, and `snapshot` already
+/// allocates a `Vec` on the census path.
+const SWEEP_THRESHOLD_MIN: usize = 192;
 
 /// `TASK_ID` is `OBJ_HANDLE` is `int` — measured 4 bytes, and asserted below
 /// beside the descriptor offsets.
@@ -457,65 +473,54 @@ fn registry() -> std::sync::MutexGuard<'static, TaskRegistry> {
 }
 
 struct TaskRegistry {
-    ids: [TaskId; MAX_TASKS],
-    len: usize,
-    /// Registrations refused for want of room, counted so the census can say
-    /// it truncated instead of quietly under-reporting.
-    dropped: u32,
+    ids: Vec<TaskId>,
+    /// Sweep exited tasks once `ids` reaches this, then re-arm to twice the
+    /// live count. Keeps the sweep — a kernel query per entry — amortised
+    /// against the threads that actually exist, instead of running it on every
+    /// registration once the registry is busy.
+    sweep_at: usize,
 }
 
 impl TaskRegistry {
     const fn new() -> Self {
         Self {
-            ids: [0; MAX_TASKS],
-            len: 0,
-            dropped: 0,
+            ids: Vec::new(),
+            sweep_at: SWEEP_THRESHOLD_MIN,
         }
     }
 
-    /// Record `id`, compacting away exited tasks first if that is what it takes
-    /// to make room.
+    /// Record `id`, sweeping away exited tasks when the registry has grown
+    /// past its sweep threshold.
     ///
-    /// Compaction is why this is not a plain append. `TASK_ID`s accumulate: an
-    /// IOC creates a thread per client connection, so over a long run the
-    /// registry would fill with ids of tasks that have exited and stop
-    /// recording live ones — the census would go stale in exactly the
-    /// long-uptime case it is read for. Sweeping only when full keeps the cost
-    /// off the common path; it is a read-only kernel query per entry, at thread
-    /// startup, at most once per overflow.
+    /// The sweep is why this is not a plain append. `TASK_ID`s accumulate: a
+    /// thread that exits leaves its id behind, so over a long run the registry
+    /// would fill with the dead — which, when the list was fixed, meant it
+    /// stopped recording the live. It no longer costs correctness, only
+    /// memory, so the sweep is now purely about not growing without bound; it
+    /// is a read-only kernel query per entry, at thread startup, amortised by
+    /// re-arming `sweep_at` to twice whatever survived.
     fn insert(&mut self, id: TaskId) {
-        if self.ids[..self.len].contains(&id) {
+        if self.ids.contains(&id) {
             return;
         }
-        if self.len == MAX_TASKS {
+        if self.ids.len() >= self.sweep_at {
             self.retain_live();
+            self.sweep_at = self.ids.len().saturating_mul(2).max(SWEEP_THRESHOLD_MIN);
         }
-        if self.len == MAX_TASKS {
-            self.dropped = self.dropped.saturating_add(1);
-            return;
-        }
-        self.ids[self.len] = id;
-        self.len += 1;
+        self.ids.push(id);
     }
 
     fn retain_live(&mut self) {
-        let mut kept = 0;
-        for i in 0..self.len {
-            if task_info(self.ids[i]).is_some() {
-                self.ids[kept] = self.ids[i];
-                kept += 1;
-            }
-        }
-        self.len = kept;
+        self.ids.retain(|id| task_info(*id).is_some());
     }
 
-    /// The ids to report, and how many registrations were refused.
+    /// The ids to report.
     ///
     /// Copied out so the console printing below runs with the lock released: a
     /// census that held the registry across its own `println!`s would block
     /// every thread trying to start while the probe wrote to a serial console.
-    fn snapshot(&self) -> (Vec<TaskId>, u32) {
-        (self.ids[..self.len].to_vec(), self.dropped)
+    fn snapshot(&self) -> Vec<TaskId> {
+        self.ids.clone()
     }
 }
 

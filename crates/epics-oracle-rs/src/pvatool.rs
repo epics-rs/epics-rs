@@ -38,9 +38,9 @@
 //! client's beacon bind out of everyone's way — left at pvxs's default, the
 //! client hears every PVA server on this host, and `pvxlist` reports
 //! beacon-discovered servers as well as searched ones, which made
-//! [`crate::ioc::verify_sole_server`] intermittently indict a foreign IOC as a
+//! `verify_sole_server` intermittently indict a foreign IOC as a
 //! second server on our port. That port is allocated per invocation, never once
-//! per run; [`PvaTools::run_raw`] explains why that distinction is what stops
+//! per run; `run_raw` explains why that distinction is what stops
 //! whole record types from scoring ERROR.
 
 use std::collections::HashMap;
@@ -159,7 +159,7 @@ impl PvaTools {
     /// **The single owner of the beacon port**, and the only place a pvxs client
     /// is spawned. A pvxs client binds `EPICS_PVA_BROADCAST_PORT` for beacon RX
     /// (`client.cpp:641`); it must be a quiet port, or `pvxlist` hears every PVA
-    /// server on this host and [`crate::ioc::verify_sole_server`] reports a
+    /// server on this host and `verify_sole_server` reports a
     /// foreign one as a second server on our port. It also cannot be 0 —
     /// `config.cpp:561` rejects that and silently substitutes pvxs's real
     /// default, 5076, which is the very port being avoided.
@@ -362,7 +362,7 @@ impl PvaTools {
 
     /// Read many PVs in one invocation, attributing each reading to its own PV.
     ///
-    /// # Why this is not [`crate::runner::probe_bisect`]
+    /// # Why this is not `probe_bisect`
     ///
     /// The C CA tools are all-or-nothing: one unconnectable PV and `caget`
     /// prints *nothing at all*, so the only way to isolate the bad one is to
@@ -590,7 +590,7 @@ impl PvaTools {
     /// Lines are deduplicated, because the question is how many *distinct*
     /// servers answered — a server that replies twice is still one server, and
     /// it prints its own address both times. The count is scoped to this port
-    /// by [`PvxTools::beacon_port`]: without that, `pvxlist` also reports
+    /// by `run_raw`'s per-invocation beacon port: without that, `pvxlist` also reports
     /// beacon-discovered servers, and a foreign IOC elsewhere on the host
     /// would be miscounted as a second server here.
     pub fn server_count(&self) -> Result<usize, ToolError> {

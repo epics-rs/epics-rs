@@ -201,7 +201,12 @@ mod tests {
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
         FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
+            snapshot: std::sync::Arc::new(Snapshot::new(
+                EpicsValue::Double(v),
+                0,
+                0,
+                SystemTime::UNIX_EPOCH,
+            )),
             origin: 0,
             mask,
         })
@@ -391,7 +396,7 @@ mod tests {
             SystemTime::UNIX_EPOCH,
         );
         let event = FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: snap,
+            snapshot: std::sync::Arc::new(snap),
             origin: 0,
             mask: EventMask::VALUE,
         });

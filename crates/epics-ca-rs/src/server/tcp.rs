@@ -232,6 +232,7 @@ use crate::server::outbox::Outbox;
 #[cfg(not(epics_embedded_target))]
 use crate::server::recv::{Admit, RecvAccumulator, Refused};
 // `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
+use crate::server::frame::{FrameBuf, size_dbr_reply};
 #[cfg(not(epics_embedded_target))]
 use crate::server::outbox::OutboxDrain;
 use epics_base_rs::error::CaResult;
@@ -244,7 +245,7 @@ use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::pv::ProcessVariable;
 use epics_base_rs::server::record::RecordInstance;
-use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr, native_type_for_dbr};
+use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr_into, native_type_for_dbr};
 
 #[derive(Clone)]
 pub(crate) enum ChannelTarget {
@@ -268,7 +269,7 @@ pub(crate) enum ChannelTarget {
 /// wire-type error and can never be reported as one.
 ///
 /// Constructing the reply status only through this type is what keeps that
-/// true: [`CaError::to_eca_status`] is the client-side table, where
+/// true: [`CaError::to_eca_status`](epics_base_rs::error::CaError::to_eca_status) is the client-side table, where
 /// `ECA_BADTYPE` is a legitimate answer, and calling it on a put reply is
 /// how the port came to tell a `caput` of `32768` into a `DBF_SHORT` field
 /// "The data type specified is invalid" where C says "Channel write request
@@ -503,7 +504,7 @@ struct ChannelEntry {
     /// equivalent. Every request's wire element count is clamped to this
     /// ceiling on READ / READ_NOTIFY / EVENT_ADD so an oversized
     /// `m_count` cannot drive the reply zero-fill
-    /// ([`pad_dbr_to_requested_count`] / the steady-state monitor
+    /// (`size_dbr_reply` / the steady-state monitor
     /// producer) past the channel's real capacity. Mirrors epics-base
     /// PR #934's `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
     /// mp->m_count = dbChannelFinalElements(pciu->dbch);` clamp. This is
@@ -793,7 +794,7 @@ impl ClientState {
 
     /// Decide this circuit's ACF host identity + mTLS auth context, once,
     /// from the connection itself. C decides the same in `create_tcp_client`
-    /// (`caservertask.c:1425-1437`). Extracted from [`handle_client`] so the
+    /// (`caservertask.c:1425-1437`). Extracted from `handle_client` so the
     /// async loop and the blocking thread-per-client driver
     /// (`crate::server::blocking`) derive identity byte-identically. See
     /// [`HostIdentity`].
@@ -2982,7 +2983,7 @@ pub(crate) async fn dispatch_message(
 
             // PR #934 (epics-base) parity: clamp the wire element count to
             // the channel's final element count so an oversized `m_count`
-            // cannot drive the reply zero-fill (`pad_dbr_to_requested_count`)
+            // cannot drive the reply zero-fill (`size_dbr_reply`)
             // past the channel's real capacity. C `read_action`
             // (`camessage.c`) / `read_notify_action`:
             // `if (mp->m_count > dbChannelFinalElements(pciu->dbch))
@@ -3238,6 +3239,7 @@ pub(crate) async fn dispatch_message(
             // computation; the connection loop's outbox owner is the only
             // code that touches the socket. Emit by pushing the bytes.
             match build_read_reply(
+                writer.pool(),
                 requested_type,
                 requested_count,
                 is_notify,
@@ -4522,7 +4524,7 @@ async fn get_read_snapshot(
 /// How [`register_subscription`] wires delivery of a freshly-registered
 /// subscription. The async TCP server spawns a producer task per subscription;
 /// the blocking (RTEMS) driver has no async runtime, so it takes the raw
-/// [`EventReader`] and multiplexes every subscription on one event thread.
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) and multiplexes every subscription on one event thread.
 #[derive(Clone, Copy)]
 pub(crate) enum SubscriptionDelivery {
     /// C `event_add_action` async path: spawn the producer task.
@@ -4560,7 +4562,7 @@ pub(crate) struct SpawnedSubscription {
 }
 
 /// A registered-but-not-spawned subscription handed to the blocking driver's
-/// event thread. Carries the live [`EventReader`] plus everything
+/// event thread. Carries the live [`EventReader`](epics_base_rs::server::event_queue::EventReader) plus everything
 /// [`run_event_task`] needs to frame deliveries byte-identically to the async
 /// producer.
 pub(crate) struct RegisteredSubscription {
@@ -4594,7 +4596,7 @@ pub(crate) struct CancelInfo {
 /// caller owns those. In [`SubscriptionDelivery::AsyncSpawn`] mode it spawns
 /// the monitor producer task and returns [`SubscriptionOutcome::Spawned`];
 /// in [`SubscriptionDelivery::HandOff`] mode it returns the live
-/// [`EventReader`] as [`SubscriptionOutcome::HandedOff`] before spawning, so
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader) as [`SubscriptionOutcome::HandedOff`] before spawning, so
 /// the blocking driver's single event thread can multiplex it (the driver
 /// has no async runtime to spawn onto). `channel_sub_count` and
 /// `sub_id_in_use` are read from the caller's own subscription registry so
@@ -4703,7 +4705,7 @@ pub(crate) async fn register_subscription(
     // PR #934 (epics-base) parity: clamp the wire element count to
     // the channel's final element count BEFORE it is stored on the
     // subscription (`SubscriptionEntry::data_count`), so neither the
-    // initial snapshot (`pad_dbr_to_requested_count`) nor every
+    // initial snapshot (`size_dbr_reply`) nor every
     // steady-state monitor delivery (the producer in `monitor.rs`)
     // can zero-fill past the channel's real capacity. C
     // `event_add_action`:
@@ -4925,7 +4927,7 @@ pub(crate) async fn register_subscription(
                             // when `requested_count` exceeds
                             // the live element count and
                             // truncates when it is smaller, via
-                            // `pad_dbr_to_requested_count` (C
+                            // `size_dbr_reply` (C
                             // `read_reply` parity). The
                             // producer task already
                             // pads/truncates future updates
@@ -5163,7 +5165,7 @@ pub(crate) async fn register_subscription(
                     // directions — `send_monitor_snapshot`
                     // pads an over-requested count and
                     // truncates an under-requested one via
-                    // `pad_dbr_to_requested_count`.
+                    // `size_dbr_reply`.
                     send_monitor_snapshot(
                         writer,
                         sub_id,
@@ -5265,44 +5267,46 @@ pub(crate) async fn register_subscription(
                         // string instead of an empty 40-byte
                         // pad.
                         if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                            event.snapshot.class_name =
+                            std::sync::Arc::make_mut(&mut event.snapshot).class_name =
                                 Some(record_for_task.read().record.record_type().to_string());
                         }
                         // long-string boundary conversion before
                         // encoding: `$` → CHAR[40]+NUL, or a native
-                        // record field → scalar DBR_STRING.
-                        super::apply_long_string_mode(&mut event.snapshot, long_string_mode);
-                        let mut payload_bytes = match encode_dbr(requested_type, &event.snapshot) {
-                            Ok(bytes) => bytes,
-                            Err(_) => break,
-                        };
+                        // record field → scalar DBR_STRING. Both this and
+                        // the CLASS_NAME override are per-subscription
+                        // rewrites of a snapshot every other subscriber
+                        // shares, so they take the copy-on-write path —
+                        // and only when they have something to write, so a
+                        // `Plain` channel (the common case) never copies.
+                        if long_string_mode != crate::server::LongStringMode::Plain {
+                            super::apply_long_string_mode(
+                                std::sync::Arc::make_mut(&mut event.snapshot),
+                                long_string_mode,
+                            );
+                        }
+                        // Header space reserved up front, payload encoded
+                        // straight into it — see `server::frame` for the C
+                        // `cas_copy_in_header` shape this ports.
+                        let mut frame = FrameBuf::acquire(outbox_clone.pool(), 0);
+                        if encode_dbr_into(frame.dst(), requested_type, &event.snapshot).is_err() {
+                            break;
+                        }
                         // CA-268: see GET path note — fixed 1.
                         //
-                        // C `read_reply`
-                        // (`rsrv/camessage.c:507-571`) uses the
-                        // ORIGINAL request count as the header
-                        // value (autosize=0 case) and pads the
-                        // payload up to `dbr_size_n(type,
-                        // request_count)`. Pre-fix Rust used
-                        // the live `snapshot.value.count()`,
-                        // so an EVENT_ADD with explicit
-                        // `count=1` on a waveform received the
-                        // full N-element waveform on every
-                        // update instead of just one element.
-                        let actual_count = event.snapshot.value.count() as u32;
-                        let element_count =
-                            if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                                1
-                            } else {
-                                pad_dbr_to_requested_count(
-                                    &mut payload_bytes,
-                                    actual_count,
-                                    requested_count,
-                                    requested_type,
-                                )
-                            };
-                        let mut padded = payload_bytes;
-                        padded.resize(align8(padded.len()), 0);
+                        // Pre-fix Rust framed every update at the
+                        // live `snapshot.value.count()`, so an
+                        // EVENT_ADD with explicit `count=1` on a
+                        // waveform received the full N-element
+                        // waveform on every update instead of just
+                        // one element. `size_dbr_reply` owns the
+                        // request-count rule.
+                        let element_count = size_dbr_reply(
+                            &mut frame,
+                            requested_type,
+                            event.snapshot.value.count() as u32,
+                            requested_count,
+                        );
+                        frame.align_payload();
 
                         let mut ev = CaHeader::new(CA_PROTO_EVENT_ADD);
                         // C client TCP parser requires 8-byte aligned postsize.
@@ -5310,7 +5314,7 @@ pub(crate) async fn register_subscription(
                         // client that cannot parse the extended header gets
                         // ECA_16KARRAYCLIENT instead of a de-syncing frame.
                         if ev
-                            .set_payload_size(padded.len(), element_count, client_minor)
+                            .set_payload_size(frame.payload_len(), element_count, client_minor)
                             .is_err()
                         {
                             let _ = send_16k_array_client_err(
@@ -5327,18 +5331,13 @@ pub(crate) async fn register_subscription(
 
                         // Abort-safety: this monitor task can be
                         // `task.abort()`ed mid-flight by EVENT_CANCEL /
-                        // CLEAR_CHANNEL / disconnect cleanup. Build the
-                        // whole EVENT_ADD frame (header + padded
-                        // payload) as ONE contiguous buffer and hand it
-                        // to the outbox with a single synchronous
-                        // `push`, so an abort can only land at a frame
-                        // boundary — the connection loop never observes
-                        // a partial frame.
-                        let hdr_bytes = ev.to_bytes_extended();
-                        let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
-                        frame.extend_from_slice(&hdr_bytes);
-                        frame.extend_from_slice(&padded);
-                        outbox_clone.push(frame);
+                        // CLEAR_CHANNEL / disconnect cleanup. `seal`
+                        // yields the whole EVENT_ADD frame as ONE
+                        // contiguous buffer, handed to the outbox with a
+                        // single synchronous `push`, so an abort can only
+                        // land at a frame boundary — the connection loop
+                        // never observes a partial frame.
+                        outbox_clone.push(frame.seal(&ev));
                         // Frame handed to the outbox — PCAS
                         // `subscriptionEventsProcessed` parity
                         // (gateway `serverEventRate`).
@@ -5492,7 +5491,7 @@ enum EventStep {
 /// Await the next event across every active subscription, every pending
 /// write-completion, and the control channel, in one `select`. C's `event_task`
 /// blocks on one semaphore per `event_user`; here the per-subscription
-/// [`EventReader`]s and the WRITE_NOTIFY completion oneshots are multiplexed with
+/// [`EventReader`](epics_base_rs::server::event_queue::EventReader)s and the WRITE_NOTIFY completion oneshots are multiplexed with
 /// `select_all`, and the control channel lets the dispatch thread add/cancel
 /// subscriptions, hand over write completions, and signal shutdown.
 /// `EventReader::recv` is cancel-safe and an unfired oneshot polled by `&mut`
@@ -5548,7 +5547,7 @@ async fn next_event_step(
 /// send lock the dispatch thread holds (C `client->lock`, `server.h:221`).
 /// `db_post_events` stays enqueue-only; this thread is the sole consumer.
 ///
-/// It multiplexes every subscription's [`EventReader`] (added via the control
+/// It multiplexes every subscription's [`EventReader`](epics_base_rs::server::event_queue::EventReader) (added via the control
 /// channel by the dispatch thread on EVENT_ADD, removed on EVENT_CANCEL) and
 /// frames each delivery with [`super::monitor::send_event`] — the same builder
 /// the async `spawn_monitor_sender` uses — so a blocking-driver monitor update
@@ -5614,7 +5613,7 @@ pub(crate) async fn run_event_task<W>(
                         // async record-field producer sets it per event.
                         if d.data_type == epics_base_rs::types::DBR_CLASS_NAME {
                             if let ChannelTarget::RecordField { record, .. } = &d.target {
-                                event.snapshot.class_name =
+                                std::sync::Arc::make_mut(&mut event.snapshot).class_name =
                                     Some(record.read().record.record_type().to_string());
                             }
                         }
@@ -5699,7 +5698,7 @@ pub(crate) async fn run_event_task<W>(
 ///   with no read hook, i.e. every cached / non-gateway PV). No `.await`, no
 ///   reactor. `inner` is the `Option<Snapshot>` the async path also yields:
 ///   `Some(snap)` for a value, `None` for an absent record field.
-/// - `None` — a gateway `-no_cache` [`ReadHook`] is installed, whose upstream
+/// - `None` — a gateway `-no_cache` [`ReadHook`](epics_base_rs::server::pv::ReadHook) is installed, whose upstream
 ///   GET is genuine network I/O; the caller must fall back to the async
 ///   [`get_read_snapshot`]. Only `SimplePv` can reach this.
 ///
@@ -5726,20 +5725,13 @@ fn try_get_read_snapshot_local(
 /// `CA_PROTO_EVENT_ADD` frame.
 ///
 /// `requested_count` is the element count from the originating
-/// `CA_PROTO_EVENT_ADD` request. The encoded DBR payload is routed
-/// through [`pad_dbr_to_requested_count`] so a request count *larger*
-/// than the live element count is zero-padded to the requested shape
-/// — and a smaller count is truncated — exactly as the READ path and
-/// the steady-state monitor producer already do. Without this the
-/// first monitor frame (and the access-restore frame) was framed at
-/// `snapshot.value.count()`, so a client requesting more elements
-/// than the PV currently holds saw a count/size discontinuity
-/// between the initial frame and later padded updates. C `read_reply`
-/// frames non-autosize monitor events at the requested count and
-/// zero-fills missing elements (`rsrv/camessage.c:507-571`).
-///
-/// `requested_count == 0` is autosize: the frame keeps the live
-/// element count.
+/// `CA_PROTO_EVENT_ADD` request; the encoded DBR payload is sized by
+/// `size_dbr_reply`, exactly as the READ path and the steady-state
+/// monitor producer are. Without that the first monitor frame (and
+/// the access-restore frame) was framed at `snapshot.value.count()`,
+/// so a client requesting more elements than the PV currently holds
+/// saw a count/size discontinuity between the initial frame and
+/// later padded updates.
 fn send_monitor_snapshot(
     writer: &Outbox,
     sub_id: u32,
@@ -5749,29 +5741,24 @@ fn send_monitor_snapshot(
     reply: ReplyContext,
 ) -> CaResult<()> {
     let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
-    let data = encode_dbr(data_type, snapshot)?;
-    // CA-268: DBR_CLASS_NAME wire payload is always one 40-byte
-    // string regardless of underlying value count — and is never
-    // padded/truncated to a requested element count.
-    let mut padded = data;
-    let element_count = if data_type == epics_base_rs::types::DBR_CLASS_NAME {
-        1
-    } else {
-        // pad (or truncate) the encoded DBR to the requested
-        // element count before the 8-byte alignment resize, so the
-        // header count and payload shape match a non-autosize
-        // request. `pad_dbr_to_requested_count` returns the header
-        // element count to use (`requested_count` when non-zero,
-        // the live `actual_count` for autosize).
-        let actual_count = snapshot.value.count() as u32;
-        pad_dbr_to_requested_count(&mut padded, actual_count, requested_count, data_type)
-    };
-    padded.resize(align8(padded.len()), 0);
+    // Header space reserved up front, payload encoded straight into it — see
+    // `server::frame` for the C `cas_copy_in_header` shape this ports.
+    let mut frame = FrameBuf::acquire(writer.pool(), 0);
+    encode_dbr_into(frame.dst(), data_type, snapshot)?;
+    // Size the payload to the request count *before* the 8-byte alignment
+    // resize, so the header count and the payload shape agree.
+    let element_count = size_dbr_reply(
+        &mut frame,
+        data_type,
+        snapshot.value.count() as u32,
+        requested_count,
+    );
+    frame.align_payload();
 
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
     // C client TCP parser requires 8-byte aligned postsize
     if resp
-        .set_payload_size(padded.len(), element_count, client_minor)
+        .set_payload_size(frame.payload_len(), element_count, client_minor)
         .is_err()
     {
         return send_16k_array_client_err(writer, request_hdr, request_hdr.cid, client_minor);
@@ -5780,15 +5767,11 @@ fn send_monitor_snapshot(
     resp.cid = 1; // ECA_NORMAL
     resp.available = sub_id;
 
-    // Abort-safety: build header + payload as ONE contiguous frame and
-    // hand it to the outbox with a single `push`, so a cancel (send_timeout
+    // Abort-safety: `seal` yields header + payload as ONE contiguous frame,
+    // handed to the outbox with a single `push`, so a cancel (send_timeout
     // / task abort) can only land at a frame boundary — the connection loop
     // never observes a partial frame.
-    let hdr_bytes = resp.to_bytes_extended();
-    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
-    frame.extend_from_slice(&hdr_bytes);
-    frame.extend_from_slice(&padded);
-    writer.push(frame);
+    writer.push(frame.seal(&resp));
     Ok(())
 }
 
@@ -5967,7 +5950,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
             // `send_monitor_snapshot` pads when the request asked
             // for more elements than the PV currently holds and
             // truncates when it asked for fewer, via
-            // `pad_dbr_to_requested_count` — so the access-restore
+            // `size_dbr_reply` — so the access-restore
             // frame matches the request shape and later padded
             // updates. C `read_reply` always honours the stored
             // request count; pre-fix Rust framed the restore event
@@ -6173,7 +6156,12 @@ enum ReadReplyError {
 /// `client_minor`), which is exactly this function. That makes the READ
 /// reply byte-production testable against a hand-built snapshot with no
 /// socket in the loop.
+// The send buffer joins seven request parameters that are all genuinely
+// independent; grouping them into a single-use struct to satisfy the lint would
+// hide the sans-io signature this function exists to expose.
+#[allow(clippy::too_many_arguments)]
 fn build_read_reply(
+    pool: &std::sync::Arc<crate::server::frame::FramePool>,
     requested_type: u16,
     requested_count: u32,
     is_notify: bool,
@@ -6181,8 +6169,11 @@ fn build_read_reply(
     cid: u32,
     ioid: u32,
     client_minor: u16,
-) -> Result<Vec<u8>, ReadReplyError> {
-    let data = encode_dbr(requested_type, snapshot).map_err(|_| ReadReplyError::BadType)?;
+) -> Result<crate::server::frame::PooledFrame, ReadReplyError> {
+    // Header space reserved up front, payload encoded straight into it — see
+    // `server::frame` for the C `cas_copy_in_header` shape this ports.
+    let mut frame = FrameBuf::acquire(pool, 0);
+    encode_dbr_into(frame.dst(), requested_type, snapshot).map_err(|_| ReadReplyError::BadType)?;
     // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
     // the request count in the header and zero-fills the
     // payload when fewer elements are returned than requested
@@ -6193,7 +6184,6 @@ fn build_read_reply(
     // a short array, so a `ca_array_get_callback(type,
     // count > native, ...)` saw a shorter response from
     // Rust than from rsrv.
-    let mut data = data;
     let actual_count = snapshot.value.count() as u32;
     // ORDER MATTERS: the deprecated-READ count==0 branch MUST
     // precede the DBR_CLASS_NAME normalization. C `read_action`
@@ -6236,8 +6226,8 @@ fn build_read_reply(
                 } else {
                     epics_base_rs::types::dbr_buffer_size(requested_type, native, 0)
                 };
-                if data.len() > meta_size {
-                    data.truncate(meta_size);
+                if frame.payload_len() > meta_size {
+                    frame.truncate_payload(meta_size);
                 }
                 0
             }
@@ -6246,22 +6236,19 @@ fn build_read_reply(
             // to the autosize sizing so the header count still
             // matches the payload rather than shipping count=0
             // with a value-bearing body.
-            Err(_) => {
-                pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
-            }
+            // Unreachable for a type that already encoded above
+            // (<= LAST_BUFFER_TYPE), and unreachable for
+            // DBR_CLASS_NAME (whose native lookup succeeds). If it
+            // ever weren't, fall through to the shared sizing so the
+            // header count still matches the payload rather than
+            // shipping count=0 with a value-bearing body.
+            Err(_) => size_dbr_reply(&mut frame, requested_type, actual_count, requested_count),
         }
-    } else if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-        // CA-268: DBR_CLASS_NAME wire payload is always one fixed
-        // 40-byte string. element_count must be 1 regardless of
-        // the underlying record's value count — for waveform
-        // records, snapshot.value.count() can be N, which would
-        // make C clients parse 40 * N bytes of body and fail.
-        // This applies to the READ_NOTIFY / EVENT_ADD path and to
-        // ordinary deprecated reads with count!=0; the deprecated
-        // count==0 case is handled above (C ships count=0).
-        1
     } else {
-        pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
+        // Every other count — including DBR_CLASS_NAME's fixed single
+        // element — is the shared `read_reply` sizing. Only the
+        // deprecated-READ count==0 case above deviates from it.
+        size_dbr_reply(&mut frame, requested_type, actual_count, requested_count)
     };
     // Deprecated CA_PROTO_READ (cmd 3) contracts a scalar
     // DBR_STRING payload to its NUL-terminated length before the
@@ -6283,13 +6270,12 @@ fn build_read_reply(
         // scalar string at <= 39 chars (value.rs to_bytes), so the
         // no-NUL else-branch C guards against cannot arise here and
         // the full 40-byte slot is kept untouched if it ever did.
-        let slot = data.len().min(40);
-        if let Some(nul) = data[..slot].iter().position(|&b| b == 0) {
-            data.truncate(nul + 1);
+        let slot = frame.payload_len().min(40);
+        if let Some(nul) = frame.payload()[..slot].iter().position(|&b| b == 0) {
+            frame.truncate_payload(nul + 1);
         }
     }
-    let mut padded = data;
-    padded.resize(align8(padded.len()), 0);
+    frame.align_payload();
 
     // For deprecated CA_PROTO_READ (cmd=3), the response carries
     // the *client-side* CID (`pciu->cid` in C `read_action`
@@ -6315,7 +6301,7 @@ fn build_read_reply(
     // extended header for a pre-V49 client is not framed — the server
     // answers ECA_16KARRAYCLIENT and keeps the circuit.
     if resp
-        .set_payload_size(padded.len(), element_count, client_minor)
+        .set_payload_size(frame.payload_len(), element_count, client_minor)
         .is_err()
     {
         return Err(ReadReplyError::Oversize);
@@ -6323,54 +6309,13 @@ fn build_read_reply(
     resp.data_type = requested_type;
     resp.available = ioid;
 
-    // Abort-safety: build the whole READ/READ_NOTIFY frame as ONE
+    // Abort-safety: `seal` yields the whole READ/READ_NOTIFY frame as ONE
     // contiguous buffer so the caller can hand it to the outbox in a
     // single `push`. A `send_timeout` cancel can only land at a frame
     // boundary — a partial frame can never be enqueued, so it can never
     // reach the connection loop's socket writer and mis-frame the
     // following messages. Same shape as the monitor path (`monitor.rs`).
-    let hdr_bytes = resp.to_bytes_extended();
-    let mut frame = Vec::with_capacity(hdr_bytes.len() + padded.len());
-    frame.extend_from_slice(&hdr_bytes);
-    frame.extend_from_slice(&padded);
-    Ok(frame)
-}
-
-/// Resize an encoded DBR payload to the requested element count.
-/// C `read_reply` (`rsrv/camessage.c:507-571`) sets the response
-/// header count to `mp->m_count` (non-autosize) and sizes the
-/// payload to `dbr_size_n(type, request_count)`: extra bytes are
-/// zero-filled, and a response that decoded fewer elements than
-/// requested is still framed at the request count. This refinement
-/// covers BOTH directions: pad when requested > actual, truncate
-/// when requested < actual. Returns the header element count to
-/// use (`requested_count` when non-zero, `actual_count` when
-/// zero / autosize).
-fn pad_dbr_to_requested_count(
-    encoded: &mut Vec<u8>,
-    actual_count: u32,
-    requested_count: u32,
-    data_type: u16,
-) -> u32 {
-    if requested_count == 0 {
-        return actual_count;
-    }
-    if let Ok(native) = epics_base_rs::types::native_type_for_dbr(data_type) {
-        // Plain types (0-6) have no metadata; STS / TIME / GR /
-        // CTRL slot metadata before the value array.
-        // `dbr_buffer_size(_, _, 0)` returns just the metadata size.
-        let meta_size = epics_base_rs::types::dbr_buffer_size(data_type, native, 0);
-        let target_size = meta_size + (requested_count as usize) * native.element_size();
-        if requested_count > actual_count {
-            let cur = encoded.len();
-            if cur < target_size {
-                encoded.extend(std::iter::repeat_n(0u8, target_size - cur));
-            }
-        } else if requested_count < actual_count && encoded.len() > target_size {
-            encoded.truncate(target_size);
-        }
-    }
-    requested_count
+    Ok(frame.seal(&resp))
 }
 
 /// Send a CA_PROTO_ERROR response with the original header echoed
@@ -6677,7 +6622,7 @@ mod put_notify_supersede_tests {
     fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(f) = drain.try_next() {
-            frames.push(f);
+            frames.push(f.to_vec());
         }
         frames
     }
@@ -8796,7 +8741,7 @@ mod deprecated_read_autosize_tests {
     /// SECURITY — epics-base PR #934 (Item 2) parity. An oversized wire
     /// element count on READ_NOTIFY must clamp to the channel's final
     /// element count, never drive the reply zero-fill
-    /// (`pad_dbr_to_requested_count`) to a `count * element_size`
+    /// (`size_dbr_reply`) to a `count * element_size`
     /// allocation. Pre-fix an extended-header count of 0xFFFFFFFF on a
     /// DBR_DOUBLE channel sized the reply to ~34 GB and the `Vec` zero-fill
     /// aborted the whole process — a remote, unauthenticated DoS.
@@ -8983,7 +8928,7 @@ mod single_write_all_framing_tests {
     pub(super) fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(f) = drain.try_next() {
-            frames.push(f);
+            frames.push(f.to_vec());
         }
         frames
     }
@@ -10302,13 +10247,18 @@ mod read_reply_sans_io_tests {
     //! Sans-io proof for the READ / READ_NOTIFY reply: `build_read_reply`
     //! produces the exact wire frame from a hand-built [`Snapshot`] and the
     //! request parameters, with NO socket, NO `DuplexStream`, NO database,
-    //! and NO async. Every assertion here inspects the returned `Vec<u8>`
+    //! and NO async. Every assertion here inspects the returned frame's bytes
     //! directly. This is the increment-1 demonstration that the reply's
     //! byte production is a pure function of `(snapshot, request)` — the
-    //! whole point of the sans-io split.
+    //! whole point of the sans-io split. The frame buffer it borrows is an
+    //! allocator, not I/O: a test supplies its own.
     use super::*;
     use epics_base_rs::server::snapshot::Snapshot;
     use epics_base_rs::types::{DBR_LONG, DBR_STRING, EpicsValue};
+
+    fn pool() -> std::sync::Arc<crate::server::frame::FramePool> {
+        std::sync::Arc::new(crate::server::frame::FramePool::new())
+    }
 
     fn scalar_long(v: i32) -> Snapshot {
         Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH)
@@ -10320,6 +10270,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn read_notify_scalar_long_is_header_plus_padded_value() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             0, // notify autosize → live count (scalar ⇒ 1)
             true,
@@ -10347,6 +10298,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn deprecated_read_uses_channel_cid_and_read_opcode() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             1, // non-zero ⇒ ordinary scalar, not the count==0 metadata path
             false,
@@ -10373,6 +10325,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn deprecated_read_count_zero_ships_header_only_for_plain_type() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             0,
             false,
@@ -10400,7 +10353,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_LONG, 5, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+        let frame = build_read_reply(&pool(), DBR_LONG, 5, true, &snap, 0, 0x7, CA_MINOR_VERSION)
             .expect("padded array frames");
 
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
@@ -10426,7 +10379,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_LONG, 2, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+        let frame = build_read_reply(&pool(), DBR_LONG, 2, true, &snap, 0, 0x7, CA_MINOR_VERSION)
             .expect("truncated array frames");
 
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
@@ -10447,7 +10400,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let err = build_read_reply(DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
+        let err = build_read_reply(&pool(), DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
             .expect_err("pre-V49 client cannot frame an extended reply");
         assert!(matches!(err, ReadReplyError::Oversize));
     }
@@ -10457,8 +10410,17 @@ mod read_reply_sans_io_tests {
     /// (READ_NOTIFY).
     #[test]
     fn unsupported_dbr_type_is_err_badtype() {
-        let err = build_read_reply(99, 1, false, &scalar_long(0), 0x1, 0x2, CA_MINOR_VERSION)
-            .expect_err("type 99 > LAST_BUFFER_TYPE cannot encode");
+        let err = build_read_reply(
+            &pool(),
+            99,
+            1,
+            false,
+            &scalar_long(0),
+            0x1,
+            0x2,
+            CA_MINOR_VERSION,
+        )
+        .expect_err("type 99 > LAST_BUFFER_TYPE cannot encode");
         assert!(matches!(err, ReadReplyError::BadType));
     }
 
@@ -10473,8 +10435,17 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_STRING, 1, false, &snap, 0x1, 0x2, CA_MINOR_VERSION)
-            .expect("scalar string frames");
+        let frame = build_read_reply(
+            &pool(),
+            DBR_STRING,
+            1,
+            false,
+            &snap,
+            0x1,
+            0x2,
+            CA_MINOR_VERSION,
+        )
+        .expect("scalar string frames");
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
         // "OK" + NUL = 3 bytes, 8-aligned to 8 — not the 40-byte slot.
         assert_eq!(

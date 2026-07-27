@@ -1859,7 +1859,7 @@ impl Default for MonitorEventMask {
 /// **Invariant.** A monitor consumer MUST learn connection transitions from
 /// this stream and MUST NOT infer them from the subscription
 /// handle/future terminating. The handle loops re-subscribe INTERNALLY on
-/// [`MonitorEnd::ConnectionLost`] (deliver the transition, sleep 200 ms,
+/// `MonitorEnd::ConnectionLost` (deliver the transition, sleep 200 ms,
 /// loop), so a dead upstream never makes the handle's task return — a
 /// consumer that watches only the task reports a dead upstream as connected
 /// and keeps serving its last value. That was the defect family closed here
@@ -2173,7 +2173,7 @@ impl SubscriptionHandle {
     /// holding a [`Pauser`] cloned out beforehand.
     ///
     /// **Not a disconnect signal.** The loop re-subscribes internally on
-    /// [`MonitorEnd::ConnectionLost`], so this does NOT return when the
+    /// `MonitorEnd::ConnectionLost`, so this does NOT return when the
     /// upstream goes away — a consumer that infers "the upstream is gone"
     /// from this returning learns nothing and serves a stale value as good
     /// (doc/pvalink-rtems-design.md §12.8, §12.10). Connection transitions

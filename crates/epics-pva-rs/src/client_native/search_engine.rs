@@ -657,7 +657,7 @@ impl SearchTransport {
     /// Pack `entries` into as few datagrams as fit under
     /// [`MAX_SEARCH_PAYLOAD`] and broadcast each. Without a UDP transport
     /// nothing is packed at all — the response ports these frames would
-    /// advertise exist only inside [`UdpTransport`].
+    /// advertise exist only inside `UdpTransport`.
     async fn broadcast_search(
         &self,
         codec: &PvaCodec,

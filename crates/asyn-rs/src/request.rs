@@ -185,7 +185,7 @@ pub enum RequestOp {
     /// Unblock the port.
     UnblockProcess,
     /// Resolve a record's bind request to a parameter reason index. Carries the
-    /// full [`DrvUserRequest`] — drvInfo, asyn `addr`, and the record's asyn
+    /// full [`DrvUserRequest`](crate::port::DrvUserRequest) — drvInfo, asyn `addr`, and the record's asyn
     /// interface — so an on-demand driver can create the parameter with the type
     /// the record will read it as.
     DrvUserCreate(crate::port::DrvUserRequest),

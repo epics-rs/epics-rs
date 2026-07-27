@@ -190,7 +190,7 @@ impl LinkAlarm {
 ///
 /// Shared by the INPUT-link read path (`processing.rs`, where `dest` is
 /// the record reading its inputs) and the DB OUT-link write path
-/// ([`Database::write_db_link_value`], C `dbDbPutValue` →
+/// (`write_db_link_value`, C `dbDbPutValue` →
 /// `recGblInheritSevrMsg`, dbDbLink.c:382-383, where `dest` is the
 /// OUT-link target). One implementation keeps the two sides from
 /// diverging — an earlier INPUT-side variant wrongly treated MS like
@@ -374,7 +374,7 @@ pub(crate) enum MultiOutPhaseKind {
 /// (`dfanoutRecord.c:128`: `if (prec->nsev < INVALID_ALARM) push_values();
 /// else switch (ivoa)`), taken before ANY output runs; the IVOA=IVOV arm has
 /// already stored IVOV in the record's own value field
-/// ([`Record::apply_invalid_output_value`] — C `prec->val = prec->ivov`,
+/// ([`Record::apply_invalid_output_value`](crate::server::record::Record::apply_invalid_output_value) — C `prec->val = prec->ivov`,
 /// dfanoutRecord.c:137), so the push here just reads VAL, as C's `push_values`
 /// does.
 #[derive(Clone, Copy)]
@@ -499,7 +499,7 @@ impl PvDatabase {
             // re-apply a constant every cycle (sseq `SELL="3"` stomping a
             // client's `caput SELN 5`, a compress with `INP="5"` filling its
             // buffer with 5s). `None` here is classified as
-            // [`LinkFetch::NoData`] — success, nothing delivered — by
+            // [`LinkFetch::NoData`](crate::server::recgbl::simm::LinkFetch::NoData) — success, nothing delivered — by
             // [`empty_read_fetch`], never as a failed read.
             crate::server::record::ParsedLink::Constant(_) => None,
             crate::server::record::ParsedLink::Db(db) => {
@@ -523,10 +523,10 @@ impl PvDatabase {
     }
 
     /// C `dbGetLink(plink, dbrType, ...)` — an input-link read for the DBR class
-    /// the READER asked for ([`LinkReadAs`]), not the source's native type.
+    /// the READER asked for ([`LinkReadAs`](crate::server::record::LinkReadAs)), not the source's native type.
     ///
     /// The typed READ seam, twin of the typed WRITE seam
-    /// ([`Record::typed_output_buffer`] + [`Self::resolve_out_target`]). C's
+    /// ([`Record::typed_output_buffer`](crate::server::record::Record::typed_output_buffer) + [`Self::resolve_out_target`]). C's
     /// conversion happens at the SOURCE (`dbConvert.c`'s
     /// `[field_type][dbrType]` table), which is why it belongs here and not at
     /// the reader's `put_field`: only this side can reach the source record's
@@ -537,9 +537,9 @@ impl PvDatabase {
     /// would hand over an array no numeric target can absorb.
     ///
     /// Returns C's `(status, buffer)` pair through the same
-    /// [`LinkFetch`] classification [`Self::read_link_with_alarm`] uses — a
-    /// CONSTANT link is [`LinkFetch::NoData`] (success, nothing written), a
-    /// read or conversion that failed is [`LinkFetch::Failed`]. The two used to
+    /// [`LinkFetch`](crate::server::recgbl::simm::LinkFetch) classification [`Self::read_link_with_alarm`] uses — a
+    /// CONSTANT link is [`LinkFetch::NoData`](crate::server::recgbl::simm::LinkFetch::NoData) (success, nothing written), a
+    /// read or conversion that failed is [`LinkFetch::Failed`](crate::server::recgbl::simm::LinkFetch::Failed). The two used to
     /// be one `Option` here, which is how the `ReadDbLink` executor came to
     /// re-deliver a constant on every cycle while the multi-input fetch (same
     /// links, same records) correctly ignored it.
@@ -714,9 +714,9 @@ impl PvDatabase {
     /// SUBL, output-time DOL) go through here.
     ///
     /// Returns C's `(status, buffer)` pair, not an `Option`: a CONSTANT link is
-    /// [`LinkFetch::NoData`] — SUCCESS with nothing delivered
+    /// [`LinkFetch::NoData`](crate::server::recgbl::simm::LinkFetch::NoData) — SUCCESS with nothing delivered
     /// (`dbConstLink.c:219-225` `dbConstGetValue`: `*pnRequest = 0; return 0`)
-    /// — which is NOT the same as [`LinkFetch::Failed`]. Collapsing the two
+    /// — which is NOT the same as [`LinkFetch::Failed`](crate::server::recgbl::simm::LinkFetch::Failed). Collapsing the two
     /// into `Option` is what made a constant input both re-apply its value on
     /// every cycle (destroying a client's `caput A=99` on a
     /// `field(INPA,"5")` calc) and, once it stopped delivering, look like a
@@ -1227,7 +1227,7 @@ impl PvDatabase {
     /// `dbInitLink`'s locality dispatch (`dbLink.c:118-130`): a target that
     /// is not in this IOC never gets `dbDb_lset` at all — it is made a CA
     /// link, so its metadata comes from the `dbCa` lset. Mirrors the same
-    /// split [`Self::read_target_value`] makes for the value path.
+    /// split `read_target_value` makes for the value path.
     fn db_target_metadata(
         &self,
         db: &crate::server::record::DbLink,
@@ -1570,7 +1570,7 @@ impl PvDatabase {
     }
 
     /// Write a value to an external (`ca://` / `pva://`) OUT link
-    /// through the registered [`LinkSet`] — **by staging it on the
+    /// through the registered [`LinkSet`](super::LinkSet) — **by staging it on the
     /// database's link-put queue and returning**, exactly as C
     /// `dbCaPutLink` stages into `pca->pputNative` and returns
     /// (`dbCa.c:544-631`).
@@ -1598,7 +1598,7 @@ impl PvDatabase {
     /// `dbCa.c:1240-1244`). So:
     ///
     /// * `Err` — no lset is registered for the scheme, or the lset reports
-    ///   the link as [`PutAdmission::Disconnected`]. The caller folds this
+    ///   the link as [`PutAdmission::Disconnected`](super::PutAdmission::Disconnected). The caller folds this
     ///   into the owning record's LINK/INVALID (`setLinkAlarm`), same cycle,
     ///   same as before this change.
     /// * `Ok(())` for [`LinkPutOp::Plain`] — the write is staged. It is
@@ -1751,7 +1751,7 @@ impl PvDatabase {
     /// (`pva://` / `ca://`) PV — the FWD-link counterpart of
     /// [`Self::write_external_pv`]. Resolves the scheme (or tries every
     /// registered lset for a bare name, first to accept wins, exactly as
-    /// the OUT-write path does) and delegates to [`LinkSet::scan_forward`].
+    /// the OUT-write path does) and delegates to [`LinkSet::scan_forward`](super::LinkSet::scan_forward).
     ///
     /// Mirrors C `dbScanFwdLink` → `plink->lset->scanForward`
     /// (`dbLink.c:475-480`): the database hands the forward link to the
@@ -1808,7 +1808,7 @@ impl PvDatabase {
     /// element capacity, and whether C would classify the link as a
     /// `CA_LINK`. Single owner of the target-metadata lookup every soft
     /// device support's write-buffer switch reads
-    /// ([`Record::multi_output_buffer`]).
+    /// ([`Record::multi_output_buffer`](crate::server::record::Record::multi_output_buffer)).
     ///
     /// C's resolution, mirrored branch for branch:
     /// - local DB target — `dbNameToAddr` (`devsCalcoutSoft.c:127-131`):
@@ -1821,7 +1821,7 @@ impl PvDatabase {
     ///   in this IOC, which C classifies as a CA link) —
     ///   `dbCaGetLinkDBFtype` / `dbCaGetNelements` (`dbCa.c:662-704`,
     ///   both `-1` while disconnected): the lset's cached
-    ///   [`LinkMetadata`], `UNRESOLVED` when the link is down.
+    ///   [`LinkMetadata`](super::LinkMetadata), `UNRESOLVED` when the link is down.
     ///
     /// `no_elements` is a field CAPACITY, which the port does not carry per
     /// field: an array field reports its record's `NELM` when it has one and
@@ -1909,7 +1909,7 @@ impl PvDatabase {
     /// Apply the writing record's device-support write-buffer switch to a
     /// multi-output pair: resolve the TARGET ([`Self::resolve_out_target`]),
     /// then let the record pick the buffer C's `write_*` would put
-    /// ([`Record::multi_output_buffer`]).
+    /// ([`Record::multi_output_buffer`](crate::server::record::Record::multi_output_buffer)).
     ///
     /// The record lock is NOT held across the target resolution — a
     /// self-referencing OUT link would re-enter the source record's own
@@ -1932,7 +1932,7 @@ impl PvDatabase {
 
     /// The record's generic multi-output OUT writes — scalcout / acalcout
     /// `OUT`->`OVAL`, the pairs a record declares through
-    /// [`Record::multi_output_links`]. C's soft device support performs these
+    /// [`Record::multi_output_links`](crate::server::record::Record::multi_output_links). C's soft device support performs these
     /// from `writeValue`, i.e. inside `process()` and BEFORE `monitor()`
     /// commits the cycle's alarm, so this runs pre-commit: a failed put's
     /// `LINK_ALARM`/`INVALID` (raised inside [`Self::write_out_link_value`])
@@ -2943,11 +2943,11 @@ impl PvDatabase {
     ///
     /// Runs after all records have loaded and before `setup_cp_links`, which
     /// is C's ordering: `initPVLinks` walks the loaded database once. Only the
-    /// [`COMMON_LINK_FIELDS`](crate::server::record::record_instance::COMMON_LINK_FIELDS)
+    /// `COMMON_LINK_FIELDS`
     /// have a parse cache to commit into; `INPA..`/`DOL..` and the `lnkCalc`
     /// arguments are re-parsed from their raw text each process cycle and keep
     /// the read path's runtime locality fallback
-    /// ([`Self::read_target_value`]) instead.
+    /// (`read_target_value`) instead.
     ///
     /// The decision is taken from the field's RAW text, not from the cache:
     /// the cache is only guaranteed fresh when the field was written through
@@ -3132,13 +3132,13 @@ impl PvDatabase {
     /// The field enumeration is [`super::PvDatabase::record_link_fields`], the
     /// same single owner `setup_cp_links` uses, so "what is a link field"
     /// cannot diverge between the two passes. Staging goes through
-    /// [`super::PvDatabase::stage_external_link_open_by_name`] →
+    /// `PvDatabase::stage_external_link_open_by_name` →
     /// `stage_external_link_open`, so the connect still runs on the link work
     /// owner and never on a record-processing thread; nothing here calls
     /// `LinkSet::connect_link` directly.
     ///
     /// Idempotent against `setup_cp_links`: the queue's open state is
-    /// per-[`super::link_put_queue::LinkKey`] and terminal, and both passes
+    /// per-`LinkKey` and terminal, and both passes
     /// derive the key from the same boundary name, so a CP link already warmed
     /// above is not staged a second time.
     ///

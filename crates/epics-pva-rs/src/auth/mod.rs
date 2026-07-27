@@ -3,7 +3,7 @@
 //! - [`plain`] — username/host AuthZ ("ca" mode); used over plain TCP. This
 //!   is what every connection negotiates today.
 //! - [`x509`] — the X.509 credential type, free of any TLS stack.
-//! - [`tls`] — TLS-secured TCP via `rustls`, behind the `tls` feature (ON by
+//! - `tls` — TLS-secured TCP via `rustls`, behind the `tls` feature (ON by
 //!   default). Reads cert/key paths from the standard `EPICS_PVA{,S}_TLS_*`
 //!   environment variables and produces ready-to-use `TlsConnector` /
 //!   `TlsAcceptor` handles.

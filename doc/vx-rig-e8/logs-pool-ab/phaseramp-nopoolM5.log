@@ -1,0 +1,67 @@
+[    0.2s] nopoolM5 monitors=5 ceiling=200 hold=0s deadline=300s
+[    0.3s] nopoolM5 SAMPLE idle         CONN_CNT=0.0 REFUSED=0.0 FD_CNT=5.0 FD_MAX=1000.0 MEM_USED=43278336.0
+[    0.3s] nopoolM5 UP n=  1 total=  6 total_s= 0.064 connect= 0.000 search= 0.037 create= 0.016 read= 0.010
+[    0.4s] nopoolM5 UP n=  2 total=  7 total_s= 0.072 connect= 0.000 search= 0.059 create= 0.004 read= 0.008
+[    0.4s] nopoolM5 UP n=  3 total=  8 total_s= 0.045 connect= 0.000 search= 0.036 create= 0.005 read= 0.004
+[    0.5s] nopoolM5 UP n=  4 total=  9 total_s= 0.070 connect= 0.000 search= 0.048 create= 0.009 read= 0.013
+[    0.6s] nopoolM5 UP n=  5 total= 10 total_s= 0.052 connect= 0.000 search= 0.043 create= 0.004 read= 0.004
+[    0.6s] nopoolM5 UP n=  6 total= 11 total_s= 0.062 connect= 0.000 search= 0.041 create= 0.009 read= 0.011
+[    0.7s] nopoolM5 UP n=  7 total= 12 total_s= 0.055 connect= 0.000 search= 0.047 create= 0.004 read= 0.004
+[    0.7s] nopoolM5 UP n=  8 total= 13 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.004 read= 0.004
+[    0.7s] nopoolM5 UP n=  9 total= 14 total_s= 0.038 connect= 0.000 search= 0.027 create= 0.008 read= 0.003
+[    0.8s] nopoolM5 UP n= 10 total= 15 total_s= 0.037 connect= 0.000 search= 0.029 create= 0.004 read= 0.004
+[    0.8s] nopoolM5 UP n= 11 total= 16 total_s= 0.037 connect= 0.000 search= 0.029 create= 0.004 read= 0.004
+[    0.9s] nopoolM5 UP n= 12 total= 17 total_s= 0.055 connect= 0.000 search= 0.045 create= 0.006 read= 0.004
+[    0.9s] nopoolM5 UP n= 13 total= 18 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.005 read= 0.004
+[    0.9s] nopoolM5 UP n= 14 total= 19 total_s= 0.039 connect= 0.000 search= 0.031 create= 0.004 read= 0.004
+[    1.0s] nopoolM5 UP n= 15 total= 20 total_s= 0.039 connect= 0.000 search= 0.030 create= 0.004 read= 0.004
+[    1.0s] nopoolM5 UP n= 16 total= 21 total_s= 0.047 connect= 0.000 search= 0.039 create= 0.004 read= 0.004
+[    1.1s] nopoolM5 UP n= 17 total= 22 total_s= 0.057 connect= 0.000 search= 0.049 create= 0.005 read= 0.004
+[    1.1s] nopoolM5 UP n= 18 total= 23 total_s= 0.049 connect= 0.000 search= 0.039 create= 0.004 read= 0.006
+[    1.2s] nopoolM5 UP n= 19 total= 24 total_s= 0.039 connect= 0.000 search= 0.031 create= 0.004 read= 0.004
+[    1.2s] nopoolM5 UP n= 20 total= 25 total_s= 0.056 connect= 0.000 search= 0.048 create= 0.004 read= 0.004
+[    1.3s] nopoolM5 UP n= 21 total= 26 total_s= 0.058 connect= 0.000 search= 0.050 create= 0.005 read= 0.004
+[    1.4s] nopoolM5 UP n= 22 total= 27 total_s= 0.059 connect= 0.000 search= 0.051 create= 0.004 read= 0.004
+[    1.4s] nopoolM5 UP n= 23 total= 28 total_s= 0.055 connect= 0.000 search= 0.044 create= 0.007 read= 0.004
+[    1.5s] nopoolM5 UP n= 24 total= 29 total_s= 0.041 connect= 0.000 search= 0.033 create= 0.004 read= 0.004
+[    1.5s] nopoolM5 UP n= 25 total= 30 total_s= 0.097 connect= 0.000 search= 0.087 create= 0.007 read= 0.004
+[    1.6s] nopoolM5 UP n= 26 total= 31 total_s= 0.039 connect= 0.000 search= 0.031 create= 0.004 read= 0.004
+[    1.6s] nopoolM5 UP n= 27 total= 32 total_s= 0.038 connect= 0.000 search= 0.029 create= 0.004 read= 0.004
+[    1.7s] nopoolM5 UP n= 28 total= 33 total_s= 0.055 connect= 0.000 search= 0.047 create= 0.005 read= 0.004
+[    1.8s] nopoolM5 UP n= 29 total= 34 total_s= 0.145 connect= 0.000 search= 0.135 create= 0.006 read= 0.004
+[    1.9s] nopoolM5 UP n= 30 total= 35 total_s= 0.057 connect= 0.000 search= 0.049 create= 0.004 read= 0.004
+[    1.9s] nopoolM5 UP n= 31 total= 36 total_s= 0.038 connect= 0.000 search= 0.030 create= 0.004 read= 0.004
+[    2.0s] nopoolM5 UP n= 32 total= 37 total_s= 0.044 connect= 0.000 search= 0.035 create= 0.004 read= 0.004
+[    2.0s] nopoolM5 UP n= 33 total= 38 total_s= 0.076 connect= 0.000 search= 0.067 create= 0.004 read= 0.004
+[    2.1s] nopoolM5 UP n= 34 total= 39 total_s= 0.040 connect= 0.000 search= 0.028 create= 0.008 read= 0.004
+[    2.1s] nopoolM5 UP n= 35 total= 40 total_s= 0.036 connect= 0.000 search= 0.028 create= 0.004 read= 0.004
+[    2.2s] nopoolM5 UP n= 36 total= 41 total_s= 0.037 connect= 0.000 search= 0.029 create= 0.004 read= 0.004
+[    2.2s] nopoolM5 UP n= 37 total= 42 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.004 read= 0.004
+[    2.2s] nopoolM5 UP n= 38 total= 43 total_s= 0.035 connect= 0.000 search= 0.027 create= 0.005 read= 0.004
+[    2.3s] nopoolM5 UP n= 39 total= 44 total_s= 0.044 connect= 0.000 search= 0.028 create= 0.006 read= 0.010
+[    2.3s] nopoolM5 UP n= 40 total= 45 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.004 read= 0.005
+[    2.4s] nopoolM5 UP n= 41 total= 46 total_s= 0.114 connect= 0.000 search= 0.106 create= 0.004 read= 0.004
+[    2.5s] nopoolM5 UP n= 42 total= 47 total_s= 0.047 connect= 0.000 search= 0.039 create= 0.004 read= 0.004
+[    2.5s] nopoolM5 UP n= 43 total= 48 total_s= 0.037 connect= 0.000 search= 0.028 create= 0.004 read= 0.005
+[    2.6s] nopoolM5 UP n= 44 total= 49 total_s= 0.098 connect= 0.000 search= 0.089 create= 0.004 read= 0.005
+[    2.7s] nopoolM5 UP n= 45 total= 50 total_s= 0.071 connect= 0.000 search= 0.055 create= 0.005 read= 0.011
+[    2.7s] nopoolM5 UP n= 46 total= 51 total_s= 0.055 connect= 0.000 search= 0.037 create= 0.014 read= 0.004
+[    2.8s] nopoolM5 UP n= 47 total= 52 total_s= 0.039 connect= 0.000 search= 0.030 create= 0.004 read= 0.004
+[    2.8s] nopoolM5 UP n= 48 total= 53 total_s= 0.043 connect= 0.000 search= 0.029 create= 0.010 read= 0.004
+[    3.0s] nopoolM5 UP n= 49 total= 54 total_s= 0.172 connect= 0.000 search= 0.153 create= 0.005 read= 0.013
+[    3.0s] nopoolM5 UP n= 50 total= 55 total_s= 0.063 connect= 0.000 search= 0.045 create= 0.007 read= 0.010
+[    3.1s] nopoolM5 UP n= 51 total= 56 total_s= 0.058 connect= 0.000 search= 0.043 create= 0.009 read= 0.006
+[    3.1s] nopoolM5 UP n= 52 total= 57 total_s= 0.042 connect= 0.000 search= 0.032 create= 0.006 read= 0.004
+[    3.2s] nopoolM5 UP n= 53 total= 58 total_s= 0.063 connect= 0.000 search= 0.051 create= 0.004 read= 0.008
+[    3.3s] nopoolM5 FAIL attempt=54 held=53 total=58 elapsed=0.09s REFUSED_BY_SERVER(CA_PROTO_ERROR:CAS: no resources for a new client (resource unavailable try again (os error 11))|hex=000b006800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e7420287265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f72203131292900000000000000)
+[    3.4s] nopoolM5 FAIL attempt=54 held=53 total=58 elapsed=0.07s REFUSED_BY_SERVER(CA_PROTO_ERROR:CAS: no resources for a new client (resource unavailable try again (os error 11))|hex=000b006800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e7420287265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f72203131292900000000000000)
+[    3.4s] nopoolM5 FAIL attempt=54 held=53 total=58 elapsed=0.06s REFUSED_BY_SERVER(CA_PROTO_ERROR:CAS: no resources for a new client (resource unavailable try again (os error 11))|hex=000b006800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e7420287265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f72203131292900000000000000)
+[    3.5s] nopoolM5 FAIL attempt=54 held=53 total=58 elapsed=0.04s REFUSED_BY_SERVER(CA_PROTO_ERROR:CAS: no resources for a new client (resource unavailable try again (os error 11))|hex=000b006800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e7420287265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f72203131292900000000000000)
+[    3.5s] nopoolM5 === TOP ===
+[    3.5s] nopoolM5 D1 client-side served = 53 ramp + 5 monitor = 58
+[    3.5s] nopoolM5 deadline_hit=False consecutive_failures=4 ceiling_hit=False
+[    3.5s] nopoolM5 SAMPLE top          CONN_CNT=0.0 REFUSED=0.0 FD_CNT=5.0 FD_MAX=1000.0 MEM_USED=43278336.0
+[    3.5s] nopoolM5 D2 server-side RTEMS:CA_CONN_CNT = 0.0
+[    3.5s] nopoolM5 first failure at ramp attempt 54, t=3.3s
+[    3.5s] nopoolM5 first failure verbatim: REFUSED_BY_SERVER(CA_PROTO_ERROR:CAS: no resources for a new client (resource unavailable try again (os error 11))|hex=000b006800000000ffffffff00000030000000000000000000000000000000004341533a206e6f207265736f757263657320666f722061206e657720636c69656e7420287265736f7572636520756e617661696c61626c652074727920616761696e20286f73206572726f72203131292900000000000000)
+[    3.5s] nopoolM5 phaseramp done

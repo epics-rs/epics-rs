@@ -1,7 +1,7 @@
 //! Blocking, thread-per-connection PVA server driver (RTEMS phase 6 item 5,
 //! stage 3 — `doc/pva-rtems-item5-design.md` §1, §3).
 //!
-//! The second driver, beside [`super::accept`]. It serves one connection with
+//! The second driver, beside `super::accept`. It serves one connection with
 //! three threads and **no reactor**:
 //!
 //! ```text
@@ -27,7 +27,7 @@
 //! Those implementors are no longer defined here. `ChannelReader` /
 //! `ChannelWriter`, the two pump bodies, the send-deadline loop and the two
 //! thread-lifecycle guards live in
-//! [`epics_base_rs::runtime::blocking_io`](epics_base_rs::runtime::blocking_io),
+//! [`epics_base_rs::runtime::blocking_io`],
 //! because the PVA *client* and the CA client need the identical primitive and
 //! `epics-ca-rs` cannot depend on this crate (`doc/calink-rtems-design.md`
 //! §3.3). What remains in this file is what is genuinely server-side: the
@@ -49,7 +49,7 @@
 //! off first. That difference matters, because on a **hosted** build the
 //! operation future still needs a tokio runtime underneath it: `runtime::task`
 //! aliases `spawn` and `interval` to tokio's, and tokio's need a reactor. So
-//! [`serve_connection_blocking`] must be called from a multi-thread runtime
+//! `serve_connection_blocking` must be called from a multi-thread runtime
 //! worker on the host. On RTEMS the `exec_backend` supplies both the spawn
 //! pool and the timer, so the very same call runs on a bare thread. This
 //! module is therefore host-compiled and host-tested — the only way to show
@@ -117,11 +117,11 @@
 //! # The accept side
 //!
 //! [`BlockingPvaServer`] owns the [`ConnRegistry`] and hands sockets to
-//! [`serve_connection_blocking`], assembling the arguments the hosted
-//! [`super::accept`] assembles for its own driver. It creates **no thread per
+//! `serve_connection_blocking`, assembling the arguments the hosted
+//! `super::accept` assembles for its own driver. It creates **no thread per
 //! connection**: each connection *borrows* its three threads — connection body,
 //! reader pump, writer pump — as one set from a
-//! [`WorkerPool`](epics_base_rs::runtime::worker_pool::WorkerPool), because
+//! [`epics_base_rs::runtime::worker_pool::WorkerPool`], because
 //! every `std::thread` creation leaks 176–179 B permanently on RTEMS
 //! (`doc/rtems-connection-worker-pool-design.md`). All three workers take
 //! `PVA_SERVER_PRIORITY` — see that constant for why they share one number —
@@ -158,12 +158,12 @@ use std::time::Duration;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io::{
-    DEFAULT_READ_CHUNK, is_socket_timeout, send_tick_for, spawn_reader_pump, spawn_writer_pump,
+    DEFAULT_READ_CHUNK, is_socket_timeout, spawn_reader_pump, spawn_writer_pump,
 };
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
+use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use tracing::{debug, warn};
 
 use super::config::PvaServerConfig;
@@ -285,7 +285,7 @@ struct RegistryState {
 ///
 /// # Invariant
 ///
-/// * **MUST** — every connection served by [`serve_connection_blocking`] is
+/// * **MUST** — every connection served by `serve_connection_blocking` is
 ///   registered here before either of its threads starts, and stays registered
 ///   until its operation thread has joined both of them.
 /// * **MUST NOT** — no path shuts a connection's socket down, or takes it out
@@ -309,7 +309,7 @@ struct RegistryState {
 ///
 /// Target-neutral, like the rest of this module: `std` sockets, `std` mutex,
 /// no `cfg`. Item 7's RTEMS accept loop owns one and calls `stop`; on the host
-/// that role belongs to [`super::accept`], which drives its connections as
+/// that role belongs to `super::accept`, which drives its connections as
 /// tasks and so has nothing to register here.
 pub struct ConnRegistry {
     state: Mutex<RegistryState>,
@@ -432,10 +432,10 @@ impl Drop for ConnRegistration<'_> {
 // ---------------------------------------------------------------------------
 
 /// The reader and writer slots of a connection's leased worker set, passed to
-/// [`serve_connection_blocking`] as one value.
+/// `serve_connection_blocking` as one value.
 ///
 /// A pair, not two parameters, because the two are always leased and returned
-/// together — [`start_connection`] takes them from one `acquire`, and neither
+/// together — `start_connection` takes them from one `acquire`, and neither
 /// pump may run on a worker the connection did not lease. Passing them as a unit
 /// is what makes "you cannot serve with a half-borrowed set" a property of the
 /// signature rather than a convention.
@@ -452,7 +452,7 @@ pub(super) struct PumpWorkers {
 /// connection is over — they can only report (§4.1).
 ///
 /// `pumps` are two of the three workers this connection borrowed from the pool
-/// ([`start_connection`]); the connection body itself runs on the third. The
+/// (`start_connection`); the connection body itself runs on the third. The
 /// pumps run on these two, and their guards join the jobs — returning the
 /// workers to their set — before this function returns, on every exit path
 /// including a panic. The pair is taken by value so a caller cannot run a pump
@@ -493,17 +493,16 @@ pub(super) fn serve_connection_blocking(
         .set_read_timeout(Some(config.op_timeout))
         .map_err(PvaError::Io)?;
     let send_timeout = config.send_timeout;
-    // SO_SNDTIMEO, unlike SO_RCVTIMEO above, is NOT portable: VxWorks'
-    // libbsd socket stack does not implement it and returns ENOPROTOOPT
-    // (errno 42) on an otherwise-good accepted socket. Propagating that
-    // fatally closed every VxWorks PVA connection before the first byte
-    // (SET_BYTE_ORDER) went out (measured on target). Best-effort like
-    // `set_nodelay` above: applied on RTEMS, silently absent on VxWorks,
-    // where `handle_connection_io`'s `runtime::task::timeout(send_timeout)`
-    // wrapper around every `write_all` is the portable send-stall guard —
-    // this socket-level timeout is a redundant backstop here, not the only
-    // one.
-    let _ = stream.set_write_timeout(Some(send_tick_for(send_timeout)));
+    // No SO_SNDTIMEO. It is not portable — VxWorks' socket stack does not
+    // implement it and returns ENOPROTOOPT (errno 42) on an otherwise-good
+    // accepted socket, which closed every VxWorks PVA connection before the
+    // first byte (SET_BYTE_ORDER) went out when it was propagated fatally
+    // (measured on target). It is also no longer needed on any target:
+    // `blocking_io::write_frame_deadline` waits for writability against
+    // `send_timeout` itself, so the per-frame bound is the same here as it is
+    // for the blocking clients, and `handle_connection_io`'s
+    // `runtime::task::timeout(send_timeout)` around every `write_all` sits
+    // above it as a second, async-side bound rather than as the only one.
 
     // One socket, several handles: the SAME descriptor shared through an
     // `Arc` by both pump threads and the registry, which owns it from here
@@ -607,16 +606,16 @@ impl Drop for ConnSlot {
 }
 
 /// A blocking, thread-per-connection PVA TCP server — the accept side of the
-/// driver in this module, and the RTEMS counterpart of [`super::accept`].
+/// driver in this module, and the RTEMS counterpart of `super::accept`.
 ///
-/// [`serve_connection_blocking`] serves one connection on three threads; this
+/// `serve_connection_blocking` serves one connection on three threads; this
 /// is what gives it sockets and the arguments the hosted accept loop assembles
 /// in `accept.rs`. An N-client server therefore costs **3N+2** threads — this
 /// accept loop, the UDP search responder, and three per connection — where the
 /// hosted driver costs two tasks per connection. That is a stated RTEMS budget
 /// item, not an accident.
 ///
-/// It owns the [`ConnRegistry`], because [`serve_connection_blocking`] cannot
+/// It owns the [`ConnRegistry`], because `serve_connection_blocking` cannot
 /// be called without one, and that makes [`shutdown`](Self::shutdown) able to
 /// end live connections rather than only stop accepting new ones.
 ///
@@ -644,7 +643,7 @@ pub struct BlockingPvaServer {
 }
 
 /// The three roles one PVA connection borrows together, in the order
-/// [`serve_connection_blocking`] and [`start_connection`] destructure them:
+/// `serve_connection_blocking` and `start_connection` destructure them:
 /// `[conn, reader, writer]`. All three take `PVA_SERVER_PRIORITY` — see that
 /// constant. The connection body is `Big` (it runs the whole protocol state
 /// machine under `block_on_sync`, the counterpart of C's `epicsThreadStackBig`
@@ -848,17 +847,25 @@ impl BlockingPvaServer {
     ///
     /// Admission lives in [`WorkerPool::acquire`] now, not in an `active` check:
     /// the pool's capacity *is* `max_connections`, so a full pool refuses with
-    /// [`io::ErrorKind::WouldBlock`], which this maps to the same operator-visible
+    /// [`AcquireError::AtCapacity`], which this maps to the same operator-visible
     /// warning the old gate produced. Any other `acquire` error is a target out
     /// of thread resources and propagates to the accept loop's "connection not
     /// started" path.
+    ///
+    /// That split used to be written as `e.kind() == io::ErrorKind::WouldBlock`,
+    /// and it was wrong for the case that matters: a failed thread spawn is
+    /// `EAGAIN`, `std` decodes `EAGAIN` as `WouldBlock`, so a target that had
+    /// run out of thread resources was reported to the operator as
+    /// `max_connections reached` — pointing at a config knob when the machine
+    /// was out of memory. Matching the gate instead of an errno makes the two
+    /// unmixable; the CA driver had the same defect on its own refusal path.
     fn start_connection(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
         // One atomic borrow of all three roles — connection body, reader pump,
         // writer pump — so a server at capacity can never hold a partial set and
         // block for the rest.
         let (lease, [conn_worker, reader_worker, writer_worker]) = match self.conn_pool.acquire() {
             Ok(set) => set,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(AcquireError::AtCapacity { capacity }) => {
                 // Dropping the stream closes it. Refusing costs more here than on
                 // the host: each connection is three threads, not two tasks.
                 //
@@ -868,14 +875,26 @@ impl BlockingPvaServer {
                 // (`epics_base_rs::runtime::log::install_console_subscriber`),
                 // which is the same silent-refusal defect the CA driver had at
                 // its thread ceiling.
+                //
+                // `limit` is the bound the pool actually enforced, not the
+                // configured number it was built from: they are the same today
+                // and reporting the enforced one keeps them the same tomorrow.
                 warn!(
                     ?peer,
-                    limit = self.config.max_connections,
+                    limit = capacity,
                     "blocking PVA server: refusing connection, max_connections reached"
                 );
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(cause @ AcquireError::OutOfReservation { .. }) => {
+                // The other refusal the process itself makes. It is not a
+                // failure to start a connection — the server is healthy and
+                // said no — so it takes the refusal path and reports the pool's
+                // own words, which name the switch that raises the budget.
+                warn!(?peer, "blocking PVA server: refusing connection, {cause}");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
         };
 
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -1919,7 +1938,7 @@ mod tests {
     ///
     /// Driven through the real pump primitive rather than a hand-built thread,
     /// so what is under test is the registry's reach into a connection assembled
-    /// the way [`serve_connection_blocking`] assembles one.
+    /// the way `serve_connection_blocking` assembles one.
     #[test]
     fn stop_wakes_a_writer_parked_in_the_deadline_loop() {
         // Kept alive and deliberately never read from: this is the stuck-peer
@@ -1933,9 +1952,6 @@ mod tests {
         // Far longer than this test may take, so only the wake can explain a
         // prompt exit.
         const DEADLINE: Duration = Duration::from_secs(30);
-        write_sock
-            .set_write_timeout(Some(send_tick_for(DEADLINE)))
-            .expect("SO_SNDTIMEO");
 
         let label = format!("PVA connection {peer}");
         // `_lease` is declared before `_guard`, so it drops last — after the

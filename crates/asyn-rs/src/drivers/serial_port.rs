@@ -1,6 +1,9 @@
 //! Serial port driver (drvAsynSerialPort equivalent).
 //!
-//! Uses `libc` termios directly for serial I/O. Unix-only (`#[cfg(unix)]`).
+//! Mounted on every unix. Everything a target can differ about — the termios
+//! ABI itself, the flag values, and which facilities exist at all — lives in
+//! the private `platform` module below, which is the only place in the file
+//! that names a target.
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -16,6 +19,338 @@ use crate::{asyn_trace, asyn_trace_io};
 use super::option_parse::{bad_number, parse_yn_option, sscanf_int, sscanf_uint};
 use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 
+/// The termios facilities this driver needs, resolved once per target.
+///
+/// This module is the only place in the file that names a target, and it owns
+/// the whole termios ABI: the struct, the flag constants, the `c_cc` indices
+/// and the calls are all reached through here, never through `libc` directly.
+/// Two kinds of difference live here and nowhere else:
+///
+/// * a name the platform *has* but `libc` does not bind — taken from the
+///   platform's own header, with the citation;
+/// * a facility the platform genuinely *lacks* — an [`Option`] (or an
+///   `Option`-returning call), so every consumer refuses the corresponding
+///   asyn option through [`option_unsupported_here`] instead of silently
+///   doing nothing.
+///
+/// That second shape is the point. A missing bit is not an absent line of
+/// code, it is a *refusal*, and making it an `Option` means the refusal is
+/// the same statement at every site rather than a `#[cfg]` at each one that
+/// the next platform has to be added to individually.
+///
+/// Every arm exports the same names, so one rule covers every target: a
+/// facility is supported exactly where this platform's termios has the bit,
+/// the index or the call. No arm gets an exception, and a target that is
+/// missing a name fails to build rather than silently taking another
+/// platform's value.
+///
+/// # VxWorks: why the POSIX path and not C's
+///
+/// C's vxWorks branch drives the line through `ioctl(SIO_HW_OPTS_SET)` on a
+/// *fake* `struct termios { int c_cflag; }` (`drvAsynSerialPort.c:43-62`),
+/// because it predates VxWorks 7's POSIX termios. Consequences C then has to
+/// live with: `crtscts` is aliased onto `CLOCAL` ("vxWorks uses CLOCAL when
+/// it should use CRTSCTS", `:425-431`) since `sioLibCommon.h` has no
+/// flow-control bit, and `ixoff` is refused outright (`:488-490`).
+///
+/// This driver takes VxWorks 7's real `<termios.h>` instead, which the RTP
+/// sysroot exposes and `libc` binds ABI-correctly (`struct termios` field for
+/// field, `NCCS == 20`, `VMIN == 16`). There `CRTSCTS` (`CCTS_OFLOW |
+/// CRTS_IFLOW`) and `IXOFF` are real, distinct bits, so honouring them costs
+/// nothing and keeps asyn's documented option contract — whereas C's aliasing
+/// would make `crtscts` and `clocal` silently overwrite each other. `ixany`
+/// stays refused because VxWorks genuinely has no such bit: the same
+/// conclusion C reaches, reached by the same test.
+///
+/// Note the `c_cflag` bits are *not* Linux's — VxWorks uses the `sioLib`
+/// numbering (`CS8 == 0xc`, `CLOCAL == 0x1`, `PARENB == 0x40`). They are
+/// taken from `libc`, which was checked field for field against
+/// `wrsdk-vxworks7/vxsdk/sysroot/usr/h/published/UTILS_UNIX/termios.h`.
+///
+/// # RTEMS: why the ABI is declared here rather than taken from `libc`
+///
+/// RTEMS is the one target where `libc` cannot be the source. Its newlib
+/// module declares a `struct termios` — commented "Unverified" in `libc`'s own
+/// source (`src/unix/newlib/mod.rs:200-212`) — that inserts a `c_line: cc_t`
+/// RTEMS does not have and gates `c_ispeed`/`c_ospeed` to espidf. The four
+/// flag words still land at 0/4/8/12, so nothing *looks* wrong; what breaks is
+/// everything after them. `c_cc` is displaced one byte, so `VMIN`, `VTIME` and
+/// the flow characters address the wrong bytes, and `cfsetispeed` /
+/// `cfsetospeed` write four bytes past the end of the Rust struct. None of
+/// that is a compile error.
+///
+/// The loud half is that newlib binds not one termios *constant*: mounting
+/// this file on `libc` fails with 102 errors over 42 names (`CSIZE`, `CS5`..
+/// `CS8`, `PARENB`, `CLOCAL`, `VMIN`, `TCSANOW`, `O_NOCTTY`, the `B*` ladder)
+/// before it can ever mis-execute.
+///
+/// Both halves close the same way, and it is the way the two earlier RTEMS ABI
+/// breaks in this workspace closed — `sockaddr` without its `sin_len`,
+/// `timespec` at 8 bytes where the target has 16: declare the ABI here, from
+/// the BSP sysroot's own header, and pin every offset with a `const` assertion
+/// so a layout that drifts is a build failure instead of a silent misread.
+///
+/// The facilities themselves are all present, so this is a complete platform
+/// with an incomplete binding — which is why the seam's rule needs no RTEMS
+/// case. `librtemscpu.a` defines all twelve termios entry points including
+/// `tcdrain`, and `sys/_termios.h` carries `CRTSCTS` (`:141`), `IXANY`
+/// (`:97`) and `VSTART`/`VSTOP` (`:66-67`), so RTEMS takes `Some(..)` at every
+/// option site.
+mod platform {
+    #[cfg(not(any(target_os = "vxworks", target_os = "rtems")))]
+    mod imp {
+        pub use libc::termios;
+        /// `speed_t`, the type of a termios speed code.
+        pub type Speed = libc::speed_t;
+        pub use libc::{
+            B300, B9600, CLOCAL, CREAD, CS5, CS6, CS7, CS8, CSIZE, CSTOPB, IGNBRK, IGNPAR, IXOFF,
+            IXON, PARENB, PARODD, TCIFLUSH, TCSANOW, VMIN, VTIME,
+        };
+        pub use libc::{
+            cfmakeraw, cfsetispeed, cfsetospeed, tcflush, tcgetattr, tcsendbreak, tcsetattr,
+        };
+
+        /// Hardware flow control.
+        pub const CRTSCTS: libc::tcflag_t = libc::CRTSCTS;
+        /// Do not make the serial line this process's controlling terminal.
+        pub const O_NOCTTY: libc::c_int = libc::O_NOCTTY;
+        /// Discard both queues — C `connectIt` (`drvAsynSerialPort.c:729`).
+        pub const FLUSH_IO: libc::c_int = libc::TCIOFLUSH;
+        /// Any character restarts paused output.
+        pub const IXANY: Option<libc::tcflag_t> = Some(libc::IXANY);
+        /// `c_cc` indices of the XON/XOFF characters.
+        pub const SOFT_FLOW_CHARS: Option<(usize, usize)> = Some((libc::VSTART, libc::VSTOP));
+
+        /// Block until queued output has actually been transmitted.
+        pub fn drain(fd: libc::c_int) -> Option<std::io::Result<()>> {
+            Some(if unsafe { libc::tcdrain(fd) } < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    /// RTEMS 6, declared against `arm-rtems6/include/sys/_termios.h` and
+    /// `.../termios.h` in the BSP sysroot. Every line below cites the header
+    /// it was read from; nothing here is inferred from another platform.
+    #[cfg(target_os = "rtems")]
+    mod imp {
+        /// `_termios.h:226`: `typedef unsigned int speed_t;`. Its two
+        /// siblings — `tcflag_t` and `cc_t`, `:224-225` — are spelled
+        /// `libc::c_uint` and `libc::c_uchar` at each use below rather than
+        /// aliased, so the C type is visible where the field is.
+        pub type Speed = libc::c_uint;
+
+        /// `_termios.h:78`. `libc` gets this one right (it has an explicit
+        /// RTEMS arm at 20), which is exactly what makes the one-byte `c_cc`
+        /// displacement in its struct so quiet.
+        pub const NCCS: usize = 20;
+
+        /// `_termios.h:228-236`, in the header's own field order. This is the
+        /// declaration `libc`'s newlib module gets wrong.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct termios {
+            pub c_iflag: libc::c_uint,
+            pub c_oflag: libc::c_uint,
+            pub c_cflag: libc::c_uint,
+            pub c_lflag: libc::c_uint,
+            pub c_cc: [libc::c_uchar; NCCS],
+            pub c_ispeed: Speed,
+            pub c_ospeed: Speed,
+        }
+
+        // The offsets the C header really produces, written out so the
+        // declaration above cannot drift from it and so a `libc`-shaped
+        // struct cannot be substituted by accident. Under newlib's binding
+        // `c_cc` starts at 17 and there are no speed fields at all, so the
+        // `c_cc` and `c_ispeed` lines below are the two that fail first.
+        const _: () = {
+            use std::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<libc::c_uint>() == 4, "tcflag_t is `unsigned int`");
+            assert!(size_of::<libc::c_uchar>() == 1, "cc_t is `unsigned char`");
+            assert!(size_of::<Speed>() == 4, "speed_t is `unsigned int`");
+            assert!(offset_of!(termios, c_iflag) == 0, "c_iflag at 0");
+            assert!(offset_of!(termios, c_oflag) == 4, "c_oflag at 4");
+            assert!(offset_of!(termios, c_cflag) == 8, "c_cflag at 8");
+            assert!(offset_of!(termios, c_lflag) == 12, "c_lflag at 12");
+            assert!(offset_of!(termios, c_cc) == 16, "c_cc at 16, not 17");
+            assert!(offset_of!(termios, c_ispeed) == 36, "c_ispeed at 36");
+            assert!(offset_of!(termios, c_ospeed) == 40, "c_ospeed at 40");
+            assert!(size_of::<termios>() == 44, "sizeof(struct termios) == 44");
+            assert!(align_of::<termios>() == 4, "alignof(struct termios) == 4");
+            assert!(
+                VMIN < NCCS && VTIME < NCCS && VSTART < NCCS && VSTOP < NCCS,
+                "every c_cc index used here must be inside the array"
+            );
+        };
+
+        // `termios.h:78-95`. Declared here rather than used from `libc`
+        // because `libc`'s declarations take *its* `struct termios`, and a
+        // pointer to this one is not that. The symbols themselves are the
+        // same: `librtemscpu.a` defines all twelve as `T`.
+        unsafe extern "C" {
+            pub fn tcgetattr(fd: libc::c_int, t: *mut termios) -> libc::c_int;
+            pub fn tcsetattr(
+                fd: libc::c_int,
+                action: libc::c_int,
+                t: *const termios,
+            ) -> libc::c_int;
+            pub fn tcflush(fd: libc::c_int, queue: libc::c_int) -> libc::c_int;
+            pub fn tcdrain(fd: libc::c_int) -> libc::c_int;
+            pub fn tcsendbreak(fd: libc::c_int, duration: libc::c_int) -> libc::c_int;
+            pub fn cfmakeraw(t: *mut termios);
+            pub fn cfsetispeed(t: *mut termios, speed: Speed) -> libc::c_int;
+            pub fn cfsetospeed(t: *mut termios, speed: Speed) -> libc::c_int;
+        }
+
+        // Input flags, `_termios.h:85-97`.
+        pub const IGNBRK: libc::c_uint = 0x0000_0001;
+        pub const IGNPAR: libc::c_uint = 0x0000_0004;
+        pub const IXON: libc::c_uint = 0x0000_0200;
+        pub const IXOFF: libc::c_uint = 0x0000_0400;
+        /// `_termios.h:97`. RTEMS has the bit, so the option is supported.
+        pub const IXANY: Option<libc::c_uint> = Some(0x0000_0800);
+
+        // Control flags, `_termios.h:128-142`. BSD numbering, not Linux's.
+        pub const CSIZE: libc::c_uint = 0x0000_0300;
+        pub const CS5: libc::c_uint = 0x0000_0000;
+        pub const CS6: libc::c_uint = 0x0000_0100;
+        pub const CS7: libc::c_uint = 0x0000_0200;
+        pub const CS8: libc::c_uint = 0x0000_0300;
+        pub const CSTOPB: libc::c_uint = 0x0000_0400;
+        pub const CREAD: libc::c_uint = 0x0000_0800;
+        pub const PARENB: libc::c_uint = 0x0000_1000;
+        pub const PARODD: libc::c_uint = 0x0000_2000;
+        pub const CLOCAL: libc::c_uint = 0x0000_8000;
+        /// `CCTS_OFLOW | CRTS_IFLOW`, `_termios.h:140-142`.
+        pub const CRTSCTS: libc::c_uint = 0x0001_0000 | 0x0002_0000;
+
+        // `c_cc` indices, `_termios.h:66-73`.
+        pub const VSTART: usize = 12;
+        pub const VSTOP: usize = 13;
+        pub const VMIN: usize = 16;
+        pub const VTIME: usize = 17;
+        /// RTEMS has both indices, so the ^Q/^S characters are ours to seed.
+        pub const SOFT_FLOW_CHARS: Option<(usize, usize)> = Some((VSTART, VSTOP));
+
+        // `tcsetattr` action and `tcflush` selectors, `termios.h:62,69-71`.
+        pub const TCSANOW: libc::c_int = 0;
+        pub const TCIFLUSH: libc::c_int = 1;
+        /// `TCIOFLUSH` — RTEMS has the both-queues selector.
+        pub const FLUSH_IO: libc::c_int = 3;
+
+        /// `sys/_default_fcntl.h:25` via `:59` (`O_NOCTTY` is `_FNOCTTY`).
+        /// Newlib binds `O_RDWR` and `O_NONBLOCK` but not this one.
+        pub const O_NOCTTY: libc::c_int = 0x8000;
+
+        /// Standard speeds, `_termios.h:186-221`. Only the two the branch
+        /// assertion below needs are named: the codes *are* the rates here,
+        /// so `baud_to_speed` never looks the rest up.
+        pub const B300: Speed = 300;
+        pub const B9600: Speed = 9600;
+
+        /// RTEMS has `tcdrain` (`termios.h:84`, defined in `librtemscpu.a`).
+        pub fn drain(fd: libc::c_int) -> Option<std::io::Result<()>> {
+            Some(if unsafe { tcdrain(fd) } < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(target_os = "vxworks")]
+    mod imp {
+        pub use libc::termios;
+        /// `speed_t`, the type of a termios speed code.
+        pub type Speed = libc::speed_t;
+        pub use libc::{
+            B300, B9600, CLOCAL, CREAD, CS5, CS6, CS7, CS8, CSIZE, CSTOPB, IGNBRK, IGNPAR, IXOFF,
+            IXON, PARENB, PARODD, TCIFLUSH, TCSANOW, VMIN, VTIME,
+        };
+        pub use libc::{
+            cfmakeraw, cfsetispeed, cfsetospeed, tcflush, tcgetattr, tcsendbreak, tcsetattr,
+        };
+
+        /// `CCTS_OFLOW | CRTS_IFLOW`, `termios.h:114-116`. Present in the SDK
+        /// header, absent from `libc`'s VxWorks module, so it is named here.
+        pub const CRTSCTS: libc::tcflag_t = 0x0001_0000 | 0x0002_0000;
+        /// `_FNOCTTY`, `sys/fcntlcom.h:76` via `:109`. Same story: the SDK
+        /// defines it, `libc` does not bind it. VxWorks has no controlling
+        /// terminal to acquire, but `open` still accepts the flag, and C
+        /// passes it unconditionally (`drvAsynSerialPort.c:707`).
+        pub const O_NOCTTY: libc::c_int = 0x8000;
+        /// VxWorks defines no both-queues selector — `termios.h:102` has
+        /// `TCIFLUSH` alone. Discarding the input queue is the half that
+        /// matters at connect (stale bytes from before the line was
+        /// configured); C skips this flush entirely on vxWorks
+        /// (`drvAsynSerialPort.c:728-740` is `#ifndef vxWorks`), so doing the
+        /// input half is strictly closer to the hosted behaviour than C is.
+        pub const FLUSH_IO: libc::c_int = libc::TCIFLUSH;
+        /// No `IXANY` bit exists on VxWorks — the SDK's input-flag block
+        /// (`termios.h:70-81`) goes straight from `IXON` to `IXOFF`. C refuses
+        /// the option here too (`drvAsynSerialPort.c:469-471`).
+        pub const IXANY: Option<libc::tcflag_t> = None;
+        /// No `VSTART`/`VSTOP` indices exist: VxWorks `c_cc` runs `VINTR`,
+        /// `VQUIT`, `VERASE`, `VKILL`, `VEOF`, `VMIN`, `VTIME` and nothing
+        /// else (`termios.h:59-68`). The XON/XOFF characters are fixed in the
+        /// tty layer rather than programmable.
+        pub const SOFT_FLOW_CHARS: Option<(usize, usize)> = None;
+
+        /// VxWorks has no `tcdrain` (nor any drain-shaped ioctl — `FIOWFLUSH`
+        /// *discards* the write queue rather than waiting for it), so this
+        /// reports the gap instead of pretending to have drained.
+        pub fn drain(_fd: libc::c_int) -> Option<std::io::Result<()>> {
+            None
+        }
+    }
+
+    pub use imp::*;
+}
+
+/// C's refusal for an asyn option the platform's termios has no bit for:
+/// `"Option ixany not supported on vxWorks"` (`drvAsynSerialPort.c:469-471`,
+/// and `:488-490` for `ixoff`). Refusing is what C does, and it is the only
+/// honest answer — accepting the key and dropping it would let `getOption`
+/// report a line state the hardware was never told about.
+fn option_unsupported_here(key: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("Option {key} not supported on {}", std::env::consts::OS),
+    }
+}
+
+/// Write `speed` into both directions of `t`, reporting the platform's own
+/// refusal instead of discarding it. The single owner of that write: nothing
+/// else may call `cfset[io]speed`, so a caller cannot forget the check.
+///
+/// C tests both returns and answers asynError carrying the `strerror` text
+/// (`drvAsynSerialPort.c:346-355`). Dropping that is not cosmetic, because
+/// `cfsetospeed` is where a platform enforces its speed table — and the table
+/// is not implied by `B300 == 300`. Measured on RTEMS 6:
+/// `rtems_termios_baud_to_number(31250)` is 0 and `cfsetospeed` refuses the
+/// rate, leaving the previous one, while a `tcsetattr` carrying 31250 in
+/// `c_ospeed` directly is accepted and reads back. Without the check
+/// `set_option("baud", "31250")` answered `Ok` and `get_option("baud")` then
+/// reported 31250 on a line still running at 9600.
+fn set_termios_speed(t: &mut platform::termios, speed: platform::Speed) -> AsynResult<()> {
+    if unsafe { platform::cfsetispeed(t, speed) } < 0 {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("cfsetispeed returned {}", std::io::Error::last_os_error()),
+        });
+    }
+    if unsafe { platform::cfsetospeed(t, speed) } < 0 {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("cfsetospeed returned {}", std::io::Error::last_os_error()),
+        });
+    }
+    Ok(())
+}
+
 impl SerialConfig {
     /// Apply this configuration to a raw termios struct.
     ///
@@ -23,59 +358,59 @@ impl SerialConfig {
     /// is the single validation owner; surfacing the error here (rather than a
     /// silent `B9600` fallback) means an unmappable rate cannot be applied even
     /// through a directly-built `SerialConfig`, not just via `set_option`.
-    pub fn apply_to_termios(&self, t: &mut libc::termios) -> AsynResult<()> {
+    pub fn apply_to_termios(&self, t: &mut platform::termios) -> AsynResult<()> {
         let baud = baud_to_speed(self.baud).ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("unsupported baud rate: {}", self.baud),
         })?;
-        unsafe {
-            libc::cfsetispeed(t, baud);
-            libc::cfsetospeed(t, baud);
-        }
+        set_termios_speed(t, baud)?;
 
         // Data bits
-        t.c_cflag &= !libc::CSIZE;
+        t.c_cflag &= !platform::CSIZE;
         t.c_cflag |= match self.data_bits {
-            DataBits::Five => libc::CS5,
-            DataBits::Six => libc::CS6,
-            DataBits::Seven => libc::CS7,
-            DataBits::Eight => libc::CS8,
+            DataBits::Five => platform::CS5,
+            DataBits::Six => platform::CS6,
+            DataBits::Seven => platform::CS7,
+            DataBits::Eight => platform::CS8,
         };
 
         // Parity
         match self.parity {
             Parity::None => {
-                t.c_cflag &= !libc::PARENB;
+                t.c_cflag &= !platform::PARENB;
             }
             Parity::Even => {
-                t.c_cflag |= libc::PARENB;
-                t.c_cflag &= !libc::PARODD;
+                t.c_cflag |= platform::PARENB;
+                t.c_cflag &= !platform::PARODD;
             }
             Parity::Odd => {
-                t.c_cflag |= libc::PARENB;
-                t.c_cflag |= libc::PARODD;
+                t.c_cflag |= platform::PARENB;
+                t.c_cflag |= platform::PARODD;
             }
         }
 
         // Stop bits
         match self.stop_bits {
-            StopBits::One => t.c_cflag &= !libc::CSTOPB,
-            StopBits::Two => t.c_cflag |= libc::CSTOPB,
+            StopBits::One => t.c_cflag &= !platform::CSTOPB,
+            StopBits::Two => t.c_cflag |= platform::CSTOPB,
         }
 
-        // Flow control
+        // Flow control. `IXANY` is only in the *clear* masks, so a platform
+        // without the bit (`None`) needs no refusal here — there is nothing
+        // to clear, and neither mode ever sets it.
+        let ixany = platform::IXANY.unwrap_or(0);
         match self.flow_control {
             FlowControl::None => {
-                t.c_cflag &= !libc::CRTSCTS;
-                t.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+                t.c_cflag &= !platform::CRTSCTS;
+                t.c_iflag &= !(platform::IXON | platform::IXOFF | ixany);
             }
             FlowControl::Hardware => {
-                t.c_cflag |= libc::CRTSCTS;
-                t.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+                t.c_cflag |= platform::CRTSCTS;
+                t.c_iflag &= !(platform::IXON | platform::IXOFF | ixany);
             }
             FlowControl::Software => {
-                t.c_cflag &= !libc::CRTSCTS;
-                t.c_iflag |= libc::IXON | libc::IXOFF;
+                t.c_cflag &= !platform::CRTSCTS;
+                t.c_iflag |= platform::IXON | platform::IXOFF;
             }
         }
         Ok(())
@@ -92,29 +427,34 @@ impl SerialConfig {
 /// non-standard ones. Elsewhere (Linux, where the codes are small encoded
 /// integers) C maps the known standard rates with a `switch` and returns
 /// asynError ("Unsupported data rate", lines 340-343) for anything outside it.
-fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))]
+///
+/// Both embedded targets are in the first group — VxWorks at `termios.h:22-52`
+/// and RTEMS at `sys/_termios.h:186-221` — so both take the passthrough branch
+/// exactly as C does there. Which group a target is in is
+/// `asyn_baud_code_is_rate`, named once in `build.rs` because this file asks
+/// the question three times.
+///
+/// Passthrough here is not a promise that the *device* will take the rate, and
+/// C makes no such promise either: it is only the statement that this platform
+/// has no separate encoding to look the rate up in. Measured on RTEMS 6, where
+/// `rtems_termios_baud_to_number(31250)` is 0 and `cfsetospeed` refuses the
+/// rate outright — which is why [`set_termios_speed`], not this function, is
+/// where a rate is finally accepted or refused.
+fn baud_to_speed(baud: u32) -> Option<platform::Speed> {
+    #[cfg(asyn_baud_code_is_rate)]
     {
         // Bxxx == literal rate: the baud value is itself a valid speed code.
         // `from` (not `as`) so this stays clean whether speed_t is u32 or u64.
-        Some(libc::speed_t::from(baud))
+        Some(platform::Speed::from(baud))
     }
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )))]
+    // The one place the file reads `libc::` termios names instead of going
+    // through `platform`, here and in the same arm of `speed_to_baud`. It is
+    // sound because the `cfg` *is* the guarantee: a target reaches this ladder
+    // only if its codes are encoded integers, which is only true where `libc`
+    // binds them. Selecting the wrong arm does not misbehave, it fails to
+    // compile — on RTEMS with `cannot find value B50 in crate libc`.
+    #[cfg(not(asyn_baud_code_is_rate))]
     {
         Some(match baud {
             // C parity (drvAsynSerialPort.c:276-344): the Linux switch starts at
@@ -173,53 +513,89 @@ fn baud_to_speed(baud: u32) -> Option<libc::speed_t> {
     }
 }
 
+/// `asyn_baud_code_is_rate` selects *code*, but the question it answers is a
+/// property of the platform's constants, and C asks it as exactly that — a
+/// preprocessor test rather than a platform list
+/// (`drvAsynSerialPort.c:272-273`):
+///
+/// ```c
+/// #if (defined(B300) && (B300 == 300) && defined(B9600) && (B9600 == 9600))
+/// ```
+///
+/// The two cannot be collapsed here: the arms reference different constant
+/// sets, so which one compiles has to be a `cfg`. What can be removed is the
+/// chance of them disagreeing. This fails the build on any target where
+/// `build.rs` claims one thing and the constants say the other — which is what
+/// silently mapping a rate through the wrong branch would otherwise cost:
+/// arbitrary rates rejected where they are legal, or `9600` programmed as
+/// speed code 13.
+const _: () = assert!(
+    (platform::B300 == 300 && platform::B9600 == 9600) == cfg!(asyn_baud_code_is_rate),
+    "asyn_baud_code_is_rate disagrees with this platform's Bxxx codes: add or \
+     remove this target in build.rs, do not leave the branch mismatched"
+);
+
+/// The inverse of [`baud_to_speed`], branching the same way so the two stay
+/// inverse on every platform. `0` means "not a rate this platform expresses".
 #[allow(dead_code)]
-fn speed_to_baud(speed: libc::speed_t) -> u32 {
-    match speed {
-        libc::B0 => 0,
-        libc::B50 => 50,
-        libc::B75 => 75,
-        libc::B110 => 110,
-        libc::B134 => 134,
-        libc::B150 => 150,
-        libc::B200 => 200,
-        libc::B300 => 300,
-        libc::B600 => 600,
-        libc::B1200 => 1200,
-        libc::B1800 => 1800,
-        libc::B2400 => 2400,
-        libc::B4800 => 4800,
-        libc::B9600 => 9600,
-        libc::B19200 => 19200,
-        libc::B38400 => 38400,
-        libc::B57600 => 57600,
-        libc::B115200 => 115200,
-        libc::B230400 => 230400,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B460800 => 460800,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B500000 => 500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B576000 => 576000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B921600 => 921600,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B1000000 => 1000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B1152000 => 1152000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B1500000 => 1500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B2000000 => 2000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B2500000 => 2500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B3000000 => 3000000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B3500000 => 3500000,
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-        libc::B4000000 => 4000000,
-        _ => 0,
+fn speed_to_baud(speed: platform::Speed) -> u32 {
+    // Where the code *is* the rate, the ladder below would be a table of
+    // `n => n` — and one that answered 0 for every rate outside it, so
+    // `speed_to_baud(baud_to_speed(31250))` would lose a rate the platform
+    // accepts. The identity is both shorter and the actual inverse.
+    #[cfg(asyn_baud_code_is_rate)]
+    {
+        u32::try_from(speed).unwrap_or(0)
+    }
+
+    #[cfg(not(asyn_baud_code_is_rate))]
+    {
+        match speed {
+            libc::B0 => 0,
+            libc::B50 => 50,
+            libc::B75 => 75,
+            libc::B110 => 110,
+            libc::B134 => 134,
+            libc::B150 => 150,
+            libc::B200 => 200,
+            libc::B300 => 300,
+            libc::B600 => 600,
+            libc::B1200 => 1200,
+            libc::B1800 => 1800,
+            libc::B2400 => 2400,
+            libc::B4800 => 4800,
+            libc::B9600 => 9600,
+            libc::B19200 => 19200,
+            libc::B38400 => 38400,
+            libc::B57600 => 57600,
+            libc::B115200 => 115200,
+            libc::B230400 => 230400,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B460800 => 460800,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B500000 => 500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B576000 => 576000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B921600 => 921600,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B1000000 => 1000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B1152000 => 1152000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B1500000 => 1500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B2000000 => 2000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B2500000 => 2500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B3000000 => 3000000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B3500000 => 3500000,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::B4000000 => 4000000,
+            _ => 0,
+        }
     }
 }
 
@@ -330,23 +706,15 @@ impl OctetNext for SerialIoState {
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let fd = self.fd_or_err()?;
 
-        // The driver fd is blocking (connect restores O_NONBLOCK off so reads
-        // can block on poll). A blocking `write(fd, all_remaining)` would not
+        // No blocking-mode toggle here: the fd is non-blocking for its whole
+        // life (see `connect`). A blocking `write(fd, all_remaining)` would not
         // return until the *entire* buffer is accepted by the kernel, so a
-        // stalled or slow peer blocks the write past the timeout regardless of
-        // the poll below — C instead unblocks a stuck write from its timeout
-        // timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649). This driver has
-        // no such timer, so make the fd non-blocking for the duration of the
-        // write: each `write` then returns immediately with what fit (or EAGAIN)
-        // and the poll/deadline loop bounds the whole write. Blocking mode is
-        // restored on every exit path.
-        let prev_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if prev_flags < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags | libc::O_NONBLOCK) } < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
+        // stalled or slow peer would block the write past the timeout
+        // regardless of the poll below — C instead unblocks a stuck write from
+        // its timeout timer via tcflush(TCOFLUSH) (drvAsynSerialPort.c:649).
+        // This driver has no such timer; a permanently non-blocking fd is what
+        // replaces it, so each `write` returns immediately with what fit (or
+        // EAGAIN) and the poll/deadline loop bounds the whole write.
 
         // C parity (drvAsynSerialPort.c:815-842): writeIt arms a single timer
         // for the whole writeTimeout *before* the loop and breaks when it fires,
@@ -425,8 +793,6 @@ impl OctetNext for SerialIoState {
             }
         };
 
-        // Restore blocking mode on every exit path (success, timeout, error).
-        unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags) };
         match result {
             Ok(()) => Ok(total),
             Err(e) => Err(e.with_partial_write(total)),
@@ -437,7 +803,7 @@ impl OctetNext for SerialIoState {
         if let Some(fd) = self.fd {
             // C parity: tcflush(TCIFLUSH) discards received-but-unread input data,
             // matching C drvAsynSerialPort's flush behavior. NOT tcdrain (output wait).
-            let ret = unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+            let ret = unsafe { platform::tcflush(fd, platform::TCIFLUSH) };
             if ret < 0 {
                 return Err(AsynError::Io(std::io::Error::last_os_error()));
             }
@@ -474,9 +840,9 @@ pub struct DrvAsynSerialPort {
     /// anything not representable in `SerialConfig` (clocal, the ixon family)
     /// was silently dropped while disconnected and wiped at the next
     /// auto-reconnect.
-    termios: libc::termios,
+    termios: platform::termios,
     io: SerialIoState,
-    saved_termios: Option<libc::termios>,
+    saved_termios: Option<platform::termios>,
 }
 
 /// Seed the cached termios the way C `drvAsynSerialPortConfigure` does
@@ -491,16 +857,16 @@ pub struct DrvAsynSerialPort {
 /// the line state from `SerialConfig` again, so an option that `SerialConfig`
 /// cannot express (clocal, per-flag ixon/ixoff/ixany) is no longer erased at
 /// the next connect.
-fn seed_termios(config: &SerialConfig) -> AsynResult<libc::termios> {
-    let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    unsafe { libc::cfmakeraw(&mut t) };
+fn seed_termios(config: &SerialConfig) -> AsynResult<platform::termios> {
+    let mut t: platform::termios = unsafe { std::mem::zeroed() };
+    unsafe { platform::cfmakeraw(&mut t) };
     // Enable receiver, local mode (C's CS8|CLOCAL|CREAD seed).
-    t.c_cflag |= libc::CREAD | libc::CLOCAL;
+    t.c_cflag |= platform::CREAD | platform::CLOCAL;
     // C parity (drvAsynSerialPort.c:1080): the default input flags are
     // IGNBRK | IGNPAR. cfmakeraw clears IGNBRK (and never sets IGNPAR),
     // so without this a line BREAK or a framing/parity error reaches
     // the reader as a spurious 0x00 byte where C silently ignores it.
-    t.c_iflag |= libc::IGNBRK | libc::IGNPAR;
+    t.c_iflag |= platform::IGNBRK | platform::IGNPAR;
     // VMIN=1, VTIME=0 — blocking read waits for at least 1 byte.
     // Deliberate divergence from C (drvAsynSerialPort.c:1083 seeds
     // VMIN=0 and reprograms VMIN/VTIME per read from the requested
@@ -511,15 +877,19 @@ fn seed_termios(config: &SerialConfig) -> AsynResult<libc::termios> {
     // VMIN=0 would make a spurious poll-wake return 0 and be misread as a
     // disconnect. Every representable (non-negative) timeout is already
     // bounded by the poll.
-    t.c_cc[libc::VMIN] = 1;
-    t.c_cc[libc::VTIME] = 0;
+    t.c_cc[platform::VMIN] = 1;
+    t.c_cc[platform::VTIME] = 0;
     // C parity (drvAsynSerialPort.c:1085-1086): the XON/XOFF flow
     // characters default to ^Q (0x11, VSTART) and ^S (0x13, VSTOP).
     // `t` was zeroed before cfmakeraw and cfmakeraw leaves c_cc
     // untouched, so without this FlowControl::Software (IXON|IXOFF)
-    // would drive flow with NUL bytes instead of ^Q/^S.
-    t.c_cc[libc::VSTART] = 0x11; // ^Q
-    t.c_cc[libc::VSTOP] = 0x13; // ^S
+    // would drive flow with NUL bytes instead of ^Q/^S. Where the
+    // platform has no such indices the characters are not ours to
+    // choose — see `platform::SOFT_FLOW_CHARS`.
+    if let Some((vstart, vstop)) = platform::SOFT_FLOW_CHARS {
+        t.c_cc[vstart] = 0x11; // ^Q
+        t.c_cc[vstop] = 0x13; // ^S
+    }
     config.apply_to_termios(&mut t)?;
     Ok(t)
 }
@@ -616,7 +986,7 @@ impl DrvAsynSerialPort {
     /// initial state.
     pub fn send_break(&self, duration_tenths: i32) -> AsynResult<()> {
         let fd = self.io.fd_or_err()?;
-        let ret = unsafe { libc::tcsendbreak(fd, duration_tenths) };
+        let ret = unsafe { platform::tcsendbreak(fd, duration_tenths) };
         if ret < 0 {
             return Err(AsynError::Io(std::io::Error::last_os_error()));
         }
@@ -628,28 +998,31 @@ impl DrvAsynSerialPort {
     /// transmitted (POSIX `tcdrain`). Useful immediately before
     /// [`Self::send_break`] so the BREAK signal isn't preceded by
     /// unflushed user data.
+    ///
+    /// Errors where the platform has no drain at all (VxWorks), rather
+    /// than returning `Ok(())` for an operation that did not happen.
     pub fn drain_output(&self) -> AsynResult<()> {
         let fd = self.io.fd_or_err()?;
-        let ret = unsafe { libc::tcdrain(fd) };
-        if ret < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
+        match platform::drain(fd) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(AsynError::Io(e)),
+            None => Err(option_unsupported_here("drain")),
         }
-        Ok(())
     }
 
-    fn get_current_termios(&self) -> AsynResult<libc::termios> {
+    fn get_current_termios(&self) -> AsynResult<platform::termios> {
         let fd = self.io.fd_or_err()?;
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::tcgetattr(fd, &mut t) };
+        let mut t: platform::termios = unsafe { std::mem::zeroed() };
+        let ret = unsafe { platform::tcgetattr(fd, &mut t) };
         if ret < 0 {
             return Err(AsynError::Io(std::io::Error::last_os_error()));
         }
         Ok(t)
     }
 
-    fn apply_termios(&self, t: &libc::termios) -> AsynResult<()> {
+    fn apply_termios(&self, t: &platform::termios) -> AsynResult<()> {
         let fd = self.io.fd_or_err()?;
-        let ret = unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) };
+        let ret = unsafe { platform::tcsetattr(fd, platform::TCSANOW, t) };
         if ret < 0 {
             return Err(AsynError::Io(std::io::Error::last_os_error()));
         }
@@ -666,7 +1039,7 @@ impl DrvAsynSerialPort {
     /// successful cache mutation, so the device state is always exactly the
     /// cache — never a rebuild from a partial config.
     fn apply_options(&mut self) -> AsynResult<()> {
-        self.termios.c_cflag |= libc::CREAD;
+        self.termios.c_cflag |= platform::CREAD;
         let t = self.termios;
         self.apply_termios(&t)
     }
@@ -707,7 +1080,7 @@ impl PortDriver for DrvAsynSerialPort {
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+                libc::O_RDWR | platform::O_NOCTTY | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -742,17 +1115,29 @@ impl PortDriver for DrvAsynSerialPort {
             // C parity (drvAsynSerialPort.c:729): discard any bytes that
             // accumulated in the kernel input/output buffers before the port
             // was configured, so the first read/write starts from a clean
-            // device state. C does this right before turning blocking back on.
-            unsafe { libc::tcflush(fd, libc::TCIOFLUSH) };
+            // device state.
+            unsafe { platform::tcflush(fd, platform::FLUSH_IO) };
 
-            // 4. Restore blocking mode
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
-            }
+            // 4. The fd STAYS non-blocking, for its whole life.
+            //
+            // C turns blocking back on here (drvAsynSerialPort.c:731-739),
+            // because its reads are bounded by termios VMIN/VTIME and its
+            // writes by an epicsTimer that fires tcflush(TCOFLUSH) at a stuck
+            // one. This driver has neither: every read and every write is
+            // gated by `poll` with the caller's deadline (see `OctetNext for
+            // SerialIoState`), which is the deviation `seed_termios` already
+            // documents. Under that model blocking mode buys nothing — a
+            // `read` only ever runs after `poll` reported POLLIN, and EAGAIN
+            // is already a retry — while a blocking `write` would sit past
+            // the deadline with no timer to break it.
+            //
+            // So the state is uniform rather than toggled: `write` used to
+            // flip the fd non-blocking and back on every call, which meant
+            // the fd's mode depended on where you looked from. One mode for
+            // the fd's whole life removes that, and with it the
+            // `fcntl(F_GETFL)` that VxWorks answers -1 to — measured on
+            // target, and the reason C skips this very block there
+            // (`#ifndef vxWorks`, :728). One rule, no platform branch.
             Ok(())
         })();
         if let Err(e) = setup {
@@ -785,7 +1170,7 @@ impl PortDriver for DrvAsynSerialPort {
 
         // Restore original termios if available
         if let (Some(fd), Some(saved)) = (self.io.fd, &self.saved_termios) {
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, saved) };
+            unsafe { platform::tcsetattr(fd, platform::TCSANOW, saved) };
         }
 
         // Close fd
@@ -829,7 +1214,7 @@ impl PortDriver for DrvAsynSerialPort {
     /// The raw device read — the **bottom** of the port's octet chain, C
     /// `drvAsynSerialPort.c::readIt` below the interposes the manager installed
     /// on top of it. The interpose chain is run by the port
-    /// ([`crate::port::octet_read_chain`]), not from here: a driver that
+    /// (`crate::port::octet_read_chain`), not from here: a driver that
     /// dispatched its own chain gave every other driver a chain that never ran.
     fn io_read_octet_eom(
         &mut self,
@@ -916,7 +1301,7 @@ impl PortDriver for DrvAsynSerialPort {
         let value = value.trim();
 
         // C keeps `baudPrev`/`termiosPrev` for the applyOptions rollback
-        // (:341-346, :599-606). `libc::termios` is Copy, so this is the same
+        // (:341-346, :599-606). `platform::termios` is Copy, so this is the same
         // snapshot-and-restore.
         let baud_prev = self.baud;
         let termios_prev = self.termios;
@@ -939,10 +1324,7 @@ impl PortDriver for DrvAsynSerialPort {
                         status: AsynStatus::Error,
                         message: format!("Unsupported data rate ({baud} baud)"),
                     })?;
-                unsafe {
-                    libc::cfsetispeed(&mut self.termios, speed);
-                    libc::cfsetospeed(&mut self.termios, speed);
-                }
+                set_termios_speed(&mut self.termios, speed)?;
                 self.baud = baud as u32;
             }
             "bits" => {
@@ -960,12 +1342,12 @@ impl PortDriver for DrvAsynSerialPort {
                         });
                     }
                 };
-                self.termios.c_cflag &= !libc::CSIZE;
+                self.termios.c_cflag &= !platform::CSIZE;
                 self.termios.c_cflag |= match bits {
-                    DataBits::Five => libc::CS5,
-                    DataBits::Six => libc::CS6,
-                    DataBits::Seven => libc::CS7,
-                    DataBits::Eight => libc::CS8,
+                    DataBits::Five => platform::CS5,
+                    DataBits::Six => platform::CS6,
+                    DataBits::Seven => platform::CS7,
+                    DataBits::Eight => platform::CS8,
                 };
             }
             "parity" => {
@@ -975,14 +1357,14 @@ impl PortDriver for DrvAsynSerialPort {
                 // were a Rust-only superset and are dropped to match C.
                 let val_lower = value.to_ascii_lowercase();
                 match val_lower.as_str() {
-                    "none" => self.termios.c_cflag &= !libc::PARENB,
+                    "none" => self.termios.c_cflag &= !platform::PARENB,
                     "even" => {
-                        self.termios.c_cflag |= libc::PARENB;
-                        self.termios.c_cflag &= !libc::PARODD;
+                        self.termios.c_cflag |= platform::PARENB;
+                        self.termios.c_cflag &= !platform::PARODD;
                     }
                     "odd" => {
-                        self.termios.c_cflag |= libc::PARENB;
-                        self.termios.c_cflag |= libc::PARODD;
+                        self.termios.c_cflag |= platform::PARENB;
+                        self.termios.c_cflag |= platform::PARODD;
                     }
                     _ => {
                         // C's text for this key is not of the "Invalid <key>
@@ -995,8 +1377,8 @@ impl PortDriver for DrvAsynSerialPort {
                 }
             }
             "stop" => match value {
-                "1" => self.termios.c_cflag &= !libc::CSTOPB,
-                "2" => self.termios.c_cflag |= libc::CSTOPB,
+                "1" => self.termios.c_cflag &= !platform::CSTOPB,
+                "2" => self.termios.c_cflag |= platform::CSTOPB,
                 _ => {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
@@ -1006,37 +1388,42 @@ impl PortDriver for DrvAsynSerialPort {
             },
             "clocal" => {
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_cflag |= libc::CLOCAL;
+                    self.termios.c_cflag |= platform::CLOCAL;
                 } else {
-                    self.termios.c_cflag &= !libc::CLOCAL;
+                    self.termios.c_cflag &= !platform::CLOCAL;
                 }
             }
             "crtscts" => {
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_cflag |= libc::CRTSCTS;
+                    self.termios.c_cflag |= platform::CRTSCTS;
                 } else {
-                    self.termios.c_cflag &= !libc::CRTSCTS;
+                    self.termios.c_cflag &= !platform::CRTSCTS;
                 }
             }
             "ixon" => {
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_iflag |= libc::IXON;
+                    self.termios.c_iflag |= platform::IXON;
                 } else {
-                    self.termios.c_iflag &= !libc::IXON;
+                    self.termios.c_iflag &= !platform::IXON;
                 }
             }
             "ixoff" => {
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_iflag |= libc::IXOFF;
+                    self.termios.c_iflag |= platform::IXOFF;
                 } else {
-                    self.termios.c_iflag &= !libc::IXOFF;
+                    self.termios.c_iflag &= !platform::IXOFF;
                 }
             }
             "ixany" => {
+                // C validates the value before the platform check on POSIX,
+                // but refuses `ixany` on vxWorks without looking at it at all
+                // (drvAsynSerialPort.c:466-471) — the refusal is about the
+                // key, not the value, so it comes first.
+                let bit = platform::IXANY.ok_or_else(|| option_unsupported_here("ixany"))?;
                 if parse_yn_option(&key, value)? {
-                    self.termios.c_iflag |= libc::IXANY;
+                    self.termios.c_iflag |= bit;
                 } else {
-                    self.termios.c_iflag &= !libc::IXANY;
+                    self.termios.c_iflag &= !bit;
                 }
             }
             "break" => {
@@ -1059,10 +1446,15 @@ impl PortDriver for DrvAsynSerialPort {
                     // tcdrain/tcsendbreak on the dead fd and returns asynError.
                     let fd = self.io.fd_or_err()?;
                     // Drain output first (C parity: tcdrain before tcsendbreak).
-                    if unsafe { libc::tcdrain(fd) } < 0 {
-                        return Err(AsynError::Io(std::io::Error::last_os_error()));
+                    // Where the platform has no drain the BREAK still goes out
+                    // — only the guarantee that queued bytes precede it is
+                    // lost. C weighs it the same way, ignoring tcdrain's return
+                    // entirely (drvAsynSerialPort.c:526), so a missing drain is
+                    // not grounds to refuse the break.
+                    if let Some(res) = platform::drain(fd) {
+                        res.map_err(AsynError::Io)?;
                     }
-                    let ret = unsafe { libc::tcsendbreak(fd, duration) };
+                    let ret = unsafe { platform::tcsendbreak(fd, duration) };
                     if ret < 0 {
                         return Err(AsynError::Io(std::io::Error::last_os_error()));
                     }
@@ -1115,35 +1507,35 @@ impl PortDriver for DrvAsynSerialPort {
             // reported "N" for a `clocal N`-by-default port that C reports as
             // "Y", and lost every option set while the line was down.
             "baud" => Ok(self.baud.to_string()),
-            "bits" => Ok(match self.termios.c_cflag & libc::CSIZE {
-                libc::CS5 => "5",
-                libc::CS6 => "6",
-                libc::CS7 => "7",
-                libc::CS8 => "8",
+            "bits" => Ok(match self.termios.c_cflag & platform::CSIZE {
+                platform::CS5 => "5",
+                platform::CS6 => "6",
+                platform::CS7 => "7",
+                platform::CS8 => "8",
                 _ => "?",
             }
             .to_string()),
-            "parity" => Ok(if self.termios.c_cflag & libc::PARENB == 0 {
+            "parity" => Ok(if self.termios.c_cflag & platform::PARENB == 0 {
                 "none"
-            } else if self.termios.c_cflag & libc::PARODD != 0 {
+            } else if self.termios.c_cflag & platform::PARODD != 0 {
                 "odd"
             } else {
                 "even"
             }
             .to_string()),
-            "stop" => Ok(if self.termios.c_cflag & libc::CSTOPB != 0 {
+            "stop" => Ok(if self.termios.c_cflag & platform::CSTOPB != 0 {
                 "2"
             } else {
                 "1"
             }
             .to_string()),
-            "clocal" => Ok(if self.termios.c_cflag & libc::CLOCAL != 0 {
+            "clocal" => Ok(if self.termios.c_cflag & platform::CLOCAL != 0 {
                 "Y"
             } else {
                 "N"
             }
             .to_string()),
-            "crtscts" => Ok(if self.termios.c_cflag & libc::CRTSCTS != 0 {
+            "crtscts" => Ok(if self.termios.c_cflag & platform::CRTSCTS != 0 {
                 "Y"
             } else {
                 "N"
@@ -1154,22 +1546,27 @@ impl PortDriver for DrvAsynSerialPort {
             // ixoff from `tty->termios.c_iflag` on every POSIX target; the
             // hard-coded 'N' for ixany/ixoff there is inside `#ifdef vxWorks`,
             // where the flags genuinely have no termios home.
-            "ixon" => Ok(if self.termios.c_iflag & libc::IXON != 0 {
+            "ixon" => Ok(if self.termios.c_iflag & platform::IXON != 0 {
                 "Y"
             } else {
                 "N"
             }
             .to_string()),
-            "ixoff" => Ok(if self.termios.c_iflag & libc::IXOFF != 0 {
+            "ixoff" => Ok(if self.termios.c_iflag & platform::IXOFF != 0 {
                 "Y"
             } else {
                 "N"
             }
             .to_string()),
-            "ixany" => Ok(if self.termios.c_iflag & libc::IXANY != 0 {
-                "Y"
-            } else {
-                "N"
+            // Asymmetric with `set_option` on purpose, and C is asymmetric the
+            // same way: `setOption` refuses `ixany` on vxWorks
+            // (drvAsynSerialPort.c:466-471) while `getOption` answers a
+            // hard-coded 'N' (:189-190) rather than erroring. Both are true
+            // statements about a line that has no such bit — the option cannot
+            // be turned on, and it is not on.
+            "ixany" => Ok(match platform::IXANY {
+                Some(bit) if self.termios.c_iflag & bit != 0 => "Y",
+                _ => "N",
             }
             .to_string()),
             // C getOption (drvAsynSerialPort.c:204-207): "break" is a momentary
@@ -2627,6 +3024,183 @@ mod tests {
         let t = drv.get_current_termios().unwrap();
         assert_eq!(t.c_cc[libc::VSTART], 0x11, "VSTART must be ^Q (C default)");
         assert_eq!(t.c_cc[libc::VSTOP], 0x13, "VSTOP must be ^S (C default)");
+    }
+
+    /// Invariant: the serial fd is non-blocking for its whole life — at every
+    /// point an observer can look, not just inside `write`.
+    ///
+    /// The three boundaries are right after `connect` (which used to clear
+    /// O_NONBLOCK), after a `write` (which used to set it and restore it), and
+    /// after a `read`. Checking all three is the point: the defect this
+    /// replaces was not a wrong mode, it was a mode that *depended on where
+    /// you looked from*, and only a per-boundary check catches that.
+    #[test]
+    fn pty_fd_is_non_blocking_at_every_boundary() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+        let _guard = PtyGuard { master, slave: -1 };
+
+        let mut drv = DrvAsynSerialPort::new("pty_nonblock", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        let fd = drv.io.fd.expect("connected");
+
+        let nonblocking = |where_: &str| {
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(fl >= 0, "F_GETFL failed at {where_}");
+            assert_ne!(
+                fl & libc::O_NONBLOCK,
+                0,
+                "fd must be non-blocking {where_}, flags=0x{fl:x}"
+            );
+        };
+
+        nonblocking("after connect");
+
+        let mut user = AsynUser {
+            timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        drv.write_octet(&mut user, b"probe\n").unwrap();
+        nonblocking("after write");
+
+        // The read times out (nothing is driving the master end); what matters
+        // is the fd's mode on the way out, not the outcome.
+        let mut buf = [0u8; 8];
+        let _ = drv.read_octet(&user, &mut buf);
+        nonblocking("after read");
+    }
+
+    /// Boundary: this host HAS every termios facility, so `platform` must
+    /// report every one of them present.
+    ///
+    /// The `None` arms exist for VxWorks and cannot be exercised here — but
+    /// the failure this guards against is the opposite direction and is very
+    /// much reachable: widen `platform`'s `cfg` by one target, or invert it,
+    /// and a hosted build silently starts refusing `ixany`, stops seeding
+    /// ^Q/^S, and answers `drain_output` with an error. Nothing else would
+    /// fail, because every consumer handles `None` as a legitimate answer.
+    /// So the assertion is that `None` is *not* legitimate here.
+    #[test]
+    fn platform_reports_every_facility_present_on_this_host() {
+        assert_eq!(
+            platform::IXANY,
+            Some(libc::IXANY),
+            "hosted unix has an IXANY bit"
+        );
+        assert_eq!(
+            platform::SOFT_FLOW_CHARS,
+            Some((libc::VSTART, libc::VSTOP)),
+            "hosted unix has programmable XON/XOFF characters"
+        );
+        assert_eq!(
+            platform::CRTSCTS,
+            libc::CRTSCTS,
+            "the seam must be transparent where libc has the bit"
+        );
+        assert_eq!(platform::O_NOCTTY, libc::O_NOCTTY);
+        assert_eq!(
+            platform::FLUSH_IO,
+            libc::TCIOFLUSH,
+            "hosted unix can discard both queues at once"
+        );
+        // A closed fd: `drain` must still answer `Some` (the platform *has*
+        // tcdrain), reporting EBADF rather than the `None` that means "no
+        // such call exists here".
+        assert!(
+            matches!(platform::drain(-1), Some(Err(_))),
+            "hosted unix has tcdrain; -1 must fail as an fd, not as a facility"
+        );
+    }
+
+    /// A speed the platform's own `cfsetospeed` refuses must come back as an
+    /// error, not as a silently unchanged rate.
+    ///
+    /// `baud_to_speed` keeps an invalid code from reaching here through the
+    /// public API on this host, so the owner is exercised directly — which is
+    /// the point: it is the owner, not the caller, that has to refuse. The
+    /// failure this reproduces was measured on RTEMS, where the rate reached
+    /// `cfsetospeed` and was dropped.
+    ///
+    /// Runs where the speed argument is an encoded code, because that is where
+    /// a refusable input exists. On the rate-valued hosts — macOS and the BSDs
+    /// — `cfsetospeed` is an assignment to `c_ospeed` that validates nothing
+    /// and returns 0 for any value, so no `bogus` can reach the error arm; C
+    /// accepts every rate there too (`baudCode = baud`). RTEMS is nominally in
+    /// that group but its `cfsetospeed` does enforce a rate table, which is
+    /// what this reproduces — asserted on target, since RTEMS runs no
+    /// `cargo test`.
+    #[cfg(not(asyn_baud_code_is_rate))]
+    #[test]
+    fn a_speed_the_platform_refuses_is_an_error_not_a_silent_no_op() {
+        let mut t: platform::termios = unsafe { std::mem::zeroed() };
+        set_termios_speed(&mut t, platform::B9600).expect("9600 is settable everywhere");
+        let before = unsafe { libc::cfgetospeed(&t) };
+        let bogus = platform::Speed::MAX / 2;
+        let r = set_termios_speed(&mut t, bogus);
+        assert!(
+            matches!(&r, Err(AsynError::Status { message, .. })
+                     if message.starts_with("cfsetispeed returned")
+                     || message.starts_with("cfsetospeed returned")),
+            "must name the call C names, got {r:?}"
+        );
+        assert_eq!(
+            unsafe { libc::cfgetospeed(&t) },
+            before,
+            "a refused speed must leave the previous rate in place"
+        );
+    }
+
+    /// Every `c_cc` index the seam hands out has to be inside the array the
+    /// platform's own `struct termios` declares — `seed_termios` writes
+    /// through all four without a bounds question.
+    ///
+    /// On RTEMS this is a `const` assertion next to the struct, because the
+    /// target cannot run these tests; here it is checked against the real
+    /// array, so an arm that took an index from another platform's `c_cc`
+    /// layout is caught rather than corrupting whatever follows the field.
+    #[test]
+    fn every_c_cc_index_the_seam_hands_out_is_inside_the_array() {
+        let t: platform::termios = unsafe { std::mem::zeroed() };
+        let n = t.c_cc.len();
+        assert!(
+            platform::VMIN < n,
+            "VMIN {} outside c_cc[{n}]",
+            platform::VMIN
+        );
+        assert!(
+            platform::VTIME < n,
+            "VTIME {} outside c_cc[{n}]",
+            platform::VTIME
+        );
+        if let Some((vstart, vstop)) = platform::SOFT_FLOW_CHARS {
+            assert!(vstart < n, "VSTART {vstart} outside c_cc[{n}]");
+            assert!(vstop < n, "VSTOP {vstop} outside c_cc[{n}]");
+        }
+    }
+
+    /// The refusal `platform`'s `None` arms lean on, checked for shape here
+    /// since the arms themselves only compile on VxWorks. C's wording is
+    /// "Option ixany not supported on vxWorks" (drvAsynSerialPort.c:469-471).
+    #[test]
+    fn unsupported_option_names_the_key_and_the_platform() {
+        let msg = match option_unsupported_here("ixany") {
+            AsynError::Status { status, message } => {
+                assert_eq!(status, AsynStatus::Error);
+                message
+            }
+            other => panic!("expected a Status error, got {other:?}"),
+        };
+        assert!(msg.contains("ixany"), "must name the option: {msg}");
+        assert!(
+            msg.contains(std::env::consts::OS),
+            "must name the platform: {msg}"
+        );
     }
 
     /// DRV-35: C setOption (drvAsynSerialPort.c:601-604) restores the previous

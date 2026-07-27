@@ -27,10 +27,20 @@
 //! ```
 //!
 //! So on an alarm-transition cycle the two masks differ (DBE_ALARM is in one and
-//! not the other), and an array in BOTH masks gets BOTH events. The port
-//! collapsed the two marks into one post carrying `monitor_mask|DBE_VALUE|
-//! DBE_LOG`: one event instead of two, and the AMASK event carrying an alarm bit
-//! C never puts on it.
+//! not the other), and an array in BOTH masks is posted TWICE. The port used to
+//! merge the two marks before posting at all: one `db_post_events` call instead
+//! of two, and the AMASK call carrying an alarm bit C never puts on it. That is
+//! what these tests pin — the record's *post* sites, which is where the
+//! divergence was.
+//!
+//! What a subscriber then RECEIVES is the event queue's business, and for an
+//! array field C's queue absorbs the second post: `db_create_field_log` stores
+//! an array by reference (`dbfl_type_ref`), and `db_queue_event_log`'s
+//! early-drop (`dbEvent.c:786-799`) refuses to queue a second by-reference log
+//! for one monitor. So an undrained C monitor sees ONE delivery here, not two,
+//! and it reads the record's current array when it is finally delivered. The
+//! port's queue does the same (`event_queue`'s latest-only rule), keeping the
+//! newer snapshot and OR-ing the displaced mask into it.
 
 use std::collections::HashSet;
 
@@ -71,58 +81,75 @@ async fn acalcout_with(db: &PvDatabase, calc: &str) {
     db.add_record("A", Box::new(a)).await.unwrap();
 }
 
-async fn subscribe_aa(db: &PvDatabase) -> epics_base_rs::server::event_queue::EventReader {
+fn subscribe_aa(
+    db: &PvDatabase,
+    sid: u32,
+    mask: EventMask,
+) -> epics_base_rs::server::event_queue::EventReader {
     let inst = db.get_record("A").unwrap();
     let mut g = inst.write();
-    g.add_subscriber(
-        "AA",
-        1,
-        DbFieldType::Double,
-        (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
-    )
-    .expect("an AA subscription must be accepted")
+    g.add_subscriber("AA", sid, DbFieldType::Double, mask.bits())
+        .expect("an AA subscription must be accepted")
 }
 
 /// AA is in BOTH masks: the link delivered a changed array (NEWM bit 0) and the
 /// expression stored into it (AMASK bit 0). C posts it twice — `afterCalc` with
 /// a literal DBE_VALUE|DBE_LOG, then `monitor()` with the alarm bit folded in.
+///
+/// Both posts land on an ARRAY field, so an undrained monitor holds one entry
+/// either way (C's by-reference early-drop, the port's latest-only rule). The
+/// two call sites are therefore counted, not received: a subscription that
+/// takes both masks absorbs the second post as a collapse, while an ALARM-only
+/// subscription is reached by exactly one post and so absorbs none — which is
+/// what shows that `afterCalc`'s mask carries no alarm bit.
 #[epics_macros_rs::epics_test]
 async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
     let db = PvDatabase::new();
     // `AA := AA + 0` stores AA (AMASK bit 0) without altering the fetched value.
     acalcout_with(&db, "AA:=AA+0;SUM(AA)").await;
-    let mut aa_rx = subscribe_aa(&db).await;
+    let mut both_rx = subscribe_aa(&db, 1, EventMask::VALUE | EventMask::LOG | EventMask::ALARM);
+    let mut alarm_rx = subscribe_aa(&db, 2, EventMask::ALARM);
 
     process(&db, "A").await;
 
-    let first = aa_rx
-        .try_recv()
-        .expect("afterCalc posts the AMASK-flagged AA (:293-297)");
     assert_eq!(
-        first.mask,
-        EventMask::VALUE | EventMask::LOG,
-        "afterCalc's post is a LITERAL DBE_VALUE|DBE_LOG — monitor_mask is not in \
-         scope there, so the alarm bit of this transition cycle is NOT on it"
+        both_rx.queue().ncollapse(1),
+        1,
+        "two db_post_events calls reached this subscription — the second \
+         collapsed onto the first, which is what C's early-drop does to a \
+         second by-reference log"
+    );
+    let held = both_rx
+        .try_recv()
+        .expect("the collapsed entry is still queued");
+    assert_eq!(
+        held.mask,
+        EventMask::ALARM | EventMask::VALUE | EventMask::LOG,
+        "monitor()'s monitor_mask|DBE_VALUE|DBE_LOG, with afterCalc's displaced \
+         DBE_VALUE|DBE_LOG OR-ed in by the queue"
     );
     assert_eq!(
-        first.snapshot.value,
+        held.snapshot.value,
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0])
     );
+    assert!(both_rx.try_recv().is_err());
 
-    let second = aa_rx
-        .try_recv()
-        .expect("monitor() posts the NEWM-flagged AA as well (:1031-1036)");
     assert_eq!(
-        second.mask,
+        alarm_rx.queue().ncollapse(2),
+        0,
+        "afterCalc's post is a LITERAL DBE_VALUE|DBE_LOG — monitor_mask is not \
+         in scope there — so it never reaches an ALARM-only subscription and \
+         there is nothing for monitor()'s post to collapse onto"
+    );
+    let only = alarm_rx
+        .try_recv()
+        .expect("monitor() posts the NEWM-flagged AA with the alarm bit (:1031-1036)");
+    assert_eq!(
+        only.mask,
         EventMask::ALARM | EventMask::VALUE | EventMask::LOG,
-        "monitor()'s post is monitor_mask|DBE_VALUE|DBE_LOG, and this cycle's \
-         NoAlarm -> Minor transition puts DBE_ALARM in monitor_mask"
+        "this cycle's NoAlarm -> Minor transition puts DBE_ALARM in monitor_mask"
     );
-
-    assert!(
-        aa_rx.try_recv().is_err(),
-        "two C call sites fired, so exactly two events"
-    );
+    assert!(alarm_rx.try_recv().is_err());
 }
 
 /// The AMASK half alone: the expression stores into CC, no link feeds it. Even on

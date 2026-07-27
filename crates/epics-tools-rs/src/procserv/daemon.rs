@@ -36,7 +36,7 @@ use crate::procserv::sidecar::write_pid_file;
 /// log file, and write the pid file with the **child's** pid so a
 /// `Type=forking` systemd unit finds it the instant the parent returns.
 pub struct DaemonParent<'a> {
-    /// Diagnostic prefix (C `procservName` = argv[0]); the bin passes
+    /// Diagnostic prefix (C `procservName` = `argv[0]`); the bin passes
     /// `"procserv-rs"` to match its other stderr diagnostics.
     pub name: &'a str,
     /// `--pidfile` path. The parent writes it with the daemon's pid.

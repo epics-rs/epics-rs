@@ -7,7 +7,7 @@
 //!   [`search`], [`search_engine`], [`peers`]. No sockets; drives the codec in
 //!   [`crate::decode`] / [`crate::proto`]. Compiles for every target, RTEMS
 //!   included.
-//! * **Async I/O layer** — [`accept`], [`udp`], [`runtime`]. Built on
+//! * **Async I/O layer** — `accept`, `udp`, `runtime`. Built on
 //!   `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
 //!   None of those cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*`
 //!   triples (§8.1), so this layer is host-only; each embedded target gets a
@@ -16,11 +16,11 @@
 //!   `epics_embedded_target`, not a feature: it is not a choice a hosted
 //!   build can make.
 //!
-//! [`accept`] is the TCP side's only socket-bearing module; [`tcp`] and the
+//! `accept` is the TCP side's only socket-bearing module; [`tcp`] and the
 //! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
-//! second (blocking) driver is an addition beside [`accept`] rather than a
+//! second (blocking) driver is an addition beside `accept` rather than a
 //! `cfg` threaded through the protocol (`doc/pva-rtems-item7-design.md` §6).
-//! The re-point that moves the gate off `tcp` and onto [`accept`] — the owed
+//! The re-point that moves the gate off `tcp` and onto `accept` — the owed
 //! half named in `4c75e766` — has landed: `tcp`, [`peers`] and [`search`]
 //! build for RTEMS, and the four items that held `tcp` back were fixed at
 //! source rather than gated around (config and SEARCH protocol lifted out of
@@ -30,7 +30,7 @@
 #[cfg(not(epics_embedded_target))]
 pub mod accept;
 // The blocking thread-per-connection driver — the second driver beside
-// [`accept`], for targets with no reactor (RTEMS item 5 stage 3). Owns
+// `accept`, for targets with no reactor (RTEMS item 5 stage 3). Owns
 // sockets, so it belongs to the I/O layer; host-compiled and host-tested so
 // hosted behaviour can be shown unchanged.
 pub mod blocking;
@@ -59,7 +59,7 @@ pub mod shared_pv;
 pub mod source;
 // The circuit protocol. Speaks `AsyncRead`/`AsyncWrite` trait objects and
 // spawns through the runtime seam — no socket type, so it is target-neutral;
-// [`accept`] supplies the hosted stream and the embedded-target blocking
+// `accept` supplies the hosted stream and the embedded-target blocking
 // driver will supply its own.
 pub mod tcp;
 #[cfg(not(epics_embedded_target))]
@@ -70,11 +70,17 @@ pub use monitor_control::{MonitorControlOp, MonitorReceiver, PostError};
 pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };
+// The config record lives in the ungated [`config`] module and compiles for
+// every target, so it is re-exported from there rather than from the host-only
+// [`runtime`] that also re-exports it. Routing it through `runtime` made
+// `server_native::PvaServerConfig` vanish on `armv7-rtems-eabihf` and the
+// `*-wrs-vxworks*` triples even though the type was right there, which forced
+// embedded callers onto `server_native::config::PvaServerConfig` and left every
+// doc reference to the short path unresolvable on those targets.
+pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
 pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
 #[cfg(not(epics_embedded_target))]
-pub use runtime::{
-    DEFAULT_MAX_MESSAGE_SIZE, PvaServer, PvaServerConfig, ServerReportHandle, run_pva_server,
-};
+pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{AddPvError, SharedPV, SharedSource};
 pub use source::{

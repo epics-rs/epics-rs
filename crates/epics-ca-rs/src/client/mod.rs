@@ -937,6 +937,11 @@ impl CaClient {
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let client_identity: types::ClientIdentitySlot =
             Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
+        // Built before the transport, because the circuit's receive path — not
+        // the coordinator — is what raises server exceptions (C ref:
+        // `cac::exceptionRespAction`, `cac.cpp:1082-1120`, runs inside
+        // `executeResponse` on the receive thread).
+        let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
@@ -945,6 +950,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    exception_slot.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
                     client_identity.clone(),
@@ -959,6 +965,7 @@ impl CaClient {
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
+                    exception_slot.clone(),
                     server_writers.clone(),
                     last_rx_at.clone(),
                     client_identity.clone(),
@@ -967,7 +974,6 @@ impl CaClient {
         };
 
         let diagnostics = Arc::new(CaDiagnostics::default());
-        let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         #[cfg(ca_beacon_monitor)]
         let (beacon_ctrl_tx, beacon_ctrl_rx) =
@@ -2011,13 +2017,21 @@ impl CaChannel {
         // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
         // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
         crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
+        // Bind the identity to the request before the request exists on the
+        // wire, at the one site both routes pass through. A plain write has
+        // no ioid and no completion, so this record is the only thing that
+        // survives to tell a later `CA_PROTO_ERROR` what it is about; libca
+        // gets the same answer from the `nciu` the write was issued through.
+        self.in_flight
+            .write_identities
+            .insert(self.cid, Arc::clone(&self.pv_name));
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
                 data_type,
                 count,
-                None,
+                Some(self.cid),
                 payload,
                 snap.server_minor,
             )?);
@@ -2026,6 +2040,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::Write {
                 sid: snap.sid,
+                cid: self.cid,
                 data_type,
                 count,
                 payload,
@@ -3104,7 +3119,7 @@ impl CaChannel {
     /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
     /// not in the tool.
     ///
-    /// The lookup is [`types::peer_resolved_name`] — `hostname::ip_addr_to_a`
+    /// The lookup is `types::peer_resolved_name` — `hostname::ip_addr_to_a`
     /// on a blocking thread: this is an `async fn` a caller awaits, so it can
     /// wait for the resolver exactly as C's `cainfo` does, and no other
     /// channel's progress is behind it.
@@ -3624,6 +3639,7 @@ async fn run_coordinator(
                         }
 
                         // Clear channel on server + clean reverse index
+                        let mut cleared_on_server = false;
                         if let Some(ch) = channels.get(&cid) {
                             if ch.state.is_operational() {
                                 let _ = transport_tx.send(TransportCommand::ClearChannel {
@@ -3632,6 +3648,7 @@ async fn run_coordinator(
                                     server_addr: ch.server_addr.unwrap(),
                                     priority: ch.priority,
                                 });
+                                cleared_on_server = true;
                             }
                             // Cancel search for any non-connected state
                             match ch.state {
@@ -3653,6 +3670,16 @@ async fn run_coordinator(
                         // authoritative table.
                         cid_alloc.release(cid);
                         snapshots.remove(&cid);
+                        // A channel that never reached the server cannot be
+                        // the subject of a later ERROR, so its write identity
+                        // closes here. When a CLEAR_CHANNEL did go out the
+                        // window stays open until the server confirms it —
+                        // that confirmation is the fence, and dropping the
+                        // identity here instead is exactly the race this
+                        // record exists to remove.
+                        if !cleared_on_server {
+                            in_flight.write_identities.remove(&cid);
+                        }
                         // Drop any in-flight read/write entries for this
                         // cid. Normally `self.in_flight.reads/writes
                         // .remove(&ioid)` in the op future already cleans
@@ -4143,105 +4170,6 @@ async fn run_coordinator(
                                 });
                             }
                         }
-                    }
-                    TransportEvent::ServerError {
-                        eca_status,
-                        original_request,
-                        message,
-                        server_addr,
-                        cid,
-                        data_type,
-                        count,
-                    } => {
-                        // Already logged in the transport layer; this is the
-                        // libca exception path (`cac::exceptionRespAction` →
-                        // the per-command stub). `message` stays RAW — it is
-                        // C's `pCtx`, and the default handler prints it as
-                        // `ctx="..."`; the request command is carried
-                        // structurally (op / type / count), not smuggled into
-                        // the text.
-                        //
-                        // libca's exception jump table (`cac.cpp:93-124`) sends
-                        // READ / READ_NOTIFY / WRITE_NOTIFY / EVENT_ADD to the
-                        // stubs that complete the pending IO or the
-                        // subscription callback — the exception HOOK never
-                        // fires for those, and the tool prints its own
-                        // per-operation diagnostic instead. The transport has
-                        // already completed those waiters above, so they are
-                        // done here.
-                        let routed_to_a_callback = matches!(
-                            original_request,
-                            Some(
-                                crate::protocol::CA_PROTO_READ
-                                    | crate::protocol::CA_PROTO_READ_NOTIFY
-                                    | crate::protocol::CA_PROTO_WRITE_NOTIFY
-                                    | crate::protocol::CA_PROTO_EVENT_ADD
-                            )
-                        );
-                        if routed_to_a_callback {
-                            continue;
-                        }
-                        // What is left is `cac::writeExcep` (a plain
-                        // CA_PROTO_WRITE has no callback to complete, so libca
-                        // takes it to `oldChannelNotify::writeException`,
-                        // `cac.cpp:1049-1061`) and `cac::defaultExcep` for
-                        // every other command.
-                        let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
-                            types::CaOp::Put
-                        } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
-                            types::CaOp::ClearEvent
-                        } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
-                            types::CaOp::CreateChannel
-                        } else {
-                            types::CaOp::Other
-                        };
-                        let is_channel_exception = op == types::CaOp::Put;
-                        let pv_name = is_channel_exception
-                            .then(|| cid.and_then(|c| channels.get(&c)))
-                            .flatten()
-                            .map(|ch| ch.pv_name.to_string());
-                        // `cac::defaultExcep` folds the host into the ctx
-                        // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
-                        // before raising; the channel path passes the server's
-                        // diagnostic through untouched.
-                        //
-                        // C's host there is `iiu.getHostName` — the circuit's
-                        // `hostNameCache`, i.e. the reverse-resolved NAME, the
-                        // same source `ca_host_name` reads (W10-B5). This
-                        // arm runs on the coordinator task, so it takes the
-                        // NON-blocking half of that cache: a `getnameinfo` here
-                        // would park every channel's progress behind one DNS
-                        // timeout.
-                        let message = if is_channel_exception {
-                            message
-                        } else {
-                            format!(
-                                "host={host} ctx={message}",
-                                host = types::peer_display_name(server_addr)
-                            )
-                        };
-                        types::dispatch_exception(
-                            &exception_slot,
-                            types::CaException {
-                                kind: types::CaExceptionKind::ServerError,
-                                message,
-                                server_addr: Some(server_addr),
-                                pv_name,
-                                status: Some(eca_status),
-                                op,
-                                data_type: is_channel_exception.then_some(data_type).flatten(),
-                                count: is_channel_exception.then_some(count).flatten(),
-                                // `cac::defaultExcep` (`cac.cpp:1006-1016`)
-                                // is libca's one null-file producer, so it is
-                                // the one block with no `Source File:` line;
-                                // the channel-write exception carries its own.
-                                source: if is_channel_exception {
-                                    types::LIBCA_WRITE_EXCEPTION_SITE
-                                } else {
-                                    types::ExceptionSite::NullFile
-                                },
-                            },
-                        );
                     }
                     TransportEvent::TcpClosed { server_addr, priority } => {
                         let circuit = (server_addr, priority);
@@ -5457,7 +5385,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
     out
 }
 
-/// Parse `EPICS_CA_NAME_SERVERS` — whitespace-separated host[:port] entries
+/// Parse `EPICS_CA_NAME_SERVERS` — whitespace-separated `host[:port]` entries
 /// reachable over TCP. Returns each entry's resolved [`SocketAddr`] alongside
 /// the operator-supplied hostname when one was given (None for raw-IP
 /// entries). The hostname is later threaded into the TLS handshake as the

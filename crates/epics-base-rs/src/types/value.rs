@@ -5,6 +5,12 @@ use super::DbFieldType;
 use super::PvString;
 use super::c_cast;
 
+/// `sizeof(union native_value)` (C `dbFldTypes.h`) — the widest member is
+/// `char [MAX_STRING_SIZE]`, so 40 bytes. The cut-off C uses to decide whether
+/// a monitor event queue may hold a value inline; see
+/// [`EpicsValue::queues_by_value`].
+pub const NATIVE_VALUE_BYTES: usize = 40;
+
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
 pub enum EpicsValue {
@@ -349,119 +355,130 @@ impl EpicsValue {
         }
     }
 
-    /// Serialize a value to bytes for writing
+    /// Serialize a value to bytes for writing.
+    ///
+    /// Thin wrapper over [`EpicsValue::write_into`], which is the single
+    /// owner of the wire layout. Prefer `write_into` on any path that
+    /// already has a destination buffer: C's `dbGet` converts the field
+    /// straight into the reply buffer (`dbAccess.c:1020`) and never
+    /// materialises a standalone payload, so a wide array should be written
+    /// once rather than built here and copied.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_into(&mut buf);
+        buf
+    }
+
+    /// Append this value's CA wire bytes to `dst`.
+    ///
+    /// The port of C `convert(paddr, pbuf, ...)` writing into the payload
+    /// space `cas_copy_in_header` reserved inside the client's send buffer
+    /// (`camessage.c:516` → `dbAccess.c:1020`): one materialisation of the
+    /// value, in the buffer that will be written to the socket.
+    pub fn write_into(&self, dst: &mut Vec<u8>) {
         match self {
             Self::String(s) => {
                 let mut buf = [0u8; 40];
                 let bytes = s.as_bytes();
                 let len = bytes.len().min(39);
                 buf[..len].copy_from_slice(&bytes[..len]);
-                buf.to_vec()
+                dst.extend_from_slice(&buf);
             }
-            Self::Short(v) => v.to_be_bytes().to_vec(),
-            Self::Float(v) => v.to_be_bytes().to_vec(),
-            Self::Enum(v) => v.to_be_bytes().to_vec(),
-            Self::EnumWithChoices { index, .. } => index.to_be_bytes().to_vec(),
-            Self::Char(v) => vec![*v],
-            Self::Long(v) => v.to_be_bytes().to_vec(),
-            Self::Double(v) => v.to_be_bytes().to_vec(),
+            Self::Short(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Float(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Enum(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::EnumWithChoices { index, .. } => dst.extend_from_slice(&index.to_be_bytes()),
+            Self::Char(v) => dst.push(*v),
+            Self::Long(v) => dst.extend_from_slice(&v.to_be_bytes()),
+            Self::Double(v) => dst.extend_from_slice(&v.to_be_bytes()),
             // Over CA, Int64 is served as Double (8-byte f64 big-endian).
             // Precision is lost for |v| > 2^53; that is a CA protocol limitation.
-            Self::Int64(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::Int64(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // UInt64 mirrors Int64: no CA wire type, served as DBR_DOUBLE.
-            Self::UInt64(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::UInt64(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // DBF_USHORT promotes to DBR_LONG on the wire
             // (db_convert.h `dbDBRnewToDBRold[DBR_USHORT] = DBR_LONG`); a u16
             // fits losslessly in i32. Emit 4 promoted big-endian bytes to
             // match `dbr_type()` == Long.
-            Self::UShort(v) => (*v as i32).to_be_bytes().to_vec(),
+            Self::UShort(v) => dst.extend_from_slice(&(*v as i32).to_be_bytes()),
             // DBF_ULONG promotes to DBR_DOUBLE on the wire
             // (db_convert.h `dbDBRnewToDBRold[DBR_ULONG] = DBR_DOUBLE`),
             // mirroring UInt64. Emit 8 promoted big-endian bytes.
-            Self::ULong(v) => (*v as f64).to_be_bytes().to_vec(),
+            Self::ULong(v) => dst.extend_from_slice(&(*v as f64).to_be_bytes()),
             // DBF_UCHAR promotes to DBR_CHAR on the wire (db_convert.h
             // `dbDBRnewToDBRold[DBR_UCHAR] = DBR_CHAR`); the raw byte is
             // identical to `Char`, only the interpretation is unsigned.
-            Self::UChar(v) => vec![*v],
+            Self::UChar(v) => dst.push(*v),
             Self::ShortArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 2);
+                dst.reserve(arr.len() * 2);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::FloatArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::EnumArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 2);
+                dst.reserve(arr.len() * 2);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::DoubleArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::LongArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&v.to_be_bytes());
+                    dst.extend_from_slice(&v.to_be_bytes());
                 }
-                buf
             }
             Self::Int64Array(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
             Self::UInt64Array(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
             // DBF_USHORT[] promotes element-wise to DBR_LONG[] (4 bytes each).
             Self::UShortArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 4);
+                dst.reserve(arr.len() * 4);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as i32).to_be_bytes());
+                    dst.extend_from_slice(&(*v as i32).to_be_bytes());
                 }
-                buf
             }
             // DBF_ULONG[] promotes element-wise to DBR_DOUBLE[] (8 bytes each).
             Self::ULongArray(arr) => {
-                let mut buf = Vec::with_capacity(arr.len() * 8);
+                dst.reserve(arr.len() * 8);
                 for v in arr {
-                    buf.extend_from_slice(&(*v as f64).to_be_bytes());
+                    dst.extend_from_slice(&(*v as f64).to_be_bytes());
                 }
-                buf
             }
-            Self::CharArray(arr) => arr.clone(),
+            Self::CharArray(arr) => dst.extend_from_slice(arr),
             // DBF_UCHAR[] promotes to DBR_CHAR[] over CA (identical raw bytes,
             // same as CharArray); the unsigned interpretation is carried by
             // the type, not the wire bytes.
-            Self::UCharArray(arr) => arr.clone(),
+            Self::UCharArray(arr) => dst.extend_from_slice(arr),
             Self::StringArray(arr) => {
-                let mut buf = vec![0u8; arr.len() * 40];
+                let start = dst.len();
+                dst.resize(start + arr.len() * 40, 0);
                 for (i, s) in arr.iter().enumerate() {
                     let bytes = s.as_bytes();
                     let len = bytes.len().min(39);
-                    buf[i * 40..i * 40 + len].copy_from_slice(&bytes[..len]);
+                    let at = start + i * 40;
+                    dst[at..at + len].copy_from_slice(&bytes[..len]);
                 }
-                buf
             }
         }
     }
@@ -731,6 +748,48 @@ impl EpicsValue {
                 | Self::CharArray(_)
                 | Self::StringArray(_)
         )
+    }
+
+    /// C `db_add_event`'s `useValque` test (`dbEvent.c:492-500`): may a monitor
+    /// event queue hold this value *by value*, or must it keep only the latest?
+    ///
+    /// ```c
+    /// if (dbChannelElements(chan) == 1 &&
+    ///     dbChannelSpecial(chan) != SPC_DBADDR &&
+    ///     dbChannelFieldSize(chan) <= sizeof(union native_value)) {
+    ///     pevent->useValque = TRUE;
+    /// }
+    /// else {
+    ///     pevent->useValque = FALSE;
+    /// }
+    /// ```
+    ///
+    /// C's `union native_value` (`dbFldTypes.h`) is at most one
+    /// `char[MAX_STRING_SIZE]`, so "queueable by value" means "fits in 40
+    /// bytes". Anything wider is stored by reference
+    /// (`db_create_field_log`'s `dbfl_type_ref` branch, which copies nothing
+    /// and points at the record's own field), and C then refuses to queue a
+    /// second one — `dbel` reports such a subscription as
+    /// "queueing disabled".
+    ///
+    /// The port cannot store a reference (every event carries an owned
+    /// [`crate::server::snapshot::Snapshot`]), so this predicate is what keeps
+    /// its memory profile C's: see
+    /// [`crate::server::event_queue`]'s latest-only rule.
+    pub fn queues_by_value(&self) -> bool {
+        match self {
+            // C: `dbChannelElements(chan) == 1` fails for every array field,
+            // whatever its current element count.
+            v if v.is_array() => false,
+            // The two scalar variants with heap-allocated payloads: a
+            // long-string `DBR_STRING` can exceed MAX_STRING_SIZE, and the
+            // transient NTEnum carrier holds a whole label vector.
+            Self::String(s) => s.len() <= NATIVE_VALUE_BYTES,
+            Self::EnumWithChoices { .. } => false,
+            // Every remaining variant is a fixed-width scalar of at most 8
+            // bytes.
+            _ => true,
+        }
     }
 
     /// Get the element count for this value.
@@ -1908,5 +1967,33 @@ mod enum_with_choices_tests {
         }
         // Out-of-range: ASCII decimal index.
         assert_eq!(EpicsValue::enum_index_label(&choices, 9).as_bytes(), b"9");
+    }
+
+    /// Boundaries of C's `useValque` test, one case per boundary: a fixed-width
+    /// scalar, a string exactly `sizeof(union native_value)`, one byte past it,
+    /// the heap-carrying enum variant, and an array at its smallest — a
+    /// one-element array is still an array field in C (`dbChannelElements`
+    /// reads the declared NELM, not the current NORD).
+    #[test]
+    fn queues_by_value_boundaries() {
+        assert!(EpicsValue::Double(1.0).queues_by_value());
+        assert!(
+            EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES]))
+                .queues_by_value()
+        );
+        assert!(
+            !EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES + 1]))
+                .queues_by_value()
+        );
+        assert!(
+            !EpicsValue::EnumWithChoices {
+                index: 0,
+                choices: vec![],
+            }
+            .queues_by_value()
+        );
+        assert!(!EpicsValue::DoubleArray(vec![1.0]).queues_by_value());
+        assert!(!EpicsValue::DoubleArray(vec![]).queues_by_value());
+        assert!(!EpicsValue::CharArray(vec![0u8; 1]).queues_by_value());
     }
 }

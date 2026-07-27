@@ -1246,7 +1246,7 @@ impl Record for ScalerRecord {
     }
 
     /// Every C scaler post outside the idle `monitor()` sweep is a literal
-    /// `DBE_VALUE` — see [`VALUE_ONLY_BY_NCH`], which lists them. The framework
+    /// `DBE_VALUE` — see `VALUE_ONLY_BY_NCH`, which lists them. The framework
     /// strips the LOG bit from the change post (and from `VAL`'s deadband post,
     /// and from the `special()` side-effect posts in
     /// [`Self::monitor_side_effect_fields`]) of every field returned here, so a
@@ -1257,7 +1257,7 @@ impl Record for ScalerRecord {
     }
 
     /// C's scaler posts a FIXED list from a process cycle (see
-    /// [`PROCESS_POSTED_BY_NCH`]) and leaves every other field it wrote silent.
+    /// `PROCESS_POSTED_BY_NCH`) and leaves every other field it wrote silent.
     /// Declaring that list closes the spurious-event family the framework's
     /// generic "post whatever changed" rule opened:
     ///

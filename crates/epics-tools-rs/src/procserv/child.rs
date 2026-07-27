@@ -62,7 +62,7 @@ pub enum ChildEvent {
 /// [`crate::procserv::config::ChildConfig`] this module needs.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
-    /// The positional command — presented as argv[0] to the child, and
+    /// The positional command — presented as `argv[0]` to the child, and
     /// the exec target unless [`Self::child_exec`] overrides it.
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -72,7 +72,7 @@ pub struct ChildSpec {
     /// (`--coresize`). `None` ⇒ leave the inherited limit untouched.
     pub core_size: Option<u64>,
     /// Override executable to `exec` instead of [`Self::program`]
-    /// (`--exec`). `None` ⇒ exec `program`. argv[0] stays `program`
+    /// (`--exec`). `None` ⇒ exec `program`. `argv[0]` stays `program`
     /// regardless, so a different binary runs under the original
     /// command line.
     pub child_exec: Option<PathBuf>,

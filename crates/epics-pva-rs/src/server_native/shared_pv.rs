@@ -428,7 +428,7 @@ struct Inner {
     /// monitor start/stop hook (pvxs `onStart`). See
     /// [`OnStartFn`].
     on_start: Option<OnStartFn>,
-    /// Server channel-invalidators bound by the [`SharedSource`](s) this PV
+    /// Server channel-invalidators bound by the [`SharedSource`] this PV
     /// is registered with, paired with the name it is registered under.
     /// [`SharedPV::close`] publishes each name through its invalidator so the
     /// per-connection read loop force-disconnects every attached server
@@ -1213,7 +1213,7 @@ pub struct AddPvError(pub String);
 
 /// Trivial map-of-named-SharedPV adapter that implements
 /// [`super::source::ChannelSource`]. Construct via `SharedSource::new()`,
-/// `add(name, shared_pv)`, then pass to [`super::runtime::run_pva_server`].
+/// `add(name, shared_pv)`, then pass to `super::runtime::run_pva_server`.
 pub struct SharedSource {
     pvs: Mutex<HashMap<String, SharedPV>>,
     /// Optional per-source access gate. When `None`, the trait

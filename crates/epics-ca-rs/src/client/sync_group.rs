@@ -15,16 +15,16 @@
 //!
 //! each scheduled `get`/`put` spawns its op immediately (it is
 //! "in flight" the moment it is scheduled, matching libca), and the
-//! group tracks the outstanding tasks. [`Self::block`] takes `&mut self`
+//! group tracks the outstanding tasks. [`SyncGroup::block`] takes `&mut self`
 //! and waits only for the requests issued since the last `block`/`reset`.
 //! libca `ca_sg_block` discards the batch on **every** return — success
 //! *and* timeout — because it unconditionally calls `sync_group_reset`
 //! after `CASG::block` returns (`syncgrp.cpp:128-150`); the next
 //! `ca_sg_block` then waits only for ops issued afterward (`cadef.h`).
 //! So a timed-out `block` here also empties the batch: retry means
-//! scheduling fresh ops, not re-blocking the old ones. [`Self::test`]
-//! reports completion without consuming the group, [`Self::reset`] aborts
-//! and discards the outstanding batch, and [`Self::stat`] exposes the
+//! scheduling fresh ops, not re-blocking the old ones. [`SyncGroup::test`]
+//! reports completion without consuming the group, [`SyncGroup::reset`] aborts
+//! and discards the outstanding batch, and [`SyncGroup::stat`] exposes the
 //! outstanding/completed counts.
 
 use std::time::Duration;

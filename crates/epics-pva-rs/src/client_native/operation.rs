@@ -70,7 +70,7 @@ pub struct PvaOperation<T: Send + 'static> {
     /// the instant the operation produces its result — the **same event the
     /// caller observes** when `wait()` hands that result back. This, not the
     /// termination guard, is what "the operation completed" means; see
-    /// [`Self::reached_terminal_state`].
+    /// `Self::reached_terminal_state`.
     completed: Arc<std::sync::atomic::AtomicBool>,
     /// Receiver whose paired `watch::Sender` lives **inside** the spawned
     /// task. The sender is the operation's RAII termination guard: when
@@ -358,7 +358,7 @@ impl<T: Send + 'static> PvaOperation<T> {
     ///
     /// This is deliberately the **same question** [`Self::cancel`] negates to
     /// answer "was it still active", and it is answered in the one place both
-    /// share, [`Self::reached_terminal_state`]. So `is_done()` is true exactly
+    /// share, `Self::reached_terminal_state`. So `is_done()` is true exactly
     /// when a `cancel()` would report not-active, and after `wait()` returns a
     /// value it is true immediately — the result *is* the terminal event.
     ///

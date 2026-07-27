@@ -19,6 +19,11 @@
 // reaches tokio I/O with no reactor. Inapplicable under the executor
 // backend; the RTEMS model has no async CLI client.
 #![cfg(not(feature = "rtems-exec-model"))]
+// …and `client`, because the contract asserted here includes the *resolved
+// peer name* in the exception context, which comes from `hostname::warm`
+// (`lib.rs`, `#[cfg(feature = "client")]`). Under `client-core` the context
+// carries the dotted address by design.
+#![cfg(feature = "client")]
 
 mod common;
 

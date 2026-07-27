@@ -1,0 +1,23 @@
+[    0.1s] e11-envraise320 monitor RTEMS:CA_CONN_CNT      initial=0.0
+[    0.1s] e11-envraise320 monitor RTEMS:CA_REFUSED_CNT   initial=0.0
+[    0.1s] e11-envraise320 monitor RTEMS:FD_CNT           initial=5.0
+[    0.2s] e11-envraise320 monitor RTEMS:FD_MAX           initial=1000.0
+[    0.2s] e11-envraise320 monitor RTEMS:MEM_USED         initial=16998400.0
+[    0.2s] e11-envraise320 monitors=5 ceiling=200 refusals_wanted=2 deadline=240s
+[    0.2s] e11-envraise320 SAMPLE idle           CONN_CNT=0.0 REFUSED=0.0 FD_CNT=5.0 FD_MAX=1000.0 MEM_USED=16998400.0
+[    0.5s] e11-envraise320 UP held=8 total=13 last_conn=0.03s
+[    0.8s] e11-envraise320 UP held=16 total=21 last_conn=0.03s
+[    1.1s] e11-envraise320 UP held=24 total=29 last_conn=0.03s
+[    1.4s] e11-envraise320 UP held=32 total=37 last_conn=0.03s
+[    1.8s] e11-envraise320 UP held=40 total=45 last_conn=0.03s
+[    2.9s] e11-envraise320 WALL attempt=42 held=41 elapsed_conn=1.06s ACCEPTED_THEN_EOF
+[    2.9s] e11-envraise320 REFUSAL 2/2 elapsed_conn=0.00s CONNECT_FAIL(errno=104 ECONNRESET)
+[    2.9s] e11-envraise320 === TOP ===
+[    2.9s] e11-envraise320 D1 client-side served = 41 ramp + 5 monitor = 46
+[    2.9s] e11-envraise320 refusals observed client-side = 2
+[    2.9s] e11-envraise320 refusal 1 NOT A PROTOCOL REFUSAL: ACCEPTED_THEN_EOF
+[    2.9s] e11-envraise320 refusal 2 NOT A PROTOCOL REFUSAL: CONNECT_FAIL(errno=104 ECONNRESET)
+[    2.9s] e11-envraise320 SAMPLE top            CONN_CNT=ERR:OTHER(RuntimeError: EOF) REFUSED=ERR:OTHER(RuntimeError: EOF) FD_CNT=ERR:OTHER(RuntimeError: EOF) FD_MAX=ERR:OTHER(RuntimeError: EOF) MEM_USED=ERR:OTHER(RuntimeError: EOF)
+[    2.9s] e11-envraise320 spot-check: 0/10 sampled held connections still answer a fresh READ_NOTIFY
+[    2.9s] e11-envraise320 released 41 ramp connections
+[    2.9s] e11-envraise320 refusalprobe done deadline_hit=False

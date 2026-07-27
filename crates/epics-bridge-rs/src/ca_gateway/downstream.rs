@@ -1,7 +1,7 @@
 //! Downstream CA server adapter for the gateway.
 //!
 //! Hosts a [`CaServer`] backed by a shadow [`PvDatabase`]. The shadow
-//! database is populated by the [`UpstreamManager`] as upstream
+//! database is populated by the [`super::upstream::UpstreamManager`] as upstream
 //! subscriptions establish. Downstream clients see PVs as if they
 //! were normal in-process PVs — the gateway is transparent on the wire.
 //!
@@ -65,7 +65,7 @@ const REPLAY_CHANNEL_CAPACITY: usize = 1024;
 /// per-PV subscriber refcounts in [`super::cache::GwPvEntry`]
 /// permanently skewed by the dropped CREATE/CLEAR pairs.
 ///
-/// This log keeps the most recent [`REPLAY_LOG_CAPACITY`] events,
+/// This log keeps the most recent `REPLAY_LOG_CAPACITY` events,
 /// each tagged with a monotonic sequence number. On lag, a
 /// [`ReplayingReceiver`] consults [`Self::events_since`] to recover
 /// exactly the events it missed, in order, so the refcount math is
@@ -346,7 +346,7 @@ impl DownstreamServer {
     }
 
     /// Subscribe to connection lifecycle events with replay-on-lag
-    /// (B11). Must be called BEFORE [`run`] (which moves the server
+    /// (B11). Must be called BEFORE [`Self::run`] (which moves the server
     /// out of the Mutex).
     ///
     /// The first call wires up the replay infrastructure: it takes the
@@ -361,7 +361,7 @@ impl DownstreamServer {
     /// Subsequent calls return additional independent receivers backed
     /// by the same forwarder + log.
     ///
-    /// Returns `None` once [`run`] has consumed the inner server.
+    /// Returns `None` once [`Self::run`] has consumed the inner server.
     pub async fn connection_events(&self) -> Option<ReplayingReceiver> {
         let mut replay_guard = self.replay_state.lock().await;
         if replay_guard.is_none() {
@@ -410,7 +410,7 @@ impl DownstreamServer {
     }
 
     /// Snapshot the beacon-anomaly Notify handle so the gateway can
-    /// fire `generateBeaconAnomaly`-style pulses after [`run`] has
+    /// fire `generateBeaconAnomaly`-style pulses after [`Self::run`] has
     /// consumed the inner CaServer. Must be called BEFORE `run`;
     /// returns None afterwards.
     pub async fn beacon_anomaly_handle(&self) -> Option<Arc<tokio::sync::Notify>> {
@@ -447,7 +447,7 @@ impl DownstreamServer {
     ///
     /// Spawn this in a tokio task — it accepts incoming TCP connections
     /// from downstream clients, handles UDP search broadcasts, and emits
-    /// beacons. After this is called, [`connection_events`] returns None.
+    /// beacons. After this is called, [`Self::connection_events`] returns None.
     pub async fn run(&self) -> BridgeResult<()> {
         let server = {
             let mut guard = self.server.lock().await;
@@ -466,10 +466,10 @@ impl DownstreamServer {
             .map_err(|e| crate::error::BridgeError::PutRejected(format!("CaServer run: {e}")))
     }
 
-    /// Reinstall the inner [`CaServer`] after a previous [`run`] returned.
+    /// Reinstall the inner [`CaServer`] after a previous [`Self::run`] returned.
     /// Used by the supervisor when a CA server task crashes — the outer
     /// supervise loop reconstructs a server (with the same shadow DB)
-    /// and re-attaches it here so the next [`run`] picks it up.
+    /// and re-attaches it here so the next [`Self::run`] picks it up.
     /// Returns the previously installed server, if any.
     pub async fn reinstall(&self, server: CaServer) -> Option<CaServer> {
         let mut guard = self.server.lock().await;

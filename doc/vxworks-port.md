@@ -673,18 +673,276 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
 
 ## 7. Known opens
 
-* **E8 / E9 / E10 measurement procedures.** E8 (pool probe) needs re-authoring
-  for this target; E9 needs a VxWorks SYN ladder; E10's dial numbers are now
-  unblocked, since the probe images link and run. None has been run on VxWorks.
-* **Connection-wall sizing.** The wall is 44 concurrent clients at ~3 MiB each.
-  Not a formula difference: `StackSizeClass::bytes` is
-  `f * 0x10000 * size_of::<usize>()`, parameterised by pointer width exactly as
-  C's `STACK_SIZE(f)` is, so a 64-bit target costs precisely 2× what
-  `armv7-rtems-eabihf` costs, class for class. The sizing **decision** is
-  deferred until `STACKUSE` high-water data is collected across a real
-  workload — the census that produces it now exists and has been run once, but
-  not under load.
-* **A 1-in-3 wall-abort with mutex `EINVAL`** is observed and not root-caused.
+* **E9 — DONE 2026-07-26**, in
+  [vxworks-circuit-wedge-on-target-measurement.md](vxworks-circuit-wedge-on-target-measurement.md).
+  The `CircuitDeathGuard` A/B was run on target and the fix confirmed: the
+  control image holds one descriptor (`peer=none(errno=57)`, the same local
+  port) across seven consecutive censuses of a 480 s link cut, the fix image
+  holds none. The redial ladder that had to be measured first is **75.0 s per
+  rung, 74900–75000 ms over eight rungs**, ~30 s of client backoff between
+  rungs — it coincides with the RTEMS `TCPTV_KEEP_INIT`, which was not knowable
+  in advance. The errno does not transfer (BSD numbering, and it varies between
+  `EHOSTUNREACH` 65 and `ETIMEDOUT` 60 across attempts of the same cut), nor
+  does the RTEMS census signature (`mode` stays `0140666` on a dead VxWorks
+  socket). Running it uncovered and fixed one shipped defect: `SO_SNDTIMEO` is
+  unimplemented here and `drive_socket_blocking` propagated its `ENOPROTOOPT`
+  fatally, so a CA client on this target established no circuits at all.
+  The first fix for that made the option best-effort and was a workaround; the
+  round that closed it moved the bound inside `write_frame_deadline`
+  (`poll(POLLOUT, remaining)` + `send(MSG_DONTWAIT)`), so the send deadline no
+  longer depends on a socket option any target may refuse and `SO_SNDTIMEO` is
+  now set nowhere in the write path. Measured on target in one boot against a
+  peer that accepts and never reads: the bounded path returned at **2016 ms
+  against a 2000 ms deadline**, the old path had not returned **127.5 s** later
+  and still held its descriptor (§5.1). This removes `SEND_TICKS_PER_DEADLINE`
+  and `send_tick_for` from the public API of `epics-libcom-rs`, so the next
+  release is a **0.26.0 minor bump** — decided against a deprecated shim, since
+  the two items exist only to split a deadline the caller no longer owns.
+* **The same `SO_SNDTIMEO` defect in `asyn-rs`, closed — latent until the
+  crate's port gap is closed.** `drivers::ip_port::IpIoState::write` armed the option on
+  all three of its arms (TCP, UDP, Unix) and propagated the result with `?`, so
+  the write path would fail before sending a byte on a target that refuses the
+  option. C never sets it here either: `drvAsynIPPort.c` compiles the option
+  only under `USE_SOCKTIMEOUT`, which is `#if defined(__rtems__)` (`:71-72`),
+  while vxWorks takes `USE_POLL` through its own `FAKE_POLL` (`:75-76`) and
+  bounds `writeIt` with `poll(POLLOUT, writePollmsec)` (`:667-686`) on a socket
+  `connectIt` already made non-blocking (`:511`). `write_with_retry` now has
+  C's shape, proven by a host regression test that fails without it.
+  **On-target verification is not available until an open port gap is closed.**
+  `asyn-rs` does not build for VxWorks or RTEMS: its `socket2` dependency is
+  unconditional, in the shared `[dependencies]`
+  (`crates/asyn-rs/Cargo.toml:16`), where `epics-ca-rs` keeps
+  `socket2`/`if-addrs`/`tokio` full behind
+  `[target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]`
+  (`crates/epics-ca-rs/Cargo.toml:82`); `socket2` 0.5.10 aliases `IovLen` under
+  two `target_os` lists that omit vxworks, and the crate is absent from
+  `vxworks-check.sh`'s `CRATES`, so nothing catches a regression here. That is
+  a gap, not a decision: C `asyn` supports vxWorks explicitly —
+  `drvAsynIPPort.c:63` disables `AF_UNIX` for vxWorks alone, `:75` selects
+  `FAKE_POLL` for it, `setNonBlock` branches to `ioctl(fd, FIONBIO, &flags)`
+  at `:178`, the socket `cleanup` comment at `:243` exists to "reduce problems
+  with vxWorks when the IOC restarts", and
+  `asynDriver/epicsInterruptibleSyscall.c:31` includes `ioLib.h` under
+  `#ifdef vxWorks`. Closing that gap is separate work and is not attempted
+  here; until then this fix is proven on the host only.
+* **The CA name-service connection had no liveness rule — closed, measured
+  both ways.** `run_nameserver_connection` sent `CA_PROTO_ECHO` on a hardcoded
+  60 s tick and never checked that it was answered, so an
+  `EPICS_CA_NAME_SERVERS` peer that accepts, keeps reading and never replies was
+  held indefinitely: ten consecutive censuses on the same local port over
+  ≈600 s, one accept, dial-pool `attempts=1`, against the data circuit's 35 s
+  bound (`EPICS_CA_CONN_TMO` + `ECHO_TIMEOUT_SECS`). The link-cut A/B cannot
+  reach this because a cut always ends in TCP giving up — which is also what
+  retired the name-service socket 30 s after the data circuit in that run. C has
+  no such asymmetry: `cac::setSearchDestinations` builds a name server through
+  `findOrCreateVirtCircuit`, so it is a `tcpiiu` with the same watchdogs. The
+  fix inherits the rule the same way rather than branching on the peer's kind:
+  `CircuitWatchdog` is returned by `split_circuit` with the reader and writer
+  halves and taken **by value** by `read_loop`, so a CA TCP reader without a
+  liveness rule does not compile. Re-measured on the E9 rig with the fix
+  compiled in: seven retirements at **35, 35, 35, 37, 35, 35, 35 s** against the
+  35 s bound, eight dial/retire cycles in 8 minutes with `FD_CNT=6` and
+  `MEM_USED=17022976` on all 47 censuses. One deliberate deviation: C's
+  `unresponsiveCircuitNotify` keeps the socket, our name-service reader ends and
+  redials after `CONN_TMO`
+  ([§3.5](vxworks-circuit-wedge-on-target-measurement.md)).
+
+  **The verdict and the descriptor now land together.** Retiring the reader is
+  not retiring the circuit: a descriptor lives until *both* halves are dropped,
+  and the reconnect backoff sat in the same scope as the send half, so a circuit
+  the watchdog had just declared unresponsive stayed open a further
+  `EPICS_CA_CONN_TMO` — 69.6 s of socket for a 35 s verdict, on the host test
+  that now bounds it. `serve_nameserver_circuit` is the circuit's scope and the
+  backoff is in its caller. Measured on the rig against a control image that
+  differs by that one hunk: the descriptor goes at `seq=16` with the fix and at
+  `seq=19` without it — 30 s apart — and only the control ever censuses it as
+  `peer=none(errno=57)`, the VxWorks reading for a socket already shut but still
+  allocated ([§3.6](vxworks-circuit-wedge-on-target-measurement.md)). The data
+  circuit gets the same guarantee from a different owner, `CircuitDeathGuard`,
+  and is the later of the two afterwards (138 s) because C keeps an unresponsive
+  circuit's socket on purpose.
+* **E8 is measured.** E8 (pool probe) was re-authored for
+  this target as `doc/vx-ca-pool-probe.patch` and run under load:
+  `doc/vxworks-ca-worker-pool-on-target-measurement.md`. Holding 141 concurrent
+  CA clients, `POOLPROBE` gives `BUSY == SETS == CONNS` with
+  `worker_count() == 2 × sets` on every sample and `sets` never past
+  `CAS_CLIENT_POOL_CAPACITY = 141`, and all 282 pooled workers read
+  `vx = 199 - epics` with zero mismatches over three independent instruments
+  (`pthread_getschedparam`, `taskPriorityGet`, `taskInfoGet`). E9's ladder and
+  E10's dial residue have since been measured too — see their bullets.
+* **E10 is closed, both halves.** The pooled-vs-per-attempt dial residue is
+  **0 B/attempt on VxWorks 7**, for the CA half *and* the PVA half, measured
+  2026-07-26 by `-Wl,--wrap` live-block accounting over ~230 dial attempts per
+  image: CA differs by −184 B, PVA by +184 B, in both cases exactly one 184 B
+  timer-sleep group of sampling skew (resolution ±0.8 B/attempt). The brief's
+  `semMCreate`/`semBCreate` hypothesis is measured false with the mechanism
+  named — VxWorks 7 returns per-thread blocks *and* per-thread semaphores on
+  thread exit, so 235 extra thread creations add zero live blocks in all three
+  per-thread size classes. `DialPool` therefore buys no heap residue on this
+  target; its value here is thread-creation rate and the fd/stack ceiling.
+  `doc/vxworks-dial-attempt-residue-on-target-measurement.md` carries the
+  transcripts and the rig (`doc/vxworks-e10-rig/`).
+* **E10's `timer_sleep` growth was a leak, and it is fixed at source.** The
+  184 B per ~30 s that round 1 left open is wall-clock paced, not attempt
+  paced — halving the dial rate over the same wall clock left it unchanged
+  (+6624 B against +6440 B) while the `sleep_until` trough climbed +6 entries
+  per 180 s `BEACON_CLEAN_INTERVAL` cycle against a flat arm rate, i.e.
+  ~530 KB/day on an unattended IOC. Cause: a `Sleep` dropped before its
+  deadline could not take its queue entry back, because `DelayedTimer` held
+  entries in a `BinaryHeap`, which addresses only its top; the entry kept the
+  future's `Arc<Mutex<SleepState>>` — and the `pthread` mutex `std` creates
+  inside it — alive for the whole remaining delay. The queue is now a
+  `BTreeMap<WakeKey, _>`, `schedule_wake` returns the key and `Drop for Sleep`
+  cancels it, so an entry is addressable by construction. Measured on target:
+  `pva-fixed-5s` reads the same `live_bytes` at seq 30, 138 and 139 over 223
+  dial attempts and 9.0 M allocations, with **no size class and no call site
+  changed**; `pva-fixed-perattempt` repeats it on the other dial arm. This is
+  `epics-libcom-rs` runtime code, so it applied to every `exec_backend`
+  consumer, RTEMS included.
+* **The CA name-server queue ceiling is now observed on VxWorks.** With
+  `EPICS_CA_NAMESERVER_QUEUE_DEPTH` compiled in at 8, `fire_searches` holds
+  exactly 8 live 144 B blocks for 172 further dial attempts while its call
+  count runs 8 → 16 — `ns_try_send` drops rather than queues. Ceiling at the
+  shipping default is 256 × 144 B = 36,864 B, reached only while a configured
+  name server is unreachable.
+* **Connection-wall sizing.** The wall is **not** a fixed client count. Measured
+  on one image on two guests: 47 concurrent clients on `~958MB`, refused with
+  `EAGAIN` from the worker spawn, and 141 on `~1982MB`, refused by
+  `CAS_CLIENT_POOL_CAPACITY` itself. The earlier "44 concurrent clients" figure
+  is retracted — it was reproduced at neither size. Per connection the port
+  reserves 3,145,728 B (`CAS-client` Big + `CAS-event` Medium) and *uses*
+  19,208 B of it, flat from n = 1 to n = 141; `cbMedium` at 206,800 B is the one
+  class whose high-water justifies `Big`. Not a formula difference:
+  `StackSizeClass::bytes` is `f * 0x10000 * size_of::<usize>()`, parameterised
+  by pointer width exactly as C's `STACK_SIZE(f)` is, so a 64-bit target costs
+  precisely 2× what `armv7-rtems-eabihf` costs, class for class. **Why `EAGAIN`
+  lands at 47 is now answered** (§10 of the measurement): a three-arm
+  `StackSizeClass` A/B at fixed RAM moved the wall 47 → 59 → 80 as the declared
+  per-connection stack fell 3,145,728 → 2,097,152 → 1,048,576, which falsifies
+  "the wall tracks declared stack" — that predicted 141, the pool's own
+  capacity. Charging each thread its declared stack **plus a flat 1 MiB** makes
+  the total at all three walls 246.4 / 247.5 / 251.7 MB, a 2.1 % spread. The
+  binding resource is reserved address space, ceiling ~248 MB on this guest, not
+  committed memory. Two thirds of the per-connection cost is that per-thread
+  overhead, so the class is the minor lever and threads-per-connection the major
+  one; `Big` is justified by no high-water measured here (13,240 B in all three
+  arms) and costs a fifth of the wall.
+* **The class decision, now measured against a real database** (§15 of the
+  measurement). The 13,240 B above came from `READ_NOTIFY` on a single `ao`, so
+  it is superseded, not confirmed: driven against waveform / `subArray` /
+  `compress` / a FLNK chain / an 8-wide `dfanout` / six monitors per connection
+  and the `DBR_TIME` and `DBR_CTRL` reply shapes, `CAS-client` measures
+  **65,912 B** and `CAS-event` **7,120 B** — 5.0× and 1.19× the old figures — on
+  all four threads over four census passes, single-instance proved with
+  `rtpShow`. **The number is invariant**: payloads of 8 B, 32,768 B, 262,144 B
+  and 1,048,576 B, every reply shape, and all three class arms leave it
+  unchanged to the byte, because array payloads are on the heap. **The
+  bullet above is wrong on one point and it matters:** C's stack table is not
+  one table. `StackSizeClass::bytes` matches C's *POSIX* table
+  (`posix/osdThread.c:506-509`), but C on VxWorks uses `{4000, 6000, 11000} *
+  ARCH_STACK_FACTOR` (`vxWorks/osdThread.c:63-64`), so C's
+  `epicsThreadStackBig` on x86_64 is **22,000 B** and our `Big` is 95.3× it —
+  while our measured 65,912 B is 3.0× C's *entire* `Big`, because `park_on`
+  pins each connection's async state machine onto the connection stack. So
+  "match C's class" is not available as a decision rule here; only the measured
+  bytes are. `Big` runs at 3.14 % utilisation and `Medium` would keep 15.9×
+  margin while moving the measured wall 47 → 59. The change is **not made**:
+  `client_roster` is shared with `armv7-rtems-eabihf`, where no `CAS-client`
+  high-water has ever been measured.
+* **`MAX_LINK_DEPTH = 16` silently truncates a legal FLNK chain** (§16). A put
+  to a 32-deep chain processes the entry plus `L1..L15` and stops; C has no
+  depth counter on that path (`processTarget`, `dbDbLink.c:427-436`, guards
+  cycles via `pact`, and `MAX_LOCK 10` is an unrelated already-active alarm).
+  The bail is `Ok(None)`, so the put returns success with no client notice and
+  no record alarm, and the notice goes through `eprintln!` which never reaches
+  `errlog` on this target. Its one upside: the cap makes the 65,912 B above
+  depth-inclusive by construction.
+* **A monitored 1 MiB waveform aborts the RTP at four clients** (§17).
+  `EVENT_ADD` on a 131,072-element `DOUBLE` array drove `MEM_USED` 43,278,336 →
+  211,804,160 B and killed the process with `memory allocation of 1048576 bytes
+  failed` → signal 6. The same workload without that one monitor survives a
+  480 s hold with eighty 1 MiB gets and eighty 1 MiB `WRITE_NOTIFY`s, so the
+  reply path is sound and the per-subscriber event queues are what exhaust the
+  heap.
+* **A wall-abort with mutex `EINVAL` — now reproduced, and worse than filed.**
+  Two of four wall events this round, in the Big and Small arms and not the
+  Medium one, never below the wall, never on a guest where pool capacity binds
+  first. The census registry is exonerated. In the Small arm the panic deleted
+  the RTP with signal 6, so this is not "a worker is lost while the IOC looks
+  healthy" — **a client that fills the pool can take the IOC down.**
+  **Root cause now established, statically and on target** (§18). The SDK's
+  `pthreadLib.o` shows the first `lock()` on a `PTHREAD_MUTEX_INITIALIZER`
+  mutex reaching `pthreadMutexInitComplete` → `pthreadMutexInit` →
+  `semMCreate`, which on NULL returns `0x16` — `EINVAL`, not `ENOMEM` —
+  propagated verbatim so std panics "invalid argument (os error 22)".
+  `pthread_mutex_init` only stamps the magic, so **every** VxWorks pthread mutex
+  materialises its semaphore on first lock and eager init is no protection.
+  Confirmed with `--wrap=semMCreate --wrap=pthread_mutex_lock`:
+  `semMCreate=NULL nth_null=1 succeeded_before=588`, then `lock rc=22`, then the
+  fatal panic on `CAS-client 48`. So **the failing allocation is a VxWorks
+  semaphore object, not mimalloc heap** — which is why this arm reports no byte
+  count while the aborts above do; two allocators fail at the same wall. There
+  is no single guilty mutex: it is whichever `std::sync::Mutex` a freshly leased
+  worker touches first. The budget number is **588 live semaphores** at 49 sets
+  / 98 workers / 48 connections, and it is **transient** — creations passed
+  1,024 afterwards — so a bound must throttle creation rate, not only cap a
+  total.
+* **A panicking worker leaks its pool set permanently.** `BUSY=2 SETS=50
+  WORKERS=100 CONNS=0` — nothing returns a `SetLease` whose worker died, so
+  capacity drops permanently by one set per panic. `WorkerPool` accounting,
+  shared with `armv7-rtems-eabihf`, so outside this row's scope.
+* ~~**Connection establishment knees 180× at ~80 concurrent clients.**~~
+  **Root-caused and fixed** — same defect as the census truncation below; see
+  that bullet.
+* **Status PVs are lagging indicators under load — but my band-ordering
+  explanation for it was wrong.** I attributed the 402 s reporter silence to
+  pooled workers banding at 179/180 against `status-pv`/`scan-owner`/`c6-probe`
+  at 189. That is contradicted: with the census registry fixed, the same 282
+  thread creations take 10.4 s with **unbroken reporter sequence numbers** and
+  no starvation at all. The reporter was blocked on the registry mutex the
+  sweeps held, not starved by priority. What survives is the weaker and still
+  load-bearing claim: the status PVs are scan-driven, so a burst that completes
+  faster than the scan is sampled through pre-burst values — measured this
+  round, a 0.9 s burst of 40 read `CONN_CNT=0.0`, and the same burst held 90 s
+  read `CONN_CNT=40.0`. **Any row that counts something under load still needs
+  a client-side derivation beside the PV**, for scan latency rather than for
+  band starvation.
+* ~~**The task census truncates before a saturated pool.**~~ **Fixed** — and it
+  was the same defect as the 180× handshake knee above, not two. `MAX_TASKS =
+  192` in `crates/epics-rtems-boot/src/stats/vxworks.rs` is reached at
+  `19 + 2 × (n + 5) = 192`, n = 81.5, exactly the (80, 88] bracket the knee was
+  measured in; past it every `insert()` ran a full `retain_live()` sweep — one
+  `taskInfoGet` per entry under the registry mutex — reclaiming nothing, at
+  3.674 s a sweep and two sweeps per connection. The registry now grows and
+  `SWEEP_THRESHOLD_MIN` keeps only its sweep-trigger job. On target the
+  141-client ramp fell **402 s → 10.4 s** and the saturated census reads
+  `count=301 capacity=unbounded dropped=0`. The RTEMS shim's
+  `EPICS_RTEMS_DUMP_MAX_TASKS = 192` (`csrc/rtems_stats.c:148`) has the same
+  symptom and **cannot** take this fix: its arrays are filled inside a
+  `rtems_task_iterate` visitor where allocating is unsafe. Open, on that target.
+* **The CA client pool never shrinks — reclassified from "by design" to a
+  defect.** C `rsrv` creates a `CAS-client` thread per accept
+  (`caservertask.c:109`) and tears both threads down in `destroy_tcp_client`, so
+  its steady-state retention is zero. Ours holds `SETS=45 WORKERS=90` with
+  `BUSY=0 CONNS=0` after every client has left; descriptors, connections and
+  heap all come back, the threads and their reservation do not. Against the
+  ~248 MB ceiling above, 42 retained sets are 53 % of the guest's entire
+  reservation held permanently at zero clients — a transient burst becomes a
+  permanent exhaustion. Counterweight: the pool exists to bound the RTEMS 128 B
+  per-`std::thread` leak, and the VxWorks thread-exit leak is unmeasured (it
+  cannot be measured through a pool that never destroys a thread). Even granting
+  the RTEMS figure, retaining a thread spends 3,145,728 B to avoid 128 B.
+  **Proposed structural fix, not made, awaiting sign-off:** bound the pool by a
+  reservation budget rather than by `CAS_CLIENT_POOL_CAPACITY = 141`, which on
+  the `~958MB` guest is never the binding term — so the IOC walks past the real
+  ceiling into a failing `pthread_create`, whose outcome ranges from a clean
+  refusal to an RTP abort.
+* **Refusal `errlog` records are dropped without a discard notice.** Both walls
+  logged every refusal through `epics_ca_rs::server::blocking`'s `WARN` and
+  counted every one in `POOLPROBE REFUSED=`, while the `errlog` leg printed 4 of
+  8 on one guest and 3 of 4 on the other and emitted no `messages were
+  discarded` line. The `errlog` counter itself is right (it labels the 8th
+  refusal `#8`), so the loss is after the call.
 * **`MEM_FREE`, `MEM_MAX`, `MEM_BLK` stay `NaN`** until either mimalloc grows a
   public free-bytes accessor or a defensible source appears. §3.1 is the
   standing rejection, not a TODO.

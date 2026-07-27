@@ -103,7 +103,7 @@ fn poison_should_be_announced() -> bool {
 ///
 /// Recovering is not silent, or a degraded IOC would read exactly like a
 /// healthy one. The panic that *caused* the poisoning is announced where it
-/// happened ([`run_isolated`], [`run_facility_loop`]) for the two paths that
+/// happened ([`run_isolated`], `run_facility_loop`) for the two paths that
 /// run on a facility thread; a panic under the lock on a *submitter's* thread
 /// — inside `schedule`/`request`, on whatever thread called it — has no such
 /// site, and this is what reports it.

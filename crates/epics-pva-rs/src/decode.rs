@@ -689,13 +689,13 @@ pub fn decode_op_response_cached(
 /// owned by the reader task and threaded across every frame in wire order.
 /// The introspection entry is dropped on MONITOR FINISH here, and on any
 /// op's teardown via
-/// [`ServerConn::unregister_ioid`](crate::client_native::server_conn::ServerConn::unregister_ioid).
+/// `ServerConn::unregister_ioid`.
 ///
 /// ChannelArray (`Command::Array`) is intentionally NOT handled here: its
 /// DATA frame layout is sub-op dependent (getArray value vs getLength size
 /// vs empty) and cannot be determined from the frame alone, so its INIT and
 /// DATA legs resolve markers against an op-local cache in
-/// [`op_array_data`](crate::client_native::ops_v2). That op runs both legs
+/// `op_array_data`. That op runs both legs
 /// on one task in wire order, so the op-local cache is correctly ordered;
 /// the narrow consequence is that an Array value may not resolve a slot a
 /// *different* op defined on the same connection.

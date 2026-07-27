@@ -106,7 +106,7 @@ pub struct PvaServer {
     udp_v6_abort: Option<tokio::task::AbortHandle>,
     tcp_abort: tokio::task::AbortHandle,
     /// Effective config the server is running under. Captured at
-    /// `start()` so [`Self::client_config`] can hand back a builder
+    /// `start()` so `client_config` can hand back a builder
     /// pre-pointed at the actual bound TCP port without re-reading env
     /// vars (which may have changed since startup).
     effective_config: PvaServerConfig,

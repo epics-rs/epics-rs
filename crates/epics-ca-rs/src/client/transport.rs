@@ -4,9 +4,14 @@
 // runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
 // DOWN, never up, without running the survivors under the feature.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): the flavored tests drive the TCP transport
+// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the TCP transport
 // over tokio::net, which needs the reactor. These run and pass in the
 // feature-ON suite on the tokio driver.
+//
+// 9 -> 11 for `write_identity_tests`, which arrived with the fix binding a
+// write exception to its request rather than to the channel. Both were run
+// under `--features rtems-exec-model` before this count moved, per the
+// ratchet rule above, and both pass.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]
@@ -391,28 +396,38 @@ impl AsyncWrite for PumpedCircuit {
 }
 
 /// What [`dial_ca`] returns: a `tokio::net::TcpStream` on a hosted build, a
-/// [`PumpedCircuit`] where there is no reactor to register one with.
+/// `PumpedCircuit` where there is no reactor to register one with. Not a link:
+/// `PumpedCircuit` is compiled only under the configuration this alias is
+/// compiled *out* of, so it is never in this doc build's scope.
 #[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) type CaCircuit = TcpStream;
 /// See the hosted definition.
 #[cfg(any(exec_backend, ca_blocking_client))]
 pub(super) type CaCircuit = PumpedCircuit;
 
-/// Split a dialled circuit into the two halves `read_loop` / `write_loop` take.
+/// Split a dialled circuit into the halves `read_loop` / `write_loop` take, and
+/// the [`CircuitWatchdog`] that decides when its peer has stopped answering.
 ///
 /// A free function rather than a method so the two transports' *different*
 /// half types stay concrete — `read_loop` and `write_loop` are generic over
 /// `AsyncRead`/`AsyncWrite`, so neither boxing nor a trait object is needed on
 /// either side. The hosted arm keeps `into_split`'s owned halves (no `BiLock`,
 /// unchanged from before this seam existed).
+///
+/// The watchdog rides in the return type rather than being constructed by
+/// whoever remembers to: this is the only way to obtain the reader of a dialled
+/// circuit, so a CA TCP connection with no liveness rule cannot be built. See
+/// [`CircuitWatchdog`] for why that is the C shape.
 #[cfg(not(any(exec_backend, ca_blocking_client)))]
 pub(super) fn split_circuit(
     stream: CaCircuit,
 ) -> (
     tokio::net::tcp::OwnedReadHalf,
     tokio::net::tcp::OwnedWriteHalf,
+    CircuitWatchdog,
 ) {
-    stream.into_split()
+    let (reader, writer) = stream.into_split();
+    (reader, writer, CircuitWatchdog::new())
 }
 
 /// See the hosted definition.
@@ -422,8 +437,185 @@ pub(super) fn split_circuit(
 ) -> (
     epics_base_rs::runtime::blocking_io::GuardedReader,
     epics_base_rs::runtime::blocking_io::GuardedWriter,
+    CircuitWatchdog,
 ) {
-    (stream.reader, stream.writer)
+    (stream.reader, stream.writer, CircuitWatchdog::new())
+}
+
+// ---------------------------------------------------------------------------
+// The CA client's one TCP liveness rule
+// ---------------------------------------------------------------------------
+
+/// What an expired [`CircuitWatchdog`] deadline means.
+///
+/// The verdict is the same for every circuit; the *recovery* is the caller's,
+/// because the two circuits have different machinery to recover with — exactly
+/// as in C, where `unresponsiveCircuitNotify` moves `connectedList` channels to
+/// `unrespCircuit` (`tcpiiu.cpp:922-940`) and a name-service circuit, whose
+/// `connectedList` is empty, falls through that block.
+pub(super) enum WatchdogExpiry {
+    /// The peer has been quiet for the idle period. Probe it, then wait
+    /// `ECHO_TIMEOUT_SECS` for an answer.
+    SendEcho {
+        /// libca Issue #190: wall-clock skipped far past the sleep we asked
+        /// for, so the host was suspended rather than the peer being quiet.
+        /// The probe window is shortened; the caller logs it.
+        suspend_wake: bool,
+        wall_skip: Duration,
+    },
+    /// The probe went unanswered inside `ECHO_TIMEOUT_SECS`. The watchdog has
+    /// disarmed itself; C `tcpRecvWatchdog::expire` returns `noRestart` here
+    /// and `unresponsiveCircuitNotify` cancels the timer outright
+    /// (`tcpRecvWatchdog.cpp:81`, `tcpiiu.cpp:915-921`). Any byte from the peer
+    /// re-arms it through [`CircuitWatchdog::data_arrived`].
+    Unresponsive,
+}
+
+/// **The CA client's one TCP liveness rule** — the fourth seam shared by the
+/// upstream circuit's [`read_loop`] and the `EPICS_CA_NAME_SERVERS` circuit's
+/// reader (`client/search.rs::run_nameserver_connection`), after the dial
+/// ([`dial_ca`]), the framing ([`next_frame`]) and the receive-side body limit
+/// ([`RecvBodyPolicy`]).
+///
+/// **Invariant:** every CA TCP connection this client opens is retired if its
+/// peer answers nothing within `echo_idle_secs() + ECHO_TIMEOUT_SECS`, and
+/// retiring it releases the descriptor *then* — a circuit is never held open
+/// past its own verdict.
+///
+/// The second half needs its own owner, because a descriptor outlives the
+/// watchdog's verdict until **both** halves are dropped, and the watchdog only
+/// ends the reader:
+///
+/// * data circuit — [`spawn_guarded_pump`]'s [`CircuitDeathGuard`] reports
+///   whichever pump exits first, and `run_transport_manager` drops the
+///   `ServerConnection`, whose `Drop` aborts the sibling task.
+/// * name-service circuit — `search::serve_nameserver_circuit` *is* the
+///   circuit's scope: both halves are its locals and the reconnect backoff is
+///   in its caller, so returning releases them. Held inside that scope instead,
+///   the send half survived the retirement by a full `EPICS_CA_CONN_TMO`.
+///
+/// It is inherited rather than opted into: [`split_circuit`] hands one back
+/// with the two halves, so the reader of a dialled circuit cannot be obtained
+/// without it. That is this port's shape of what C gets from `tcpiiu`'s
+/// constructor — `cac::setSearchDestinations` (`cac.cpp:260-282`) builds a name
+/// server through `findOrCreateVirtCircuit` like any data circuit, so
+/// `tcpRecvThread::connect` arms `recvDog.connectNotify` for it at
+/// `tcpiiu.cpp:627` with no `isNameService()` branch anywhere in the watchdog
+/// path. C's five `isNameService()` branches are all elsewhere: search-dest
+/// wiring (`:452`, `:811`), the connect-failure retry cadence (`:637`, `:647`)
+/// and the zero-channel shutdown (`:2023`).
+///
+/// Before this existed the name-service reader had no liveness rule at all — it
+/// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
+/// reply, so a name server that accepted, kept reading and never answered was
+/// held indefinitely: ten consecutive censuses on one local port over ≈600 s,
+/// measured on VxWorks
+/// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §3.5).
+pub(super) struct CircuitWatchdog {
+    idle: Duration,
+    echo: Duration,
+    deadline: epics_base_rs::runtime::task::Instant,
+    /// A probe is out and its answer is what the deadline now waits for.
+    echo_pending: bool,
+    /// C's timer armed/cancelled state, distinct from the circuit-level
+    /// unresponsive flag that `read_loop` also drives from `write_loop`.
+    armed: bool,
+    /// libca `tcpRecvWatchdog::beaconAnomaly`: while set, healthy beacons do
+    /// not refresh the deadline, so it expires on its own schedule.
+    beacon_anomaly: bool,
+    /// Wall-clock anchor for suspend detection, refreshed per loop iteration.
+    last_iteration_at: std::time::SystemTime,
+    suspend_threshold: Duration,
+}
+
+impl CircuitWatchdog {
+    /// Shortened probe window once a suspend wake is detected, so recovery is
+    /// seconds rather than tens of seconds.
+    const SUSPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(super) fn new() -> Self {
+        let idle = Duration::from_secs(echo_idle_secs());
+        Self {
+            idle,
+            echo: Duration::from_secs(ECHO_TIMEOUT_SECS),
+            deadline: epics_base_rs::runtime::task::Instant::now() + idle,
+            echo_pending: false,
+            armed: true,
+            beacon_anomaly: false,
+            last_iteration_at: std::time::SystemTime::now(),
+            // 3× idle — large enough to ignore ordinary scheduling jitter,
+            // small enough to fire on a real suspend of even a few minutes.
+            suspend_threshold: idle.saturating_mul(3).max(Duration::from_secs(60)),
+        }
+    }
+
+    /// The invariant's bound: the longest a peer may say nothing before this
+    /// watchdog calls its circuit dead — `echo_idle_secs()` of quiet, then
+    /// `ECHO_TIMEOUT_SECS` for the probe to be answered. One home for the
+    /// number, so a test asserting the bound cites what the code enforces.
+    pub(super) fn retire_bound() -> Duration {
+        Duration::from_secs(echo_idle_secs()) + Duration::from_secs(ECHO_TIMEOUT_SECS)
+    }
+
+    /// What to `sleep_until`. Meaningful only while [`Self::is_armed`].
+    pub(super) fn deadline(&self) -> epics_base_rs::runtime::task::Instant {
+        self.deadline
+    }
+
+    pub(super) fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Refresh the suspend-detection anchor at the top of a loop iteration.
+    pub(super) fn note_iteration(&mut self) {
+        self.last_iteration_at = std::time::SystemTime::now();
+    }
+
+    /// Bytes arrived from the peer — libca `messageArrivalNotify`. Any byte
+    /// counts, including an ECHO reply and a frame the parser later rejects.
+    pub(super) fn data_arrived(&mut self) {
+        self.echo_pending = false;
+        self.beacon_anomaly = false;
+        self.armed = true;
+        self.deadline = epics_base_rs::runtime::task::Instant::now() + self.idle;
+    }
+
+    /// libca `beaconAnomalyNotify`: sticky flag, deadline untouched.
+    pub(super) fn beacon_anomaly(&mut self) {
+        self.beacon_anomaly = true;
+    }
+
+    /// libca `beaconArrivalNotify`: refresh only when beacons are trusted and
+    /// no probe is outstanding.
+    pub(super) fn beacon_arrived(&mut self) {
+        if !self.beacon_anomaly && !self.echo_pending {
+            self.deadline = epics_base_rs::runtime::task::Instant::now() + self.idle;
+        }
+    }
+
+    /// The deadline fired. Advances the state machine and says what the peer's
+    /// silence now means.
+    pub(super) fn expired(&mut self) -> WatchdogExpiry {
+        let wall_skip = std::time::SystemTime::now()
+            .duration_since(self.last_iteration_at)
+            .unwrap_or(Duration::ZERO);
+        if self.echo_pending {
+            self.armed = false;
+            return WatchdogExpiry::Unresponsive;
+        }
+        self.echo_pending = true;
+        let suspend_wake = wall_skip >= self.suspend_threshold;
+        let probe = if suspend_wake {
+            Self::SUSPEND_PROBE_TIMEOUT
+        } else {
+            self.echo
+        };
+        self.deadline = epics_base_rs::runtime::task::Instant::now() + probe;
+        WatchdogExpiry::SendEcho {
+            suspend_wake,
+            wall_skip,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +1199,9 @@ impl Drop for ServerConnection {
 /// The manager retiring the circuit on this signal is what frees a reader pump
 /// still parked in a blocking `read` that a peer RST never woke (RTEMS libbsd,
 /// measured): removing the `ServerConnection` runs its `Drop`, which aborts the
-/// sibling task and drops the [`GuardedReader`]/[`GuardedWriter`] guards, and
+/// sibling task and drops the
+/// [`GuardedReader`](epics_base_rs::runtime::blocking_io::GuardedReader)/[`GuardedWriter`](epics_base_rs::runtime::blocking_io::GuardedWriter)
+/// guards, and
 /// those `shutdown(Both)` the socket — the only thing that returns that read.
 /// Before this signal the circuit was retired only lazily, at the next
 /// `CreateChannel`; during a prolonged upstream outage that reconnect never
@@ -1060,6 +1254,13 @@ pub(crate) async fn run_transport_manager(
     mut command_rx: mpsc::UnboundedReceiver<TransportCommand>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     server_writers: DirectServerWriters,
     last_rx_at: super::types::ServerLastRxAt,
     // Shared client identity (user / host). Cloned per connect so each
@@ -1190,6 +1391,7 @@ pub(crate) async fn run_transport_manager(
                         #[cfg(feature = "experimental-rust-tls")]
                         let sni = pick_sni(server_addr);
                         let in_flight_clone = in_flight.clone();
+                        let exception_slot_clone = exception_slot.clone();
                         let last_rx_clone = last_rx_at.clone();
                         let identity_clone = client_identity.clone();
                         let circuit_dead_clone = circuit_dead_tx.clone();
@@ -1200,6 +1402,7 @@ pub(crate) async fn run_transport_manager(
                                 priority,
                                 event_tx_clone,
                                 in_flight_clone,
+                                exception_slot_clone,
                                 last_rx_clone,
                                 identity_clone,
                                 circuit_dead_clone,
@@ -1213,6 +1416,7 @@ pub(crate) async fn run_transport_manager(
                                 priority,
                                 event_tx_clone,
                                 in_flight_clone,
+                                exception_slot_clone,
                                 last_rx_clone,
                                 identity_clone,
                                 circuit_dead_clone,
@@ -1436,6 +1640,7 @@ fn process_command(
         }
         TransportCommand::Write {
             sid,
+            cid,
             data_type,
             count,
             payload,
@@ -1451,7 +1656,7 @@ fn process_command(
                 sid,
                 data_type,
                 count,
-                None,
+                Some(cid),
                 payload,
                 peer_minor,
             ) else {
@@ -1761,6 +1966,13 @@ async fn connect_server(
     priority: u8,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     last_rx_at: super::types::ServerLastRxAt,
     identity: super::types::ClientIdentitySlot,
     // Fires the circuit key back to the transport manager the moment either
@@ -1871,7 +2083,12 @@ async fn connect_server(
                 }
             };
         tracing::debug!(server = %server_addr, "TLS handshake complete");
+        // The one reader path that does not come from `split_circuit` — the
+        // halves are tokio's, over the TLS stream. It is still a CA TCP
+        // connection, so it carries the same [`CircuitWatchdog`]; `read_loop`
+        // takes one by value, which is what makes that unskippable.
         let (reader, writer) = tokio::io::split(tls_stream);
+        let watchdog = CircuitWatchdog::new();
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1896,15 +2113,17 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
     } else {
-        let (reader, writer) = split_circuit(stream);
+        let (reader, writer, watchdog) = split_circuit(stream);
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1929,10 +2148,12 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
@@ -1940,7 +2161,7 @@ async fn connect_server(
 
     #[cfg(not(feature = "experimental-rust-tls"))]
     let (read_task, write_task) = {
-        let (reader, writer) = split_circuit(stream);
+        let (reader, writer, watchdog) = split_circuit(stream);
         let write_task = spawn_guarded_pump(
             circuit_dead.clone(),
             circuit,
@@ -1965,10 +2186,12 @@ async fn connect_server(
                 write_tx.clone(),
                 beacon_arrival_rx,
                 in_flight.clone(),
+                exception_slot.clone(),
                 last_rx_at.clone(),
                 unresponsive.clone(),
                 bytes_pending_in_os.clone(),
                 server_minor.clone(),
+                watchdog,
             ),
         );
         (read_task, write_task)
@@ -2218,10 +2441,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut beacon_arrival_rx: mpsc::UnboundedReceiver<bool>,
     in_flight: super::types::InFlightOps,
+    // The client's exception handler, raised on THIS thread. C ref:
+    // `cac::exceptionRespAction` (`cac.cpp:1082-1120`) runs inside
+    // `executeResponse` on the circuit's receive thread, so an exception is
+    // raised before any later response on the same circuit is dispatched.
+    // Handing it to the coordinator as an event instead lets a reply that
+    // takes the in-flight fast path overtake the exception it should follow.
+    exception_slot: super::types::CaExceptionSlot,
     last_rx_at: super::types::ServerLastRxAt,
     unresponsive: std::sync::Arc<UnresponsiveGate>,
     bytes_pending_in_os: OsRecvQueueProbe,
     server_minor: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    mut watchdog: CircuitWatchdog,
 ) {
     // Helper: emit an echo (or pre-v4.3 READ_SYNC) request. Used on idle
     // expiry, and again on echo timeout (C `unresponsiveCircuitNotify`
@@ -2245,42 +2476,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // ignore-don't-close policy — see [`RecvBodyPolicy`], shared with the
     // name-service circuit's reader.
     let mut body_policy = RecvBodyPolicy::new();
-    let idle_timeout = Duration::from_secs(echo_idle_secs());
-    let echo_timeout = Duration::from_secs(ECHO_TIMEOUT_SECS);
-    let mut echo_pending = false;
-    // libca Issue #190 (laptop-suspend stall): the OS may pause the
-    // tokio reactor for many minutes during system suspend. On
-    // resume, `Instant::now()` jumps forward by ~the suspend
-    // duration. The Sleep fires immediately (deadline in the past)
-    // and sends an echo — but the TCP socket may be half-open and
-    // we'd otherwise wait the full 5 s echo timeout to find out.
-    // Track wall-clock between loop iterations; if it skips more than
-    // `SUSPEND_THRESHOLD` (3× idle_timeout — large enough to ignore
-    // ordinary scheduling jitter, small enough to fire on a real
-    // suspend of even a few minutes) we use the abbreviated echo
-    // timeout so recovery completes in seconds instead of tens.
-    const SUSPEND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    let suspend_threshold = idle_timeout.saturating_mul(3).max(Duration::from_secs(60));
-    // Anchor for suspend detection — refreshed at the top of every
-    // loop iteration. Initialized at the loop entry; first iteration
-    // overwrites it before the wall-clock skip is consulted.
-    let mut last_loop_at;
-    // libca `tcpRecvWatchdog::beaconAnomaly` flag. Set when the
-    // beacon monitor classifies a beacon as anomalous — fresh sequence
-    // or off-band period (`bhe.cpp:226-262`); suppresses subsequent
-    // healthy-beacon watchdog refreshes so the deadline expires on
-    // its own schedule. Cleared on any data arrival from the server.
-    let mut beacon_anomaly = false;
-    // C `tcpRecvWatchdog`'s timer armed/cancelled state. `expire` returns
-    // `noRestart` once the echo probe times out (`tcpRecvWatchdog.cpp:81`)
-    // and `unresponsiveCircuitNotify` cancels the timer outright
-    // (`tcpiiu.cpp:915-921`), so the watchdog stops firing on an
-    // already-unresponsive circuit; the socket stays open and any byte from
-    // the server re-arms it. Distinct from the shared `unresponsive` flag,
-    // which is the circuit-level state — also set by the send watchdog in
-    // `write_loop` — and guards the one-shot `CircuitUnresponsive` /
-    // `CircuitResponsive` events.
-    let mut watchdog_armed = true;
+    // The idle period, the probe window, the armed/cancelled state, the
+    // beacon-anomaly flag and libca Issue #190's suspend detection all live in
+    // [`CircuitWatchdog`], which `split_circuit` handed us — the same rule the
+    // name-service circuit's reader runs. Nothing about the liveness bound is
+    // decided here.
     // libca flow control (C `tcpRecvThread::run`, `tcpiiu.cpp:543-572`).
     // `contig_recv_msg_count` counts consecutive receive frames that each
     // left bytes still unread in the OS socket buffer; once it reaches
@@ -2351,16 +2551,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     // optional here: on the RTEMS target this loop runs with no tokio reactor
     // in the process, and `tokio::time::sleep_until` panics the task instead
     // of firing (§11.1).
-    let mut deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
-
     loop {
-        // Refresh the suspend-detection anchor at the top of each
-        // loop iteration. When the sleep branch wakes, `wall_skip =
-        // SystemTime::now() - last_loop_at` reveals whether the host
-        // was suspended during the await — sleep duration on a live
-        // system stays bounded by `idle_timeout`/`echo_timeout`, so a
-        // skip far beyond that is a strong suspend signal.
-        last_loop_at = std::time::SystemTime::now();
+        // Refresh the suspend-detection anchor at the top of each loop
+        // iteration. When the sleep branch wakes, the wall-clock skip since
+        // this point reveals whether the host was suspended during the await.
+        watchdog.note_iteration();
         // Not processing a message while parked in `select!` (blocked in
         // the socket read / watchdog / beacon wait). C `_receiveThreadIsBusy`
         // is false here; the send watchdog may mark the circuit unresponsive
@@ -2387,16 +2582,14 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         // beacons to reset the connection time out
                         // watchdog until we have received a ping
                         // response" comment in tcpRecvWatchdog.cpp.
-                        beacon_anomaly = true;
+                        watchdog.beacon_anomaly();
                     }
                     Some(false) => {
                         // libca beaconArrivalNotify: refresh the
                         // deadline only when we trust beacons (no
                         // anomaly outstanding) and aren't already
                         // probing.
-                        if !beacon_anomaly && !echo_pending {
-                            deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
-                        }
+                        watchdog.beacon_arrived();
                     }
                     None => {
                         // Transport manager dropped the sender —
@@ -2409,18 +2602,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             }
             // Watchdog deadline expired. Disabled while the watchdog is
             // cancelled (C: unresponsive circuit, timer not restarted).
-            _ = epics_base_rs::runtime::task::sleep_until(deadline), if watchdog_armed => {
-                // libca Issue #190: detect suspend wake. If wall-clock
-                // skipped far more than expected for this sleep, the
-                // tokio reactor was paused (laptop suspend / VM stop).
-                // Shorten the echo probe so recovery is seconds, not
-                // tens of seconds.
-                let now_wall = std::time::SystemTime::now();
-                let wall_skip = now_wall
-                    .duration_since(last_loop_at)
-                    .unwrap_or(Duration::ZERO);
-                let suspend_wake = wall_skip >= suspend_threshold;
-                if echo_pending {
+            _ = epics_base_rs::runtime::task::sleep_until(watchdog.deadline()), if watchdog.is_armed() => {
+                match watchdog.expired() {
+                WatchdogExpiry::Unresponsive => {
                     // Echo timeout. C `tcpRecvWatchdog::expire` with
                     // `probeResponsePending` set calls `receiveTimeoutNotify`
                     // and returns `noRestart` (`tcpRecvWatchdog.cpp:54-81`).
@@ -2436,21 +2620,20 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // So: perform the one-shot unresponsive transition
                     // (shared with the send watchdog via the gate — only the
                     // winning transition emits), emit the trailing probe, and
-                    // DISARM the watchdog. The data-arrival path below is the
-                    // recovery: it re-arms the deadline and emits the sole
-                    // `CircuitResponsive`. A server that goes quiet for
-                    // minutes and comes back keeps its circuit, its channels
-                    // and its subscriptions, with no re-search.
+                    // let the watchdog stay DISARMED. The data-arrival path
+                    // below is the recovery: it re-arms the deadline and emits
+                    // the sole `CircuitResponsive`. A server that goes quiet
+                    // for minutes and comes back keeps its circuit, its
+                    // channels and its subscriptions, with no re-search.
                     unresponsive.mark_unresponsive(&event_tx, server_addr, priority);
                     if send_echo(&write_tx, server_minor_version).is_err() {
                         let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
                         return;
                     }
-                    watchdog_armed = false;
                     continue;
                 }
                 // Idle expired — send echo heartbeat. The deadline
-                // path itself doesn't read `beacon_anomaly`; the
+                // path itself doesn't read the beacon-anomaly flag; the
                 // flag's job is upstream, in the beacon-arrival
                 // branch, where it gates whether healthy beacons
                 // refresh the deadline. By the time we get here on
@@ -2458,23 +2641,21 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 // already kept the deadline at its original value
                 // long enough for it to expire on the schedule it
                 // would have had without any beacons at all.
-                if send_echo(&write_tx, server_minor_version).is_err() {
-                    let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
-                    return;
+                WatchdogExpiry::SendEcho { suspend_wake, wall_skip } => {
+                    if send_echo(&write_tx, server_minor_version).is_err() {
+                        let _ = event_tx.send(TransportEvent::TcpClosed { server_addr, priority });
+                        return;
+                    }
+                    if suspend_wake {
+                        tracing::info!(
+                            server = %server_addr,
+                            wall_skip_secs = wall_skip.as_secs(),
+                            "suspend wake detected; probing with shortened echo timeout"
+                        );
+                    }
+                    continue;
                 }
-                echo_pending = true;
-                let probe = if suspend_wake {
-                    tracing::info!(
-                        server = %server_addr,
-                        wall_skip_secs = wall_skip.as_secs(),
-                        "suspend wake detected; probing with shortened echo timeout"
-                    );
-                    SUSPEND_PROBE_TIMEOUT
-                } else {
-                    echo_timeout
-                };
-                deadline = epics_base_rs::runtime::task::Instant::now() + probe;
-                continue;
+                }
             }
             // Data from the server.
             read_result = reader.read(&mut buf) => {
@@ -2496,12 +2677,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
         // set, a concurrent send stall in `write_loop` restarts its
         // watchdog rather than marking this live circuit unresponsive.
         unresponsive.set_recv_busy(true);
-        echo_pending = false;
-        beacon_anomaly = false;
         // Re-arm the watchdog (C `messageArrivalNotify` restarts the timer;
         // an unresponsive circuit's cancelled timer comes back here).
-        watchdog_armed = true;
-        deadline = epics_base_rs::runtime::task::Instant::now() + idle_timeout;
+        watchdog.data_arrived();
         // Phase D: bump the per-server "last RX" stamp before any
         // protocol parsing so that even ECHO replies and frames the
         // parser later rejects still count as proof of liveness.
@@ -3020,15 +3198,41 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // channel-scoped commands and `0xFFFF_FFFF` otherwise
                     // (`rsrv/camessage.c:155-182`).
                     let err_cid = (hdr.cid != 0xFFFF_FFFF).then_some(hdr.cid);
-                    let _ = event_tx.send(TransportEvent::ServerError {
-                        eca_status,
-                        original_request: orig_cmd,
-                        message: msg,
-                        server_addr,
-                        cid: err_cid,
-                        data_type: echo_type,
-                        count: echo_count,
-                    });
+                    // Identity of the failing request, from the record its
+                    // issuer left behind. `echo_available` is the ECHOED
+                    // request's `m_available` — on a plain `CA_PROTO_WRITE`
+                    // that is the cid the client stamped at issue time, and
+                    // it is the field libca looks the channel up by
+                    // (`cac::writeExcep`, `cac.cpp:1056`), so the request
+                    // names itself and the channel need not still exist.
+                    // `err_cid` is the same number by the other route (rsrv
+                    // stamps the outer header from `pciu->cid`,
+                    // `camessage.c:155-182`); it covers a peer that echoes a
+                    // truncated header.
+                    let pv_name = echo_available
+                        .or(err_cid)
+                        .and_then(|c| in_flight.write_identities.get(&c).map(|n| n.clone()));
+                    // Raise here, on the circuit's receive thread, in frame
+                    // order — `cac::exceptionRespAction` (`cac.cpp:1082-1120`)
+                    // runs inside `executeResponse`, so libca has already
+                    // raised the exception by the time it dispatches the next
+                    // response off the same circuit. Posting it to the
+                    // coordinator instead put it behind a queue that the
+                    // in-flight fast path does not use, and a readback landing
+                    // on that fast path could finish the tool before the
+                    // exception was ever raised.
+                    super::types::raise_server_exception(
+                        &exception_slot,
+                        super::types::ServerErrorFrame {
+                            eca_status,
+                            original_request: orig_cmd,
+                            message: msg,
+                            server_addr,
+                            data_type: echo_type,
+                            count: echo_count,
+                            pv_name,
+                        },
+                    );
                 }
                 CA_PROTO_SERVER_DISCONN => {
                     // server retired this cid — drop it from
@@ -3036,6 +3240,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // reuse later in the circuit starts fresh.
                     known_cids.remove(&hdr.cid);
                     pending_access.remove(&hdr.cid);
+                    // the server has retired the cid, so nothing it sends
+                    // later can be an answer for it — the write identity's
+                    // window is closed.
+                    in_flight.write_identities.remove(&hdr.cid);
                     let _ = event_tx.send(TransportEvent::ServerDisconnect {
                         cid: hdr.cid,
                         server_addr,
@@ -3064,6 +3272,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 //     1000-1003` `clearChannelRespAction` is
                 //     currently a documented no-op in C.
                 CA_PROTO_SEARCH | CA_PROTO_READ | CA_PROTO_CLEAR_CHANNEL => {
+                    if hdr.cmmd == CA_PROTO_CLEAR_CHANNEL {
+                        // Not a no-op for the write identities: rsrv answers
+                        // a CLEAR_CHANNEL by echoing `m_cid`/`m_available`
+                        // (`camessage.c:1944-1957`), and a circuit answers
+                        // its requests in order, so this frame arrives after
+                        // every ERROR the cleared channel could still
+                        // produce. That makes it the exact point at which the
+                        // identity stops being needed — a fence, not a delay.
+                        // Our own CLEAR_CHANNEL puts the cid in `m_available`
+                        // (`hdr.available = cid` where the command is built).
+                        in_flight.write_identities.remove(&hdr.available);
+                    }
                     tracing::trace!(
                         server = %server_addr,
                         cmd = hdr.cmmd,
@@ -3204,10 +3424,12 @@ mod read_loop_tests {
             write_tx,
             beacon_rx,
             crate::client::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             std::sync::Arc::new(dashmap::DashMap::new()),
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
         (server_end, event_rx, write_rx, beacon_tx, task)
     }
@@ -3480,10 +3702,12 @@ mod recv_body_limit_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // Extended header announcing 3x max_frame_body_bytes() of body.
@@ -3532,10 +3756,12 @@ mod recv_body_limit_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 20 MiB EVENT_ADD body for a subscription nobody is waiting on: the
@@ -3646,10 +3872,12 @@ mod malformed_header_close_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 16-byte header declaring a 12-byte payload: 12 & 0x7 != 0.
@@ -3693,10 +3921,12 @@ mod malformed_header_close_tests {
             write_tx,
             ba_rx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // 20 bytes: 16-byte base header with postsize=0xFFFF + only 4 of
@@ -3772,6 +4002,16 @@ mod error_echo_dispatch_tests {
         let in_flight = super::super::types::InFlightOps::new();
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client_io, server_io) = tokio::io::duplex(256);
+        // The user-visible global exception hook, so the test observes what a
+        // tool observes instead of an internal event.
+        let raised = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let raised_in_hook = raised.clone();
+        let exception_slot = crate::client::types::CaExceptionSlot::default();
+        *exception_slot.write() = Some(std::sync::Arc::new(
+            move |_: &crate::client::types::CaException| {
+                raised_in_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
 
         let loop_handle = tokio::spawn(read_loop(
             server_io,
@@ -3781,10 +4021,12 @@ mod error_echo_dispatch_tests {
             write_tx,
             ba_rx,
             in_flight,
+            exception_slot,
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // ECA_TOLARGE echoing subscription id 0xCAFE_BABE — the exact
@@ -3801,16 +4043,14 @@ mod error_echo_dispatch_tests {
         // dispatcher's `_ => {}` arm swallowed it and only the global
         // `ServerError` hook fired.
         let mut saw_status_error = false;
-        let mut saw_server_error = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline && !(saw_status_error && saw_server_error) {
+        while tokio::time::Instant::now() < deadline && !saw_status_error {
             match tokio::time::timeout_at(deadline, event_rx.recv()).await {
                 Ok(Some(TransportEvent::MonitorStatusError { subid, eca_status })) => {
                     assert_eq!(subid, SUBID, "must carry the echoed subscription id");
                     assert_eq!(eca_status, ECA_TOLARGE, "must carry the ECA status");
                     saw_status_error = true;
                 }
-                Ok(Some(TransportEvent::ServerError { .. })) => saw_server_error = true,
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
             }
@@ -3820,9 +4060,17 @@ mod error_echo_dispatch_tests {
             "CA_PROTO_ERROR echoing EVENT_ADD must be routed to the \
              subscription (C: eventAddExcep → ioExceptionNotify)"
         );
-        assert!(
-            saw_server_error,
-            "the global exception hook must still fire (C: cac::exception)"
+        // ...and ONLY there. libca's jump table (`cac.cpp:93-124`) sends
+        // EVENT_ADD to `eventAddExcep`, which completes the subscription
+        // callback; the global hook (`cac::defaultExcep`) is not on that path.
+        // This assertion used to read the opposite, because it watched an
+        // internal `TransportEvent` that fired before the filter rather than
+        // the hook a tool actually installs.
+        assert_eq!(
+            raised.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an EVENT_ADD exception is the subscription's, not the global \
+             hook's (C: cac.cpp:93-124 → eventAddExcep)"
         );
 
         drop(client);
@@ -3862,10 +4110,12 @@ mod error_echo_dispatch_tests {
             write_tx,
             ba_rx,
             in_flight.clone(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         const ECA_GETFAIL: u32 = 0xC4;
@@ -3906,6 +4156,139 @@ mod error_echo_dispatch_tests {
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod write_identity_tests {
+    //! The identity a `CA_PROTO_WRITE` exception carries comes from the
+    //! record its issuer left in `InFlightOps::write_identities`, keyed by
+    //! the cid the ECHOED request header carries — libca's
+    //! `cac::writeExcep` reads the same field (`cac.cpp:1056`). These are
+    //! the boundaries of that record's lifetime, one case each: present,
+    //! and closed by the CLEAR_CHANNEL fence.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    const CID: u32 = 0x2A;
+    const ECA_PUTFAIL: u32 = 0xCC;
+
+    fn write_error_frame(cid: u32) -> Vec<u8> {
+        let mut echoed = CaHeader::new(CA_PROTO_WRITE);
+        echoed.postsize = 16;
+        echoed.data_type = epics_base_rs::types::DBR_STRING;
+        echoed.count = 1;
+        echoed.cid = 7; // sid, as the client sent it
+        echoed.available = cid;
+        let echoed = echoed.to_bytes();
+
+        let mut err = CaHeader::new(CA_PROTO_ERROR);
+        err.postsize = echoed.len() as u16;
+        err.cid = cid;
+        err.available = ECA_PUTFAIL;
+
+        let mut frame = err.to_bytes().to_vec();
+        frame.extend_from_slice(&echoed);
+        frame
+    }
+
+    /// rsrv's delete confirmation (`camessage.c:1944-1957`) echoes the
+    /// request's `m_cid`/`m_available`; our CLEAR_CHANNEL puts the sid in
+    /// the first and the cid in the second.
+    fn clear_channel_confirm(cid: u32) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        hdr.cid = 7;
+        hdr.available = cid;
+        hdr.to_bytes().to_vec()
+    }
+
+    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<String> {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        // The issuer's record: this channel wrote, so its name is bound to
+        // its cid before any answer can come back.
+        in_flight
+            .write_identities
+            .insert(CID, Arc::from("TST:LO.RTYP"));
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        // Observe the exception where a tool observes it: the installed
+        // handler. `ca_add_exception_event`'s slot is the only surface the
+        // block is printed from.
+        let (exc_tx, mut exc_rx) = mpsc::unbounded_channel::<Option<String>>();
+        let exception_slot = crate::client::types::CaExceptionSlot::default();
+        *exception_slot.write() = Some(Arc::new(move |e: &crate::client::types::CaException| {
+            let _ = exc_tx.send(e.pv_name.clone());
+        }));
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            exception_slot,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
+        ));
+
+        let mut client = client_io;
+        for f in frames {
+            client.write_all(&f).await.expect("write frame");
+        }
+        client.flush().await.expect("flush");
+
+        let name = tokio::time::timeout(Duration::from_secs(2), exc_rx.recv())
+            .await
+            .expect("an exception must be raised for a CA_PROTO_ERROR")
+            .expect("the handler must be called, not dropped");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        name
+    }
+
+    /// The write's own record names the channel. Nothing consults live
+    /// channel state, so the answer does not change with the channel's
+    /// state — which is the whole point: pre-fix the coordinator read the
+    /// name out of its `channels` map, and an ERROR that overtook the
+    /// channel's `DropChannel` printed `Context: "TST:LO.RTYP"` with no
+    /// `channel=` in it at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_error_is_named_by_the_record_its_issuer_left() {
+        assert_eq!(
+            server_error_pv_name(vec![write_error_frame(CID)])
+                .await
+                .as_deref(),
+            Some("TST:LO.RTYP"),
+        );
+    }
+
+    /// After the server confirms the CLEAR_CHANNEL there is nothing left it
+    /// can answer for that cid, so the record is gone and a later ERROR
+    /// naming the cid carries no channel — it cannot borrow the name of
+    /// whatever channel holds the cid next. C is the same shape:
+    /// `cac::writeExcep` raises nothing when the lookup misses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmed_clear_closes_the_identity_before_the_cid_can_be_reused() {
+        assert_eq!(
+            server_error_pv_name(vec![clear_channel_confirm(CID), write_error_frame(CID)])
+                .await
+                .as_deref(),
+            None,
+        );
     }
 }
 
@@ -3954,10 +4337,12 @@ mod flow_control_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             probe,
             Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
         Harness {
             client,
@@ -4139,10 +4524,12 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::clone(&unresponsive),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         let idle = Duration::from_secs(echo_idle_secs());
@@ -4241,10 +4628,12 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             super::super::types::InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         drop(client_io);
@@ -4285,10 +4674,12 @@ mod recv_watchdog_tests {
             write_tx,
             ba_rx,
             in_flight.clone(),
+            crate::client::types::CaExceptionSlot::default(),
             last_rx_at,
             std::sync::Arc::new(UnresponsiveGate::new()),
             drained_socket_probe(),
             std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
         ));
 
         // DBR_DOUBLE, one element: the post-recovery value.
@@ -4708,6 +5099,7 @@ mod connect_deadline_tests {
             0,
             event_tx,
             InFlightOps::new(),
+            crate::client::types::CaExceptionSlot::default(),
             ServerLastRxAt::default(),
             identity,
             circuit_dead_tx,
@@ -5134,6 +5526,7 @@ mod priority_circuit_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5143,6 +5536,7 @@ mod priority_circuit_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5371,7 +5765,15 @@ mod priority_circuit_tests {
 // Host/tokio-only: drives the real `run_transport_manager`, which spawns its
 // per-circuit tasks with `tokio::spawn` and has no reactor under
 // `rtems-exec-model` (same reason as `priority_circuit_tests`' async cases).
-#[cfg(all(test, not(feature = "rtems-exec-model")))]
+//
+// `feature = "client"` as well, and stated here rather than inside: every case
+// below reads establishment off `TransportEvent::ServerConnected`, which is a
+// `client`-only variant (`types.rs`) with a `client`-only emit site
+// (`read_loop`) because its one consumer is the beacon EMA reset. Without this
+// in the gate the module referred to a variant that does not exist under
+// `--no-default-features --features client-core`, which is a compile error and
+// not a skipped test.
+#[cfg(all(test, feature = "client", not(feature = "rtems-exec-model")))]
 mod circuit_retirement_tests {
     //! The wedge measured on the RTEMS target (topology-B, an 11-minute
     //! upstream outage, `~/rtems-bringup/topoB/wedge-fd3-*`): a data circuit's
@@ -5426,6 +5828,7 @@ mod circuit_retirement_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,
@@ -5435,6 +5838,7 @@ mod circuit_retirement_tests {
             cmd_rx,
             event_tx,
             in_flight,
+            crate::client::types::CaExceptionSlot::default(),
             server_writers,
             last_rx_at,
             identity,

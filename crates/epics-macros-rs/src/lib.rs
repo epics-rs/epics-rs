@@ -727,17 +727,17 @@ fn epics_pva_path() -> proc_macro2::TokenStream {
     }
 }
 
-/// `#[derive(NTScalar)]` — generate a [`TypedNT`] impl for the
+/// `#[derive(NTScalar)]` — generate a `TypedNT` impl for the
 /// annotated struct. The struct must have:
 ///
 /// - exactly one field named `value` of a primitive type (`f64`,
 ///   `i32`, `String`, etc.) — encoded as the NTScalar `value` slot
 /// - any number of additional fields. Fields tagged
 ///   `#[nt(meta)]` get encoded as their type's
-///   [`TypedNT`] impl (`Alarm`, `TimeStamp`, custom meta structs).
+///   `TypedNT` impl (`Alarm`, `TimeStamp`, custom meta structs).
 ///
 /// The wrapper structure id is taken from the `value` type's own
-/// [`TypedNT`] descriptor (`epics:nt/NTScalar:1.0`,
+/// `TypedNT` descriptor (`epics:nt/NTScalar:1.0`,
 /// `epics:nt/NTScalarArray:1.0`, or `epics:nt/NTEnum:1.0`). The
 /// mandatory metadata members for that id — `alarm` and `timeStamp`
 /// (and `display` for NTEnum) — are always present in the generated
@@ -998,7 +998,7 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
 }
 
 /// `#[pva_service]` — turn an `impl Block` for a service struct
-/// into a [`PvaService`] (in `epics_pva_rs::service`). Every async
+/// into a `PvaService` (in `epics_pva_rs::service`). Every async
 /// method becomes a wire-callable RPC; positional parameters are
 /// extracted from the request struct's named fields.
 ///
@@ -1126,7 +1126,7 @@ pub fn pva_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// `#[derive(NTTable)]` — generate a [`TypedNT`] impl for a
+/// `#[derive(NTTable)]` — generate a `TypedNT` impl for a
 /// table-shaped struct. Every field of the annotated struct must
 /// be a `Vec<T>` where `T: TypedNT` (the column type). Field
 /// names become column labels.

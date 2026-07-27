@@ -230,7 +230,7 @@ impl BlockingBridge {
         Self
     }
 
-    /// Drive `fut` on this thread via [`park_on`]; whatever it spawns or
+    /// Drive `fut` on this thread via `park_on`; whatever it spawns or
     /// sleeps on lands on the background executor.
     pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
         park_on(fut)
@@ -254,7 +254,7 @@ impl BlockingBridge {
 /// builds: a fresh current-thread runtime with IO and time enabled. On
 /// `exec_backend` (the RTEMS target, or a host run with
 /// `--features rtems-exec-model`) no tokio runtime exists to build, so the
-/// test thread itself drives the future via [`park_on`], and everything the
+/// test thread itself drives the future via `park_on`, and everything the
 /// body spawns or sleeps on lands on the process-global background executor
 /// (lazily initialised on first use) — the same seam the RTEMS boot path
 /// exercises. A test written with `#[epics_test]` therefore needs no
@@ -953,11 +953,11 @@ pub enum RtPolicy {
 ///     (VxWorks 7, `x86_64-wrs-vxworks`), 11 of 11 measured threads landed
 ///     `PriorityApplied::Realtime` via `SCHED_FIFO`, exactly one scheduler
 ///     call each, at `posix = 56 + epics` — the same POSIX value RTEMS gets
-///     (see [`map_epics_priority_rtems`]) — which VxWorks's own POSIX layer
+///     (see `map_epics_priority_rtems`) — which VxWorks's own POSIX layer
 ///     then inverts into its native task-priority space at `vx = 199 -
 ///     epics`, exact: EPICS base's own vxWorks-port formula
 ///     (`vxWorks/osdThread.c:99`), reached by construction rather than by
-///     restating it (see [`map_epics_priority_vxworks`]).
+///     restating it (see `map_epics_priority_vxworks`).
 ///
 /// An explicit value still wins in **both** directions on every target, so
 /// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS or VxWorks.
@@ -1212,6 +1212,7 @@ fn probe_fifo_range() -> RtRange {
     // The probe *changes the scheduling of the thread that runs it*, so it
     // runs on a throwaway thread — exactly why C hands `find_pri_range` to
     // its own `pthread_create`/`pthread_join` pair (`osdThread.c:316-334`).
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(StackSizeClass::Small);
     let probe = std::thread::Builder::new()
         .name("cbRtProbe".to_string())
         // Two `sched_get_priority_*` calls and a `sched_setscheduler`; nothing
@@ -1219,6 +1220,7 @@ fn probe_fifo_range() -> RtRange {
         // no reason for a throwaway probe to reserve 2 MiB on any target.
         .stack_size(StackSizeClass::Small.bytes())
         .spawn(move || {
+            let _charge = charge;
             // `osdThread.c:277-287`: failing at the minimum means no
             // permission for SCHED_FIFO at all.
             if set_fifo_priority(min) != 0 {
@@ -1257,7 +1259,7 @@ fn probe_fifo_range() -> RtRange {
 /// RTEMS/vxWorks (`RTEMS-score/osdThread.c:94`, `vxWorks/osdThread.c:99`).
 ///
 /// **Hosted only.** RTEMS deliberately does not use this map — see
-/// [`map_epics_priority_rtems`] for the shape and the reason. The `test`
+/// `map_epics_priority_rtems` for the shape and the reason. The `test`
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
 #[cfg(any(target_os = "linux", test))]
@@ -1311,7 +1313,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 
 /// Map an EPICS priority onto an RTEMS **POSIX** SCHED_FIFO priority.
 ///
-/// A distinct function from [`map_epics_priority`] on purpose: the two have
+/// A distinct function from `map_epics_priority` on purpose: the two have
 /// different *shapes*, not different endpoints. Expressing this one as the
 /// hosted linear map with `min`/`max` retuned would re-introduce the linear
 /// map the moment somebody adjusted a constant, and the linear map is the
@@ -1348,7 +1350,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 /// see `rtems_priority_map_stays_below_the_libbsd_network_band`, which
 /// asserts the non-strict `core >= 100` this tie actually produces.
 #[cfg(any(target_os = "rtems", test))]
-fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
@@ -1356,7 +1358,7 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 ///
 /// **Measurement-backed**, not derived: on the bring-up box (VxWorks 7,
 /// `x86_64-wrs-vxworks`), setting `posix = 56 + epics` — the identical POSIX
-/// value [`map_epics_priority_rtems`] computes for RTEMS — landed 11 of 11
+/// value `map_epics_priority_rtems` computes for RTEMS — landed 11 of 11
 /// measured threads at `PriorityApplied::Realtime`, one scheduler call each.
 /// VxWorks's own POSIX layer then inverts that POSIX value into its native
 /// task-priority space, and the result observed there was `vx = 199 -
@@ -1365,8 +1367,8 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// different route (we set the POSIX value; VxWorks inverts it, rather than
 /// us computing the native value directly as C's own port does).
 ///
-/// Deliberately **not** implemented by calling [`rtems_core_priority`] /
-/// [`map_epics_priority_rtems`]: those compute an RTEMS **core** priority
+/// Deliberately **not** implemented by calling `rtems_core_priority` /
+/// `map_epics_priority_rtems`: those compute an RTEMS **core** priority
 /// through `RTEMS_MAXIMUM_PRIORITY`, an RTEMS kernel constant measured on the
 /// RTEMS bring-up guest — machinery VxWorks has no equivalent of. The two
 /// happen to land on the same POSIX number; this restates the `56 + epics`
@@ -1374,7 +1376,7 @@ fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// change to the RTEMS core-priority mechanism cannot silently move the
 /// VxWorks value with it.
 #[cfg(any(target_os = "vxworks", test))]
-fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
     56 + epics_priority.min(99) as i32
 }
 
@@ -1809,10 +1811,13 @@ where
     F: FnOnce() + Send + 'static,
 {
     let ambient = InheritedRuntime::capture();
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
         .spawn(move || {
+            // Dies with the thread, so the account tracks threads that exist.
+            let _charge = charge;
             // Held for the whole body: it is what makes `tokio::spawn` and the
             // timer reachable from this thread, and therefore what lets a future
             // written for the hosted driver run unchanged under `block_on_sync`.
@@ -1890,10 +1895,12 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
         .stack_size(stack.bytes())
         .spawn(move || {
+            let _charge = charge;
             let _ = enter_ioc_thread(priority);
             f()
         })
@@ -1979,10 +1986,12 @@ impl MandatoryThread {
         F: FnOnce() + Send + 'static,
     {
         let priority = self.priority;
+        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(self.stack);
         std::thread::Builder::new()
             .name(self.name)
             .stack_size(self.stack.bytes())
             .spawn(move || {
+                let _charge = charge;
                 let _ = enter_ioc_thread(priority);
                 f()
             })

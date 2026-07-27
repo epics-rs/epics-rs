@@ -28,7 +28,7 @@
 //!
 //! "Thread-per-client" describes the I/O model, not the thread lifecycle. A
 //! client runs on two threads — the C `camsgtask` receiver and its `event_task`
-//! sender — but it **borrows** them, as one set, from [`CAS_CLIENT_POOL`]; it
+//! sender — but it **borrows** them, as one set, from `CAS_CLIENT_POOL`; it
 //! creates neither. Every `std::thread` *creation* leaves 176–179 B behind
 //! permanently on RTEMS 6, so a driver that created two per accept leaked
 //! without a ceiling (`doc/rtems-connection-worker-pool-design.md`). Borrowing
@@ -38,7 +38,7 @@
 //! the one refusal, taken after `accept` with the socket still open, where C
 //! `rsrv` takes its own (`caservertask.c:1240-1250`). The pool's capacity is
 //! deliberately **one below** the target's descriptor wall so that refusal has
-//! a descriptor to happen on; see [`CAS_CLIENT_POOL_CAPACITY`], where the
+//! a descriptor to happen on; see `CAS_CLIENT_POOL_CAPACITY`, where the
 //! measurement that forced the "one below" is cited.
 //!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
@@ -140,7 +140,7 @@ use epics_base_rs::runtime::blocking_io;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
-use epics_base_rs::runtime::worker_pool::{Worker, WorkerPool, WorkerRole};
+use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::mpsc;
 
@@ -261,19 +261,72 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 /// * `client` is the TCP receiver, C `camsgtask`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackBig)` at
 ///   `rsrv/caservertask.c:109-111` and at `epicsThreadPriorityCAServerLow`
-///   (`:109`). It runs the full CA command dispatch into the database, so
-///   `Big` is the parity answer, not merely a safe one.
+///   (`:109`). It runs the full CA command dispatch into the database.
+///
+///   **`Big` is C's *class*, but on VxWorks it is not C's *size*, and the
+///   difference is 95×.** [`StackSizeClass::bytes`] implements C's POSIX table
+///   (`libcom/src/osi/os/posix/osdThread.c:506-509`, `STACK_SIZE(f) = f *
+///   0x10000 * sizeof(void *)` over `{1, 2, 4}`), so `Big` is 2,097,152 B on a
+///   64-bit target. C on VxWorks uses an entirely different table
+///   (`libcom/src/osi/os/vxWorks/osdThread.c:63-64`, `{4000, 6000, 11000} *
+///   ARCH_STACK_FACTOR`, and `ARCH_STACK_FACTOR` is 2 for x86_64), so C's
+///   `epicsThreadStackBig` there is **22,000 B**.
+///
+///   We cannot follow C's VxWorks number: the `CAS-client` high-water MEASURED
+///   on `x86_64-wrs-vxworks` is **65,912 B**, three times C's whole `Big`
+///   allowance. That is the port's own cost — `park_on` pins each connection's
+///   async state machine onto this stack — and it is what the class table, not
+///   the class name, has to cover. See §15 of
+///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B proved
+///   invariant across payloads from 8 B to 1,048,576 B, the
+///   `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes, `subArray`, `compress`, the FLNK
+///   recursion at its `MAX_LINK_DEPTH` cap, and six monitors per connection.
+///
+///   **The class is `Medium`, decided from a measurement on BOTH targets this
+///   roster serves.** The second one closed the gap that used to hold this at
+///   `Big`: `armv7-rtems-eabihf` measures **24,432 B**, converged over a
+///   4-client/400-round and an 8-client/500-round run, and inclusive of the
+///   inline FLNK chain. Headroom against `Medium`, which is pointer-width
+///   scaled (`STACK_SIZE(f) = f * 0x10000 * sizeof(void *)`):
+///
+///   | target | high-water | `Medium` | headroom |
+///   |---|---|---|---|
+///   | `x86_64-wrs-vxworks` | 65,912 B | 1,048,576 B | 15.9× |
+///   | `armv7-rtems-eabihf` | 24,432 B | 524,288 B | 21.5× |
+///
+///   Both numbers are only *bounds* because the FLNK recursion is bounded. The
+///   armv7 measurement puts one inline FLNK hop at ~1,934 B and the chainless
+///   floor at 8,960 B, so this high-water rises LINEARLY with the depth of the
+///   user's link graph. `MAX_LINK_DEPTH` is what caps it — and it is now a cap
+///   that announces itself rather than truncating in silence
+///   (`PvDatabase::refuse_bounded_entry`), so it cannot be raised or removed
+///   without the change being visible. **Raising or removing that bound reopens
+///   this stack to the user's DB depth and invalidates both numbers above**;
+///   at ~1,934 B/hop, `Medium` on armv7 covers roughly 266 hops of headroom and
+///   the x86_64 side about half that per byte of pointer width.
+///
+///   What the class buys: reservation, not usage, is the binding resource on
+///   VxWorks (a thread costs its declared stack plus ~1 MiB of reserved address
+///   space), and the measured wall moves **47 → 59** concurrent clients at
+///   `Medium`.
 /// * `event` is the per-client monitor sender, C's `event_task`, created with
 ///   `epicsThreadGetStackSize(epicsThreadStackMedium)` (`db/dbEvent.c:1117`) —
-///   one class below the receiver, because it formats and sends queued events
-///   rather than dispatching commands — and banded one level below it
+///   because it formats and sends queued events rather than dispatching
+///   commands — and banded one level below the receiver
 ///   (`caservertask.c:560`, computed at `:1508`) so a client that stops
 ///   reading cannot starve command dispatch.
+///
+///   This one stays at C's class on one measurement, not two: `CAS-event` on
+///   `armv7-rtems-eabihf` is **3,816 B** (137.4× headroom against that
+///   target's `Medium` of 524,288 B), and no `CAS-event` high-water has been
+///   measured on `x86_64-wrs-vxworks`. Dropping it to `Small` would be a
+///   one-target decision, and this role is not what moves the wall — the
+///   receiver's class is 4× larger in bytes reserved.
 fn client_roster() -> [WorkerRole; 2] {
     [
         WorkerRole {
             suffix: "client",
-            stack: StackSizeClass::Big,
+            stack: StackSizeClass::Medium,
             priority: ThreadPriority::CaServerLow,
         },
         WorkerRole {
@@ -410,7 +463,7 @@ impl BlockingCaServer {
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
     /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
-    /// now stops one short of that, at [`CAS_CLIENT_POOL_CAPACITY`] = 141, so
+    /// now stops one short of that, at `CAS_CLIENT_POOL_CAPACITY` = 141, so
     /// the descriptor client #142 needs to *hear why* is still there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
@@ -422,10 +475,10 @@ impl BlockingCaServer {
     ///
     /// Each accepted connection **borrows** its two threads — the C `camsgtask`
     /// receiver (`caservertask.c:109`) and its event sender — as one set from
-    /// [`CAS_CLIENT_POOL`]; it creates none. Nobody joins a client, and a client
+    /// `CAS_CLIENT_POOL`; it creates none. Nobody joins a client, and a client
     /// returns its set when it disconnects. Borrowing is also the admission
     /// point: a set that cannot be borrowed is a client that cannot be served,
-    /// and is refused through [`refuse_client`] with the socket still open.
+    /// and is refused through `refuse_client` with the socket still open.
     pub fn serve(&self) {
         // The band belongs to the loop, not to whoever spawned the thread:
         // `serve` is what actually blocks here, on every path that reaches it.
@@ -472,11 +525,12 @@ impl BlockingCaServer {
                     //
                     // This is also the only fallible step left before the client
                     // is served, which is what makes it the only place a refusal
-                    // is owed. `WouldBlock` is "this process is full" (§5) and
-                    // any other error is "this target is out of thread
-                    // resources"; both mean this client cannot be served, so
-                    // both go to the one refusal owner, whose console line
-                    // carries the cause verbatim to tell them apart.
+                    // is owed. `AcquireError::AtCapacity` is "this process is
+                    // full" (§5) and `SpawnFailed` is "this target is out of
+                    // thread resources"; both mean this client cannot be served,
+                    // so both go to the one refusal owner, which names the gate
+                    // it was handed rather than re-deriving it from an error
+                    // message.
                     //
                     // Note the socket is still held here, un-moved, precisely so
                     // there is something to refuse *with*: a refusal after
@@ -590,17 +644,42 @@ impl BlockingCaServer {
 
 /// How many clients this server has refused for want of resources, ever.
 ///
-/// Not a rate limiter's clock. On RTEMS `Instant` is quantised to whole
-/// seconds by the libc `timespec` defect (`epics_rtems_boot`'s layout guard),
-/// so a time-windowed limiter is exactly the wrong shape here. Counting and
-/// emitting on powers of two needs no clock at all, cannot suppress the first
-/// occurrence by construction, and keeps the console readable when a client
-/// retries in a loop against a server that is out of memory.
+/// The number [`refused_clients`] reports over CA, and the ordinal each refusal
+/// record carries. Nothing reads it to decide whether to print: every refusal is
+/// announced, so the count of refusal records on the console *is* the count of
+/// refusals, and an operator never has to know a schedule to read one.
 static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// True for the 1st, 2nd, 4th, 8th … refusal.
-fn refusal_should_be_announced(nth: u64) -> bool {
-    nth.is_power_of_two()
+/// The words one refusal is reported with, on the wire and on the console.
+///
+/// Built from the gate, not from an error's `Display`, so the two refusals
+/// cannot converge on the same text as the process ages or as `std`'s errno
+/// mapping changes. Each arm names the remedy, because that is the whole reason
+/// an operator needs the two told apart:
+///
+/// * at capacity → the bound, which is the number to raise;
+/// * out of reservation → the target is short of memory for another client's
+///   threads, and the switch that says how much it may have;
+/// * spawn failed → what the target said, which is a memory problem and has
+///   nothing to do with the bound (it was never reached).
+///
+/// `worker pool at capacity` is kept verbatim from the pre-fix wording: it is
+/// the string in the on-target consoles quoted in
+/// `doc/vxworks-ca-refusal-fidelity.md` §2, so an operator's existing grep
+/// still finds a refusal.
+fn refusal_reason(cause: &AcquireError) -> String {
+    let gate = match cause {
+        AcquireError::AtCapacity { capacity } => {
+            format!("worker pool at capacity: {capacity} concurrent clients")
+        }
+        // Deliberately the pool's own words: the three numbers and the name of
+        // the switch that moves them are the whole remedy, and restating them
+        // here is how they drift apart.
+        AcquireError::OutOfReservation { .. } => cause.to_string(),
+        AcquireError::SpawnFailed(e) => format!("cannot create a client thread: {e}"),
+        AcquireError::ShuttingDown => "the server is shutting down".to_string(),
+    };
+    format!("CAS: no resources for a new client ({gate})")
 }
 
 /// Refuse an accepted client that the server has no resources to serve:
@@ -629,6 +708,12 @@ fn refusal_should_be_announced(nth: u64) -> bool {
 /// and on failure calls `epicsSocketDestroy(sock)` **plus**
 /// `epicsPrintf("CAS: no space in pool for a new client ...")`. The message is
 /// the part that matters — `epicsPrintf` reaches the console unconditionally.
+/// C also names *which* check refused, in the message and nowhere else: its two
+/// `create_client` refusals differ only by `(below max block thresh)` versus
+/// `(alloc failed)`, and its third (`caservertask.c:117`) is a distinct string
+/// again. So "the gate is named in the text" is C's answer too; what is ours
+/// alone is that the text is now generated from the gate rather than from an
+/// error's prose.
 ///
 /// Two deliberate differences:
 ///
@@ -645,13 +730,39 @@ fn refusal_should_be_announced(nth: u64) -> bool {
 ///   (`cac::executeResponse`, `cac.cpp:1208-1220`) — there is no
 ///   version-verified gate — so this is legible from either site, including
 ///   the accept-loop one where the circuit never got its VERSION reply.
-fn refuse_client(peer: SocketAddr, cause: &std::io::Error, send: impl FnOnce(&[u8])) {
+///
+/// # Why both gates send `ECA_ALLOCMEM`, and why that is not a choice
+///
+/// The two admission gates mean different things and need different remedies
+/// ([`AcquireError`]), but the status *field* cannot carry which one it was.
+/// The constraint is libca's, not ours: `ca_client_context::vSignal`
+/// (`ca_client_context.cpp:410-416`) ends every default-handler exception with
+///
+/// ```text
+/// if (!(ca_status & CA_M_SUCCESS) &&
+///     CA_EXTRACT_SEVERITY(ca_status) != CA_K_WARNING) { errlogFlush(); abort(); }
+/// ```
+///
+/// so any status whose severity is not `CA_K_WARNING` **aborts a client that
+/// has not installed its own exception handler** — which is every `caget`,
+/// `camonitor` and IOC client by default. `ECA_MAXIOC` ("Maximum simultaneous
+/// IOC connections exceeded", `caerr.h:86`) is the one code that says exactly
+/// what the capacity gate means, and it is `CA_K_ERROR`; sending it would turn
+/// a refusal into a client crash. No `CA_K_WARNING` code means "server full",
+/// so `ECA_ALLOCMEM` (`CA_K_WARNING`, and true of both gates in the sense that
+/// a resource ran out) stays for both.
+///
+/// What carries the gate is the diagnostic string, and it reaches the client:
+/// `defaultExcep` passes it as the exception's `Context:` line
+/// (`cac.cpp:1013-1016`, `%.400s`). So the distinction is on the wire, in the
+/// only field that can hold it — see [`refusal_reason`].
+fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8])) {
     let nth = REFUSED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let reason = format!("CAS: no resources for a new client ({cause})");
+    let reason = refusal_reason(cause);
 
     // Tell the peer. The echoed header is a synthetic CA_PROTO_VERSION: the
     // client has sent nothing we are answering, and `defaultExcep` is what
-    // index 0 of libca's exception jump table selects (`cac.cpp:96`).
+    // index 0 of libca's exception jump table selects (`cac.cpp:96-97`).
     let echo = CaHeader::new(CA_PROTO_VERSION);
     let frame = crate::server::tcp::build_ca_error_frame(
         &echo,
@@ -662,20 +773,43 @@ fn refuse_client(peer: SocketAddr, cause: &std::io::Error, send: impl FnOnce(&[u
     );
     send(&frame);
 
-    // Tell the operator. `errlog` is C's `epicsPrintf` seam and reaches the
-    // console even with no `tracing` subscriber installed
-    // (`runtime::log::errlog_sev_printf`), which is the state every RTEMS IOC
-    // binary runs in.
-    if refusal_should_be_announced(nth) {
-        epics_base_rs::runtime::log::errlog_sev_printf(
-            epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-            &format!("{reason} — refused {peer} (refusal #{nth})"),
-        );
-    }
-    tracing::warn!(
-        target: "epics_ca_rs::server::blocking",
-        %peer, error = %cause, nth,
-        "refused a CA client for want of resources"
+    // Tell the operator: one record, on one sink, for every refusal.
+    //
+    // # Invariant
+    //
+    // MUST: each refusal produce exactly one console record, carrying its
+    // ordinal. MUST NOT: any refusal be sampled away, and MUST NOT: one
+    // refusal produce two records that a reader has to reconcile.
+    //
+    // Both halves were broken and the E8 target run measured both
+    // (`doc/vxworks-ca-refusal-fidelity.md` §2). This used to
+    // announce on `errlog` only when the ordinal was a power of two, *and* emit
+    // an ungated `tracing::warn!` beside it. On the 1024M guest that put 8 WARN
+    // lines and 4 `errlog` lines on the console for 8 refusals; on the 2048M
+    // guest, 4 and 3. Neither number is the refusal count unless you already
+    // know which sink follows which rule — and the `errlog` stream, the one an
+    // EPICS operator reads, understated the wall by half.
+    //
+    // The sampling bought nothing it was meant to buy. Its purpose was to keep
+    // a retrying client from flooding a serial console, but the `warn!` beside
+    // it was ungated and reached that same console through
+    // `runtime::log::install_console_subscriber` — so the console already paid
+    // one line per refusal and the schedule only suppressed the *second* line.
+    // One record per refusal is therefore also strictly less console traffic
+    // than what this replaced, and there is no rate to trade against.
+    //
+    // `errlog` is the surviving sink because it is C's `epicsPrintf` /
+    // `errlogPrintf` seam (`rsrv/caservertask.c:117`, `:1248`, `:1255`, all
+    // three unconditional — C throttles the *accept loop* with a 15 s sleep,
+    // never the message) and because it reaches the console even with no
+    // `tracing` subscriber installed, which is the state an RTEMS IOC binary
+    // runs in. It is also a `tracing` event on `epics_base_rs::errlog`, so a
+    // subscriber-based application still sees every refusal. Nothing the
+    // `warn!` carried is lost: its `peer` and `nth` are in this line, and its
+    // `error` is `reason`'s parenthesised tail.
+    epics_base_rs::runtime::log::errlog_sev_printf(
+        epics_base_rs::runtime::log::ErrlogSevEnum::Major,
+        &format!("{reason} — refused {peer} (refusal #{nth})"),
     );
 }
 
@@ -1448,10 +1582,10 @@ mod tests {
 
         refuse_client(
             peer,
-            &std::io::Error::new(
+            &AcquireError::SpawnFailed(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "cannot allocate the client thread stack",
-            ),
+            )),
             |frame| {
                 use std::io::Write;
                 let _ = server.write_all(frame);
@@ -1496,20 +1630,171 @@ mod tests {
         );
     }
 
-    /// The first refusal is always announced. A rate limit that can swallow
-    /// occurrence #1 is indistinguishable, to an operator, from the silence
-    /// this change exists to remove.
+    /// The diagnostic string of a refusal frame, as a client reads it.
+    ///
+    /// Skips the response header and the echoed request header; what remains is
+    /// the NUL-padded message libca hands to its exception handler as the
+    /// `Context:` line.
+    fn refusal_frame_text(cause: &AcquireError) -> String {
+        let mut frame = Vec::new();
+        refuse_client(
+            "127.0.0.1:5064".parse().expect("literal peer address"),
+            cause,
+            |bytes| frame = bytes.to_vec(),
+        );
+        assert_eq!(
+            u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+            crate::protocol::ECA_ALLOCMEM,
+            "the status must stay ECA_ALLOCMEM for both gates: it is the only \
+             CA_K_WARNING code for an exhausted resource, and a non-warning \
+             severity aborts a default-handler libca client \
+             (ca_client_context.cpp:410-416)"
+        );
+        String::from_utf8_lossy(&frame[2 * CaHeader::SIZE..])
+            .trim_end_matches('\0')
+            .to_string()
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: a refusal say which admission gate refused, and say it in the one
+    /// wire field that can carry it. MUST NOT: the capacity gate and the
+    /// thread-spawn gate produce the same refusal text.
+    ///
+    /// The two need opposite remedies — raise the bound versus give the target
+    /// memory — and on VxWorks 7 both walls were reached on the same image,
+    /// 96 concurrent with `EAGAIN` on a 1280M guest and 141 with the pool's own
+    /// capacity on a 2048M one, with `available=48` on both
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §6). The status
+    /// code cannot separate them (see [`refuse_client`]), so the diagnostic
+    /// must, and it must carry the *bound* — a capacity refusal that does not
+    /// say what the capacity is tells an operator nothing they can act on.
     #[test]
-    fn the_first_refusal_can_never_be_rate_limited_away() {
-        assert!(refusal_should_be_announced(1), "the first refusal is mute");
-        // …and the schedule after it is logarithmic, so a client retrying in
-        // a loop cannot flood the console.
-        let announced: Vec<u64> = (1..=64)
-            .filter(|n| refusal_should_be_announced(*n))
-            .collect();
-        assert_eq!(announced, vec![1, 2, 4, 8, 16, 32, 64]);
-        assert!(!refusal_should_be_announced(3));
-        assert!(!refusal_should_be_announced(1000));
+    fn each_admission_gate_names_itself_and_its_remedy_in_the_refusal() {
+        let at_capacity = refusal_frame_text(&AcquireError::AtCapacity {
+            capacity: CAS_CLIENT_POOL_CAPACITY,
+        });
+        let spawn_failed = refusal_frame_text(&AcquireError::SpawnFailed(
+            std::io::Error::from_raw_os_error(11),
+        ));
+
+        assert_ne!(
+            at_capacity, spawn_failed,
+            "the two gates must not read the same on the wire"
+        );
+        assert!(
+            at_capacity.contains(&CAS_CLIENT_POOL_CAPACITY.to_string()),
+            "a capacity refusal must name the bound it hit — that number is the \
+             remedy: {at_capacity:?}"
+        );
+        assert!(
+            !spawn_failed.contains(&CAS_CLIENT_POOL_CAPACITY.to_string()),
+            "a target that refused a thread has nothing to do with the pool's \
+             bound, which was never reached: {spawn_failed:?}"
+        );
+        assert!(
+            spawn_failed.contains("client thread"),
+            "a spawn refusal must say the target refused a thread, not imply a \
+             configured limit: {spawn_failed:?}"
+        );
+    }
+
+    /// Counts `tracing` events by target, on the thread that emits them.
+    ///
+    /// Installed with `with_default`, so it is scoped to the calling thread and
+    /// no concurrently-running test can add to its counts. Declaring a
+    /// `max_level_hint` is what makes `runtime::log::nothing_is_listening`
+    /// false, so `errlog`'s console fallback stays quiet and every record
+    /// arrives here exactly once.
+    struct RefusalRecorder {
+        errlog: Arc<AtomicUsize>,
+        elsewhere: Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for RefusalRecorder {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            let counter = if event.metadata().target() == "epics_base_rs::errlog" {
+                &self.errlog
+            } else {
+                &self.elsewhere
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    /// # Invariant
+    ///
+    /// MUST: every refusal produce exactly one console record. MUST NOT: a
+    /// refusal be sampled away, and MUST NOT: one refusal produce two records.
+    ///
+    /// Both halves failed on target and both are asserted here, because either
+    /// one alone makes the console's refusal count a number an operator cannot
+    /// read. Measured on VxWorks 7 at the connection wall
+    /// (`doc/vxworks-ca-refusal-fidelity.md` §2): 8 refusals
+    /// produced 4 `errlog` records and 8 `warn` records, and 4 refusals
+    /// produced 3 and 4 — so neither sink's line count was the refusal count,
+    /// and the `errlog` stream, which is the one an EPICS operator reads,
+    /// understated the wall by half with no notice that it had.
+    ///
+    /// Seven is deliberate: it is not a power of two and it spans three of
+    /// them, so the schedule that produced the defect cannot satisfy this by
+    /// coincidence the way the measured runs' 4 and 8 nearly did.
+    #[test]
+    fn every_refusal_produces_exactly_one_console_record() {
+        const REFUSALS: usize = 7;
+
+        let errlog = Arc::new(AtomicUsize::new(0));
+        let elsewhere = Arc::new(AtomicUsize::new(0));
+        let recorder = RefusalRecorder {
+            errlog: errlog.clone(),
+            elsewhere: elsewhere.clone(),
+        };
+
+        let peer: SocketAddr = "127.0.0.1:5064".parse().expect("literal peer address");
+        tracing::subscriber::with_default(recorder, || {
+            for _ in 0..REFUSALS {
+                refuse_client(
+                    peer,
+                    &AcquireError::AtCapacity {
+                        capacity: CAS_CLIENT_POOL_CAPACITY,
+                    },
+                    // The peer leg is not under test here; refusing with a
+                    // discarded frame keeps this off the network entirely.
+                    |_frame| {},
+                );
+            }
+        });
+
+        assert_eq!(
+            errlog.load(Ordering::Relaxed),
+            REFUSALS,
+            "every refusal must reach the operator: {} of {REFUSALS} refusals \
+             produced an errlog record. A refusal that is not announced is \
+             invisible at exactly the moment an operator is reading the console \
+             to find out why clients stopped connecting.",
+            errlog.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            elsewhere.load(Ordering::Relaxed),
+            0,
+            "one refusal is one record: {} record(s) landed off the errlog \
+             sink, so the console carries two accounts of the same event under \
+             two emission rules and neither one is the refusal count",
+            elsewhere.load(Ordering::Relaxed),
+        );
     }
 
     /// A bind failure must not be described as a `local_addr` failure, nor
@@ -1625,14 +1910,25 @@ mod tests {
             &prod[at..]
         };
         let roster = &roster[..roster.find("\n}").expect("client_roster body")];
-        for class in ["StackSizeClass::Big", "StackSizeClass::Medium"] {
-            assert!(
-                roster.contains(class),
-                "the per-client worker roster must state `{class}`: C creates \
-                 the receiver with epicsThreadStackBig (caservertask.c:109-111) \
-                 and the event task with epicsThreadStackMedium (dbEvent.c:1117)"
-            );
-        }
+        // Every role states a class — checked by counting declarations against
+        // roles, not by naming the classes. Naming them is what this guard used
+        // to do (`Big` for the receiver, from C's
+        // `epicsThreadGetStackSize(epicsThreadStackBig)`,
+        // `caservertask.c:109-111`), and it was the wrong invariant: C's class
+        // NAMES do not carry C's VxWorks byte SIZES (C's `Big` there is
+        // 22,000 B, ours is 2,097,152 B), so the class has to be chosen from
+        // the measured high-water on every target this roster serves. The
+        // reasoning for the current choice is on `client_roster` itself. What
+        // must not regress is a role with no class at all, which is two threads
+        // per client at std's 2 MiB default.
+        let roles = roster.matches("WorkerRole {").count();
+        let classes = roster.matches("stack: StackSizeClass::").count();
+        assert_eq!(
+            classes, roles,
+            "every per-client worker role must state a stack class: {roles} \
+             roles, {classes} classes"
+        );
+        assert!(roles >= 2, "the roster lost a role: {roles}");
     }
 
     /// The RTEMS IOC installs a console subscriber before it does anything
@@ -2105,7 +2401,7 @@ mod tests {
         let mut reply = None;
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_READ_NOTIFY {
-                reply = Some(f);
+                reply = Some(f.to_vec());
             }
         }
         reply.expect("reference produced a READ_NOTIFY reply")
@@ -3170,7 +3466,7 @@ mod tests {
     fn drain_one_event_add(drain: &mut OutboxDrain) -> Vec<u8> {
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_EVENT_ADD {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("outbox held no CA_PROTO_EVENT_ADD frame");
@@ -3637,7 +3933,7 @@ mod tests {
 
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("reference produced no WRITE_NOTIFY completion frame");

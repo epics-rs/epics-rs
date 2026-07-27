@@ -30,9 +30,9 @@
 //!   `to_be_bytes` / `to_le_bytes` (one byte-swap per element, no
 //!   enum match).
 //!
-//! Backwards compat: [`PvField::ScalarArray`] still exists as the
+//! Backwards compat: [`PvField::ScalarArray`](crate::pvdata::PvField::ScalarArray) still exists as the
 //! generic catch-all. New code should prefer the typed constructors
-//! ([`PvField::scalar_array_double`], etc.) to avoid the
+//! ([`PvField::scalar_array_double`](crate::pvdata::PvField::scalar_array_double), etc.) to avoid the
 //! `Vec<ScalarValue>` blowup. Encoders / decoders accept both.
 
 use std::fmt;

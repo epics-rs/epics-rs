@@ -14,6 +14,7 @@ pub mod beacon;
 pub mod blocking;
 #[cfg(not(epics_embedded_target))]
 pub mod ca_server;
+pub(crate) mod frame;
 #[cfg(not(epics_embedded_target))]
 pub mod introspection;
 pub mod ioc_app;
@@ -32,7 +33,7 @@ pub mod udp;
 pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
 /// Live-connection / byte / channel / subscription counters. Runtime-agnostic
 /// (pure atomics) and shared by the async server and the blocking driver's
-/// monitor path, so it lives outside the host-only [`ca_server`] module.
+/// monitor path, so it lives outside the host-only `ca_server` module.
 pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 

@@ -492,7 +492,7 @@ impl RustIoc {
     /// Boot the **PVA** side, reporting the bound UDP search port.
     ///
     /// Same binary, same `.db`, same bind-and-read-back discipline — only the
-    /// protocol and the port line differ (see [`RustMode`]).
+    /// protocol and the port line differ (see `RustMode`).
     pub fn boot_pva(db: &Path) -> Result<Self, BootError> {
         Self::boot_mode(db, RustMode::Pva)
     }
@@ -899,7 +899,7 @@ impl PvaPair {
     ///
     /// There is no output to scan, so exclusivity is established the only way
     /// left: by measurement. `pvxlist` on each side's port must find exactly
-    /// one server ([`PvaTools::server_count`]).
+    /// one server ([`crate::pvatool::PvaTools::server_count`]).
     pub fn boot(tools: &PvxTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
         let c = PvxIoc::boot(tools, db)?;
         let rust = RustIoc::boot_pva(db)?;

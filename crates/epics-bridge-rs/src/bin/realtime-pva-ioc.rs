@@ -283,6 +283,7 @@ mod ioc {
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    use epics_base_rs::runtime::worker_pool::ThreadCharge;
     use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::server::ioc_app::GroupLoadRequest;
     use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -729,15 +730,20 @@ mod ioc {
         // `realtime-ca-ioc`: `serve` and `serve_udp_search` each take their own
         // thread to their own priority through `enter_ioc_thread`, so a
         // priority passed here would be set twice and the second one would win
-        // anyway. The stack class is stated, which is what the guard wants.
+        // anyway. The stack class is stated, which is what one guard wants, and
+        // so is the charge, which is what the other wants: a thread the process
+        // account never hears about is memory the worker pool spends twice.
         let srv_tcp = server.clone();
+        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let tcp_thread = match thread::Builder::new()
             .name("PVAS-TCP".to_string())
             // Accepts and hands off; the per-connection threads are where the
             // depth is (`blocking.rs` spawns those at Big/Medium).
             .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || srv_tcp.serve())
-        {
+            .spawn(move || {
+                let _charge = charge;
+                srv_tcp.serve()
+            }) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("realtime-pva-ioc: cannot start the PVA accept thread: {e}");
@@ -747,11 +753,14 @@ mod ioc {
         let udp_thread = match udp {
             Some(socket) => {
                 let srv_udp = server.clone();
+                let charge = ThreadCharge::fixed(StackSizeClass::Medium);
                 match thread::Builder::new()
                     .name("PVAS-UDP".to_string())
                     .stack_size(StackSizeClass::Medium.bytes())
-                    .spawn(move || srv_udp.serve_udp_search(socket))
-                {
+                    .spawn(move || {
+                        let _charge = charge;
+                        srv_udp.serve_udp_search(socket)
+                    }) {
                     Ok(h) => Some(h),
                     Err(e) => {
                         eprintln!("realtime-pva-ioc: cannot start the PVA name-search thread: {e}");
@@ -808,12 +817,18 @@ mod ioc {
                 "STAGE5 probe: EPICS_PVA_NAME_SERVERS={} (compiled in), reporting every 10 s",
                 STAGE5_NAME_SERVER,
             );
+            let charge = ThreadCharge::fixed(StackSizeClass::Medium);
             match thread::Builder::new()
                 .name("stage5-probe".to_string())
                 .stack_size(StackSizeClass::Medium.bytes())
                 .spawn(move || {
-                    let _ = epics_base_rs::runtime::task::enter_ioc_thread(
-                        epics_base_rs::runtime::task::ThreadPriority::Low,
+                    let _charge = charge;
+                    // The band is the role's, and for this role the table
+                    // says below client service: a census this long, above
+                    // the serving threads, rewrites the measurement it is
+                    // here to take — see `runtime::ioc_role`.
+                    let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
+                        epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                     );
                     let mut seq = 0u32;
                     loop {
@@ -1007,6 +1022,89 @@ mod tests {
         assert_eq!(
             builders, stacks,
             "every `Builder` in this entry point must state a stack size"
+        );
+    }
+
+    /// Every thread this entry point starts is also charged to the process
+    /// account, which is the half the guard above does not cover.
+    ///
+    /// A stack class says how much this thread takes. The charge is what makes
+    /// the worker pool's budget know it was taken — without it the pool admits
+    /// clients against a number that has never heard of the acceptor, the UDP
+    /// responder or the probe. Measured at roughly 15 MiB of fixed IOC threads
+    /// on the VxWorks target: inside the headroom, which is not the same as
+    /// accounted for, and the moment a target runs more fixed threads than
+    /// this one the error is no longer small and nothing reports that it grew.
+    ///
+    /// The charge must be held *inside* the spawned body, not by the spawning
+    /// function: a guard left on the calling thread is released the moment
+    /// `main` walks past the `spawn`, while the thread it paid for runs for the
+    /// life of the IOC. That is the shape this guard pins.
+    ///
+    /// Fails today, on Linux, with no cross toolchain.
+    #[test]
+    fn every_thread_here_is_charged_to_the_process_account() {
+        let src = include_str!("realtime-pva-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // Needle assembled with `concat!` so this guard does not match itself
+        // in the file it is written in.
+        let mut sites = 0usize;
+        let mut unpaid = Vec::new();
+        for (n, after) in prod
+            .split(concat!("thread", "::Builder::new()"))
+            .skip(1)
+            .enumerate()
+        {
+            sites += 1;
+            let body = after.split(".spawn(").nth(1).unwrap_or("");
+            // The charge is the first statement of the body, so a short window
+            // is the whole check: a `_charge` further down would be a `Drop`
+            // that runs at a different time than the thread's life.
+            let head = &body[..body.len().min(120)];
+            if !head.contains("let _charge = charge;") {
+                unpaid.push(format!("Builder #{}", n + 1));
+            }
+        }
+        assert_eq!(
+            sites, 3,
+            "expected the accept thread, the UDP responder and the bring-up \
+             probe, found {sites} — a thread was added or moved, and the \
+             account has to be told about it"
+        );
+        assert!(
+            unpaid.is_empty(),
+            "these threads reserve stack the pool's budget never hears about, \
+             so it admits clients against memory that is already gone: \
+             {unpaid:?}. Take a `ThreadCharge::fixed` before the `spawn` and \
+             move it into the body."
+        );
+    }
+
+    /// This entry point takes bands by role and names none of its own.
+    ///
+    /// The bring-up probe named `ThreadPriority::Low` here, the same band the
+    /// CA entry point's probe measured as starving under load while the
+    /// servers ran at 16..20. The serving threads take their bands from
+    /// `epics_pva_rs::server_native::blocking`'s named constants.
+    #[test]
+    fn this_entry_point_names_no_scheduling_band() {
+        let src = include_str!("realtime-pva-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            !prod.contains(concat!("Thread", "Priority")),
+            "this file must not name a scheduling band — ask \
+             `runtime::ioc_role` for one by role"
+        );
+        assert!(
+            prod.contains("IocRole::ConsoleCensus"),
+            "the bring-up probe must enter its thread as \
+             `IocRole::ConsoleCensus`"
         );
     }
 

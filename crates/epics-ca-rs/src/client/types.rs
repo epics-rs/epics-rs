@@ -697,6 +697,28 @@ pub(crate) struct InFlightOps {
     /// `subid` spaces separate, so the reply's owner is recorded here and
     /// the response dispatcher consults this map first.
     pub(crate) sub_updates: Arc<DashMap<u32, (u32, u32)>>,
+    /// `cid -> pv_name`, written by the issuer of a fire-and-forget
+    /// `CA_PROTO_WRITE` and read by the circuit's ERROR decoder.
+    ///
+    /// A plain write carries no `ioid` and completes nothing, so unlike
+    /// every other request it leaves no per-op record — which is why the
+    /// exception path used to recover the channel name by looking the
+    /// error's cid up in the coordinator's live `channels` map. That
+    /// lookup answers "is this channel still alive", not "what was this
+    /// request issued against", and a `CA_PROTO_ERROR` that overtakes the
+    /// channel's own `DropChannel` therefore printed a context with no
+    /// channel in it. libca has the record because the name lives on the
+    /// `nciu` the write was issued through (`cac::writeExcep` →
+    /// `chanTable.lookup(hdr.m_available)`, `cac.cpp:1050-1061`, the
+    /// ECHOED request's cid); this map is that record.
+    ///
+    /// Entries outlive the channel on purpose. They are removed when the
+    /// server can no longer answer for the cid: the `CA_PROTO_CLEAR_CHANNEL`
+    /// confirmation (`rsrv/camessage.c:1944-1957` echoes `m_cid`/
+    /// `m_available`, and a circuit answers in order, so it is a fence and
+    /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
+    /// sent no CLEAR_CHANNEL because the channel was not operational.
+    pub(crate) write_identities: Arc<DashMap<u32, Arc<str>>>,
     /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
@@ -713,6 +735,7 @@ impl InFlightOps {
             reads: Arc::new(DashMap::new()),
             writes: Arc::new(DashMap::new()),
             sub_updates: Arc::new(DashMap::new()),
+            write_identities: Arc::new(DashMap::new()),
             next_ioid: Arc::new(AtomicU32::new(1)),
         }
     }
@@ -1119,8 +1142,10 @@ pub(crate) enum SearchRequest {
     /// `addAddrToChannelAccessAddressList` (iocinf.cpp:45). The
     /// new entry is consulted on the next scheduled search round;
     /// already-pending searches do NOT auto-restart against the
-    /// new address — call [`super::CaClient::hurry_up`] (or wait
-    /// for the natural retry) for that.
+    /// new address — they reach it at their natural retry. There is
+    /// no way to force a round: [`super::CaClient`] exposes none, and
+    /// neither does libca, whose `addAddrToChannelAccessAddressList`
+    /// only fills a list and never touches a live `cac`.
     AddAddress(SocketAddr),
     /// Remove a unicast address from the search engine's working
     /// address list. Used when a discovery backend reports an IOC
@@ -1131,7 +1156,7 @@ pub(crate) enum SearchRequest {
     ///
     /// `client` only: a `DiscoveryEvent::Removed` is the sole producer —
     /// there is no `CaClient::remove_address` counterpart to
-    /// [`CaClient::add_address`], because libca has no
+    /// [`super::CaClient::add_address`], because libca has no
     /// `removeAddrFromChannelAccessAddressList` either.
     #[cfg(feature = "client")]
     RemoveAddress(SocketAddr),
@@ -1180,6 +1205,12 @@ pub(crate) enum TransportCommand {
     },
     Write {
         sid: u32,
+        /// Client cid of the channel the write is issued on. Goes on the
+        /// wire in `m_available`, where libca puts it
+        /// (`tcpiiu::writeRequest`, `tcpiiu.cpp:1430-1432`) so the server's
+        /// echo in a `CA_PROTO_ERROR` names the channel back
+        /// (`cac::writeExcep` reads `hdr.m_available`).
+        cid: u32,
         data_type: u16,
         count: u32,
         payload: Vec<u8>,
@@ -1285,28 +1316,6 @@ pub(crate) enum TransportEvent {
     ChannelCreateFailed {
         cid: u32,
     },
-    ServerError {
-        /// ECA status code (caerr.h) — the server's resp.cid carries
-        /// this in CA_PROTO_ERROR. This is what `ca_extract_msg_no(stat)`
-        /// would parse on the C side.
-        eca_status: u32,
-        /// Original request command that triggered the error
-        /// (from the first u16 of the error payload's copy of the
-        /// original header). Diagnostic only — distinct from `eca_status`.
-        original_request: Option<u16>,
-        message: String,
-        server_addr: SocketAddr,
-        /// Client cid of the channel the failed request was on. rsrv's
-        /// `vsend_err` (`rsrv/camessage.c:155-182`) stamps the outer error
-        /// header's `m_cid` with `pciu->cid` for every channel-scoped command
-        /// and with `0xFFFF_FFFF` otherwise, so this is `None` exactly when
-        /// the error is not about a channel.
-        cid: Option<u32>,
-        /// DBR type and element count of the echoed request header — libca's
-        /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
-        data_type: Option<u16>,
-        count: Option<u32>,
-    },
     TcpClosed {
         server_addr: SocketAddr,
         /// which priority circuit closed. Only channels on
@@ -1350,4 +1359,144 @@ pub(crate) enum TransportEvent {
     ServerConnected {
         server_addr: SocketAddr,
     },
+}
+
+/// Raise the exception a `CA_PROTO_ERROR` frame calls for, on the task that
+/// decoded it.
+///
+/// libca does this in `cac::exceptionRespAction` (`cac.cpp:1082-1120`), which
+/// runs on the circuit's receive thread inside `executeResponse` — the
+/// exception is raised in frame order, before the responses that follow it on
+/// the same circuit are dispatched. That ordering is load-bearing for a tool
+/// like `caput`: the readback GET it waits on is queued after the failing
+/// write, and a server answers a circuit in order, so an exception raised at
+/// decode time has already been delivered by the time the readback resolves.
+/// Routing this through the coordinator's event queue instead broke that edge
+/// — the GET completed on the transport's own fast path while the exception
+/// was still queued, and a client that exited on the GET dropped it (measured:
+/// 1 run in 150 printed nothing at all).
+///
+/// A handler installed by the user runs here, i.e. on the circuit, exactly as
+/// it does on libca's receive thread; a handler that blocks stalls its own
+/// circuit in both implementations.
+/// A decoded `CA_PROTO_ERROR` frame, already carrying the identity of the
+/// request it answers.
+///
+/// This is the argument of [`raise_server_exception`], and it is the shape
+/// the old `TransportEvent::ServerError` variant had — minus the raw cid. It
+/// carried one, and the coordinator resolved the channel name from it against
+/// its live `channels` map, which is the lookup that produced a nameless
+/// exception whenever the error overtook the channel's own teardown. Naming
+/// the channel at decode time and nowhere else makes that outcome
+/// unrepresentable.
+pub(crate) struct ServerErrorFrame {
+    /// ECA status code (caerr.h) — the server's resp.cid carries this in
+    /// `CA_PROTO_ERROR`. This is what `ca_extract_msg_no(stat)` would parse
+    /// on the C side.
+    pub(crate) eca_status: u32,
+    /// Original request command that triggered the error (from the first u16
+    /// of the error payload's copy of the original header). Diagnostic only —
+    /// distinct from `eca_status`.
+    pub(crate) original_request: Option<u16>,
+    pub(crate) message: String,
+    pub(crate) server_addr: SocketAddr,
+    /// DBR type and element count of the echoed request header — libca's
+    /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
+    pub(crate) data_type: Option<u16>,
+    pub(crate) count: Option<u32>,
+    /// Channel name the failing request was issued against, taken from
+    /// [`InFlightOps::write_identities`] by the cid the ECHOED request header
+    /// carries. Resolved on the circuit that owns the request, so the
+    /// identity of a request that already failed does not depend on whether
+    /// its channel is still open.
+    pub(crate) pv_name: Option<Arc<str>>,
+}
+
+pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFrame) {
+    let ServerErrorFrame {
+        eca_status,
+        original_request,
+        message,
+        server_addr,
+        data_type,
+        count,
+        pv_name,
+    } = err;
+    // libca's exception jump table (`cac.cpp:93-124`) sends READ /
+    // READ_NOTIFY / WRITE_NOTIFY / EVENT_ADD to the stubs that complete the
+    // pending IO or the subscription callback — the exception HOOK never
+    // fires for those, and the tool prints its own per-operation diagnostic
+    // instead. The caller has already completed those waiters.
+    let routed_to_a_callback = matches!(
+        original_request,
+        Some(
+            crate::protocol::CA_PROTO_READ
+                | crate::protocol::CA_PROTO_READ_NOTIFY
+                | crate::protocol::CA_PROTO_WRITE_NOTIFY
+                | crate::protocol::CA_PROTO_EVENT_ADD
+        )
+    );
+    if routed_to_a_callback {
+        return;
+    }
+    // What is left is `cac::writeExcep` (a plain CA_PROTO_WRITE has no
+    // callback to complete, so libca takes it to
+    // `oldChannelNotify::writeException`, `cac.cpp:1049-1061`) and
+    // `cac::defaultExcep` for every other command.
+    let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
+        CaOp::Put
+    } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
+        CaOp::ClearEvent
+    } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
+        CaOp::CreateChannel
+    } else {
+        CaOp::Other
+    };
+    let is_channel_exception = op == CaOp::Put;
+    let pv_name = is_channel_exception
+        .then_some(pv_name)
+        .flatten()
+        .map(|n| n.to_string());
+    // `cac::defaultExcep` folds the host into the ctx text itself
+    // (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`) before raising; the channel
+    // path passes the server's diagnostic through untouched. `message` stays
+    // RAW — it is C's `pCtx`, and the default handler prints it as
+    // `ctx="..."`; the request command is carried structurally (op / type /
+    // count), not smuggled into the text.
+    //
+    // C's host there is `iiu.getHostName` — the circuit's `hostNameCache`,
+    // i.e. the reverse-resolved NAME, the same source `ca_host_name` reads
+    // (W10-B5). This runs on the circuit, so it takes the NON-blocking half
+    // of that cache: a `getnameinfo` here would park the circuit behind one
+    // DNS timeout.
+    let message = if is_channel_exception {
+        message
+    } else {
+        format!(
+            "host={host} ctx={message}",
+            host = peer_display_name(server_addr)
+        )
+    };
+    dispatch_exception(
+        slot,
+        CaException {
+            kind: CaExceptionKind::ServerError,
+            message,
+            server_addr: Some(server_addr),
+            pv_name,
+            status: Some(eca_status),
+            op,
+            data_type: is_channel_exception.then_some(data_type).flatten(),
+            count: is_channel_exception.then_some(count).flatten(),
+            // `cac::defaultExcep` (`cac.cpp:1006-1016`) is libca's one
+            // null-file producer, so it is the one block with no
+            // `Source File:` line; the channel-write exception carries its
+            // own.
+            source: if is_channel_exception {
+                LIBCA_WRITE_EXCEPTION_SITE
+            } else {
+                ExceptionSite::NullFile
+            },
+        },
+    );
 }

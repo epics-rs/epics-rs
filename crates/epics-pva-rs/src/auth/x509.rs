@@ -1,7 +1,7 @@
 //! X.509 authorization identity — the credential type, free of any TLS
 //! stack.
 //!
-//! This lives outside [`crate::auth::tls`] on purpose. The value an
+//! This lives outside `crate::auth::tls` on purpose. The value an
 //! authenticated peer contributes to authorization is two strings; it is
 //! carried on the plain connection path too (as `None`), matched by ACF
 //! rules, and reported by `PvaServer::report()`. Keeping the *type* in the
@@ -10,7 +10,7 @@
 //! the coupling the RTEMS server build has to break (design doc §8.2).
 //!
 //! The construction side — turning a *verified rustls certificate chain*
-//! into one of these — stays in [`crate::auth::tls`], behind the `tls`
+//! into one of these — stays in `crate::auth::tls`, behind the `tls`
 //! feature, because that genuinely needs the TLS types.
 
 /// Authorization identity derived from a verified TLS peer certificate

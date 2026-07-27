@@ -92,7 +92,7 @@ impl Action {
 
 /// Scan a buffer of bytes; return the actions every byte triggers,
 /// concatenated in input order. Used by
-/// [`super::client::ClientConnection`] when input arrives from the
+/// [`super::client::spawn_client`]'s task pair when input arrives from the
 /// telnet parser. Callers pass the resulting actions to the
 /// supervisor while still echoing the original buffer to other
 /// clients (matches C procServ's "act AND echo" behaviour).

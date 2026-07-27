@@ -1,6 +1,6 @@
 //! Emit the parsed `.dbd` declarations as a checked-in Rust source file.
 //!
-//! The one place the `DBF_*` -> [`DbFieldType`] mapping is decided is
+//! The one place the `DBF_*` -> `DbFieldType` mapping is decided is
 //! [`dbf_to_rust`]. It emits the *field* type the `.dbd` declares — the
 //! promotion a CA client observes (`DBF_ULONG` -> `DBR_DOUBLE`,
 //! `DBF_USHORT` -> `DBR_LONG`, ...) is not folded in here, because

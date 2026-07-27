@@ -56,28 +56,61 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut seen: Vec<String> = Vec::new();
     let mut line = String::new();
-    // The IOC keeps running, so read until the banner that follows the warning
-    // block rather than to EOF.
-    loop {
+    // Read until the block under test is complete — NOT until some later
+    // startup milestone. The five lines are written by `bind_tcp_listeners`,
+    // and the UDP responders bind after it on the same configured port number:
+    // `--port` sets both. That port was reserved here for TCP only, so on a
+    // loaded host another process can hold the same number on UDP, and
+    // softioc-rs then exits with `AddrInUse` — *after* printing all five lines.
+    // Waiting for the "CA server:" banner made that exit fail this test even
+    // though its subject had already been satisfied in full. Reproduced twice
+    // in 400 runs under a concurrent workspace run, at 0.04 s:
+    //
+    //   softioc-rs exited; stderr: [ …five cas lines…,
+    //     "Error: Io(Custom { kind: AddrInUse, error: \"CA server UDP search
+    //      responder bind 0.0.0.0:39103: Address already in use\" })" ]
+    //
+    // EOF *before* the block is still a failure, and stays one: the block is
+    // printed during the TCP bind, so nothing that happens later can suppress
+    // it.
+    let mut block: Vec<String> = Vec::new();
+    while block.len() < 5 {
         assert!(
             Instant::now() < deadline,
-            "softioc-rs never got past startup; stderr so far: {seen:#?}"
+            "softioc-rs printed {} of the 5 cas lines; stderr so far: {seen:#?}",
+            block.len()
         );
         line.clear();
         let n = reader.read_line(&mut line).expect("read softioc-rs stderr");
-        assert!(n > 0, "softioc-rs exited; stderr: {seen:#?}");
-        seen.push(line.trim_end().to_string());
-        if line.contains("CA server:") {
-            break;
+        assert!(
+            n > 0,
+            "softioc-rs exited before the TCP-port warning block was complete; \
+             stderr: {seen:#?}"
+        );
+        let trimmed = line.trim_end().to_string();
+        if trimmed.starts_with("cas ") {
+            block.push(trimmed.clone());
         }
+        assert!(
+            !trimmed.contains("CA server:"),
+            "the banner arrived with only {} cas lines; C writes five before \
+             the server starts; stderr: {seen:#?}",
+            block.len()
+        );
+        seen.push(trimmed);
+    }
+    // "and no more": the next stderr line must not be a sixth. EOF here is the
+    // UDP-collision exit described above — the block was already whole, so it
+    // proves the same thing the banner would have.
+    line.clear();
+    if reader.read_line(&mut line).expect("read softioc-rs stderr") > 0 {
+        assert!(
+            !line.starts_with("cas "),
+            "C writes five lines and no more; a sixth: {:?}",
+            line.trim_end()
+        );
     }
 
-    let block: Vec<&String> = seen.iter().filter(|l| l.starts_with("cas ")).collect();
-    assert_eq!(
-        block.len(),
-        5,
-        "C writes five lines and no more; stderr: {seen:#?}"
-    );
     assert_eq!(
         block[0],
         "cas WARNING: Configured TCP port was unavailable."

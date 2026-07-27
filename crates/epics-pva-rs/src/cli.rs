@@ -63,7 +63,7 @@ pub enum TimeoutPolicy {
 impl TimeoutPolicy {
     /// `-w 0` ("no timeout") cannot be expressed as a truly unbounded
     /// wait on the Duration-based client builder
-    /// ([`crate::client::PvaClient`]'s `timeout` takes a `Duration`, fed
+    /// (`client::PvaClient`'s `timeout` takes a `Duration`, fed
     /// to `tokio::time::timeout`), so [`TimeoutPolicy::Forever`] is
     /// encoded as a ~10-year sentinel the operation timeout cannot
     /// realistically reach — operationally a no-deadline wait for an
@@ -286,7 +286,7 @@ pub fn effective_config_string() -> String {
 }
 
 /// Render the effective **server** (`EPICS_PVAS_*`) configuration block —
-/// the server-side companion to [`effective_config_string`], used by the
+/// the server-side companion to `effective_config_string`, used by the
 /// `pvinfo -D` host-troubleshooting report.
 ///
 /// pvxs `target_information` prints both an "Effective Client config" and

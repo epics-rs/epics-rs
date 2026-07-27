@@ -94,7 +94,7 @@ fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
 /// * properties iff `change & Property` — `getProperties`
 ///   (`iocsource.cpp:252-310`) is gated on `info.type == Scalar`, so only
 ///   Scalar mappings carry property leaves. It assigns exactly
-///   [`property_leaves`]: the whole `display` / `control` / `valueAlarm`
+///   `property_leaves`: the whole `display` / `control` / `valueAlarm`
 ///   structures are NOT assigned;
 /// * `timeStamp` iff `change & (Value | Alarm)` — `getTimeAlarm` always
 ///   fills the timestamp when it runs, but its `alarm` leaves only under
@@ -683,7 +683,7 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     // descriptor carries the same leaves, and simply never ASSIGNS the ones
     // `dbChannelGet` reported unsupplied, so they reach no client
     // (`iocsource.cpp:263-305`). The port says the same thing by leaving
-    // them out of the changed-bitset — see [`property_leaves`], which is
+    // them out of the changed-bitset — see `property_leaves`, which is
     // the one gate, keyed off the snapshot's [`PropertySupport`].
     let disp = snapshot.display.clone().unwrap_or_default();
     pv.fields.push((

@@ -20,7 +20,7 @@ use super::event::RuntimeEvent;
 /// is explicitly shut down ([`Self::shutdown`], [`Self::shutdown_and_wait`]) or
 /// when nothing can reach it any more — that is, when its last [`PortHandle`]
 /// is dropped. So publishing a port's `PortHandle` (to the
-/// [`crate::asyn_record`] registry, a [`crate::manager::PortManager`], a
+/// `asyn_record` registry, a [`crate::manager::PortManager`], a
 /// driver) is by itself enough to keep the port alive for as long as that
 /// publication lives; no caller has to park the runtime handle in a static to
 /// stop the actor thread from dying underneath it.
@@ -571,7 +571,7 @@ mod tests {
                 "the manager must not hold a handle for a port that was never created"
             );
             assert!(
-                crate::asyn_record::get_port(PORT).is_none(),
+                crate::registry::get_port(PORT).is_none(),
                 "the process registry must not hold a port that was never created"
             );
             println!("{DONE}");

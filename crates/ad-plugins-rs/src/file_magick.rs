@@ -429,7 +429,7 @@ impl NDFileWriter for MagickWriter {
     }
 }
 
-/// Magick file processor wrapping FilePluginController<MagickWriter>.
+/// Magick file processor wrapping `FilePluginController<MagickWriter>`.
 pub struct MagickFileProcessor {
     ctrl: FilePluginController<MagickWriter>,
     quality_idx: Option<usize>,

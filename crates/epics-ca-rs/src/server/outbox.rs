@@ -15,8 +15,8 @@
 //! The structural fix (this module) removes the second owner *by
 //! construction*: the raw socket writer becomes private to ONE owner, the
 //! connection loop. Every emit site — request→reply handlers, the monitor
-//! producers, put-notify completion — instead PUSHES a fully-framed
-//! `Vec<u8>` into the `Outbox`. The connection loop is the sole draining
+//! producers, put-notify completion — instead PUSHES one fully-framed
+//! message into the `Outbox`. The connection loop is the sole draining
 //! owner: it pulls framed bytes in arrival order and is the only code that
 //! ever touches the socket.
 //!
@@ -35,23 +35,32 @@
 //! valid CA wire message (header + padded payload). The drain concatenates
 //! frames back-to-back into the socket buffer, so a partial frame would
 //! mis-align every following message. All server senders already build one
-//! contiguous `Vec<u8>` per message for the pre-existing abort-safety
+//! contiguous buffer per message for the pre-existing abort-safety
 //! invariant, so this is the shape they already produce.
+//!
+//! Frames travel as `PooledFrame`, so the drain owner's drop of a written
+//! frame is also what returns the connection's send buffer to its
+//! `FramePool` for the next delivery — see `crate::server::frame`, which is
+//! crate-private and so cannot be linked from this module's public docs.
 
+use crate::server::frame::{FramePool, PooledFrame};
 use epics_base_rs::runtime::sync::mpsc;
+use std::sync::Arc;
 
 /// Cloneable producer handle. Handed to every emit site (in-loop handlers
-/// and spawned monitor / put-notify tasks). Its only capability is
-/// [`push`](Outbox::push) — enqueue one complete frame.
+/// and spawned monitor / put-notify tasks). Its only capabilities are
+/// [`push`](Outbox::push) — enqueue one complete frame — and [`pool`](Outbox::pool),
+/// the connection's send buffer to build that frame in.
 #[derive(Clone)]
 pub(crate) struct Outbox {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<PooledFrame>,
+    pool: Arc<FramePool>,
 }
 
 /// The draining end, owned solely by the connection loop alongside the
 /// socket `BufWriter`. Not `Clone`: there is exactly one drain owner.
 pub(crate) struct OutboxDrain {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<PooledFrame>,
 }
 
 /// Create a linked [`Outbox`] / [`OutboxDrain`] pair for one connection.
@@ -62,19 +71,36 @@ pub(crate) struct OutboxDrain {
 /// frames — the same bytes the old `BufWriter` would have buffered.
 pub(crate) fn channel() -> (Outbox, OutboxDrain) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (Outbox { tx }, OutboxDrain { rx })
+    (
+        Outbox {
+            tx,
+            pool: Arc::new(FramePool::new()),
+        },
+        OutboxDrain { rx },
+    )
 }
 
 impl Outbox {
+    /// This connection's send buffer, for [`FrameBuf::acquire`](crate::server::frame::FrameBuf::acquire).
+    ///
+    /// Shared by every clone of the handle, so all of a connection's producers
+    /// draw on the one buffer and the drain owner's `Drop` of the written frame
+    /// hands it back to whichever of them asks next.
+    pub(crate) fn pool(&self) -> &Arc<FramePool> {
+        &self.pool
+    }
+
     /// Enqueue one complete frame for the connection loop to write.
     ///
     /// Best-effort by design: once the connection loop has exited it drops
     /// the [`OutboxDrain`], and a push then silently discards the frame —
     /// exactly as a write to the already-torn-down socket was previously
     /// discarded. Producers never observe send failures because there is
-    /// nothing actionable to do with a dead circuit.
-    pub(crate) fn push(&self, frame: Vec<u8>) {
-        let _ = self.tx.send(frame);
+    /// nothing actionable to do with a dead circuit. A discarded frame still
+    /// returns its buffer to the pool on drop; the pool dies with the
+    /// connection either way.
+    pub(crate) fn push(&self, frame: impl Into<PooledFrame>) {
+        let _ = self.tx.send(frame.into());
     }
 }
 
@@ -82,7 +108,7 @@ impl OutboxDrain {
     /// Pull the next already-queued frame without waiting. Returns `None`
     /// when the queue is momentarily empty. The connection loop calls this
     /// in a tight loop to drain a whole burst before a single flush.
-    pub(crate) fn try_next(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn try_next(&mut self) -> Option<PooledFrame> {
         self.rx.try_recv().ok()
     }
 
@@ -96,7 +122,7 @@ impl OutboxDrain {
     /// blocking driver drains synchronously via [`OutboxDrain::try_next`].
     /// Host-only (not `epics_embedded_target`).
     #[cfg(not(epics_embedded_target))]
-    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
+    pub(crate) async fn recv(&mut self) -> Option<PooledFrame> {
         self.rx.recv().await
     }
 }
@@ -113,10 +139,10 @@ mod tests {
         // A clone is an equal producer; its frames interleave in push order.
         outbox.clone().push(vec![6]);
 
-        assert_eq!(drain.try_next(), Some(vec![1, 2, 3]));
-        assert_eq!(drain.try_next(), Some(vec![4, 5]));
-        assert_eq!(drain.try_next(), Some(vec![6]));
-        assert_eq!(drain.try_next(), None);
+        assert_eq!(drain.try_next().as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(drain.try_next().as_deref(), Some(&[4, 5][..]));
+        assert_eq!(drain.try_next().as_deref(), Some(&[6][..]));
+        assert!(drain.try_next().is_none());
     }
 
     #[epics_macros_rs::epics_test]

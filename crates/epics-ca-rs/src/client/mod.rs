@@ -3104,7 +3104,7 @@ impl CaChannel {
     /// (W10-B5) — the resolution belongs here, at the `ca_host_name` analog,
     /// not in the tool.
     ///
-    /// The lookup is [`types::peer_resolved_name`] — `hostname::ip_addr_to_a`
+    /// The lookup is `types::peer_resolved_name` — `hostname::ip_addr_to_a`
     /// on a blocking thread: this is an `async fn` a caller awaits, so it can
     /// wait for the resolver exactly as C's `cainfo` does, and no other
     /// channel's progress is behind it.

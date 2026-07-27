@@ -697,6 +697,28 @@ pub(crate) struct InFlightOps {
     /// `subid` spaces separate, so the reply's owner is recorded here and
     /// the response dispatcher consults this map first.
     pub(crate) sub_updates: Arc<DashMap<u32, (u32, u32)>>,
+    /// `cid -> pv_name`, written by the issuer of a fire-and-forget
+    /// `CA_PROTO_WRITE` and read by the circuit's ERROR decoder.
+    ///
+    /// A plain write carries no `ioid` and completes nothing, so unlike
+    /// every other request it leaves no per-op record — which is why the
+    /// exception path used to recover the channel name by looking the
+    /// error's cid up in the coordinator's live `channels` map. That
+    /// lookup answers "is this channel still alive", not "what was this
+    /// request issued against", and a `CA_PROTO_ERROR` that overtakes the
+    /// channel's own `DropChannel` therefore printed a context with no
+    /// channel in it. libca has the record because the name lives on the
+    /// `nciu` the write was issued through (`cac::writeExcep` →
+    /// `chanTable.lookup(hdr.m_available)`, `cac.cpp:1050-1061`, the
+    /// ECHOED request's cid); this map is that record.
+    ///
+    /// Entries outlive the channel on purpose. They are removed when the
+    /// server can no longer answer for the cid: the `CA_PROTO_CLEAR_CHANNEL`
+    /// confirmation (`rsrv/camessage.c:1944-1957` echoes `m_cid`/
+    /// `m_available`, and a circuit answers in order, so it is a fence and
+    /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
+    /// sent no CLEAR_CHANNEL because the channel was not operational.
+    pub(crate) write_identities: Arc<DashMap<u32, Arc<str>>>,
     /// monotonic `ioid` source owned by the same registry
     /// that holds the live ids. Keeping the counter here (rather than
     /// a process-global static) lets [`Self::alloc_ioid`] probe
@@ -713,6 +735,7 @@ impl InFlightOps {
             reads: Arc::new(DashMap::new()),
             writes: Arc::new(DashMap::new()),
             sub_updates: Arc::new(DashMap::new()),
+            write_identities: Arc::new(DashMap::new()),
             next_ioid: Arc::new(AtomicU32::new(1)),
         }
     }
@@ -1182,6 +1205,12 @@ pub(crate) enum TransportCommand {
     },
     Write {
         sid: u32,
+        /// Client cid of the channel the write is issued on. Goes on the
+        /// wire in `m_available`, where libca puts it
+        /// (`tcpiiu::writeRequest`, `tcpiiu.cpp:1430-1432`) so the server's
+        /// echo in a `CA_PROTO_ERROR` names the channel back
+        /// (`cac::writeExcep` reads `hdr.m_available`).
+        cid: u32,
         data_type: u16,
         count: u32,
         payload: Vec<u8>,
@@ -1298,16 +1327,23 @@ pub(crate) enum TransportEvent {
         original_request: Option<u16>,
         message: String,
         server_addr: SocketAddr,
-        /// Client cid of the channel the failed request was on. rsrv's
-        /// `vsend_err` (`rsrv/camessage.c:155-182`) stamps the outer error
-        /// header's `m_cid` with `pciu->cid` for every channel-scoped command
-        /// and with `0xFFFF_FFFF` otherwise, so this is `None` exactly when
-        /// the error is not about a channel.
-        cid: Option<u32>,
         /// DBR type and element count of the echoed request header — libca's
         /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
         data_type: Option<u16>,
         count: Option<u32>,
+        /// Channel name the failing request was issued against, taken from
+        /// [`InFlightOps::write_identities`] by the cid the ECHOED request
+        /// header carries. Resolved here, on the circuit that owns the
+        /// request, rather than by the coordinator against its live
+        /// `channels` map: the identity of a request that already failed
+        /// does not depend on whether its channel is still open.
+        ///
+        /// This variant deliberately carries no raw cid. It carried one, and
+        /// the coordinator resolved the name from it against `channels` —
+        /// which is the lookup that produced a nameless exception whenever
+        /// the error overtook the channel's own teardown. Naming the channel
+        /// here and nowhere else is what makes that outcome unrepresentable.
+        pv_name: Option<Arc<str>>,
     },
     TcpClosed {
         server_addr: SocketAddr,

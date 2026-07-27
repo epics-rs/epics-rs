@@ -1625,6 +1625,7 @@ fn process_command(
         }
         TransportCommand::Write {
             sid,
+            cid,
             data_type,
             count,
             payload,
@@ -1640,7 +1641,7 @@ fn process_command(
                 sid,
                 data_type,
                 count,
-                None,
+                Some(cid),
                 payload,
                 peer_minor,
             ) else {
@@ -3165,14 +3166,28 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // channel-scoped commands and `0xFFFF_FFFF` otherwise
                     // (`rsrv/camessage.c:155-182`).
                     let err_cid = (hdr.cid != 0xFFFF_FFFF).then_some(hdr.cid);
+                    // Identity of the failing request, from the record its
+                    // issuer left behind. `echo_available` is the ECHOED
+                    // request's `m_available` — on a plain `CA_PROTO_WRITE`
+                    // that is the cid the client stamped at issue time, and
+                    // it is the field libca looks the channel up by
+                    // (`cac::writeExcep`, `cac.cpp:1056`), so the request
+                    // names itself and the channel need not still exist.
+                    // `err_cid` is the same number by the other route (rsrv
+                    // stamps the outer header from `pciu->cid`,
+                    // `camessage.c:155-182`); it covers a peer that echoes a
+                    // truncated header.
+                    let pv_name = echo_available
+                        .or(err_cid)
+                        .and_then(|c| in_flight.write_identities.get(&c).map(|n| n.clone()));
                     let _ = event_tx.send(TransportEvent::ServerError {
                         eca_status,
                         original_request: orig_cmd,
                         message: msg,
                         server_addr,
-                        cid: err_cid,
                         data_type: echo_type,
                         count: echo_count,
+                        pv_name,
                     });
                 }
                 CA_PROTO_SERVER_DISCONN => {
@@ -3181,6 +3196,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // reuse later in the circuit starts fresh.
                     known_cids.remove(&hdr.cid);
                     pending_access.remove(&hdr.cid);
+                    // the server has retired the cid, so nothing it sends
+                    // later can be an answer for it — the write identity's
+                    // window is closed.
+                    in_flight.write_identities.remove(&hdr.cid);
                     let _ = event_tx.send(TransportEvent::ServerDisconnect {
                         cid: hdr.cid,
                         server_addr,
@@ -3209,6 +3228,18 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 //     1000-1003` `clearChannelRespAction` is
                 //     currently a documented no-op in C.
                 CA_PROTO_SEARCH | CA_PROTO_READ | CA_PROTO_CLEAR_CHANNEL => {
+                    if hdr.cmmd == CA_PROTO_CLEAR_CHANNEL {
+                        // Not a no-op for the write identities: rsrv answers
+                        // a CLEAR_CHANNEL by echoing `m_cid`/`m_available`
+                        // (`camessage.c:1944-1957`), and a circuit answers
+                        // its requests in order, so this frame arrives after
+                        // every ERROR the cleared channel could still
+                        // produce. That makes it the exact point at which the
+                        // identity stops being needed — a fence, not a delay.
+                        // Our own CLEAR_CHANNEL puts the cid in `m_available`
+                        // (`hdr.available = cid` where the command is built).
+                        in_flight.write_identities.remove(&hdr.available);
+                    }
                     tracing::trace!(
                         server = %server_addr,
                         cmd = hdr.cmmd,
@@ -4058,6 +4089,136 @@ mod error_echo_dispatch_tests {
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+    }
+}
+
+#[cfg(test)]
+mod write_identity_tests {
+    //! The identity a `CA_PROTO_WRITE` exception carries comes from the
+    //! record its issuer left in `InFlightOps::write_identities`, keyed by
+    //! the cid the ECHOED request header carries — libca's
+    //! `cac::writeExcep` reads the same field (`cac.cpp:1056`). These are
+    //! the boundaries of that record's lifetime, one case each: present,
+    //! and closed by the CLEAR_CHANNEL fence.
+    use super::*;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    const CID: u32 = 0x2A;
+    const ECA_PUTFAIL: u32 = 0xCC;
+
+    fn write_error_frame(cid: u32) -> Vec<u8> {
+        let mut echoed = CaHeader::new(CA_PROTO_WRITE);
+        echoed.postsize = 16;
+        echoed.data_type = epics_base_rs::types::DBR_STRING;
+        echoed.count = 1;
+        echoed.cid = 7; // sid, as the client sent it
+        echoed.available = cid;
+        let echoed = echoed.to_bytes();
+
+        let mut err = CaHeader::new(CA_PROTO_ERROR);
+        err.postsize = echoed.len() as u16;
+        err.cid = cid;
+        err.available = ECA_PUTFAIL;
+
+        let mut frame = err.to_bytes().to_vec();
+        frame.extend_from_slice(&echoed);
+        frame
+    }
+
+    /// rsrv's delete confirmation (`camessage.c:1944-1957`) echoes the
+    /// request's `m_cid`/`m_available`; our CLEAR_CHANNEL puts the sid in
+    /// the first and the cid in the second.
+    fn clear_channel_confirm(cid: u32) -> Vec<u8> {
+        let mut hdr = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        hdr.cid = 7;
+        hdr.available = cid;
+        hdr.to_bytes().to_vec()
+    }
+
+    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<Arc<str>> {
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        // The issuer's record: this channel wrote, so its name is bound to
+        // its cid before any answer can come back.
+        in_flight
+            .write_identities
+            .insert(CID, Arc::from("TST:LO.RTYP"));
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(1024);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
+        ));
+
+        let mut client = client_io;
+        for f in frames {
+            client.write_all(&f).await.expect("write frame");
+        }
+        client.flush().await.expect("flush");
+
+        let name = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(TransportEvent::ServerError { pv_name, .. }) => return pv_name,
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("a ServerError must be emitted for a CA_PROTO_ERROR");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        name
+    }
+
+    /// The write's own record names the channel. Nothing consults live
+    /// channel state, so the answer does not change with the channel's
+    /// state — which is the whole point: pre-fix the coordinator read the
+    /// name out of its `channels` map, and an ERROR that overtook the
+    /// channel's `DropChannel` printed `Context: "TST:LO.RTYP"` with no
+    /// `channel=` in it at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_error_is_named_by_the_record_its_issuer_left() {
+        assert_eq!(
+            server_error_pv_name(vec![write_error_frame(CID)])
+                .await
+                .as_deref(),
+            Some("TST:LO.RTYP"),
+        );
+    }
+
+    /// After the server confirms the CLEAR_CHANNEL there is nothing left it
+    /// can answer for that cid, so the record is gone and a later ERROR
+    /// naming the cid carries no channel — it cannot borrow the name of
+    /// whatever channel holds the cid next. C is the same shape:
+    /// `cac::writeExcep` raises nothing when the lookup misses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmed_clear_closes_the_identity_before_the_cid_can_be_reused() {
+        assert_eq!(
+            server_error_pv_name(vec![clear_channel_confirm(CID), write_error_frame(CID)])
+                .await
+                .as_deref(),
+            None,
+        );
     }
 }
 

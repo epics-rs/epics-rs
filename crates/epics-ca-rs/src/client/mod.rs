@@ -2011,13 +2011,21 @@ impl CaChannel {
         // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
         // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
         crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
+        // Bind the identity to the request before the request exists on the
+        // wire, at the one site both routes pass through. A plain write has
+        // no ioid and no completion, so this record is the only thing that
+        // survives to tell a later `CA_PROTO_ERROR` what it is about; libca
+        // gets the same answer from the `nciu` the write was issued through.
+        self.in_flight
+            .write_identities
+            .insert(self.cid, Arc::clone(&self.pv_name));
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
                 data_type,
                 count,
-                None,
+                Some(self.cid),
                 payload,
                 snap.server_minor,
             )?);
@@ -2026,6 +2034,7 @@ impl CaChannel {
         self.transport_tx
             .send(TransportCommand::Write {
                 sid: snap.sid,
+                cid: self.cid,
                 data_type,
                 count,
                 payload,
@@ -3624,6 +3633,7 @@ async fn run_coordinator(
                         }
 
                         // Clear channel on server + clean reverse index
+                        let mut cleared_on_server = false;
                         if let Some(ch) = channels.get(&cid) {
                             if ch.state.is_operational() {
                                 let _ = transport_tx.send(TransportCommand::ClearChannel {
@@ -3632,6 +3642,7 @@ async fn run_coordinator(
                                     server_addr: ch.server_addr.unwrap(),
                                     priority: ch.priority,
                                 });
+                                cleared_on_server = true;
                             }
                             // Cancel search for any non-connected state
                             match ch.state {
@@ -3653,6 +3664,16 @@ async fn run_coordinator(
                         // authoritative table.
                         cid_alloc.release(cid);
                         snapshots.remove(&cid);
+                        // A channel that never reached the server cannot be
+                        // the subject of a later ERROR, so its write identity
+                        // closes here. When a CLEAR_CHANNEL did go out the
+                        // window stays open until the server confirms it —
+                        // that confirmation is the fence, and dropping the
+                        // identity here instead is exactly the race this
+                        // record exists to remove.
+                        if !cleared_on_server {
+                            in_flight.write_identities.remove(&cid);
+                        }
                         // Drop any in-flight read/write entries for this
                         // cid. Normally `self.in_flight.reads/writes
                         // .remove(&ioid)` in the op future already cleans
@@ -4149,9 +4170,9 @@ async fn run_coordinator(
                         original_request,
                         message,
                         server_addr,
-                        cid,
                         data_type,
                         count,
+                        pv_name,
                     } => {
                         // Already logged in the transport layer; this is the
                         // libca exception path (`cac::exceptionRespAction` →
@@ -4197,9 +4218,9 @@ async fn run_coordinator(
                         };
                         let is_channel_exception = op == types::CaOp::Put;
                         let pv_name = is_channel_exception
-                            .then(|| cid.and_then(|c| channels.get(&c)))
+                            .then_some(pv_name)
                             .flatten()
-                            .map(|ch| ch.pv_name.to_string());
+                            .map(|n| n.to_string());
                         // `cac::defaultExcep` folds the host into the ctx
                         // text itself (`host=%s ctx=%.400s`, `cac.cpp:1006-1016`)
                         // before raising; the channel path passes the server's

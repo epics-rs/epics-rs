@@ -38,9 +38,10 @@
 //! contiguous buffer per message for the pre-existing abort-safety
 //! invariant, so this is the shape they already produce.
 //!
-//! Frames travel as [`PooledFrame`], so the drain owner's drop of a written
+//! Frames travel as `PooledFrame`, so the drain owner's drop of a written
 //! frame is also what returns the connection's send buffer to its
-//! [`FramePool`] for the next delivery — see [`crate::server::frame`].
+//! `FramePool` for the next delivery — see `crate::server::frame`, which is
+//! crate-private and so cannot be linked from this module's public docs.
 
 use crate::server::frame::{FramePool, PooledFrame};
 use epics_base_rs::runtime::sync::mpsc;

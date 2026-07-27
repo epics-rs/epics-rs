@@ -61,8 +61,16 @@ echo $NCPID > "$R/nc.pid"
 sleep 25                       # kernel shell prompt
 echo "" > "$R/con.in"
 sleep 2
-echo "rtpSp \"/host.host/$IMG.vxe\"" > "$R/con.in"
-echo "launched; running ${SECS}s"
+# VXNOLAUNCH=1 leaves the guest at the kernel shell with no RTP started. The
+# 768M/832M diagnosis needs the kernel's free pool as it stands BEFORE the
+# loader touches it — once the RTP has loaded (or failed and been destroyed)
+# memShow no longer answers "was there room for the image".
+if [ "${VXNOLAUNCH:-0}" = 1 ]; then
+    echo "no-launch: kernel shell only"
+else
+    echo "rtpSp \"/host.host/$IMG.vxe\"" > "$R/con.in"
+    echo "launched; running ${SECS}s"
+fi
 sleep "$SECS"
 
 echo "=== stopping ==="

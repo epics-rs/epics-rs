@@ -29,7 +29,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.25.1"
+version = "0.25.2"
 authors = ["Sang Woo Kim <sngwkim915@gmail.com>"]
 license = "EPICS"
 repository = "https://github.com/epics-rs/epics-rs"

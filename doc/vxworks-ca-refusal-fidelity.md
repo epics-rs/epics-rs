@@ -471,12 +471,129 @@ this — `RTEMS-posix/osdPoolStatus.c` switches on `__RTEMS_MAJOR__ < 5` and use
 `malloc_free_space()` for 5 and later. That function *is* reachable in our
 build: declared in `rtems/libcsupport.h`, defined in `librtemscpu.a`.
 
-Whether it tracks an RTEMS wall of ours is unmeasured — this port has never
-walled a pool on RTEMS, so there is no wall to compare a reading against. What
-is measured is that the budget is inert there: our RTEMS guest is a 256 MB
-`xilinx-zynq-a9`, and [`default_reservation_budget`] hands RTEMS the same
-160 MiB, which is 62.5 % of the entire guest. The count bound or the heap will
-be reached first, so on RTEMS the memory gate cannot be what refuses. Closing
-that needs an RTEMS-side ladder of the kind §10.2 ran here, and then either a
-measured RTEMS constant or, since RTEMS is a single address space where the heap
-*is* the binding resource, the `malloc_free_space()` query base already uses.
+Whether it tracks an RTEMS wall of ours is still unmeasured — no RTEMS ladder of
+the kind §10.2 ran here has been run — but the budget's *runtime* behaviour on
+RTEMS is no longer unmeasured, and the earlier reading of it was wrong. This
+section previously said the budget was inert on RTEMS, on the arithmetic that
+160 MiB is 62.5 % of a 256 MB `xilinx-zynq-a9` guest and that the count bound or
+the heap must therefore be reached first. It is not what happens. See §11.3.
+
+## 11. On-target round: the arena gate, RTEMS, and who publishes the wall
+
+Three questions taken to the target on one rig (E11: VxWorks 7 `x86_64` guest on
+host ports 51534/55064/55075; RTEMS 6 `xilinx-zynq-a9` guest on 45064/45065).
+One of the three answers is a failure and is recorded as one.
+
+### 11.1 The object-arena gate is not demonstrated
+
+`materialise_set_mutex` takes the set's own `Mutex<SetState>` before any thread
+of that set exists, so a target that cannot hand out a kernel mutex object
+refuses the client instead of killing a worker inside `Mutex::lock`. E8 measured
+the failure it is aimed at: `semMCreate=NULL` with 588 live semaphores at 49
+sets / 98 workers, transient, so the object arena is a rate problem and not a
+total — which is why it has its own gate rather than a term added to the byte
+budget.
+
+That failure did not reproduce on this rig, so the gate's effect could not be
+shown. Three configurations, all on the gated image:
+
+| guest | `EPICS_RS_POOL_RESERVATION_MB` | what bound first |
+|---|---|---|
+| 1024M | 320 | `memory allocation of 64 bytes failed` → signal 6, RTP deleted, at attempt 42 |
+| 1536M | 400 | budget refusal at attempt 76, IOC survived |
+| 1536M | 1200 | `CAS_CLIENT_POOL_CAPACITY` refusal at attempt 137, IOC survived |
+
+No `semMCreate=NULL` in any of them. The 1024M/320 run is the one that matters:
+the pre-gate image aborted there at attempt 42 (`console-e11-1024M-envraise320-abort.log`),
+and the gated image aborts there at attempt 42 with the identical message. The
+gate changed nothing, because the allocation that fails is E10's 64-byte
+per-thread TLS destructor list, taken by `std` *inside* the already-spawned
+thread — past `pthread_create`, past every gate, and with no fallible
+`Vec::push` to fail into. That is the residue §10 already names, and this round
+measured that it, not the semaphore arena, is what binds on this box.
+
+So: the gate is shipped and unit-tested, and its on-target effect is
+**unverified**. Verifying it needs a run that reaches `semMCreate=NULL` before
+the address-space wall, which this rig's ratio of guest RAM to arena size does
+not produce.
+
+### 11.2 The abort is reachable only through the operator's own switch
+
+Worth stating plainly, because the table above invites the wrong reading. With
+the **default** 160 MiB budget the 1024M guest refuses cleanly at 17 clients and
+keeps serving. Every abort in this round required raising
+`EPICS_RS_POOL_RESERVATION_MB` past what the target can honour — 320 MiB on a
+box whose measured ceiling is ~254 MiB of thread reservation (§10.2). The switch
+is documented as "raise it if the target has the memory" and takes the operator
+at their word; when they are wrong the process dies rather than refusing.
+
+A startup clamp is possible and is the structural close: §10.2's single-mapping
+probe returns 192 MiB on this guest against a true ceiling of 254 MiB — a sound
+lower bound, obtained in ~0.3 s from one `PROT_NONE` mapping that is released
+immediately — so a configured budget could be clamped to what the address space
+will actually give instead of to what the operator believes. That is not built.
+
+### 11.3 RTEMS: the budget is live, and refuses
+
+Measured on the 256 MB `xilinx-zynq-a9` guest, image built through
+`scripts/embedded-image.sh rtems ca`, default budget:
+
+```
+WALL attempt=33 held=32
+  CAS: no resources for a new client (worker pool at its thread-memory budget:
+  this set needs 3584 KiB, 158 of 160 MiB already reserved — raise
+  EPICS_RS_POOL_RESERVATION_MB if the target has the memory)
+```
+
+The IOC survived and kept serving for the rest of the run: `CA_CONN_CNT=37`,
+`FD_CNT=45`, `MEM_USED=86,427,536` — a third of the guest, with the budget
+refusing at 158 of 160 MiB reserved. So the memory gate *is* what refuses on
+RTEMS, not the count bound and not the heap, and §10.4's arithmetic was wrong
+because it compared the budget against the guest's RAM rather than against what
+the pool had actually reserved. An RTEMS CA set is 3584 KiB where a VxWorks one
+is 5120 KiB, which is why 160 MiB buys 32 sets there and 32 sets here are a
+different number of bytes.
+
+The console carried the same refusal with its ordinal
+(`… — refused 10.0.2.2:41620 (refusal #1)`), and nothing fatal appeared.
+
+### 11.4 The refusal counter is right; the thread that publishes it is starved
+
+`RTEMS:CA_REFUSED_CNT` reading 0.0 straight after a refusal was written off as a
+poll-interval effect. It is not, and the poll interval is not the interesting
+part.
+
+Sampled on VxWorks, 1536M guest, 1200 MiB budget, one 136-client ramp:
+
+| probe time | UPTIME | CA_CONN_CNT | CA_REFUSED_CNT |
+|---|---|---|---|
+| t+0 s | 00:00:00 | 0 | 0 |
+| t+12 s | 00:00:12 | 5 | 0 |
+| t+413 s (refusal) | 00:00:12 | 5 | 0 |
+| t+415 s | **00:06:55** | 141 | 1 |
+
+`UPTIME` changes once a second by construction. It did not move for 401 seconds
+— the whole ramp — and then jumped 6 min 43 s in a single tick two seconds after
+the load stopped. The counter was correct all along; nothing published it.
+
+It is priority starvation, not lock coupling, and the console settles which. The
+`c6-probe` thread shares no lock with the status pusher, sleeps 10 s and prints;
+over the same 444 s run it emitted **4** ticks instead of ~44, and its
+`FDPROBE seq=1` reports `CA_CONN_CNT=5` while `seq=2` already reports 141. Both
+threads froze together, and the only thing they share is their band:
+`ThreadPriority::Low` (EPICS 10). On a single-CPU target under `SCHED_FIFO`,
+"below the serving threads" means "never, while the server is busy".
+
+This is a deviation from base, not a tuning choice. C's `devIocStats` status
+records are updated by the periodic scan tasks at `epicsThreadPriorityScanLow`
+(60) / `ScanHigh` (70), both **above** `epicsThreadPriorityCAServerLow` (20) and
+`CAServerHigh` (40) — so under C the operator can read a loaded IOC. We put the
+only equivalent below the CA server, so ours goes blind exactly when it is
+needed. The fix is the band: `status_pv.rs`'s pusher belongs at a scan band, and
+the module comment that argues for `Low` ("it reports, it does not serve — so it
+must never be the reason a scan or a CA reply waits") is the reasoning that
+produced the defect; a 1 Hz walk of five values is not what makes a CA reply
+wait.
+
+`crates/epics-base-rs/src/server/status_pv.rs:296` is not this panel's file, so
+the one-line band change is handed over rather than made here.

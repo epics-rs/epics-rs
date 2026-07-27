@@ -50,7 +50,8 @@
 //! *after* the target has run out is not an admission gate.
 //!
 //! So every set's memory is reserved from one **process-wide** budget before a
-//! thread is created ([`try_reserve`], [`POOL_RESERVATION_ENV`]), and a set
+//! thread is created (`Reservation::try_reserve`, [`POOL_RESERVATION_ENV`]),
+//! and a set
 //! that does not fit is refused with [`AcquireError::OutOfReservation`] while
 //! the target still has the memory to deliver the refusal. Process-wide because
 //! the resource is: an IOC runs several pools, and three pools each inside
@@ -77,7 +78,7 @@
 //! That accounting is exact only while every dispatched job comes back, and a
 //! worker *thread* can die where the job's `catch_unwind` does not reach — on
 //! target it did, at the memory wall, in a `std` mutex that returned `EINVAL`.
-//! So the set's slot is released by the thread's destructor ([`WorkerExit`]),
+//! So the set's slot is released by the thread's destructor (`WorkerExit`),
 //! not by a code path that a panic can skip: any exit that was not asked for
 //! marks the set dead, stops its siblings, and gives the slot back to `created`
 //! when the last of its threads is gone. A dead set is never pooled again,
@@ -382,7 +383,7 @@ impl Job {
     /// A dropped sender (the worker gone at teardown after the job was taken)
     /// reads as a clean completion: there is no unwind to report and nothing to
     /// tear down twice. A job that was never dispatched at all is *not* clean —
-    /// it reports [`NEVER_DISPATCHED`], because a borrower that is told its
+    /// it reports `NEVER_DISPATCHED`, because a borrower that is told its
     /// body succeeded when it never ran is the same silent loss as a dropped
     /// panic payload.
     pub fn join(self) -> thread::Result<()> {
@@ -560,7 +561,7 @@ fn finish_job(inner: &Arc<PoolInner>, set: &Arc<SetHandle>) {
 // ---------------------------------------------------------------------------
 
 /// How many MiB of thread memory every pool in this process may reserve
-/// *together*. Overrides [`default_reservation_budget`]; read once, on first
+/// *together*. Overrides `default_reservation_budget`; read once, on first
 /// admission.
 pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
 
@@ -1013,7 +1014,7 @@ fn thread_reservation(role: &WorkerRole) -> usize {
 /// It is not a total. Creation resumed past 1,024 objects after that NULL, so
 /// the arena is a *transient* refusal and a byte or count budget is the wrong
 /// shape for it — there is no per-thread figure to add to
-/// [`PER_THREAD_OBJECT_ARENA`], and a cap set at 588 would refuse connections a
+/// `PER_THREAD_OBJECT_ARENA`, and a cap set at 588 would refuse connections a
 /// moment later than the target would have served them. What a transient
 /// refusal needs is for the *rate* of creation to bend to the target, which is
 /// what this gate does: the pool asks for the object at a point where "no"
@@ -1095,7 +1096,7 @@ pub struct ThreadCharge {
 
 impl ThreadCharge {
     /// Charge one fixed thread of `stack`. Never refuses — see
-    /// [`Reservation::charge`].
+    /// `Reservation::charge`.
     pub fn fixed(stack: StackSizeClass) -> Self {
         let bytes = thread_reservation_bytes(stack);
         PROCESS_RESERVATION.charge(bytes);

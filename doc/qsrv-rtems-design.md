@@ -721,15 +721,20 @@ HOST_ONLY=( …
 )
 ```
 
-Note the census walks `crates/$crate/src/bin/*.rs` by **filename**, while
-the bridge's `[[bin]]` entries give explicit `path`s whose basenames use
-underscores (`src/bin/ca_gateway_rs.rs` → bin name `ca-gateway-rs`). The
-census computes `crate:$(basename "$src" .rs)`, so the pairs it will
-produce are `epics-bridge-rs:ca_gateway_rs`, `:dual_gateway_rs`,
-`:dual_ioc_rs`, `:pva_gateway_rs`, `:qsrv_rs` — **underscores, not
-hyphens**. Getting this wrong makes the script fail with both an
-"unclassified" and a "stale" complaint at once. UNVERIFIED which spelling
-the maintainers want; the mechanical answer is the basename.
+**Superseded (`build(scripts): take the gate binary census from cargo
+metadata`): the spelling above is the current one.** When
+this section was written the census walked `crates/$crate/src/bin/*.rs`
+by **filename**, so the pairs it produced for the bridge were
+`epics-bridge-rs:ca_gateway_rs`, `:dual_gateway_rs`, `:dual_ioc_rs`,
+`:pva_gateway_rs`, `:qsrv_rs` — underscores, because the bridge's
+`[[bin]]` entries give explicit `path`s whose basenames use underscores
+while the names use hyphens (`src/bin/ca_gateway_rs.rs` → bin name
+`ca-gateway-rs`). Both censuses now read `cargo metadata --no-deps
+--offline` and key on the bin NAME, so the lists spell what `--bin`
+takes. The glob was not merely inconvenient: it could not see a `[[bin]]`
+whose `path` lies outside `src/bin`, nor a nested
+`src/bin/<name>/main.rs`, and both were measured being built with both
+gates exiting 0.
 
 `BINS` gains nothing: no bridge binary is built for the target. The
 target's qsrv mount lives in `epics-pva-rs:rtems-pva-ioc`, which is
@@ -998,6 +1003,12 @@ Everything here is a claim this document could not settle from source.
    `:pva_gateway_rs`, `:qsrv_rs`, exactly as the mechanical reading of
    `basename src/bin/*.rs .rs` predicted. Hyphens fail the run with both
    an "unclassified" and a "stale" complaint at once, as anticipated.
+   **Reversed by `build(scripts): take the gate binary census from cargo
+   metadata`: hyphens, i.e. cargo's bin names.** The
+   census now takes its population from `cargo metadata`, because the
+   glob's real cost was not the spelling — it could not see a `[[bin]]`
+   pointing outside `src/bin` or a nested `src/bin/<name>/main.rs`,
+   measured as two binaries cargo built and no gate row named.
 8. **The bridge's `Instant::now()` deadline loop
    (`pvalink/integration.rs:725`, `:730`, `:733`).** Only reachable once
    pvalink is on the target (stage 5), but worth recording now: the

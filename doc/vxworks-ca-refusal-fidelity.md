@@ -597,3 +597,70 @@ wait.
 
 `crates/epics-base-rs/src/server/status_pv.rs:296` is not this panel's file, so
 the one-line band change is handed over rather than made here.
+
+### 11.5 The rule: a diagnostic path must publish while the IOC is at its wall
+
+§11.4 is not "one status PV is stale". Two independent threads went blind for
+401 s, and e10-residue saw the same shape from the other side on VxWorks —
+accept latency from 0.02 s to 7.36 s past 40 held clients, with the console
+stopping — so this is a class, and the fix belongs at the class.
+
+**Invariant.** MUST: every thread on the diagnostic path — the status-PV
+publisher and anything else whose only job is to let an operator see the box —
+keep running while the IOC is being driven to its admission wall. MUST NOT: a
+diagnostic thread sit below the serving threads on a target whose scheduler is
+strictly priority-ordered, because there "below" means "never, while the server
+is busy".
+
+**Owner.** Applying a band has exactly one owner and it holds:
+`runtime::task::enter_ioc_thread` is the sole place a thread takes its EPICS
+priority (`task.rs:1094`), every thread body calls it, and `task.rs:3053`'s
+source scan fails the build for a thread body that calls neither it nor
+`name_current_thread()`. Nothing bypasses it — audited across the workspace:
+`worker_pool.rs:1250` (pool workers, from `role.priority`),
+`epics-ca-rs/src/server/blocking.rs:443,587`,
+`epics-pva-rs/src/server_native/blocking.rs:802,1132`, `task.rs:1705,1825,1904,1995`
+(the spawn helpers), and the two bring-up probes.
+
+**The gap.** *Choosing* the band has no owner. The serving paths name theirs and
+pin them: `CAS_TCP_PRIORITY` / `CAS_UDP_PRIORITY` (`blocking.rs:184,197`) with a
+guard asserting each loop enters at its own constant (`blocking.rs:2015`), and
+`PVA_SERVER_PRIORITY` / `PVA_UDP_PRIORITY` likewise. The diagnostic path passes a
+bare `ThreadPriority::Low` literal at three call sites — `status_pv.rs:296`,
+`realtime-ca-ioc.rs:776`, `realtime-pva-ioc.rs:826` — with no named constant and
+no guard. So the band was never chosen against a rule; it was argued locally,
+once, in the comment above `status_pv.rs:296`: *"this is the least urgent thread
+in the IOC by construction — it reports, it does not serve — so it must never be
+the reason a scan or a CA reply waits."* That argument is why the path is at the
+bottom, and it is the defect: it optimises for never delaying a reply and pays
+with never being published.
+
+**What C does.** C reaches the opposite arrangement and states it in numbers.
+`libcom/src/osi/epicsThread.h:77-85`: `Low`=10, `CAServerLow`=20,
+`CAServerHigh`=40, `Medium`=50, `ScanLow`=60, `ScanHigh`=70. The whole CA server
+lives at the bottom of that: `caservertask.c:109` creates `CAS-client` at
+`epicsThreadPriorityCAServerLow`, and `:554-560` puts the TCP listener at
+`CAServerLow-2`, the name receiver at `CAServerLow-4`, the beacon sender at
+`-3`, the TCP sender at `-1`, while `:1508` places the event task at
+`epicsThreadHighestPriorityLevelBelow(CAServerLow)`. Everything that publishes a
+record value on a period runs 40 levels above all of it:
+`dbScan.c:949` spawns each `scan-%g` at `epicsThreadPriorityScanLow + ind`, and
+`dbScan.c:776` puts `scanOnce` at `ScanLow + nPeriodic`. devIocStats' status
+records are ordinary periodic records, so under C an operator reads a saturated
+IOC because record publication outranks client service by design.
+
+Ours inverts it: the publisher at `Low`(10) is ten levels *below*
+`CAServerLow`(20), which our own `map_epics_priority_*` carries faithfully to
+the target. Under `SCHED_FIFO` on a single CPU that is the measured 401 s.
+
+**The change.** `status_pv.rs:296` moves from `ThreadPriority::Low` to a scan
+band, behind a named constant with the guard shape `blocking.rs:2015` already
+uses, so the choice is pinned rather than re-argued. That file is
+`crates/epics-base-rs/**` and is not this panel's, so the change is handed over
+rather than made here.
+
+The two bring-up probes stay at `Low` on purpose, and not by omission: `c6-probe`
+writes an `fd_census` line per descriptor — 146 lines to a serial console at 141
+clients — and putting a write of that size above the CA server would stall
+service in a way the 1 Hz five-value push does not. They are `bringup-probes`
+measurement rigs, not the operator's view; the status PVs are.

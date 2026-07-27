@@ -571,6 +571,15 @@ pub const POOL_RESERVATION_ENV: &str = "EPICS_RS_POOL_RESERVATION_MB";
 /// (`doc/vxworks-ca-refusal-fidelity.md` §8; the three-arm measurement is E8's,
 /// `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1` §10).
 ///
+/// It is **not** what the OS charges for a thread. A C RTP laddering bare
+/// pthreads on the same guest walls at exactly `n × declared stack` — 127 × 2
+/// MiB, 254 × 1 MiB, 509 × 512 KiB, each matching an `mmap` ceiling to the byte
+/// (§10.2). So the flat MiB is what a *Rust* thread reserves beyond its stack,
+/// consistent with a per-thread allocator arena and with E10's abort landing on
+/// a 64-byte allocation inside a freshly spawned thread. Charge it per thread
+/// for that reason; do not delete it on the theory that a thread costs only its
+/// stack, and do not read it as an address-space constant of the target.
+///
 /// RTEMS takes the same figure, **assumed rather than measured**: it is the
 /// conservative direction — over-charging refuses one connection early, while
 /// under-charging is what walks the process into the ceiling. A host is not

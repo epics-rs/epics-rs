@@ -64,7 +64,7 @@ fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
 /// `PARAM`, `EPICS_PV`, `FUNCTION`, `CONST` — the match is case-insensitive so
 /// historic lowercase forms still parse.
 ///
-/// G10: live attributes are built with concrete [`NDAttributeSource`]
+/// G10: live attributes are built with concrete [`crate::attributes::NDAttributeSource`]
 /// backends:
 /// - `PARAM` → [`ParamAttributeSource`], fed by the driver from the asyn
 ///   parameter library (optional `addr` attribute, default 0).

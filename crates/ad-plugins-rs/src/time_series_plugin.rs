@@ -21,7 +21,7 @@
 //! the element type *first* (wrapping/truncating), then divides — so `UInt8`
 //! inputs `200,200,200` with `numAverage == 3` gave `(u8)600 == 88`, `88 / 3 ==
 //! 29` instead of `200`. That parenthesis bug was fixed upstream as ADCore #596
-//! (merged 2026-07-16). [`averaged_value`] divides first and then narrows, which
+//! (merged 2026-07-16). `averaged_value` divides first and then narrows, which
 //! this port has done since `d8f27b88` (2026-07-13) — it matches current
 //! upstream C and yields the correct `200`.
 //!

@@ -150,7 +150,7 @@ impl BadPixelProcessor {
     ///
     /// Mirrors C++ `fixBadPixelsT`: bad-pixel coordinates and Replace/Median
     /// neighbor coordinates are all expressed in sensor space and converted to
-    /// an array offset via [`Self::pixel_offset`] (C++ `computePixelOffset`).
+    /// an array offset via `pixel_offset` (C++ `computePixelOffset`).
     /// Replace/Median offsets are scaled by the array binning (`scaleX`,
     /// `scaleY`), and the "is the neighbor also bad" test queries the bad set
     /// in sensor space.

@@ -14,15 +14,21 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 /// The C++ filter uses a single filter buffer and numFiltered-dependent coefficients:
 ///
 /// Reset:
-///   filter[i] = rOffset + rc1*filter[i] + rc2*data[i]
+///
+/// ```text
+/// filter[i] = rOffset + rc1*filter[i] + rc2*data[i]
+/// ```
 ///
 /// Normal operation (after numFiltered is incremented):
-///   O1 = oScale * (oc1 + oc2/numFiltered)
-///   O2 = oScale * (oc3 + oc4/numFiltered)
-///   F1 = fScale * (fc1 + fc2/numFiltered)
-///   F2 = fScale * (fc3 + fc4/numFiltered)
-///   data[i]   = oOffset + O1*filter[i] + O2*data[i]
-///   filter[i] = fOffset + F1*filter[i] + F2*data[i]
+///
+/// ```text
+/// O1 = oScale * (oc1 + oc2/numFiltered)
+/// O2 = oScale * (oc3 + oc4/numFiltered)
+/// F1 = fScale * (fc1 + fc2/numFiltered)
+/// F2 = fScale * (fc3 + fc4/numFiltered)
+/// data[i]   = oOffset + O1*filter[i] + O2*data[i]
+/// filter[i] = fOffset + F1*filter[i] + F2*data[i]
+/// ```
 #[derive(Debug, Clone)]
 pub struct FilterConfig {
     /// Number of frames to average before auto-reset (if enabled).
@@ -281,10 +287,13 @@ impl ProcessState {
     /// Apply a named filter type preset, setting the FC/OC/RC coefficients.
     ///
     /// Uses the C++ coefficient scheme where:
-    ///   O1 = oScale * (oc[0] + oc[1]/N), O2 = oScale * (oc[2] + oc[3]/N)
-    ///   F1 = fScale * (fc[0] + fc[1]/N), F2 = fScale * (fc[2] + fc[3]/N)
-    ///   data[i]   = oOffset + O1*filter[i] + O2*data[i]
-    ///   filter[i] = fOffset + F1*filter[i] + F2*data[i]
+    ///
+    /// ```text
+    /// O1 = oScale * (oc[0] + oc[1]/N), O2 = oScale * (oc[2] + oc[3]/N)
+    /// F1 = fScale * (fc[0] + fc[1]/N), F2 = fScale * (fc[2] + fc[3]/N)
+    /// data[i]   = oOffset + O1*filter[i] + O2*data[i]
+    /// filter[i] = fOffset + F1*filter[i] + F2*data[i]
+    /// ```
     pub fn apply_filter_type(&mut self, filter_type: i32) {
         let fc = &mut self.config.filter;
         match filter_type {

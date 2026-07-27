@@ -121,7 +121,7 @@ pub struct ROIStatParams {
 pub struct ROIStatProcessor {
     rois: Vec<ROIStatROI>,
     results: Vec<ROIStatResult>,
-    /// Time series buffers: [roi_index][stat_index][time_point].
+    /// Time series buffers: `[roi_index][stat_index][time_point]`.
     ts_mode: TSMode,
     ts_buffers: Vec<Vec<Vec<f64>>>,
     ts_num_points: usize,

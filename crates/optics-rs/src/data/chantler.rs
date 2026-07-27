@@ -1,7 +1,7 @@
 //! Chantler X-ray absorption data for filter materials.
 //
 //! Ported from `opticsApp/src/chantler.c` (22 elements, up to 274 energy points each).
-//! Data: mass attenuation coefficients mu/rho [cm^2/g] vs photon energy [keV].
+//! Data: mass attenuation coefficients mu/rho `cm^2/g` vs photon energy `keV`.
 // These are tabulated physical data, not approximations of mathematical constants.
 #![allow(clippy::approx_constant)]
 

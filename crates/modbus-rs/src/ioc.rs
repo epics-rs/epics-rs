@@ -92,7 +92,7 @@ fn to_asyn(e: ModbusError) -> AsynError {
 }
 
 /// Decode a poller register block (from a record's offset to the block end)
-/// into an int32 array — the relative-mode decode of [`Ioc::read_int32_array`],
+/// into an int32 array — the relative-mode decode of `read_int32_array`,
 /// one element per `register_count` registers. Mirrors C `readPoller`'s
 /// `for (i=0; offset<modbusLength_; i++) readPlcInt32(...)` array fan-out
 /// (drvModbusAsyn.cpp:1840-1843). A malformed element decode aborts the poll.

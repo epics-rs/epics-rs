@@ -2991,7 +2991,7 @@ impl Record for TableRecord {
     }
 
     /// C `tableRecord.c` posts every record-internal change with a literal
-    /// `DBE_VALUE` (no `DBE_LOG`); see [`TABLE_VALUE_ONLY_FIELDS`].
+    /// `DBE_VALUE` (no `DBE_LOG`); see `TABLE_VALUE_ONLY_FIELDS`.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
         TABLE_VALUE_ONLY_FIELDS
     }
@@ -3000,7 +3000,7 @@ impl Record for TableRecord {
     /// and posts `SET` with `DBE_VALUE` (tableRecord.c:658-663). Neither
     /// `SSET` nor `SUSE` is `pp(TRUE)`, so no process cycle posts `SET`; the
     /// framework posts it here as a side effect of the put. `SET` is named in
-    /// [`TABLE_VALUE_ONLY_FIELDS`], so the side-effect post carries
+    /// `TABLE_VALUE_ONLY_FIELDS`, so the side-effect post carries
     /// `DBE_VALUE` only — matching C's literal mask.
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
         match put_field {

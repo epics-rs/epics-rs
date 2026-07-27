@@ -166,7 +166,7 @@ pub enum FifoResponseKind {
     Busy,
     /// Position DONE: `%<ID> <posA> <posB> DONE;` (4 words)
     PositionDone { pos_a: i32, pos_b: i32 },
-    /// Position OK: `%<ID> OK <posA> <posB>` (5 words, word[1]=="OK")
+    /// Position OK: `%<ID> OK <posA> <posB>` (5 words, `word[1]=="OK"`)
     PositionOk { pos_a: i32, pos_b: i32 },
     /// Unrecognized.
     Unknown,

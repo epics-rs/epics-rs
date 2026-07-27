@@ -773,9 +773,10 @@ mod ioc {
                 .stack_size(StackSizeClass::Medium.bytes())
                 .spawn(move || {
                     let _charge = charge;
-                    // The band is the role's. A console reporter that stops
-                    // when the IOC is loaded reports on the wrong half of the
-                    // run — see `runtime::ioc_role`.
+                    // The band is the role's, and for this role the table
+                    // says below client service: a census this long, above
+                    // the serving threads, rewrites the measurement it is
+                    // here to take — see `runtime::ioc_role`.
                     let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
                         epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                     );

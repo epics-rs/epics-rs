@@ -27,12 +27,12 @@
 //! # The rule
 //!
 //! **A thread whose output is how the IOC is observed must be schedulable
-//! while the IOC is at its wall.** Concretely: every role here sits strictly
-//! above `epicsThreadPriorityCAServerHigh` (40), which is the ceiling of the
-//! band C gives `rsrv` (`caservertask.c:562-575` builds its ladder down from
-//! `CAServerLow`), and at or below `epicsThreadPriorityScanHigh` (70), so a
-//! diagnostic can never delay record processing that is more urgent than the
-//! slowest periodic scan.
+//! while the IOC is at its wall — if its per-tick work is bounded.** The
+//! operator surface sits strictly above `epicsThreadPriorityCAServerHigh`
+//! (40), the ceiling of the band C gives `rsrv` (`caservertask.c:562-575`
+//! builds its ladder down from `CAServerLow`), and at or below
+//! `epicsThreadPriorityScanHigh` (70), so it can never delay record
+//! processing more urgent than the slowest periodic scan.
 //!
 //! C reaches the same ordering by a different route, which is why the rule is
 //! stated against C's constants rather than invented here: its status numbers
@@ -42,6 +42,18 @@
 //! inverted. The operator-facing report path C does have as a thread, `iocsh`,
 //! sits higher still at 91 (`epicsThread.h:86`), so this table is conservative
 //! relative to C in both directions.
+//!
+//! The bounded-work half of the rule is measured, not assumed, and it is why
+//! this table has two answers rather than one. On the same rig, the same ramp
+//! and the same guest, with the status pusher raised to `ScanLow`: 136 clients
+//! admitted before the pool's capacity refusal, identical to the pre-fix run,
+//! and `UPTIME` advancing 1 s/s throughout. With the bring-up console census
+//! raised alongside it: 87, twice, the 88th client's handshake exceeding a 15 s
+//! timeout. Its per-tick work is roughly a hundred lines onto a byte-serial
+//! console, and above the serving threads that work *is* the load — an
+//! instrument that changes what it measures. `epicsThreadPriorityIocsh` (91)
+//! is not a counter-example: C's unbounded reports are typed by a human, once,
+//! not emitted on a timer forever.
 //!
 //! # What is here and what is not
 //!
@@ -76,12 +88,15 @@ pub enum IocRole {
     /// The bring-up console reporter on the embedded entry points — the
     /// 10-second line groups and the descriptor/task census behind them.
     ///
-    /// Same rule, same reason: on RTEMS and in a VxWorks RTP the serial
-    /// console is the only channel there is, so a console that stops during
-    /// the interesting window is the same lost instrument as a frozen PV. Not
-    /// raised above the scan bands even though its work is bursty: it writes
-    /// at whatever rate the device drains, and a console burst must not delay
-    /// record processing. C does not raise a periodic reporter either.
+    /// Deliberately **below** client service, which is the other half of the
+    /// rule rather than an exception to it. This is an instrument, not an
+    /// operator surface: it exists only under the `bringup-probes` feature,
+    /// no shipped image contains it, and its per-tick work is a census whose
+    /// length is the descriptor table's. Raised to the operator surface's band
+    /// it cost 36% of the connection ceiling in two identical runs (see the
+    /// module docs), which is the instrument rewriting its own measurement.
+    /// The operator's diagnostic path on a shell-less target is
+    /// [`IocRole::StatusPublisher`], and that one publishes at the wall.
     ConsoleCensus,
 }
 
@@ -97,10 +112,15 @@ impl IocRole {
     /// (`dbScan.c:949`). It is the lowest band that still outranks every CA
     /// and PVA server thread in this workspace, all of which sit at or below
     /// `CaServerLow` (20). Choosing the bottom of the scan ladder rather than
-    /// a point inside it means a diagnostic preempts nothing that scans.
+    /// a point inside it means the operator surface preempts nothing that
+    /// scans.
+    ///
+    /// `Low` (10) is `epicsThreadPriorityLow`, below the whole CA ladder,
+    /// which starts at `CaServerLow - 4` (16).
     pub const fn band(self) -> ThreadPriority {
         match self {
-            IocRole::StatusPublisher | IocRole::ConsoleCensus => ThreadPriority::ScanLow,
+            IocRole::StatusPublisher => ThreadPriority::ScanLow,
+            IocRole::ConsoleCensus => ThreadPriority::Low,
         }
     }
 }
@@ -136,49 +156,72 @@ where
 mod tests {
     use super::*;
 
-    /// The rule this module exists to hold, over every role rather than over
-    /// the one that was measured.
+    /// The floor of the CA server ladder: `CAS_UDP_PRIORITY` in
+    /// `epics_ca_rs::server::blocking` is `CaServerLow - 4`, and no serving
+    /// thread in this workspace sits lower. Restated rather than imported
+    /// because that crate is above this one.
+    const CLIENT_SERVICE_FLOOR: u8 = ThreadPriority::CaServerLow.value() - 4;
+
+    /// Every role is placed on one side of client service, deliberately.
+    ///
+    /// The `match` is exhaustive on purpose: a new role cannot be added to the
+    /// table without this test failing to compile, which is the point of
+    /// having the table at all. Adding a variant is a decision about whether
+    /// its output is what an operator reads or an instrument that must not
+    /// disturb what it measures — see the module docs for the measurement
+    /// that made those two different answers.
     #[test]
-    fn every_role_outranks_client_service_and_yields_to_scanning() {
+    fn every_role_is_placed_on_a_stated_side_of_client_service() {
         for role in IocRole::ALL {
             let band = role.band().value();
-            assert!(
-                band > ThreadPriority::CaServerHigh.value(),
-                "{role:?} at {band} does not outrank the CA server band ceiling \
-                 ({}) — it can be starved by the client load whose effect it \
-                 exists to report",
-                ThreadPriority::CaServerHigh.value(),
-            );
-            assert!(
-                band <= ThreadPriority::ScanHigh.value(),
-                "{role:?} at {band} outranks record processing ({}); a \
-                 diagnostic must not delay a scan",
-                ThreadPriority::ScanHigh.value(),
-            );
+            match role {
+                IocRole::StatusPublisher => {
+                    assert!(
+                        band > ThreadPriority::CaServerHigh.value(),
+                        "{role:?} at {band} does not outrank the CA server band \
+                         ceiling ({}) — it can be starved by the client load \
+                         whose effect it exists to report",
+                        ThreadPriority::CaServerHigh.value(),
+                    );
+                    assert!(
+                        band <= ThreadPriority::ScanHigh.value(),
+                        "{role:?} at {band} outranks record processing ({}); an \
+                         operator surface must not delay a scan",
+                        ThreadPriority::ScanHigh.value(),
+                    );
+                }
+                IocRole::ConsoleCensus => assert!(
+                    band < CLIENT_SERVICE_FLOOR,
+                    "{role:?} at {band} is not below the CA server ladder's \
+                     floor ({CLIENT_SERVICE_FLOOR}) — an unbounded periodic \
+                     report above client service becomes the load",
+                ),
+            }
         }
     }
 
-    /// The band is C's, by value and not by resemblance.
+    /// The bands are C's, by value and not by resemblance.
     #[test]
-    fn the_diagnostic_band_is_epics_thread_priority_scan_low() {
-        assert_eq!(IocRole::StatusPublisher.band().value(), 60);
-        assert_eq!(IocRole::ConsoleCensus.band().value(), 60);
+    fn the_bands_are_the_epics_thread_priority_constants() {
         // dbScan.c:949 spawns `scan-%g` at ScanLow + ind, so ind == 0 — the
         // slowest periodic list — is this same number.
+        assert_eq!(IocRole::StatusPublisher.band().value(), 60);
         assert_eq!(ThreadPriority::ScanLow.value(), 60);
+        assert_eq!(IocRole::ConsoleCensus.band().value(), 10);
+        assert_eq!(ThreadPriority::Low.value(), 10);
     }
 
-    /// The same rule must produce the same *ordering* on both embedded
-    /// targets, whose maps are not the same function.
+    /// The table's ordering must survive both embedded targets, whose maps are
+    /// not the same function.
     ///
     /// Both land on POSIX `56 + epics` — for RTEMS that is the tail of a
-    /// core-priority inversion through `RTEMS_MAXIMUM_PRIORITY`, for VxWorks
-    /// it is measured directly — so both are strictly increasing in the EPICS
-    /// value and the EPICS-space ordering survives. VxWorks then inverts that
-    /// POSIX value into its own task space as `vx = 199 - epics`, where lower
-    /// is more urgent, so a diagnostic ends up at a *smaller* native number
-    /// than client service: the same ordering once more, through a third
-    /// arithmetic.
+    /// core-priority inversion through `RTEMS_MAXIMUM_PRIORITY`, for VxWorks it
+    /// is measured directly — so both are strictly increasing in the EPICS
+    /// value and the EPICS-space ordering survives unchanged. VxWorks then
+    /// inverts that POSIX value into its own task space as `vx = 199 - epics`,
+    /// where lower is more urgent, so the operator surface ends up at a
+    /// *smaller* native number than client service: the same ordering a third
+    /// time, through a third arithmetic.
     #[test]
     fn the_ordering_survives_both_embedded_priority_maps() {
         use super::super::task::{map_epics_priority_rtems, map_epics_priority_vxworks};
@@ -186,36 +229,39 @@ mod tests {
         let service = ThreadPriority::CaServerHigh.value();
         for role in IocRole::ALL {
             let band = role.band().value();
+            // Which side of client service this role is on is asserted above;
+            // here the only claim is that whichever side it is, both targets
+            // agree with the EPICS-space answer.
+            let above = band > service;
 
-            let (rtems_service, rtems_role) = (
-                map_epics_priority_rtems(service),
-                map_epics_priority_rtems(band),
-            );
-            assert!(
-                rtems_service < rtems_role,
-                "{role:?}: RTEMS posix {rtems_role} does not outrank client \
-                 service at {rtems_service}",
-            );
-
-            let (vx_service, vx_role) = (
-                map_epics_priority_vxworks(service),
-                map_epics_priority_vxworks(band),
-            );
-            assert!(
-                vx_service < vx_role,
-                "{role:?}: VxWorks posix {vx_role} does not outrank client \
-                 service at {vx_service}",
-            );
-
-            // VxWorks's own POSIX layer inverts into native task priorities,
-            // measured as `vx = 199 - epics`; smaller is more urgent there.
-            assert!(
-                (199 - band as i32) < (199 - service as i32),
-                "{role:?}: VxWorks native {} does not outrank client service \
-                 at {}",
-                199 - band as i32,
-                199 - service as i32,
-            );
+            for (target, service_os, role_os) in [
+                (
+                    "RTEMS posix",
+                    map_epics_priority_rtems(service),
+                    map_epics_priority_rtems(band),
+                ),
+                (
+                    "VxWorks posix",
+                    map_epics_priority_vxworks(service),
+                    map_epics_priority_vxworks(band),
+                ),
+                // VxWorks's own POSIX layer inverts into native task
+                // priorities, measured as `vx = 199 - epics`; smaller is more
+                // urgent there, so negate to compare in the same direction.
+                (
+                    "VxWorks native",
+                    -(199 - service as i32),
+                    -(199 - band as i32),
+                ),
+            ] {
+                assert_eq!(
+                    role_os > service_os,
+                    above,
+                    "{role:?}: {target} puts it at {role_os} against client \
+                     service at {service_os}, which is the opposite order to \
+                     EPICS {band} against {service}",
+                );
+            }
         }
     }
 }

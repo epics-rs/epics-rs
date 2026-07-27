@@ -1,8 +1,8 @@
 //! PVA server components — protocol bridge, server wrapper, protocol runner.
 //!
 //! [`native_source`] is the database→pvAccess bridge and is target-neutral.
-//! The wrapper ([`pva_server`]), its iocsh command ([`iocsh`]) and
-//! [`run_pva_ioc`] all drive [`crate::server_native::runtime`], which is
+//! The wrapper (`pva_server`), its iocsh command (`iocsh`) and
+//! `run_pva_ioc` all drive `crate::server_native::runtime`, which is
 //! host-only — see that module for why an `epics_embedded_target` build
 //! (RTEMS or VxWorks) stops at the protocol layer.
 

@@ -2,7 +2,7 @@
 //!
 //! The user/host pair is part of the CONNECTION_VALIDATION reply per pvxs
 //! `clientconn.cpp::handle_validation`. We default to `$USER`/`hostname()`
-//! but callers can override via [`crate::client_native::PvaClientBuilder`]
+//! but callers can override via `client_native::PvaClientBuilder`
 //! or the `EPICS_PVA_AUTH_USER` / `EPICS_PVA_AUTH_HOST` environment variables.
 
 /// pvxs `buildCAMethod` (client.cpp:519-532) sends these literals in the

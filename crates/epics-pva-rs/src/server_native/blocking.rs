@@ -1,7 +1,7 @@
 //! Blocking, thread-per-connection PVA server driver (RTEMS phase 6 item 5,
 //! stage 3 — `doc/pva-rtems-item5-design.md` §1, §3).
 //!
-//! The second driver, beside [`super::accept`]. It serves one connection with
+//! The second driver, beside `super::accept`. It serves one connection with
 //! three threads and **no reactor**:
 //!
 //! ```text
@@ -27,7 +27,7 @@
 //! Those implementors are no longer defined here. `ChannelReader` /
 //! `ChannelWriter`, the two pump bodies, the send-deadline loop and the two
 //! thread-lifecycle guards live in
-//! [`epics_base_rs::runtime::blocking_io`](epics_base_rs::runtime::blocking_io),
+//! [`epics_base_rs::runtime::blocking_io`],
 //! because the PVA *client* and the CA client need the identical primitive and
 //! `epics-ca-rs` cannot depend on this crate (`doc/calink-rtems-design.md`
 //! §3.3). What remains in this file is what is genuinely server-side: the
@@ -49,7 +49,7 @@
 //! off first. That difference matters, because on a **hosted** build the
 //! operation future still needs a tokio runtime underneath it: `runtime::task`
 //! aliases `spawn` and `interval` to tokio's, and tokio's need a reactor. So
-//! [`serve_connection_blocking`] must be called from a multi-thread runtime
+//! `serve_connection_blocking` must be called from a multi-thread runtime
 //! worker on the host. On RTEMS the `exec_backend` supplies both the spawn
 //! pool and the timer, so the very same call runs on a bare thread. This
 //! module is therefore host-compiled and host-tested — the only way to show
@@ -117,11 +117,11 @@
 //! # The accept side
 //!
 //! [`BlockingPvaServer`] owns the [`ConnRegistry`] and hands sockets to
-//! [`serve_connection_blocking`], assembling the arguments the hosted
-//! [`super::accept`] assembles for its own driver. It creates **no thread per
+//! `serve_connection_blocking`, assembling the arguments the hosted
+//! `super::accept` assembles for its own driver. It creates **no thread per
 //! connection**: each connection *borrows* its three threads — connection body,
 //! reader pump, writer pump — as one set from a
-//! [`WorkerPool`](epics_base_rs::runtime::worker_pool::WorkerPool), because
+//! [`epics_base_rs::runtime::worker_pool::WorkerPool`], because
 //! every `std::thread` creation leaks 176–179 B permanently on RTEMS
 //! (`doc/rtems-connection-worker-pool-design.md`). All three workers take
 //! `PVA_SERVER_PRIORITY` — see that constant for why they share one number —
@@ -285,7 +285,7 @@ struct RegistryState {
 ///
 /// # Invariant
 ///
-/// * **MUST** — every connection served by [`serve_connection_blocking`] is
+/// * **MUST** — every connection served by `serve_connection_blocking` is
 ///   registered here before either of its threads starts, and stays registered
 ///   until its operation thread has joined both of them.
 /// * **MUST NOT** — no path shuts a connection's socket down, or takes it out
@@ -309,7 +309,7 @@ struct RegistryState {
 ///
 /// Target-neutral, like the rest of this module: `std` sockets, `std` mutex,
 /// no `cfg`. Item 7's RTEMS accept loop owns one and calls `stop`; on the host
-/// that role belongs to [`super::accept`], which drives its connections as
+/// that role belongs to `super::accept`, which drives its connections as
 /// tasks and so has nothing to register here.
 pub struct ConnRegistry {
     state: Mutex<RegistryState>,
@@ -432,10 +432,10 @@ impl Drop for ConnRegistration<'_> {
 // ---------------------------------------------------------------------------
 
 /// The reader and writer slots of a connection's leased worker set, passed to
-/// [`serve_connection_blocking`] as one value.
+/// `serve_connection_blocking` as one value.
 ///
 /// A pair, not two parameters, because the two are always leased and returned
-/// together — [`start_connection`] takes them from one `acquire`, and neither
+/// together — `start_connection` takes them from one `acquire`, and neither
 /// pump may run on a worker the connection did not lease. Passing them as a unit
 /// is what makes "you cannot serve with a half-borrowed set" a property of the
 /// signature rather than a convention.
@@ -452,7 +452,7 @@ pub(super) struct PumpWorkers {
 /// connection is over — they can only report (§4.1).
 ///
 /// `pumps` are two of the three workers this connection borrowed from the pool
-/// ([`start_connection`]); the connection body itself runs on the third. The
+/// (`start_connection`); the connection body itself runs on the third. The
 /// pumps run on these two, and their guards join the jobs — returning the
 /// workers to their set — before this function returns, on every exit path
 /// including a panic. The pair is taken by value so a caller cannot run a pump
@@ -607,16 +607,16 @@ impl Drop for ConnSlot {
 }
 
 /// A blocking, thread-per-connection PVA TCP server — the accept side of the
-/// driver in this module, and the RTEMS counterpart of [`super::accept`].
+/// driver in this module, and the RTEMS counterpart of `super::accept`.
 ///
-/// [`serve_connection_blocking`] serves one connection on three threads; this
+/// `serve_connection_blocking` serves one connection on three threads; this
 /// is what gives it sockets and the arguments the hosted accept loop assembles
 /// in `accept.rs`. An N-client server therefore costs **3N+2** threads — this
 /// accept loop, the UDP search responder, and three per connection — where the
 /// hosted driver costs two tasks per connection. That is a stated RTEMS budget
 /// item, not an accident.
 ///
-/// It owns the [`ConnRegistry`], because [`serve_connection_blocking`] cannot
+/// It owns the [`ConnRegistry`], because `serve_connection_blocking` cannot
 /// be called without one, and that makes [`shutdown`](Self::shutdown) able to
 /// end live connections rather than only stop accepting new ones.
 ///
@@ -644,7 +644,7 @@ pub struct BlockingPvaServer {
 }
 
 /// The three roles one PVA connection borrows together, in the order
-/// [`serve_connection_blocking`] and [`start_connection`] destructure them:
+/// `serve_connection_blocking` and `start_connection` destructure them:
 /// `[conn, reader, writer]`. All three take `PVA_SERVER_PRIORITY` — see that
 /// constant. The connection body is `Big` (it runs the whole protocol state
 /// machine under `block_on_sync`, the counterpart of C's `epicsThreadStackBig`
@@ -1919,7 +1919,7 @@ mod tests {
     ///
     /// Driven through the real pump primitive rather than a hand-built thread,
     /// so what is under test is the registry's reach into a connection assembled
-    /// the way [`serve_connection_blocking`] assembles one.
+    /// the way `serve_connection_blocking` assembles one.
     #[test]
     fn stop_wakes_a_writer_parked_in_the_deadline_loop() {
         // Kept alive and deliberately never read from: this is the stuck-peer

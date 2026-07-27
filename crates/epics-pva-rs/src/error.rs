@@ -8,7 +8,7 @@ pub enum PvaError {
     #[error("timeout waiting for response")]
     Timeout,
 
-    /// A `wait` was woken by [`crate::client_native::PvaOperation::interrupt`]
+    /// A `wait` was woken by `client_native::PvaOperation::interrupt`
     /// rather than by a deadline. pvxs distinguishes
     /// `Interrupted` from `Timeout`, and conflating them hid the cause
     /// (operator-driven wake-up vs. real deadline) from callers. The

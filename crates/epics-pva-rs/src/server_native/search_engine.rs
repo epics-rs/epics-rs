@@ -9,12 +9,12 @@
 //!
 //! **Why it is its own module.** `aa1af842` already made
 //! `process_search_datagram` socket-free, but left it inside
-//! [`super::udp`], which is gated out of RTEMS (`mod.rs`) because of the
+//! `super::udp`, which is gated out of RTEMS (`mod.rs`) because of the
 //! `tokio::net` / `socket2` / `if-addrs` stack around it. A blocking RTEMS
 //! driver could therefore not reach the decode even though the decode itself
 //! needs no reactor. Lifting it here — un-gated, exactly as the SEARCH
 //! protocol was lifted into [`super::search`] (`4da1e04a`) and the accept loop
-//! into [`super::accept`] (`4c75e766`) — is a move, not a copy: a copy would
+//! into `super::accept` (`4c75e766`) — is a move, not a copy: a copy would
 //! re-open the whole family of SEARCH-parity bugs on a second code path.
 //! `super::udp` re-exports every name below, so its own call sites and tests
 //! are unchanged and keep exercising this code.
@@ -262,7 +262,7 @@ pub(crate) enum SearchOutput {
 /// payload's announced reply addr when present.
 ///
 /// **I/O-free.** It decides *what* to send and returns it; the caller owns
-/// the sockets and performs the sends ([`dispatch_search_outputs`] is the
+/// the sockets and performs the sends (`dispatch_search_outputs` is the
 /// async responder's tail). That split exists so the blocking RTEMS driver
 /// — one `std::net::UdpSocket`, no `AsyncUdpV4`, no runtime — can reuse
 /// this decode verbatim and produce byte-identical replies, the same shape
@@ -277,7 +277,7 @@ pub(crate) enum SearchOutput {
 /// `origin` controls forwarding-related semantics:
 /// - [`Origin::Direct`]: no special handling; reply to the UDP source
 ///   when the SEARCH announced no specific addr.
-/// - [`Origin::FromOriginTag`]: the SEARCH came in via the loopback
+/// - `Origin::FromOriginTag`: the SEARCH came in via the loopback
 ///   ORIGIN_TAG channel. Drop SEARCHes that announced
 ///   `server.isAny()` since they would route the reply back to the
 ///   forwarder, not the original requester (pvxs warning at
@@ -475,7 +475,7 @@ pub(crate) async fn process_search_datagram(
 ///
 /// `requester` is the SEARCH's resolved reply destination (UDP) or the
 /// established peer (TCP circuit); it is forwarded to
-/// [`ChannelSource::searchable_from`] so a source can scope
+/// [`ChannelSource::searchable_from`](crate::server_native::ChannelSource::searchable_from) so a source can scope
 /// advertisement by client endpoint (pvxs `Search::source()`).
 pub(crate) async fn search_matched_cids(
     source: &DynSource,
@@ -507,12 +507,12 @@ pub(crate) async fn search_matched_cids(
 /// - [`Origin::Direct`]: arrived on a per-NIC socket. Reply via the
 ///   same NIC the packet came in on. Treat unicast-flagged SEARCHes
 ///   as candidates for re-forwarding (sub-phase d).
-/// - [`Origin::FromOriginTag`]: arrived on the loopback mcast socket
+/// - `Origin::FromOriginTag`: arrived on the loopback mcast socket
 ///   wrapped in CMD_ORIGIN_TAG. Reply via the NIC matching the peeled
 ///   destination. Do NOT re-forward (anti-loop) and reject SEARCHes
 ///   with `server.isAny()` per pvxs `udp_collector.cpp:367-371`
 ///   ("Forwarded SEARCH with reply to sender never works").
-/// - [`Origin::Forwarded`]: arrived on the loopback mcast socket
+/// - `Origin::Forwarded`: arrived on the loopback mcast socket
 ///   WITHOUT a CMD_ORIGIN_TAG prefix. pvxs tolerates these because some
 ///   PVA implementations forward unicast SEARCHes to `224.0.0.128`
 ///   without adding the tag (`udp_collector.cpp:401-404`), and still
@@ -525,8 +525,8 @@ pub(crate) async fn search_matched_cids(
 ///
 /// Both forwarded origins exist only where a **loopback multicast socket**
 /// does, because that socket is the only thing that can deliver one:
-/// [`super::udp`] joins `224.0.0.128` on loopback and classifies what arrives
-/// there ([`super::udp::classify_loopback_datagram`]). That module is
+/// `super::udp` joins `224.0.0.128` on loopback and classifies what arrives
+/// there (`super::udp::classify_loopback_datagram`). That module is
 /// `#[cfg(not(epics_embedded_target))]`, and the driver that replaces it on
 /// an embedded target — [`super::blocking`]'s UDP responder — serves one
 /// plain `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and

@@ -33,7 +33,7 @@ pub struct SourceEntry {
 }
 
 /// Multi-source registry. Wrap with `Arc` and feed to
-/// [`crate::server_native::PvaServer::start`].
+/// `PvaServer::start`.
 pub struct CompositeSource {
     entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
     /// The composite's gate is

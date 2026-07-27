@@ -1,6 +1,6 @@
 //! Per-connection handler.
 //!
-//! For each accepted client [`super::accept`] runs one task that:
+//! For each accepted client `super::accept` runs one task that:
 //!
 //! 1. Sends SET_BYTE_ORDER + CONNECTION_VALIDATION request
 //! 2. Reads client's CONNECTION_VALIDATION response (auth)
@@ -13,7 +13,7 @@
 //! This module owns no socket. The connection enters through
 //! `handle_connection_io`, whose reader and writer are
 //! `Box<dyn AsyncRead/AsyncWrite>` trait objects — which driver produced
-//! them (the host accept loop in [`super::accept`], or the blocking
+//! them (the host accept loop in `super::accept`, or the blocking
 //! thread-per-client driver coming with RTEMS phase 6 item 7) is not
 //! visible from here.
 //!
@@ -47,7 +47,7 @@ use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
 use super::config::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
 
-// The accept loop moved to [`super::accept`] (RTEMS phase 6 item 7 stage A);
+// The accept loop moved to `super::accept` (RTEMS phase 6 item 7 stage A);
 // these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
 // every existing caller and doc link. `accept` owns the listener socket and is
 // host-only, so the re-exports carry its gate — this is the shim, not the
@@ -278,7 +278,7 @@ fn clamp_watermarks(levels: Option<(usize, usize)>, ack_at: Option<u32>) -> Opti
 }
 
 /// Wrap a PVA monitor event's `PvField` in the CA-side
-/// [`FilteredMonitorEvent`] shape so it can flow through the shared
+/// [`FilteredMonitorEvent`](epics_base_rs::server::database::filters::FilteredMonitorEvent) shape so it can flow through the shared
 /// channel filter framework. The CA filters operate on a Snapshot
 /// (value + STAT/SEVR + time); the PVA monitor stream carries a
 /// PvField tree that contains those same fields under nested
@@ -760,7 +760,7 @@ struct ChannelState {
     /// Shared per-channel report counters (name + tx/rx + ReportInfo),
     /// the SAME `Arc` registered in this connection's `PeerEntry` under
     /// the channel's SID. Handlers attribute per-PV traffic through this
-    /// (`stat.add_tx`/`add_rx`) so [`crate::server_native::PvaServer::report`]
+    /// (`stat.add_tx`/`add_rx`) so `PvaServer::report`
     /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
     /// server.cpp:260-268).
     stat: Arc<crate::server_native::peers::ChannelStat>,
@@ -1244,7 +1244,7 @@ struct OpState {
     /// carries per-operation options (`record._options.process` /
     /// `block`, etc.) that the data-phase payload does NOT carry.
     /// We stash the value here at INIT so the data-phase PUT can
-    /// attach it to the [`ChannelContext`] forwarded to the source,
+    /// attach it to the [`ChannelContext`](crate::server_native::ChannelContext) forwarded to the source,
     /// letting sources like the QSRV bridge honor process/block
     /// without re-parsing the value (where they no longer live).
     pv_request: Option<PvField>,
@@ -1335,9 +1335,9 @@ fn cross_watermark(state: &std::sync::atomic::AtomicU64, want_above: bool) -> Op
 /// client counts the initial frame against its queue, the server did
 /// not, so the server sent one DATA frame more than the client could
 /// hold before the first ACK. Both send sites now route through
-/// [`Self::acquire`] exactly once before sending.
+/// [`Self::take`] exactly once before sending.
 struct MonitorPipelineCredit<'a> {
-    /// `None` for a non-pipeline monitor — [`Self::acquire`] is then a
+    /// `None` for a non-pipeline monitor — [`Self::take`] is then a
     /// no-op (mpsc backpressure stays the only gate, as before).
     window: Option<&'a Arc<std::sync::atomic::AtomicU32>>,
     window_notify: Option<&'a Arc<tokio::sync::Notify>>,
@@ -1490,7 +1490,7 @@ fn next_op_id() -> u64 {
 /// covers every exit path by construction, rather than scattering a
 /// withdraw at each teardown site.
 ///
-/// On drop it fires [`WatermarkKind::Withdraw`] unconditionally for this
+/// On drop it fires [`WatermarkKind::Withdraw`](crate::server_native::source::WatermarkKind::Withdraw) unconditionally for this
 /// op_id. The gateway removes the op's vote and recomputes the aggregate:
 /// if this op's vote was the only thing keeping the upstream paused (or
 /// keeping it from pausing), the aggregate edge fires the corresponding
@@ -1575,7 +1575,7 @@ impl MonitorGateDriver {
 /// single owner of one MONITOR op's Executing<->Idle edge.
 /// pvxs fires `MonitorControlOp::onStart(bool)` once when a monitor
 /// begins producing and once when it stops (`servermon.cpp:677-683`); we
-/// mirror that through [`ChannelSource::notify_monitor_start`], firing
+/// mirror that through [`ChannelSource::notify_monitor_start`](crate::server_native::ChannelSource::notify_monitor_start), firing
 /// only on a real edge so a gateway source can suspend its upstream
 /// subscription while every downstream consumer is paused.
 ///
@@ -2487,7 +2487,7 @@ impl ClientCredentials {
     /// `setPort(0)` is why only the IP is taken, and `map6to4` is why an
     /// IPv4-mapped IPv6 peer renders as its IPv4 form — so a client reaching a
     /// dual-stack listener matches the same HAG entry it would over IPv4.
-    /// [`Ipv6Addr::to_ipv4_mapped`] is the exact counterpart (`to_ipv4` is
+    /// [`Ipv6Addr::to_ipv4_mapped`](std::net::Ipv6Addr::to_ipv4_mapped) is the exact counterpart (`to_ipv4` is
     /// not: it also maps IPv4-*compatible* addresses, turning `::1` into
     /// `0.0.0.1`).
     ///
@@ -2988,7 +2988,7 @@ pub(super) struct ConnInit {
     /// `SSLContext::fill_credentials`.
     pub(super) x509_identity: Option<crate::auth::X509Credentials>,
     /// Server-wide channel invalidator (see
-    /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
+    /// [`ChannelSource::set_channel_invalidator`](crate::server_native::ChannelSource::set_channel_invalidator)). Subscribed once below; a
     /// published PV name force-disconnects every channel this connection
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
@@ -4850,18 +4850,18 @@ enum ChannelArrayReply {
 /// `responseHandlers.cpp:2115-2208` request decode /
 /// `:2347-2393` reply encode; client `clientContextImpl.cpp:1567-1666`):
 /// - INIT (`QOS_INIT 0x08`): decode the pvRequest selecting the array
-///   field, call [`ChannelSource::channel_array_init`], and reply
+///   field, call [`ChannelSource::channel_array_init`](crate::server_native::ChannelSource::channel_array_init), and reply
 ///   `ioid + subcmd + status [+ array introspection]`. The default source
 ///   refuses with a protocol `Status` error — the client always gets an
 ///   answer, never the pre-fix silent drop.
 /// - getArray (`QOS_GET 0x40`): `offset + count + stride` → READ-gated
-///   [`ChannelSource::channel_array_get`] → `status + array value`.
+///   [`ChannelSource::channel_array_get`](crate::server_native::ChannelSource::channel_array_get) → `status + array value`.
 /// - setLength (`QOS_GET_PUT 0x80`): `length` → WRITE-gated
-///   [`ChannelSource::channel_array_set_length`] → `status`.
+///   [`ChannelSource::channel_array_set_length`](crate::server_native::ChannelSource::channel_array_set_length) → `status`.
 /// - getLength (`QOS_PROCESS 0x04`): no payload → READ-gated
-///   [`ChannelSource::channel_array_get_length`] → `status + length`.
+///   [`ChannelSource::channel_array_get_length`](crate::server_native::ChannelSource::channel_array_get_length) → `status + length`.
 /// - putArray (no get/length bits): `offset + stride + array value` →
-///   WRITE-gated [`ChannelSource::channel_array_put`] → `status`.
+///   WRITE-gated [`ChannelSource::channel_array_put`](crate::server_native::ChannelSource::channel_array_put) → `status`.
 ///
 /// The op stays alive across sub-ops (pvAccessCPP keeps one
 /// `ChannelArray`), reusing the same `begin_exec` / `ExecFinishGuard` /
@@ -5464,7 +5464,7 @@ async fn handle_create_channel(
     Ok(())
 }
 
-/// Build the connection-scoped [`ChannelContext`] for a channel
+/// Build the connection-scoped [`ChannelContext`](crate::server_native::ChannelContext) for a channel
 /// *lifecycle* edge (open/close). pvAccess carries no per-op `pvRequest`
 /// on these edges, so `pv_request` is `None` — the same shape
 /// CREATE_CHANNEL uses to resolve the owner (serverchan.cpp:62, the
@@ -5519,7 +5519,7 @@ fn close_channel(ch: ChannelState, peer: SocketAddr) {
 /// (`ChannelState::open_cred`), pinned at CREATE_CHANNEL, not the
 /// connection's current identity — which a re-auth can reassign after the
 /// channel is open.
-/// `close_channel` reconstructs the lifecycle [`ChannelContext`] from that
+/// `close_channel` reconstructs the lifecycle [`ChannelContext`](crate::server_native::ChannelContext) from that
 /// stored snapshot and `ctx.peer`.
 struct ChannelTeardownCtx<'a> {
     tx: &'a SrvTx,
@@ -7750,7 +7750,7 @@ fn build_op_error_frame(
 /// Encode a single `CMD_MESSAGE` frame (`ioid`, `messageType`,
 /// `message`). pvxs `ServerConn::logRemote()` (`serverconn.cpp:146-160`)
 /// sends operation diagnostics this way. The payload layout mirrors the
-/// client decoder [`crate::client_native::server_conn`] (and is
+/// client decoder `client_native::server_conn` (and is
 /// `ioid:u32 + mtype:u8 + message:string`); the client logs `Warning`
 /// (1) at `warn!` and `Fatal` (3) at `error!`. Used by the MONITOR INIT
 /// owner to surface [`MonitorOptionDiag`] negotiation diagnostics, and
@@ -7767,7 +7767,7 @@ fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrde
     buf
 }
 
-/// Drain a source's per-operation [`RemoteLog`] onto the wire as
+/// Drain a source's per-operation [`RemoteLog`](crate::server_native::source::RemoteLog) onto the wire as
 /// IOID-tagged `CMD_MESSAGE` frames — the Rust half of pvxs
 /// `RemoteLogger::logRemote()` (`serverconn.cpp:146-160`), which the
 /// pvxs IOC source layer uses for "present but unusable option"
@@ -8338,7 +8338,7 @@ mod tests {
     /// withdraw its vote when its subscriber task drops, or it can starve
     /// co-subscribers that share the upstream entry. Tested by the
     /// invariant: dropping the guard fires exactly one
-    /// [`WatermarkKind::Withdraw`] carrying this op's `op_id` (the gateway
+    /// [`WatermarkKind::Withdraw`](crate::server_native::source::WatermarkKind::Withdraw) carrying this op's `op_id` (the gateway
     /// then removes the op's vote and recomputes the aggregate). Firing is
     /// unconditional — a torn-down op always withdraws — and op-scoped, so
     /// it cannot disturb a co-subscriber's vote.

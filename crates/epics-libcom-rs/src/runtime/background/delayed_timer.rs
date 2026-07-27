@@ -17,8 +17,7 @@
 //! [`CallbackHandle`] executor pool. It uses `Condvar::wait_timeout` on the
 //! nearest deadline — plain `std`, no tokio timer wheel — so it runs on RTEMS.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,40 +51,30 @@ enum TimerAction {
     Pool(CallbackPriority),
 }
 
-/// One scheduled callback awaiting its deadline.
-struct TimerEntry {
+/// Identifies one queued entry, and orders the queue: earliest deadline first,
+/// ties broken by submission order. Being a *key* rather than a field of the
+/// entry is what makes an entry addressable — a [`BinaryHeap`](std::collections::BinaryHeap)
+/// can only pop its top, so an entry it holds is reachable by nobody and lives
+/// until its deadline no matter who has lost interest.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct WakeKey {
     deadline: Instant,
-    /// Tie-breaker so equal deadlines fire in submission order and `Ord` is a
+    /// Tie-breaker so equal deadlines fire in submission order and the key is a
     /// total order (the callback itself is not comparable).
     seq: u64,
+}
+
+/// One scheduled callback awaiting its deadline. Its deadline and sequence live
+/// in the [`WakeKey`] it is filed under.
+struct TimerEntry {
     action: TimerAction,
     cb: Callback,
 }
 
-// `BinaryHeap` is a max-heap; order so the *earliest* deadline is "greatest"
-// and therefore sits at the top. Ties break on the lower `seq` first.
-impl PartialEq for TimerEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline && self.seq == other.seq
-    }
-}
-impl Eq for TimerEntry {}
-impl Ord for TimerEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .deadline
-            .cmp(&self.deadline)
-            .then_with(|| other.seq.cmp(&self.seq))
-    }
-}
-impl PartialOrd for TimerEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 struct TimerState {
-    heap: BinaryHeap<TimerEntry>,
+    /// Deadline-ordered and *addressable*: [`Inner::cancel`] removes one entry
+    /// by key, which a heap cannot do.
+    queue: BTreeMap<WakeKey, TimerEntry>,
     next_seq: u64,
     shutdown: bool,
 }
@@ -99,31 +88,43 @@ struct Inner {
 impl Inner {
     /// Insert a scheduled callback and wake the timer thread so it can
     /// recompute its sleep deadline. Port of `epicsTimerStartDelay`
-    /// (`callback.c:418`).
-    fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) {
+    /// (`callback.c:418`). Returns the key the entry is filed under, or `None`
+    /// when the timer has already shut down and the callback was dropped.
+    fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) -> Option<WakeKey> {
         let deadline = Instant::now() + delay;
         let mut st = recover(FACILITY, self.state.lock());
         if st.shutdown {
             // Timer thread stopped: match C dropping late delayed requests
             // during shutdown. Drop `cb` (never scheduled or fired) instead of
-            // pushing it onto a heap no worker will ever drain.
+            // filing it in a queue no worker will ever drain.
             drop(st);
             tracing::trace!(
                 target: "epics_base_rs::runtime::delayed_timer",
                 "callbackRequestDelayed after shutdown dropped"
             );
-            return;
+            return None;
         }
-        let seq = st.next_seq;
-        st.next_seq += 1;
-        st.heap.push(TimerEntry {
+        let key = WakeKey {
             deadline,
-            seq,
-            action,
-            cb,
-        });
+            seq: st.next_seq,
+        };
+        st.next_seq += 1;
+        st.queue.insert(key, TimerEntry { action, cb });
         drop(st);
         self.wake.notify_one();
+        Some(key)
+    }
+
+    /// Remove the entry filed under `key`, dropping its callback now rather
+    /// than at its deadline. A key whose entry has already fired is a no-op.
+    fn cancel(&self, key: WakeKey) {
+        // Taken out of the lock before it drops: a callback's drop glue is
+        // arbitrary user code and must never run while the queue is held.
+        let entry = {
+            let mut st = recover(FACILITY, self.state.lock());
+            st.queue.remove(&key)
+        };
+        drop(entry);
     }
 }
 
@@ -137,14 +138,14 @@ fn timer_loop(inner: &Inner) {
             return;
         }
         let now = Instant::now();
-        // `deadline` is `Copy`, so this releases the peek borrow immediately.
-        match st.heap.peek().map(|e| e.deadline) {
+        // `deadline` is `Copy`, so this releases the borrow immediately.
+        match st.queue.first_key_value().map(|(k, _)| k.deadline) {
             Some(deadline) if deadline <= now => {
                 // Due: run it. A wakeup (`Inline`) runs here on the timer thread
                 // — it only unparks a driver, needs no worker, and must not queue
                 // on the callback pool (that is the sleep-wake self-deadlock). A
                 // deferred-work callback (`Pool`) is handed to the executor pool.
-                let entry = st.heap.pop().unwrap();
+                let (_, entry) = st.queue.pop_first().unwrap();
                 drop(st);
                 match entry.action {
                     TimerAction::Inline => {
@@ -199,8 +200,33 @@ impl TimerHandle {
     /// when `future_exec` parked a worker per future for the future's whole
     /// life; that executor is now cooperative and holds a worker only across a
     /// single poll, but a wake still costs no worker here.
-    pub fn schedule_wake(&self, delay: Duration, cb: Callback) {
-        self.inner.schedule(delay, TimerAction::Inline, cb);
+    ///
+    /// The returned [`WakeKey`] is the caller's claim on the queued entry, and
+    /// the caller MUST pass it to [`cancel_wake`](Self::cancel_wake) when it
+    /// stops caring about the wakeup. `None` means the timer had already shut
+    /// down and `cb` was dropped unscheduled — there is nothing to cancel.
+    #[must_use = "a wake entry lives until its deadline unless its key is cancelled"]
+    pub fn schedule_wake(&self, delay: Duration, cb: Callback) -> Option<WakeKey> {
+        self.inner.schedule(delay, TimerAction::Inline, cb)
+    }
+
+    /// Drop the wake entry filed under `key` now, instead of leaving it queued
+    /// until its deadline. Cancelling an entry that has already fired is a
+    /// no-op, so a caller never has to know which happened first.
+    ///
+    /// Unlike [`schedule`](Self::schedule), which is C's fire-and-forget
+    /// `callbackRequestDelayed`, a wake belongs to the sleeper that armed it:
+    /// the entry holds a clone of the sleeper's shared cell, so an uncancelled
+    /// entry keeps that cell — and the OS mutex inside it — alive for the whole
+    /// remaining delay even though the sleeper is long gone.
+    pub fn cancel_wake(&self, key: WakeKey) {
+        self.inner.cancel(key);
+    }
+
+    /// How many entries are queued. For tests and on-target probes: the
+    /// per-sleep retention this queue used to carry is only visible as a count.
+    pub fn scheduled_count(&self) -> usize {
+        recover(FACILITY, self.inner.state.lock()).queue.len()
     }
 }
 
@@ -221,7 +247,7 @@ impl DelayedTimer {
     pub fn new(sink: CallbackHandle) -> Self {
         let inner = Arc::new(Inner {
             state: Mutex::new(TimerState {
-                heap: BinaryHeap::new(),
+                queue: BTreeMap::new(),
                 next_seq: 0,
                 shutdown: false,
             }),
@@ -356,7 +382,7 @@ mod tests {
         let timer = DelayedTimer::new(pool.handle());
         let h = timer.handle();
 
-        h.schedule_wake(
+        let _key = h.schedule_wake(
             Duration::from_millis(10),
             Box::new(|| panic!("a waker panicked on the timer thread")),
         );
@@ -404,6 +430,79 @@ mod tests {
             Ok(()),
             "a poisoned state stopped the timer facility"
         );
+    }
+
+    /// Boundary: a wake whose owner loses interest before the deadline. The
+    /// queue used to be a `BinaryHeap`, which can only pop its top, so an entry
+    /// it held was reachable by nobody and stayed until its deadline — with
+    /// everything the callback captured.
+    #[test]
+    fn cancelling_a_wake_drops_its_entry_before_the_deadline() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        // An hour out: nothing but cancellation can retire this.
+        let key = h
+            .schedule_wake(Duration::from_secs(3600), Box::new(|| ()))
+            .expect("a live timer must queue the wake");
+        assert_eq!(h.scheduled_count(), 1, "the wake was not queued");
+
+        h.cancel_wake(key);
+        assert_eq!(
+            h.scheduled_count(),
+            0,
+            "the cancelled wake is still queued and will hold its callback for an hour"
+        );
+    }
+
+    /// Cancelling twice, or cancelling a wake that already fired, must be a
+    /// no-op — the owner cannot know which happened first, so it always calls.
+    #[test]
+    fn cancelling_an_already_gone_wake_is_a_no_op() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+
+        let key = h
+            .schedule_wake(Duration::from_secs(3600), Box::new(|| ()))
+            .expect("a live timer must queue the wake");
+        h.cancel_wake(key);
+        h.cancel_wake(key);
+        assert_eq!(h.scheduled_count(), 0);
+
+        // And one that fired on its own.
+        let (tx, rx) = mpsc::channel();
+        let fired = h
+            .schedule_wake(
+                Duration::from_millis(10),
+                Box::new(move || tx.send(()).unwrap()),
+            )
+            .expect("a live timer must queue the wake");
+        assert_eq!(rx.recv_timeout(T), Ok(()));
+        h.cancel_wake(fired);
+        assert_eq!(h.scheduled_count(), 0);
+    }
+
+    /// The ordering the key encodes is the ordering the queue had: earliest
+    /// deadline first, ties in submission order. `BinaryHeap` got that from a
+    /// reversed `Ord` on the entry; the map gets it from the key's natural one.
+    #[test]
+    fn equal_deadlines_fire_in_submission_order() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let (tx, rx) = mpsc::channel();
+
+        for n in 0..4 {
+            let tx = tx.clone();
+            timer.schedule(
+                Duration::from_millis(20),
+                CallbackPriority::Medium,
+                Box::new(move || tx.send(n).unwrap()),
+            );
+        }
+        let got: Vec<i32> = (0..4).map(|_| rx.recv_timeout(T).unwrap()).collect();
+        assert_eq!(got, vec![0, 1, 2, 3]);
     }
 
     #[test]

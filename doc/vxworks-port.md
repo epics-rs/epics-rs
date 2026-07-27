@@ -761,16 +761,50 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   circuit gets the same guarantee from a different owner, `CircuitDeathGuard`,
   and is the later of the two afterwards (138 s) because C keeps an unresponsive
   circuit's socket on purpose.
-* **E8 is measured; E10 is not.** E8 (pool probe) was re-authored for
+* **E8 is measured.** E8 (pool probe) was re-authored for
   this target as `doc/vx-ca-pool-probe.patch` and run under load:
   `doc/vxworks-ca-worker-pool-on-target-measurement.md`. Holding 141 concurrent
   CA clients, `POOLPROBE` gives `BUSY == SETS == CONNS` with
   `worker_count() == 2 × sets` on every sample and `sets` never past
   `CAS_CLIENT_POOL_CAPACITY = 141`, and all 282 pooled workers read
   `vx = 199 - epics` with zero mismatches over three independent instruments
-  (`pthread_getschedparam`, `taskPriorityGet`, `taskInfoGet`). E9's ladder has
-  since been measured — see its bullet above; E10's dial numbers are unblocked
-  but not taken.
+  (`pthread_getschedparam`, `taskPriorityGet`, `taskInfoGet`). E9's ladder and
+  E10's dial residue have since been measured too — see their bullets.
+* **E10 is closed, both halves.** The pooled-vs-per-attempt dial residue is
+  **0 B/attempt on VxWorks 7**, for the CA half *and* the PVA half, measured
+  2026-07-26 by `-Wl,--wrap` live-block accounting over ~230 dial attempts per
+  image: CA differs by −184 B, PVA by +184 B, in both cases exactly one 184 B
+  timer-sleep group of sampling skew (resolution ±0.8 B/attempt). The brief's
+  `semMCreate`/`semBCreate` hypothesis is measured false with the mechanism
+  named — VxWorks 7 returns per-thread blocks *and* per-thread semaphores on
+  thread exit, so 235 extra thread creations add zero live blocks in all three
+  per-thread size classes. `DialPool` therefore buys no heap residue on this
+  target; its value here is thread-creation rate and the fd/stack ceiling.
+  `doc/vxworks-dial-attempt-residue-on-target-measurement.md` carries the
+  transcripts and the rig (`doc/vxworks-e10-rig/`).
+* **E10's `timer_sleep` growth was a leak, and it is fixed at source.** The
+  184 B per ~30 s that round 1 left open is wall-clock paced, not attempt
+  paced — halving the dial rate over the same wall clock left it unchanged
+  (+6624 B against +6440 B) while the `sleep_until` trough climbed +6 entries
+  per 180 s `BEACON_CLEAN_INTERVAL` cycle against a flat arm rate, i.e.
+  ~530 KB/day on an unattended IOC. Cause: a `Sleep` dropped before its
+  deadline could not take its queue entry back, because `DelayedTimer` held
+  entries in a `BinaryHeap`, which addresses only its top; the entry kept the
+  future's `Arc<Mutex<SleepState>>` — and the `pthread` mutex `std` creates
+  inside it — alive for the whole remaining delay. The queue is now a
+  `BTreeMap<WakeKey, _>`, `schedule_wake` returns the key and `Drop for Sleep`
+  cancels it, so an entry is addressable by construction. Measured on target:
+  `pva-fixed-5s` reads the same `live_bytes` at seq 30, 138 and 139 over 223
+  dial attempts and 9.0 M allocations, with **no size class and no call site
+  changed**; `pva-fixed-perattempt` repeats it on the other dial arm. This is
+  `epics-libcom-rs` runtime code, so it applied to every `exec_backend`
+  consumer, RTEMS included.
+* **The CA name-server queue ceiling is now observed on VxWorks.** With
+  `EPICS_CA_NAMESERVER_QUEUE_DEPTH` compiled in at 8, `fire_searches` holds
+  exactly 8 live 144 B blocks for 172 further dial attempts while its call
+  count runs 8 → 16 — `ns_try_send` drops rather than queues. Ceiling at the
+  shipping default is 256 × 144 B = 36,864 B, reached only while a configured
+  name server is unreachable.
 * **Connection-wall sizing.** The wall is **not** a fixed client count. Measured
   on one image on two guests: 47 concurrent clients on `~958MB`, refused with
   `EAGAIN` from the worker spawn, and 141 on `~1982MB`, refused by

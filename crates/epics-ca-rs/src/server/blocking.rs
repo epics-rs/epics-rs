@@ -28,7 +28,7 @@
 //!
 //! "Thread-per-client" describes the I/O model, not the thread lifecycle. A
 //! client runs on two threads — the C `camsgtask` receiver and its `event_task`
-//! sender — but it **borrows** them, as one set, from [`CAS_CLIENT_POOL`]; it
+//! sender — but it **borrows** them, as one set, from `CAS_CLIENT_POOL`; it
 //! creates neither. Every `std::thread` *creation* leaves 176–179 B behind
 //! permanently on RTEMS 6, so a driver that created two per accept leaked
 //! without a ceiling (`doc/rtems-connection-worker-pool-design.md`). Borrowing
@@ -38,7 +38,7 @@
 //! the one refusal, taken after `accept` with the socket still open, where C
 //! `rsrv` takes its own (`caservertask.c:1240-1250`). The pool's capacity is
 //! deliberately **one below** the target's descriptor wall so that refusal has
-//! a descriptor to happen on; see [`CAS_CLIENT_POOL_CAPACITY`], where the
+//! a descriptor to happen on; see `CAS_CLIENT_POOL_CAPACITY`, where the
 //! measurement that forced the "one below" is cited.
 //!
 //! S1b adds the UDP name-search responder ([`BlockingCaServer::serve_udp_search`]),
@@ -433,7 +433,7 @@ impl BlockingCaServer {
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
     /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
-    /// now stops one short of that, at [`CAS_CLIENT_POOL_CAPACITY`] = 141, so
+    /// now stops one short of that, at `CAS_CLIENT_POOL_CAPACITY` = 141, so
     /// the descriptor client #142 needs to *hear why* is still there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
@@ -445,10 +445,10 @@ impl BlockingCaServer {
     ///
     /// Each accepted connection **borrows** its two threads — the C `camsgtask`
     /// receiver (`caservertask.c:109`) and its event sender — as one set from
-    /// [`CAS_CLIENT_POOL`]; it creates none. Nobody joins a client, and a client
+    /// `CAS_CLIENT_POOL`; it creates none. Nobody joins a client, and a client
     /// returns its set when it disconnects. Borrowing is also the admission
     /// point: a set that cannot be borrowed is a client that cannot be served,
-    /// and is refused through [`refuse_client`] with the socket still open.
+    /// and is refused through `refuse_client` with the socket still open.
     pub fn serve(&self) {
         // The band belongs to the loop, not to whoever spawned the thread:
         // `serve` is what actually blocks here, on every path that reaches it.

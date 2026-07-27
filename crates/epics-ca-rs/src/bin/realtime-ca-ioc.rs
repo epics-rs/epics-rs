@@ -689,12 +689,14 @@ mod ioc {
                     ),
                 }
                 let flag = ctl_returned.clone();
+                let charge = ThreadCharge::fixed(StackSizeClass::Medium);
                 match thread::Builder::new()
                     .name("c6-wd-ctl".to_string())
                     .stack_size(StackSizeClass::Medium.bytes())
                     .spawn(move || {
-                        let _ = epics_base_rs::runtime::task::enter_ioc_thread(
-                            epics_base_rs::runtime::task::ThreadPriority::Low,
+                        let _charge = charge;
+                        let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
+                            epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                         );
                         let mut sock = sock;
                         let frame = vec![0u8; C6_WRITE_DEADLINE_FRAME];
@@ -1225,12 +1227,14 @@ mod ioc {
             // for it. Its own thread: both legs are meant to block, and the
             // reporter above must keep printing while they do.
             if !C6_WRITE_DEADLINE_PEER.is_empty() {
+                let charge = ThreadCharge::fixed(StackSizeClass::Medium);
                 match thread::Builder::new()
                     .name("c6-wd-probe".to_string())
                     .stack_size(StackSizeClass::Medium.bytes())
-                    .spawn(|| {
-                        let _ = epics_base_rs::runtime::task::enter_ioc_thread(
-                            epics_base_rs::runtime::task::ThreadPriority::Low,
+                    .spawn(move || {
+                        let _charge = charge;
+                        let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
+                            epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                         );
                         c6_write_deadline_probe();
                     }) {
@@ -1363,10 +1367,11 @@ mod tests {
             }
         }
         assert_eq!(
-            sites, 3,
-            "expected the accept thread, the UDP responder and the bring-up \
-             probe, found {sites} — a thread was added or moved, and the \
-             account has to be told about it"
+            sites, 5,
+            "expected the accept thread, the UDP responder, the bring-up \
+             probe and the write-deadline probe's two legs, found {sites} — \
+             a thread was added or moved, and the account has to be told \
+             about it"
         );
         assert!(
             unpaid.is_empty(),

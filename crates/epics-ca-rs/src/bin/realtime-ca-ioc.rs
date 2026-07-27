@@ -182,6 +182,274 @@ mod demo_db {
         // host `camonitor` sees IS the band's timer jitter.
         "record(ai, \"RTEMS:CA:TICK\") { field(PREC, \"0\") field(SCAN, \"Passive\") }\n",
     );
+
+    /// E8 STACK PROBE: a record set whose CA traffic is *not* a single scalar.
+    ///
+    /// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §10.2 could only
+    /// measure a 13,240 B `CAS-client` high-water, because every driver in that
+    /// round did `READ_NOTIFY` against one `ao`. That number cannot decide
+    /// `StackSizeClass`: it is the depth of the shallowest possible CA request.
+    /// These records are chosen so each one drives a different part of the
+    /// server thread's stack, and the census then says which of them, if any,
+    /// approaches a class boundary:
+    ///
+    ///   * `WF` / `WF2` — 32,768 and 8,192 `DOUBLE`, so a `READ_NOTIFY` reply
+    ///     is 262,144 B and 65,536 B of payload rather than 8. Array
+    ///     serialisation is what `EPICS_CA_MAX_ARRAY_BYTES` is about, and it
+    ///     runs on the `CAS-client` thread for a get and on `CAS-event` for a
+    ///     monitor.
+    ///   * `SA` — a `subArray` window over `WF`, so the reply is built through
+    ///     `ArrayKind::SubArray`'s INDX/NELM path rather than by copying a
+    ///     whole field.
+    ///   * `CMP` — a `compress` whose INP is `WF`, so processing consumes a
+    ///     32,768-element array instead of a scalar.
+    ///   * `H` → `L1..L32` — a 32-deep `FLNK` chain, four times the existing
+    ///     C1..C8 one, so the chain is longer than any depth bound the engine
+    ///     imposes and the bound itself becomes observable. MEASURED on
+    ///     `x86_64-wrs-vxworks`: a CA put to `H` processes `H` and `L1..L15`
+    ///     and stops, because `process_entry_prelude`'s `MAX_LINK_DEPTH = 16`
+    ///     bails at `L16` (`L15 = 1215.0`, `L16 = L17 = L18 = 0.0`). So this
+    ///     record set drives the recursion to its cap, which is what makes the
+    ///     `CAS-client` high-water below depth-inclusive.
+    ///   * `WFBIG` — 131,072 `DOUBLE`, a 1,048,576 B reply, 4× `WF`. `WF`
+    ///     alone cannot say whether stack high-water scales with payload
+    ///     size; two array sizes an octave apart can.
+    ///   * `FAN` — a `dfanout` to 8 targets, breadth rather than depth, so the
+    ///     two shapes can be told apart.
+    ///
+    /// Kept separate from [`C6_PROBE_DB`] rather than appended to it because
+    /// that constant's record count is asserted by another row's test.
+    #[cfg(feature = "bringup-probes")]
+    pub const E8_STACK_DB: &str = concat!(
+        "record(waveform, \"RTEMS:E8:WF\") { field(FTVL, \"DOUBLE\") field(NELM, \"32768\") }\n",
+        "record(waveform, \"RTEMS:E8:WF2\") { field(FTVL, \"DOUBLE\") field(NELM, \"8192\") }\n",
+        "record(waveform, \"RTEMS:E8:WFBIG\") { field(FTVL, \"DOUBLE\") field(NELM, \"131072\") }\n",
+        "record(subArray, \"RTEMS:E8:SA\") {\n",
+        "  field(FTVL, \"DOUBLE\") field(INP, \"RTEMS:E8:WF\")\n",
+        "  field(MALM, \"32768\") field(NELM, \"4096\") field(INDX, \"1024\")\n",
+        "}\n",
+        "record(compress, \"RTEMS:E8:CMP\") {\n",
+        "  field(ALG, \"Circular Buffer\") field(NSAM, \"256\") field(INP, \"RTEMS:E8:WF\")\n",
+        "}\n",
+        // The 32-deep chain. `H` is an `ao` so a plain `caput` starts it.
+        "record(ao, \"RTEMS:E8:H\") { field(PREC, \"3\") field(FLNK, \"RTEMS:E8:L1\") }\n",
+        "record(calc, \"RTEMS:E8:L1\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:H\") field(FLNK, \"RTEMS:E8:L2\") }\n",
+        "record(calc, \"RTEMS:E8:L2\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L1\") field(FLNK, \"RTEMS:E8:L3\") }\n",
+        "record(calc, \"RTEMS:E8:L3\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L2\") field(FLNK, \"RTEMS:E8:L4\") }\n",
+        "record(calc, \"RTEMS:E8:L4\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L3\") field(FLNK, \"RTEMS:E8:L5\") }\n",
+        "record(calc, \"RTEMS:E8:L5\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L4\") field(FLNK, \"RTEMS:E8:L6\") }\n",
+        "record(calc, \"RTEMS:E8:L6\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L5\") field(FLNK, \"RTEMS:E8:L7\") }\n",
+        "record(calc, \"RTEMS:E8:L7\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L6\") field(FLNK, \"RTEMS:E8:L8\") }\n",
+        "record(calc, \"RTEMS:E8:L8\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L7\") field(FLNK, \"RTEMS:E8:L9\") }\n",
+        "record(calc, \"RTEMS:E8:L9\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L8\") field(FLNK, \"RTEMS:E8:L10\") }\n",
+        "record(calc, \"RTEMS:E8:L10\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L9\") field(FLNK, \"RTEMS:E8:L11\") }\n",
+        "record(calc, \"RTEMS:E8:L11\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L10\") field(FLNK, \"RTEMS:E8:L12\") }\n",
+        "record(calc, \"RTEMS:E8:L12\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L11\") field(FLNK, \"RTEMS:E8:L13\") }\n",
+        "record(calc, \"RTEMS:E8:L13\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L12\") field(FLNK, \"RTEMS:E8:L14\") }\n",
+        "record(calc, \"RTEMS:E8:L14\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L13\") field(FLNK, \"RTEMS:E8:L15\") }\n",
+        "record(calc, \"RTEMS:E8:L15\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L14\") field(FLNK, \"RTEMS:E8:L16\") }\n",
+        "record(calc, \"RTEMS:E8:L16\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L15\") field(FLNK, \"RTEMS:E8:L17\") }\n",
+        "record(calc, \"RTEMS:E8:L17\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L16\") field(FLNK, \"RTEMS:E8:L18\") }\n",
+        "record(calc, \"RTEMS:E8:L18\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L17\") field(FLNK, \"RTEMS:E8:L19\") }\n",
+        "record(calc, \"RTEMS:E8:L19\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L18\") field(FLNK, \"RTEMS:E8:L20\") }\n",
+        "record(calc, \"RTEMS:E8:L20\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L19\") field(FLNK, \"RTEMS:E8:L21\") }\n",
+        "record(calc, \"RTEMS:E8:L21\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L20\") field(FLNK, \"RTEMS:E8:L22\") }\n",
+        "record(calc, \"RTEMS:E8:L22\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L21\") field(FLNK, \"RTEMS:E8:L23\") }\n",
+        "record(calc, \"RTEMS:E8:L23\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L22\") field(FLNK, \"RTEMS:E8:L24\") }\n",
+        "record(calc, \"RTEMS:E8:L24\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L23\") field(FLNK, \"RTEMS:E8:L25\") }\n",
+        "record(calc, \"RTEMS:E8:L25\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L24\") field(FLNK, \"RTEMS:E8:L26\") }\n",
+        "record(calc, \"RTEMS:E8:L26\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L25\") field(FLNK, \"RTEMS:E8:L27\") }\n",
+        "record(calc, \"RTEMS:E8:L27\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L26\") field(FLNK, \"RTEMS:E8:L28\") }\n",
+        "record(calc, \"RTEMS:E8:L28\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L27\") field(FLNK, \"RTEMS:E8:L29\") }\n",
+        "record(calc, \"RTEMS:E8:L29\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L28\") field(FLNK, \"RTEMS:E8:L30\") }\n",
+        "record(calc, \"RTEMS:E8:L30\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L29\") field(FLNK, \"RTEMS:E8:L31\") }\n",
+        "record(calc, \"RTEMS:E8:L31\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L30\") field(FLNK, \"RTEMS:E8:L32\") }\n",
+        "record(calc, \"RTEMS:E8:L32\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:E8:L31\") }\n",
+        // Breadth, to tell a wide fan-out apart from a deep chain.
+        "record(dfanout, \"RTEMS:E8:FAN\") {\n",
+        "  field(OUTA, \"RTEMS:E8:F1\") field(OUTB, \"RTEMS:E8:F2\")\n",
+        "  field(OUTC, \"RTEMS:E8:F3\") field(OUTD, \"RTEMS:E8:F4\")\n",
+        "  field(OUTE, \"RTEMS:E8:F5\") field(OUTF, \"RTEMS:E8:F6\")\n",
+        "  field(OUTG, \"RTEMS:E8:F7\") field(OUTH, \"RTEMS:E8:F8\")\n",
+        "}\n",
+        "record(ai, \"RTEMS:E8:F1\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F2\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F3\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F4\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F5\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F6\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F7\") { field(PREC, \"3\") }\n",
+        "record(ai, \"RTEMS:E8:F8\") { field(PREC, \"3\") }\n",
+    );
+}
+
+/// E8 STACK PROBE, second half: link-time interposers that name the allocation
+/// behind the wall-abort mutex `EINVAL`.
+///
+/// The SDK's `pthreadLib.o` settles the chain statically —
+/// `pthread_mutex_lock+0x34` calls `pthreadMutexInitComplete`, which calls
+/// `pthreadMutexInit`, which calls `semMCreate` and, when that returns NULL,
+/// returns `0x16` = `EINVAL` rather than `ENOMEM`; `InitComplete` passes the
+/// code through and `pthread_mutex_lock` returns it verbatim, so std's
+/// `Mutex::lock` panics with "invalid argument (os error 22)". Note that
+/// `pthread_mutex_init` only *stamps* the `0xec542a37` magic and never calls
+/// `semMCreate` itself, so **every** VxWorks pthread mutex materialises its
+/// semaphore on first lock and an eager `init()` does not avoid this.
+///
+/// This proves the same chain on target. Built only when the linker is given
+/// `--wrap=semMCreate --wrap=pthread_mutex_lock`; without those flags the
+/// `__wrap_*` symbols are simply unreferenced.
+///
+/// Everything here is allocation-free and takes no std lock, because it runs
+/// *inside* the failing path: a `format!` would call the allocator that is
+/// already refusing, and an `eprintln!` would lock the very kind of object
+/// whose creation just failed.
+#[cfg(all(feature = "bringup-probes", target_os = "vxworks"))]
+mod mutex_alloc_probe {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEM_OK: AtomicUsize = AtomicUsize::new(0);
+    static SEM_NULL: AtomicUsize = AtomicUsize::new(0);
+    static LOCK_FAIL: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many of each event to print before going quiet. A wall event can
+    /// produce these in a tight loop and the console is a 115200-baud pipe.
+    const REPORT_CAP: usize = 24;
+
+    /// Fixed-buffer line writer: no allocator, no locks, one `write(2)`.
+    struct Line {
+        buf: [u8; 240],
+        n: usize,
+    }
+
+    impl Line {
+        const fn new() -> Self {
+            Self {
+                buf: [0; 240],
+                n: 0,
+            }
+        }
+
+        fn s(&mut self, t: &str) -> &mut Self {
+            for &b in t.as_bytes() {
+                if self.n < self.buf.len() {
+                    self.buf[self.n] = b;
+                    self.n += 1;
+                }
+            }
+            self
+        }
+
+        fn d(&mut self, mut v: usize) -> &mut Self {
+            let mut tmp = [0u8; 20];
+            let mut i = tmp.len();
+            loop {
+                i -= 1;
+                tmp[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 || i == 0 {
+                    break;
+                }
+            }
+            // SAFETY-free: the slice is ASCII digits by construction.
+            let digits = core::str::from_utf8(&tmp[i..]).unwrap_or("?");
+            self.s(digits)
+        }
+
+        fn h(&mut self, v: usize) -> &mut Self {
+            self.s("0x");
+            let mut started = false;
+            for shift in (0..16).rev() {
+                let nib = ((v >> (shift * 4)) & 0xf) as u8;
+                if nib != 0 || started || shift == 0 {
+                    started = true;
+                    let c = if nib < 10 {
+                        b'0' + nib
+                    } else {
+                        b'a' + nib - 10
+                    };
+                    if self.n < self.buf.len() {
+                        self.buf[self.n] = c;
+                        self.n += 1;
+                    }
+                }
+            }
+            self
+        }
+
+        fn emit(&mut self) {
+            self.s("\n");
+            unsafe {
+                libc::write(2, self.buf.as_ptr().cast::<c_void>(), self.n);
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn __real_semMCreate(options: libc::c_int) -> *mut c_void;
+        fn __real_pthread_mutex_lock(m: *mut libc::pthread_mutex_t) -> libc::c_int;
+    }
+
+    /// The allocation that fails. `semMCreate` returning NULL is what turns
+    /// into `EINVAL` two frames up.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_semMCreate(options: libc::c_int) -> *mut c_void {
+        let sem = unsafe { __real_semMCreate(options) };
+        if sem.is_null() {
+            let n = SEM_NULL.fetch_add(1, Ordering::Relaxed);
+            if n < REPORT_CAP {
+                let mut l = Line::new();
+                l.s("MTXPROBE semMCreate=NULL nth_null=")
+                    .d(n + 1)
+                    .s(" succeeded_before=")
+                    .d(SEM_OK.load(Ordering::Relaxed))
+                    .s(" options=")
+                    .h(options as usize)
+                    .emit();
+            }
+        } else {
+            let ok = SEM_OK.fetch_add(1, Ordering::Relaxed) + 1;
+            // A running census on a milestone rather than from a call site: the
+            // console reporter lives in the rig patch, not in this file, and the
+            // trajectory up to the wall is the number the reservation budget
+            // needs. The first call reports unconditionally: silence must mean
+            // "no semaphores created", never "the --wrap flags did not take",
+            // and on the first run of this probe those two were indistinguishable.
+            if ok == 1 || ok % 512 == 0 {
+                let mut l = Line::new();
+                l.s("MTXPROBE semaphores_created=").d(ok).emit();
+            }
+        }
+        sem
+    }
+
+    /// The symptom. Reports the mutex address and the running semaphore count,
+    /// so a failing lock can be tied to the NULL that caused it.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn __wrap_pthread_mutex_lock(
+        m: *mut libc::pthread_mutex_t,
+    ) -> libc::c_int {
+        let rc = unsafe { __real_pthread_mutex_lock(m) };
+        if rc != 0 {
+            let n = LOCK_FAIL.fetch_add(1, Ordering::Relaxed);
+            if n < REPORT_CAP {
+                let mut l = Line::new();
+                l.s("MTXPROBE lock rc=")
+                    .d(rc as usize)
+                    .s(" mutex=")
+                    .h(m as usize)
+                    .s(" nth_fail=")
+                    .d(n + 1)
+                    .s(" sem_ok=")
+                    .d(SEM_OK.load(Ordering::Relaxed))
+                    .s(" sem_null=")
+                    .d(SEM_NULL.load(Ordering::Relaxed))
+                    .emit();
+            }
+        }
+        rc
+    }
 }
 
 #[cfg(any(
@@ -358,6 +626,7 @@ mod ioc {
             #[cfg(feature = "bringup-probes")]
             {
                 builder = builder.db_string(crate::demo_db::C6_PROBE_DB, &macros)?;
+                builder = builder.db_string(crate::demo_db::E8_STACK_DB, &macros)?;
             }
         } else {
             for path in db_files {
@@ -1072,6 +1341,95 @@ mod tests {
             "the C6_PROBE_DB load site is not feature-gated: the measurement \
              rig would ship in the default image"
         );
+    }
+
+    /// Same guard for the E8 stack-probe set. It is a second constant with a
+    /// second load site, so the C6 gate above does not cover it.
+    #[test]
+    fn the_e8_stack_db_loads_only_behind_the_feature() {
+        let src = include_str!("realtime-ca-ioc.rs");
+        let prod = match src.find("\n#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let load_at = prod
+            .find(concat!("crate::demo_db::E8_STACK_", "DB, &macros"))
+            .expect("the E8 stack database is loaded somewhere in load_database");
+        let before = &prod[load_at.saturating_sub(400)..load_at];
+        assert!(
+            before.contains(concat!("#[cfg(feature = \"bringup-", "probes\")]")),
+            "the E8_STACK_DB load site is not feature-gated: the measurement \
+             rig would ship in the default image"
+        );
+    }
+
+    /// The E8 set exists to make a CA request that is not a single scalar, so
+    /// pin the three properties the stack measurement depends on: the big
+    /// array is actually big, the `FLNK` chain is actually 32 deep, and the
+    /// whole set parses on top of the other two constants.
+    #[cfg(feature = "bringup-probes")]
+    #[test]
+    fn the_e8_stack_db_defines_a_deep_chain_and_a_large_array() {
+        use std::collections::HashMap;
+
+        let full = format!(
+            "{}{}{}",
+            crate::demo_db::DEMO_DB,
+            crate::demo_db::C6_PROBE_DB,
+            crate::demo_db::E8_STACK_DB
+        );
+        let recs = epics_base_rs::server::db_loader::parse_db(&full, &HashMap::new())
+            .expect("demo + C6 + E8 must parse together");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+
+        for n in [
+            "RTEMS:E8:WF",
+            "RTEMS:E8:WF2",
+            "RTEMS:E8:SA",
+            "RTEMS:E8:CMP",
+            "RTEMS:E8:H",
+            "RTEMS:E8:FAN",
+        ] {
+            assert!(names.contains(&n), "{n} missing from the E8 stack set");
+        }
+        for i in 1..=32 {
+            let n = format!("RTEMS:E8:L{i}");
+            assert!(
+                names.contains(&n.as_str()),
+                "{n} missing: the chain is not 32 deep, so a depth comparison \
+                 against C1..C8 would not be a comparison"
+            );
+        }
+        assert!(
+            !names.contains(&"RTEMS:E8:L33"),
+            "the chain is longer than the 32 the measurement reports"
+        );
+
+        // Two array sizes an octave apart, because one size cannot say whether
+        // the CAS-client stack high-water scales with payload size.
+        for (pv, want, why) in [
+            (
+                "RTEMS:E8:WF",
+                "32768",
+                "the array must stay large enough that a reply is 262,144 B, not 8",
+            ),
+            (
+                "RTEMS:E8:WFBIG",
+                "131072",
+                "the second array must stay 4x the first, or the payload-size \
+                 sensitivity arm compares nothing",
+            ),
+        ] {
+            let rec = recs.iter().find(|r| r.name == pv).unwrap_or_else(|| {
+                panic!("{pv} missing from the E8 stack set");
+            });
+            let nelm = rec
+                .fields
+                .iter()
+                .find(|(k, _)| k == "NELM")
+                .map(|(_, v)| v.to_string());
+            assert_eq!(nelm.as_deref(), Some(want), "{why}");
+        }
     }
 
     /// With the feature on, the rig is exactly the 14 records the C6

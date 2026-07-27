@@ -590,6 +590,16 @@ mod ioc {
              queued={dial_queued} dialing={dial_dialing} \
              MEM_FREE={mem_free} MEM_USED={mem_used}",
         );
+        // The monitor queue's collapse counter, beside MEM_USED because the two
+        // answer one question together: whether a wide-value monitor is being
+        // held to one queued entry (C's `db_queue_event_log` early-drop for a
+        // second by-reference log, `dbEvent.c:786-799`) or is accumulating whole
+        // owned array copies. A rising count with a flat MEM_USED is the bound
+        // working; a flat count with a climbing MEM_USED is not.
+        println!(
+            "MONPROBE seq={seq} COLLAPSED={}",
+            epics_base_rs::server::pv::dropped_monitor_events()
+        );
         for (pv, connected) in resolver.link_report() {
             println!("C6 seq={seq} link pv={pv} connected={connected}");
         }

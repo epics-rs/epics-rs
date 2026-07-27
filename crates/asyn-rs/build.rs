@@ -18,6 +18,7 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
     println!("cargo::rustc-check-cfg=cfg(asyn_serial_backend)");
+    println!("cargo::rustc-check-cfg=cfg(asyn_af_unix)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
@@ -40,5 +41,25 @@ fn main() {
     let windows = target_family.split(',').any(|f| f == "windows");
     if (unix && !embedded) || windows {
         println!("cargo::rustc-cfg=asyn_serial_backend");
+    }
+
+    // Whether `unix://` is a usable protocol, mirroring C's own `HAS_AF_UNIX`:
+    //
+    //     #if !defined(_WIN32) && !defined(vxWorks) && defined(AF_UNIX)
+    //     # define HAS_AF_UNIX 1
+    //
+    // (`drvAsynIPPort.c:62-64`). Named here for the same reason C names it:
+    // `drivers::ip_port` tests the condition at eight sites, and C tests it at
+    // as many, in both cases because the enum variant, each transport arm, the
+    // connect and its refusal must all agree.
+    //
+    // NOT `epics_embedded_target`, and the difference is the point: that macro
+    // excludes `_WIN32` and `vxWorks` but says nothing about `__rtems__`, so
+    // RTEMS keeps AF_UNIX. VxWorks is the one embedded target that loses it,
+    // and `std` compiles `UnixStream` for the triple regardless — so without
+    // this the VxWorks build takes the unix arm, offers `unix://`, and fails
+    // at connect on a socket family C never offered there.
+    if unix && target_os != "vxworks" {
+        println!("cargo::rustc-cfg=asyn_af_unix");
     }
 }

@@ -1,6 +1,9 @@
 //! Serial port driver (drvAsynSerialPort equivalent).
 //!
-//! Uses `libc` termios directly for serial I/O. Unix-only (`#[cfg(unix)]`).
+//! Uses `libc` termios directly for serial I/O, so it is mounted only where
+//! those bindings exist: unix **excluding** RTEMS and VxWorks, whose `libc`
+//! declares `struct termios` without the constants this file needs. See
+//! `drivers/mod.rs` for the gate and what a VxWorks backend would take.
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};

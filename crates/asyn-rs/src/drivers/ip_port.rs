@@ -31,7 +31,10 @@ use crate::{asyn_trace, asyn_trace_io};
 /// - `UDP&` → UDP + `SO_REUSEPORT` (C line 375-378, NOT broadcast)
 /// - `UDP*` → UDP + `SO_BROADCAST` (C line 379-382, NOT multicast)
 /// - `UDP*&` → UDP + `SO_BROADCAST` + `SO_REUSEPORT` (C line 383-387)
-/// - `unix://path` → Unix domain socket (cfg(unix) only)
+/// - `unix://path` → Unix domain socket. Present wherever C defines
+///   `HAS_AF_UNIX` — every unix but VxWorks, which `drvAsynIPPort.c:62`
+///   excludes by name. RTEMS keeps it; C excludes only `_WIN32` and
+///   `vxWorks`.
 /// - `HTTP` → TCP + `FLAG_CONNECT_PER_TRANSACTION` (C line 368-371)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IpProtocol {
@@ -125,20 +128,35 @@ impl IpPortConfig {
             .strip_prefix("unix://")
             .or_else(|| spec.strip_prefix("UNIX://"))
         {
-            if path.is_empty() {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "empty unix socket path".into(),
+            // Where the platform has no AF_UNIX the spec is refused *here*, in
+            // parsing, which is where C refuses it — `drvAsynIPPortConfigure`
+            // prints "AF_UNIX not available on this platform." and returns -1
+            // from inside this same `unix://` branch (drvAsynIPPort.c:315-317).
+            // That makes a startup script fail on the line that is wrong,
+            // rather than accepting it and failing later on the first connect.
+            #[cfg(not(asyn_af_unix))]
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("AF_UNIX not available on this platform: '{path}'"),
+            });
+
+            #[cfg(asyn_af_unix)]
+            {
+                if path.is_empty() {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "empty unix socket path".into(),
+                    });
+                }
+                return Ok(Self {
+                    host: path.to_string(),
+                    port: 0,
+                    local_port: None,
+                    protocol: IpProtocol::Unix,
+                    connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+                    no_delay: false,
                 });
             }
-            return Ok(Self {
-                host: path.to_string(),
-                port: 0,
-                local_port: None,
-                protocol: IpProtocol::Unix,
-                connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-                no_delay: false,
-            });
         }
 
         // Parse protocol suffix (case-insensitive)
@@ -293,7 +311,7 @@ enum IpIoInner {
     // sendto/recvfrom. We mirror that: the socket is left unconnected and
     // the resolved peer is carried alongside it for `send_to`.
     Udp(UdpSocket, std::net::SocketAddr),
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     Unix(std::os::unix::net::UnixStream),
 }
 
@@ -424,7 +442,7 @@ impl OctetNext for IpIoState {
                     Err(e) => Err(classify_read_error(e)),
                 }
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => {
                 // Same C fall-through as the TCP arm (drvAsynIPPort.c:744-756):
                 // a failed set_read_timeout must not pre-empt the read that
@@ -493,7 +511,7 @@ impl OctetNext for IpIoState {
                 // no partial-write carrier.
                 Ok(socket.send_to(data, *peer)?)
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => {
                 stream.set_write_timeout(Some(socket_poll_timeout(user.timeout)))?;
                 write_with_retry(stream, data, deadline)
@@ -550,7 +568,7 @@ impl OctetNext for IpIoState {
                     let _ = socket.set_nonblocking(false);
                 }
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             Some(IpIoInner::Unix(stream)) => {
                 let restore = stream.set_nonblocking(true);
                 loop {
@@ -1245,7 +1263,7 @@ impl DrvAsynIPPort {
         Ok((socket, peer))
     }
 
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     fn connect_unix(&mut self) -> AsynResult<std::os::unix::net::UnixStream> {
         let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
             AsynError::Status {
@@ -1307,16 +1325,21 @@ impl PortDriver for DrvAsynIPPort {
                 let (socket, peer) = self.connect_udp()?;
                 self.io.inner = Some(IpIoInner::Udp(socket, peer));
             }
-            #[cfg(unix)]
+            #[cfg(asyn_af_unix)]
             IpProtocol::Unix => {
                 let stream = self.connect_unix()?;
                 self.io.inner = Some(IpIoInner::Unix(stream));
             }
-            #[cfg(not(unix))]
+            // Unreachable rather than defensive: `IpPortConfig::parse` refuses
+            // a `unix://` spec outright on a platform without AF_UNIX, so no
+            // config carrying this variant can exist here. The arm is present
+            // because `IpProtocol::Unix` is still a variant of the enum and the
+            // match must be exhaustive.
+            #[cfg(not(asyn_af_unix))]
             IpProtocol::Unix => {
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
-                    message: "Unix domain sockets not supported on this platform".into(),
+                    message: "AF_UNIX not available on this platform".into(),
                 });
             }
             IpProtocol::Http => {
@@ -3204,7 +3227,7 @@ mod tests {
 
     // --- Unix socket integration test ---
 
-    #[cfg(unix)]
+    #[cfg(asyn_af_unix)]
     #[test]
     fn test_unix_socket_connect_roundtrip() {
         use std::os::unix::net::UnixListener;

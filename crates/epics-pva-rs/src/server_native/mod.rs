@@ -70,11 +70,17 @@ pub use monitor_control::{MonitorControlOp, MonitorReceiver, PostError};
 pub use op_handle::{
     ClientCredentials, ExecOp, ExecResult, MessageLevel, OpBase, OpMessage, RemoteLogger,
 };
+// The config record lives in the ungated [`config`] module and compiles for
+// every target, so it is re-exported from there rather than from the host-only
+// [`runtime`] that also re-exports it. Routing it through `runtime` made
+// `server_native::PvaServerConfig` vanish on `armv7-rtems-eabihf` and the
+// `*-wrs-vxworks*` triples even though the type was right there, which forced
+// embedded callers onto `server_native::config::PvaServerConfig` and left every
+// doc reference to the short path unresolvable on those targets.
+pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
 pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
 #[cfg(not(epics_embedded_target))]
-pub use runtime::{
-    DEFAULT_MAX_MESSAGE_SIZE, PvaServer, PvaServerConfig, ServerReportHandle, run_pva_server,
-};
+pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource};
 pub use shared_pv::{AddPvError, SharedPV, SharedSource};
 pub use source::{

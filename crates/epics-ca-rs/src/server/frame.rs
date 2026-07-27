@@ -32,28 +32,145 @@
 //! [`FrameBuf`] is the port of that reservation: one `Vec` that starts with
 //! room for the largest CA header, into which `encode_dbr_into` writes the
 //! payload directly. [`FrameBuf::seal`] then writes the finished header into
-//! the reserved prefix and returns the complete frame — still the single
-//! contiguous `Vec<u8>` the [`Outbox`](super::outbox::Outbox) abort-safety
+//! the reserved prefix and returns the complete frame — still a single
+//! contiguous buffer, as the [`Outbox`](super::outbox::Outbox) abort-safety
 //! invariant requires.
+//!
+//! # Reuse across deliveries
+//!
+//! Reserving in one buffer removes the payload copy, but a `FrameBuf` per
+//! delivery still *allocates* per delivery, where C's send buffer is allocated
+//! once per client and reused for every reply and every monitor update it ever
+//! sends. [`FramePool`] closes that: it is the connection's one send buffer,
+//! [`FrameBuf::acquire`] borrows it, and [`PooledFrame`]'s `Drop` — running in
+//! the single drain owner once the bytes are on the socket — returns it. A
+//! producer therefore allocates only when the buffer is already out on loan.
+//!
+//! One buffer and one lock per connection is C's shape, not an addition to it:
+//! `rsrv` guards its per-client send buffer with that client's `SEND_LOCK`.
+//! The lock here is only ever `try_lock`ed, so a producer that loses the race
+//! allocates a throwaway rather than waiting on another thread — the buffer is
+//! an optimisation and must never be able to serialise two producers, let
+//! alone invert their priorities.
 
 use crate::protocol::{CaHeader, align8};
+use std::sync::{Arc, Mutex};
 
 /// Room reserved at the front of a [`FrameBuf`] — the largest CA header
 /// (extended: 16 fixed bytes plus the 8 extended-postsize/count bytes).
 const HDR_RESERVE: usize = 24;
 
+/// One connection's reusable send buffer — the owner of the allocation that
+/// [`FrameBuf`] borrows and [`PooledFrame`] returns.
+///
+/// Exactly one buffer, like C's per-client send buffer: the slot keeps the
+/// larger of the returned and the resident capacity, so it settles at the
+/// connection's high-water frame size and stays there. Bounding it at one is
+/// what keeps a burst of concurrent producers from parking N high-water buffers
+/// on a connection that only needs one at a time; producers past the first
+/// allocate for that delivery and drop it, which is exactly today's behaviour.
+pub(crate) struct FramePool {
+    slot: Mutex<Option<Vec<u8>>>,
+}
+
+impl FramePool {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// Take the buffer if it is resident and the slot is uncontended.
+    fn take(&self) -> Option<Vec<u8>> {
+        self.slot.try_lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Give a buffer back. Keeps the larger capacity when the slot is already
+    /// occupied, and drops the buffer outright when the slot is contended —
+    /// a missed return costs one allocation, never correctness.
+    fn put(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        if let Ok(mut slot) = self.slot.try_lock() {
+            let keep = match slot.take() {
+                Some(resident) if resident.capacity() >= buf.capacity() => resident,
+                _ => buf,
+            };
+            *slot = Some(keep);
+        }
+    }
+}
+
+/// A finished CA frame on its way to the socket, which returns its allocation
+/// to the [`FramePool`] it came from when the drain owner drops it.
+///
+/// The lend/return is the type's, not the caller's: there is no way to obtain
+/// one of these without either borrowing from a pool
+/// ([`FrameBuf::acquire`] → [`FrameBuf::seal`]) or supplying an owned `Vec`
+/// (`From<Vec<u8>>`, for the fixed-size control frames that have nothing worth
+/// reusing), and no way to keep the buffer past the drop.
+pub(crate) struct PooledFrame {
+    buf: Vec<u8>,
+    home: Option<Arc<FramePool>>,
+}
+
+impl std::fmt::Debug for PooledFrame {
+    /// Length and provenance, never the bytes: a frame can carry a megabyte of
+    /// waveform and an assertion message that dumps it is unreadable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledFrame")
+            .field("len", &self.buf.len())
+            .field("pooled", &self.home.is_some())
+            .finish()
+    }
+}
+
+impl std::ops::Deref for PooledFrame {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl From<Vec<u8>> for PooledFrame {
+    /// A frame built outside the pool: the CA control messages, whose bodies
+    /// are a header or a fixed handful of bytes. Returning those to the slot
+    /// would evict the high-water payload buffer the pool exists to keep, so
+    /// they carry no home and free normally.
+    fn from(buf: Vec<u8>) -> Self {
+        Self { buf, home: None }
+    }
+}
+
+impl Drop for PooledFrame {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            home.put(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
 /// A CA frame under construction: the header prefix is reserved, the payload
 /// is appended after it.
 pub(crate) struct FrameBuf {
     buf: Vec<u8>,
+    home: Option<Arc<FramePool>>,
 }
 
 impl FrameBuf {
-    /// Reserve header room plus `payload_hint` bytes for the payload.
-    pub(crate) fn new(payload_hint: usize) -> Self {
-        let mut buf = Vec::with_capacity(HDR_RESERVE + payload_hint);
+    /// Borrow the connection's send buffer, reserving header room plus
+    /// `payload_hint` bytes of payload. Allocates only when the buffer is out
+    /// on loan to another producer.
+    pub(crate) fn acquire(pool: &Arc<FramePool>, payload_hint: usize) -> Self {
+        let mut buf = pool
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(HDR_RESERVE + payload_hint));
+        buf.clear();
         buf.resize(HDR_RESERVE, 0);
-        Self { buf }
+        Self {
+            buf,
+            home: Some(pool.clone()),
+        }
     }
 
     /// Append-only destination for the payload encoder (`encode_dbr_into`).
@@ -110,7 +227,7 @@ impl FrameBuf {
     /// payload `>= 0xFFFF`, so a frame that shifts always carries under 64 KiB
     /// — and the large-array frames this module exists for fill the
     /// reservation exactly and never move a byte.
-    pub(crate) fn seal(mut self, hdr: &CaHeader) -> Vec<u8> {
+    pub(crate) fn seal(mut self, hdr: &CaHeader) -> PooledFrame {
         let hdr_bytes = hdr.to_bytes_extended();
         debug_assert!(hdr_bytes.len() <= HDR_RESERVE);
         let start = HDR_RESERVE - hdr_bytes.len();
@@ -118,7 +235,10 @@ impl FrameBuf {
         if start > 0 {
             self.buf.drain(..start);
         }
-        self.buf
+        PooledFrame {
+            buf: self.buf,
+            home: self.home,
+        }
     }
 }
 
@@ -180,11 +300,115 @@ mod tests {
     use super::*;
     use crate::protocol::CA_PROTO_EVENT_ADD;
 
+    /// A pool of its own per test: the buffer is per connection, so a test
+    /// standing in for one connection owns one.
+    fn pool() -> Arc<FramePool> {
+        Arc::new(FramePool::new())
+    }
+
+    /// Where the allocation lives, so a reuse claim is checked against the
+    /// buffer's identity and not merely its capacity.
+    fn resident(pool: &Arc<FramePool>) -> Option<(usize, usize)> {
+        let slot = pool.slot.lock().unwrap();
+        slot.as_ref().map(|b| (b.as_ptr() as usize, b.capacity()))
+    }
+
+    /// One delivery, then the next: the second borrows the allocation the first
+    /// returned. This is the property the whole module exists for — C's send
+    /// buffer is allocated once per client, not once per update.
+    #[test]
+    fn a_sealed_frame_returns_its_buffer_for_the_next_delivery() {
+        let pool = pool();
+        assert_eq!(resident(&pool), None, "a fresh pool holds nothing");
+
+        let mut first = FrameBuf::acquire(&pool, 4096);
+        first.dst().extend(std::iter::repeat_n(0xAAu8, 4096));
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.set_payload_size(4096, 1, 13).unwrap();
+        let sealed = first.seal(&hdr);
+        // Out on loan: the frame holds the buffer until the drain owner writes
+        // it, so the slot is empty for as long as the bytes are in flight.
+        assert_eq!(resident(&pool), None);
+        assert_eq!(sealed.len(), 16 + 4096);
+
+        drop(sealed); // the drain owner, once the bytes are on the socket
+        let back = resident(&pool).expect("drop returns the buffer");
+        assert!(
+            back.1 >= 16 + 4096,
+            "returned buffer kept its capacity: {back:?}"
+        );
+
+        let second = FrameBuf::acquire(&pool, 0);
+        assert_eq!(resident(&pool), None, "the second delivery took it");
+        // `seal` may shift the payload down by 8 when the header is not
+        // extended, so compare against the buffer's own start, not the sealed
+        // frame's: the allocation is what must be identical.
+        assert_eq!(
+            second.buf.as_ptr() as usize,
+            back.0,
+            "the second delivery must reuse the first's allocation, not allocate"
+        );
+    }
+
+    /// A control frame handed to the outbox as a plain `Vec` has no home, so it
+    /// cannot evict the payload buffer the pool is holding. A 16-byte header
+    /// displacing a 1 MiB waveform buffer would make the pool worse than no
+    /// pool at all.
+    #[test]
+    fn an_unpooled_control_frame_never_displaces_the_payload_buffer() {
+        let pool = pool();
+        let mut f = FrameBuf::acquire(&pool, 65536);
+        f.dst().extend(std::iter::repeat_n(0x5Au8, 65536));
+        let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
+        hdr.set_payload_size(65536, 1, 13).unwrap();
+        drop(f.seal(&hdr));
+        let big = resident(&pool).expect("payload buffer resident");
+        assert!(big.1 >= 65536);
+
+        drop(PooledFrame::from(vec![0u8; 16]));
+        assert_eq!(
+            resident(&pool),
+            Some(big),
+            "an unpooled frame must leave the slot untouched"
+        );
+    }
+
+    /// Two producers at once — the async driver runs one monitor task per
+    /// subscription — and only one buffer. The second must allocate rather than
+    /// wait, and the slot must not end up holding the smaller of the two.
+    #[test]
+    fn a_second_concurrent_producer_allocates_and_the_slot_keeps_the_larger() {
+        let pool = pool();
+        let mut small = FrameBuf::acquire(&pool, 64);
+        small.dst().extend(std::iter::repeat_n(1u8, 64));
+        // While `small` holds the (only) buffer, a second producer gets its own.
+        let mut large = FrameBuf::acquire(&pool, 65536);
+        large.dst().extend(std::iter::repeat_n(2u8, 65536));
+        assert_ne!(
+            small.buf.as_ptr() as usize,
+            large.buf.as_ptr() as usize,
+            "concurrent producers must not share one buffer"
+        );
+
+        let mut h_small = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h_small.set_payload_size(64, 1, 13).unwrap();
+        let mut h_large = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h_large.set_payload_size(65536, 1, 13).unwrap();
+        drop(large.seal(&h_large));
+        drop(small.seal(&h_small));
+
+        let kept = resident(&pool).expect("one of them is resident");
+        assert!(
+            kept.1 >= 65536,
+            "the slot kept the smaller buffer: {kept:?}"
+        );
+    }
+
     /// A payload small enough for the 16-byte header seals to
     /// `header || payload` with the unused 8 reserved bytes gone.
     #[test]
     fn short_payload_seals_without_the_extended_prefix() {
-        let mut f = FrameBuf::new(8);
+        let mut f = FrameBuf::acquire(&pool(), 8);
         f.dst().extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(f.payload_len(), 8);
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -200,7 +424,7 @@ mod tests {
     #[test]
     fn extended_payload_seals_in_place() {
         let n = 0x1_0000; // >= 0xFFFF forces the extended header
-        let mut f = FrameBuf::new(n);
+        let mut f = FrameBuf::acquire(&pool(), n);
         f.dst().extend(std::iter::repeat_n(0xABu8, n));
         assert_eq!(f.payload_len(), n);
         let mut hdr = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -228,7 +452,7 @@ mod tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let mut frame = FrameBuf::new(0);
+        let mut frame = FrameBuf::acquire(&pool(), 0);
         epics_base_rs::types::encode_dbr_into(frame.dst(), dbr_type, &snapshot)
             .expect("native-type encode must succeed");
         (frame, count)
@@ -303,7 +527,7 @@ mod tests {
         use epics_base_rs::types::DBR_CLASS_NAME;
 
         for requested in [0u32, 1, 4, 9] {
-            let mut frame = FrameBuf::new(0);
+            let mut frame = FrameBuf::acquire(&pool(), 0);
             frame.dst().extend_from_slice(&[0xCD; 40]);
             assert_eq!(size_dbr_reply(&mut frame, DBR_CLASS_NAME, 7, requested), 1);
             assert_eq!(
@@ -319,7 +543,7 @@ mod tests {
     /// the payload start, not the buffer start.
     #[test]
     fn payload_ops_are_relative_to_the_payload_start() {
-        let mut f = FrameBuf::new(0);
+        let mut f = FrameBuf::acquire(&pool(), 0);
         f.dst().extend_from_slice(&[7; 5]);
         f.align_payload();
         assert_eq!(f.payload_len(), 8);

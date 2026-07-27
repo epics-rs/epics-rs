@@ -3239,6 +3239,7 @@ pub(crate) async fn dispatch_message(
             // computation; the connection loop's outbox owner is the only
             // code that touches the socket. Emit by pushing the bytes.
             match build_read_reply(
+                writer.pool(),
                 requested_type,
                 requested_count,
                 is_notify,
@@ -5286,7 +5287,7 @@ pub(crate) async fn register_subscription(
                         // Header space reserved up front, payload encoded
                         // straight into it — see `server::frame` for the C
                         // `cas_copy_in_header` shape this ports.
-                        let mut frame = FrameBuf::new(0);
+                        let mut frame = FrameBuf::acquire(outbox_clone.pool(), 0);
                         if encode_dbr_into(frame.dst(), requested_type, &event.snapshot).is_err() {
                             break;
                         }
@@ -5742,7 +5743,7 @@ fn send_monitor_snapshot(
     let (request_hdr, client_minor) = (&reply.req_hdr, reply.client_minor);
     // Header space reserved up front, payload encoded straight into it — see
     // `server::frame` for the C `cas_copy_in_header` shape this ports.
-    let mut frame = FrameBuf::new(0);
+    let mut frame = FrameBuf::acquire(writer.pool(), 0);
     encode_dbr_into(frame.dst(), data_type, snapshot)?;
     // Size the payload to the request count *before* the 8-byte alignment
     // resize, so the header count and the payload shape agree.
@@ -6155,7 +6156,12 @@ enum ReadReplyError {
 /// `client_minor`), which is exactly this function. That makes the READ
 /// reply byte-production testable against a hand-built snapshot with no
 /// socket in the loop.
+// The send buffer joins seven request parameters that are all genuinely
+// independent; grouping them into a single-use struct to satisfy the lint would
+// hide the sans-io signature this function exists to expose.
+#[allow(clippy::too_many_arguments)]
 fn build_read_reply(
+    pool: &std::sync::Arc<crate::server::frame::FramePool>,
     requested_type: u16,
     requested_count: u32,
     is_notify: bool,
@@ -6163,10 +6169,10 @@ fn build_read_reply(
     cid: u32,
     ioid: u32,
     client_minor: u16,
-) -> Result<Vec<u8>, ReadReplyError> {
+) -> Result<crate::server::frame::PooledFrame, ReadReplyError> {
     // Header space reserved up front, payload encoded straight into it — see
     // `server::frame` for the C `cas_copy_in_header` shape this ports.
-    let mut frame = FrameBuf::new(0);
+    let mut frame = FrameBuf::acquire(pool, 0);
     encode_dbr_into(frame.dst(), requested_type, snapshot).map_err(|_| ReadReplyError::BadType)?;
     // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
     // the request count in the header and zero-fills the
@@ -6616,7 +6622,7 @@ mod put_notify_supersede_tests {
     fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(f) = drain.try_next() {
-            frames.push(f);
+            frames.push(f.to_vec());
         }
         frames
     }
@@ -8922,7 +8928,7 @@ mod single_write_all_framing_tests {
     pub(super) fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(f) = drain.try_next() {
-            frames.push(f);
+            frames.push(f.to_vec());
         }
         frames
     }
@@ -10241,13 +10247,18 @@ mod read_reply_sans_io_tests {
     //! Sans-io proof for the READ / READ_NOTIFY reply: `build_read_reply`
     //! produces the exact wire frame from a hand-built [`Snapshot`] and the
     //! request parameters, with NO socket, NO `DuplexStream`, NO database,
-    //! and NO async. Every assertion here inspects the returned `Vec<u8>`
+    //! and NO async. Every assertion here inspects the returned frame's bytes
     //! directly. This is the increment-1 demonstration that the reply's
     //! byte production is a pure function of `(snapshot, request)` — the
-    //! whole point of the sans-io split.
+    //! whole point of the sans-io split. The frame buffer it borrows is an
+    //! allocator, not I/O: a test supplies its own.
     use super::*;
     use epics_base_rs::server::snapshot::Snapshot;
     use epics_base_rs::types::{DBR_LONG, DBR_STRING, EpicsValue};
+
+    fn pool() -> std::sync::Arc<crate::server::frame::FramePool> {
+        std::sync::Arc::new(crate::server::frame::FramePool::new())
+    }
 
     fn scalar_long(v: i32) -> Snapshot {
         Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH)
@@ -10259,6 +10270,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn read_notify_scalar_long_is_header_plus_padded_value() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             0, // notify autosize → live count (scalar ⇒ 1)
             true,
@@ -10286,6 +10298,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn deprecated_read_uses_channel_cid_and_read_opcode() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             1, // non-zero ⇒ ordinary scalar, not the count==0 metadata path
             false,
@@ -10312,6 +10325,7 @@ mod read_reply_sans_io_tests {
     #[test]
     fn deprecated_read_count_zero_ships_header_only_for_plain_type() {
         let frame = build_read_reply(
+            &pool(),
             DBR_LONG,
             0,
             false,
@@ -10339,7 +10353,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_LONG, 5, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+        let frame = build_read_reply(&pool(), DBR_LONG, 5, true, &snap, 0, 0x7, CA_MINOR_VERSION)
             .expect("padded array frames");
 
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
@@ -10365,7 +10379,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_LONG, 2, true, &snap, 0, 0x7, CA_MINOR_VERSION)
+        let frame = build_read_reply(&pool(), DBR_LONG, 2, true, &snap, 0, 0x7, CA_MINOR_VERSION)
             .expect("truncated array frames");
 
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
@@ -10386,7 +10400,7 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let err = build_read_reply(DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
+        let err = build_read_reply(&pool(), DBR_LONG, 20_000, true, &snap, 0, 0x7, 8)
             .expect_err("pre-V49 client cannot frame an extended reply");
         assert!(matches!(err, ReadReplyError::Oversize));
     }
@@ -10396,8 +10410,17 @@ mod read_reply_sans_io_tests {
     /// (READ_NOTIFY).
     #[test]
     fn unsupported_dbr_type_is_err_badtype() {
-        let err = build_read_reply(99, 1, false, &scalar_long(0), 0x1, 0x2, CA_MINOR_VERSION)
-            .expect_err("type 99 > LAST_BUFFER_TYPE cannot encode");
+        let err = build_read_reply(
+            &pool(),
+            99,
+            1,
+            false,
+            &scalar_long(0),
+            0x1,
+            0x2,
+            CA_MINOR_VERSION,
+        )
+        .expect_err("type 99 > LAST_BUFFER_TYPE cannot encode");
         assert!(matches!(err, ReadReplyError::BadType));
     }
 
@@ -10412,8 +10435,17 @@ mod read_reply_sans_io_tests {
             0,
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let frame = build_read_reply(DBR_STRING, 1, false, &snap, 0x1, 0x2, CA_MINOR_VERSION)
-            .expect("scalar string frames");
+        let frame = build_read_reply(
+            &pool(),
+            DBR_STRING,
+            1,
+            false,
+            &snap,
+            0x1,
+            0x2,
+            CA_MINOR_VERSION,
+        )
+        .expect("scalar string frames");
         let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
         // "OK" + NUL = 3 bytes, 8-aligned to 8 — not the 40-byte slot.
         assert_eq!(

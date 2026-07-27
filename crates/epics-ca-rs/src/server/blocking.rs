@@ -2169,7 +2169,7 @@ mod tests {
         let mut reply = None;
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_READ_NOTIFY {
-                reply = Some(f);
+                reply = Some(f.to_vec());
             }
         }
         reply.expect("reference produced a READ_NOTIFY reply")
@@ -3234,7 +3234,7 @@ mod tests {
     fn drain_one_event_add(drain: &mut OutboxDrain) -> Vec<u8> {
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_EVENT_ADD {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("outbox held no CA_PROTO_EVENT_ADD frame");
@@ -3701,7 +3701,7 @@ mod tests {
 
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                return f;
+                return f.to_vec();
             }
         }
         panic!("reference produced no WRITE_NOTIFY completion frame");

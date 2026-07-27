@@ -132,7 +132,7 @@ pub(crate) fn send_event(
     // encoded straight into it — C `cas_copy_in_header` reserving inside the
     // client's send buffer and `dbGet` converting into that space
     // (`camessage.c:516` → `dbAccess.c:1020`). See `server::frame`.
-    let mut frame = FrameBuf::new(0);
+    let mut frame = FrameBuf::acquire(outbox.pool(), 0);
     encode_dbr_into(frame.dst(), data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
     // Size the payload and pick the header count — `size_dbr_reply` owns the
@@ -191,7 +191,7 @@ mod tests {
     fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(frame) = drain.try_next() {
-            frames.push(frame);
+            frames.push(frame.to_vec());
         }
         frames
     }

@@ -704,14 +704,66 @@ no `setcap`, and `net.ipv4.ip_unprivileged_port_start=1024`.
   overhead, so the class is the minor lever and threads-per-connection the major
   one; `Big` is justified by no high-water measured here (13,240 B in all three
   arms) and costs a fifth of the wall.
+* **The class decision, now measured against a real database** (§15 of the
+  measurement). The 13,240 B above came from `READ_NOTIFY` on a single `ao`, so
+  it is superseded, not confirmed: driven against waveform / `subArray` /
+  `compress` / a FLNK chain / an 8-wide `dfanout` / six monitors per connection
+  and the `DBR_TIME` and `DBR_CTRL` reply shapes, `CAS-client` measures
+  **65,912 B** and `CAS-event` **7,120 B** — 5.0× and 1.19× the old figures — on
+  all four threads over four census passes, single-instance proved with
+  `rtpShow`. **The number is invariant**: payloads of 8 B, 32,768 B, 262,144 B
+  and 1,048,576 B, every reply shape, and all three class arms leave it
+  unchanged to the byte, because array payloads are on the heap. **The
+  bullet above is wrong on one point and it matters:** C's stack table is not
+  one table. `StackSizeClass::bytes` matches C's *POSIX* table
+  (`posix/osdThread.c:506-509`), but C on VxWorks uses `{4000, 6000, 11000} *
+  ARCH_STACK_FACTOR` (`vxWorks/osdThread.c:63-64`), so C's
+  `epicsThreadStackBig` on x86_64 is **22,000 B** and our `Big` is 95.3× it —
+  while our measured 65,912 B is 3.0× C's *entire* `Big`, because `park_on`
+  pins each connection's async state machine onto the connection stack. So
+  "match C's class" is not available as a decision rule here; only the measured
+  bytes are. `Big` runs at 3.14 % utilisation and `Medium` would keep 15.9×
+  margin while moving the measured wall 47 → 59. The change is **not made**:
+  `client_roster` is shared with `armv7-rtems-eabihf`, where no `CAS-client`
+  high-water has ever been measured.
+* **`MAX_LINK_DEPTH = 16` silently truncates a legal FLNK chain** (§16). A put
+  to a 32-deep chain processes the entry plus `L1..L15` and stops; C has no
+  depth counter on that path (`processTarget`, `dbDbLink.c:427-436`, guards
+  cycles via `pact`, and `MAX_LOCK 10` is an unrelated already-active alarm).
+  The bail is `Ok(None)`, so the put returns success with no client notice and
+  no record alarm, and the notice goes through `eprintln!` which never reaches
+  `errlog` on this target. Its one upside: the cap makes the 65,912 B above
+  depth-inclusive by construction.
+* **A monitored 1 MiB waveform aborts the RTP at four clients** (§17).
+  `EVENT_ADD` on a 131,072-element `DOUBLE` array drove `MEM_USED` 43,278,336 →
+  211,804,160 B and killed the process with `memory allocation of 1048576 bytes
+  failed` → signal 6. The same workload without that one monitor survives a
+  480 s hold with eighty 1 MiB gets and eighty 1 MiB `WRITE_NOTIFY`s, so the
+  reply path is sound and the per-subscriber event queues are what exhaust the
+  heap.
 * **A wall-abort with mutex `EINVAL` — now reproduced, and worse than filed.**
   Two of four wall events this round, in the Big and Small arms and not the
   Medium one, never below the wall, never on a guest where pool capacity binds
   first. The census registry is exonerated. In the Small arm the panic deleted
   the RTP with signal 6, so this is not "a worker is lost while the IOC looks
-  healthy" — **a client that fills the pool can take the IOC down.** Root cause
-  still open: which uninitialised mutex, and which allocation fails, are not
-  established.
+  healthy" — **a client that fills the pool can take the IOC down.**
+  **Root cause now established, statically and on target** (§18). The SDK's
+  `pthreadLib.o` shows the first `lock()` on a `PTHREAD_MUTEX_INITIALIZER`
+  mutex reaching `pthreadMutexInitComplete` → `pthreadMutexInit` →
+  `semMCreate`, which on NULL returns `0x16` — `EINVAL`, not `ENOMEM` —
+  propagated verbatim so std panics "invalid argument (os error 22)".
+  `pthread_mutex_init` only stamps the magic, so **every** VxWorks pthread mutex
+  materialises its semaphore on first lock and eager init is no protection.
+  Confirmed with `--wrap=semMCreate --wrap=pthread_mutex_lock`:
+  `semMCreate=NULL nth_null=1 succeeded_before=588`, then `lock rc=22`, then the
+  fatal panic on `CAS-client 48`. So **the failing allocation is a VxWorks
+  semaphore object, not mimalloc heap** — which is why this arm reports no byte
+  count while the aborts above do; two allocators fail at the same wall. There
+  is no single guilty mutex: it is whichever `std::sync::Mutex` a freshly leased
+  worker touches first. The budget number is **588 live semaphores** at 49 sets
+  / 98 workers / 48 connections, and it is **transient** — creations passed
+  1,024 afterwards — so a bound must throttle creation rate, not only cap a
+  total.
 * **A panicking worker leaks its pool set permanently.** `BUSY=2 SETS=50
   WORKERS=100 CONNS=0` — nothing returns a `SetLease` whose worker died, so
   capacity drops permanently by one set per panic. `WorkerPool` accounting,

@@ -1033,3 +1033,143 @@ passing through either owner. Stated here so it is not rediscovered from the
 
 It compounds §13: at the reservation wall a panic is likelier, and each panic
 permanently shrinks the pool that the wall already constrained.
+
+## 15. The `StackSizeClass` decision, measured against a realistic database
+
+§5 and §10.2 could only report a **13,240 B** `CAS-client` high-water,
+because every driver in those rounds did `READ_NOTIFY` against a single
+`ao`. That is the shallowest CA request there is, so §10.2 refused to
+decide the class off it. This is that measurement redone against a record
+set chosen so each shape the decision depends on is actually driven.
+
+### 15.1 What was driven
+
+`E8_STACK_DB` (`crates/epics-ca-rs/src/bin/realtime-ca-ioc.rs`), through
+`doc/vx-rig-e8/stackload.py`, 4 connections, one cold RTP on a `1024M`
+guest (`OS Memory Size: ~958MB`):
+
+| op | reply / effect | outcome |
+| --- | --- | --- |
+| `get_WF` | 32,768 `DOUBLE` → 262,144 B, extended 24-byte header | 48/48 ok |
+| `get_WFBIG` | 131,072 `DOUBLE` → **1,048,576 B** | 48/48 ok |
+| `get_WF2` | 8,192 `DOUBLE` → 65,536 B | 48/48 ok |
+| `get_SA` | `subArray` window via `ArrayKind::SubArray` → 32,768 B | 48/48 ok |
+| `get_WF_ctrl` | `DBR_CTRL_DOUBLE`, full control block → 262,224 B | 48/48 ok |
+| `get_WF_time` | `DBR_TIME_DOUBLE`, stamped → 262,160 B | 48/48 ok |
+| `get_BIG_ctrl` | `DBR_CTRL_DOUBLE` on the 1 MiB array → 1,048,656 B | 48/48 ok |
+| `get_SA_ctrl` | `DBR_CTRL_DOUBLE` on the window → 32,848 B | 48/48 ok |
+| `put_WF` | `WRITE_NOTIFY`, 262,144 B inbound | 48/48 ok |
+| `put_WFBIG` | `WRITE_NOTIFY`, 1,048,576 B inbound | 48/48 ok |
+| `put_chain` | FLNK chain, `H` → `L1..L15` (see §16) | 48/48 ok |
+| `put_fan` | `dfanout`, 8 targets | 48/48 ok |
+| monitors | 6 per connection incl. a `DBR_CTRL_DOUBLE` one on `WF` | established |
+
+Plus a 380 s hold at that load (`HOLD ok=192 fail=0`) so census passes
+land while the workload is at its deepest.
+
+### 15.2 The numbers
+
+Verbatim, the last census pass (`tag=c6-54`), and identical in the three
+passes before it:
+
+```
+STACKUSE tag=c6-54 id=0x00030047 name=CAS-client 0 size=2097152 current=1536 high=65912
+STACKUSE tag=c6-54 id=0x00030069 name=CAS-event 0  size=1048576 current=1536 high=7120
+STACKUSE tag=c6-54 id=0x000300ac name=CAS-client 1 size=2097152 current=1536 high=65912
+STACKUSE tag=c6-54 id=0x000300b0 name=CAS-event 1  size=1048576 current=1536 high=7120
+STACKUSE tag=c6-54 id=0x000300b9 name=CAS-client 2 size=2097152 current=1536 high=65912
+STACKUSE tag=c6-54 id=0x000300bd name=CAS-event 2  size=1048576 current=1536 high=7120
+STACKUSE tag=c6-54 id=0x000300c5 name=CAS-client 3 size=2097152 current=1536 high=65912
+STACKUSE tag=c6-54 id=0x000300c9 name=CAS-event 3  size=1048576 current=1536 high=7120
+STACKUSE tag=c6-54 id=0x0001001b name=cbMedium     size=2097152 current=1008 high=206800
+STACKUSE tag=c6-54 id=0x00010034 name=scan-owner   size=1048576 current=2096 high=6664
+STACKUSE tag=c6-54 id=0x0001003c name=CAS-TCP      size=1048576 current=2384 high=5568
+```
+
+* **`CAS-client` = 65,912 B**, all four threads, four census passes. This
+  is **5.0×** the 13,240 B one-`ao` figure, so the old number was indeed
+  not usable for the decision.
+* **`CAS-event` = 7,120 B**, all four threads. 1.19× the old 5,968 B.
+* Largest consumer in the process is not a CA thread at all: `cbMedium` at
+  **206,800 B**.
+
+**The high-water is invariant, and that is the load-bearing result.**
+65,912 B did not move — not by one byte — across payloads of 8 B, 32,768 B,
+65,536 B, 262,144 B and 1,048,576 B, across `DBR_DOUBLE` / `DBR_TIME_DOUBLE`
+/ `DBR_CTRL_DOUBLE`, across `subArray` and `compress`, or with six monitors
+per connection. Array payloads are on the heap, so growing them grows
+`MEM_USED`, never the stack. It also did not move across the three
+`StackSizeClass` arms of §10.1 — class changes reservation, never usage.
+
+An earlier pass of this run appeared to show an asymmetry (`CAS-client 0`
+at 65,912 B, clients 1–3 at 12,992 B). That was a census landing mid
+round 1, before the other three connections had done the deep work; by
+`c6-24` all four had converged. Single-instance was proved with `rtpShow`
+(one RTP, 39 tasks) rather than assumed, because a second resident RTP
+sharing port 5064 would have split the readings.
+
+### 15.3 What the class costs, and what C actually does
+
+Utilisation against each class, and against C:
+
+| | bytes | `CAS-client` 65,912 B | `CAS-event` 7,120 B |
+| --- | --- | --- | --- |
+| `Small` | 524,288 | 12.57 %, 7.96× headroom | 1.36 %, 73.6× |
+| `Medium` | 1,048,576 | 6.29 %, 15.9× headroom | 0.68 %, 147× |
+| `Big` | 2,097,152 | **3.14 %, 31.8× headroom** | — |
+| C-on-VxWorks `epicsThreadStackBig` | **22,000** | **300 % — would overflow** | 32.4 % |
+
+C's two stack tables are not the same table, and this is the fact that
+settles the parity question:
+
+* POSIX (`libcom/src/osi/os/posix/osdThread.c:506-509`) —
+  `STACK_SIZE(f) = f * 0x10000 * sizeof(void *)` over `{1, 2, 4}`, i.e.
+  524,288 / 1,048,576 / 2,097,152 on 64-bit. **Byte-identical to our
+  `StackSizeClass::bytes`.**
+* VxWorks (`libcom/src/osi/os/vxWorks/osdThread.c:63-64`) —
+  `{4000, 6000, 11000} * ARCH_STACK_FACTOR`, and x86_64 takes the `#else`
+  giving `ARCH_STACK_FACTOR 2`: **8,000 / 12,000 / 22,000 B.**
+
+So `rsrv`'s `epicsThreadStackBig` for `CAS-client`
+(`caservertask.c:109-111`) is 22,000 B on this target, and our `Big` is
+**95.3×** that. But our own measured need, 65,912 B, is **3.0× C's entire
+`Big` allowance** — C's VxWorks number would overflow this port's
+`CAS-client` outright. The gap is the port's own: `park_on` pins each
+connection's async state machine onto the connection stack
+(`doc/vxworks-port.md` §7), where C's `camsgtask` keeps almost nothing.
+**"Match C's class" is therefore not available as a decision rule here;
+only the measured byte count is.**
+
+### 15.4 Judgement
+
+Against the reservation model of §10.1 — each pool thread costs its
+declared stack plus a flat ~1 MiB, against a ~248 MB reserved-address-space
+ceiling — the class is the second-biggest lever on the wall, and the
+measured walls were **47** (`Big`/`Medium`), **59** (`Medium`/`Medium`),
+**80** (`Small`/`Small`).
+
+**`Big` is not justified by anything measured.** It holds 2,031,240 B of
+untouched reservation per connection for a 65,912 B worst case that proved
+invariant under every dimension this round could vary, and it costs 2 MiB
+of a ~5.2 MiB per-connection reservation on the target where reservation is
+the binding resource. `Medium` keeps a 15.9× margin over the measured worst
+case and takes the wall from 47 to 59 concurrent clients (+25.5 %) — and
+that wall is measured for exactly that configuration (§10.1 arm B), not
+predicted.
+
+**The change is nevertheless NOT made, and the blocker is named rather than
+worked around.** `client_roster` is shared with `armv7-rtems-eabihf`, and no
+`CAS-client` stack high-water has ever been measured there — the RTEMS
+measurement doc records priorities and retention, not stack use. Shipping
+`Medium` off an `x86_64-wrs-vxworks` number would change an unmeasured
+target, and on 32-bit RTEMS `Medium` is 524,288 B, half the byte count this
+round validated. The one-line change is owed a second measurement, not a
+second opinion; it is listed in §19. What *is* fixed now is the false
+justification that would otherwise have settled this wrongly forever — the
+roster's "`Big` is the parity answer" claim (commit `fbfd2847`).
+
+`CAS-event` at 7,120 B of `Medium` is 0.68 %. `Small` would give it a 73.6×
+margin and return a further 524,288 B per connection, but the
+`Medium`-client/`Small`-event wall is unmeasured, so no wall number is
+claimed for it.
+

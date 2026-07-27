@@ -653,14 +653,84 @@ Ours inverts it: the publisher at `Low`(10) is ten levels *below*
 `CAServerLow`(20), which our own `map_epics_priority_*` carries faithfully to
 the target. Under `SCHED_FIFO` on a single CPU that is the measured 401 s.
 
-**The change.** `status_pv.rs:296` moves from `ThreadPriority::Low` to a scan
-band, behind a named constant with the guard shape `blocking.rs:2015` already
-uses, so the choice is pinned rather than re-argued. That file is
-`crates/epics-base-rs/**` and is not this panel's, so the change is handed over
-rather than made here.
+**The change.** Not three call sites moved one at a time: a single owner for
+*which role sits at which band*, so the band stops being an argument a spawn
+site can invent. See §11.6, which is the built and measured version of this
+paragraph.
 
-The two bring-up probes stay at `Low` on purpose, and not by omission: `c6-probe`
-writes an `fd_census` line per descriptor — 146 lines to a serial console at 141
-clients — and putting a write of that size above the CA server would stall
-service in a way the 1 Hz five-value push does not. They are `bringup-probes`
-measurement rigs, not the operator's view; the status PVs are.
+The two bring-up probes were expected to stay at `Low`, on the argument that
+`c6-probe` writes an `fd_census` line per descriptor — 146 lines to a serial
+console at 141 clients — where the 1 Hz five-value push does not. §11.6 keeps
+that conclusion and replaces the argument with a number.
+
+### 11.6 The band owner, and what it costs on each side
+
+`runtime::ioc_role` is the owner §11.5 said was missing. A role names itself
+(`IocRole::StatusPublisher`, `IocRole::ConsoleCensus`), `IocRole::band` is the
+one table that answers, and `enter_ioc_role` / `spawn_ioc_role` are what a
+thread calls. The three files that used to write a band literal are guarded
+against writing one at all: each asserts its own production scope contains no
+`ThreadPriority` (`status_pv.rs`, `realtime-ca-ioc.rs`, `realtime-pva-ioc.rs`),
+so the band cannot be re-argued at a creation point.
+
+The serving bands stay with their servers. They already have named constants
+and their own guards (`blocking.rs:184,197,2015` and the PVA pair), and each is
+derived from the C line that sets it; the table states the ordering against C's
+`CAServerHigh` rather than reaching across crates for theirs.
+
+**Both sides of the rule are measured.** Every run below is the same rig, guest
+and probe; VxWorks 7 on qemu, 1536 MB guest, `EPICS_RS_POOL_RESERVATION_MB=1200`,
+one serial ramp of CA clients to the pool's 141-client capacity.
+
+| image | probes | held at wall | `UPTIME` across the ramp | `CONN` at the wall |
+|---|---|---|---|---|
+| pre-fix | on | 136 | frozen `00:00:12` for 420 s | 5 |
+| both roles at `ScanLow` | on | **87** | live | 92 |
+| both roles at `ScanLow` (rerun) | on | **87** | live | 92 |
+| status only at `ScanLow` | off | 136 | live, `00:00:00`→`00:07:08` | 141 |
+| status only at `ScanLow` | on | 136 | live, `00:00:01`→`00:07:14` | 141 |
+
+Raising the status publisher costs nothing: 136 admitted either way, and the
+refusal is the same `worker pool at capacity: 141`. Raising the console census
+with it costs 36% of the ceiling, twice, the 88th client's handshake exceeding
+its 15 s timeout while the server keeps accepting — an instrument rewriting its
+own measurement. So the table answers per role: `StatusPublisher` at `ScanLow`,
+`ConsoleCensus` at `Low`, and the ordering test matches exhaustively so a new
+role has to pick a side.
+
+What the operator sees at the wall, which is the point of the exercise: pre-fix
+`CONN=5, REFUSED=0.0, UPTIME=00:00:12` while 141 clients are connected and one
+has been turned away; after, `CONN=141, REFUSED=1.0` two seconds later, holding
+for the 30 s the wall is held.
+
+**RTEMS, same rule, same order.** The two targets do not share a priority map —
+RTEMS inverts through `RTEMS_MAXIMUM_PRIORITY` and VxWorks is measured directly
+— but both land on POSIX `56 + epics`, so both are strictly increasing in the
+EPICS value, and VxWorks's own layer then inverts once more to `vx = 199 -
+epics` where smaller is more urgent. All three orderings agree, asserted in
+`the_ordering_survives_both_embedded_priority_maps`.
+
+On target: armv7 RTEMS 6 guest, 256 MB, 16 standing clients, then 60 s of
+accept churn — connect, handshake, close — which is the load that starves,
+refusal churn having been ruled out (a refused client never spawns a set, and
+both arms publish through it).
+
+| image | churn cycles in 60 s | `UPTIME` at +10/+20/+30/+40/+50 s |
+|---|---|---|
+| pre-fix | 6000 | `00:00:22` at all five — frozen 40 s |
+| after | 5979 | `00:00:23`, `00:00:33`, `00:00:42`, `00:00:53`, `01:02` |
+
+0.4% fewer accept cycles, and the operator's view stops going dark. The RTEMS
+wall itself reads correctly too: refusal at attempt 33 (`this set needs 3584
+KiB, 158 of 160 MiB already reserved`), and under sustained refusal churn
+`CA_REFUSED_CNT` tracks the client-side count within 2 at every sample —
+16/19, 33/35, 50/52, 66/68, 83/85, 100/100 — with `UPTIME` advancing 1 s/s
+throughout.
+
+**Still open.** The bring-up console reporter goes quiet under ramp load, by
+decision rather than by accident: 4 ticks in 478 s at `Low` against 9 in 116 s
+at `ScanLow`. That is the symptom e10-residue raised, and for that path it is
+not fixed — the operator's instrument on a shell-less target is the status PVs,
+and a periodic unbounded console dump cannot sit above the threads it measures.
+Bounding the census's per-tick output would let it move up; that is a change to
+what the probe prints, not to which band it takes.

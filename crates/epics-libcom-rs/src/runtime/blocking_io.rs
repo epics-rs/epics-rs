@@ -536,17 +536,43 @@ impl tokio::io::AsyncRead for ChannelReader {
     }
 }
 
-/// Blocking read loop. Ends on EOF, read error, or `SO_RCVTIMEO`; dropping `tx`
-/// on the way out is the EOF signal to the adapter.
-fn reader_pump(sock: Arc<TcpStream>, tx: mpsc::Sender<Vec<u8>>, chunk_size: usize, label: String) {
+/// Read loop. Ends on EOF, read error, or a read that outlives `read_timeout`;
+/// dropping `tx` on the way out is the EOF signal to the adapter.
+///
+/// The wait is [`wait_readable`], not the socket's own `SO_RCVTIMEO`, because
+/// the descriptor is non-blocking — see [`own_blocking_mode`] for why it has to
+/// be. `read_timeout` is the same value the option carried, applied per read
+/// exactly as the option applied it, so a connection ends on a silent peer at
+/// the same point it did before.
+fn reader_pump(
+    sock: Arc<TcpStream>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    label: String,
+    read_timeout: Option<Duration>,
+) {
     // `impl Read for &TcpStream`: one shared descriptor, no `try_clone`.
     let mut sock = &*sock;
     let mut chunk = vec![0u8; chunk_size];
     loop {
+        match wait_readable(sock, read_timeout.map(|t| Instant::now() + t)) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(label, "blocking reader: receive timeout, ending connection");
+                break;
+            }
+            Err(e) => {
+                debug!(label, error = %e, "blocking reader: wait failed");
+                break;
+            }
+        }
         let n = match sock.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Readiness that yielded nothing: back to the wait, which re-arms
+            // the same bound, so this cannot spin.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) if is_socket_timeout(e.kind()) => {
                 debug!(label, "blocking reader: receive timeout, ending connection");
                 break;
@@ -637,10 +663,32 @@ pub fn spawn_reader_pump(
     chunk_size: usize,
     queue_depth: usize,
 ) -> (ChannelReader, ReaderPumpGuard) {
+    // What the caller configured, read back rather than passed in, so this
+    // signature is unchanged: the socket already carries the read bound, and
+    // `SO_RCVTIMEO` stops being the mechanism that applies it without ceasing
+    // to be where the value lives. `None` — never set, or a target whose
+    // getter declines — polls with no deadline, which is what a socket with no
+    // `SO_RCVTIMEO` did before.
+    let read_timeout = sock_read_timeout(&sock);
+    spawn_reader_pump_with_timeout(worker, sock, label, chunk_size, queue_depth, read_timeout)
+}
+
+fn sock_read_timeout(sock: &TcpStream) -> Option<Duration> {
+    sock.read_timeout().ok().flatten()
+}
+
+fn spawn_reader_pump_with_timeout(
+    worker: Worker,
+    sock: Arc<TcpStream>,
+    label: &str,
+    chunk_size: usize,
+    queue_depth: usize,
+    read_timeout: Option<Duration>,
+) -> (ChannelReader, ReaderPumpGuard) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(queue_depth);
     let pump_sock = sock.clone();
     let pump_label = label.to_string();
-    let job = worker.run(move || reader_pump(pump_sock, tx, chunk_size, pump_label));
+    let job = worker.run(move || reader_pump(pump_sock, tx, chunk_size, pump_label, read_timeout));
     (
         ChannelReader::new(rx),
         ReaderPumpGuard {
@@ -753,11 +801,112 @@ impl tokio::io::AsyncWrite for ChannelWriter {
 #[cfg(target_os = "rtems")]
 const POLLOUT_EVENT: libc::c_short = 0x0004;
 #[cfg(target_os = "rtems")]
+const POLLIN_EVENT: libc::c_short = 0x0001;
+#[cfg(target_os = "rtems")]
 const SEND_DONTWAIT: libc::c_int = 0x0080;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const POLLOUT_EVENT: libc::c_short = libc::POLLOUT;
 #[cfg(all(unix, not(target_os = "rtems")))]
+const POLLIN_EVENT: libc::c_short = libc::POLLIN;
+#[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
+
+/// Put `sock` in non-blocking mode, so that no syscall this module issues on it
+/// can park regardless of which flags and options the target honours.
+///
+/// This module owns the descriptor's blocking mode; that ownership is what the
+/// bound is made of. Both directions are gated by a `poll` against the caller's
+/// own deadline ([`wait_readable`], [`wait_writable`]), so the mode is not a
+/// performance choice but the thing that makes "the syscall returns" true by
+/// construction instead of true wherever `MSG_DONTWAIT` or `SO_SNDTIMEO`
+/// happens to be implemented.
+///
+/// C reaches the same place the same way: `setNonBlock(fd, 1)` at connect under
+/// `USE_POLL` (`drvAsynIPPort.c:511`), with a poll on reads as well as writes.
+/// Which is also the evidence that the call is available on the embedded
+/// targets — it is `ioctl(FIONBIO)`, the one socket control C already relies on
+/// there, not one of the options VxWorks answers `ENOPROTOOPT` to.
+///
+/// Windows keeps blocking sockets and its `SO_SNDTIMEO`/`SO_RCVTIMEO`, which it
+/// does implement; the `not(unix)` arms of both waits are built on them.
+#[cfg(unix)]
+fn own_blocking_mode(sock: &TcpStream) -> io::Result<()> {
+    sock.set_nonblocking(true)
+}
+
+#[cfg(not(unix))]
+fn own_blocking_mode(_sock: &TcpStream) -> io::Result<()> {
+    Ok(())
+}
+
+/// Wait until `sock` has a byte to read or has hit EOF, or `deadline` passes.
+/// `Ok(true)` = readable, `Ok(false)` = the deadline passed with it still empty.
+/// `None` waits with no deadline, which is what an unconfigured socket did
+/// before.
+///
+/// The read-side twin of [`wait_writable`], and it exists for the same reason:
+/// with the descriptor non-blocking, a `read` cannot park, so the bound has to
+/// come from here. It replaces `SO_RCVTIMEO` as the *mechanism* while keeping
+/// it as the *value* — callers still say how long a read may take, and
+/// [`drive_socket_blocking`] still sets the option for the `not(unix)` arm.
+///
+/// `POLLHUP` also returns `Ok(true)`: the read that follows returns 0 and the
+/// pump ends on its existing EOF path, which is how a `shutdown` still wakes a
+/// waiting reader now that no `read` is parked for it to interrupt.
+#[cfg(unix)]
+fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        let ms = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int
+            }
+            None => -1,
+        };
+        let mut fds = libc::pollfd {
+            fd: sock.as_raw_fd(),
+            events: POLLIN_EVENT,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
+        // and stays open for the call; `poll` reads `fd`/`events` and writes
+        // only `revents`.
+        let rc = unsafe { libc::poll(&mut fds, 1, ms) };
+        if rc > 0 {
+            return Ok(true);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+        // `EINTR`: the remaining time is recomputed at the top, so a signal
+        // storm cannot extend the bound.
+    }
+}
+
+/// Non-Unix arm: Windows implements `SO_RCVTIMEO` and keeps a blocking socket,
+/// so the read that follows carries its own bound and this only arms it.
+#[cfg(not(unix))]
+fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool> {
+    let Some(d) = deadline else {
+        sock.set_read_timeout(None)?;
+        return Ok(true);
+    };
+    let remaining = d.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    sock.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+    Ok(true)
+}
 
 /// Wait until `sock` will accept at least one byte, or `deadline` passes.
 /// `Ok(true)` = writable, `Ok(false)` = the deadline passed with it still full.
@@ -895,10 +1044,20 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 ///
 /// # The deadline holds on every target, by construction
 ///
-/// This function owns its bound end to end. `wait_writable` does every wait,
-/// against `deadline`; `write_some` cannot park, whatever the socket's
-/// options say. Between them there is no call in this loop that can outlast
-/// `send_timeout`, and nothing a caller does or fails to do can disarm it.
+/// This function owns its bound end to end. It owns the socket's blocking mode
+/// ([`own_blocking_mode`]) so that no syscall below it can park; `wait_writable`
+/// does every wait, against `deadline`. Between them there is no call in this
+/// loop that can outlast `send_timeout`, and nothing a caller does or fails to
+/// do can disarm it.
+///
+/// Owning the mode is what makes that true rather than nearly true. `write_some`
+/// passing `MSG_DONTWAIT` is not enough on its own: XNU consults `SS_NBIO` and
+/// its internal `MSG_NBIO` and ignores the flag a caller sends, so on Darwin the
+/// send parked and the deadline was carried by whatever `SO_SNDTIMEO` the caller
+/// happened to have armed — measured, macOS CI 2026-07-27, where the case that
+/// armed none outlived a 20 s wait while its armed sibling ended on time. The
+/// flag stays, because where it is honoured it saves the loop a `poll`, but it
+/// is no longer what the guarantee rests on.
 ///
 /// It used to lean on the caller having set `SO_SNDTIMEO`, which was the only
 /// thing that returned control to this loop. That made the bound conditional on
@@ -917,6 +1076,11 @@ pub fn write_frame_deadline(
     frame: &[u8],
     send_timeout: Duration,
 ) -> io::Result<()> {
+    // Here, not at the call sites, so that no caller can be the one that forgot
+    // — including a caller that reached this socket without going through
+    // `drive_socket_blocking`. Idempotent, so the writer pump paying for it once
+    // per frame costs an `ioctl` next to the `poll` and `send` it already makes.
+    own_blocking_mode(sock)?;
     // `impl Write for &TcpStream`: rebind so `write`/`flush` have a mutable
     // place to borrow, without needing `&mut TcpStream` from the caller.
     let mut sock = sock;
@@ -1148,11 +1312,16 @@ impl Default for PumpConfig {
 /// protocol code cannot tell from a split socket, with both pump threads owned
 /// by the values returned.
 ///
-/// `SO_RCVTIMEO` is set here rather than left to the caller, and fatally: every
-/// target that runs this accepts it. There is no send-side counterpart —
-/// [`write_frame_deadline`] owns its own bound and needs no socket option, so
-/// there is nothing here for a target that implements fewer of them to switch
-/// off.
+/// The socket's blocking mode is taken over here ([`own_blocking_mode`]), and
+/// fatally: it is what makes both pumps' bounds hold by construction rather
+/// than wherever a flag or option is honoured, so a target that refused it
+/// would be a target this seam cannot bound, and that is worth a failed dial
+/// rather than a silent park. `SO_RCVTIMEO` is still set, also fatally, but as
+/// the *value* the reader's wait uses and as the mechanism on the `not(unix)`
+/// arm; on unix the wait is [`wait_readable`]. There is no send-side
+/// counterpart: [`write_frame_deadline`] owns its own bound and needs no socket
+/// option, so there is nothing here for a target that implements fewer of them
+/// to switch off.
 ///
 /// # The pool, and the two bands it carries
 ///
@@ -1174,6 +1343,8 @@ pub fn drive_socket_blocking(
     config: &PumpConfig,
 ) -> io::Result<(GuardedReader, GuardedWriter)> {
     let _ = stream.set_nodelay(true);
+    // The mode both pumps' bounds are built on, fatal: see this function's docs.
+    own_blocking_mode(&stream)?;
     // SO_RCVTIMEO, fatal: every target that runs this accepts it.
     stream.set_read_timeout(Some(config.read_timeout))?;
     // No SO_SNDTIMEO, on purpose. It was set here once, and it was the send
@@ -1195,12 +1366,16 @@ pub fn drive_socket_blocking(
     // the module docs for why this is not `try_clone`.
     let stream = Arc::new(stream);
 
-    let (reader, reader_guard) = spawn_reader_pump(
+    // The configured value directly, not read back off the socket: this is the
+    // path that knows it, and it should not depend on the target implementing
+    // the `SO_RCVTIMEO` *getter* as well as the setter.
+    let (reader, reader_guard) = spawn_reader_pump_with_timeout(
         reader_worker,
         stream.clone(),
         label,
         config.chunk_size,
         config.queue_depth,
+        Some(config.read_timeout),
     );
     let (writer, writer_guard) = spawn_writer_pump(
         writer_worker,
@@ -1507,13 +1682,12 @@ mod tests {
     /// `recv`, because the failure being excluded is a park with no end: a
     /// direct call would hang the test rather than fail it.
     ///
-    /// Not Darwin: this is the one case [`write_some`] cannot carry there,
-    /// because `MSG_DONTWAIT` does not make an XNU send non-blocking. The
-    /// exclusion records a defect rather than a platform's licence — see that
-    /// function's "Known gap" and `doc/darwin-send-dontwait-gap.md`. The
-    /// sibling case above still runs on macOS and covers the same deadline
-    /// with the option armed.
-    #[cfg(all(unix, not(target_vendor = "apple")))]
+    /// Runs on Darwin too, which is the point of it. `MSG_DONTWAIT` does not
+    /// make an XNU send non-blocking, so while the flag was the only thing
+    /// keeping the send out of a park this case was the one that failed there;
+    /// it passes because [`own_blocking_mode`] no longer leaves the guarantee
+    /// to the flag.
+    #[cfg(unix)]
     #[test]
     fn the_deadline_holds_with_no_socket_send_timeout() {
         let (client, server) = socket_pair();

@@ -133,6 +133,30 @@ pub fn tcp_connect(
     sys::tcp_connect(remote, local, opts, timeout)
 }
 
+/// Enable `SO_KEEPALIVE` on an already-accepted TCP connection.
+///
+/// The one option here applied *after* the socket exists rather than before it
+/// binds: a server does not construct the sockets it serves, it accepts them.
+/// It still belongs here, because "reach `setsockopt` without `socket2` on the
+/// embedded triples" is the whole reason this module exists, and a keepalive
+/// setter written at a call site would be the third hand-rolled copy of that
+/// twenty lines (`epics-tools-rs::procserv::client::set_keepalive` is the
+/// second).
+///
+/// The error is returned, not swallowed. C treats this option as required —
+/// `create_client` calls `destroy_client` and refuses the connection when it
+/// fails (`caservertask.c:1456`) — so the caller gets to make C's decision.
+///
+/// Only the flag is set, which is all C sets. The idle/probe tuning the hosted
+/// CA driver adds through `socket2` (`epics-ca-rs::server::tcp`, 15 s + 5 s) is
+/// deliberately not reproduced: `TCP_KEEPIDLE` is a Linux spelling, BSD-derived
+/// stacks call it `TCP_KEEPALIVE`, and neither has been measured on RTEMS or
+/// VxWorks. A target's default idle is therefore what applies here, as it is in
+/// C.
+pub fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
+    sys::enable_keepalive(sock)
+}
+
 #[cfg(not(epics_embedded_target))]
 mod sys {
     //! Hosted: `socket2` already owns the pre-bind option surface and its
@@ -235,6 +259,10 @@ mod sys {
                 Err(_) => Err(e),
             },
         }
+    }
+
+    pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
+        socket2::SockRef::from(sock).set_keepalive(true)
     }
 }
 
@@ -435,6 +463,11 @@ mod sys {
         Ok(unsafe { TcpStream::from_raw_fd(owned.into_raw()) })
     }
 
+    pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        set_bool_opt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE)
+    }
+
     /// RTEMS: plain blocking connect, no deadline.
     ///
     /// C parity, not a shortcut: `__rtems__` selects `USE_SOCKTIMEOUT`
@@ -541,6 +574,53 @@ mod tests {
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// Read the flag back off the socket, because "the call returned `Ok`" and
+    /// "the option is on" are different claims — C checks the `setsockopt`
+    /// status and this checks the state that status is supposed to mean.
+    #[cfg(unix)]
+    #[test]
+    fn enable_keepalive_actually_sets_so_keepalive() {
+        use std::os::fd::AsRawFd;
+
+        let listener = tcp_listener(localhost(0), SocketOptions::REUSE_ADDRESS, 4).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(localhost(port)).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+
+        let mut before: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `accepted` owns a live socket for the borrow; `before`/`len`
+        // are sized as SO_KEEPALIVE's `c_int` optval expects.
+        let rc = unsafe {
+            libc::getsockopt(
+                accepted.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of_mut!(before).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed: {}", io::Error::last_os_error());
+        assert_eq!(before, 0, "the fixture must start with the option off");
+
+        enable_keepalive(&accepted).expect("SO_KEEPALIVE");
+
+        let mut after: libc::c_int = 0;
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::getsockopt(
+                accepted.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of_mut!(after).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed: {}", io::Error::last_os_error());
+        assert_ne!(after, 0, "SO_KEEPALIVE not enabled");
+        drop(client);
     }
 
     #[test]

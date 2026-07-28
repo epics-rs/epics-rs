@@ -88,6 +88,33 @@ impl SearchUdpSocket {
         sys::Sock::bind_ephemeral(broadcast, pump_name, pump_priority).map(Self)
     }
 
+    /// Bind a **beacon listener** on a fixed port, alongside whatever server
+    /// already holds it.
+    ///
+    /// Separate constructor rather than a port argument on
+    /// [`Self::bind_ephemeral`], because the two differ in more than the port:
+    /// a listener on a well-known port must share it (`SO_REUSEADDR` +
+    /// `SO_REUSEPORT`), and it is the only shape that has multicast groups to
+    /// join afterwards. pvxs binds this one wildcard
+    /// (`udp_collector.cpp:140`) so multicast reaches it, and receives
+    /// multicast only for groups explicitly joined via
+    /// [`Self::join_multicast_v4`].
+    pub fn bind_beacon(
+        port: u16,
+        pump_name: &str,
+        pump_priority: crate::runtime::task::ThreadPriority,
+    ) -> io::Result<Self> {
+        sys::Sock::bind_beacon(port, pump_name, pump_priority).map(Self)
+    }
+
+    /// Join an IPv4 multicast group on `iface` (`IP_ADD_MEMBERSHIP`).
+    ///
+    /// `iface` is `0.0.0.0` to let the routing table choose, which is what a
+    /// single wildcard socket has to do.
+    pub fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+        self.0.join_multicast_v4(group, iface)
+    }
+
     /// `SO_RCVBUF`. Best-effort on every platform: a kernel is free to clamp.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         self.0.set_recv_buffer_size(size)
@@ -150,6 +177,33 @@ mod sys {
             // No pump: the reactor is the pump.
             let _ = (pump_name, pump_priority);
             AsyncUdpV4::bind(0, broadcast).map(Self)
+        }
+
+        pub(super) fn bind_beacon(
+            port: u16,
+            pump_name: &str,
+            pump_priority: crate::runtime::task::ThreadPriority,
+        ) -> io::Result<Self> {
+            let _ = (pump_name, pump_priority);
+            // Skips the loopback NIC, which the bundle can do and one wildcard
+            // socket cannot: a local PVA server's UDP responder already holds
+            // `127.0.0.1:<port>` with `SO_REUSEPORT`, and a co-bound client
+            // listener there would take half its inbound SEARCHes through the
+            // kernel's REUSEPORT balancing. Beacons arrive on NIC subnet
+            // broadcasts, never on the loopback address, so nothing is lost.
+            AsyncUdpV4::bind_non_loopback(port, true).map(Self)
+        }
+
+        pub(super) fn join_multicast_v4(
+            &self,
+            group: std::net::Ipv4Addr,
+            iface: std::net::Ipv4Addr,
+        ) -> io::Result<()> {
+            if iface.is_unspecified() {
+                self.0.join_multicast_v4(group)
+            } else {
+                self.0.join_multicast_v4_on(group, iface)
+            }
         }
 
         pub(super) fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
@@ -218,6 +272,9 @@ mod sys {
         rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
         /// Set by `Drop`; the pump observes it between `recv_from` calls.
         stop: Arc<AtomicBool>,
+        /// The pump thread, joined by `Drop`. `Option` only so `Drop` can
+        /// `take` it; it is `Some` for the whole life of a constructed `Sock`.
+        pump: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Sock {
@@ -226,11 +283,40 @@ mod sys {
             pump_name: &str,
             pump_priority: ThreadPriority,
         ) -> io::Result<Self> {
-            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?);
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
             if broadcast {
                 socket.set_broadcast(true)?;
             }
+            Self::with_pump(socket, pump_name, pump_priority)
+        }
+
+        pub(super) fn bind_beacon(
+            port: u16,
+            pump_name: &str,
+            pump_priority: ThreadPriority,
+        ) -> io::Result<Self> {
+            // Wildcard, which is what pvxs binds (`udp_collector.cpp:140`) so
+            // that joined multicast groups reach it. The host arm skips the
+            // loopback NIC instead; one socket cannot, and on a target with a
+            // single non-loopback NIC there is nothing to skip.
+            let socket = bind_shared_port(port)?;
+            socket.set_broadcast(true)?;
+            Self::with_pump(socket, pump_name, pump_priority)
+        }
+
+        pub(super) fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+            self.socket.join_multicast_v4(&group, &iface)
+        }
+
+        /// The half both constructors share: give the socket its stop-poll
+        /// cadence and start the one thread that reads it.
+        fn with_pump(
+            socket: UdpSocket,
+            pump_name: &str,
+            pump_priority: ThreadPriority,
+        ) -> io::Result<Self> {
             socket.set_read_timeout(Some(PUMP_WAKE_INTERVAL))?;
+            let socket = Arc::new(socket);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let stop = Arc::new(AtomicBool::new(false));
@@ -240,8 +326,9 @@ mod sys {
             // (`udpiiu.cpp:129`). Ours does strictly less than C's CAC-UDP —
             // it copies bytes to a channel where C runs the whole response
             // callback on this stack — but there is one such thread per
-            // process, so matching C costs nothing worth deviating for.
-            spawn_dedicated_thread(
+            // socket and a client holds at most two, so matching C costs
+            // nothing worth deviating for.
+            let pump = spawn_dedicated_thread(
                 pump_name.to_string(),
                 pump_priority,
                 StackSizeClass::Medium,
@@ -252,6 +339,7 @@ mod sys {
                 socket,
                 rx: tokio::sync::Mutex::new(rx),
                 stop,
+                pump: Some(pump),
             })
         }
 
@@ -362,15 +450,29 @@ mod sys {
     }
 
     impl Drop for Sock {
-        /// Ask the pump to stop. It exits within [`PUMP_WAKE_INTERVAL`] and
-        /// releases the last `Arc<UdpSocket>` as it does.
+        /// Stop the pump and **wait for it**, so that the socket is closed
+        /// before `drop` returns.
         ///
-        /// Not joined: `Drop` runs on the engine's worker, and blocking it for
-        /// up to one wake interval to reclaim a thread that is already leaving
-        /// trades a certain stall for no gain. The exit is unconditional — it
-        /// is the pump loop's own condition, not a later cleanup step.
+        /// # Invariant
+        ///
+        /// **A dropped `SearchUdpSocket` MUST hold no port.** The pump shares
+        /// ownership of the socket (`Arc`), so the fd outlives this `drop` by
+        /// however long the pump takes to notice the stop flag unless `drop`
+        /// waits — and a caller that drops one SEARCH socket and binds the
+        /// same port again then loses the race with its own teardown. Joining
+        /// here makes the release happen by construction rather than
+        /// eventually.
+        ///
+        /// The wait is bounded by [`PUMP_WAKE_INTERVAL`]: the socket carries
+        /// that as its read timeout, so the pump re-reads the flag at least
+        /// that often. There is no cheaper wake — `shutdown(2)` on an
+        /// unconnected `SOCK_DGRAM` reports `ENOTCONN` on Linux and does not
+        /// interrupt the blocked `recvfrom`.
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            if let Some(pump) = self.pump.take() {
+                let _ = pump.join();
+            }
         }
     }
 
@@ -431,6 +533,54 @@ mod sys {
         pub(super) const SO_RCVBUF: libc::c_int = libc::SO_RCVBUF;
         pub(super) const IPPROTO_IP: libc::c_int = libc::IPPROTO_IP;
         pub(super) const IP_MULTICAST_TTL: libc::c_int = libc::IP_MULTICAST_TTL;
+    }
+
+    /// Bind the wildcard address on a well-known port that a server on this
+    /// host already holds.
+    ///
+    /// Hand-rolled because `SO_REUSEADDR`/`SO_REUSEPORT` have to be set
+    /// *before* the bind and `std::net::UdpSocket::bind` binds as it
+    /// constructs. Same sequence, and the same reason, as the blocking CA
+    /// server's `bind_udp_search_socket`.
+    #[cfg(unix)]
+    fn bind_shared_port(port: u16) -> io::Result<UdpSocket> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `socket()` returns a fresh owned fd or -1.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Owned immediately, so every early return below closes it via `Drop`.
+        // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
+        let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+        // Zeroed rather than field-by-field: `sin_len` exists on the BSD
+        // targets and not on Linux, and all-zero is valid for both.
+        // SAFETY: `sockaddr_in` is plain-old-data.
+        let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_port = port.to_be();
+        // SAFETY: `sin` is fully initialized and the length is exact.
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                std::ptr::addr_of!(sin).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(socket)
+    }
+
+    #[cfg(not(unix))]
+    fn bind_shared_port(_port: u16) -> io::Result<UdpSocket> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "port-sharing bind on a non-Unix exec-backend socket",
+        ))
     }
 
     #[cfg(unix)]
@@ -501,6 +651,31 @@ mod tests {
         for a in &addrs {
             assert_ne!(a.port(), 0, "ephemeral bind assigns a real port: {a}");
         }
+    }
+
+    /// A fixed-port beacon listener binds and reports that port, on either
+    /// arm — the property the PVA client's optional beacon socket needs, and
+    /// the one the exec arm's hand-rolled `SO_REUSEPORT` bind exists for.
+    #[epics_macros_rs::epics_test]
+    async fn beacon_binds_the_port_it_was_given() {
+        // Ephemeral first, only to learn a port nothing else on this machine
+        // holds; dropped before the beacon claims it.
+        let port = {
+            let probe = bind();
+            probe
+                .local_addrs()
+                .iter()
+                .find(|a| a.is_ipv4())
+                .expect("an IPv4 SEARCH address")
+                .port()
+        };
+        let beacon = SearchUdpSocket::bind_beacon(port, "test-BEACON", ThreadPriority::Medium)
+            .expect("beacon bind");
+        assert!(
+            beacon.local_addrs().iter().any(|a| a.port() == port),
+            "a beacon listener must bind the port it was given; got {:?}",
+            beacon.local_addrs()
+        );
     }
 
     /// Round-trip one datagram through the arm this build selected — the

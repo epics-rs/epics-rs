@@ -797,6 +797,12 @@ Which means: for CA, UDP search is deferred in §6 because it is *not needed for
 a record link*, not because it is *blocked*. That is a weaker reason, and the
 plan should say so rather than borrowing PVA's stronger one.
 
+> **DELIVERED 2026-07-28.** The CA client binds its SEARCH socket on every
+> backend through `epics_base_rs::net::search_udp::SearchUdpSocket`, at
+> libca's own `CAC-UDP` band (`udpiiu.cpp:128-132`). Measured on target:
+> `UDPSEARCH reply n=40 src=10.0.2.15:5064`. The analysis above is why it
+> was cheap; §6's ordering is unchanged.
+
 ### 4.5 What the target actually needs
 
 For stage C5's on-target gate, the guest IOC needs exactly:

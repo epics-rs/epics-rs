@@ -41,11 +41,18 @@
 //! *do* ship `getifaddrs`; C's selection predates that rather than reflecting
 //! it. Measured headers, not assumed:
 //!
-//! | target | header | `getifaddrs` |
-//! |---|---|---|
-//! | RTEMS 5 | `arm-rtems5/<bsp>/lib/include/ifaddrs.h` | declared |
-//! | RTEMS 7 | `arm-rtems7/<bsp>/lib/include/ifaddrs.h` | declared |
-//! | VxWorks 7 | `vxsdk/sysroot/usr/h/public/net/ifaddrs.h` | declared |
+//! | target | header | declared | defined in |
+//! |---|---|---|---|
+//! | **RTEMS 6** (`armv7-rtems-eabihf`) | `arm-rtems6/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
+//! | RTEMS 5 | `arm-rtems5/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
+//! | RTEMS 7 | `arm-rtems7/<bsp>/lib/include/ifaddrs.h` | yes | `libbsd.a` |
+//! | **VxWorks 7** (`*-wrs-vxworks`) | `vxsdk/sysroot/usr/h/public/net/ifaddrs.h` | yes | `libnet.a` |
+//!
+//! The two bold rows are the triples this workspace builds; the RTEMS 5 and 7
+//! rows are there because the struct is unchanged across all three, so an RTEMS
+//! version bump is not a layout risk. "defined in" is `nm --defined-only`, not
+//! the header — a declaration the image cannot link is what a `cargo check`
+//! gate would have missed.
 //!
 //! Taking it avoids re-deriving the BSD `_IOWR` request encoding — on VxWorks
 //! that is a *different* encoding again (`VX_IOWR`, `net/ioctl.h`), so the

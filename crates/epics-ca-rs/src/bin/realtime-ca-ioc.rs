@@ -566,6 +566,52 @@ mod ioc {
         epics_rtems_boot::stats::stack_report(tag);
     }
 
+    /// PROBE: what `getifaddrs` reports on this target, and the UDP SEARCH
+    /// destination list derived from it.
+    ///
+    /// The gate gives `net::iface_v4` a compile for both embedded triples and
+    /// `nm` gives it a defined `getifaddrs` in `libbsd.a` / `libnet.a`, but
+    /// neither says the call returns an interface once the BSP's stack is up:
+    /// an RTEMS image whose libbsd has no configured `ifconfig` would return
+    /// success and an empty list, and `EPICS_CA_AUTO_ADDR_LIST` would expand to
+    /// nothing exactly as it did before the enumeration existed — a silent
+    /// no-op wearing a working build's clothes. This is the line that tells the
+    /// two apart, so it prints the raw walk and not only the derived list.
+    ///
+    /// Before the search-configuration defaults below, so it reports what the
+    /// OS has rather than what this image then decides to do with it.
+    #[cfg(feature = "bringup-probes")]
+    fn iface_report() {
+        match epics_base_rs::net::iface_v4::enumerate() {
+            Ok(ifaces) => {
+                for i in &ifaces {
+                    println!(
+                        "IFPROBE name={} ip={} flags=0x{:x} up={} lo={} bc={} p2p={} dest={:?} search={:?}",
+                        i.name,
+                        i.ip,
+                        i.flags,
+                        i.is_up() as u8,
+                        i.is_loopback() as u8,
+                        i.is_broadcast() as u8,
+                        i.is_point_to_point() as u8,
+                        i.dest,
+                        i.search_destination()
+                    );
+                }
+                println!(
+                    "IFPROBE count={} broadcast_addrs={:?} local_addr={}",
+                    ifaces.len(),
+                    epics_base_rs::net::iface_v4::broadcast_addrs(),
+                    epics_base_rs::net::iface_v4::local_addr()
+                );
+            }
+            // Printed, not panicked: an image that cannot enumerate is still a
+            // working IOC for every explicitly configured destination, and the
+            // whole point of the probe is to report the difference.
+            Err(e) => println!("IFPROBE error={e}"),
+        }
+    }
+
     /// C6 PROBE: one console report — the link registry, the shared
     /// client's circuit count, and every record the gate reads.
     ///
@@ -817,6 +863,11 @@ mod ioc {
         //     No `#[cfg]`: the funnel is portable and every backend but
         //     VxWorks' takes this as a no-op.
         epics_rtems_boot::stats::register_task();
+
+        // (0-iface) PROBE: what the OS's interface enumeration returns, before
+        //     anything in this image decides what to do with it.
+        #[cfg(feature = "bringup-probes")]
+        iface_report();
 
         // (0-probe) C6 PROBE: the target's CA search configuration.
         // `rtems_init.c:195` hands `main` a fixed one-element argv and

@@ -593,7 +593,7 @@ log "VxWorks gate (toolchain $TOOLCHAIN): every crate and target binary compiles
 log "for $TARGET, in the portability configuration — which is the only"
 log "configuration this target has, permanently: there is no C of ours to link,"
 log "so there is no image-closure cfg for a second one to name."
-log "PVA client (--features client): $VXWORKS_PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
+log "PVA client (--features client): $VXWORKS_PVA_CLIENT_TARGET_ERRORS target errors (v4 UDP transport compiled in; only the IPv6 half is absent)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."
 # Repeated at the end, not only at the top: a green summary is what gets pasted
 # into a report, and it must say which resolution the rows measured — the

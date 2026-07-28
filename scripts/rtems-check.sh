@@ -478,17 +478,19 @@ fi
 #     29  after stages 1 and 2  cascade gone with search_engine's TcpStream
 #     28  after server_conn's unconditional tokio::net import was removed
 #      0  after stage 4         UDP transport cfg-gated out of the target build
+#      0  after the v4 SEARCH socket landed — transport compiled IN, still 0
 #
-# Stage 4 closed the remaining 28 (§5): the whole UDP SEARCH/beacon transport —
-# `client_native::udp`, the legacy `client_native::search`, and every UDP-only
-# item in `search_engine.rs` (the `SearchTransport::Udp` variant, `UdpTransport`
-# and its `bind_udp`/broadcast, the bind/join/fanout helpers, `SearchTarget`) —
-# is `#[cfg(not(target_os = "rtems"))]`. On the target `SearchTransport` has the
-# single `NameServersOnly` variant, so "no UDP socket" is a fact about the type
-# rather than a runtime branch, and the three UDP-config spawn entry points
-# construct `NameServersOnly` through `env_transport`/`config_transport`. This is
-# what lets the `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink` bin
-# above pull `epics-pva-rs/client` and still compile for the target.
+# Stage 4 closed the remaining 28 (§5) by gating the whole UDP SEARCH/beacon
+# transport out of the target build. The v4 half is now compiled back IN and the
+# count is still zero: `search_engine.rs` binds through `SearchUdpSocket`, whose
+# `exec_backend` arm is one `std::net::UdpSocket` plus a receive-pump thread, and
+# `config::env`'s interface enumeration goes through
+# `epics_base_rs::net::iface_v4` instead of `if-addrs`. What stays absent is the
+# IPv6 half alone: `V6Socket` is an uninhabited enum there, so `socket2` and
+# `tokio::net` leave the target's compiled unit entirely — which is what keeps
+# this number at zero while the `epics-bridge-rs:realtime-pva-ioc --features
+# qsrv-core,pvalink` bin above pulls `epics-pva-rs/client` and still compiles
+# for the target.
 #
 # The count stays pinned even at zero: a probe that regressed the client back
 # off the target would raise it, and this comparison is what turns that into a
@@ -586,5 +588,5 @@ else
     log "crate and target binary compiles for the generated native-TLS spec, in"
     log "both the portability and the image configuration."
 fi
-log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
+log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (v4 UDP transport compiled in; only the IPv6 half is absent)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

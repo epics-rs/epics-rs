@@ -395,9 +395,11 @@ The script's whole matrix: six libs — `epics-libcom-rs`, `epics-base-rs`,
 `epics-bridge-rs` (`qsrv-core,pvalink`) — both bins with and without
 `bringup-probes`, and the ratchet row `epics-pva-rs --features client`, whose
 extracted count is **0 target errors**. That is the same zero the RTEMS gate
-reports, for the same reason (UDP search gated out, so `SearchTransport` has
-its single `NameServersOnly` variant) but through `epics_embedded_target`
-rather than `cfg(target_os = "rtems")`.
+reports, for the same reason (at the time of this run, UDP search gated out, so
+`SearchTransport` had its single `NameServersOnly` variant) but through
+`epics_embedded_target` rather than `cfg(target_os = "rtems")`. The zero has
+since survived the v4 SEARCH transport being compiled back **in** on both
+targets — see [§5.6](#56-udp-search-on-target).
 
 Run under shape 3 of §1.2 — stock `nightly` plus an explicit
 `VXWORKS_CARGO_CONFIG` patch pointing at the bring-up checkout (content now
@@ -622,6 +624,61 @@ the TLS spec of `doc/rtems-tls-spec-deviation.md`
 cargo +nightly build --target "$TGT" -Zbuild-std=std,panic_abort -Zjson-target-spec --release --config 'profile.release.strip="symbols"' --config 'profile.release.lto="fat"' --config profile.release.codegen-units=1 -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
 # Row5 fat+cgu1 PVA  (same configs) -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
 ```
+
+### 5.6 UDP search on target
+
+Measured 2026-07-28, after the v4 SEARCH transport was compiled back in on
+both embedded targets. The subject is `epics_base_rs::net::search_udp::
+SearchUdpSocket`'s `exec_backend` arm, whose two portability risks here were
+never anything but compiled: `SO_RCVTIMEO` on the pump — this target refuses
+`SO_SNDTIMEO` with `ENOPROTOOPT` (§7), which is reason enough to doubt any
+timeout sockopt — and the raw-`libc` `SO_REUSEADDR`/`SO_REUSEPORT` bind the
+beacon shape needs.
+
+An RTP that binds the socket and nothing else, `x86_64-wrs-vxworks` release,
+1,736,544 B, on the §6 rig at 1024M:
+
+```
+-> VXUDP start exec_backend=true
+VXUDP ifaces local=10.0.2.15 broadcast=[10.255.255.255]
+VXUDP iface name=gei0 ip=10.0.2.15 up=true lo=false bcast=true search=Some(10.255.255.255)
+VXUDP iface name=lo0 ip=127.0.0.1 up=true lo=true bcast=false search=None
+VXUDP bound=[0.0.0.0:55599]
+VXUDP roundtrip sent=12 recv=12 src=127.0.0.1:55599 text=SEARCH-PROBE
+VXUDP fanout broadcast sends=1
+VXUDP beacon bound=[0.0.0.0:55600]
+VXUDP rebind_after_drop ok=[0.0.0.0:55600]
+VXUDP droptest ephemeral=59084
+VXUDP droptest reclaimed=[0.0.0.0:59084] same_port=true
+```
+
+Seven facts, each one an arm that had only been type-checked before:
+
+* **`exec_backend=true`** — the executor arm is what ran, by target predicate,
+  with `rtems-exec-model` absent (§2.1).
+* **Interface enumeration works.** `iface_v4` reads `gei0` and `lo0` off this
+  stack, and `search_destination()` gives the directed broadcast for `gei0` and
+  `None` for loopback — C's `osdNetIfAddrs.c:130-151` rule, on a BSD stack that
+  is not the one it was written against.
+* **`local_addrs()` reads back.** The RTEMS `sin_len` defect
+  (`doc/rtems-libc-sockaddr-len-bug.md`) has no counterpart here; the socket
+  can advertise the `response_port` a SEARCH frame carries.
+* **`SO_RCVTIMEO` is accepted.** The pump's `set_read_timeout` is fatal by
+  design and did not fire.
+* **The pump delivers.** `sent=12 recv=12` is a datagram through the pump
+  thread and its channel, not through a reactor.
+* **`fanout_to` expands the limited broadcast to one eligible NIC** — `gei0`,
+  loopback excluded.
+* **`Drop` releases the port synchronously.** An ephemeral socket sets no
+  `SO_REUSEPORT`, so a beacon can only take port 59084 back once `Drop` has
+  joined the pump thread that co-owns it. This is the on-target shape of the
+  host regression `beacon_binds_the_port_it_was_given`. The beacon→beacon
+  rebind on the line above proves less, since both set `SO_REUSEPORT`.
+
+No `FAIL` line, no ED&R entry, no exception. Rig: `~/vx-udps` on `gv100`,
+ports 51634/55164/55175, ftpd 2261, passive 60050-60055, console socket
+`/tmp/vxcon-udps.sock` — a port-shifted copy of §6, because that box also runs
+two long-lived RTEMS guests that must survive.
 
 ---
 

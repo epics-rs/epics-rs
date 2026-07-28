@@ -129,9 +129,16 @@ mod cap_parse_tests {
 /// Per-socket send timeout. Without this, a client that stops
 /// reading (frozen GUI, dead viewer holding the socket open) causes
 /// every server `write` to block once the kernel send buffer fills,
-/// stalling the whole per-client dispatcher task. C rsrv defaults
-/// SO_SNDTIMEO to 5 s; we honour the same default and let
-/// `EPICS_CAS_SEND_TMO` override.
+/// stalling the whole per-client dispatcher task.
+///
+/// **This has no C counterpart.** `SO_SNDTIMEO` appears nowhere in epics-base,
+/// and rsrv's `create_client` sets only `TCP_NODELAY`, `SO_KEEPALIVE`,
+/// `SO_SNDBUF` and `SO_RCVBUF` (`caservertask.c:1444-1483`); `cas_send_bs_msg`
+/// then loops on a blocking `send()` under `SEND_LOCK` with no bound at all
+/// (`caserverio.c:43`), and it is the keepalive probe that eventually ends such
+/// a client. So the 5 s here is this port's own choice and
+/// `EPICS_CAS_SEND_TMO` its own knob — [`crate::estdlib`] classifies it as
+/// exactly that, a variable outside C's `ENV_PARAM` table.
 #[cfg(not(epics_embedded_target))]
 fn send_timeout() -> Duration {
     static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -1465,9 +1472,10 @@ async fn accept_loop(
                 .with_interval(Duration::from_secs(5));
             let _ = sock.set_keepalive(true);
             let _ = sock.set_tcp_keepalive(&keepalive);
-            // SO_SNDTIMEO is set as a defence-in-depth (matches C
-            // rsrv default 5s, configurable via EPICS_CAS_SEND_TMO),
-            // but on a non-blocking tokio socket the kernel does NOT
+            // SO_SNDTIMEO is set as a defence-in-depth — this port's own
+            // 5 s, not C's; rsrv sets no send timeout anywhere (see
+            // `send_timeout`) — but on a non-blocking tokio socket the
+            // kernel does NOT
             // apply it — a stuck client where the kernel send buffer
             // fills would still leave `poll_write` Pending forever.
             // The actual stall guard is the `tokio::time::timeout`

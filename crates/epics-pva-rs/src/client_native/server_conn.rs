@@ -230,7 +230,7 @@ pub(crate) type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// circuit (`tcpiiu.cpp:677-682`); pvxs derives one, and passing it twice is
 /// how this side states that its two pumps are one band by intent rather than
 /// by an API that could not express the difference.
-const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+pub(super) const PVA_CLIENT_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
     epics_base_rs::runtime::task::ThreadPriority::Custom(18);
 
 /// Every TCP dial this client makes, on a bounded set of permanent threads.

@@ -65,7 +65,7 @@ async fn send_with_fanout(
         SocketAddr::V6(_) => false,
     };
     let result = if needs_fanout {
-        socket.fanout_to(buf, addr).await.map(|_| ())
+        socket.fanout_to(buf, addr, &[]).await.map(|_| ())
     } else {
         socket.send_to(buf, addr).await.map(|_| ())
     };

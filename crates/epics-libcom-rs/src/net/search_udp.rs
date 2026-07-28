@@ -151,9 +151,22 @@ impl SearchUdpSocket {
     /// limited broadcast `255.255.255.255` and for multicast groups, which a
     /// single socket would otherwise emit on one interface only.
     ///
+    /// `ifaces` is the operator's egress constraint (`EPICS_PVA_INTF_ADDR_LIST`,
+    /// pvxs `expandAddrList` over `Config::interfaces`); empty means every
+    /// eligible interface, which is the default. It is one parameter rather
+    /// than a second `fanout_on_interfaces` entry point because "which
+    /// interfaces may this leave through" is one question with a default
+    /// answer, and two functions let a caller ask it on one path and forget it
+    /// on the other.
+    ///
     /// Returns how many sends succeeded; errors only when none did.
-    pub async fn fanout_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
-        self.0.fanout_to(buf, dest).await
+    pub async fn fanout_to(
+        &self,
+        buf: &[u8],
+        dest: SocketAddr,
+        ifaces: &[Ipv4Addr],
+    ) -> io::Result<usize> {
+        self.0.fanout_to(buf, dest, ifaces).await
     }
 }
 
@@ -176,7 +189,14 @@ mod sys {
         ) -> io::Result<Self> {
             // No pump: the reactor is the pump.
             let _ = (pump_name, pump_priority);
-            AsyncUdpV4::bind(0, broadcast).map(Self)
+            // *Same* ephemeral port on every NIC, not a port per NIC. A PVA
+            // SEARCH advertises the port its reply must be sent to
+            // (`response_port`, pvxs `udp_collector.cpp:380`), and a server
+            // reached over NIC B would answer a port that only NIC A holds.
+            // The exec arm has one port by construction; binding the bundle
+            // this way makes `local_addrs().first()` a fact about the socket
+            // on both arms rather than about which NIC happens to be first.
+            AsyncUdpV4::bind_ephemeral_same_port(broadcast).map(Self)
         }
 
         pub(super) fn bind_beacon(
@@ -236,8 +256,38 @@ mod sys {
             self.0.send_to(buf, dest).await
         }
 
-        pub(super) async fn fanout_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
-            self.0.fanout_to(buf, dest).await
+        pub(super) async fn fanout_to(
+            &self,
+            buf: &[u8],
+            dest: SocketAddr,
+            ifaces: &[std::net::Ipv4Addr],
+        ) -> io::Result<usize> {
+            if ifaces.is_empty() {
+                return self.0.fanout_to(buf, dest).await;
+            }
+            let mut ok = 0usize;
+            let mut last_err: Option<io::Error> = None;
+            for ip in ifaces {
+                // Loopback carries no broadcast, and a constrained list that
+                // names only loopback yields no destination at all — which is
+                // the operator asking for nothing to leave the host.
+                if ip.is_loopback() {
+                    continue;
+                }
+                match self.0.send_via(buf, dest, *ip).await {
+                    Ok(_) => ok += 1,
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if ok == 0 {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "SEARCH fanout: no listed interface available",
+                    )
+                }));
+            }
+            Ok(ok)
         }
     }
 }
@@ -400,21 +450,26 @@ mod sys {
             self.socket.send_to(buf, dest)
         }
 
-        pub(super) async fn fanout_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+        pub(super) async fn fanout_to(
+            &self,
+            buf: &[u8],
+            dest: SocketAddr,
+            ifaces: &[Ipv4Addr],
+        ) -> io::Result<usize> {
             // One socket cannot pick its egress NIC by binding, so the
             // destination does it: each interface's own directed broadcast
             // leaves via that interface by ordinary routing. This is what
             // libca sends to in the first place — `EPICS_CA_AUTO_ADDR_LIST`
             // is exactly this list — so the expansion is C's own, not a
-            // substitute for one.
+            // substitute for one. `ifaces` narrows which interfaces
+            // contribute, the same constraint the host arm applies by
+            // choosing which NIC's socket transmits.
             let port = dest.port();
             let dests: Vec<SocketAddr> = match dest {
-                SocketAddr::V4(v4) if v4.ip().is_broadcast() => {
-                    crate::net::iface_v4::broadcast_addrs()
-                        .into_iter()
-                        .map(|ip| SocketAddr::from((ip, port)))
-                        .collect()
-                }
+                SocketAddr::V4(v4) if v4.ip().is_broadcast() => eligible_broadcast_addrs(ifaces)
+                    .into_iter()
+                    .map(|ip| SocketAddr::from((ip, port)))
+                    .collect(),
                 // A multicast group has no per-interface rewrite: the group
                 // address *is* the destination on every NIC, and one socket
                 // emits on the routing table's choice. Sending it once is all
@@ -474,6 +529,34 @@ mod sys {
                 let _ = pump.join();
             }
         }
+    }
+
+    /// The directed broadcast of every eligible interface, narrowed to
+    /// `ifaces` when that list is non-empty.
+    ///
+    /// Eligibility and the destination choice are
+    /// [`crate::net::iface_v4::IfaceV4::search_destination`]'s — C's own rule
+    /// (`osdNetIfAddrs.c:130-151`) — so a down or loopback interface
+    /// contributes nothing whether or not the operator listed it.
+    fn eligible_broadcast_addrs(ifaces: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+        if ifaces.is_empty() {
+            return crate::net::iface_v4::broadcast_addrs();
+        }
+        let Ok(all) = crate::net::iface_v4::enumerate() else {
+            return Vec::new();
+        };
+        let mut out: Vec<Ipv4Addr> = Vec::new();
+        for iface in all {
+            if !ifaces.contains(&iface.ip) {
+                continue;
+            }
+            if let Some(dest) = iface.search_destination() {
+                if !out.contains(&dest) {
+                    out.push(dest);
+                }
+            }
+        }
+        out
     }
 
     /// Read datagrams until asked to stop or the receiver is gone.

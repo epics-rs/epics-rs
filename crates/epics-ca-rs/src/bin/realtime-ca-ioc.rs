@@ -653,9 +653,11 @@ mod ioc {
     ///   writer pump did while the deadline depended on that socket option
     ///   taking. On a target that refuses the option this thread has nothing
     ///   entitled to reclaim it.
-    /// * **fixed** — `write_frame_deadline`, which owns its own wait
-    ///   (`poll(POLLOUT, remaining)` + `send(MSG_DONTWAIT)`) and so cannot be
-    ///   disarmed by the option being absent.
+    /// * **fixed** — `write_frame_deadline`, which owns the socket's blocking
+    ///   mode and polls `POLLOUT` for what the deadline has left, so it cannot
+    ///   be disarmed by the option being absent — nor by a send flag the target
+    ///   ignores, which is what `MSG_DONTWAIT` turned out to be on Darwin
+    ///   (`doc/darwin-send-dontwait-gap.md`).
     ///
     /// Both legs print their elapsed time and their outcome. A leg that
     /// *completes* says so: silence is never read as a bound here, and a frame

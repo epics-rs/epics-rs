@@ -961,10 +961,14 @@ fn wait_writable(sock: &TcpStream, deadline: Instant) -> io::Result<bool> {
 /// send buffer fills, it waits until the *whole* buffer is queued
 /// (`tcp_sendmsg` parks in `sk_stream_wait_memory`). So waiting for `POLLOUT`
 /// first is not enough on its own — the very next `write` re-enters the same
-/// unbounded wait one byte later. `MSG_DONTWAIT` makes the send itself
-/// per-call non-blocking, and unlike `O_NONBLOCK` it does not touch the file
-/// description, which matters because the reader pump shares this exact
-/// descriptor (see the module docs on why it is shared and not `dup`ed).
+/// unbounded wait one byte later. The socket is non-blocking for as long as it
+/// is live ([`own_blocking_mode`]), so the send takes what there is room for and
+/// returns; `MSG_DONTWAIT` rides on top as the per-call form of the same ask.
+///
+/// That mode is on the file description the reader pump shares (see the module
+/// docs on why it is shared and not `dup`ed), which is what [`wait_readable`]
+/// exists for: the reader polls before reading rather than parking in `read`,
+/// so sharing the description with a non-blocking writer costs it nothing.
 ///
 /// A full buffer surfaces as `EAGAIN`/`WouldBlock`, which returns the caller to
 /// [`wait_writable`] and therefore to the deadline.

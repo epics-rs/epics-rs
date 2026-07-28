@@ -43,6 +43,7 @@ pub mod iface_map;
 pub mod iface_v4;
 #[cfg(not(epics_embedded_target))]
 pub mod loopback_mcast;
+pub mod search_udp;
 
 /// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
 /// `udp_collector.cpp:127`: `"224.0.0.128,1@127.0.0.1"` — TTL=1,
@@ -59,6 +60,7 @@ pub mod loopback_mcast;
 pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
 
 pub use iface_v4::{IfaceV4, broadcast_addrs, local_addr};
+pub use search_udp::{SearchDatagram, SearchUdpSocket};
 
 #[cfg(not(epics_embedded_target))]
 pub use async_udp_v4::{

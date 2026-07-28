@@ -1116,7 +1116,17 @@ fn handle_client_blocking(
     acf: SharedAcf,
     tcp_port: u16,
 ) -> CaResult<()> {
-    let _ = stream.set_nodelay(true);
+    // C `create_client` sets both of these and refuses the client —
+    // `destroy_client`, `return NULL` — when either `setsockopt` fails
+    // (`caservertask.c:1444`, `:1456`), so neither is best-effort here.
+    // KEEPALIVE is what bounds a client that stops reading: `write_frame_locked`
+    // parks in `write_all` under the send lock, exactly as C parks in `send`
+    // under `SEND_LOCK`, and in C it is the keepalive probe failing that ends
+    // it. The hosted driver sets it in `tcp::accept_loop` through `socket2`,
+    // which does not build for the embedded triples — so this path had no
+    // reaper at all until the option came from `runtime::socket`.
+    stream.set_nodelay(true).map_err(CaError::Io)?;
+    epics_base_rs::runtime::socket::enable_keepalive(&stream).map_err(CaError::Io)?;
     // `None` (no configured cap) leaves the socket in pure blocking mode — C
     // `rsrv`'s default (`camsgtask` blocks in `recv` with no idle cap).
     // `set_read_timeout` sets SO_RCVTIMEO on Unix (incl. RTEMS) and is portable

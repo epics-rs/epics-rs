@@ -8,36 +8,29 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-// The UDP SEARCH transport is compiled out wherever a spawned future has no
-// tokio reactor — `cfg(exec_backend)`, which is either embedded target
-// (RTEMS or VxWorks) *and* a host `--features rtems-exec-model` build. Two
-// facts, one gate:
+// The UDP SEARCH transport is available on **every** backend.
 //
-//   * On RTEMS `AsyncUdpV4` does not exist at all (it is host-only in
-//     `epics-base-rs`): newlib has no `recvmsg`/`IP_PKTINFO` receive path and
-//     cannot read a socket's `local_addr()` back. It is gated out on VxWorks
-//     too — `tokio::net`/`socket2`/`if-addrs` do not build for either
-//     embedded target, so `AsyncUdpV4` stays one host-only module rather than
-//     splitting its absence into a separate reason per target.
-//   * On either backend-free build the engine runs on a callback-pool worker
-//     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
-//     "there is no reactor running" — even when the process has a runtime
-//     somewhere else, because it is not entered on that worker.
+// It was host-only until `epics_base_rs::net::search_udp` existed, for two
+// reasons that were both about `AsyncUdpV4` rather than about UDP:
 //
-// Gating this on `not(target_os = "rtems")` named the first fact and missed
-// the second, so a hosted `rtems-exec-model` build compiled the UDP transport
-// in, selected it, and panicked at the first search
-// (`doc/calink-rtems-design.md` §10.10 item 2, measured). `tokio_backend` is
-// the predicate that means "a reactor exists" and is the one the whole UDP
-// surface below carries, so "this build binds no UDP socket" holds by
-// construction rather than by a runtime branch. The target's compiled surface
-// is unchanged: `epics_embedded_target` (RTEMS or VxWorks) implies
-// `exec_backend`.
+//   * `AsyncUdpV4` does not compile for either embedded target — it is built
+//     on `tokio::net`, `socket2` and `if-addrs`, and none of the three cross
+//     to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
+//   * On any backend-free build the engine runs on a callback-pool worker
+//     (`runtime::task::spawn`), where `tokio::net::UdpSocket` panics — "there
+//     is no reactor running" — even when the process has a runtime somewhere
+//     else, because it is not entered on that worker. Gating on
+//     `not(target_os = "rtems")` named only the first reason, so a hosted
+//     `--features rtems-exec-model` build compiled the UDP transport in,
+//     selected it, and panicked at the first search
+//     (`doc/calink-rtems-design.md` §10.10 item 2, measured).
 //
-// Either way the client resolves every PV over TCP name servers through
-// `SearchTransport::NameServersOnly` (design §4.2, §4.5).
-#[cfg(tokio_backend)]
-use epics_base_rs::net::AsyncUdpV4;
+// `SearchUdpSocket` answers both: on `exec_backend` it is one wildcard socket
+// with a blocking receive pump — libca's own model (`udpiiu.cpp:174`) — so
+// nothing here needs a reactor and nothing here needs a gate.
+// `SearchTransport::NameServersOnly` remains for C's documented UDP-free mode
+// (design §4.2, §4.5); it is no longer the only mode the target has.
+use epics_base_rs::net::search_udp::{SearchDatagram, SearchUdpSocket};
 use epics_base_rs::runtime::sync::mpsc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // The `runtime::task` seam, not `tokio::time::interval`: this engine is
@@ -56,31 +49,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// `handle_udp_response` parser as plain UDP search replies.
 type ParsedDatagram = (Vec<u8>, SocketAddr);
 
-/// What the engine's SEARCH-receive arm needs from one datagram.
-///
-/// The three fields `epics_base_rs::net::RecvMeta` carries that this loop
-/// reads, restated as a transport-neutral type — because `RecvMeta` is part of
-/// the UDP stack and does not exist for `armv7-rtems-eabihf`, while the
-/// `select!` arm that consumes it must still compile there (a `select!` branch
-/// cannot carry a `#[cfg]`). On the target the arm parks forever, so no value
-/// of this type is ever produced; what matters is that its *type* is nameable.
-struct SearchDatagram {
-    /// Datagram length in the caller's buffer.
-    n: usize,
-    /// Sender address.
-    src: SocketAddr,
-    /// IPv4 address of the NIC that received it — the key the per-NIC
-    /// `SO_RXQ_OVFL` drop counters are tracked under.
-    iface_ip: Ipv4Addr,
-}
-
-/// Send `buf` toward `addr`, expanding to a per-NIC fanout when the
+/// Send `buf` toward `addr`, expanding to a per-interface fanout when the
 /// destination is the limited broadcast `255.255.255.255` or an IPv4
 /// multicast group (`224.0.0.0/4`). Per-subnet broadcasts and
-/// unicast destinations route via the NIC chosen by [`AsyncUdpV4`].
-#[cfg(tokio_backend)]
+/// unicast destinations route via the interface [`SearchUdpSocket`] chooses.
 async fn send_with_fanout(
-    socket: &AsyncUdpV4,
+    socket: &SearchUdpSocket,
     buf: &[u8],
     addr: SocketAddr,
     site: &'static str,
@@ -540,9 +514,9 @@ impl SearchEngineState {
 // Search transport
 // ---------------------------------------------------------------------------
 
-/// The UDP half of the search transport: the per-NIC socket bundle, plus
-/// the destination policy and the per-destination diagnostics that only
-/// mean anything while those sockets exist.
+/// The UDP half of the search transport: the SEARCH socket, plus the
+/// destination policy and the per-destination diagnostics that only mean
+/// anything while that socket exists.
 ///
 /// Bundled into one value so a socket and the addresses it would transmit
 /// to cannot be configured independently. The membership test is whether a
@@ -553,12 +527,10 @@ impl SearchEngineState {
 /// `prev_drops_per_iface` keys the `SO_RXQ_OVFL` transition log by the NIC
 /// of the socket that received the datagram. None of the three survives the
 /// socket's absence.
-#[cfg(tokio_backend)]
 struct UdpTransport {
-    /// libca-style multi-NIC bundle: one bound socket per IPv4 interface so
-    /// `255.255.255.255` and per-subnet broadcasts each leave via the
-    /// matching NIC.
-    socket: AsyncUdpV4,
+    /// The SEARCH socket this backend has: a per-NIC bound bundle on the host,
+    /// one wildcard socket with a receive pump on `exec_backend`.
+    socket: SearchUdpSocket,
     /// Working UDP SEARCH destination list — `EPICS_CA_ADDR_LIST` as
     /// parsed at startup, plus any discovery / programmatic mutation
     /// applied since (libca `addAddrToChannelAccessAddressList`,
@@ -571,8 +543,9 @@ struct UdpTransport {
     /// occurrence, on errno change, and on recovery; suppress repeats.
     send_errors: HashMap<SocketAddr, std::io::ErrorKind>,
     /// pvxs parity: per-NIC `SO_RXQ_OVFL` counters, logged on transitions
-    /// only. Keyed on the receiving NIC's `iface_ip`, which the
-    /// `AsyncUdpV4` `RecvMeta` carries on every datagram.
+    /// only. Keyed on the receiving NIC's `iface_ip`, which
+    /// [`SearchDatagram`] carries whenever the receive path reports one — the
+    /// per-NIC bundle always does, a single wildcard socket never does.
     prev_drops_per_iface: HashMap<Ipv4Addr, u32>,
 }
 
@@ -582,7 +555,7 @@ struct UdpTransport {
 /// piece of state lives inside the variant that owns the sockets, and every
 /// UDP operation is a method on this type — so "a UDP socket is bound" and
 /// "the arm that reads it is armed" are the same match rather than two facts
-/// that can disagree. An `Option<AsyncUdpV4>` plus an `if let` at each of
+/// that can disagree. An `Option<SearchUdpSocket>` plus an `if let` at each of
 /// the fanout sites is the patch; this is the fix
 /// (`doc/calink-rtems-design.md` §4.3, mirroring the PVA client's
 /// `SearchTransport` — `doc/pvalink-rtems-design.md` §8).
@@ -590,16 +563,10 @@ struct UdpTransport {
 /// The configuration that needs the second variant is C's documented
 /// TCP-only name resolution mode (`modules/ca/src/client/CAref.html:515-520`):
 /// `EPICS_CA_NAME_SERVERS` set, `EPICS_CA_ADDR_LIST` empty and
-/// `EPICS_CA_AUTO_ADDR_LIST=NO`. On `exec_backend` it is the only mode
-/// available at all — see the module-head note on why the gate is the
-/// backend and not the target.
+/// `EPICS_CA_AUTO_ADDR_LIST=NO`. It is a configuration on every backend now;
+/// it used to be the only mode `exec_backend` had.
 enum SearchTransport {
     /// UDP SEARCH fanout and reply receive, alongside any TCP name servers.
-    ///
-    /// Compiled out on `exec_backend`, so there `NameServersOnly` is the
-    /// *only* variant: "this build binds no UDP socket" is then a property of
-    /// the type, which no later edit can reintroduce a branch around.
-    #[cfg(tokio_backend)]
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`run_nameserver_connection`), replies
@@ -623,19 +590,40 @@ fn log_dropped_udp_mutation(site: &'static str) {
     );
 }
 
+/// The EPICS priority the SEARCH socket's receive path runs at.
+///
+/// C parity, derived rather than chosen, exactly as `CAC_RECV_PRIORITY` and
+/// `CAC_SEND_PRIORITY` are (`client/transport.rs`): libca creates `CAC-UDP` at
+/// `lowestPriorityLevelAbove(lowestPriorityLevelAbove(initializing thread))`
+/// (`udpiiu.cpp:128-132`), and the thread that initializes the CA context for
+/// record links is C's `dbCaLink` worker at `epicsThreadPriorityMedium`
+/// (`dbCa.c:340`). `epicsThreadLowestPriorityLevelAbove` is `p + 1`
+/// (`os/posix/osdThread.c:883-899`, the file an RTEMS 6 build compiles — its
+/// one adjustment applies only when the scheduler's priority span is under
+/// 100, and SCHED_FIFO's is 1..254), so this is **52**: two bands above the
+/// link worker and one above the circuits' send pumps, because a SEARCH reply
+/// that is not read is a channel that never connects at all.
+///
+/// Only the `exec_backend` arm of [`SearchUdpSocket`] creates a thread to
+/// apply it to; the host arm receives on the reactor and ignores it. Stated
+/// unconditionally anyway, so the band is a fact about the CA client rather
+/// than about one build of it.
+const CAC_UDP_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    epics_base_rs::runtime::task::ThreadPriority::Custom(
+        epics_base_rs::runtime::task::ThreadPriority::Medium.value() + 2,
+    );
+
 impl SearchTransport {
-    /// Bind the per-NIC SEARCH socket bundle and take ownership of the UDP
-    /// destination list, so that binding a socket and deciding where it
-    /// transmits are one step.
+    /// Bind the SEARCH socket and take ownership of the UDP destination list,
+    /// so that binding a socket and deciding where it transmits are one step.
     ///
     /// `None` when the bind fails — the caller's only sane response is to
     /// abandon the engine, which is what `run_search_engine` did before this
     /// type existed.
-    #[cfg(tokio_backend)]
     fn bind_udp(addr_list: Vec<super::AddrEntry>) -> Option<Self> {
         // SO_REUSEADDR + (Linux) IP_MULTICAST_ALL=0 are applied to every
-        // per-NIC socket inside `AsyncUdpV4::bind`.
-        let socket = AsyncUdpV4::bind(0, true).ok()?;
+        // per-NIC socket inside the host arm's `AsyncUdpV4::bind`.
+        let socket = SearchUdpSocket::bind_ephemeral(true, "CAC-UDP", CAC_UDP_PRIORITY).ok()?;
         // Larger receive buffer absorbs multi-PV SEARCH response bursts.
         let _ = socket.set_recv_buffer_size(256 * 1024);
         // Apply `EPICS_CA_MCAST_TTL` (epics-base 3.16, f2a1834d). Affects
@@ -688,7 +676,6 @@ impl SearchTransport {
     /// `addAddrToChannelAccessAddressList` (`iocinf.cpp:45`).
     fn add_address(&mut self, addr: SocketAddr) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 if !u.addr_list.iter().any(|e| e.sock == addr) {
                     let port = match addr {
@@ -711,7 +698,6 @@ impl SearchTransport {
     #[cfg(feature = "client")]
     fn remove_address(&mut self, addr: SocketAddr) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 let before = u.addr_list.len();
                 u.addr_list.retain(|e| e.sock != addr);
@@ -730,7 +716,6 @@ impl SearchTransport {
     /// `configureChannelAccessAddressList` (`iocinf.cpp:166`).
     fn set_address_list(&mut self, list: Vec<SocketAddr>) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 tracing::info!(count = list.len(), "ca-rs: addr_list replaced");
                 u.addr_list = list
@@ -757,23 +742,9 @@ impl SearchTransport {
     /// Parks forever without a UDP transport — the degradation shape the
     /// PVA client's optional beacon socket already used, and the reason the
     /// arm needs no `if` of its own.
-    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(SearchDatagram, u32)> {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<SearchDatagram> {
         match self {
-            #[cfg(tokio_backend)]
-            Self::Udp(u) => u
-                .socket
-                .recv_with_meta_with_drops(buf)
-                .await
-                .map(|(meta, drops)| {
-                    (
-                        SearchDatagram {
-                            n: meta.n,
-                            src: meta.src,
-                            iface_ip: meta.iface_ip,
-                        },
-                        drops,
-                    )
-                }),
+            Self::Udp(u) => u.socket.recv(buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
                 std::future::pending().await
@@ -784,9 +755,15 @@ impl SearchTransport {
     /// Record this NIC's `SO_RXQ_OVFL` counter and log the transitions —
     /// pvxs `udp_collector.cpp:55-67` logs at debug on
     /// `prev != current && current != 0`.
-    fn note_drops(&mut self, iface_ip: Ipv4Addr, drops: u32) {
+    ///
+    /// `iface_ip` is `None` when the receive path does not report which NIC a
+    /// datagram arrived on, which is every single-socket receive path. There
+    /// is nothing to key the counter under then, so the datagram carries no
+    /// drop record — as opposed to keying every NIC's drops under one
+    /// stand-in address, which would report transitions that did not happen.
+    fn note_drops(&mut self, iface_ip: Option<Ipv4Addr>, drops: u32) {
+        let Some(iface_ip) = iface_ip else { return };
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 let prev = u.prev_drops_per_iface.insert(iface_ip, drops).unwrap_or(0);
                 if drops != 0 && drops != prev {
@@ -808,12 +785,10 @@ impl SearchTransport {
     /// Send one built SEARCH datagram to every UDP destination.
     ///
     /// Nothing is sent without a UDP transport: the destinations a datagram
-    /// would go to live inside `UdpTransport` (`#[cfg(tokio_backend)]`, so not
-    /// in scope on the exec-backend doc build), so there is no list to walk
+    /// would go to live inside [`UdpTransport`], so there is no list to walk
     /// rather than a list that must be checked for emptiness.
     async fn fanout(&mut self, frame: &[u8], site: &'static str) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Split-borrow so the per-destination error-suppression map can
                 // be updated while the socket is borrowed for the send.
@@ -843,7 +818,6 @@ impl SearchTransport {
             // cached IP when it differs. Changes are logged at info so
             // operators can correlate an IOC migration with the client's
             // discovery of the new address.
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 for entry in u.addr_list.iter_mut() {
                     let prev_sock = entry.sock;
@@ -886,7 +860,6 @@ impl SearchTransport {
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
-            #[cfg(tokio_backend)]
             Self::Udp(u) => u.socket.local_addrs(),
         }
     }
@@ -894,16 +867,13 @@ impl SearchTransport {
     /// How many UDP SEARCH destinations this transport holds. Zero for
     /// [`Self::NameServersOnly`] by construction.
     ///
-    /// Separate from [`Self::addr_list`] because it is nameable on both
-    /// backends: `AddrEntry` is part of the UDP surface and does not exist on
-    /// `exec_backend`, so a test that asserts "this transport holds no UDP
-    /// destinations" — which is exactly the assertion that must still run
-    /// there — cannot go through a slice of it.
+    /// Separate from [`Self::addr_list`] because it answers the question
+    /// without handing out `AddrEntry`: a test that asserts "this transport
+    /// holds no UDP destinations" wants the count, not the list.
     #[cfg(test)]
     fn udp_dest_count(&self) -> usize {
         match self {
             Self::NameServersOnly => 0,
-            #[cfg(tokio_backend)]
             Self::Udp(u) => u.addr_list.len(),
         }
     }
@@ -911,15 +881,13 @@ impl SearchTransport {
     /// The current UDP SEARCH destinations. Empty for
     /// [`Self::NameServersOnly`], which has none by construction.
     ///
-    /// `tokio_backend` as well as `test`: `AddrEntry` is part of the UDP
-    /// surface and does not exist on `exec_backend`. `feature = "client"`
-    /// because its one caller — `add_then_remove_address_round_trip` — is the
-    /// runtime address-list mutation path, which `client-core` does not have.
-    #[cfg(all(test, tokio_backend, feature = "client"))]
+    /// `feature = "client"` because its one caller —
+    /// `add_then_remove_address_round_trip` — is the runtime address-list
+    /// mutation path, which `client-core` does not have.
+    #[cfg(all(test, feature = "client"))]
     fn addr_list(&self) -> &[super::AddrEntry] {
         match self {
             Self::NameServersOnly => &[],
-            #[cfg(tokio_backend)]
             Self::Udp(u) => &u.addr_list,
         }
     }
@@ -929,12 +897,14 @@ impl SearchTransport {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// The ordinary client engine: bind the UDP SEARCH bundle and additionally
+/// The ordinary client engine: bind the UDP SEARCH socket and additionally
 /// use any `EPICS_CA_NAME_SERVERS` TCP circuits.
 ///
-/// Host-only, because binding that bundle is: the RTEMS target selects
-/// [`name_servers_only_search_engine`] instead (design §4.5).
-#[cfg(tokio_backend)]
+/// Available on every backend since `SearchUdpSocket` existed. It used to be
+/// host-only, and the embedded targets took [`name_servers_only_search_engine`]
+/// whatever their configuration said (design §4.5) — which resolved a PV only
+/// if an operator had named its server in `EPICS_CA_NAME_SERVERS`, and
+/// silently never resolved one reachable by broadcast alone.
 pub(crate) async fn run_search_engine(
     addr_list: Vec<super::AddrEntry>,
     nameserver_addrs: Vec<SocketAddr>,
@@ -963,9 +933,7 @@ pub(crate) async fn run_search_engine(
 /// with an empty EPICS_CA_ADDR_LIST and EPICS_CA_AUTO_ADDR_LIST set to
 /// \"NO\", Channel Access can be run without using UDP for name
 /// resolution." libca reaches it by registering a `SearchDestTCP` per
-/// `EPICS_CA_NAME_SERVERS` address (`cac.cpp:250-280`); it is what the RTEMS
-/// target needs, because `AsyncUdpV4` does not exist there at all
-/// (`doc/calink-rtems-design.md` §4.5).
+/// `EPICS_CA_NAME_SERVERS` address (`cac.cpp:250-280`).
 ///
 /// Selection is an **explicit entry point**, not derived from the address
 /// list being empty — deriving it would silently drop UDP search for every
@@ -983,19 +951,17 @@ pub(crate) async fn run_search_engine(
 /// Returns the engine future rather than running it, so the empty-name-server
 /// refusal is observed by the caller **before** anything is spawned.
 ///
-/// On `exec_backend` this is the *only* engine: `CaClient` selects it there
-/// (`client/mod.rs`), because `SearchTransport` has no UDP variant compiled in.
-/// That is the RTEMS target and a host `--features rtems-exec-model` build
-/// alike. On `tokio_backend` it stays capability-only — the client binds UDP —
-/// so it is dead code there outside the gate test. The `expect` covers exactly
-/// that, and is *not* applied where the call is live.
+/// Capability-only on every backend: `CaClient` binds UDP, so nothing in this
+/// crate calls it outside the gate tests. It was the sole engine on
+/// `exec_backend` while `SearchTransport` had no UDP variant there.
 #[cfg_attr(
-    all(tokio_backend, not(test)),
+    any(not(test), feature = "rtems-exec-model"),
     expect(
         dead_code,
         reason = "\
-    a client with a reactor binds UDP; this entry point is what the reactor-free \
-    exec backend selects (doc/calink-rtems-design.md §4.5, §6 stage C5)"
+    every client binds UDP; this entry point exists for C's documented \
+    UDP-free name-resolution mode (CAref.html:515-520), which no caller in \
+    this crate selects"
     )
 )]
 pub(crate) fn name_servers_only_search_engine(
@@ -1097,7 +1063,7 @@ async fn run_engine(
             }
 
             result = transport.recv(&mut recv_buf) => {
-                let Ok((meta, drops)) = result else { continue };
+                let Ok(meta) = result else { continue };
                 // drain any queued `SearchRequest` before parsing
                 // this datagram. A `Schedule{Reconnect}` enqueued by the
                 // coordinator (mod.rs ServerDisconnect / TcpClosed paths)
@@ -1117,7 +1083,7 @@ async fn run_engine(
                     fire_searches(&mut state, &immediate, &mut transport, &nameserver_send_txs).await;
                 }
                 // Surface per-NIC kernel drop transitions.
-                transport.note_drops(meta.iface_ip, drops);
+                transport.note_drops(meta.iface_ip, meta.drops);
                 handle_udp_response(&mut state, &recv_buf[..meta.n], meta.src, &response_tx);
             }
 
@@ -2388,10 +2354,11 @@ mod tests {
     /// address not in the list is a silent no-op.
     ///
     /// Async because the destination list now lives inside `UdpTransport`,
-    /// whose construction binds the per-NIC socket bundle — the point of the
-    /// sum type is that there is no way to hold UDP destinations without the
-    /// socket that would transmit to them.
-    #[cfg(all(feature = "client", tokio_backend))]
+    /// whose construction binds the SEARCH socket — the point of the sum type
+    /// is that there is no way to hold UDP destinations without the socket
+    /// that would transmit to them. Runs on both backends, which is what makes
+    /// it the mutation-path coverage for the exec backend's pumped socket too.
+    #[cfg(feature = "client")]
     #[epics_macros_rs::epics_test]
     async fn add_then_remove_address_round_trip() {
         let mut state = SearchEngineState::new();
@@ -2913,6 +2880,11 @@ mod tests {
 
         // Sniffer on loopback ephemeral. Used as the engine's
         // ONLY addr_list destination.
+        // The sniffer stands in for a CA server, so it reads the datagrams the
+        // engine sent rather than going through the engine's own transport:
+        // `AsyncUdpV4` directly, which is why these two tests stay
+        // `tokio_backend`.
+        use epics_base_rs::net::AsyncUdpV4;
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
@@ -3015,6 +2987,11 @@ mod tests {
         let restore = std::env::var("EPICS_CA_MAX_SEARCH_PERIOD").ok();
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60") };
 
+        // The sniffer stands in for a CA server, so it reads the datagrams the
+        // engine sent rather than going through the engine's own transport:
+        // `AsyncUdpV4` directly, which is why these two tests stay
+        // `tokio_backend`.
+        use epics_base_rs::net::AsyncUdpV4;
         let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()

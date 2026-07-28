@@ -23,9 +23,9 @@
 //!    [`install_calink_resolver`](epics_ca_rs::calink::install_calink_resolver)
 //!    mounts the CA external record-link resolver on the database (C
 //!    `dbCaLinkInit`, `dbCa.c:1071`), so a ` CA`-modified or `ca://...`
-//!    INP/OUT field resolves through a live `CaClient`. The client dials
-//!    `EPICS_CA_NAME_SERVERS` over TCP; the UDP SEARCH transport is compiled
-//!    out on this target.
+//!    INP/OUT field resolves through a live `CaClient`. The client binds the
+//!    UDP SEARCH socket and additionally dials `EPICS_CA_NAME_SERVERS` over
+//!    TCP, as it does on a host — see `epics_base_rs::net::search_udp`.
 //! 4. **CA front-end** — [`epics_ca_rs::server::blocking::BlockingCaServer`]: the TCP accept loop (C
 //!    `CAS-TCP`, `caservertask.c:62`) and the UDP name-search responder (C
 //!    `CAS-UDP`, `cast_server.c:113`), each on its own `std::thread`, with one
@@ -612,6 +612,103 @@ mod ioc {
         }
     }
 
+    /// UDP SEARCH PROBE: broadcast one real CA SEARCH from the client's own
+    /// socket type and wait for this IOC's own responder to answer it.
+    ///
+    /// The four things nothing else on this target proves, in one round trip:
+    /// [`SearchUdpSocket`](epics_base_rs::net::search_udp::SearchUdpSocket)
+    /// **binds**, its `send_to` reaches the broadcast address
+    /// [`iface_report`] derived, the responder receives it, and the receive
+    /// pump thread hands the reply back to an `async fn` running with no
+    /// reactor. A cross-compile gate proves none of them — `std::net::UdpSocket`
+    /// on `armv7-rtems-eabihf` type-checks whatever libbsd then does.
+    ///
+    /// Deliberately its own socket rather than the search engine's: this must
+    /// report on the transport alone, and a failure here must not be
+    /// confusable with a database, resolver or name-server fault. It runs
+    /// after the responder thread is up, because it needs an answer.
+    #[cfg(feature = "bringup-probes")]
+    fn udp_search_report(port: u16, pv: &str) {
+        use epics_base_rs::net::search_udp::SearchUdpSocket;
+        use epics_base_rs::runtime::ioc_role::IocRole;
+        use epics_base_rs::runtime::task::{block_on_sync, timeout};
+        use epics_ca_rs::protocol::{
+            CA_DO_REPLY, CA_MINOR_VERSION, CA_PROTO_SEARCH, CA_PROTO_VERSION, CaHeader,
+        };
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        // The pump's band comes from the role, not from a number named here:
+        // this probe is a `ConsoleCensus` instrument and must not preempt
+        // client service, which is the rule
+        // `this_entry_point_names_no_scheduling_band` enforces.
+        let sock =
+            match SearchUdpSocket::bind_ephemeral(true, "PROBE-UDP", IocRole::ConsoleCensus.band())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("UDPSEARCH bind error={e}");
+                    return;
+                }
+            };
+        println!("UDPSEARCH bound={:?}", sock.local_addrs());
+
+        // VERSION then SEARCH, the two-message datagram every CA client opens
+        // with (`udpiiu.cpp::searchMsg`). Built here from `CaHeader::to_bytes`
+        // rather than through the search engine, for the reason above.
+        let mut frame = CaHeader {
+            cmmd: CA_PROTO_VERSION,
+            count: CA_MINOR_VERSION,
+            ..CaHeader::new(CA_PROTO_VERSION)
+        }
+        .to_bytes()
+        .to_vec();
+        let mut name = pv.as_bytes().to_vec();
+        name.push(0);
+        while name.len() % 8 != 0 {
+            name.push(0);
+        }
+        frame.extend_from_slice(
+            &CaHeader {
+                cmmd: CA_PROTO_SEARCH,
+                postsize: name.len() as u16,
+                data_type: CA_DO_REPLY,
+                count: CA_MINOR_VERSION,
+                cid: 0xC0DE,
+                available: 0xC0DE,
+                ..CaHeader::new(CA_PROTO_SEARCH)
+            }
+            .to_bytes(),
+        );
+        frame.extend_from_slice(&name);
+
+        let dests = epics_base_rs::net::iface_v4::broadcast_addrs();
+        if dests.is_empty() {
+            println!("UDPSEARCH no broadcast destination — nothing to send to");
+            return;
+        }
+        let outcome = block_on_sync(async {
+            for ip in &dests {
+                let dest = SocketAddr::from((*ip, port));
+                match sock.send_to(&frame, dest).await {
+                    Ok(n) => println!("UDPSEARCH sent bytes={n} pv={pv} dest={dest}"),
+                    Err(e) => println!("UDPSEARCH send error={e} dest={dest}"),
+                }
+            }
+            let mut buf = vec![0u8; 1024];
+            match timeout(Duration::from_secs(5), sock.recv(&mut buf)).await {
+                Ok(Ok(dg)) => format!(
+                    "UDPSEARCH reply n={} src={} iface_ip={:?} drops={}",
+                    dg.n, dg.src, dg.iface_ip, dg.drops
+                ),
+                Ok(Err(e)) => format!("UDPSEARCH recv error={e}"),
+                Err(_) => "UDPSEARCH no reply within 5s".to_string(),
+            }
+        })
+        .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
+        println!("{outcome}");
+    }
+
     /// C6 PROBE: one console report — the link registry, the shared
     /// client's circuit count, and every record the gate reads.
     ///
@@ -947,12 +1044,11 @@ mod ioc {
         //      so every record's link fields route through it before the
         //      server answers its first client.
         //
-        //      On this target the CA client reaches upstream servers over TCP
-        //      name servers alone (`EPICS_CA_NAME_SERVERS`): the UDP SEARCH
-        //      transport is compiled out (design §6 stage C5,
-        //      `search::SearchTransport::NameServersOnly`), and every task the
-        //      resolver spawns lands on the callback pool `background_init`
-        //      started above via `runtime::task::spawn`, never a tokio runtime.
+        //      The CA client reaches upstream servers the way a host client
+        //      does — the UDP SEARCH socket plus any `EPICS_CA_NAME_SERVERS`
+        //      circuits — and every task the resolver spawns lands on the
+        //      callback pool `background_init` started above via
+        //      `runtime::task::spawn`, never a tokio runtime.
         let resolver = block_on_sync(install_calink_resolver(&db))
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
 
@@ -1126,16 +1222,24 @@ mod ioc {
              RTEMS execution model, no tokio runtime",
             names.len()
         );
+
+        // (5-udp) PROBE: the client's SEARCH socket, end to end against this
+        //     IOC's own responder. After the responder thread above, because
+        //     it needs an answer.
+        #[cfg(feature = "bringup-probes")]
+        udp_search_report(port, "RTEMS:AO");
         // The calink resolver is mounted, so ` CA`-modified and `ca://...`
         // INP/OUT links resolve. Reported at every boot — including
         // `link_count == 0`, when the loaded database configured none —
         // because on a target with no shell the console is the only place an
         // operator can confirm the resolver came up and how many links it
-        // registered. The client reaches upstream servers over
-        // `EPICS_CA_NAME_SERVERS` (TCP); the UDP SEARCH transport is compiled
-        // out on this target, so a link to a server reachable only by
-        // broadcast will not resolve, and `EPICS_CA_ADDR_LIST` is not even
-        // parsed here.
+        // registered. The client reaches upstream servers over both paths a
+        // host client uses — the UDP SEARCH socket and any
+        // `EPICS_CA_NAME_SERVERS` TCP circuits. A `bringup-probes` build
+        // still resolves over TCP alone in practice, because it compiles in
+        // `EPICS_CA_ADDR_LIST=""` and `EPICS_CA_AUTO_ADDR_LIST=NO` below so
+        // that a C6 resolution can only have come over TCP; that is this
+        // measurement rig's configuration, not the target's capability.
         //
         // Counted against the database's DECLARED external PV set, after
         // waiting for the registry to reach it.
@@ -1165,8 +1269,7 @@ mod ioc {
         println!(
             "realtime-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
              link{} registered ({}); ` CA`-modified and ca://... INP/OUT resolve over \
-             EPICS_CA_NAME_SERVERS (TCP name servers; UDP search is compiled out \
-             on this target)",
+             UDP search and any EPICS_CA_NAME_SERVERS TCP circuits)",
             declared.len(),
             if declared.len() == 1 { "" } else { "s" },
             if declared.is_empty() {

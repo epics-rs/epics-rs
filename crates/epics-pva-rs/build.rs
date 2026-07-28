@@ -103,9 +103,15 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // `--features rtems-exec-model` compiled the UDP transport in and panicked on
 // it at `realtime-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
 // §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
-// exists", so the transport takes that one and `SearchTransport` has the
-// single `NameServersOnly` variant on `exec_backend` — the target's shape,
-// now reached by the host build that models the target.
+// exists", so every arm that needs one takes that predicate — the target's
+// shape, now reached by the host build that models the target.
+//
+// The v4 SEARCH socket is no longer one of those arms. It binds on both
+// backends through `epics_base_rs::net::search_udp::SearchUdpSocket`, whose
+// `exec_backend` arm is a `std::net::UdpSocket` and a receive-pump thread and
+// names no reactor. `tokio_backend` still selects the IPv6 half, which is
+// `socket2` and `tokio::net` throughout, and `SearchTransport` still reduces
+// to `NameServersOnly` when the configuration asks for no UDP.
 //
 // This is a third copy of a four-line rule, so it is pinned rather than
 // trusted: a `const` assertion in `src/lib.rs` checks it against

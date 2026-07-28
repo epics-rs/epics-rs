@@ -549,12 +549,12 @@ fi
 #
 # Zero is MEASURED on the box against the merged tree, not carried over from
 # the RTEMS gate's identical-looking zero. The two zeroes have the same cause —
-# the UDP search/beacon transport is gated out, so `SearchTransport` has its
-# single `NameServersOnly` variant and "no UDP socket" is a fact about the type
-# rather than a runtime branch — but on RTEMS that gating is spelled
-# `cfg(target_os = "rtems")`, which is FALSE for `target_os = "vxworks"`. A gate
-# that assumed the RTEMS zero would have been asking cargo to compile the
-# hosted tokio/UDP path for a tier-3 target that has no tokio.
+# the v4 SEARCH transport binds through `SearchUdpSocket`, whose `exec_backend`
+# arm names no tokio and no `socket2`, and only the IPv6 half is left out — but
+# the arms that reach that shape used to be spelled `cfg(target_os = "rtems")`,
+# which is FALSE for `target_os = "vxworks"`. A gate that assumed the RTEMS
+# zero would have been asking cargo to compile the hosted tokio/UDP path for a
+# tier-3 target that has no tokio.
 #
 # What makes it zero here is the embedded-target cfg that widened those arms to
 # cover both RTOSes. This ratchet is therefore only meaningful on a tree that

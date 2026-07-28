@@ -167,8 +167,8 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # CHOICE. `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
 # implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
 # pva:// record-link resolver — is now on the target (design stage 4). It pulls
-# `epics-pva-rs/client`, whose UDP transport is cfg-gated out so the client
-# compiles for the triple (the ratchet probe below measures zero), and does NOT
+# `epics-pva-rs/client`, whose v4 UDP transport compiles for the triple through
+# `SearchUdpSocket` (the ratchet probe below measures zero), and does NOT
 # pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
 # was `qsrv-core` alone, because `client_native` was 47 errors on this target
@@ -556,14 +556,15 @@ fi
 #      0  stage C5              UDP SEARCH cfg-gated out of the target build
 #
 # Stage C5 closed the remaining 10 the way PVA stage 4 closed its 28, and for
-# the same reason: they were all UDP. On the target `search::SearchTransport`
-# has the single `NameServersOnly` variant — `UdpTransport`, `bind_udp`, the
-# fanout/DNS-refresh helpers, `run_search_engine` and the whole
-# `EPICS_CA_ADDR_LIST` parse (`AddrEntry`, `resolve_host`,
-# `parse_addr_list_with_hostnames`, `append_auto_addr_entries`) are
-# `#[cfg(not(target_os = "rtems"))]`. "No UDP socket" is a fact about the type,
-# not a runtime branch, and `CaClient::new_with_config` reaches
-# `name_servers_only_search_engine` by `cfg` rather than by choice.
+# the same reason: they were all UDP. That row is history, not the current
+# shape: the SEARCH socket has since come back, on every backend, through
+# `SearchUdpSocket`. `UdpTransport`, `bind_udp`, the fanout/DNS-refresh
+# helpers, `run_search_engine` and the whole `EPICS_CA_ADDR_LIST` parse
+# (`AddrEntry`, `resolve_host`, `parse_addr_list_with_hostnames`,
+# `append_auto_addr_entries`) are ungated, and `CaClient::new_with_config`
+# reaches `name_servers_only_search_engine` by configuration rather than by
+# `cfg`. "No UDP socket" is still a fact about the type — `NameServersOnly`
+# holds none — but it is no longer a fact about the target.
 #
 # The probe is RETIRED rather than left pinned at zero, and the replacement is
 # STRICTER, not looser: `CRATE_FEATURES[epics-ca-rs]="client-core"` above makes

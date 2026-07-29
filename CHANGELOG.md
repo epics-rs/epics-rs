@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.25.3 — 2026-07-30
+
+Patch release. The CA and PVA *clients* now bind a UDP SEARCH socket on the
+embedded targets, closing a gap that made a broadcast-only PV silently
+unreachable from an RTEMS or VxWorks IOC. Both halves are verified on target,
+not merely cross-compiled. The CA blocking server's accepted clients get
+`SO_KEEPALIVE`, as C's do. Workspace version 0.25.2 -> 0.25.3.
+
+### The clients bind a SEARCH socket on every backend
+
+On `exec_backend` the CA and PVA clients bound no UDP socket **by type**: the
+transport was selected by `cfg`, so a target IOC's own `ca://` and `pva://`
+record links could resolve only through an explicitly configured
+`EPICS_CA_NAME_SERVERS` / `EPICS_PVA_NAME_SERVERS`. A PV reachable only by
+broadcast never connected, and did so without a diagnostic. The server side was
+already complete; this was the client half alone.
+
+- **`epics_base_rs::net::search_udp::SearchUdpSocket`** is the one type both
+  clients bind. On `tokio_backend` it delegates to the existing per-NIC
+  `AsyncUdpV4` bundle unchanged. On `exec_backend` it is a single wildcard
+  `std::net::UdpSocket` plus a receive-pump thread — libca's own model
+  (`udpiiu.cpp:174` creates one socket, not a per-NIC bundle). `Drop` joins the
+  pump: the pump co-owns the socket, so a stop flag alone leaves the port held
+  for up to the pump's wake interval and the next bind fails `AddrInUse`.
+
+- **`epics_base_rs::net::iface_v4`** enumerates IPv4 interfaces through
+  `getifaddrs`, which RTEMS 6 and VxWorks 7 both provide, replacing the
+  `if-addrs` dependency that builds for neither. `IfaceV4::search_destination()`
+  is C's rule from `osdNetIfAddrs.c:130-151`. The stubs it replaces returned
+  nothing on the embedded targets, so `EPICS_CA_AUTO_ADDR_LIST=YES` — C's
+  default, and the whole of an unconfigured site's discovery — expanded to an
+  empty list there.
+
+- **`fanout_to` takes the operator's egress constraint as a parameter** rather
+  than exposing a second entry point, so "which interfaces may this leave
+  through" is one question with a default answer instead of one a caller can
+  ask on one path and forget on another.
+
+- Two host-visible behaviour changes follow from sourcing everything through
+  `iface_v4`, both toward C: interface enumeration now tests `IFF_UP`, and
+  point-to-point peer addresses are included.
+
+- The IPv6 half stays out of the embedded targets deliberately. Both its
+  binders are `socket2` and its receive is `tokio::net`, so `V6Socket` is an
+  uninhabited enum on `exec_backend` — `Option<V6Socket>` is `None` by
+  construction and neither crate reaches the target's compiled unit. That is
+  why both cross-compile ratchets still read zero target errors with the v4
+  transport compiled in.
+
+### Measured on target
+
+- RTEMS 6 (QEMU xilinx-zynq-a9): `realtime-pva-ioc` resolved `RTEMS:PVA:AO` by
+  broadcast with **no name server configured** — the SEARCH response carried
+  the IOC's own GUID.
+- VxWorks 7 (`x86_64-wrs-vxworks`): a probe RTP exercised the bind, the
+  interface walk, the pump round-trip, the broadcast fanout and the
+  `Drop`-releases-the-port regression. `SO_RCVTIMEO` is accepted here; it is
+  `SO_SNDTIMEO` that this target refuses with `ENOPROTOOPT`, and the pump sets
+  none. Transcript and its seven claims: `doc/vxworks-port.md` §5.6.
+
+### A wedged CA client is reaped again on the embedded targets
+
+`handle_client_blocking` had no `SO_KEEPALIVE`. `write_frame_locked` parks in
+`write_all` under the send lock, which is C's shape — `cas_send_bs_msg` loops on
+a blocking `send()` under `SEND_LOCK` with no bound either — and C survives it
+because `create_client` sets the option on every accepted socket. The hosted
+driver did so through `socket2`, which builds for neither embedded triple, so
+the reactor-free driver had the option nowhere.
+`runtime::socket::enable_keepalive` now carries it, and `set_nodelay` stops
+being best-effort in the same breath: C refuses the client when either option
+fails.
+
+### One flaky executor test closed
+
+`a_yielding_task_releases_the_worker_to_a_queued_task` held its slow task for
+a fixed number of yields and asserted the queued task arrived first — true
+only if the test thread enqueues that task before the worker exhausts the
+count, which under load it does not. The slow task is now gated by the test
+thread, so its own stated precondition holds by construction. Measured at
+5/400 failures pinned to one CPU before, 0/400 after.
+
 ## v0.25.2 — 2026-07-28
 
 Patch release. Three on-target rounds on the VxWorks 7 guest and the armv7

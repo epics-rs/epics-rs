@@ -2,7 +2,7 @@
 //!
 //! One type, two implementations, chosen by whether a tokio reactor exists:
 //!
-//! * `tokio_backend` — delegates to [`AsyncUdpV4`](super::async_udp_v4::AsyncUdpV4),
+//! * `tokio_backend` — delegates to `AsyncUdpV4` (`super::async_udp_v4`),
 //!   the per-NIC bundle. Unchanged behaviour: the same sockets, the same
 //!   `IP_PKTINFO` receive metadata, the same per-NIC fanout.
 //! * `exec_backend` — **one wildcard socket** plus a receive pump thread.

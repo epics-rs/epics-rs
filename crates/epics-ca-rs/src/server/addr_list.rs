@@ -359,7 +359,7 @@ fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Add
 /// Every target, including RTEMS and VxWorks — the two used to take a stub that
 /// returned nothing, because the enumeration went through `if-addrs`, which
 /// builds for neither. It now goes through
-/// [`epics_libcom_rs::net::iface_v4`], which reaches them via `getifaddrs`.
+/// [`epics_base_rs::net::iface_v4`], which reaches them via `getifaddrs`.
 /// That stub is why a target IOC could resolve a name only through an
 /// explicitly configured name server: with no interfaces there are no
 /// broadcast addresses, so `EPICS_CA_AUTO_ADDR_LIST=YES` — C's default, and

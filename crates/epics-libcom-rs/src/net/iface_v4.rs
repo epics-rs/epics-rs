@@ -58,7 +58,7 @@
 //! that is a *different* encoding again (`VX_IOWR`, `net/ioctl.h`), so the
 //! `SIOCGIFCONF` route would have been two hand-built ioctl number schemes plus
 //! two `struct ifreq` layouts, where `getifaddrs` is one struct that all three
-//! platforms agree on byte for byte (see [`sys`]).
+//! platforms agree on byte for byte (see the `sys` module below).
 //!
 //! # What is *not* here
 //!
@@ -247,7 +247,7 @@ mod sys {
     //! the sixth field `ifa_ifu` and BSD calls it `ifa_dstaddr`.
     //!
     //! So there is one declaration, and the platforms whose `libc` *does* have
-    //! the struct check it rather than being trusted: [`LAYOUT_MATCHES_LIBC`]
+    //! the struct check it rather than being trusted: `LAYOUT_MATCHES_LIBC`
     //! is a `const` assertion against `libc::ifaddrs`, so a wrong field order
     //! here fails to compile on Linux and macOS — the two hosted-Unix
     //! configurations CI builds — instead of silently misreading an address on

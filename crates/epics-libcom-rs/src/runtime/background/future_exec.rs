@@ -708,6 +708,25 @@ mod tests {
         }
     }
 
+    /// Suspends, waking itself each poll, until the flag is set — the
+    /// unbounded [`YieldN`]. For tests whose subject is *that* a task is
+    /// suspended rather than how often: a fixed count makes the test thread
+    /// race the worker, because the worker may exhaust every yield before the
+    /// thread reaches its next statement.
+    struct YieldUntil(Arc<AtomicBool>);
+
+    impl Future for YieldUntil {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
     /// Returns `Pending` `n` times, waking itself each time, then `Ready`.
     /// Exercises the wake-during-poll (`RUNNING_NOTIFIED`) edge on every step.
     struct YieldN(usize);
@@ -817,18 +836,28 @@ mod tests {
 
     #[test]
     fn a_yielding_task_releases_the_worker_to_a_queued_task() {
-        // Single worker, two tasks. `slow` yields many times; `quick` is queued
-        // behind it. Under the old park-a-worker design `quick` could not run
-        // until `slow` finished, so the order would be slow-then-quick. With
-        // the worker released at every suspension, `quick` — already on the
-        // ring when `slow` first re-enqueues at the TAIL — runs first.
+        // Single worker, two tasks. `slow` stays suspended until this thread
+        // releases it; `quick` is queued behind it. Under the old
+        // park-a-worker design `quick` could not run until `slow` finished, so
+        // it would never arrive at all.
+        //
+        // The gate is what makes the order an assertion rather than a race.
+        // Holding `slow` for a fixed number of yields instead leaves the
+        // executor free to burn all of them before this thread has enqueued
+        // `quick` — then "slow" arrives first through no fault of the
+        // executor, which is the flake this shape removes. Gated, `slow`
+        // *cannot* finish before "quick" is received, so "quick" arriving is
+        // itself the proof that a suspended task released the band's only
+        // worker.
         assert_eq!(DEFAULT_THREADS_PER_PRIORITY, 1);
         let pool = CallbackPool::new();
         let (tx, rx) = mpsc::channel::<&'static str>();
+        let gate = Arc::new(AtomicBool::new(false));
 
         let tx_slow = tx.clone();
+        let gate_slow = Arc::clone(&gate);
         let slow = spawn_future(&pool.handle(), CallbackPriority::Medium, async move {
-            YieldN(20).await;
+            YieldUntil(gate_slow).await;
             tx_slow.send("slow").unwrap();
         });
         let quick = spawn_future(&pool.handle(), CallbackPriority::Medium, async move {
@@ -840,6 +869,7 @@ mod tests {
             "quick",
             "a suspended task must not hold the band's only worker"
         );
+        gate.store(true, Ordering::Release);
         assert_eq!(
             rx.recv_timeout(T).unwrap(),
             "slow",

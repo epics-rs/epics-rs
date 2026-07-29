@@ -8,11 +8,8 @@
 //! not set, matching pvxs's `Config::server()` behavior.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-// Only the interface-enumeration surface is v4-specific, and that is
-// host-only (not `epics_embedded_target`) — see `Config`.
-#[cfg(not(epics_embedded_target))]
 use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Expand `$(VAR)` and `${VAR}` references in `input` against the
@@ -318,24 +315,22 @@ impl From<SocketAddr> for Endpoint {
 /// valid spec). Errs when the name has no IPv4 address so the caller can
 /// fall back (best-effort) rather than silently mis-route.
 ///
-/// Host-only: interface enumeration goes through `if-addrs`, which neither
-/// newlib (RTEMS) nor VxWorks's `libc` module provides `getifaddrs`/
-/// `ifaddrs` for (design doc §8.1). Every caller is in the host-only async
-/// I/O layer, so neither embedded target has a user for it; an embedded
-/// interface enumerator (libbsd `getifaddrs` or an ioctl walk, on whichever
-/// target grows one) is owed when the blocking PVA driver lands (§9 phase 6
-/// item 7).
-#[cfg(not(epics_embedded_target))]
+/// Enumerates through [`epics_base_rs::net::iface_v4`] rather than
+/// `if-addrs`, so it exists on every target. That is the enumerator the
+/// design doc's §8.1 item owed: newlib and VxWorks's `libc` module expose no
+/// `getifaddrs`, and `iface_v4` is the workspace's own walk against the BSP's
+/// interface table. The client's UDP SEARCH path needs `@iface` to resolve on
+/// the embedded targets too, and a name that silently failed to resolve there
+/// would send a multicast join out the wrong interface.
 pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
     if let Ok(v4) = spec.parse::<Ipv4Addr>() {
         return Ok(v4);
     }
-    let ifaces = if_addrs::get_if_addrs().map_err(|e| format!("get_if_addrs failed: {e}"))?;
+    let ifaces = epics_base_rs::net::iface_v4::enumerate()
+        .map_err(|e| format!("interface enumeration failed: {e}"))?;
     for iface in ifaces {
         if iface.name == spec {
-            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                return Ok(v4.ip);
-            }
+            return Ok(iface.ip);
         }
     }
     Err(format!("interface {spec:?} has no IPv4 address"))
@@ -1335,24 +1330,19 @@ pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
 /// requests / BEACONs across all subnets the host is attached to.
 /// Skips loopback and interfaces without a broadcast address.
 ///
-/// Host-only (not `epics_embedded_target`) for the same reason as
-/// [`resolve_iface_v4`].
-#[cfg(not(epics_embedded_target))]
+/// Enumerates through [`epics_base_rs::net::iface_v4`], so it exists on every
+/// target — see [`resolve_iface_v4`]. The eligibility and destination rules
+/// are `IfaceV4::search_destination`'s, which are C's
+/// (`osdNetIfAddrs.c:130-151`): up and non-loopback, the broadcast address
+/// unless it is `0.0.0.0`, else a point-to-point peer. The `if-addrs` version
+/// this replaces tested neither `IFF_UP` nor the point-to-point case, so a
+/// configured-but-down NIC contributed a destination and a VPN tunnel
+/// contributed none.
 pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    let Ok(ifaces) = if_addrs::get_if_addrs() else {
-        return out;
-    };
-    for iface in ifaces {
-        if iface.is_loopback() {
-            continue;
-        }
-        if let if_addrs::IfAddr::V4(v4) = iface.addr {
-            if let Some(bcast) = v4.broadcast {
-                out.push(SocketAddr::new(IpAddr::V4(bcast), port));
-            }
-        }
-    }
+    let mut out: Vec<SocketAddr> = epics_base_rs::net::iface_v4::broadcast_addrs()
+        .into_iter()
+        .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+        .collect();
     // Always include limited broadcast as a fallback.
     out.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
     out
@@ -1377,27 +1367,24 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
 ///   loopback-only list (`127.0.0.1`) yields an empty set and no
 ///   broadcast traffic leaves the host.
 ///
-/// Host-only (not `epics_embedded_target`) for the same reason as
-/// [`resolve_iface_v4`].
-#[cfg(not(epics_embedded_target))]
+/// Enumerates through [`epics_base_rs::net::iface_v4`], so it exists on every
+/// target — see [`resolve_iface_v4`].
 pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
     if interfaces.is_empty() || interfaces.iter().any(|ip| ip.is_unspecified()) {
         return list_broadcast_addresses(port);
     }
     let mut out = Vec::new();
     let mut any_non_loopback = false;
-    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+    if let Ok(ifaces) = epics_base_rs::net::iface_v4::enumerate() {
         for want in interfaces {
             if want.is_loopback() {
                 continue;
             }
             for iface in &ifaces {
-                if let if_addrs::IfAddr::V4(v4) = &iface.addr {
-                    if &v4.ip == want {
-                        any_non_loopback = true;
-                        if let Some(bcast) = v4.broadcast {
-                            out.push(SocketAddr::new(IpAddr::V4(bcast), port));
-                        }
+                if &iface.ip == want {
+                    any_non_loopback = true;
+                    if let Some(dest) = iface.search_destination() {
+                        out.push(SocketAddr::new(IpAddr::V4(dest), port));
                     }
                 }
             }

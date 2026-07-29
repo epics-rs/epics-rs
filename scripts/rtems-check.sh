@@ -167,8 +167,8 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # CHOICE. `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
 # implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
 # pva:// record-link resolver — is now on the target (design stage 4). It pulls
-# `epics-pva-rs/client`, whose UDP transport is cfg-gated out so the client
-# compiles for the triple (the ratchet probe below measures zero), and does NOT
+# `epics-pva-rs/client`, whose v4 UDP transport compiles for the triple through
+# `SearchUdpSocket` (the ratchet probe below measures zero), and does NOT
 # pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
 # was `qsrv-core` alone, because `client_native` was 47 errors on this target
@@ -478,17 +478,19 @@ fi
 #     29  after stages 1 and 2  cascade gone with search_engine's TcpStream
 #     28  after server_conn's unconditional tokio::net import was removed
 #      0  after stage 4         UDP transport cfg-gated out of the target build
+#      0  after the v4 SEARCH socket landed — transport compiled IN, still 0
 #
-# Stage 4 closed the remaining 28 (§5): the whole UDP SEARCH/beacon transport —
-# `client_native::udp`, the legacy `client_native::search`, and every UDP-only
-# item in `search_engine.rs` (the `SearchTransport::Udp` variant, `UdpTransport`
-# and its `bind_udp`/broadcast, the bind/join/fanout helpers, `SearchTarget`) —
-# is `#[cfg(not(target_os = "rtems"))]`. On the target `SearchTransport` has the
-# single `NameServersOnly` variant, so "no UDP socket" is a fact about the type
-# rather than a runtime branch, and the three UDP-config spawn entry points
-# construct `NameServersOnly` through `env_transport`/`config_transport`. This is
-# what lets the `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink` bin
-# above pull `epics-pva-rs/client` and still compile for the target.
+# Stage 4 closed the remaining 28 (§5) by gating the whole UDP SEARCH/beacon
+# transport out of the target build. The v4 half is now compiled back IN and the
+# count is still zero: `search_engine.rs` binds through `SearchUdpSocket`, whose
+# `exec_backend` arm is one `std::net::UdpSocket` plus a receive-pump thread, and
+# `config::env`'s interface enumeration goes through
+# `epics_base_rs::net::iface_v4` instead of `if-addrs`. What stays absent is the
+# IPv6 half alone: `V6Socket` is an uninhabited enum there, so `socket2` and
+# `tokio::net` leave the target's compiled unit entirely — which is what keeps
+# this number at zero while the `epics-bridge-rs:realtime-pva-ioc --features
+# qsrv-core,pvalink` bin above pulls `epics-pva-rs/client` and still compiles
+# for the target.
 #
 # The count stays pinned even at zero: a probe that regressed the client back
 # off the target would raise it, and this comparison is what turns that into a
@@ -554,14 +556,15 @@ fi
 #      0  stage C5              UDP SEARCH cfg-gated out of the target build
 #
 # Stage C5 closed the remaining 10 the way PVA stage 4 closed its 28, and for
-# the same reason: they were all UDP. On the target `search::SearchTransport`
-# has the single `NameServersOnly` variant — `UdpTransport`, `bind_udp`, the
-# fanout/DNS-refresh helpers, `run_search_engine` and the whole
-# `EPICS_CA_ADDR_LIST` parse (`AddrEntry`, `resolve_host`,
-# `parse_addr_list_with_hostnames`, `append_auto_addr_entries`) are
-# `#[cfg(not(target_os = "rtems"))]`. "No UDP socket" is a fact about the type,
-# not a runtime branch, and `CaClient::new_with_config` reaches
-# `name_servers_only_search_engine` by `cfg` rather than by choice.
+# the same reason: they were all UDP. That row is history, not the current
+# shape: the SEARCH socket has since come back, on every backend, through
+# `SearchUdpSocket`. `UdpTransport`, `bind_udp`, the fanout/DNS-refresh
+# helpers, `run_search_engine` and the whole `EPICS_CA_ADDR_LIST` parse
+# (`AddrEntry`, `resolve_host`, `parse_addr_list_with_hostnames`,
+# `append_auto_addr_entries`) are ungated, and `CaClient::new_with_config`
+# reaches `name_servers_only_search_engine` by configuration rather than by
+# `cfg`. "No UDP socket" is still a fact about the type — `NameServersOnly`
+# holds none — but it is no longer a fact about the target.
 #
 # The probe is RETIRED rather than left pinned at zero, and the replacement is
 # STRICTER, not looser: `CRATE_FEATURES[epics-ca-rs]="client-core"` above makes
@@ -586,5 +589,5 @@ else
     log "crate and target binary compiles for the generated native-TLS spec, in"
     log "both the portability and the image configuration."
 fi
-log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (UDP transport cfg-gated out)."
+log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (v4 UDP transport compiled in; only the IPv6 half is absent)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

@@ -409,6 +409,63 @@ mod ioc {
         epics_rtems_boot::stats::stack_report(tag);
     }
 
+    /// STAGE-5 PROBE: prove a PVA SEARCH broadcast round-trips on this target.
+    ///
+    /// Drives the **real** client search engine with no name servers
+    /// configured, so what it reports on is the whole UDP path — bind, the
+    /// per-interface broadcast fanout, the server's own UDP responder, and the
+    /// SEARCH_RESPONSE decode — rather than just that a datagram left the box.
+    /// `pv` is one this IOC serves itself, so the answer comes from this
+    /// guest's own PVA server via its subnet broadcast address, which is the
+    /// only reachable responder under SLIRP.
+    ///
+    /// Its own engine and not the pvalink resolver's: a failure here must name
+    /// the transport, and a resolver that also has TCP name servers configured
+    /// would resolve through those and report success for the wrong reason.
+    #[cfg(feature = "bringup-probes")]
+    fn udp_search_report(pv: &str) {
+        use epics_base_rs::runtime::task::{block_on_sync, timeout};
+        use epics_pva_rs::client_native::search_engine::{
+            ClientSearchConfig, SearchEngine, SearchReason,
+        };
+        use std::time::Duration;
+
+        let outcome = block_on_sync(async {
+            let config = ClientSearchConfig::from_env();
+            let bport = config.broadcast_port;
+            // No name servers, no extra targets: auto-address broadcast is the
+            // only way this engine can reach anything.
+            let engine = SearchEngine::spawn_with_config(
+                config,
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+                String::new(),
+                Duration::from_secs(1),
+            )
+            .await?;
+            println!("UDPSEARCH broadcast_port={bport} pv={pv}");
+            let hit = timeout(
+                Duration::from_secs(5),
+                engine.find(pv, SearchReason::Initial),
+            )
+            .await
+            .map_err(|_| {
+                epics_pva_rs::error::PvaError::Protocol("no SEARCH_RESPONSE in 5 s".into())
+            })??;
+            Ok::<_, epics_pva_rs::error::PvaError>(hit)
+        });
+
+        match outcome {
+            Ok(Ok(hit)) => println!(
+                "UDPSEARCH reply pv={pv} server={} guid={:02x?} proto={} version={}",
+                hit.server, hit.guid, hit.proto, hit.peer_version
+            ),
+            Ok(Err(e)) => eprintln!("UDPSEARCH failed pv={pv}: {e}"),
+            Err(e) => eprintln!("UDPSEARCH not runnable here: {e:?}"),
+        }
+    }
+
     /// STAGE-5 PROBE: one console report — the link registry, the ONE
     /// client's connection list, and the two link-bearing records.
     ///
@@ -791,13 +848,13 @@ mod ioc {
         // the loaded database configured none — because on a target with no
         // shell the console is the only place an operator can confirm the
         // resolver came up and how many links it pre-registered. The client
-        // reaches upstream servers over `EPICS_PVA_NAME_SERVERS` (TCP); the UDP
-        // SEARCH transport is compiled out on this target (design §4.2), so a
-        // link to a server reachable only by broadcast will not resolve.
+        // reaches upstream servers both ways now: UDP SEARCH broadcast to the
+        // interfaces' own destinations, and any `EPICS_PVA_NAME_SERVERS` over
+        // TCP.
         println!(
             "realtime-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
-             link{} pre-registered; pva://... INP/OUT resolve over EPICS_PVA_NAME_SERVERS \
-             (TCP name servers; UDP search is compiled out on this target)",
+             link{} pre-registered; pva://... INP/OUT resolve over UDP SEARCH \
+             broadcast and EPICS_PVA_NAME_SERVERS (TCP)",
             if link_count == 1 { "" } else { "s" },
         );
         for name in &names {
@@ -830,6 +887,10 @@ mod ioc {
                     let _ = epics_base_rs::runtime::ioc_role::enter_ioc_role(
                         epics_base_rs::runtime::ioc_role::IocRole::ConsoleCensus,
                     );
+                    // Once, before the periodic census: the transport either
+                    // round-trips or it does not, and repeating it every 10 s
+                    // would bury the answer in the report stream.
+                    udp_search_report("RTEMS:PVA:AO");
                     let mut seq = 0u32;
                     loop {
                         thread::sleep(std::time::Duration::from_secs(10));

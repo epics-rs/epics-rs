@@ -18,11 +18,12 @@
 //!   that channel immediately.
 //! - Beacon anomaly throttling via [`super::beacon_throttle::BeaconTracker`].
 
-// (11 tests that spin the live UDP search engine gated out feature-ON below;
-// §4.2 defers UDP search, so their spawned timers/socket cannot run on the
-// reactor-less callback pool — stage 3.)
+// The tests that spin a live UDP search engine now run feature-ON too: the
+// engine binds a `SearchUdpSocket` on every backend, so a mock UDP responder
+// receives the SEARCH on the exec backend exactly as it does on the host. The
+// three that stay gated are the IPv6 ones, whose subject is uninhabited there.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(14): checked - these run and pass in the feature-ON suite.
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -30,40 +31,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-// The UDP SEARCH/beacon transport is compiled out wherever a spawned future
-// has no tokio reactor — `cfg(exec_backend)`, which is either embedded
-// target (RTEMS or VxWorks) *and* a host `--features rtems-exec-model`
-// build. Two facts, one gate:
+// The v4 UDP SEARCH/beacon transport is bound on **every** backend, through
+// `SearchUdpSocket` — one type whose `exec_backend` arm is a single wildcard
+// socket with a receive-pump thread, because there is no reactor to register
+// a `tokio::net::UdpSocket` with there.
 //
-//   * On RTEMS, newlib has no `recvmsg`/`IP_PKTINFO` original-destination
-//     recovery and `local_addr()` cannot be read back to stamp a SEARCH
-//     response port, so a UDP search would advertise port 0 and never be
-//     answered (doc/pvalink-rtems-design.md §4.2). It is gated out on
-//     VxWorks too — `AsyncUdpV4`'s `tokio::net`/`socket2`/`if-addrs` stack
-//     does not build for either embedded target, so the module stays one
-//     host-only unit rather than a per-target reason each.
-//   * On either backend-free build this engine runs on a callback-pool worker
-//     (`runtime::task::spawn`), and `tokio::net::UdpSocket` panics there —
-//     "there is no reactor running" — even when the process has a runtime
-//     somewhere else, because it is not entered on that worker.
+// It used to be compiled out on `exec_backend` entirely, for two stated
+// reasons. The second was real and is what `SearchUdpSocket` answers: this
+// engine runs on a callback-pool worker (`runtime::task::spawn`), and
+// `tokio::net::UdpSocket` panics there — "there is no reactor running" — even
+// when the process has a runtime somewhere else, because it is not entered on
+// that worker. Gating on `not(target_os = "rtems")` missed exactly that, so a
+// hosted `rtems-exec-model` build compiled the transport in, selected it, and
+// panicked at `realtime-pva-ioc`'s first search.
 //
-// Gating this on `not(target_os = "rtems")` named the first fact and missed
-// the second, so a hosted `rtems-exec-model` build compiled the UDP transport
-// in, selected it, and panicked in `bind_ephemeral_udp` at `realtime-pva-ioc`'s
-// first search (`doc/calink-rtems-design.md` §10.10 item 2, measured).
-// `tokio_backend` is the predicate that means "a reactor exists" and is the
-// one the whole `AsyncUdpV4`/`UdpSocket` surface below carries, so "no UDP in
-// this build" holds by construction. The target's compiled surface is
-// unchanged: `epics_embedded_target` (RTEMS or VxWorks) implies
-// `exec_backend`.
+// The first reason was that RTEMS could not read `local_addr()` back to stamp
+// a SEARCH response port, so it would advertise port 0 and never be answered
+// (doc/pvalink-rtems-design.md §4.2). That premise is false: it was the
+// `sin_len` libc defect, fixed in the pinned `libc` patch, and a bound socket
+// on RTEMS 6 now reports its port — MEASURED on target, `UDPSEARCH
+// bound=[0.0.0.0:55153]`.
 //
-// Either way everything the client reaches goes over TCP name servers via the
-// `SearchTransport::NameServersOnly` seam.
-#[cfg(tokio_backend)]
-use epics_base_rs::net::AsyncUdpV4;
+// What remains target-shaped is the IPv6 half alone; see [`V6Socket`].
+use epics_base_rs::net::search_udp::SearchUdpSocket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(tokio_backend)]
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 // The periodic/one-shot timers come from the `runtime::task` seam, NOT from
 // `tokio::time`: this loop is spawned through `runtime::task::spawn`, which on
@@ -78,9 +69,6 @@ use tokio::sync::{mpsc, oneshot};
 // keeps the two from being different timelines.
 use epics_base_rs::runtime::task::{Instant, Interval, interval, sleep, sleep_until};
 use tracing::debug;
-// `warn!` only fires from the UDP bind/broadcast paths, which are gated out on
-// `exec_backend` — so the import is too, or it is unused there.
-#[cfg(tokio_backend)]
 use tracing::warn;
 
 use crate::codec::PvaCodec;
@@ -373,19 +361,21 @@ impl Default for ClientSearchConfig {
 /// cannot be configured independently, and so the per-client
 /// `EPICS_PVA_*` UDP knobs are resolved once at bind time rather than
 /// re-read from the process environment each tick.
-#[cfg(tokio_backend)]
 struct UdpTransport {
-    /// Ephemeral all-NIC v4 SEARCH socket: sends SEARCH, receives the
-    /// unicast SEARCH_RESPONSE.
-    search_socket: AsyncUdpV4,
+    /// Ephemeral v4 SEARCH socket: sends SEARCH, receives the unicast
+    /// SEARCH_RESPONSE. All-NIC on the host, one wildcard socket on
+    /// `exec_backend`; either way one port, which is what
+    /// [`Self::response_port`] advertises.
+    search_socket: SearchUdpSocket,
     /// PR #205 IPv6 Stage 4: optional v6 SEARCH socket. `None` when the
-    /// host has no usable IPv6 stack.
-    search_socket_v6: Option<Arc<UdpSocket>>,
+    /// host has no usable IPv6 stack, and always `None` on `exec_backend`,
+    /// where [`V6Socket`] is uninhabited.
+    search_socket_v6: Option<V6Socket>,
     /// Beacon listener on [`Self::broadcast_port`]. `None` when the bind
     /// failed — beacon-driven fast reconnect is best-effort.
-    beacon_socket: Option<AsyncUdpV4>,
+    beacon_socket: Option<SearchUdpSocket>,
     /// PR #205 IPv6 Stage 6: optional v6 multicast beacon listener.
-    beacon_socket_v6: Option<Arc<UdpSocket>>,
+    beacon_socket_v6: Option<V6Socket>,
     /// Explicit `addr_list` UDP SEARCH targets (already merged with any
     /// programmatic extras) — every datagram is sent to each of these.
     extra_targets: Vec<SocketAddr>,
@@ -418,19 +408,15 @@ struct UdpTransport {
 /// piece of state lives inside the variant that owns the sockets, and each
 /// UDP `select!` arm is a method on this type — so "a UDP socket is bound"
 /// and "the arm that reads it is armed" are the same match rather than two
-/// facts that can disagree. An `Option<AsyncUdpV4>` plus an `if let` per arm
-/// would leave them able to disagree, and the RTEMS target
-/// (`doc/pvalink-rtems-design.md` §4.2) is precisely the configuration where
-/// they would: there is no `recvmsg`/`IP_PKTINFO` for the UDP receive path,
-/// and `local_addr()` cannot be read back to stamp a response port.
+/// facts that can disagree. An `Option<SearchUdpSocket>` plus an `if let` per
+/// arm would leave them able to disagree.
 enum SearchTransport {
     /// UDP SEARCH and beacon receive, alongside any TCP name servers.
     ///
-    /// Compiled out on `exec_backend` — there is no UDP transport to hold,
-    /// so `NameServersOnly` is the only variant and "no UDP socket" is a fact
-    /// about the type rather than a runtime branch (§4.2). See the module-head
-    /// note on why the gate is the backend and not the target.
-    #[cfg(tokio_backend)]
+    /// Built on every backend. The `exec_backend` arm of [`SearchUdpSocket`]
+    /// is one wildcard socket with a receive pump instead of a per-NIC
+    /// reactor bundle, which is libca's own model and pvxs's beacon-listener
+    /// model (`udp_collector.cpp:140`).
     Udp(Box<UdpTransport>),
     /// No UDP socket is bound at all. Every SEARCH goes out over the
     /// configured TCP name servers (`ns_task`), and every UDP arm parks
@@ -447,7 +433,6 @@ impl SearchTransport {
     /// `addr_list` is merged into them here (pva2pva client-config
     /// semantics: address-list entries are UDP SEARCH destinations on
     /// `broadcast_port`, never TCP name servers).
-    #[cfg(tokio_backend)]
     fn bind_udp(
         config: &ClientSearchConfig,
         mut extra_targets: Vec<SocketAddr>,
@@ -475,7 +460,7 @@ impl SearchTransport {
         // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
-        let search_socket_v6 = bind_ephemeral_udp_v6();
+        let search_socket_v6 = V6Socket::bind_search();
         // Beacon receive uses the per-client UDP port and joins the
         // per-client address-list multicast groups (pvxs `udp_port`).
         let beacon_socket = bind_beacon_udp(config.broadcast_port, &config.addr_list); // Optional.
@@ -483,7 +468,7 @@ impl SearchTransport {
         // `[::]:5076` joined to `ff0e::400`. Receives v6 multicast
         // beacons emitted by the server's Stage 5 path. None when the
         // host has no v6.
-        let beacon_socket_v6 = bind_beacon_udp_v6(config.broadcast_port);
+        let beacon_socket_v6 = V6Socket::bind_beacon(config.broadcast_port);
 
         // Merge the per-client address-list UDP SEARCH targets into
         // `extra_targets`. The list was parsed once (DNS-resolved,
@@ -539,8 +524,7 @@ impl SearchTransport {
             .unwrap_or(0);
         let response_port_v6 = search_socket_v6
             .as_ref()
-            .and_then(|s| s.local_addr().ok())
-            .map(|a| a.port())
+            .and_then(|s| s.local_port())
             .unwrap_or(response_port);
 
         Ok(Self::Udp(Box::new(UdpTransport {
@@ -563,7 +547,6 @@ impl SearchTransport {
     fn has_no_udp_destinations(&self) -> bool {
         match self {
             Self::NameServersOnly => true,
-            #[cfg(tokio_backend)]
             Self::Udp(u) => u.extra_targets.is_empty() && !u.auto_addr_list,
         }
     }
@@ -578,22 +561,23 @@ impl SearchTransport {
     /// (`stage1_name_servers_only_resolves_without_binding_udp`) rather
     /// than being production surface that happens to be tested.
     #[cfg(test)]
-    // Only consumer is the gated `stage1_name_servers_only_resolves_without_binding_udp`,
-    // so it carries the same predicate — otherwise dead code feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
             Self::Udp(u) => {
                 let mut addrs = u.search_socket.local_addrs();
                 if let Some(s) = &u.search_socket_v6 {
-                    addrs.extend(s.local_addr().ok());
+                    addrs.extend(s.local_port().map(|p| {
+                        SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0))
+                    }));
                 }
                 if let Some(s) = &u.beacon_socket {
                     addrs.extend(s.local_addrs());
                 }
                 if let Some(s) = &u.beacon_socket_v6 {
-                    addrs.extend(s.local_addr().ok());
+                    addrs.extend(s.local_port().map(|p| {
+                        SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, p, 0, 0))
+                    }));
                 }
                 addrs
             }
@@ -605,8 +589,7 @@ impl SearchTransport {
     /// socket already used.
     async fn recv_search(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(tokio_backend)]
-            Self::Udp(u) => u.search_socket.recv_from(buf).await,
+            Self::Udp(u) => u.search_socket.recv(buf).await.map(|d| (d.n, d.src)),
             Self::NameServersOnly => {
                 let _ = buf;
                 std::future::pending().await
@@ -618,7 +601,6 @@ impl SearchTransport {
     /// without a UDP transport, and equally when v6 is unavailable.
     async fn recv_search_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => recv_from_v6(u.search_socket_v6.as_ref(), buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
@@ -630,9 +612,8 @@ impl SearchTransport {
     /// `select!` arm: the next v4 BEACON datagram.
     async fn recv_beacon(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => match &u.beacon_socket {
-                Some(s) => s.recv_from(buf).await,
+                Some(s) => s.recv(buf).await.map(|d| (d.n, d.src)),
                 None => std::future::pending().await,
             },
             Self::NameServersOnly => {
@@ -645,7 +626,6 @@ impl SearchTransport {
     /// `select!` arm: the next v6 multicast BEACON datagram.
     async fn recv_beacon_v6(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => recv_from_v6(u.beacon_socket_v6.as_ref(), buf).await,
             Self::NameServersOnly => {
                 let _ = buf;
@@ -665,7 +645,6 @@ impl SearchTransport {
         send_errs: &mut HashSet<SocketAddr>,
     ) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Pack the same entries with each family's response port. The
                 // port field is fixed-width, so the two sets batch identically
@@ -676,9 +655,9 @@ impl SearchTransport {
                     u.broadcast(frame_v4, frame_v6, send_errs).await;
                 }
             }
-            // No UDP transport (RTEMS target, or a name-servers-only host
-            // engine): nothing is packed or sent — the frames would advertise
-            // response ports that only exist inside `UdpTransport`.
+            // A name-servers-only engine: nothing is packed or sent — the
+            // frames would advertise response ports that only exist inside
+            // `UdpTransport`.
             Self::NameServersOnly => {
                 let _ = (codec, entries, send_errs);
             }
@@ -691,7 +670,6 @@ impl SearchTransport {
     /// nature — discovery has no name-server equivalent.
     async fn broadcast_discover(&self, codec: &PvaCodec, send_errs: &mut HashSet<SocketAddr>) {
         match self {
-            #[cfg(tokio_backend)]
             Self::Udp(u) => {
                 // Stamp the fixed pvxs `search_seq` ("find") rather than a fresh
                 // randomized id: the discovery-pong receive path gates on this
@@ -738,19 +716,11 @@ impl SearchEngine {
     }
 
     /// Build the SEARCH transport from the process environment: a bound UDP
-    /// socket bundle on `tokio_backend`, and
-    /// [`SearchTransport::NameServersOnly`] on `exec_backend`, where no UDP
-    /// socket can be bound (§4.2). The single place that choice is made, so
-    /// the three UDP-config spawn entry points collapse to name-servers-only
-    /// there rather than each naming `bind_udp` (which does not exist there).
-    #[cfg(tokio_backend)]
+    /// SEARCH socket plus the optional beacon listener, on every backend. The
+    /// single place that choice is made, so the three UDP-config spawn entry
+    /// points cannot drift apart.
     fn env_transport(extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
         SearchTransport::bind_udp(&ClientSearchConfig::from_env(), extra_targets)
-    }
-
-    #[cfg(exec_backend)]
-    fn env_transport(_extra_targets: Vec<SocketAddr>) -> PvaResult<SearchTransport> {
-        Ok(SearchTransport::NameServersOnly)
     }
 
     /// Spawn with an explicit per-client UDP SEARCH config (address list /
@@ -778,25 +748,13 @@ impl SearchEngine {
     }
 
     /// Build the SEARCH transport from an explicit per-client
-    /// [`ClientSearchConfig`]: a bound UDP socket bundle on `tokio_backend`,
-    /// [`SearchTransport::NameServersOnly`] on `exec_backend` (§4.2). The
-    /// config's UDP knobs (address list, ports, auto-addr) have no effect
-    /// there, where there is no UDP socket to apply them to; the caller's TCP
-    /// name servers still reach every server.
-    #[cfg(tokio_backend)]
+    /// [`ClientSearchConfig`] rather than the process environment. Its UDP
+    /// knobs (address list, ports, auto-addr) apply on every backend.
     fn config_transport(
         config: ClientSearchConfig,
         extra_targets: Vec<SocketAddr>,
     ) -> PvaResult<SearchTransport> {
         SearchTransport::bind_udp(&config, extra_targets)
-    }
-
-    #[cfg(exec_backend)]
-    fn config_transport(
-        _config: ClientSearchConfig,
-        _extra_targets: Vec<SocketAddr>,
-    ) -> PvaResult<SearchTransport> {
-        Ok(SearchTransport::NameServersOnly)
     }
 
     /// Spawn with the client's CA credentials for TCP name-server connections,
@@ -825,11 +783,10 @@ impl SearchEngine {
     /// Spawn an engine that binds **no UDP socket at all** and reaches every
     /// server over the TCP name servers alone (`EPICS_PVA_NAME_SERVERS`).
     ///
-    /// This is the RTEMS client configuration (`doc/pvalink-rtems-design.md`
-    /// §4.2): the target has no `recvmsg`/`IP_PKTINFO` for the UDP receive
-    /// path and cannot read a socket's `local_addr()` back to stamp a SEARCH
-    /// response port, so a UDP search would advertise port 0 and never be
-    /// answered. TCP name-server search needs neither.
+    /// An explicit configuration choice, not a target's capability: every
+    /// backend can bind the UDP transport, and [`Self::spawn`] does. This is
+    /// for a client that must not emit broadcast at all — a locked-down
+    /// subnet, or a gateway reached only through `EPICS_PVA_NAME_SERVERS`.
     ///
     /// It is a deliberate deviation from pvxs, which always binds its search
     /// and beacon sockets (`client.cpp:578-590`, `:638-650`) regardless of
@@ -1024,10 +981,196 @@ impl SearchEngine {
     }
 }
 
-// ── UDP socket helpers ──────────────────────────────────────────────────
+// ── The IPv6 half ───────────────────────────────────────────────────────
+
+/// The client's IPv6 SEARCH or beacon socket, where one can exist at all.
+///
+/// This is the one part of the UDP transport that does not cross to the
+/// embedded targets, and the reason is the dependency graph rather than a
+/// design choice: both binders are `socket2` (newlib has no `msghdr` /
+/// `recvmsg` / `ip_mreqn`, and neither does VxWorks's `libc` module) and the
+/// receive is `tokio::net::UdpSocket`, whose `net` feature is not enabled on
+/// either target because mio has no selector there.
+///
+/// So on `exec_backend` the type is **uninhabited**. `Option<V6Socket>` is
+/// then `None` by construction rather than by a runtime check that a build
+/// could get wrong, every method below reduces to `match *self {}`, and the
+/// `socket2`/`tokio::net` surface leaves the target's compiled unit entirely.
+/// That is the shape the whole transport used to have as a `SearchTransport`
+/// variant, kept for the half that is genuinely unreachable.
+#[cfg(tokio_backend)]
+struct V6Socket(Arc<tokio::net::UdpSocket>);
+
+#[cfg(exec_backend)]
+enum V6Socket {}
 
 #[cfg(tokio_backend)]
-fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
+impl V6Socket {
+    /// PR #205 IPv6 Stage 4: a v6-only ephemeral socket used to send SEARCH
+    /// to IPv6 destinations (unicast servers from `EPICS_PVA_ADDR_LIST` and
+    /// the v6 multicast group). `None` when the host lacks IPv6 — the engine
+    /// keeps running IPv4-only.
+    ///
+    /// Sets `IPV6_V6ONLY=true` explicitly so the v6 socket cannot accept
+    /// v4-mapped traffic that would otherwise duplicate what the v4 SEARCH
+    /// socket already handles.
+    fn bind_search() -> Option<Self> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("IPv6 SEARCH socket: socket() failed: {e}; v6 disabled");
+                return None;
+            }
+        };
+        if let Err(e) = sock.set_only_v6(true) {
+            debug!("IPv6 SEARCH socket: set_only_v6 failed: {e}");
+        }
+        if let Err(e) = sock.set_nonblocking(true) {
+            debug!("IPv6 SEARCH socket: set_nonblocking failed: {e}");
+            return None;
+        }
+        // Multicast TTL=1 (link-local only) is the safe default — matches
+        // pvxs `udp_collector.cpp` v6 send path.
+        if let Err(e) = sock.set_multicast_hops_v6(1) {
+            debug!("IPv6 SEARCH socket: set_multicast_hops_v6 failed: {e}");
+        }
+        let bind =
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+        if let Err(e) = sock.bind(&bind.into()) {
+            debug!("IPv6 SEARCH socket: bind {bind} failed: {e}; v6 disabled");
+            return None;
+        }
+        Self::adopt(sock, "IPv6 SEARCH socket")
+    }
+
+    /// PR #205 IPv6 Stage 6: a v6 beacon listener on `[::]:port` with
+    /// `SO_REUSEADDR`/`SO_REUSEPORT` + `IPV6_V6ONLY=1`, joined to the default
+    /// v6 PVA multicast group `ff0e::400`. `None` when the host lacks v6 or
+    /// the bind fails — fast-reconnect via v6 beacons is best-effort and the
+    /// v4 beacon socket keeps doing its job.
+    fn bind_beacon(port: u16) -> Option<Self> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("v6 beacon socket: socket() failed: {e}; v6 beacon recv disabled");
+                return None;
+            }
+        };
+        if let Err(e) = sock.set_only_v6(true) {
+            debug!("v6 beacon socket: set_only_v6 failed: {e}");
+        }
+        // Mirror the v4 beacon socket setup: SO_REUSEADDR + SO_REUSEPORT so
+        // a server v6 SEARCH listener on `[::]:port` and a client v6 beacon
+        // listener can coexist. The server emits beacons FROM a separate
+        // ephemeral socket, so this REUSEPORT-shared listener only receives.
+        //
+        // SO_REUSEADDR on every platform, Windows included: pvxs puts its UDP
+        // sockets through `epicsSocketEnableAddressUseForDatagramFanout`
+        // (udp_collector.cpp:136), and that libcom helper has no `#ifdef
+        // _WIN32` — the Windows carve-out belongs to the TCP time-wait helper,
+        // not this one. Skipping it here would stop a second PVA process on a
+        // Windows host from co-binding the beacon port.
+        if let Err(e) = sock.set_reuse_address(true) {
+            debug!("v6 beacon socket: set_reuse_address failed: {e}");
+        }
+        #[cfg(unix)]
+        if let Err(e) = sock.set_reuse_port(true) {
+            debug!("v6 beacon socket: set_reuse_port failed: {e}");
+        }
+        if let Err(e) = sock.set_nonblocking(true) {
+            debug!("v6 beacon socket: set_nonblocking failed: {e}");
+            return None;
+        }
+
+        let bind = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            port,
+            0,
+            0,
+        ));
+        if let Err(e) = sock.bind(&bind.into()) {
+            debug!("v6 beacon socket: bind {bind} failed: {e}; v6 beacon recv disabled");
+            return None;
+        }
+
+        let adopted = Self::adopt(sock, "v6 beacon socket")?;
+        // Join the default PVA v6 multicast group on the unspecified
+        // interface (let the OS pick). Additional groups from
+        // EPICS_PVA_ADDR_LIST are joined separately.
+        if let Err(e) = adopted.0.join_multicast_v6(&DEFAULT_V6_MULTICAST_GROUP, 0) {
+            debug!(
+                "v6 beacon socket: join_multicast_v6 ff0e::400 failed: {e}; \
+                 v6 multicast beacons will not be received"
+            );
+        }
+        Some(adopted)
+    }
+
+    fn adopt(sock: socket2::Socket, what: &str) -> Option<Self> {
+        let std_sock: std::net::UdpSocket = sock.into();
+        match tokio::net::UdpSocket::from_std(std_sock) {
+            Ok(s) => Some(Self(Arc::new(s))),
+            Err(e) => {
+                debug!("{what}: tokio adoption failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn local_port(&self) -> Option<u16> {
+        self.0.local_addr().ok().map(|a| a.port())
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
+        self.0.send_to(buf, dest).await
+    }
+}
+
+#[cfg(exec_backend)]
+impl V6Socket {
+    fn bind_search() -> Option<Self> {
+        None
+    }
+
+    fn bind_beacon(_port: u16) -> Option<Self> {
+        None
+    }
+
+    fn local_port(&self) -> Option<u16> {
+        match *self {}
+    }
+
+    async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match *self {}
+    }
+
+    async fn send_to(&self, _buf: &[u8], _dest: SocketAddr) -> std::io::Result<usize> {
+        match *self {}
+    }
+}
+
+// ── UDP socket helpers ──────────────────────────────────────────────────
+
+/// The band the `exec_backend` SEARCH-receive pump runs at.
+///
+/// pvxs receives SEARCH replies, beacons and client TCP traffic on one
+/// libevent loop thread (`client.cpp`), so upstream derives no separate UDP
+/// band for the client at all. Taking the TCP pumps' own band is therefore the
+/// parity answer rather than a number invented here: splitting how the work is
+/// scheduled *internally* must not change how it is scheduled relative to
+/// everything else. The host arm receives on the reactor and ignores it.
+const PVA_SEARCH_UDP_PRIORITY: epics_base_rs::runtime::task::ThreadPriority =
+    super::server_conn::PVA_CLIENT_PRIORITY;
+
+fn bind_ephemeral_udp() -> PvaResult<SearchUdpSocket> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
     // identical so the IOC's response lands on the right
@@ -1044,63 +1187,14 @@ fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // `INTF_ADDR_LIST=127.0.0.1`; the interface constraint now lives only
     // in `search_targets` (auto-broadcast generation) and `broadcast`'s
     // limited-broadcast / multicast fanout egress.
-    AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
-}
-
-/// PR #205 IPv6 Stage 4: bind a v6-only ephemeral UDP socket used to
-/// send SEARCH to IPv6 destinations (unicast servers from
-/// `EPICS_PVA_ADDR_LIST` and the v6 multicast group). Returns `None`
-/// when the host lacks IPv6 (bind fails) — the engine keeps running
-/// IPv4-only in that case.
-///
-/// Sets `IPV6_V6ONLY=true` explicitly so the v6 socket cannot accept
-/// v4-mapped traffic that would otherwise duplicate what the
-/// `AsyncUdpV4` search socket already handles.
-#[cfg(tokio_backend)]
-fn bind_ephemeral_udp_v6() -> Option<Arc<UdpSocket>> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("IPv6 SEARCH socket: socket() failed: {e}; v6 disabled");
-            return None;
-        }
-    };
-    if let Err(e) = sock.set_only_v6(true) {
-        debug!("IPv6 SEARCH socket: set_only_v6 failed: {e}");
-    }
-    if let Err(e) = sock.set_nonblocking(true) {
-        debug!("IPv6 SEARCH socket: set_nonblocking failed: {e}");
-        return None;
-    }
-    // Multicast TTL=1 (link-local only) is the safe default — matches
-    // pvxs `udp_collector.cpp` v6 send path.
-    if let Err(e) = sock.set_multicast_hops_v6(1) {
-        debug!("IPv6 SEARCH socket: set_multicast_hops_v6 failed: {e}");
-    }
-    let bind =
-        std::net::SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
-    if let Err(e) = sock.bind(&bind.into()) {
-        debug!("IPv6 SEARCH socket: bind {bind} failed: {e}; v6 disabled");
-        return None;
-    }
-    let std_sock: std::net::UdpSocket = sock.into();
-    match UdpSocket::from_std(std_sock) {
-        Ok(s) => Some(Arc::new(s)),
-        Err(e) => {
-            debug!("IPv6 SEARCH socket: tokio adoption failed: {e}");
-            None
-        }
-    }
+    SearchUdpSocket::bind_ephemeral(true, "PVAC-UDP", PVA_SEARCH_UDP_PRIORITY).map_err(PvaError::Io)
 }
 
 /// `select!`-friendly recv helper: yields the next datagram from the
 /// optional v6 socket, or parks forever when v6 is disabled. Shared by the
 /// v6 search and v6 beacon arms of [`SearchTransport`].
-#[cfg(tokio_backend)]
 async fn recv_from_v6(
-    sock: Option<&Arc<UdpSocket>>,
+    sock: Option<&V6Socket>,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, SocketAddr)> {
     match sock {
@@ -1109,18 +1203,17 @@ async fn recv_from_v6(
     }
 }
 
-#[cfg(tokio_backend)]
-fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<AsyncUdpV4> {
-    // Skip the loopback NIC: any local pva-rs *server* has its UDP
-    // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
-    // co-bound client beacon socket on the same (addr, port) would
-    // race with the server for inbound SEARCH packets via the kernel's
-    // REUSEPORT load-balancing on macOS / Linux. Beacons that the
-    // local server emits go to NIC subnet broadcasts (never to the
-    // loopback addr — see `config::env::list_broadcast_addresses`
-    // which filters loopback), so dropping the loopback bind here
-    // costs nothing on the receive side.
-    let sock = match AsyncUdpV4::bind_non_loopback(port, true) {
+fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<SearchUdpSocket> {
+    // The host arm skips the loopback NIC, which a per-NIC bundle can do and
+    // one wildcard socket cannot: any local pva-rs *server* has its UDP
+    // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a co-bound
+    // client beacon socket on the same (addr, port) would race with the
+    // server for inbound SEARCH packets via the kernel's REUSEPORT
+    // load-balancing on macOS / Linux. Beacons that the local server emits go
+    // to NIC subnet broadcasts (never to the loopback addr — see
+    // `config::env::list_broadcast_addresses`, which filters loopback), so
+    // dropping the loopback bind costs nothing on the receive side.
+    let sock = match SearchUdpSocket::bind_beacon(port, "PVAC-beacon", PVA_SEARCH_UDP_PRIORITY) {
         Ok(s) => s,
         Err(e) => {
             debug!("beacon socket bind to {port} failed: {e}; fast-reconnect disabled");
@@ -1136,80 +1229,6 @@ fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<A
     Some(sock)
 }
 
-/// PR #205 IPv6 Stage 6: bind a v6 beacon listener on `[::]:port` with
-/// `SO_REUSEADDR`/`SO_REUSEPORT` + `IPV6_V6ONLY=1`, then join the
-/// default v6 PVA multicast group `ff0e::400`. Returns `None` when the
-/// host lacks v6 or the bind fails — fast-reconnect via v6 beacons is
-/// best-effort, the v4 beacon socket keeps doing its job.
-#[cfg(tokio_backend)]
-fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("v6 beacon socket: socket() failed: {e}; v6 beacon recv disabled");
-            return None;
-        }
-    };
-    if let Err(e) = sock.set_only_v6(true) {
-        debug!("v6 beacon socket: set_only_v6 failed: {e}");
-    }
-    // Mirror the v4 beacon socket setup: SO_REUSEADDR + SO_REUSEPORT so
-    // a server v6 SEARCH listener on `[::]:port` and a client v6 beacon
-    // listener can coexist. The server emits beacons FROM a separate
-    // ephemeral socket, so this REUSEPORT-shared listener only receives.
-    //
-    // SO_REUSEADDR on every platform, Windows included: pvxs puts its UDP
-    // sockets through `epicsSocketEnableAddressUseForDatagramFanout`
-    // (udp_collector.cpp:136), and that libcom helper has no `#ifdef
-    // _WIN32` — the Windows carve-out belongs to the TCP time-wait helper,
-    // not this one. Skipping it here would stop a second PVA process on a
-    // Windows host from co-binding the beacon port.
-    if let Err(e) = sock.set_reuse_address(true) {
-        debug!("v6 beacon socket: set_reuse_address failed: {e}");
-    }
-    #[cfg(unix)]
-    if let Err(e) = sock.set_reuse_port(true) {
-        debug!("v6 beacon socket: set_reuse_port failed: {e}");
-    }
-    if let Err(e) = sock.set_nonblocking(true) {
-        debug!("v6 beacon socket: set_nonblocking failed: {e}");
-        return None;
-    }
-
-    let bind = SocketAddr::V6(std::net::SocketAddrV6::new(
-        Ipv6Addr::UNSPECIFIED,
-        port,
-        0,
-        0,
-    ));
-    if let Err(e) = sock.bind(&bind.into()) {
-        debug!("v6 beacon socket: bind {bind} failed: {e}; v6 beacon recv disabled");
-        return None;
-    }
-
-    let std_sock: std::net::UdpSocket = sock.into();
-    let tokio_sock = match UdpSocket::from_std(std_sock) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            debug!("v6 beacon socket: tokio adoption failed: {e}");
-            return None;
-        }
-    };
-
-    // Join the default PVA v6 multicast group on the unspecified
-    // interface (let the OS pick). Additional groups from
-    // EPICS_PVA_ADDR_LIST are joined separately.
-    if let Err(e) = tokio_sock.join_multicast_v6(&DEFAULT_V6_MULTICAST_GROUP, 0) {
-        debug!(
-            "v6 beacon socket: join_multicast_v6 ff0e::400 failed: {e}; \
-             v6 multicast beacons will not be received"
-        );
-    }
-    Some(tokio_sock)
-}
-
 /// Project `EPICS_PVA_ADDR_LIST` endpoints to their multicast join
 /// targets. Each entry is `(group, iface)`:
 ///
@@ -1223,7 +1242,6 @@ fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
 /// An unresolvable `@iface` spec is skipped (logged). Pure given IP-literal
 /// `@iface` forms (`resolve_iface_v4` passthrough), so the projection is
 /// testable without real NIC multicast.
-#[cfg(tokio_backend)]
 fn addr_list_multicast_targets(
     endpoints: &[crate::config::Endpoint],
 ) -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
@@ -1259,13 +1277,12 @@ fn addr_list_multicast_targets(
 /// disable the rest of the discovery path.
 ///
 /// A group with an explicit `@iface` modifier is joined on that interface
-/// alone via [`AsyncUdpV4::join_multicast_v4_on`]; a modifier-less group is
-/// joined on every external NIC. The previous code dropped the `@iface`
-/// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
-/// group — the same `@iface`-dropping defect as the server beacon-join
-/// path, fixed here in the same change.
-#[cfg(tokio_backend)]
-pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4, endpoints: &[crate::config::Endpoint]) {
+/// alone; a modifier-less group passes `0.0.0.0`, which the host arm expands
+/// to every external NIC and the exec arm hands to the routing table. The
+/// previous code dropped the `@iface` and joined all-NIC for every group —
+/// the same `@iface`-dropping defect as the server beacon-join path, fixed
+/// here in the same change.
+fn join_addr_list_multicast(sock: &SearchUdpSocket, endpoints: &[crate::config::Endpoint]) {
     // The endpoints were resolved once at config-build time through the
     // single address-list parser (`parse_endpoints_with_port`): split on
     // WHITESPACE only (pvxs `split_addr_into` — the comma is endpoint
@@ -1273,18 +1290,10 @@ pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4, endpoints: &[crate::co
     // bracketed-v6 resolved the same way the active-SEARCH path does. We
     // keep only the V4 multicast groups here.
     for (group, iface) in addr_list_multicast_targets(endpoints) {
-        match iface {
-            Some(iface_ip) => match sock.join_multicast_v4_on(group, iface_ip) {
-                Ok(()) => debug!("joined multicast group {group} on interface {iface_ip}"),
-                Err(e) => debug!("join_multicast_v4_on {group}@{iface_ip} failed: {e}"),
-            },
-            None => {
-                if let Err(e) = sock.join_multicast_v4(group) {
-                    debug!("join_multicast_v4 for {group} failed: {e}");
-                } else {
-                    debug!("joined multicast group {group}");
-                }
-            }
+        let iface_ip = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        match sock.join_multicast_v4(group, iface_ip) {
+            Ok(()) => debug!("joined multicast group {group} on interface {iface_ip}"),
+            Err(e) => debug!("join_multicast_v4 {group}@{iface_ip} failed: {e}"),
         }
     }
 }
@@ -2169,14 +2178,12 @@ async fn maybe_poke(
 /// unicast target); `false` for broadcast / multicast.
 /// [`UdpTransport::broadcast`] uses it to pick which pre-built frame variant
 /// to send.
-#[cfg(tokio_backend)]
 #[derive(Clone, Copy, Debug)]
 struct SearchTarget {
     addr: SocketAddr,
     unicast: bool,
 }
 
-#[cfg(tokio_backend)]
 impl SearchTarget {
     fn broadcast(addr: SocketAddr) -> Self {
         Self {
@@ -2192,7 +2199,6 @@ impl SearchTarget {
     }
 }
 
-#[cfg(tokio_backend)]
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
@@ -2289,46 +2295,6 @@ fn search_targets(
     targets
 }
 
-/// Fan a limited-broadcast / multicast SEARCH out of exactly the
-/// `EPICS_PVA_INTF_ADDR_LIST` interfaces. Loopback is skipped — it cannot
-/// carry broadcast, and `list_broadcast_addresses_on` yields no broadcast
-/// target for a loopback-only list, so this is never reached for one.
-/// Best-effort: succeeds if any listed interface accepted the send, else
-/// returns the last error. With the all-NIC search bundle this reproduces
-/// the egress of the pre-fix interface-constrained bundle's `fanout_to`,
-/// while leaving explicit unicast to route across the full bundle via
-/// `pick_nic`.
-#[cfg(tokio_backend)]
-async fn fanout_on_interfaces(
-    socket: &AsyncUdpV4,
-    packet: &[u8],
-    dest: SocketAddr,
-    client_interfaces: &[Ipv4Addr],
-) -> std::io::Result<()> {
-    let mut ok = 0usize;
-    let mut last_err: Option<std::io::Error> = None;
-    for ip in client_interfaces {
-        if ip.is_loopback() {
-            continue;
-        }
-        match socket.send_via(packet, dest, *ip).await {
-            Ok(_) => ok += 1,
-            Err(e) => last_err = Some(e),
-        }
-    }
-    if ok > 0 {
-        Ok(())
-    } else {
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "no listed EPICS_PVA_INTF_ADDR_LIST interface available for broadcast fanout",
-            )
-        }))
-    }
-}
-
-#[cfg(tokio_backend)]
 impl UdpTransport {
     async fn broadcast(
         &self,
@@ -2387,11 +2353,10 @@ impl UdpTransport {
                         // all-NIC so explicit unicast routes via `pick_nic` below.
                         // Per-subnet directed broadcasts and explicit unicast take
                         // the `send_to` path.
-                        if client_interfaces.is_empty() {
-                            socket.fanout_to(pkt_v4, t).await.map(|_| ())
-                        } else {
-                            fanout_on_interfaces(socket, pkt_v4, t, client_interfaces).await
-                        }
+                        socket
+                            .fanout_to(pkt_v4, t, client_interfaces)
+                            .await
+                            .map(|_| ())
                     } else {
                         socket.send_to(pkt_v4, t).await.map(|_| ())
                     }
@@ -3298,7 +3263,6 @@ mod tests {
     use super::*;
     use crate::proto::{ByteOrder, WriteExt, encode_string_into};
     // Used only by the gated TCP-name-server tests (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     use crate::proto::ControlCommand;
     use serial_test::serial;
 
@@ -4751,10 +4715,9 @@ mod tests {
     /// the Multi responder at deadline even with empty `accumulated`,
     /// so the user-visible future resolves to `Vec::new()` and any
     /// outer `PvaClient::timeout` gets a chance to apply.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn find_all_returns_empty_when_no_responder() {
@@ -4800,10 +4763,9 @@ mod tests {
     /// placed in a sid-hashed bucket up to 30 s away and never
     /// fired (the channel-layer timeout would have cancelled the
     /// caller's oneshot before any tick processed it).
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn reconnect_search_broadcasts_within_one_tick() {
@@ -4895,10 +4857,9 @@ mod tests {
     /// reintroduce a caller-side timeout (or change `find_all`'s
     /// empty-deadline behaviour to fire for `find` too) and
     /// silently revive the disconnect-storm bug.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn reconnect_find_does_not_complete_without_response() {
@@ -4978,10 +4939,9 @@ mod tests {
     /// We observe the BEHAVIOUR (SEARCH packet timing on a sniffer),
     /// not internal state, because internal fields aren't part of
     /// the engine's public contract.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn hurry_up_kicks_pending_searches_at_fast_tick_cadence() {
@@ -5074,10 +5034,9 @@ mod tests {
     ///
     /// Slack: ±500 ms per gap to absorb scheduler / mio jitter on
     /// loaded CI. Total runtime ~4 s.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "current_thread")]
     #[serial(epics_env)]
     async fn retry_escalation_pvxs_pattern() {
@@ -5148,9 +5107,11 @@ mod tests {
     /// `extra_targets`, and verifies `find()` resolves to the server's
     /// TCP endpoint. Regression guard against the v6 send path being
     /// dropped or the v6 recv arm losing the SEARCH_RESPONSE.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
+    // Gated to `tokio_backend`, and not because of the reactor: the subject is
+    // the IPv6 half, and `V6Socket` is uninhabited on `exec_backend` (both its
+    // binders are `socket2`, its receive is `tokio::net`). A v6 assertion there
+    // would be asserting about a socket that cannot exist.
+    #[cfg(tokio_backend)]
     #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
@@ -5242,9 +5203,11 @@ mod tests {
     /// port, and the advertised `response_port` inside the frame must
     /// equal it. Before the fix the v6 frame carried the v4 socket port
     /// (≠ source) and this assertion fails.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
+    // Gated to `tokio_backend`, and not because of the reactor: the subject is
+    // the IPv6 half, and `V6Socket` is uninhabited on `exec_backend` (both its
+    // binders are `socket2`, its receive is `tokio::net`). A v6 assertion there
+    // would be asserting about a socket that cannot exist.
+    #[cfg(tokio_backend)]
     #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
@@ -5314,7 +5277,7 @@ mod tests {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
         // 5076 socket. Picks via OS-coordinated probe, drops, then
-        // passes the port directly to `bind_beacon_udp_v6`.
+        // passes the port directly to `V6Socket::bind_beacon`.
         let pick_port = || {
             let s = std::net::UdpSocket::bind("[::1]:0").expect("v6 probe bind");
             let p = s.local_addr().unwrap().port();
@@ -5323,16 +5286,11 @@ mod tests {
         };
         let port = pick_port();
 
-        let sock = bind_beacon_udp_v6(port)
+        let sock = V6Socket::bind_beacon(port)
             .expect("v6 beacon socket must bind on a host with IPv6 enabled");
-        let local = sock.local_addr().expect("local_addr");
-        assert!(
-            matches!(local.ip(), IpAddr::V6(_)),
-            "beacon socket must be IPv6; got {local}"
-        );
         assert_eq!(
-            local.port(),
-            port,
+            sock.local_port(),
+            Some(port),
             "beacon socket must bind the EPICS_PVA_BROADCAST_PORT we set"
         );
 
@@ -5344,9 +5302,11 @@ mod tests {
     /// recv arm decodes the beacon, the BeaconTracker observes the
     /// (server_addr, guid) pair, and `beacon_guid_for(addr)` returns
     /// the GUID we sent. Guards the full recv-decode-track chain.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
+    // Gated to `tokio_backend`, and not because of the reactor: the subject is
+    // the IPv6 half, and `V6Socket` is uninhabited on `exec_backend` (both its
+    // binders are `socket2`, its receive is `tokio::net`). A v6 assertion there
+    // would be asserting about a socket that cannot exist.
+    #[cfg(tokio_backend)]
     #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
@@ -5457,7 +5417,6 @@ mod tests {
     /// handle and is expected to `abort()` it.
     // Every caller is a gated TCP-name-server test, so it carries the same
     // predicate — otherwise dead code feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     fn spawn_mock_name_server(
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
@@ -5471,7 +5430,6 @@ mod tests {
     /// (clientconn.cpp:160-165, 496).
     // Same predicate as its wrapper: every caller is a gated
     // TCP-name-server test — otherwise dead code feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     fn spawn_mock_name_server_watch(
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
@@ -5641,7 +5599,6 @@ mod tests {
     /// assertion does not have to wait out the 15 s default.
     // Reactor-dependent: `interval`/`sleep` inside `ns_task` land on the
     // reactor-less callback pool feature-ON. Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn ns_circuit_echoes_like_an_ordinary_connection() {
@@ -5700,7 +5657,6 @@ mod tests {
     // Reactor-dependent: `dial_pva`'s tokio arm and `sleep` inside `ns_task`
     // land on the reactor-less callback pool feature-ON. Gated out
     // feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ns_task_exits_when_the_engine_is_gone() {
         use tokio::net::TcpListener;
@@ -5761,10 +5717,9 @@ mod tests {
     /// With EPICS_PVA_AUTO_ADDR_LIST=NO the only resolution path is the TCP
     /// NS — pre-fix find() would time out because the NS was never wired into
     /// the search path; post-fix it resolves within the timeout.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn pva_r4_tcp_nameserver_persistent_peer() {
@@ -5831,10 +5786,9 @@ mod tests {
     ///
     /// The resolution half is what proves the degradation is not merely inert:
     /// SEARCH still goes out (over TCP) and the response still lands.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn stage1_name_servers_only_resolves_without_binding_udp() {
@@ -5909,10 +5863,9 @@ mod tests {
     /// name-server connections exactly as on normal servers (clientconn.cpp:215-263),
     /// rather than forcing anonymous. Captures the client's CONNECTION_VALIDATION
     /// reply on the mock NS and asserts the negotiated method + credentials.
-    // Reactor-dependent: spins the UDP search engine, whose spawned timers and
-    // socket land on the reactor-less callback pool feature-ON (§4.2 UDP search
-    // deferred). Gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // `tokio::test` for the flavor, not for the transport: the engine binds a
+    // `SearchUdpSocket` on either backend, and this runs in the feature-ON
+    // suite (counted by the file's census marker).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial(epics_env)]
     async fn pva_rs_51_tcp_nameserver_selects_ca_with_credentials() {

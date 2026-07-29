@@ -724,12 +724,9 @@ impl CaClient {
         // `mut` only for the discovery merge below, which `client-core` does
         // not have — stated as two bindings rather than one binding and a
         // silenced lint.
-        // `EPICS_CA_ADDR_LIST` names UDP SEARCH destinations, so it is parsed
-        // only where there is a UDP SEARCH socket to send from — see
-        // `search::SearchTransport` and the engine selection below.
-        #[cfg(all(feature = "client", tokio_backend))]
+        #[cfg(feature = "client")]
         let mut addr_list = parse_addr_list_with_hostnames()?;
-        #[cfg(all(not(feature = "client"), tokio_backend))]
+        #[cfg(not(feature = "client"))]
         let addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
@@ -745,13 +742,12 @@ impl CaClient {
         };
         #[cfg(feature = "client")]
         backends.extend(config.extra_backends);
-        // The one-shot scan merges into `addr_list`, which is the UDP SEARCH
-        // destination list and so exists only on `tokio_backend`. The
-        // `subscribe()` wiring below is *not* gated with it: its deltas go to
-        // the search engine, which absorbs them on either transport
-        // (`SearchTransport::add_address` logs and drops them once, through
-        // `log_dropped_udp_mutation`, when no UDP socket is bound).
-        #[cfg(all(feature = "client", tokio_backend))]
+        // The one-shot scan merges into `addr_list`, the UDP SEARCH
+        // destination list. The `subscribe()` wiring below is *not* gated with
+        // it: its deltas go to the search engine, which absorbs them on either
+        // transport (`SearchTransport::add_address` logs and drops them once,
+        // through `log_dropped_udp_mutation`, when no UDP socket is bound).
+        #[cfg(feature = "client")]
         if !backends.is_empty() {
             let mut discovered: Vec<SocketAddr> = Vec::new();
             for b in &backends {
@@ -818,28 +814,24 @@ impl CaClient {
         let (coord_tx, coord_rx) = mpsc::unbounded_channel();
 
         let search_attempts: types::SearchAttempts = Arc::new(dashmap::DashMap::new());
-        // Which search engine this client gets is a property of the *task
-        // backend*, not of its configuration and not of the target. A build
-        // whose `runtime::task::spawn` lands on the tokio runtime binds the
-        // per-NIC UDP SEARCH bundle and *additionally* uses any
-        // `EPICS_CA_NAME_SERVERS` circuits; on `exec_backend` the engine runs
-        // on a callback-pool worker with no reactor, so there is no UDP SEARCH
-        // transport compiled in at all (`search::SearchTransport` has one
-        // variant there) and this selects C's documented TCP-only
-        // name-resolution mode explicitly — the entry point stage C1 built for
-        // exactly this call site (`doc/calink-rtems-design.md` §4.5, §6 stage
-        // C5).
+        // Which search engine this client gets is a property of its
+        // *configuration*, and of nothing else. The ordinary engine binds the
+        // UDP SEARCH socket and *additionally* uses any
+        // `EPICS_CA_NAME_SERVERS` circuits; C's documented UDP-free mode
+        // (`modules/ca/src/client/CAref.html:515-520`) stays an explicit entry
+        // point — `search::name_servers_only_search_engine` — for the reason
+        // stated there: deriving it from an empty `EPICS_CA_ADDR_LIST` would
+        // silently drop UDP search for a client that starts with no
+        // destinations and expects a later `AddAddress` or discovery event to
+        // give it some.
         //
-        // `exec_backend` is either embedded target (RTEMS or VxWorks) *and* a
-        // host `--features rtems-exec-model` build. It used to be spelled
-        // `target_os = "rtems"` here, which let the hosted exec-model build
-        // take the UDP arm and panic on the bind (§10.10 item 2).
-        //
-        // The refusal is the point of selecting it here: with no UDP socket and
-        // no name server the engine could reach nothing, so an IOC booted
-        // without `EPICS_CA_NAME_SERVERS` fails *here*, at client construction,
-        // instead of presenting as every `ca://` link timing out forever.
-        #[cfg(tokio_backend)]
+        // This used to be `#[cfg(tokio_backend)]` against `#[cfg(exec_backend)]`
+        // — the embedded targets took the TCP-only engine whatever their
+        // configuration said, because `AsyncUdpV4` did not compile for them. A
+        // PV reachable only by broadcast then never resolved and said nothing:
+        // an IOC that was itself discoverable but could not discover.
+        // `epics_base_rs::net::search_udp` removed the reason, and with it the
+        // gate — a target IOC's `ca://` links now resolve the way a C IOC's do.
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
             nameserver_addrs,
@@ -847,15 +839,6 @@ impl CaClient {
             search_resp_tx,
             search_attempts.clone(),
         ));
-        #[cfg(exec_backend)]
-        let search_task = {
-            epics_base_rs::runtime::task::spawn(search::name_servers_only_search_engine(
-                nameserver_addrs,
-                search_rx,
-                search_resp_tx,
-                search_attempts.clone(),
-            )?)
-        };
 
         // Wire each discovery backend's live-update stream into the
         // search engine. `discover()` above was a one-shot scan;
@@ -4767,12 +4750,8 @@ fn remove_server_channel(
     }
 }
 
-/// UDP-only, and gated with the transport that uses it: the addresses it
-/// resolves are `EPICS_CA_ADDR_LIST` SEARCH destinations, and the RTEMS target
-/// binds no UDP socket to send to them (`search::SearchTransport`).
-/// `EPICS_CA_NAME_SERVERS` entries go through `parse_nameserver_list`, which is
-/// live on every target.
-#[cfg(tokio_backend)]
+/// Resolve one `EPICS_CA_ADDR_LIST` SEARCH destination.
+/// `EPICS_CA_NAME_SERVERS` entries go through `parse_nameserver_list` instead.
 fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
     // Try direct IP parse first (fast path)
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
@@ -4802,9 +4781,6 @@ fn resolve_host(host: &str, port: u16) -> CaResult<SocketAddr> {
 /// re-resolve. `hostname == Some(name)` means the entry started life
 /// as a DNS name and a reconnection path may call `resolve_host`
 /// again to refresh `sock`.
-/// UDP-only; see [`resolve_host`] for why this is not compiled for the RTEMS
-/// target.
-#[cfg(tokio_backend)]
 #[derive(Debug, Clone)]
 pub(crate) struct AddrEntry {
     pub sock: SocketAddr,
@@ -4812,7 +4788,6 @@ pub(crate) struct AddrEntry {
     pub port: u16,
 }
 
-#[cfg(tokio_backend)]
 impl AddrEntry {
     pub fn new(sock: SocketAddr, hostname: Option<String>, port: u16) -> Self {
         Self {
@@ -4850,7 +4825,6 @@ impl AddrEntry {
 /// instead of permanently pinning the client to the first-resolved
 /// IP. Closes the long-standing upstream-tracking item for
 /// epics-base#488.
-#[cfg(tokio_backend)]
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
     let default_port = epics_base_rs::runtime::net::ca_server_port();
@@ -4918,7 +4892,6 @@ pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
 /// Rust-only limited-broadcast safety net. Extracted from
 /// `parse_addr_list_with_hostnames` so the bcast list can be injected
 /// in unit tests (real-NIC enumeration is environment-dependent).
-#[cfg(tokio_backend)]
 fn append_auto_addr_entries(addrs: &mut Vec<AddrEntry>, bcasts: &[Ipv4Addr], server_port: u16) {
     for bcast in bcasts {
         let sock = SocketAddr::V4(SocketAddrV4::new(*bcast, server_port));

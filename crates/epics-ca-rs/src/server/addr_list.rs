@@ -6,10 +6,6 @@
 //! emitter.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-// `IpAddr` is used only by the `if-addrs` interface-enumeration helpers, which
-// are host-only (their embedded-target stubs return empty results).
-#[cfg(not(epics_embedded_target))]
-use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::protocol::CA_REPEATER_PORT;
@@ -357,45 +353,25 @@ fn parse_ipv4_list(list: &str, env_name: &str, default_port: u16) -> Vec<Ipv4Add
 /// Discover IPv4 broadcast addresses for all up, non-loopback interfaces.
 /// Returns an empty vec if interface enumeration fails (e.g. unsupported OS).
 ///
-/// Host-only: interface enumeration (`if-addrs`) does not build for RTEMS or
-/// VxWorks. The embedded build (blocking `std::net` driver) emits no
-/// beacons/broadcast, so the shared `resolve_from_env` config path takes the
-/// empty stub below.
-#[cfg(not(epics_embedded_target))]
+/// C `osiSockDiscoverBroadcastAddresses` with a wildcard match address: one
+/// UDP destination per eligible interface.
+///
+/// Every target, including RTEMS and VxWorks — the two used to take a stub that
+/// returned nothing, because the enumeration went through `if-addrs`, which
+/// builds for neither. It now goes through
+/// [`epics_base_rs::net::iface_v4`], which reaches them via `getifaddrs`.
+/// That stub is why a target IOC could resolve a name only through an
+/// explicitly configured name server: with no interfaces there are no
+/// broadcast addresses, so `EPICS_CA_AUTO_ADDR_LIST=YES` — C's default, and
+/// the whole of an unconfigured site's discovery — expanded to nothing.
+///
+/// Two behaviours change on the host as a consequence, both toward C:
+/// interfaces without `IFF_UP` are now skipped (`if-addrs` does not report the
+/// flag, so a configured-but-down NIC used to contribute a destination C would
+/// have rejected), and a point-to-point link now contributes its peer address
+/// (`osdNetIfAddrs.c:143`) instead of nothing.
 pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    let Ok(ifs) = if_addrs::get_if_addrs() else {
-        return out;
-    };
-    for iface in ifs {
-        if iface.is_loopback() {
-            continue;
-        }
-        let IpAddr::V4(_v4) = iface.ip() else {
-            continue;
-        };
-        if let if_addrs::IfAddr::V4(v4) = iface.addr {
-            if let Some(b) = v4.broadcast {
-                // Skip degenerate 0.0.0.0 broadcasts (matches libca
-                // osdNetIfAddrs.c osiSockDiscoverBroadcastAddresses, which
-                // discards interfaces whose broadcast is INADDR_ANY).
-                if b.is_unspecified() {
-                    continue;
-                }
-                if !out.contains(&b) {
-                    out.push(b);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Embedded-target stub — `if-addrs` is host-only. The blocking driver
-/// emits no beacons/broadcast, so auto-discovery yields nothing.
-#[cfg(epics_embedded_target)]
-pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
-    Vec::new()
+    epics_base_rs::net::iface_v4::broadcast_addrs()
 }
 
 /// C `osiLocalAddr` (libcom `osi/osdNetIfAddrs.c:167-215`, `osiLocalAddrOnce`):
@@ -407,31 +383,11 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
 /// cached result; the `OnceLock` mirrors that (an interface list that changes
 /// under a running client is not re-read by C either).
 ///
-/// Caveat, shared with the sibling [`discover_broadcast_addrs`]: `if_addrs`
-/// does not expose `IFF_UP`, so a down interface that still carries an address
-/// would be picked here where C skips it.
-#[cfg(not(epics_embedded_target))]
+/// The `IFF_UP` caveat this used to carry is gone: the enumeration behind it
+/// now reports the flag, so a down interface is skipped here as it is in C.
 pub fn osi_local_addr() -> Ipv4Addr {
     static CACHED: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let Ok(ifs) = if_addrs::get_if_addrs() else {
-            return Ipv4Addr::LOCALHOST;
-        };
-        ifs.into_iter()
-            .find_map(|iface| match (iface.is_loopback(), iface.ip()) {
-                (false, IpAddr::V4(v4)) => Some(v4),
-                _ => None,
-            })
-            .unwrap_or(Ipv4Addr::LOCALHOST)
-    })
-}
-
-/// Embedded-target stub — `if-addrs` is host-only. Falls back to
-/// `INADDR_LOOPBACK`, the same value C `osiLocalAddr` returns when interface
-/// enumeration finds no up, non-loopback `AF_INET` interface.
-#[cfg(epics_embedded_target)]
-pub fn osi_local_addr() -> Ipv4Addr {
-    Ipv4Addr::LOCALHOST
+    *CACHED.get_or_init(epics_base_rs::net::iface_v4::local_addr)
 }
 
 /// Return the IPv4 broadcast address of the up, non-loopback interface
@@ -448,114 +404,23 @@ pub fn osi_local_addr() -> Ipv4Addr {
 ///   * `match_ip` is loopback (C special-cases this to "loopback as
 ///     broadcast", but a loopback responder never needs a second
 ///     broadcast bind);
-///   * no matching interface was found, or that interface lacks a
-///     broadcast addr (point-to-point links / odd kernel configs);
+///   * no matching interface was found, or the matched one is down, or it is
+///     neither `IFF_BROADCAST` nor `IFF_POINTOPOINT`;
 ///   * the discovered broadcast is `0.0.0.0` (libcom drops these).
-#[cfg(not(epics_embedded_target))]
+///
+/// The point-to-point fallback this used to reach for by hand is now the same
+/// selection every other caller gets: `IfaceV4::search_destination` reads the
+/// one `ifa_broadaddr`/`ifa_dstaddr` pointer the OS reports and lets the flags
+/// decide which it means, exactly as C does.
 pub fn broadcast_for_ip(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
     if match_ip.is_unspecified() || match_ip.is_loopback() {
         return None;
     }
-    let ifs = if_addrs::get_if_addrs().ok()?;
-    for iface in ifs {
-        if iface.is_loopback() {
-            continue;
-        }
-        let if_addrs::IfAddr::V4(v4) = iface.addr else {
-            continue;
-        };
-        if v4.ip != match_ip {
-            continue;
-        }
-        if let Some(b) = v4.broadcast {
-            if !b.is_unspecified() {
-                return Some(b);
-            }
-        }
-        // `if_addrs` only fills `broadcast` for `IFF_BROADCAST`
-        // interfaces. For `IFF_POINTOPOINT` (VPN tun, PPP, WireGuard)
-        // C `osdNetIfAddrs.c:130-151` substitutes `ifa_dstaddr` —
-        // beacons go to the remote tunnel endpoint. Fall through to a
-        // direct `getifaddrs` walk that reads dstaddr for the
-        // matched interface.
-        #[cfg(unix)]
-        {
-            if let Some(dst) = ifa_dstaddr_for_ipv4(match_ip) {
-                return Some(dst);
-            }
-        }
-        return None;
-    }
-    None
-}
-
-/// Embedded-target stub — `if-addrs` is host-only. The blocking driver binds
-/// no secondary broadcast responder, so no per-interface broadcast is
-/// resolved.
-#[cfg(epics_embedded_target)]
-pub fn broadcast_for_ip(_match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
-    None
-}
-
-/// walk `getifaddrs(3)` directly to extract `ifa_dstaddr`
-/// for the interface whose `ifa_addr` matches `match_ip` AND
-/// carries `IFF_POINTOPOINT`. The `if_addrs` crate only exposes
-/// `broadcast` for `IFF_BROADCAST` interfaces; P2P interfaces
-/// (VPN tun, PPP, WireGuard) need this path or beacons toward the
-/// tunnel peer are silently dropped from auto-expansion.
-/// Mirrors C `osdNetIfAddrs.c:130-151`. Host-only: neither the RTEMS nor the
-/// VxWorks `libc` has `getifaddrs`/`ifaddrs`, and the embedded-target
-/// `broadcast_for_ip` stub never calls this.
-#[cfg(all(unix, not(epics_embedded_target)))]
-fn ifa_dstaddr_for_ipv4(match_ip: Ipv4Addr) -> Option<Ipv4Addr> {
-    // SAFETY: `getifaddrs` returns a linked list of `ifaddrs`
-    // structs we walk read-only and free via `freeifaddrs` before
-    // returning. All pointer reads are guarded against null and
-    // the matched ipv4 octets are copied out as `[u8; 4]` before
-    // the free.
-    unsafe {
-        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 || head.is_null() {
-            return None;
-        }
-        let mut result: Option<Ipv4Addr> = None;
-        let mut cur = head;
-        while !cur.is_null() {
-            let entry = &*cur;
-            let next = entry.ifa_next;
-            // Must be IPv4 AF_INET with the matched ip + POINTOPOINT
-            // flag. `ifa_addr` may be null on some interfaces (no
-            // address assigned); skip those.
-            if !entry.ifa_addr.is_null()
-                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET
-                && entry.ifa_flags as libc::c_int & libc::IFF_POINTOPOINT != 0
-            {
-                let in4: &libc::sockaddr_in = &*(entry.ifa_addr as *const libc::sockaddr_in);
-                let ip_octets = u32::from_be(in4.sin_addr.s_addr).to_be_bytes();
-                let if_ip = Ipv4Addr::from(ip_octets);
-                // `ifa_dstaddr` on macOS/BSD; on Linux the `ifaddrs`
-                // struct carries the point-to-point destination in
-                // the `ifa_ifu` union field — `libc` exposes it by
-                // that name. Both are `*mut sockaddr`.
-                #[cfg(target_os = "linux")]
-                let dstaddr = entry.ifa_ifu;
-                #[cfg(not(target_os = "linux"))]
-                let dstaddr = entry.ifa_dstaddr;
-                if if_ip == match_ip && !dstaddr.is_null() {
-                    let dst4: &libc::sockaddr_in = &*(dstaddr as *const libc::sockaddr_in);
-                    let dst_octets = u32::from_be(dst4.sin_addr.s_addr).to_be_bytes();
-                    let dst_ip = Ipv4Addr::from(dst_octets);
-                    if !dst_ip.is_unspecified() {
-                        result = Some(dst_ip);
-                        break;
-                    }
-                }
-            }
-            cur = next;
-        }
-        libc::freeifaddrs(head);
-        result
-    }
+    epics_base_rs::net::iface_v4::enumerate()
+        .ok()?
+        .into_iter()
+        .find(|i| i.ip == match_ip)?
+        .search_destination()
 }
 
 #[cfg(test)]

@@ -4,10 +4,14 @@
 //! Two layers, split by whether they own a socket — the same split
 //! `epics_pva_rs::server_native` makes for the same reason:
 //!
-//! * **Wire constants.** Address literals the protocols embed in the
-//!   datagrams they build ([`ORIGIN_TAG_MCAST_GROUP`]). No socket, no
-//!   `tokio`, no `socket2` — compiles for every target, RTEMS and VxWorks
-//!   included.
+//! * **Wire constants and interface facts.** Address literals the protocols
+//!   embed in the datagrams they build ([`ORIGIN_TAG_MCAST_GROUP`]), and the
+//!   IPv4 interface enumeration every UDP search destination list is derived
+//!   from ([`iface_v4`]). No socket, no `tokio`, no `socket2` — compiles for
+//!   every target, RTEMS and VxWorks included. [`iface_v4`] reaches the two
+//!   embedded targets where `iface_map` cannot because it goes through
+//!   `getifaddrs`, which both of them ship, rather than through the `if-addrs`
+//!   crate, which builds for neither.
 //! * **Socket-bearing modules** — `async_udp_v4`, `iface_map`,
 //!   `loopback_mcast`. Built on `tokio::net` / `socket2` / `if-addrs`, none
 //!   of which cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples,
@@ -36,8 +40,10 @@ use std::net::Ipv4Addr;
 pub mod async_udp_v4;
 #[cfg(not(epics_embedded_target))]
 pub mod iface_map;
+pub mod iface_v4;
 #[cfg(not(epics_embedded_target))]
 pub mod loopback_mcast;
+pub mod search_udp;
 
 /// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
 /// `udp_collector.cpp:127`: `"224.0.0.128,1@127.0.0.1"` — TTL=1,
@@ -52,6 +58,9 @@ pub mod loopback_mcast;
 /// decoder to stay host-only; the fix is to move the constant, not to copy
 /// it.
 pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
+
+pub use iface_v4::{IfaceV4, broadcast_addrs, local_addr};
+pub use search_udp::{SearchDatagram, SearchUdpSocket};
 
 #[cfg(not(epics_embedded_target))]
 pub use async_udp_v4::{

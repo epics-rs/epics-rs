@@ -530,6 +530,18 @@ Any future "pvalink compiles for RTEMS" green must not be read as
 
 ### 4.2 TCP-only search works; UDP search must be a later stage
 
+> **DELIVERED 2026-07-28 — this section records the ordering, not the
+> current state.** The v4 UDP SEARCH transport is bound on every backend
+> now, through `epics_base_rs::net::search_udp::SearchUdpSocket`. Fact 3
+> below was the `sin_len` libc defect (§3.2), fixed in the pinned `libc`
+> patch: `local_addr()` reads back on RTEMS 6, MEASURED. Fact 1 stays true
+> and is why TCP-only came first; fact 2 stays true. What is still absent
+> is the IPv6 half alone — both its binders are `socket2` and its receive
+> is `tokio::net`, so `V6Socket` is an uninhabited enum on `exec_backend`.
+> Measured on target: `UDPSEARCH reply pv=RTEMS:PVA:AO
+> server=10.0.2.15:5075 proto=tcp version=2`, resolved by broadcast with no
+> name server configured.
+
 Three independent measured facts converge on the same ordering.
 
 1. **PVA is reachable over TCP alone.** `doc/rtems-scope-b-session-handoff.md`

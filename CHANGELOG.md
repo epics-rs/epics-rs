@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### The IPv6 SEARCH socket binds on every backend too
+
+v0.25.3 left the IPv6 half out of the embedded targets, on the reading that
+`socket2` and `tokio::net` were required to build it. They were an
+implementation choice, not a platform limit: `std` covers the bind, the group
+join and the loop-back option, and `IPV6_V6ONLY` / `IPV6_MULTICAST_HOPS` are
+plain `setsockopt` calls whose constants both target `libc`s carry.
+
+- **`epics_base_rs::net::search_udp::SearchUdpSocketV6`** is a sibling type
+  rather than a variant of `SearchUdpSocket`, because the two families differ
+  in what a socket *is* here and not only in the address it carries: the v4
+  host arm is a per-NIC bundle with `IP_PKTINFO` attribution and a
+  `255.255.255.255` fanout, and v6 has none of the three. Folding them into one
+  type would give four of its methods a second meaning, "unsupported for this
+  variant". The `exec_backend` receive pump, its stop flag and its joining
+  `Drop` are address-family neutral and are shared as code.
+
+- `IPV6_V6ONLY` is set on an **unbound** socket, the same ordering constraint
+  `SO_REUSEADDR` / `SO_REUSEPORT` have, which is why neither family can go
+  through `std::net::UdpSocket::bind` — it binds as it constructs.
+
+- `epics-pva-rs`'s `V6Socket` is gone (153 lines), along with the uninhabited
+  `enum V6Socket {}` whose `exec_backend` methods were `match *self {}`.
+
+- Both cross-compile ratchets still read **zero** target errors, now covering
+  both address families. Compiling is not running: whether an RTEMS BSP or the
+  VxWorks stack has IPv6 enabled is an on-target question, and a failed bind
+  degrades the client to IPv4-only by design.
+
 ## v0.25.3 — 2026-07-30
 
 Patch release. The CA and PVA *clients* now bind a UDP SEARCH socket on the

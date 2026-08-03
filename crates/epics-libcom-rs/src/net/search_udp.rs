@@ -39,7 +39,7 @@
 //! One thread per search engine, and a CA client has one.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// One received SEARCH datagram, and what the receiving path knows about it.
 ///
@@ -170,6 +170,87 @@ impl SearchUdpSocket {
     }
 }
 
+/// A client's IPv6 UDP SEARCH or beacon socket, on **every** target.
+///
+/// Separate from [`SearchUdpSocket`] rather than a variant of it, because the
+/// two families differ in what a socket *is* here and not only in the address
+/// it carries: the v4 host arm is a per-NIC bundle with `IP_PKTINFO` receive
+/// attribution and a `255.255.255.255` fanout, and v6 has none of the three —
+/// no broadcast at all, one socket, and a multicast group that is the same
+/// destination on every NIC. Folding them into one type would give four of its
+/// methods a second meaning ("unsupported for this variant"), which is the
+/// dual meaning both types exist to avoid. What they do share — the
+/// `exec_backend` receive pump, its stop flag and its joining `Drop` — is
+/// shared as code, not duplicated.
+///
+/// Both arms bind `IPV6_V6ONLY`, so this socket never sees the v4-mapped
+/// traffic [`SearchUdpSocket`] already handles and the two never answer the
+/// same datagram.
+pub struct SearchUdpSocketV6(sys::SockV6);
+
+impl SearchUdpSocketV6 {
+    /// Bind an ephemeral v6 SEARCH socket.
+    ///
+    /// `pump_name`/`pump_priority` describe the `exec_backend` receive thread,
+    /// exactly as on [`SearchUdpSocket::bind_ephemeral`]; the host arm has no
+    /// thread and ignores them.
+    ///
+    /// A host with no IPv6 stack fails here — `EAFNOSUPPORT` from `socket()`,
+    /// or `EADDRNOTAVAIL` from the bind. That is a normal condition and not an
+    /// engine error: the caller drops to IPv4-only, which is why this returns
+    /// the error rather than deciding the policy itself.
+    pub fn bind_search(
+        pump_name: &str,
+        pump_priority: crate::runtime::task::ThreadPriority,
+    ) -> io::Result<Self> {
+        sys::SockV6::bind_search(pump_name, pump_priority).map(Self)
+    }
+
+    /// Bind a v6 beacon listener on `[::]:port`, sharing the port with
+    /// whatever server already holds it (`SO_REUSEADDR` + `SO_REUSEPORT`).
+    ///
+    /// The v6 counterpart of [`SearchUdpSocket::bind_beacon`], and shared for
+    /// the same reason: pvxs puts every UDP socket through
+    /// `epicsSocketEnableAddressUseForDatagramFanout`
+    /// (`udp_collector.cpp:136`), which has no `_WIN32` carve-out.
+    pub fn bind_beacon(
+        port: u16,
+        pump_name: &str,
+        pump_priority: crate::runtime::task::ThreadPriority,
+    ) -> io::Result<Self> {
+        sys::SockV6::bind_beacon(port, pump_name, pump_priority).map(Self)
+    }
+
+    /// Join an IPv6 multicast group (`IPV6_JOIN_GROUP`).
+    ///
+    /// `iface` is a scope index; `0` lets the routing table choose, which is
+    /// what a single wildcard socket has to do.
+    pub fn join_multicast_v6(&self, group: Ipv6Addr, iface: u32) -> io::Result<()> {
+        self.0.join_multicast_v6(group, iface)
+    }
+
+    /// `IPV6_MULTICAST_HOPS`. The v6 spelling of the v4 multicast TTL; pvxs
+    /// sends its v6 multicast at hop limit 1 (link-local only).
+    pub fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
+        self.0.set_multicast_hops_v6(hops)
+    }
+
+    /// Every local address this socket bound — one entry, both arms.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.0.local_addrs()
+    }
+
+    /// The next datagram.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+        self.0.recv(buf).await
+    }
+
+    /// Send one datagram to one destination.
+    pub async fn send_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, dest).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host: the per-NIC bundle, unchanged.
 // ---------------------------------------------------------------------------
@@ -289,6 +370,100 @@ mod sys {
             }
             Ok(ok)
         }
+    }
+
+    pub(super) struct SockV6(std::sync::Arc<tokio::net::UdpSocket>);
+
+    impl SockV6 {
+        pub(super) fn bind_search(
+            pump_name: &str,
+            pump_priority: crate::runtime::task::ThreadPriority,
+        ) -> io::Result<Self> {
+            // No pump: the reactor is the pump.
+            let _ = (pump_name, pump_priority);
+            let sock = new_v6_socket()?;
+            // Link-local hop limit, matching pvxs's v6 send path
+            // (`udp_collector.cpp`). Best-effort: a stack that refuses it still
+            // reaches the link.
+            let _ = sock.set_multicast_hops_v6(1);
+            sock.bind(&v6_bind_addr(0).into())?;
+            Self::adopt(sock)
+        }
+
+        pub(super) fn bind_beacon(
+            port: u16,
+            pump_name: &str,
+            pump_priority: crate::runtime::task::ThreadPriority,
+        ) -> io::Result<Self> {
+            let _ = (pump_name, pump_priority);
+            let sock = new_v6_socket()?;
+            sock.set_reuse_address(true)?;
+            #[cfg(unix)]
+            sock.set_reuse_port(true)?;
+            sock.bind(&v6_bind_addr(port).into())?;
+            Self::adopt(sock)
+        }
+
+        fn adopt(sock: socket2::Socket) -> io::Result<Self> {
+            sock.set_nonblocking(true)?;
+            let std_sock: std::net::UdpSocket = sock.into();
+            tokio::net::UdpSocket::from_std(std_sock).map(|s| Self(std::sync::Arc::new(s)))
+        }
+
+        pub(super) fn join_multicast_v6(
+            &self,
+            group: std::net::Ipv6Addr,
+            iface: u32,
+        ) -> io::Result<()> {
+            self.0.join_multicast_v6(&group, iface)
+        }
+
+        pub(super) fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
+            socket2::SockRef::from(&*self.0).set_multicast_hops_v6(hops)
+        }
+
+        pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
+            self.0.local_addr().into_iter().collect()
+        }
+
+        pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+            let (n, src) = self.0.recv_from(buf).await?;
+            Ok(SearchDatagram {
+                n,
+                src,
+                // `IP_PKTINFO` attribution is the v4 bundle's; a single v6
+                // socket reports no receiving NIC, the same `None` the exec
+                // arm reports for the same reason.
+                iface_ip: None,
+                drops: 0,
+            })
+        }
+
+        pub(super) async fn send_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+            self.0.send_to(buf, dest).await
+        }
+    }
+
+    /// An unbound `AF_INET6` datagram socket with `IPV6_V6ONLY` already set.
+    ///
+    /// Unbound, because `IPV6_V6ONLY` only takes effect before the bind — the
+    /// same ordering constraint the v4 arm's shared-port bind has, and the
+    /// reason neither family can use `std::net::UdpSocket::bind`, which binds
+    /// as it constructs.
+    fn new_v6_socket() -> io::Result<socket2::Socket> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_only_v6(true)?;
+        Ok(sock)
+    }
+
+    fn v6_bind_addr(port: u16) -> SocketAddr {
+        SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::UNSPECIFIED,
+            port,
+            0,
+            0,
+        ))
     }
 }
 
@@ -537,6 +712,120 @@ mod sys {
         }
     }
 
+    /// The IPv6 socket, over the same pump.
+    ///
+    /// A newtype over [`Sock`] rather than a second struct: the pump thread,
+    /// its stop flag, the unbounded channel and the joining `Drop` are
+    /// address-family neutral, and duplicating them would give the port-release
+    /// invariant two implementations to hold. Only the bind and the two
+    /// multicast options differ, and those are what this type adds.
+    pub(super) struct SockV6(Sock);
+
+    impl SockV6 {
+        pub(super) fn bind_search(
+            pump_name: &str,
+            pump_priority: ThreadPriority,
+        ) -> io::Result<Self> {
+            let socket = bind_v6(0, false)?;
+            let sock = Sock::with_pump(socket, pump_name, pump_priority)?;
+            let this = Self(sock);
+            // Link-local hop limit, as pvxs sends v6 multicast. Best-effort:
+            // a stack that refuses the option still reaches the link.
+            let _ = this.set_multicast_hops_v6(1);
+            Ok(this)
+        }
+
+        pub(super) fn bind_beacon(
+            port: u16,
+            pump_name: &str,
+            pump_priority: ThreadPriority,
+        ) -> io::Result<Self> {
+            let socket = bind_v6(port, true)?;
+            Sock::with_pump(socket, pump_name, pump_priority).map(Self)
+        }
+
+        pub(super) fn join_multicast_v6(
+            &self,
+            group: std::net::Ipv6Addr,
+            iface: u32,
+        ) -> io::Result<()> {
+            self.0.socket.join_multicast_v6(&group, iface)
+        }
+
+        pub(super) fn set_multicast_hops_v6(&self, hops: u32) -> io::Result<()> {
+            set_int_opt(
+                &self.0.socket,
+                sockopt::IPPROTO_IPV6,
+                sockopt::IPV6_MULTICAST_HOPS,
+                hops as _,
+            )
+        }
+
+        pub(super) fn local_addrs(&self) -> Vec<SocketAddr> {
+            self.0.local_addrs()
+        }
+
+        pub(super) async fn recv(&self, buf: &mut [u8]) -> io::Result<SearchDatagram> {
+            self.0.recv(buf).await
+        }
+
+        pub(super) async fn send_to(&self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+            self.0.send_to(buf, dest).await
+        }
+    }
+
+    /// An `AF_INET6` datagram socket bound to `[::]:port`, with `IPV6_V6ONLY`
+    /// — and, for a shared listener, `SO_REUSEADDR`/`SO_REUSEPORT` — set
+    /// **before** the bind, which is the only point at which they take effect.
+    ///
+    /// Hand-rolled for that ordering, the same reason and the same sequence as
+    /// [`bind_shared_port`]. `IPV6_V6ONLY` is not optional here: without it a
+    /// dual-stack bind would take the v4-mapped copy of traffic the v4 SEARCH
+    /// socket is already receiving, and the engine would see every reply twice.
+    #[cfg(unix)]
+    fn bind_v6(port: u16, share: bool) -> io::Result<UdpSocket> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `socket()` returns a fresh owned fd or -1.
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Owned immediately, so every early return below closes it via `Drop`.
+        // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned.
+        let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+        set_int_opt(&socket, sockopt::IPPROTO_IPV6, sockopt::IPV6_V6ONLY, 1)?;
+        if share {
+            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+            set_int_opt(&socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+        }
+        // Zeroed rather than field-by-field: `sin6_len` exists on the BSD
+        // targets and not on Linux, and all-zero is valid for both.
+        // SAFETY: `sockaddr_in6` is plain-old-data.
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sin6.sin6_port = port.to_be();
+        // SAFETY: `sin6` is fully initialized and the length is exact.
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                std::ptr::addr_of!(sin6).cast(),
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(socket)
+    }
+
+    #[cfg(not(unix))]
+    fn bind_v6(_port: u16, _share: bool) -> io::Result<UdpSocket> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "IPv6 bind on a non-Unix exec-backend socket",
+        ))
+    }
+
     /// The directed broadcast of every eligible interface, narrowed to
     /// `ifaces` when that list is non-empty.
     ///
@@ -622,6 +911,9 @@ mod sys {
         pub(super) const SO_RCVBUF: libc::c_int = libc::SO_RCVBUF;
         pub(super) const IPPROTO_IP: libc::c_int = libc::IPPROTO_IP;
         pub(super) const IP_MULTICAST_TTL: libc::c_int = libc::IP_MULTICAST_TTL;
+        pub(super) const IPPROTO_IPV6: libc::c_int = libc::IPPROTO_IPV6;
+        pub(super) const IPV6_V6ONLY: libc::c_int = libc::IPV6_V6ONLY;
+        pub(super) const IPV6_MULTICAST_HOPS: libc::c_int = libc::IPV6_MULTICAST_HOPS;
     }
 
     /// Bind the wildcard address on a well-known port that a server on this
@@ -709,6 +1001,9 @@ mod sys {
         pub(super) const SO_RCVBUF: i32 = 0;
         pub(super) const IPPROTO_IP: i32 = 0;
         pub(super) const IP_MULTICAST_TTL: i32 = 0;
+        pub(super) const IPPROTO_IPV6: i32 = 0;
+        pub(super) const IPV6_V6ONLY: i32 = 0;
+        pub(super) const IPV6_MULTICAST_HOPS: i32 = 0;
     }
 
     #[cfg(not(unix))]
@@ -790,5 +1085,115 @@ mod tests {
                 .expect("recv");
         assert_eq!(&buf[..dg.n], b"CA-SEARCH");
         assert_eq!(dg.drops, 0, "a single quiet datagram overflows nothing");
+    }
+
+    // ── IPv6 ────────────────────────────────────────────────────────────
+
+    /// A machine with no IPv6 stack is a normal machine, and a CI runner is
+    /// often one. Every v6 case below skips on that machine rather than
+    /// failing, so the suite asserts about v6 exactly where v6 exists.
+    fn bind_v6_or_skip() -> Option<SearchUdpSocketV6> {
+        match SearchUdpSocketV6::bind_search("test-PVAC-UDP6", ThreadPriority::Medium) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("skipping: no usable IPv6 stack here ({e})");
+                None
+            }
+        }
+    }
+
+    /// The v6 counterpart of [`binds_and_reports_a_local_address`], and the
+    /// property this whole type was added for: on `exec_backend` the answer
+    /// used to be "no socket exists", by construction.
+    #[epics_macros_rs::epics_test]
+    async fn v6_binds_and_reports_a_local_address() {
+        let Some(sock) = bind_v6_or_skip() else {
+            return;
+        };
+        let addrs = sock.local_addrs();
+        assert!(!addrs.is_empty(), "a bound v6 SEARCH socket has an address");
+        for a in &addrs {
+            assert!(a.is_ipv6(), "an AF_INET6 bind reports a v6 address: {a}");
+            assert_ne!(a.port(), 0, "ephemeral bind assigns a real port: {a}");
+        }
+    }
+
+    /// Round-trip over `::1`, through whichever receive path this build
+    /// selected — the reactor on one arm, the shared pump thread on the other.
+    #[epics_macros_rs::epics_test]
+    async fn v6_round_trips_a_datagram_to_itself() {
+        let Some(sock) = bind_v6_or_skip() else {
+            return;
+        };
+        let port = sock.local_addrs()[0].port();
+        let dest = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+
+        if let Err(e) = sock.send_to(b"PVA-SEARCH6", dest).await {
+            // A v6 socket can bind while `::1` is unroutable (a container with
+            // IPv6 compiled in and no loopback route). That is the same "no
+            // usable v6 here" condition the binder reports, one step later.
+            eprintln!("skipping: v6 loopback is not routable here ({e})");
+            return;
+        }
+        let mut buf = [0u8; 64];
+        let dg =
+            crate::runtime::task::timeout(std::time::Duration::from_secs(5), sock.recv(&mut buf))
+                .await
+                .expect("a datagram sent to ourselves arrives")
+                .expect("recv");
+        assert_eq!(&buf[..dg.n], b"PVA-SEARCH6");
+        assert_eq!(
+            dg.iface_ip, None,
+            "a single v6 socket attributes no receiving NIC"
+        );
+    }
+
+    /// `IPV6_V6ONLY` holds, which is what keeps the v6 SEARCH socket out of
+    /// the v4 port space the v4 SEARCH socket owns.
+    ///
+    /// Asserted through behaviour rather than by reading the option back, and
+    /// twice, because either witness alone can pass vacuously: the same port
+    /// must still be *bindable* in the v4 family (a dual-stack `[::]` bind
+    /// reserves both, so this is `EADDRINUSE` when the option is lost), and a
+    /// v4 datagram delivered to it must leave the v6 socket silent.
+    ///
+    /// The v4 side is a plain `std` socket rather than a [`SearchUdpSocket`]
+    /// because [`SearchUdpSocket::bind_beacon`] deliberately skips the
+    /// loopback NIC, so nothing sent to `127.0.0.1` can reach it.
+    #[epics_macros_rs::epics_test]
+    async fn v6_socket_does_not_take_v4_mapped_traffic() {
+        let Some(v6) = bind_v6_or_skip() else {
+            return;
+        };
+        let port = v6.local_addrs()[0].port();
+
+        let v4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).expect(
+            "IPV6_V6ONLY leaves the v4 half of the port free; EADDRINUSE here means the v6 \
+             SEARCH socket bound dual-stack",
+        );
+        v4.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+
+        let dest = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        v4.send_to(b"V4-ONLY", dest).expect("v4 send_to");
+
+        // Blocking, but the datagram is already queued by the send above, so
+        // this returns without parking anything.
+        let mut buf = [0u8; 64];
+        let (n, _) = v4
+            .recv_from(&mut buf)
+            .expect("the v4 socket receives its own datagram");
+        assert_eq!(&buf[..n], b"V4-ONLY");
+
+        let mut v6buf = [0u8; 64];
+        let leaked = crate::runtime::task::timeout(
+            std::time::Duration::from_millis(300),
+            v6.recv(&mut v6buf),
+        )
+        .await;
+        assert!(
+            leaked.is_err(),
+            "IPV6_V6ONLY must keep the v4-mapped copy off the v6 socket"
+        );
     }
 }

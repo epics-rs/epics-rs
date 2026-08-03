@@ -19,12 +19,19 @@ should make the server's free memory fall without limit.
 Phase 0 first checks the subscription actually ticks; without a producer the
 experiment would prove nothing and say so.
 
-OUTCOME (added after the run, see ../ca-stuck-reader-measurement.md): this did
-NOT establish the hypothesis. At 1.10 events/s the 1200 s run only ever put
-~66 KB in flight, which QEMU's SLIRP hostfwd and the host socket buffers absorb
-outright, so A's small SO_RCVBUF never closed the guest's window and the drain
-never parked. Free memory moved 216 B and then held. The script is kept as the
-record of what was run; it needs a waveform-rate producer to be conclusive.
+OUTCOME (added after the run, see ../ca-stuck-reader-measurement.md): free
+memory moved 216 B and then held. That was read at the time as inconclusive,
+because at 1.10 events/s the 1200 s run only ever put ~66 KB in flight, which
+QEMU's SLIRP hostfwd and the host socket buffers absorb outright -- so A's small
+SO_RCVBUF may never have closed the guest's window at all.
+
+stuck_both.py then supplied the missing flood and reached the same flat result
+with the drain demonstrably parked, and the reason turned out to be structural:
+this guest runs server/blocking.rs, whose CAS-event thread writes the socket
+DIRECTLY under send_lock (blocking.rs:1219) instead of pushing to the outbox.
+Back-pressure therefore reaches the bounded EvQue ring, which coalesces. The
+unbounded outbox belongs to the HOSTED driver, which no embedded target runs;
+hosted_growth.py measures it at 9.34 kB/s.
 """
 import socket
 import struct

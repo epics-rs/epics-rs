@@ -263,8 +263,8 @@ impl Record for HistogramRecord {
     ///         prec->sevr = INVALID_ALARM;
     /// ```
     ///
-    /// **DEVIATION from C, deliberate — CBUG-F12 refused.** An inverted-limits
-    /// histogram (`LLIM >= ULIM`) cannot bin anything: it is genuinely
+    /// **DEVIATION from C, deliberate — CBUG-F12 refused.** An *inverted*-limits
+    /// histogram (`LLIM > ULIM`) cannot bin anything: it is genuinely
     /// misconfigured, and the record's *intent* — the C code literally tries to
     /// set `SOFT_ALARM`/`INVALID_ALARM` — is to flag it. C's *mechanism* is
     /// broken: it writes `stat`/`sevr` DIRECTLY instead of `nsta`/`nsev` via
@@ -289,9 +289,26 @@ impl Record for HistogramRecord {
     /// C's `nsev < INVALID_ALARM` guard (it only raises when strictly higher).
     /// Gated on `csta` because C's `add_count` returns before the limits test
     /// when counting is stopped.
+    ///
+    /// # Why the alarm test is `>` where C's counting test is `>=`
+    ///
+    /// The deviation flags an *inversion* — a limit pair only an operator can
+    /// create. It must not flag an *empty* range, because `LLIM == ULIM` is the
+    /// state every histogram is in before anyone configures it: neither field
+    /// carries an `initial(...)` in `histogramRecord.dbd`, so a freshly loaded
+    /// record has `LLIM == ULIM == 0` and `CSTA == 1`. Testing `>=` here made
+    /// the port raise SOFT/INVALID on the first process of *every* unconfigured
+    /// histogram, where C shows NO_ALARM — measured by the differential oracle
+    /// as 14 defects across `SCAN`/`PROC`/`UDF`, all of them a bare
+    /// `record(histogram, "…") {}`. Refusing C's broken *mechanism* was never a
+    /// licence to alarm on C's default state.
+    ///
+    /// [`Self::add_count`]'s guard stays `>=`, and is not the same test: an
+    /// empty range bins nothing, which is arithmetic rather than a judgement
+    /// about configuration, and C's `add_count` returns there too.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::record::AlarmSeverity;
-        if self.csta && self.llim >= self.ulim {
+        if self.csta && self.llim > self.ulim {
             crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::SOFT_ALARM,

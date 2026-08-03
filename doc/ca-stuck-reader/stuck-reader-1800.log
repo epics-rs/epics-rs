@@ -1,0 +1,65 @@
+A: channel up, sid=1 native dtype=6 count=1
+A: issued 50000 READ_NOTIFY requests, now reading nothing
+t+  30s  A=connected                 B=SERVED in 0.43s
+t+  60s  A=connected                 B=SERVED in 0.01s
+t+  90s  A=connected                 B=SERVED in 0.01s
+t+ 120s  A=connected                 B=SERVED in 0.01s
+t+ 150s  A=connected                 B=SERVED in 0.01s
+t+ 180s  A=connected                 B=SERVED in 0.01s
+t+ 210s  A=connected                 B=SERVED in 0.01s
+t+ 240s  A=connected                 B=SERVED in 0.01s
+t+ 270s  A=connected                 B=SERVED in 0.01s
+t+ 300s  A=connected                 B=SERVED in 0.01s
+t+ 330s  A=connected                 B=SERVED in 0.01s
+t+ 360s  A=connected                 B=SERVED in 0.01s
+t+ 390s  A=connected                 B=SERVED in 0.01s
+t+ 420s  A=connected                 B=SERVED in 0.01s
+t+ 450s  A=connected                 B=SERVED in 0.01s
+t+ 480s  A=connected                 B=SERVED in 0.01s
+t+ 510s  A=connected                 B=SERVED in 0.01s
+t+ 540s  A=connected                 B=SERVED in 0.01s
+t+ 570s  A=connected                 B=SERVED in 0.01s
+t+ 600s  A=connected                 B=SERVED in 0.01s
+t+ 630s  A=connected                 B=SERVED in 0.01s
+t+ 660s  A=connected                 B=SERVED in 0.01s
+t+ 690s  A=connected                 B=SERVED in 0.01s
+t+ 720s  A=connected                 B=SERVED in 0.01s
+t+ 750s  A=connected                 B=SERVED in 0.01s
+t+ 780s  A=connected                 B=SERVED in 0.01s
+t+ 810s  A=connected                 B=SERVED in 0.01s
+t+ 840s  A=connected                 B=SERVED in 0.01s
+t+ 870s  A=connected                 B=SERVED in 0.01s
+t+ 900s  A=connected                 B=SERVED in 0.01s
+t+ 930s  A=connected                 B=SERVED in 0.01s
+t+ 960s  A=connected                 B=SERVED in 0.01s
+t+ 990s  A=connected                 B=SERVED in 0.01s
+t+1020s  A=connected                 B=SERVED in 0.01s
+t+1050s  A=connected                 B=SERVED in 0.01s
+t+1080s  A=connected                 B=SERVED in 0.01s
+t+1110s  A=connected                 B=SERVED in 0.01s
+t+1140s  A=connected                 B=SERVED in 0.01s
+t+1170s  A=connected                 B=SERVED in 0.01s
+t+1200s  A=connected                 B=SERVED in 0.01s
+t+1230s  A=connected                 B=SERVED in 0.01s
+t+1260s  A=connected                 B=SERVED in 0.01s
+t+1290s  A=connected                 B=SERVED in 0.01s
+t+1320s  A=connected                 B=SERVED in 0.01s
+t+1350s  A=connected                 B=SERVED in 0.01s
+t+1380s  A=connected                 B=SERVED in 0.01s
+t+1410s  A=connected                 B=SERVED in 0.01s
+t+1440s  A=connected                 B=SERVED in 0.01s
+t+1470s  A=connected                 B=SERVED in 0.01s
+t+1500s  A=connected                 B=SERVED in 0.01s
+t+1530s  A=connected                 B=SERVED in 0.01s
+t+1560s  A=connected                 B=SERVED in 0.01s
+t+1590s  A=connected                 B=SERVED in 0.01s
+t+1620s  A=connected                 B=SERVED in 0.01s
+t+1650s  A=connected                 B=SERVED in 0.01s
+t+1680s  A=connected                 B=SERVED in 0.01s
+t+1710s  A=connected                 B=SERVED in 0.01s
+t+1740s  A=connected                 B=SERVED in 0.01s
+t+1770s  A=connected                 B=SERVED in 0.01s
+t+1800s  A=connected                 B=SERVED in 0.01s
+
+final: A=connected after 1800s of reading nothing
+A closed; the server may now reap it.

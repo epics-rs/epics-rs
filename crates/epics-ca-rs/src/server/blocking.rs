@@ -1061,10 +1061,14 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
 }
 
 /// Write one complete frame to the socket under the send lock, then flush.
+///
+/// Wrapped in [`crate::server::send::RetryTransient`] so an `EINTR` or an
+/// `ENOBUFS` retries the unsent remainder instead of ending the client, which
+/// is what C's `cas_send_bs_msg` loop does under the same `SEND_LOCK`.
 fn write_frame_locked(send_lock: &Mutex<Arc<TcpStream>>, frame: &[u8]) -> std::io::Result<()> {
     let sock = send_lock.lock().expect("CA send-lock poisoned");
     // `impl Write for &TcpStream` — the shared handle needs no `&mut`.
-    let mut sock = &**sock;
+    let mut sock = crate::server::send::RetryTransient(&**sock);
     sock.write_all(frame)?;
     sock.flush()
 }
@@ -1078,7 +1082,7 @@ fn drain_outbox_locked(
     drain: &mut OutboxDrain,
 ) -> std::io::Result<()> {
     let sock = send_lock.lock().expect("CA send-lock poisoned");
-    let mut sock = &**sock;
+    let mut sock = crate::server::send::RetryTransient(&**sock);
     while let Some(frame) = drain.try_next() {
         sock.write_all(&frame)?;
     }

@@ -23,6 +23,7 @@ pub mod monitor;
 pub mod outbox;
 pub mod rate_limit;
 pub(crate) mod recv;
+pub(crate) mod send;
 #[cfg(all(feature = "cap-tokens", not(epics_embedded_target)))]
 pub mod signed_beacon;
 pub mod stats;

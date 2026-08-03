@@ -1662,10 +1662,17 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
 }
 
 /// Drain every frame currently queued in the connection outbox into the
-/// socket buffer (in arrival order) and flush once. This is the ONLY place
-/// server-produced bytes reach the socket — the single-owner drain that
-/// replaces every former out-of-band `writer.lock().await` write. Returns
-/// the number of wire bytes written, for `ServerStats::bytes_out`.
+/// socket buffer (in arrival order) and flush once. This is the single-owner
+/// drain that replaces every former out-of-band `writer.lock().await` write.
+/// Returns the number of wire bytes written, for `ServerStats::bytes_out`.
+///
+/// It is *not* the only place server bytes reach the socket, and the comment
+/// that used to say so was wrong: `handle_client` writes the unsolicited
+/// `CA_PROTO_VERSION` greeting directly before the loop starts, and the
+/// out-of-band monitor arm writes its first frame directly before draining the
+/// rest. What is genuinely single-owner is the *policy* those three share —
+/// `sock`'s innermost writer is a [`crate::server::send::RetryTransientAsync`],
+/// so all three inherit C's transient-failure handling without a branch.
 ///
 /// Batching is preserved: a whole dispatch burst (or a run of monitor
 /// frames) is written back-to-back before the single `flush`, so N framed
@@ -1735,7 +1742,15 @@ where
     // iteration — turning N small TCP writes into one. Default 8 KB was hit
     // at ~330 responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
-    let mut sock = BufWriter::with_capacity(64 * 1024, write_half);
+    // The write half is wrapped before it is buffered, so `BufWriter`'s spill,
+    // `write_all`, and `flush` all sit above C's transient-failure policy: an
+    // `ENOBUFS` burst parks this circuit for 15 s and retries, where the bare
+    // `write_all` used to return `Err` and `?` used to disconnect the client.
+    // See `crate::server::send`.
+    let mut sock = BufWriter::with_capacity(
+        64 * 1024,
+        crate::server::send::RetryTransientAsync::new(write_half),
+    );
     // The single per-connection outbox. `outbox` is the cloneable producer
     // handle every emit site holds (dispatch handlers in this task, plus
     // the spawned monitor / put-notify tasks); `outbox_drain` is owned only

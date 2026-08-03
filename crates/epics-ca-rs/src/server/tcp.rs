@@ -5367,15 +5367,22 @@ pub(crate) async fn register_subscription(
                         ev.cid = 1; // ECA_NORMAL
                         ev.available = sub_id;
 
+                        // Back-pressure, taken once this event is known to
+                        // become a frame — after `recv`, so an idle producer
+                        // holds nothing (`super::outbox` invariant). With the
+                        // outbox full this parks the producer and later posts
+                        // coalesce in the ring instead of queueing.
+                        let credit = outbox_clone.reserve().await;
                         // Abort-safety: this monitor task can be
                         // `task.abort()`ed mid-flight by EVENT_CANCEL /
                         // CLEAR_CHANNEL / disconnect cleanup. `seal`
                         // yields the whole EVENT_ADD frame as ONE
                         // contiguous buffer, handed to the outbox with a
-                        // single synchronous `push`, so an abort can only
-                        // land at a frame boundary — the connection loop
-                        // never observes a partial frame.
-                        outbox_clone.push(frame.seal(&ev));
+                        // single synchronous `push_with`, so an abort can
+                        // only land at a frame boundary — the connection
+                        // loop never observes a partial frame, and an abort
+                        // at the `reserve` above strands no credit.
+                        outbox_clone.push_with(frame.seal(&ev), credit);
                         // Frame handed to the outbox — PCAS
                         // `subscriptionEventsProcessed` parity
                         // (gateway `serverEventRate`).
@@ -5661,6 +5668,11 @@ pub(crate) async fn run_event_task<W>(
                             d.sub_id,
                             &event,
                             &ev_outbox,
+                            // `ev_outbox` is this task's private one-delivery
+                            // scratch buffer, drained to the socket under the
+                            // send lock immediately below, so the socket — not
+                            // credit — is already this producer's bound.
+                            crate::server::outbox::Credit::none(),
                             d.long_string_mode,
                             ReplyContext {
                                 req_hdr: d.req_hdr,

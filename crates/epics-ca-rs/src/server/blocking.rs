@@ -3593,6 +3593,7 @@ mod tests {
             r.sub_id,
             &event,
             &outbox,
+            crate::server::outbox::Credit::none(),
             r.long_string_mode,
             crate::server::tcp::ReplyContext {
                 req_hdr: hdr,

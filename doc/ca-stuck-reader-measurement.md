@@ -142,14 +142,15 @@ monitor's last entry in place. This is C's structure: `client->lock` serializes
 `camsgtask` and `event_task` (`server.h:221`) in front of a bounded `dbEvent`
 ring.
 
-**Hosted driver — unbounded.** `monitor.rs:178` ends the monitor task with
+**Hosted driver — was unbounded.** Fixed below; this is what the measurement
+found. `monitor.rs:178` ended the monitor task with
 `outbox.push(frame.seal(&hdr))`, a synchronous send into
-`mpsc::unbounded_channel()` (`outbox.rs:73`) that never blocks and is decoupled
-from the socket. Back-pressure never reaches the `EvQue`, so that ring always
-drains and never coalesces, and the growth moves into the queue instead.
-`outbox.rs:68` justifies the unbounded choice with "the sole draining owner
-pulls the queue empty after [...]", which stops being true exactly when the
-drain parks. Pipelined requests cannot exercise this — once the drain parks the
+`mpsc::unbounded_channel()` that never blocks and is decoupled from the socket.
+Back-pressure never reached the `EvQue`, so that ring always drained and never
+coalesced, and the growth moved into the queue instead. The channel's own doc
+justified the unbounded choice with "the sole draining owner pulls the queue
+empty after [...]", which stops being true exactly when the drain parks.
+Pipelined requests cannot exercise this — once the drain parks the
 read loop stops dispatching, so no new replies are produced. It takes an
 asynchronous producer, i.e. a subscription.
 
@@ -246,29 +247,61 @@ The stack reasoning above is **not** transferred: the VxWorks 7 SDK on the rig
 ships headers only — no TCP stack source — so the persist/keepalive argument
 has not been checked there. The end-to-end result is what this run establishes.
 
-## Not fixed here — and what the fix would have to decide
+## The fix: credit, and the re-measurement
 
-The hosted driver's growth is a real defect with a measured rate, but the repair
-is not a one-liner, and picking one silently would be the wrong call.
+The C-faithful answer was already in the tree — the blocking driver's — so the
+question was only how to get the same back-pressure into the hosted driver
+without giving up what the outbox bought. Two obvious routes are both wrong:
 
-The C-faithful answer is known, because our own blocking driver already
-implements it: let the socket back-pressure the monitor producer so the bounded
-`EvQue` ring absorbs the overflow by coalescing. Two ways to get there, both
-with a cost:
+1. **Bound the channel.** Swapping `unbounded_channel` for a bounded one
+   deadlocks: the read loop both pushes command replies into the outbox and is
+   its sole drain, so a full queue has it await itself.
+2. **Give the monitor task the socket, as `blocking.rs` does.** That is the
+   structure that measures flat, but `monitor.rs` records that the outbox was
+   adopted *to remove* an abort-safety hazard — under the former shared
+   `Arc<Mutex<BufWriter>>` a `task.abort()` between header and payload could
+   expose a partial frame, which one synchronous `push` makes impossible.
+   Reverting reintroduces it.
 
-1. **Bound the outbox.** Swapping `unbounded_channel` for a bounded one
-   deadlocks as written: the read loop both pushes command replies into the
-   outbox and is its sole drain, so a full queue would have it await itself. A
-   bound would have to apply to monitor pushes only, or be paired with a
-   `try_send`-then-drain discipline on the read loop.
-2. **Give the monitor task the socket, as `blocking.rs` does.** This is the
-   exact structure that measures flat — but `monitor.rs:167-177` records that
-   the outbox was adopted *to remove* an abort-safety hazard: under the former
-   shared `Arc<Mutex<BufWriter>>` a `task.abort()` between header and payload
-   could expose a partial frame, which the single synchronous `push` makes
-   impossible. Reverting reintroduces it.
+Neither tension is real once the bound is put on the *producer* instead of on
+the queue. `server/outbox.rs` now carries a second invariant:
 
-Back-pressure and abort-safety are in tension, and choosing between them is a
-design decision for the owner rather than a defect with one obvious repair.
-Note that it is hosted-only: the embedded targets run `blocking.rs`, which
-runs 2 and 3 measure as bounded.
+> A producer that is not the connection loop MUST hold a `Credit` for every
+> frame it enqueues, and only the drain owner may release one — by dropping the
+> queued frame after its bytes are in the socket writer.
+
+`Credit` is an `OwnedSemaphorePermit` (`MONITOR_CREDIT` = 64 per connection)
+that rides *inside* the queued frame, so releasing it is the drain owner's
+`Drop` — the same `Drop` that already returns the send buffer to the
+`FramePool`. Accounting is symmetric and has one owner on each side: the
+producer takes a credit only when it really enqueues, the drain returns one
+only when it really wrote. Request→reply handlers pass `Credit::none()` and are
+unaffected, which is what keeps route 1's deadlock off the table; the frame is
+still sealed and enqueued in a single synchronous send with no await between
+header and payload, which is what keeps route 2's hazard closed.
+
+Credit is taken *after* the event leaves the ring and *after* the access-rights
+gate, never before. A producer waiting for its next event must hold nothing, or
+a connection with more subscriptions than `MONITOR_CREDIT` would exhaust the
+pool with an empty queue and nothing left to drain to release it.
+
+With no credit the producer parks without dequeuing, so the backlog stays in
+the `EvQue` ring and coalesces there — the same place, and for the same reason,
+as in C and in `blocking.rs`.
+
+### Re-measurement
+
+Same script, same 100 Hz putter, same flood, same 60 samples over 591 s
+([log](ca-stuck-reader/hosted-growth-600-credit.log)):
+
+| | before | after |
+|---|---|---|
+| `VmRSS` drift | +648 → +6,168 kB | +120 → **+120 kB** |
+| slope | 9.340 kB/s (32.8 MB/h) | **0.000 kB/s** |
+| server `Send-Q` | 1,357,200, constant | 1,357,152, constant |
+
+The `Send-Q` column is what makes the second run mean anything: it is constant
+in both, so the drain is parked for the whole window in both, and the condition
+being measured did not change — only the growth did. Monitor throughput for a
+client that *does* read is unchanged: the pre-flood phase measured 97.8
+events/s against the 100 Hz putter, versus 98.2 before the fix.

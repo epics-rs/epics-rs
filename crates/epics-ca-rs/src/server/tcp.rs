@@ -1478,9 +1478,18 @@ async fn accept_loop(
             // kernel does NOT
             // apply it — a stuck client where the kernel send buffer
             // fills would still leave `poll_write` Pending forever.
-            // The actual stall guard is the `tokio::time::timeout`
-            // wrapping `dispatch_message` in `handle_client`'s read
-            // loop (search for "send_timeout()" below).
+            //
+            // This used to name the `tokio::time::timeout` wrapping
+            // `dispatch_message` as "the actual stall guard". It is not one:
+            // `dispatch_message` takes `&Outbox` and cannot touch the socket,
+            // so no socket stall can make it late. Every server write now
+            // happens in `drain_and_flush` at the bottom of the read loop,
+            // which is not wrapped. **The hosted driver therefore has no stall
+            // guard**, which happens to match the blocking driver and C — both
+            // block in the write for as long as the peer takes. See
+            // `doc/ca-stuck-reader-measurement.md`; whether to keep that or
+            // restore a bound is an open decision, not an oversight to patch
+            // silently.
             let _ = sock.set_write_timeout(Some(send_timeout()));
         }
         let _ = stream.set_nodelay(true);
@@ -2125,12 +2134,18 @@ where
                     }
                 }
 
-                // Wrap dispatch in send_timeout so a stuck-reader client
-                // (kernel send buffer full → `write_all` Pending forever)
-                // can be detected and disconnected. Without this, one
-                // misbehaving client could deadlock its own per-client
-                // task indefinitely. On timeout we drop the connection;
-                // any in-flight reply is discarded.
+                // Bound how long one message may spend in dispatch. On
+                // timeout we drop the connection; any in-flight reply is
+                // discarded.
+                //
+                // This does NOT bound a stuck reader, though it was written
+                // to and still carried that claim until 2026-08-03.
+                // `dispatch_message` takes `&Outbox` — an unbounded channel —
+                // and never writes the socket, so a peer that stops reading
+                // cannot make it late. The batch-flush refactor moved every
+                // write to the unwrapped `drain_and_flush` below. What is
+                // left bounded here is dispatch's own work: a handler that
+                // blocks on the database or a link.
                 match tokio::time::timeout(
                     send_timeout(),
                     dispatch_message(

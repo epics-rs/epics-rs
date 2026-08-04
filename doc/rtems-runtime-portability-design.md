@@ -481,6 +481,38 @@ branch. Phase-6 items 5/8/9 likewise depend on that branch's primitives
 `caucus/WG0SFREHPX/ca-sans-io-1962c8be-1` into main is the user's decision, but
 until it lands, no PVA RTEMS milestone can be *committed* green.
 
+### 8.1.3 Measured, not applied — `epics-bridge-rs` (2026-07-21)
+
+`doc/rtems-bridge-walls.md` settles the status this document and the PI-lock
+evaluation §9 both left undeclared. Measured on `integration/rtems-scope-b`
+@ `af2d5d16`, three `cargo check --target armv7-rtems-eabihf` runs (default /
+`--no-default-features` / `--features qsrv`), all exit 101:
+
+- **Every wall is a dependency wall; not one is in bridge source** — mio 1.2.0
+  (29), socket2 0.6 (20), signal-hook-registry 1.4.8 (4), getrandom 0.2.17 (1).
+- **Root cause is one line**, `epics-bridge-rs/Cargo.toml:93`
+  `tokio = { version = "1", features = ["full"] }` in the *plain*
+  `[dependencies]` table while `epics-base-rs:43-44`, `epics-ca-rs:69-70` and
+  `epics-pva-rs:139-142` all split the same dep per target. Cargo **unions**
+  features across the graph, so that one line silently re-enables
+  `net`/`signal`/`process` for every crate in any build containing the bridge —
+  a latent hazard for *any* target-restricted build, not only RTEMS. Proved by
+  `cargo tree -i tokio -e features`: the bridge is the sole enabler of `full`.
+- **Dep-gating alone is predicted sufficient for the `qsrv` subset** (3
+  Cargo.toml edits, 0 source changes): `qsrv`/`pvalink`/`pva_gateway` use
+  `tokio::net`/`signal`/`process` **0** times; only `ca_gateway` does, at 3
+  production sites (`pvlist.rs:244`, `server.rs:1219`, `:1285`), and every
+  module already sits behind its own feature (`lib.rs:69,72,75,82`). Compile
+  surface would be 32,787 / 59,380 src lines (55%). **Not verified to exit 0** —
+  the gates were not applied; this is a well-evidenced prediction.
+- **Nobody's blocker today.** No inbound edge from base/ca/pva; the only RTEMS
+  binary that exists (`rtems-ca-ioc`) does not depend on the bridge, and
+  `rtems-pva-ioc` does not exist yet. It becomes a blocker only if item-7 stage G
+  chooses *group-aware* db-backed PVA — and stage G can avoid it entirely, since
+  `epics-pva-rs` already serves records off `DbSubscription` via
+  `PvDatabaseSource` + `UpstreamMonitor::from_db` (`server_native/source.rs:1912-1921`)
+  in a `server/` module that is **not** RTEMS-gated.
+
 ### 8.2 Gateable — excluded from the RTEMS build
 
 - **ring / rustls / tokio-rustls (TLS)** — `optional = true` in **epics-ca-rs
@@ -577,6 +609,63 @@ libm, chrono, flate2, lz4_flex — and, importantly, hashing via **RustCrypto**
    subscription, applies the transform on pull; empty-mask filter and
    connect-time seed preserved), and mapped-of-mapped is unrepresentable by
    type, which is what keeps the default monitor path allocation-free.
+
+   **Merge ordering resolved 2026-07-21 — local branch
+   `integration/rtems-scope-b`** (off `main@5241145f`; main itself untouched,
+   nothing pushed). All three branches on item 7's critical path are merged
+   there: the dep gate (`7f0f9d3e`), the CA sans-io branch through `c065fe28`
+   (which adds the opt-in SCHED_FIFO wiring, below), and
+   `phase6/pva-channelsource-ring` (`aa1af842`). Conflict resolutions of
+   record: `iocsh/commands.rs` (main's `install_record_defs` structure +
+   the CA branch's sync record API, data-lock guard scoped per field before
+   `update_scan_index(..).await`); `runtime/task.rs` (a cfg-forked
+   `runtime::task::timeout` seam — the exec arm races a pinned `sleep`
+   against the future and returns a local `Elapsed`, since tokio's `Elapsed`
+   has no public constructor); the dep gate's TLS feature gates re-applied to
+   the split-out `accept.rs`. Verified at the branch tip (`2ce9bd11`): clippy
+   `--workspace --all-targets -D warnings` clean; nextest workspace
+   **9839/9839**; `rtems-exec-model` feature-ON suite **593/593**; and
+   `--lib` RTEMS checks exit 0 for epics-base-rs, epics-ca-rs **and
+   epics-pva-rs** — the committed-green pva RTEMS check that items 5, 7 and
+   10 were waiting on. Item-5 stages 3–5, item-7 stages C–G, and items 8–9
+   are unblocked on this branch. ~~Next owed there: extract `PvaServerConfig`
+   out of the host-gated `runtime.rs` — 8 production `tcp.rs` signatures
+   name it (`tcp.rs:45`), so the gate re-point is **not** the "4 cfg lines"
+   named in `4c75e766` until that lands — then the `tcp`/`peers` gate
+   re-point and the `AbortOnDrop` → `TaskAbortHandle` rename.~~
+   **LANDED 2026-07-21** (`42a42abf` config → `server_native/config.rs` ·
+   `4da1e04a` SEARCH protocol → `server_native/search.rs`, byte-identical
+   moves diff-proved · `04cdf6fa` tcp.rs's 3 handle annotations → seam
+   aliases · `5ff20f4a` exec `AbortHandle` gains the `Debug` its tokio
+   mirror has · `ab2d48e2` gate re-point: `tcp`/`peers`/`config`/`search`
+   target-neutral, `accept`/`runtime`/`udp` stay gated · `af2d5d16` rustdoc
+   links). RTEMS `--lib` exit 0 with `tcp.rs` **type-checked into the
+   build** (deliberate-type-error probe), workspace 9839 unchanged.
+   Known residue: **116 dead-code warnings on the RTEMS check** — with the
+   pre-split `run_tcp_server*` re-exports gated, RTEMS has no entry point
+   into `tcp` yet, so the whole module is unreachable until the blocking
+   thread-per-client driver (item 7 stage C) roots it; the count is the
+   honest measure of unwired surface, deliberately not `#[allow]`-ed.
+   Still owed: the crate-wide item-9 handle rename (~87 sites), item-5
+   stages 3–5, item-7 stages C–G.
+
+   **RT-Linux track (separate from RTEMS, user-ordered 2026-07-21).**
+   Item 4 landed as `c065fe28` on the CA branch: SCHED_FIFO application is
+   now opt-in behind `EPICS_RS_ALLOW_RT_PRIORITY` (default **off**;
+   deliberately not C's `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`,
+   whose default is YES), the policy is a parameter of
+   `apply_to_current_thread_under` so "switch off ⟹ no scheduler call"
+   holds by call graph, the permitted FIFO range is probed once (C's
+   `find_pri_range`, `osdThread.c:259-334`), and `cbTimer` /
+   `CAS-client-blocking` / `CAS-event-blocking` now carry their C
+   priorities. Item 4b's evaluation is at **`doc/pi-lock-evaluation.md`** —
+   headline: 14 of the 25 shared locks are tokio primitives that no PI
+   mutex can reach (blocking threads wait in `std::thread::park()`,
+   invisible to the kernel's PI chain), and L1, the `dbScanLock` analogue,
+   holds that property *by contract* (`OwnedMutexGuard` across await) — the
+   design decision gating any hard-RT claim. On RTEMS `apply_priority_impl`
+   still returns `Unsupported` (`task.rs:715-719`); target-side priority
+   belongs with BSP bring-up (§10).
 
    Items 1/2/4 are **desktop-neutral** — they improve the hosted build too and
    can land before any RTEMS wiring. Item 4 alone deletes 6 tasks: today a

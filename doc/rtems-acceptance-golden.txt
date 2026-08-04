@@ -1,0 +1,59 @@
+# Rung -1 golden capture — `rtems-ca-ioc` on Linux under `--features rtems-exec-model`
+#
+# Captured 2026-07-21 from integration/rtems-scope-b @ 1c27465c, host
+# x86_64 Linux, EPICS base C tools from /home/stevek/work/epics-base/bin/linux-x86_64.
+# Port 15064 throughout (never bind 5064 in a test); on the guest the same
+# lines appear with 5064 substituted.
+#
+# Every later rung of doc/rtems-runtime-acceptance-plan.md asserts equality
+# against THIS file. It exists so the expected output is a measurement rather
+# than a prediction.
+#
+# It already settles one open question the plan flagged: PREC=3 on RTEMS:AO
+# does NOT apply to the default DBR_DOUBLE request — caget prints 1.5, not
+# 1.500.
+
+=== rung 1: IOC console (stdout) ===
+rtems-ca-ioc: serving 3 records on CA port 15064 (TCP + UDP search), RTEMS execution model, no tokio runtime
+rtems-ca-ioc: RTEMS:AO
+rtems-ca-ioc: RTEMS:LO
+rtems-ca-ioc: RTEMS:MSG
+
+=== rung 4: caget -t RTEMS:AO RTEMS:LO RTEMS:MSG ===
+1.5
+7
+rtems-ca-ioc
+
+=== rung 4: caget (default formatting) ===
+RTEMS:AO                       1.5
+RTEMS:LO                       7
+RTEMS:MSG                      rtems-ca-ioc
+
+=== rung 3: cainfo RTEMS:AO ===
+RTEMS:AO
+    State:            connected
+    Host:             localhost:15064
+    Access:           read, write
+    Native data type: DBF_DOUBLE
+    Request type:     DBR_DOUBLE
+    Element count:    1
+
+=== rung 5: camonitor RTEMS:LO, spanning a caput ===
+RTEMS:LO                       <undefined> 7 UDF NO_ALARM
+RTEMS:LO                       2026-07-21 21:45:45.154147 42  
+#
+# Note the first update: timestamp <undefined>, severity UDF NO_ALARM. The
+# record has never been processed at that point, so this is the correct
+# baseline, not a defect — assert it, do not "fix" it on the guest.
+# The second line's timestamp is wall-clock and is the one field that will
+# differ on the guest.
+
+=== rung 5: caput RTEMS:LO 42 ===
+Old : RTEMS:LO                       7
+New : RTEMS:LO                       42
+
+=== rung 5 negative control: caget -t RTEMS:LO after the put ===
+42
+#
+# This is what proves the monitor update came from record processing rather
+# than a cached client-side value.

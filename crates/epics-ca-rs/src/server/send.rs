@@ -53,16 +53,22 @@ use std::time::Duration;
 /// C `caserverio.c:99` — `epicsThreadSleep(15.0)` between ENOBUFS retries.
 const OUT_OF_BUFFERS_RETRY: Duration = Duration::from_secs(15);
 
-/// Did the host refuse this write for want of network buffers? On Unix that is
-/// `ENOBUFS`; Winsock reports the same condition as `WSAENOBUFS` (10055),
+/// This host's "out of network buffers" code for a socket send. On Unix that
+/// is `ENOBUFS`; Winsock reports the same condition as `WSAENOBUFS` (10055),
 /// which is what `SOCKERRNO` resolves to in C's `#ifdef` for this branch.
-fn is_out_of_buffers(e: &io::Error) -> bool {
-    #[cfg(windows)]
-    const CODE: i32 = 10055;
-    #[cfg(not(windows))]
-    const CODE: i32 = libc::ENOBUFS;
+///
+/// Named rather than inlined so the tests can assert against the very constant
+/// the classifier reads. A test that spelled the number itself would be
+/// asserting POSIX errno on Windows, where `from_raw_os_error` takes Win32
+/// codes and 105 is not `WSAENOBUFS`.
+#[cfg(windows)]
+pub(crate) const OUT_OF_BUFFERS: i32 = 10055;
+#[cfg(not(windows))]
+pub(crate) const OUT_OF_BUFFERS: i32 = libc::ENOBUFS;
 
-    e.raw_os_error() == Some(CODE)
+/// Did the host refuse this write for want of network buffers?
+fn is_out_of_buffers(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(OUT_OF_BUFFERS)
 }
 
 /// One console record per retry, on C's sink and with C's wording
@@ -174,12 +180,35 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// A writer that fails with a caller-chosen errno for the first `fails`
-    /// calls, then behaves. Records what it was actually offered so a test can
-    /// prove no byte was written twice.
+    /// How the fixture should spell its failure.
+    ///
+    /// The two discriminators in this module read different things — the EINTR
+    /// branch reads `io::ErrorKind`, the ENOBUFS branch reads the raw OS code —
+    /// so a fixture has to be able to speak both. Spelling every failure as a
+    /// POSIX errno instead is what made these tests pass on Unix and fail on
+    /// Windows, where `from_raw_os_error` takes Win32 codes and `libc::EINTR`
+    /// (4) decodes as "cannot open the file", not `Interrupted`.
+    #[derive(Clone, Copy)]
+    enum Fail {
+        Kind(io::ErrorKind),
+        Code(i32),
+    }
+
+    impl Fail {
+        fn error(self) -> io::Error {
+            match self {
+                Fail::Kind(k) => io::Error::from(k),
+                Fail::Code(c) => io::Error::from_raw_os_error(c),
+            }
+        }
+    }
+
+    /// A writer that fails a caller-chosen way for the first `fails` calls,
+    /// then behaves. Records what it was actually offered so a test can prove
+    /// no byte was written twice.
     struct FlakyWriter {
         fails: usize,
-        code: i32,
+        how: Fail,
         offered: Vec<Vec<u8>>,
         accepted: Vec<u8>,
         /// Take only this many bytes per successful `write`, to exercise the
@@ -192,7 +221,7 @@ mod tests {
             self.offered.push(buf.to_vec());
             if self.fails > 0 {
                 self.fails -= 1;
-                return Err(io::Error::from_raw_os_error(self.code));
+                return Err(self.how.error());
             }
             let n = self.chunk.min(buf.len());
             self.accepted.extend_from_slice(&buf[..n]);
@@ -203,10 +232,10 @@ mod tests {
         }
     }
 
-    fn flaky(fails: usize, code: i32, chunk: usize) -> FlakyWriter {
+    fn flaky(fails: usize, how: Fail, chunk: usize) -> FlakyWriter {
         FlakyWriter {
             fails,
-            code,
+            how,
             offered: Vec::new(),
             accepted: Vec::new(),
             chunk,
@@ -214,10 +243,11 @@ mod tests {
     }
 
     /// `EINTR` is retried in place, as C's `SOCK_EINTR: continue` does, and the
-    /// caller never sees it.
+    /// caller never sees it. Written as the `ErrorKind` the retry loop reads,
+    /// not as an errno, so it exercises the same branch on every platform.
     #[test]
     fn eintr_is_retried_not_returned() {
-        let mut w = RetryTransient(flaky(3, libc::EINTR, 64));
+        let mut w = RetryTransient(flaky(3, Fail::Kind(io::ErrorKind::Interrupted), 64));
         w.write_all(b"hello").expect("EINTR must not surface");
         assert_eq!(w.0.accepted, b"hello");
     }
@@ -228,7 +258,7 @@ mod tests {
     #[test]
     fn a_retry_after_a_partial_write_does_not_duplicate_bytes() {
         // Take 2 bytes per successful write, and fail the very first call.
-        let mut w = RetryTransient(flaky(1, libc::EINTR, 2));
+        let mut w = RetryTransient(flaky(1, Fail::Kind(io::ErrorKind::Interrupted), 2));
         w.write_all(b"abcdef").expect("write_all");
         assert_eq!(w.0.accepted, b"abcdef", "each byte delivered exactly once");
         // "abcdef" (failed), then "abcdef", "cdef", "ef".
@@ -244,28 +274,34 @@ mod tests {
         );
     }
 
-    /// A non-transient errno is the caller's to handle — that is what still
+    /// A non-transient failure is the caller's to handle — that is what still
     /// ends a circuit whose peer really is gone.
     #[test]
     fn a_real_error_is_returned_unchanged() {
-        let mut w = RetryTransient(flaky(1, libc::ECONNRESET, 64));
-        let e = w.write_all(b"x").expect_err("ECONNRESET must surface");
-        assert_eq!(e.raw_os_error(), Some(libc::ECONNRESET));
+        let mut w = RetryTransient(flaky(1, Fail::Kind(io::ErrorKind::ConnectionReset), 64));
+        let e = w.write_all(b"x").expect_err("a reset must surface");
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
     }
 
-    /// The classifier is what separates the two, and it must not fire on the
-    /// neighbouring "no buffer space" spellings.
+    /// The classifier is what separates the two, and it must fire on exactly
+    /// one code. Asserted against [`OUT_OF_BUFFERS`] itself and its immediate
+    /// neighbours, so it holds on every platform's numbering rather than on
+    /// POSIX errno — and so an off-by-one in that constant fails here.
     #[test]
-    fn only_enobufs_counts_as_out_of_buffers() {
+    fn only_out_of_buffers_counts_as_out_of_buffers() {
         assert!(is_out_of_buffers(&io::Error::from_raw_os_error(
-            libc::ENOBUFS
+            OUT_OF_BUFFERS
         )));
-        for other in [libc::ENOMEM, libc::EAGAIN, libc::EPIPE, libc::ECONNRESET] {
+        for other in [OUT_OF_BUFFERS - 1, OUT_OF_BUFFERS + 1] {
             assert!(
                 !is_out_of_buffers(&io::Error::from_raw_os_error(other)),
-                "errno {other} must not be treated as ENOBUFS"
+                "os error {other} must not be treated as out-of-buffers"
             );
         }
+        // A failure carrying no OS code at all must not sweep in either.
+        assert!(!is_out_of_buffers(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
     }
 
     /// ENOBUFS retries the same bytes. Driven with a zero delay would be a
@@ -275,7 +311,7 @@ mod tests {
     #[ignore = "sleeps 15s — C's caserverio.c:99 delay, run with --ignored"]
     fn enobufs_sleeps_then_retries_the_same_bytes() {
         let start = std::time::Instant::now();
-        let mut w = RetryTransient(flaky(1, libc::ENOBUFS, 64));
+        let mut w = RetryTransient(flaky(1, Fail::Code(OUT_OF_BUFFERS), 64));
         w.write_all(b"frame").expect("ENOBUFS must not surface");
         assert_eq!(w.0.accepted, b"frame");
         assert!(

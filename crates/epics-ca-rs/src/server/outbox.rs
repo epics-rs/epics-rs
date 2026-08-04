@@ -45,11 +45,11 @@
 //!
 //! # Invariant: an asynchronous producer runs on credit
 //!
-//! - MUST: a producer that is not the connection loop MUST hold a [`Credit`]
+//! - MUST: a producer that is not the connection loop MUST hold a `Credit`
 //!   for every frame it enqueues, and only the drain owner may release one —
 //!   by dropping the queued frame after its bytes are in the socket writer.
 //!
-//! Request→reply handlers are exempt and pass [`Credit::none`]: they run *in*
+//! Request→reply handlers are exempt and pass `Credit::none()`: they run *in*
 //! the connection loop, so a parked drain stops dispatch and no further reply
 //! can be produced. They are self-limiting.
 //!
@@ -66,7 +66,7 @@
 //!
 //! Credit is taken *after* an event leaves the ring, never before: a producer
 //! waiting for its next event must hold nothing, or a connection with more
-//! subscriptions than [`MONITOR_CREDIT`] would exhaust the pool with an empty
+//! subscriptions than `MONITOR_CREDIT` would exhaust the pool with an empty
 //! queue and nothing left to drain to release it.
 
 use crate::server::frame::{FramePool, PooledFrame};

@@ -41,11 +41,15 @@
 //! out broken again.
 //!
 //! So the policy lives *under* every writer instead: [`RetryTransient`] and
-//! [`RetryTransientAsync`] wrap the socket itself, so `write_all`, `flush`,
+//! `RetryTransientAsync` wrap the socket itself, so `write_all`, `flush`,
 //! and `BufWriter`'s internal spill all inherit it and no call site carries a
 //! branch. Resumption is exact for the same reason C's is — the adapter sits
 //! at the `write`/`poll_write` level, where a retry re-offers only the bytes
 //! the kernel did not take.
+//!
+//! (`RetryTransientAsync` is deliberately not an intra-doc link: it is
+//! `cfg(not(epics_embedded_target))`, so on an embedded target the link has no
+//! target and `rustdoc -D warnings` fails the build.)
 
 use std::io;
 use std::time::Duration;

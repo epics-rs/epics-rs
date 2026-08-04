@@ -535,9 +535,11 @@ Any future "pvalink compiles for RTEMS" green must not be read as
 > now, through `epics_base_rs::net::search_udp::SearchUdpSocket`. Fact 3
 > below was the `sin_len` libc defect (§3.2), fixed in the pinned `libc`
 > patch: `local_addr()` reads back on RTEMS 6, MEASURED. Fact 1 stays true
-> and is why TCP-only came first; fact 2 stays true. What is still absent
-> is the IPv6 half alone — both its binders are `socket2` and its receive
-> is `tokio::net`, so `V6Socket` is an uninhabited enum on `exec_backend`.
+> and is why TCP-only came first; fact 2 stays true. The IPv6 half followed
+> on 2026-08-03 through `SearchUdpSocketV6`, whose `exec_backend` arm is a
+> raw `libc` `AF_INET6` bind on the same pump — CROSS-COMPILED for both
+> RTOS targets, not yet exercised on one, so whether the BSP's stack
+> answers the bind is still open.
 > Measured on target: `UDPSEARCH reply pv=RTEMS:PVA:AO
 > server=10.0.2.15:5075 proto=tcp version=2`, resolved by broadcast with no
 > name server configured.

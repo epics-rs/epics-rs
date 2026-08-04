@@ -479,18 +479,25 @@ fi
 #     28  after server_conn's unconditional tokio::net import was removed
 #      0  after stage 4         UDP transport cfg-gated out of the target build
 #      0  after the v4 SEARCH socket landed — transport compiled IN, still 0
+#      0  after the v6 SEARCH socket landed — BOTH families in, still 0
 #
 # Stage 4 closed the remaining 28 (§5) by gating the whole UDP SEARCH/beacon
-# transport out of the target build. The v4 half is now compiled back IN and the
-# count is still zero: `search_engine.rs` binds through `SearchUdpSocket`, whose
-# `exec_backend` arm is one `std::net::UdpSocket` plus a receive-pump thread, and
+# transport out of the target build. Both halves are now compiled back IN and
+# the count is still zero: `search_engine.rs` binds through `SearchUdpSocket`
+# and `SearchUdpSocketV6`, whose `exec_backend` arms are `std::net::UdpSocket` /
+# a raw `libc` `AF_INET6` bind plus a shared receive-pump thread, and
 # `config::env`'s interface enumeration goes through
-# `epics_base_rs::net::iface_v4` instead of `if-addrs`. What stays absent is the
-# IPv6 half alone: `V6Socket` is an uninhabited enum there, so `socket2` and
-# `tokio::net` leave the target's compiled unit entirely — which is what keeps
-# this number at zero while the `epics-bridge-rs:realtime-pva-ioc --features
-# qsrv-core,pvalink` bin above pulls `epics-pva-rs/client` and still compiles
-# for the target.
+# `epics_base_rs::net::iface_v4` instead of `if-addrs`. `socket2` and
+# `tokio::net` are named only on the hosted arm of each, so neither reaches the
+# target's compiled unit — which is what keeps this number at zero while the
+# `epics-bridge-rs:realtime-pva-ioc --features qsrv-core,pvalink` bin above
+# pulls `epics-pva-rs/client` and still compiles for the target.
+#
+# Zero after the v6 half is a stronger statement than zero before it, and the
+# reason to keep the ratchet at an unchanged number rather than retire it: the
+# same 0 now covers twice the surface. Compiling is not running — whether the
+# BSP's stack answers an `AF_INET6` bind is an on-target question this script
+# cannot ask.
 #
 # The count stays pinned even at zero: a probe that regressed the client back
 # off the target would raise it, and this comparison is what turns that into a
@@ -589,5 +596,5 @@ else
     log "crate and target binary compiles for the generated native-TLS spec, in"
     log "both the portability and the image configuration."
 fi
-log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (v4 UDP transport compiled in; only the IPv6 half is absent)."
+log "PVA client (--features client): $PVA_CLIENT_TARGET_ERRORS target errors (both the v4 and the v6 UDP transport compiled in)."
 log "CA client: built, not probed (CRATE_FEATURES[epics-ca-rs]=client-core)."

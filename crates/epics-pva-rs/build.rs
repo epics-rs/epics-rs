@@ -106,12 +106,13 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // exists", so every arm that needs one takes that predicate — the target's
 // shape, now reached by the host build that models the target.
 //
-// The v4 SEARCH socket is no longer one of those arms. It binds on both
-// backends through `epics_base_rs::net::search_udp::SearchUdpSocket`, whose
-// `exec_backend` arm is a `std::net::UdpSocket` and a receive-pump thread and
-// names no reactor. `tokio_backend` still selects the IPv6 half, which is
-// `socket2` and `tokio::net` throughout, and `SearchTransport` still reduces
-// to `NameServersOnly` when the configuration asks for no UDP.
+// Neither SEARCH socket is one of those arms any longer. Both bind on both
+// backends, through `epics_base_rs::net::search_udp`'s `SearchUdpSocket` and
+// `SearchUdpSocketV6`, whose `exec_backend` arms are a `std::net::UdpSocket` /
+// a raw `libc` `AF_INET6` bind and a receive-pump thread, naming no reactor.
+// `tokio_backend` still selects the PVA *server*'s UDP responder, and
+// `SearchTransport` still reduces to `NameServersOnly` when the configuration
+// asks for no UDP.
 //
 // This is a third copy of a four-line rule, so it is pinned rather than
 // trusted: a `const` assertion in `src/lib.rs` checks it against

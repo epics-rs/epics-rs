@@ -1530,7 +1530,7 @@ decisive code path is quoted.
 | CBUG-F9 | pvxs | process-only blocking PUT selects a `requestType` dbNotify never matches — silent no-op success | Medium | NOT-REPRODUCED |
 | CBUG-F10 | pvxs | UnionArray encode omits the selector its own decoder requires — a decoded UnionA cannot be re-serialized | Medium | NOT-REPRODUCED |
 | CBUG-F11 | asyn | `caput REC.TSIZ -1` suspends the put thread forever inside `callocMustSucceed`, holding the global trace mutex | High | NOT-REPRODUCED |
-| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly — erased on the process path (NO_ALARM) but STICKS on the `.SGNL` special path (SOFT); port now refuses — raises SOFT/INVALID consistently on both paths via `nsta`/`nsev` (`9a51ba4c`) | Low | NOT-REPRODUCED |
+| CBUG-F12 | base histogram | the `LLIM >= ULIM` alarm writes `stat`/`sevr` directly — erased on the process path (NO_ALARM) but STICKS on the `.SGNL` special path (SOFT); port now refuses — raises SOFT/INVALID consistently on both paths via `nsta`/`nsev` (`9a51ba4c`), on `LLIM > ULIM` only, so an unconfigured `0 == 0` record stays quiet | Low | NOT-REPRODUCED |
 
 ### CBUG-F1: aCalc's `INC` bounds check admits writes two elements past the runtime stack — SIGSEGV at legal compile depth
 Bucket: NOT-REPRODUCED · Severity: High
@@ -1845,6 +1845,24 @@ on both the C IOC and the port.
 Proof (compiled softIoc, this host, and differential oracle):
 `LLIM=10 ULIM=5`, process → C and port both `STAT=NO_ALARM`; `caput .SGNL`
 with inverted limits → C and port both `STAT=SOFT SEVR=INVALID`.
+
+**Reconciliation 2026-08-03 — the refusal's condition narrowed to `>`.** The
+`9a51ba4c` refusal took C's condition verbatim (`llim >= ulim`), and the first
+full `--phase all` run since it landed showed what that costs: LLIM and ULIM
+carry no `initial(...)`, so a bare `record(histogram, "…") {}` already satisfies
+`>=` at `0 == 0`, and the port alarmed on the process path of every UNCONFIGURED
+histogram against C's NO_ALARM — 14 defects on `SCAN`/`PROC`/`UDF`. The alarm
+test is now `llim > ulim`: an INVERSION is a pair only an operator can create,
+an EMPTY range is the state every histogram loads in. C's path-dependence means
+no single condition agrees with C on both paths, so the residue moved rather
+than vanished — with `>` the port is quiet on a default record's `.SGNL` path
+where C's sticky write shows SOFT/INVALID (10 cases). That residue is C's bug
+showing through, is what the CBUG-F12 allowlist row now covers
+(`fields = ["SGNL"]`, `surface = ["stat","sevr"]`, `enabled = true`; the row had
+been unmatchable — its `fields` named the compared surfaces, not the case
+field), and histogram reconciles at 417 ran / 406 agreed / 11 expected /
+0 defect. A genuinely inverted histogram still alarms on BOTH paths, which is
+the consistency the refusal was for.
 
 ## Batch G — filed 2026-07-17 (PVA differential-oracle campaign, pvxs QSRV2 metadata)
 

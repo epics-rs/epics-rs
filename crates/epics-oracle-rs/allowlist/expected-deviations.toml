@@ -301,13 +301,13 @@ port serves the same menu minus that one instrument-only choice.
 [[deviation]]
 id = "CBUG-F12"
 bucket = "NOT-REPRODUCED"
-enabled = false
+enabled = true
 upstream = "epics-base / histogram"
 record_types = ["histogram"]
-fields = ["STAT", "SEVR"]
-surface = ["value_string"]
+fields = ["SGNL"]
+surface = ["stat", "sevr"]
 why = """
-An inverted-limits histogram (LLIM >= ULIM) cannot bin anything, so the record is
+An INVERTED-limits histogram (LLIM > ULIM) cannot bin anything, so the record is
 genuinely misconfigured. C's add_count tries to raise SOFT/INVALID but writes
 stat/sevr DIRECTLY instead of nsta/nsev, so recGblResetAlarms erases it on the
 process path (dead code -> NO_ALARM) while it sticks on the .SGNL special path.
@@ -317,10 +317,26 @@ histogram reports SOFT/INVALID CONSISTENTLY on both the process and the .SGNL
 special paths (port fix landed 2026-07-20, CBUG-F12 REPRODUCED -> NOT-REPRODUCED;
 covered by epics-base-rs `histogram_invalid_limits_alarm` unit tests).
 
-Kept `enabled = false`: the deviation is only observable on an inverted-limits
-histogram, and the put-phase harness never drives LLIM >= ULIM (no such case in
-cases.rs), so its scope agrees at NO_ALARM and enabling this row would report a
-FALSE STALE. Flip `enabled = true` once cases.rs grows an inverted-limits case
-that reads STAT/SEVR after a process — then the port's SOFT/INVALID vs C's
-NO_ALARM on the process path becomes the EXPECTED deviation this row allowlists.
+ENABLED 2026-08-03, and the scope corrected, after the first full `--phase all`
+run since the port fix landed. Two things were wrong here:
+
+1. The row claimed the harness "never drives LLIM >= ULIM (no such case in
+   cases.rs)". False. Neither LLIM nor ULIM carries an `initial(...)` in
+   histogramRecord.dbd, so every bare `record(histogram, "…") {}` the harness
+   loads already satisfies `LLIM >= ULIM` at 0 == 0 — C's condition holds on the
+   DEFAULT record, not only on a configured-inverted one.
+2. `fields` named STAT/SEVR and `surface` named value_string. `fields` is matched
+   against the case's own field and `surface` against the compared surface, so
+   this row could not have matched any case even enabled.
+
+What the run measured: C's behaviour is path-dependent on the one condition, so
+NO single port test agrees with C on both paths. With `>=` the port alarmed on
+the process path where C erases (14 DEFECTs on SCAN/PROC/UDF, every case a bare
+histogram); narrowed to `>` the port is quiet on the default record's SGNL path
+where C's sticky direct write shows SOFT/INVALID (10 DEFECTs on SGNL). The `>`
+form was taken: the port's rule is then uniform — an INVERSION an operator
+created alarms on both paths, an EMPTY range (which is what an unconfigured
+record has) alarms on neither — and the residue is exactly C's dead-code/sticky
+split, which is what this row exists to allowlist. Those 10 SGNL cases are its
+live scope.
 """

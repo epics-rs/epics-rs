@@ -1,4 +1,4 @@
-//! CBUG-F12 REFUSED — a histogram with `LLIM >= ULIM` and its invalid-limits
+//! CBUG-F12 REFUSED — a histogram with `LLIM > ULIM` and its inverted-limits
 //! alarm.
 //!
 //! C's `add_count` (histogramRecord.c:329-334) refuses to count when the limits
@@ -22,6 +22,15 @@
 //! `recGblResetAlarms`. (This is a Tier-2 deviation from a compiled C IOC on the
 //! process path, where C erases the alarm; recorded as a CBUG-F12 allowlist
 //! row.)
+//!
+//! The refusal covers an INVERSION (`LLIM > ULIM`) and stops there. C's counting
+//! test is `>=`, but `LLIM == ULIM` is the state every histogram is in before
+//! anyone configures it — neither field carries an `initial(...)` in
+//! `histogramRecord.dbd`, so a bare `record(histogram, "…") {}` loads with
+//! `LLIM == ULIM == 0` and `CSTA == 1`. Alarming there made every unconfigured
+//! histogram publish SOFT/INVALID on its first process against C's NO_ALARM,
+//! which the differential oracle measured as 14 defects. Refusing C's broken
+//! mechanism is not a licence to alarm on C's default state.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -89,10 +98,12 @@ async fn process_path_alarms_while_inverted_clears_when_valid() {
     );
 }
 
-/// Equal limits are inverted limits (C's test is `>=`); they too raise
-/// SOFT/INVALID on the process path.
+/// Equal limits are an EMPTY range, not an inverted one, and they are what an
+/// unconfigured record has. They bin nothing (C's counting test is `>=`) but
+/// they raise no alarm, because no operator has expressed anything to be wrong
+/// about.
 #[epics_macros_rs::epics_test]
-async fn equal_limits_alarm_on_process_too() {
+async fn equal_limits_do_not_alarm() {
     let db = PvDatabase::new();
     db.add_record("H3", Box::new(HistogramRecord::new(16, 5.0, 5.0)))
         .await
@@ -102,8 +113,28 @@ async fn equal_limits_alarm_on_process_too() {
 
     assert_eq!(
         alarm(&db, "H3").await,
-        (AlarmSeverity::Invalid, alarm_status::SOFT_ALARM),
-        "LLIM == ULIM is the `>=` boundary — still a misconfiguration, raised"
+        (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM),
+        "LLIM == ULIM is an empty range, not an inversion — nothing is raised"
+    );
+}
+
+/// The oracle's 14 defects, as one in-process case: a record loaded with no
+/// `field(LLIM,…)` / `field(ULIM,…)` at all. `histogramRecord.dbd` gives neither
+/// an `initial(...)`, so both are 0 and `CSTA` is 1 — and C publishes NO_ALARM
+/// after a `caput .PROC 1` on exactly this record.
+#[epics_macros_rs::epics_test]
+async fn a_freshly_loaded_histogram_does_not_alarm() {
+    let db = PvDatabase::new();
+    db.add_record("H6", Box::new(HistogramRecord::new(16, 0.0, 0.0)))
+        .await
+        .unwrap();
+
+    process(&db, "H6").await;
+
+    assert_eq!(
+        alarm(&db, "H6").await,
+        (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM),
+        "an unconfigured histogram is not a misconfigured one — C shows NO_ALARM here"
     );
 }
 

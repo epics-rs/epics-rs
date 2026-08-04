@@ -1061,10 +1061,14 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
 }
 
 /// Write one complete frame to the socket under the send lock, then flush.
+///
+/// Wrapped in [`crate::server::send::RetryTransient`] so an `EINTR` or an
+/// `ENOBUFS` retries the unsent remainder instead of ending the client, which
+/// is what C's `cas_send_bs_msg` loop does under the same `SEND_LOCK`.
 fn write_frame_locked(send_lock: &Mutex<Arc<TcpStream>>, frame: &[u8]) -> std::io::Result<()> {
     let sock = send_lock.lock().expect("CA send-lock poisoned");
     // `impl Write for &TcpStream` — the shared handle needs no `&mut`.
-    let mut sock = &**sock;
+    let mut sock = crate::server::send::RetryTransient(&**sock);
     sock.write_all(frame)?;
     sock.flush()
 }
@@ -1078,7 +1082,7 @@ fn drain_outbox_locked(
     drain: &mut OutboxDrain,
 ) -> std::io::Result<()> {
     let sock = send_lock.lock().expect("CA send-lock poisoned");
-    let mut sock = &**sock;
+    let mut sock = crate::server::send::RetryTransient(&**sock);
     while let Some(frame) = drain.try_next() {
         sock.write_all(&frame)?;
     }
@@ -1118,13 +1122,36 @@ fn handle_client_blocking(
 ) -> CaResult<()> {
     // C `create_client` sets both of these and refuses the client —
     // `destroy_client`, `return NULL` — when either `setsockopt` fails
-    // (`caservertask.c:1444`, `:1456`), so neither is best-effort here.
-    // KEEPALIVE is what bounds a client that stops reading: `write_frame_locked`
-    // parks in `write_all` under the send lock, exactly as C parks in `send`
-    // under `SEND_LOCK`, and in C it is the keepalive probe failing that ends
-    // it. The hosted driver sets it in `tcp::accept_loop` through `socket2`,
-    // which does not build for the embedded triples — so this path had no
-    // reaper at all until the option came from `runtime::socket`.
+    // (`caservertask.c:1444`, `:1456`), so neither is best-effort here. The
+    // hosted driver sets KEEPALIVE in `tcp::accept_loop` through `socket2`,
+    // which does not build for the embedded triples, so on this path the
+    // option comes from `runtime::socket` instead.
+    //
+    // # What KEEPALIVE does NOT do
+    //
+    // It does not bound a client that stops reading. That claim used to stand
+    // here and it is false on rtems-libbsd, read at `freebsd/sys/netinet/`:
+    //
+    // * A peer that stops reading advertises a zero window, which runs the
+    //   PERSIST timer, not the keepalive one. Keepalive is rearmed by inbound
+    //   traffic (`tcp_input.c:2061`, `:2460`), and a zero-window peer keeps
+    //   ACKing our window probes, so it never expires.
+    // * The persist timer's own drop needs
+    //   `t_rxtshift == TCP_MAXRXTSHIFT && ticks - t_rcvtime >=
+    //   tcp_maxpersistidle` (`tcp_timer.c:540-541`) — but `t_rcvtime = ticks`
+    //   is refreshed by EVERY inbound segment (`tcp_input.c:1596`), and those
+    //   probe ACKs are inbound segments. A peer that answers and never reads
+    //   refreshes it forever.
+    // * `tcp_maxpersistidle = TCPTV_KEEP_IDLE` (`tcp_subr.c:1098`), which is
+    //   why the two are easy to mistake for one another.
+    //
+    // So nothing in the stack reaps this client: `write_frame_locked` parks in
+    // `write` under the send lock until the peer reads or resets. C parks in
+    // `send` under `SEND_LOCK` for exactly as long, so the BEHAVIOUR here is
+    // C-faithful and is deliberately left alone; only the rationale was wrong.
+    // The bound, when one is wanted, is `EPICS_CAS_INACTIVITY_TMO` below —
+    // off by default, as in C. (Measured on rtems-libbsd only; the VxWorks
+    // stack is not readable from here and this was NOT transferred to it.)
     stream.set_nodelay(true).map_err(CaError::Io)?;
     epics_base_rs::runtime::socket::enable_keepalive(&stream).map_err(CaError::Io)?;
     // `None` (no configured cap) leaves the socket in pure blocking mode — C
@@ -3566,6 +3593,7 @@ mod tests {
             r.sub_id,
             &event,
             &outbox,
+            crate::server::outbox::Credit::none(),
             r.long_string_mode,
             crate::server::tcp::ReplyContext {
                 req_hdr: hdr,

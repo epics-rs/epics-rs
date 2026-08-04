@@ -1478,9 +1478,18 @@ async fn accept_loop(
             // kernel does NOT
             // apply it — a stuck client where the kernel send buffer
             // fills would still leave `poll_write` Pending forever.
-            // The actual stall guard is the `tokio::time::timeout`
-            // wrapping `dispatch_message` in `handle_client`'s read
-            // loop (search for "send_timeout()" below).
+            //
+            // This used to name the `tokio::time::timeout` wrapping
+            // `dispatch_message` as "the actual stall guard". It is not one:
+            // `dispatch_message` takes `&Outbox` and cannot touch the socket,
+            // so no socket stall can make it late. Every server write now
+            // happens in `drain_and_flush` at the bottom of the read loop,
+            // which is not wrapped. **The hosted driver therefore has no stall
+            // guard**, which happens to match the blocking driver and C — both
+            // block in the write for as long as the peer takes. See
+            // `doc/ca-stuck-reader-measurement.md`; whether to keep that or
+            // restore a bound is an open decision, not an oversight to patch
+            // silently.
             let _ = sock.set_write_timeout(Some(send_timeout()));
         }
         let _ = stream.set_nodelay(true);
@@ -1662,10 +1671,17 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
 }
 
 /// Drain every frame currently queued in the connection outbox into the
-/// socket buffer (in arrival order) and flush once. This is the ONLY place
-/// server-produced bytes reach the socket — the single-owner drain that
-/// replaces every former out-of-band `writer.lock().await` write. Returns
-/// the number of wire bytes written, for `ServerStats::bytes_out`.
+/// socket buffer (in arrival order) and flush once. This is the single-owner
+/// drain that replaces every former out-of-band `writer.lock().await` write.
+/// Returns the number of wire bytes written, for `ServerStats::bytes_out`.
+///
+/// It is *not* the only place server bytes reach the socket, and the comment
+/// that used to say so was wrong: `handle_client` writes the unsolicited
+/// `CA_PROTO_VERSION` greeting directly before the loop starts, and the
+/// out-of-band monitor arm writes its first frame directly before draining the
+/// rest. What is genuinely single-owner is the *policy* those three share —
+/// `sock`'s innermost writer is a [`crate::server::send::RetryTransientAsync`],
+/// so all three inherit C's transient-failure handling without a branch.
 ///
 /// Batching is preserved: a whole dispatch burst (or a run of monitor
 /// frames) is written back-to-back before the single `flush`, so N framed
@@ -1735,7 +1751,15 @@ where
     // iteration — turning N small TCP writes into one. Default 8 KB was hit
     // at ~330 responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
-    let mut sock = BufWriter::with_capacity(64 * 1024, write_half);
+    // The write half is wrapped before it is buffered, so `BufWriter`'s spill,
+    // `write_all`, and `flush` all sit above C's transient-failure policy: an
+    // `ENOBUFS` burst parks this circuit for 15 s and retries, where the bare
+    // `write_all` used to return `Err` and `?` used to disconnect the client.
+    // See `crate::server::send`.
+    let mut sock = BufWriter::with_capacity(
+        64 * 1024,
+        crate::server::send::RetryTransientAsync::new(write_half),
+    );
     // The single per-connection outbox. `outbox` is the cloneable producer
     // handle every emit site holds (dispatch handlers in this task, plus
     // the spawned monitor / put-notify tasks); `outbox_drain` is owned only
@@ -2110,12 +2134,18 @@ where
                     }
                 }
 
-                // Wrap dispatch in send_timeout so a stuck-reader client
-                // (kernel send buffer full → `write_all` Pending forever)
-                // can be detected and disconnected. Without this, one
-                // misbehaving client could deadlock its own per-client
-                // task indefinitely. On timeout we drop the connection;
-                // any in-flight reply is discarded.
+                // Bound how long one message may spend in dispatch. On
+                // timeout we drop the connection; any in-flight reply is
+                // discarded.
+                //
+                // This does NOT bound a stuck reader, though it was written
+                // to and still carried that claim until 2026-08-03.
+                // `dispatch_message` takes `&Outbox` — an unbounded channel —
+                // and never writes the socket, so a peer that stops reading
+                // cannot make it late. The batch-flush refactor moved every
+                // write to the unwrapped `drain_and_flush` below. What is
+                // left bounded here is dispatch's own work: a handler that
+                // blocks on the database or a link.
                 match tokio::time::timeout(
                     send_timeout(),
                     dispatch_message(
@@ -5337,15 +5367,22 @@ pub(crate) async fn register_subscription(
                         ev.cid = 1; // ECA_NORMAL
                         ev.available = sub_id;
 
+                        // Back-pressure, taken once this event is known to
+                        // become a frame — after `recv`, so an idle producer
+                        // holds nothing (`super::outbox` invariant). With the
+                        // outbox full this parks the producer and later posts
+                        // coalesce in the ring instead of queueing.
+                        let credit = outbox_clone.reserve().await;
                         // Abort-safety: this monitor task can be
                         // `task.abort()`ed mid-flight by EVENT_CANCEL /
                         // CLEAR_CHANNEL / disconnect cleanup. `seal`
                         // yields the whole EVENT_ADD frame as ONE
                         // contiguous buffer, handed to the outbox with a
-                        // single synchronous `push`, so an abort can only
-                        // land at a frame boundary — the connection loop
-                        // never observes a partial frame.
-                        outbox_clone.push(frame.seal(&ev));
+                        // single synchronous `push_with`, so an abort can
+                        // only land at a frame boundary — the connection
+                        // loop never observes a partial frame, and an abort
+                        // at the `reserve` above strands no credit.
+                        outbox_clone.push_with(frame.seal(&ev), credit);
                         // Frame handed to the outbox — PCAS
                         // `subscriptionEventsProcessed` parity
                         // (gateway `serverEventRate`).
@@ -5631,6 +5668,11 @@ pub(crate) async fn run_event_task<W>(
                             d.sub_id,
                             &event,
                             &ev_outbox,
+                            // `ev_outbox` is this task's private one-delivery
+                            // scratch buffer, drained to the socket under the
+                            // send lock immediately below, so the socket — not
+                            // credit — is already this producer's bound.
+                            crate::server::outbox::Credit::none(),
                             d.long_string_mode,
                             ReplyContext {
                                 req_hdr: d.req_hdr,

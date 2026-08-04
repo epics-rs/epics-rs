@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::LongStringMode;
 use super::frame::{FrameBuf, size_dbr_reply};
-use super::outbox::Outbox;
+use super::outbox::{Credit, Outbox};
 use super::stats::ServerStats;
 use crate::protocol::*;
 use epics_base_rs::server::event_queue::EventReader;
@@ -78,12 +78,21 @@ pub(crate) fn spawn_monitor_sender(
             if denied.load(Ordering::Acquire) {
                 continue;
             }
+            // Back-pressure, taken once this event is known to become a frame:
+            // after `recv`, so a producer waiting for work holds nothing, and
+            // after the access gate, so a suppressed delivery spends none
+            // (`super::outbox` invariant). With the outbox full this parks the
+            // producer, and every later post then coalesces in the ring above
+            // instead of queueing — which is what stops a client that has
+            // stopped reading from growing the server without limit.
+            let credit = outbox.reserve().await;
             if send_event(
                 data_type,
                 data_count,
                 sub_id,
                 &event,
                 &outbox,
+                credit,
                 long_string_mode,
                 reply,
             )
@@ -102,12 +111,16 @@ pub(crate) fn spawn_monitor_sender(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_event(
     data_type: u16,
     data_count: u32,
     sub_id: u32,
     event: &MonitorEvent,
     outbox: &Outbox,
+    // Spent on the delivery below. `Credit::none()` from callers that already
+    // run under the connection loop's own bound — see `super::outbox`.
+    credit: Credit,
     long_string_mode: LongStringMode,
     reply: super::tcp::ReplyContext,
 ) -> std::io::Result<()> {
@@ -168,14 +181,15 @@ pub(crate) fn send_event(
     // may `task.abort()` (EVENT_CANCEL / CLEAR_CHANNEL / disconnect
     // cleanup). `seal` yields the whole CA_PROTO_EVENT_ADD frame as ONE
     // contiguous buffer, handed to the outbox with a single synchronous
-    // `push`. Because `push` is a synchronous channel send with no await
+    // `push_with`. Because that is a synchronous channel send with no await
     // between building the frame and enqueuing it, an abort can only land
     // at a frame boundary — never between the header and the payload — so
     // the connection loop can never observe a partial frame. (Under the
     // former shared `Arc<Mutex<BufWriter>>` this required a two-await
     // split to be avoided; routing through the outbox removes the hazard
-    // structurally.)
-    outbox.push(frame.seal(&hdr));
+    // structurally.) The caller's `reserve().await` is likewise outside
+    // this function, so an abort there strands neither a frame nor credit.
+    outbox.push_with(frame.seal(&hdr), credit);
     Ok(())
 }
 
@@ -231,6 +245,7 @@ mod tests {
             7,
             &event,
             &outbox,
+            Credit::none(),
             LongStringMode::Plain,
             crate::server::tcp::ReplyContext {
                 req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),

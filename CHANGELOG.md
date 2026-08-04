@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.25.4 — 2026-08-04
+
+Patch release. The IPv6 SEARCH socket now builds on the embedded targets too,
+completing the half v0.25.3 left out. On the CA server, an out-of-buffers burst
+no longer disconnects every client it is serving, and a subscriber that stops
+reading no longer grows the server without bound. A default `histogram` record
+no longer alarms on its first process. Workspace version 0.25.3 -> 0.25.4.
 
 ### The IPv6 SEARCH socket binds on every backend too
 
@@ -30,6 +36,49 @@ plain `setsockopt` calls whose constants both target `libc`s carry.
   both address families. Compiling is not running: whether an RTEMS BSP or the
   VxWorks stack has IPv6 enabled is an on-target question, and a failed bind
   degrades the client to IPv4-only by design.
+
+### The CA server rides out an out-of-buffers burst instead of dropping clients
+
+C's `cas_send_bs_msg` (`rsrv/caserverio.c:65-101`) continues its send loop on
+both `SOCK_EINTR` and `SOCK_ENOBUFS`, sleeping 15 s for the latter. Both port
+drivers wrote frames with `write_all`, whose contract is the opposite — any
+`Err` ends the call — so an ENOBUFS burst that C rides out disconnected every
+CA client the IOC was serving.
+
+- The policy lives *under* every writer rather than at each call site: the
+  hosted driver has three write sites and the blocking driver two, and a retry
+  bolted onto the drain would have left the unsolicited `CA_PROTO_VERSION`
+  greeting and the out-of-band monitor frame exactly as they were. Resumption
+  is exact for the same reason C's is — the adapter sits at the `write` /
+  `poll_write` level, where a retry re-offers only the bytes the kernel did not
+  take.
+
+### A CA subscriber that stops reading no longer grows the server without bound
+
+The hosted driver's monitor producer pushed into an unbounded `mpsc` decoupled
+from the socket, so a subscriber that stopped reading grew the server at a
+measured 9.34 kB/s — 32.8 MB/hour — per 100 Hz subscription, with no knee. The
+blocking driver that the embedded targets run was never exposed: its event
+thread writes the socket directly under the send lock, so back-pressure reaches
+the bounded `EvQue` ring and the ring coalesces, which is what C gets from
+`event_task` blocking on `SEND_LOCK`.
+
+- Bounding the channel instead would deadlock, because the connection loop is
+  both a producer (reply handlers) and the sole drain. A credit rides inside
+  the queued frame and is released by the drain owner's `Drop` once the bytes
+  are in the socket writer, so the producer stops dequeuing and the backlog
+  coalesces in the ring. In-loop reply handlers are exempt and unaffected.
+  Re-measured at 0.000 kB/s with the drain still provably parked; the harness
+  and all five run logs are in `doc/ca-stuck-reader-measurement.md`.
+
+### A default `histogram` record no longer alarms on its first process
+
+`LLIM` and `ULIM` carry no `initial(...)` in `histogramRecord.dbd`, so a bare
+`record(histogram)` loads at `0 == 0` and satisfies C's `llim >= ulim`. Taking
+that condition verbatim into the CBUG-F12 refusal made `check_alarms` raise
+SOFT/INVALID on the first process of every unconfigured histogram where C
+raises NO_ALARM — 14 oracle defects on SCAN/PROC/UDF. `add_count` keeps `>=`:
+binning nothing into an empty range is arithmetic, not a judgement.
 
 ## v0.25.3 — 2026-07-30
 

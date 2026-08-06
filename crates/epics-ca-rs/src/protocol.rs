@@ -520,10 +520,10 @@ pub fn subscription_wire_count(
 /// `cacChannel::badType` → `ECA_BADTYPE` returned to the caller with nothing
 /// on the wire. It sits ABOVE the scalar/array fork (`:330`), so a scalar put
 /// is bounded by it too even though a scalar has no element bound. Resolving
-/// the sizes is that check: [`dbr_request_sizes`] is the single owner of the
-/// type bound, shared with `read_notify_wire_count` and
-/// `subscription_wire_count`, so no request path can frame a type the others
-/// would reject.
+/// the sizes is that check: `dbr_request_sizes` is the single owner of the
+/// type bound, shared with [`read_notify_wire_count`] and
+/// [`subscription_wire_count`], so no request path can frame a type the
+/// others would reject.
 ///
 /// The array bound is `comQueSend.cpp:352-364`, the put path's equivalent of
 /// `max_read_elements`, with three differences that are C's, not ours:

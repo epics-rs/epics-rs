@@ -3905,6 +3905,37 @@ mod tests {
         f
     }
 
+    /// Alarm status a compound-put test injects — a value the record must NOT
+    /// end up carrying.
+    const INJECTED_STATUS: u16 = 3;
+    /// Alarm severity a compound-put test injects.
+    const INJECTED_SEVERITY: u16 = 2;
+    /// EPICS-epoch seconds a compound-put test injects (1978-ish, so it cannot
+    /// be confused with the timestamp the server stamps itself).
+    const INJECTED_SECONDS: u32 = 0x1111_1111;
+
+    /// A `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY` carrying a real
+    /// `dbr_time_double` payload: status(2) severity(2) secs(4) nsec(4)
+    /// pad(4) value(8) = 24 bytes, per `db_access.h`. The metadata is
+    /// deliberately non-default so a test can prove it was discarded.
+    fn time_double_write_frame(cmmd: u16, sid: u32, ioid: u32, value: f64) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = epics_base_rs::types::DBR_TIME_DOUBLE;
+        h.count = 1;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(24, 1, CA_MINOR_VERSION)
+            .expect("modern peer");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&INJECTED_STATUS.to_be_bytes());
+        f.extend_from_slice(&INJECTED_SEVERITY.to_be_bytes());
+        f.extend_from_slice(&INJECTED_SECONDS.to_be_bytes());
+        f.extend_from_slice(&0x2222_2222u32.to_be_bytes()); // nanoseconds
+        f.extend_from_slice(&[0u8; 4]); // RISC_pad
+        f.extend_from_slice(&value.to_be_bytes());
+        f
+    }
+
     /// The DBR_DOUBLE scalar value in a READ_NOTIFY reply (payload after the
     /// 16-byte header).
     fn read_notify_value(frame: &[u8]) -> f64 {
@@ -4080,6 +4111,323 @@ mod tests {
             "the plain WRITE reached the record"
         );
 
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A compound buffer type on a WRITE_NOTIFY is a **failed put**, not a
+    /// protocol violation. C `write_notify_action` lets every type at or below
+    /// `LAST_BUFFER_TYPE` past `INVALID_DB_REQ` (`camessage.c:1673`) and only
+    /// `db_put_process` then fails it (`mapOldType` returns -1 for compound
+    /// types), so the client gets ECA_PUTFAIL (`camessage.c:1412-1413`) on a
+    /// circuit that stays up.
+    #[test]
+    fn compound_dbr_write_notify_is_putfail_and_keeps_the_circuit() {
+        let db = seed_db(&[("BLK:CMPWN", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:CMPWN");
+
+        let ioid = 0x00C0_FFEE;
+        c.write_all(&time_double_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            sid,
+            ioid,
+            7.5,
+        ))
+        .unwrap();
+
+        let reply = read_until_cmmd(&mut c, CA_PROTO_WRITE_NOTIFY);
+        assert_eq!(
+            u32::from_be_bytes([reply[8], reply[9], reply[10], reply[11]]),
+            crate::protocol::ECA_PUTFAIL,
+            "a compound-DBR put fails with ECA_PUTFAIL, as C's notifyError maps"
+        );
+        assert_eq!(
+            u16::from_be_bytes([reply[4], reply[5]]),
+            epics_base_rs::types::DBR_TIME_DOUBLE,
+            "the reply echoes the REQUEST's data type (C putNotifyErrorReply)"
+        );
+        assert_eq!(
+            u32::from_be_bytes([reply[12], reply[13], reply[14], reply[15]]),
+            ioid,
+            "the reply echoes the request ioid"
+        );
+
+        // The circuit is intact: a follow-up request still gets its answer,
+        // and the record never took the compound value.
+        let rb_ioid = 0x0000_5A5A;
+        c.write_all(&read_notify_frame(sid, rb_ioid, DBR_DOUBLE_MON))
+            .unwrap();
+        let rb = read_until_cmmd(&mut c, CA_PROTO_READ_NOTIFY);
+        assert_eq!(
+            read_notify_value(&rb),
+            0.0,
+            "the rejected compound put must not have reached the record"
+        );
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// The deprecated fire-and-forget `CA_PROTO_WRITE` goes further than the
+    /// notify opcode: C `dbChannel_put` (`db/db_access.c:820`) skips the
+    /// metadata header and puts the `.value` member, so the write SUCCEEDS and
+    /// the status/severity/timestamp the client sent are discarded.
+    #[test]
+    fn compound_dbr_plain_write_strips_metadata_and_writes_the_value() {
+        let db = seed_db(&[("BLK:CMPW", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:CMPW");
+
+        c.write_all(&time_double_write_frame(CA_PROTO_WRITE, sid, 0, 7.5))
+            .unwrap();
+        let rb_ioid = 0x0000_5A5B;
+        c.write_all(&read_notify_frame(
+            sid,
+            rb_ioid,
+            epics_base_rs::types::DBR_TIME_DOUBLE,
+        ))
+        .unwrap();
+
+        // A fire-and-forget WRITE that succeeds emits nothing, so the FIRST
+        // frame back is the readback — no CA_PROTO_ERROR ahead of it.
+        let rb = read_one_frame(&mut c);
+        assert_eq!(
+            u16::from_be_bytes([rb[0], rb[1]]),
+            CA_PROTO_READ_NOTIFY,
+            "a compound WRITE that C would perform must emit no error frame"
+        );
+
+        // The value crossed; the metadata did not.
+        let val = f64::from_be_bytes([
+            rb[32], rb[33], rb[34], rb[35], rb[36], rb[37], rb[38], rb[39],
+        ]);
+        assert_eq!(val, 7.5, "the .value member reached the record");
+        assert_eq!(
+            u16::from_be_bytes([rb[16], rb[17]]),
+            0,
+            "the client's alarm status must not have been applied"
+        );
+        assert_eq!(
+            u16::from_be_bytes([rb[18], rb[19]]),
+            0,
+            "the client's alarm severity must not have been applied"
+        );
+        assert_ne!(
+            u32::from_be_bytes([rb[20], rb[21], rb[22], rb[23]]),
+            INJECTED_SECONDS,
+            "the client's timestamp must not have been applied (.TIME is DBF_NOACCESS)"
+        );
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// `DBR_CLASS_NAME` sits inside C's protocol bound but outside
+    /// `dbChannel_put`'s switch, so its `default:` arm returns -1: the put
+    /// fails with ECA_PUTFAIL and the circuit stays up. Separates "compound,
+    /// therefore puttable" from "at or below `LAST_BUFFER_TYPE`".
+    #[test]
+    fn metadata_only_dbr_plain_write_is_putfail_and_keeps_the_circuit() {
+        let db = seed_db(&[("BLK:MDO", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:MDO");
+
+        c.write_all(&plain_write_frame(
+            sid,
+            epics_base_rs::types::DBR_CLASS_NAME,
+            7.5,
+        ))
+        .unwrap();
+        let rb_ioid = 0x0000_5A5C;
+        c.write_all(&read_notify_frame(sid, rb_ioid, DBR_DOUBLE_MON))
+            .unwrap();
+
+        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
+        assert_eq!(
+            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
+            crate::protocol::ECA_PUTFAIL,
+            "C's dbChannel_put default arm returns -1 → ECA_PUTFAIL, not ECA_BADTYPE"
+        );
+
+        // Circuit intact: the pipelined readback behind the refusal is served.
+        let rb = read_until_cmmd(&mut c, CA_PROTO_READ_NOTIFY);
+        assert_eq!(
+            u32::from_be_bytes([rb[12], rb[13], rb[14], rb[15]]),
+            rb_ioid,
+            "the readback pipelined behind the refusal still gets its reply"
+        );
+        assert_eq!(
+            read_notify_value(&rb),
+            0.0,
+            "the rejected put must not have reached the record"
+        );
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// C arms the put-log bracket before it can know whether the put will
+    /// succeed: `asTrapWriteWithData` runs unconditionally ahead of
+    /// `dbChannel_put` (`camessage.c:794-804`) and ahead of `dbProcessNotify`
+    /// (`:1775`), with the matching `asTrapWriteAfter` right behind. So a
+    /// put-log listener sees even the buffer types `dbChannel_put` refuses —
+    /// which is the whole point of a put-log: the attempt is the record, not
+    /// the outcome.
+    ///
+    /// Both refusal shapes on one circuit: the compound WRITE_NOTIFY (a value
+    /// the buffer carries, so the log gets one) and the metadata-only
+    /// `DBR_CLASS_NAME` WRITE (no value member at all).
+    #[test]
+    fn a_refused_dbr_type_is_still_bracketed_in_the_put_log() {
+        use epics_base_rs::server::access_security::{TrapWriteOp, register_trap_write_listener};
+
+        // The listener registry is process-global; filter to this test's PV.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.pv_name == "BLK:TRAPREF" {
+                sink.lock().unwrap().push((
+                    msg.op,
+                    msg.status.map(str::to_owned),
+                    msg.value_str.to_string(),
+                    msg.dbr_type,
+                ));
+            }
+        }));
+
+        let db = seed_db(&[("BLK:TRAPREF", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:TRAPREF");
+
+        let ioid = 0x00C0_FFEF;
+        c.write_all(&time_double_write_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            sid,
+            ioid,
+            7.5,
+        ))
+        .unwrap();
+        let reply = read_until_cmmd(&mut c, CA_PROTO_WRITE_NOTIFY);
+        assert_eq!(
+            u32::from_be_bytes([reply[8], reply[9], reply[10], reply[11]]),
+            crate::protocol::ECA_PUTFAIL,
+            "the compound WRITE_NOTIFY is still a failed put"
+        );
+
+        c.write_all(&plain_write_frame(
+            sid,
+            epics_base_rs::types::DBR_CLASS_NAME,
+            7.5,
+        ))
+        .unwrap();
+        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
+        assert_eq!(
+            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
+            crate::protocol::ECA_PUTFAIL,
+            "the metadata-only WRITE is still a failed put"
+        );
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    TrapWriteOp::BeforeWrite,
+                    None,
+                    "7.5".to_string(),
+                    epics_base_rs::types::DBR_TIME_DOUBLE
+                ),
+                (
+                    TrapWriteOp::AfterWrite,
+                    Some("dbr-type-not-puttable".to_string()),
+                    "7.5".to_string(),
+                    epics_base_rs::types::DBR_TIME_DOUBLE
+                ),
+                (
+                    TrapWriteOp::BeforeWrite,
+                    None,
+                    String::new(),
+                    epics_base_rs::types::DBR_CLASS_NAME
+                ),
+                (
+                    TrapWriteOp::AfterWrite,
+                    Some("dbr-type-not-puttable".to_string()),
+                    String::new(),
+                    epics_base_rs::types::DBR_CLASS_NAME
+                ),
+            ],
+            "every refused put is bracketed, and the log carries the type the \
+             client sent plus whatever value the buffer held"
+        );
+    }
+
+    /// The other side of the same boundary: ABOVE `LAST_BUFFER_TYPE` there is no
+    /// such tolerance. C's `caNetConvert` (`ca/src/client/convert.cpp:1421`)
+    /// answers ECA_BADTYPE and `write_action` returns RSRV_ERROR, so the circuit
+    /// goes down. Guards the compound tolerance above from widening into
+    /// "accept anything".
+    #[test]
+    fn dbr_type_above_last_buffer_type_still_drops_the_circuit() {
+        let db = seed_db(&[("BLK:BADT", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:BADT");
+
+        let over = epics_base_rs::types::LAST_BUFFER_TYPE + 1;
+        c.write_all(&plain_write_frame(sid, over, 7.5)).unwrap();
+
+        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
+        assert_eq!(
+            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
+            crate::protocol::ECA_BADTYPE,
+            "past C's protocol bound the answer is ECA_BADTYPE, not ECA_PUTFAIL"
+        );
+
+        // ... and the circuit goes down: a read returns EOF rather than blocking.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut probe = [0u8; 1];
+        match c.read(&mut probe) {
+            Ok(0) => { /* RSRV_ERROR: the circuit is torn down, as C does */ }
+            Ok(_) => panic!("unexpected extra frame bytes after the ECA_BADTYPE reply"),
+            Err(e) if is_read_timeout(e.kind()) => {
+                panic!("circuit stayed open; C drops it (write_action RSRV_ERROR)")
+            }
+            Err(_) => { /* reset counts as torn down */ }
+        }
+
+        drop(c);
         server.shutdown();
         accept.join().unwrap();
     }

@@ -74,3 +74,30 @@ status/severity/timestamp do not),
 `dbr_type_above_last_buffer_type_still_drops_the_circuit`,
 `a_refused_dbr_type_is_still_bracketed_in_the_put_log` (both refusal shapes,
 `BeforeWrite`/`AfterWrite` with status `dbr-type-not-puttable`).
+
+## Measured against the C oracle
+
+2026-08-06, `record(ao,"PROBE:AO")` served by base's `softIoc` on 127.0.0.1:5075
+and by `softioc-rs --db probe.db` on :5076, driven by a raw-CA prober (libca
+cannot emit these buffer types). Each probe ran on a fresh circuit with a
+`READ_NOTIFY` pipelined behind it, so a drop in one cannot mask the next.
+Both servers answered identically on all seven:
+
+| probe | reply | circuit | readback |
+|---|---|---|---|
+| `DBR_TIME_DOUBLE` `WRITE` (24 B) | none | up | 7.5 — value written |
+| `DBR_TIME_DOUBLE` `WRITE_NOTIFY` | `ECA_PUTFAIL`, type echo 20 | up | unchanged |
+| `DBR_CLASS_NAME` `WRITE` (40 B) | `ERROR`/`ECA_PUTFAIL` | up | unchanged |
+| `DBR_CLASS_NAME` `WRITE_NOTIFY` (40 B) | `ECA_PUTFAIL`, type echo 38 | up | unchanged |
+| `DBR_CLASS_NAME` `WRITE` (8 B, short) | `ERROR`/`ECA_PUTFAIL` | up | unchanged |
+| type 39 (`LAST_BUFFER_TYPE`+1) | `ERROR`/`ECA_BADTYPE` | **down** | — |
+| `DBR_DOUBLE` `WRITE` (control) | none | up | 3.25 |
+
+The short `DBR_CLASS_NAME` row answers the question this server has no size
+table for: C does **not** drop the circuit on an undersized metadata-only
+frame, so refusing it with `ECA_PUTFAIL` is what C does, not a shortcut.
+
+A separate probe wrote `DBR_TIME_DOUBLE` 42.125 carrying status 3, severity 2
+and seconds `0x11111111`, then read `DBR_TIME_DOUBLE` back. Both servers
+returned value 42.125, status 0, severity 0, and a timestamp that is not the
+injected one.

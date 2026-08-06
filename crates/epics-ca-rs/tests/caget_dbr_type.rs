@@ -508,3 +508,54 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
         "lsi VAL plain read must clip to the <=39-char DBR_STRING slot; got {s:?}"
     );
 }
+
+/// A DBR code past `LAST_BUFFER_TYPE` must be refused by the CLIENT, with
+/// nothing on the wire — libca `nciu::read` (`nciu.cpp:292`) and
+/// `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:323`) both throw
+/// `cacChannel::badType` before the request is queued.
+///
+/// The cost of getting this wrong is not a wasted round trip. The server
+/// treats such a type as a protocol violation and tears the circuit down
+/// (`AcceptedWriteType::classify` → ECA_BADTYPE + RSRV_ERROR, C
+/// `write_action`), so a request that leaves the client takes the connection
+/// with it — including every other channel sharing it. The surviving read at
+/// the end is what proves nothing was sent.
+///
+/// The scalar put is the case that regressed: the write gate's element bound
+/// returned early for `count == 1`, ahead of the type check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_dbr_type_past_the_protocol_bound_never_leaves_the_client() {
+    use epics_base_rs::error::CaError;
+    use epics_base_rs::types::LAST_BUFFER_TYPE;
+
+    let (_client, ch) = server_with_bi("R7C1:BI:BOUND", 1, "Off", "On").await;
+    let over = LAST_BUFFER_TYPE + 1;
+
+    assert!(
+        matches!(ch.get_with_dbr_type(over, 0).await, Err(CaError::UnsupportedType(t)) if t == over),
+        "a read past the protocol bound is refused locally"
+    );
+    assert!(
+        matches!(
+            ch.put_as_dbr_with_timeout(over, &EpicsValue::Short(1), Duration::from_secs(3)).await,
+            Err(CaError::UnsupportedType(t)) if t == over
+        ),
+        "a scalar put-callback past the protocol bound is refused locally"
+    );
+    assert!(
+        matches!(
+            ch.put_as_dbr_nowait(over, &EpicsValue::Short(1)).await,
+            Err(CaError::UnsupportedType(t)) if t == over
+        ),
+        "a fire-and-forget scalar put past the protocol bound is refused locally"
+    );
+
+    // The circuit is untouched: had any of the three reached the server, it
+    // would have answered ECA_BADTYPE and dropped, and this read would fail.
+    let snap = ch
+        .get_with_dbr_type(DBR_STRING, 0)
+        .await
+        .expect("the circuit survives a refused request");
+    assert_eq!(snap.value, EpicsValue::String("On".into()));
+}

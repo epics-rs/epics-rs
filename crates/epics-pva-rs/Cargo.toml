@@ -162,8 +162,10 @@ if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
 
 # RTEMS/VxWorks get tokio without `net`/`signal`/`process`: `net` pulls mio
-# (29 errors on RTEMS — no epoll/kqueue selector, and mio dropped its poll
-# backend deliberately) and `signal` pulls signal-hook-registry (4 errors on
+# (29 errors on RTEMS — no epoll/kqueue selector; mio's `selector/poll.rs`
+# exists but its cfg list does not name rtems, and the waker those targets
+# pair with needs a pipe rtems-libbsd `poll()` rejects) and `signal` pulls
+# signal-hook-registry (4 errors on
 # RTEMS — no `sa_sigaction`/`SA_RESTART`); neither crate carries VxWorks
 # target support either. Declared per-target rather than in the shared
 # table because Cargo *unions* a dependency's features across every matching

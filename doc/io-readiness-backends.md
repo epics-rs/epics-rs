@@ -33,6 +33,13 @@ it, whereas every connection multiplexed onto one reactor thread shares that
 thread's priority and inherits nothing finer. That is a consequence of the
 readiness choice, not a substitute for it.
 
+The corollary matters as much as the rule: the *lock* does not change when the
+readiness mechanism does. A priority-inheriting mutex behaves identically taken
+from a reactor thread and from a per-connection thread — the holder is boosted
+to the waiter's priority either way. What multiplexing changes is how much
+priority there is to express, and what one slow section of code costs everyone
+else. §5 works that out.
+
 ---
 
 ## 1. The three mechanisms
@@ -94,14 +101,55 @@ queue rather than into more threads. When one reactor thread is not enough,
 several workers can wait on the same queue and let the kernel distribute — an
 option `poll` does not offer.
 
-## 5. Why `poll` is never the pick
+## 5. What multiplexing does — and does not — cost the locking side
+
+Choosing a reactor for PVA does not change which lock guards the database, nor
+how it is taken. It changes two other things.
+
+**Blast radius, not lock type.** The hazard is not a contended lock; it is a
+long *lock-free* run on the shared thread. A PVA PUT in forced-processing mode
+runs the whole record-processing chain — record support, OUT links, FLNK
+traversal — inline on the task that handled the operation
+(`epics-bridge-rs/src/qsrv/channel.rs`, `put_with_options`). With one thread per
+connection that chain delays exactly one client; multiplexed, it delays every
+connection on the reactor. So the rule a reactor imposes is a *scheduling* rule
+— no unbounded work on the reactor thread — not a locking rule.
+
+**This is parity, not a new defect.** pvxs already does exactly this: one
+`acceptor_loop("PVXTCP", epicsThreadPriorityCAServerLow-2)` (`src/server.cpp`)
+carries every `ServerConn` bufferevent (`src/serverconn.cpp`), the `onPut`
+handler runs on that loop thread, and `IOCSource::doPostProcessing` calls
+`dbProcess` inline from it (`ioc/iocsource.cpp`). C's escape hatch for the
+unbounded case is `record._options.block=true`, which switches the operation to
+`dbProcessNotify` (`ioc/singlesource.cpp`) — the loop returns immediately and
+the completion arrives on a callback thread. A reactor port needs that path to
+be genuinely asynchronous, or the escape hatch is not one.
+
+**What is actually given up.** Per-connection priority. On the reactor every
+client contends for the record lock at the one loop thread's priority, so a
+priority-inheriting mutex has a single priority to inherit no matter which
+client is waiting — the point §3 makes for CA, read from the other side. pvxs
+accepts the same loss, so a PVA reactor is not worse than the original here; it
+is worse than what per-connection threading was giving us for free.
+
+**The one mitigation the mechanism offers.** `kqueue` lets M workers wait on the
+same queue and lets the kernel hand each event to one of them (§2), so
+isolation can be bought back in units of workers. `poll` cannot do this, which
+is a second reason it is not the fallback it looks like.
+
+The cost of *adopting* a mechanism on a particular target — what the platform's
+bindings and reactor crates actually declare — is deliberately out of scope
+here; it belongs in
+[`rtems-runtime-portability-design.md`](rtems-runtime-portability-design.md).
+
+## 6. Why `poll` is never the pick
 
 It pays O(N) to deliver one event, and it gives up all three of `kqueue`'s
 structural advantages: constant-cost registration, kernel-side distribution
 across workers, and non-socket events in the same queue. Portability is the only
 argument for it, which makes it a fallback rather than a design choice.
 
-## 6. The boundary
+## 7. The boundary
 
 One line separates the two families:
 

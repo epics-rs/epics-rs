@@ -1946,12 +1946,15 @@ impl CaChannel {
                  nciu::write ECA_NOWTACCESS); ioid {ioid}"
             )));
         }
-        // C `comQueSend::insertRequestWithPayLoad` (`comQueSend.cpp:352-364`)
-        // bounds an array put against the peer's message-body limit and throws
-        // `cacChannel::outOfBounds` (→ ECA_BADCOUNT) past it, before a byte is
-        // queued. Gate here, ahead of the direct-writer / coordinator split, so
-        // neither path can put an unframeable request on the wire.
-        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
+        // C `comQueSend::insertRequestWithPayLoad` refuses a DBR type past
+        // `INVALID_DB_REQ` (`comQueSend.cpp:323`, → ECA_BADTYPE) and an array
+        // past the peer's message-body limit (`:352-364`, → ECA_BADCOUNT),
+        // both before a byte is queued. Gate here, ahead of the
+        // direct-writer / coordinator split, so neither path can put an
+        // unframeable request on the wire — and so a caller-chosen type from
+        // `put_as_dbr_*` is answered locally instead of costing the circuit
+        // the server would drop it on.
+        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
@@ -1996,10 +1999,11 @@ impl CaChannel {
                     .into(),
             ));
         }
-        // Same pre-queue element bound as `send_write_notify_fast`
-        // (`comQueSend.cpp:352-364`) — a fire-and-forget put is bounded by
-        // libca too; `ca_array_put` returns ECA_BADCOUNT synchronously.
-        crate::protocol::check_write_element_count(count, data_type, snap.server_minor)?;
+        // Same pre-queue type and element bounds as `send_write_notify_fast`
+        // — a fire-and-forget put goes through the identical
+        // `comQueSend::insertRequestWithPayLoad`, so `ca_array_put` returns
+        // ECA_BADTYPE / ECA_BADCOUNT synchronously rather than sending.
+        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
         // Bind the identity to the request before the request exists on the
         // wire, at the one site both routes pass through. A plain write has
         // no ioid and no completion, so this record is the only thing that
@@ -2576,9 +2580,11 @@ impl CaChannel {
     /// the type codes that have no value-class analogue, e.g.
     /// `DBR_STSACK_STRING` (37) and `DBR_CLASS_NAME` (38).
     ///
-    /// The caller is responsible for validating the type code (the tool
-    /// front-ends mirror C's `caget.c:430` range check); an unsupported
-    /// code surfaces as the server's `ECA_BADTYPE`.
+    /// A code past `LAST_BUFFER_TYPE` is refused here with
+    /// `CaError::UnsupportedType` (`ECA_BADTYPE`) and never reaches the
+    /// wire, as libca's `nciu::read` (`nciu.cpp:292`) does — the server
+    /// treats such a type as a protocol violation and drops the circuit,
+    /// so the request must not leave the client.
     pub async fn get_with_dbr_type(
         &self,
         dbr_type: u16,
@@ -2737,6 +2743,11 @@ impl CaChannel {
     /// Distinct from [`Self::put_with_timeout`], which forces the channel
     /// native type and is the programmatic native-typed write API. Use
     /// this only for C-tool-parity paths that must control the wire type.
+    ///
+    /// A `dbr_type` past `LAST_BUFFER_TYPE` is refused here with
+    /// `CaError::UnsupportedType` (`ECA_BADTYPE`) and never reaches the
+    /// wire, matching `comQueSend::insertRequestWithPayLoad`
+    /// (`comQueSend.cpp:323`).
     pub async fn put_as_dbr_with_timeout(
         &self,
         dbr_type: u16,

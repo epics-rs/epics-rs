@@ -512,8 +512,20 @@ pub fn subscription_wire_count(
     Ok(count)
 }
 
-/// C `comQueSend::insertRequestWithPayLoad`'s array bound
-/// (`comQueSend.cpp:352-364`) — the put path's equivalent of
+/// Everything C `comQueSend::insertRequestWithPayLoad` refuses before a put
+/// is queued, in C's order: the DBR type first, then the array bound.
+///
+/// The type bound is `INVALID_DB_REQ` (`comQueSend.cpp:323`, with the
+/// equivalent `dataType >= comQueSendCopyDispatchSize`=39 right behind it) →
+/// `cacChannel::badType` → `ECA_BADTYPE` returned to the caller with nothing
+/// on the wire. It sits ABOVE the scalar/array fork (`:330`), so a scalar put
+/// is bounded by it too even though a scalar has no element bound. Resolving
+/// the sizes is that check: `dbr_request_sizes` is the single owner of the
+/// type bound, shared with [`read_notify_wire_count`] and
+/// [`subscription_wire_count`], so no request path can frame a type the
+/// others would reject.
+///
+/// The array bound is `comQueSend.cpp:352-364`, the put path's equivalent of
 /// `max_read_elements`, with three differences that are C's, not ours:
 /// ```text
 /// maxBytes = v49Ok ? 0xffffffff : MAX_TCP - sizeof(caHdr);
@@ -523,13 +535,13 @@ pub fn subscription_wire_count(
 /// ```
 /// — the header is subtracted, a `dbr_double_t` of slack is subtracted, the
 /// comparison is `>=` not `>`, and the failure is `ECA_BADCOUNT` rather than
-/// `ECA_TOLARGE`. The bound applies only to the array branch: `nElem == 1`
-/// takes the scalar path (`comQueSend.cpp:330-352`), which has no bound.
-pub fn check_write_element_count(count: u32, dbr_type: u16, peer_minor: u16) -> CaResult<()> {
+/// `ECA_TOLARGE`. It applies only to the array branch: `nElem == 1` takes the
+/// scalar path (`comQueSend.cpp:330-352`), which has no element bound.
+pub fn check_write_request(count: u32, dbr_type: u16, peer_minor: u16) -> CaResult<()> {
+    let (dbr_size, value_size) = dbr_request_sizes(dbr_type)?;
     if count == 1 {
         return Ok(());
     }
-    let (dbr_size, value_size) = dbr_request_sizes(dbr_type)?;
     let max_bytes: u64 = if ca_v49(peer_minor) {
         0xffff_ffff
     } else {
@@ -958,16 +970,63 @@ mod tests {
     fn write_bound_is_max_tcp_minus_header_on_a_pre_v49_circuit() {
         const DBR_DOUBLE: u16 = 6;
         const MAX_ELEM: u32 = (16384 - 16 - 8 - 8) / 8; // 2044
-        assert!(check_write_element_count(MAX_ELEM - 1, DBR_DOUBLE, 8).is_ok());
+        assert!(check_write_request(MAX_ELEM - 1, DBR_DOUBLE, 8).is_ok());
         // C's comparison is `>=`, so maxElem itself is already rejected.
         assert!(matches!(
-            check_write_element_count(MAX_ELEM, DBR_DOUBLE, 8),
+            check_write_request(MAX_ELEM, DBR_DOUBLE, 8),
             Err(CaError::BadCount)
         ));
         // A scalar put takes C's `nElem == 1` branch, which has no bound.
-        assert!(check_write_element_count(1, DBR_DOUBLE, 8).is_ok());
+        assert!(check_write_request(1, DBR_DOUBLE, 8).is_ok());
         // A V49 circuit frames the same array.
-        assert!(check_write_element_count(MAX_ELEM, DBR_DOUBLE, 13).is_ok());
+        assert!(check_write_request(MAX_ELEM, DBR_DOUBLE, 13).is_ok());
+    }
+
+    /// The type bound sits ABOVE the scalar/array fork, as C's does
+    /// (`comQueSend.cpp:323` vs `:330`). A scalar has no *element* bound, but
+    /// that is no reason to skip the *type* check — and it is the one this
+    /// gate used to skip, because the `count == 1` early return came first.
+    ///
+    /// It matters more than a wasted round trip: the server treats a type
+    /// past `LAST_BUFFER_TYPE` as a protocol violation and drops the circuit
+    /// (`AcceptedWriteType::classify` → ECA_BADTYPE + RSRV_ERROR), so a
+    /// request that leaves the client costs the connection.
+    #[test]
+    fn a_scalar_put_is_still_bounded_by_the_dbr_type() {
+        use epics_base_rs::types::LAST_BUFFER_TYPE;
+        for count in [1u32, 2, 100] {
+            assert!(
+                matches!(
+                    check_write_request(count, LAST_BUFFER_TYPE + 1, 13),
+                    Err(CaError::UnsupportedType(t)) if t == LAST_BUFFER_TYPE + 1
+                ),
+                "count {count}: a type past LAST_BUFFER_TYPE is ECA_BADTYPE \
+                 before anything is queued, scalar or array"
+            );
+        }
+        // The bound itself is inside it: DBR_CLASS_NAME is framable.
+        assert!(check_write_request(1, LAST_BUFFER_TYPE, 13).is_ok());
+    }
+
+    /// The read and subscription paths resolve the same sizes, so they carry
+    /// the same bound. Pinned so the three request paths cannot drift apart
+    /// again — that divergence is what let the scalar put through.
+    #[test]
+    fn every_request_path_shares_one_type_bound() {
+        use epics_base_rs::types::LAST_BUFFER_TYPE;
+        let over = LAST_BUFFER_TYPE + 1;
+        assert!(matches!(
+            read_notify_wire_count(1, 1, over, 13),
+            Err(CaError::UnsupportedType(_))
+        ));
+        assert!(matches!(
+            subscription_wire_count(1, 1, over, 13),
+            Err(CaError::UnsupportedType(_))
+        ));
+        assert!(matches!(
+            check_write_request(1, over, 13),
+            Err(CaError::UnsupportedType(_))
+        ));
     }
 
     /// `comQueSend.cpp:332-341`: a scalar DBR_STRING put frames

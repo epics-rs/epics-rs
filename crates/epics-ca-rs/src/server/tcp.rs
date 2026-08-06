@@ -3808,6 +3808,87 @@ pub(crate) async fn dispatch_message(
 
     Ok(())
 }
+/// A wire `data_type` that a `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY` may
+/// legally carry, split by what this server can do with it.
+///
+/// The out-of-range case is deliberately not a variant: [`Self::classify`]
+/// returns `None` for it, so a value of this type only exists once the frame
+/// has passed C's protocol bound and the circuit is no longer at risk.
+///
+/// C's bound is `LAST_BUFFER_TYPE` (= `DBR_CLASS_NAME`, 38), applied by
+/// `INVALID_DB_REQ` in `write_notify_action` (`rsrv/camessage.c:1673`) and by
+/// `caNetConvert` (`ca/src/client/convert.cpp:1421`) on the `write_action`
+/// path. Anything above it is a protocol violation and RSRV drops the circuit;
+/// anything at or below it keeps the circuit whatever the put then does.
+///
+/// As-built summary and the one remaining deviation: `doc/ca-compound-dbr-put.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptedWriteType {
+    /// 0..=6 — a native DBR the payload decoder converts directly.
+    Native(DbFieldType),
+    /// 7..=34 — a value preceded by metadata (`DBR_STS_*`, `DBR_TIME_*`,
+    /// `DBR_GR_*`, `DBR_CTRL_*`), carrying the base native type it decodes to.
+    ///
+    /// On `CA_PROTO_WRITE` C writes these: `dbChannel_put`
+    /// (`db/db_access.c:820`) skips the metadata header and puts the `.value`
+    /// member, discarding the status/severity/timestamp the client sent —
+    /// which are unwritable by any path anyway (`.TIME` is `DBF_NOACCESS`,
+    /// `STAT`/`SEVR`/`UTAG` are `SPC_NOMOD`). On `CA_PROTO_WRITE_NOTIFY` even
+    /// C fails the put: `mapOldType` (`db_access.c:988`) maps only the native
+    /// types and returns -1 for these, which `db_put_process` turns into
+    /// `notifyError` → `ECA_PUTFAIL`.
+    Compound,
+    /// 37/38 (`DBR_STSACK_STRING`, `DBR_CLASS_NAME`) — inside C's protocol
+    /// bound but outside `dbChannel_put`'s switch, so its `default:` arm
+    /// returns -1 and the put fails on both opcodes.
+    ///
+    /// `DBR_PUT_ACKT`/`DBR_PUT_ACKS` (35/36) never reach the classifier — the
+    /// alarm-acknowledge branch takes them first.
+    MetadataOnly,
+}
+
+impl AcceptedWriteType {
+    /// `None` for a `data_type` above C's `LAST_BUFFER_TYPE` — the caller must
+    /// answer `ECA_BADTYPE` and drop, as RSRV does.
+    fn classify(data_type: u16) -> Option<Self> {
+        if let Ok(native) = DbFieldType::from_u16(data_type) {
+            return Some(Self::Native(native));
+        }
+        if data_type > epics_base_rs::types::LAST_BUFFER_TYPE {
+            return None;
+        }
+        // `native_type_for_dbr` names a base type for every code up to the
+        // bound, so the upper limit — not the lookup — is what separates the
+        // types `dbChannel_put` writes from the ones it drops into `default:`.
+        Some(match epics_base_rs::types::native_type_for_dbr(data_type) {
+            Ok(_) if data_type <= epics_base_rs::types::DBR_CTRL_DOUBLE => Self::Compound,
+            _ => Self::MetadataOnly,
+        })
+    }
+}
+
+/// What the put stage does with a frame that has cleared both gates.
+///
+/// Both variants are *put results*, reached only after the trap-write bracket
+/// is armed: C runs `asTrapWriteWithData` before `dbChannel_put` /
+/// `dbProcessNotify` unconditionally (`rsrv/camessage.c:794-804`, `:1775`), so
+/// a put-log listener sees the attempt whether or not the buffer type has a
+/// put arm. Deciding refusal *here* rather than at the type gate is what keeps
+/// that bracket around it.
+enum PutPlan {
+    /// Hand `value` to the record. The decoded value carries its own native
+    /// type — the buffer's own for a native put, the compound buffer's base
+    /// type once `decode_dbr` has skipped its metadata header — so no separate
+    /// type travels with it.
+    Write { value: EpicsValue },
+    /// `dbChannel_put` has no arm for this buffer type, so the put fails with
+    /// `ECA_PUTFAIL` on either opcode. `logged_value` is what the put-log
+    /// renders: C hands `asTrapWriteWithData` the converted payload, which
+    /// carries a value for a compound buffer and none for the metadata-only
+    /// types.
+    Refuse { logged_value: Option<EpicsValue> },
+}
+
 /// The shared synchronous head of `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY`.
 ///
 /// This is the whole wire path both front-ends run in ONE copy: the SID /
@@ -4093,15 +4174,17 @@ pub(crate) async fn serve_write_head(
     // A type-state WRITE gate: `lookup_access` is the only path
     // to the cache; the witness ensures the matching ECA code
     // reaches the wire.
-    let (write_type, write_grant) = if is_notify {
-        let write_type = match DbFieldType::from_u16(hdr.data_type) {
-            Ok(t) => t,
-            Err(_) => {
+    let (wire_type, write_grant) = if is_notify {
+        let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
+            Some(t) => t,
+            None => {
                 // C `putNotifyErrorReply` (camessage.c:1482-1501)
                 // preserves `m_dataType`/`m_count` from the
                 // request, then returns RSRV_ERROR (drop) — a
-                // peer sending an unsupported DBR has a corrupted
-                // dispatcher or is probing, so C drops.
+                // peer sending a DBR above `LAST_BUFFER_TYPE` has
+                // a corrupted dispatcher or is probing, so C
+                // drops. A compound type is BELOW that bound and
+                // therefore never reaches here.
                 send_put_notify_response(
                     writer,
                     hdr.data_type,
@@ -4125,10 +4208,14 @@ pub(crate) async fn serve_write_head(
                 // route through the refinement helper so
                 // large-array put-callbacks refused by ACF carry
                 // the extended-form count instead of the u16
-                // marker.
+                // marker. The echoed type is the REQUEST's
+                // (`putNotifyErrorReply` preserves `m_dataType`,
+                // camessage.c:1482-1501) — identical to the
+                // native code for a native put, and the only
+                // available answer for a compound one.
                 send_put_notify_response(
                     writer,
-                    write_type as u16,
+                    hdr.data_type,
                     hdr.actual_count(),
                     denied.eca_code(),
                     ioid,
@@ -4141,7 +4228,7 @@ pub(crate) async fn serve_write_head(
                 return Ok(WriteHeadOutcome::Done);
             }
         };
-        (write_type, write_grant)
+        (wire_type, write_grant)
     } else {
         // C `write_action` (camessage.c:741-750) emits
         // `send_err(mp, ECA_NOWTACCESS, ...)` and returns RSRV_OK
@@ -4166,11 +4253,13 @@ pub(crate) async fn serve_write_head(
             }
         };
         // Type validated only after access passes (C
-        // `caNetConvert`, camessage.c:753) — a bad type here is a
-        // protocol violation → RSRV_ERROR/drop.
-        let write_type = match DbFieldType::from_u16(hdr.data_type) {
-            Ok(t) => t,
-            Err(_) => {
+        // `caNetConvert`, camessage.c:753) — a type ABOVE
+        // `LAST_BUFFER_TYPE` is a protocol violation →
+        // RSRV_ERROR/drop. A compound type converts fine in C and
+        // so passes here too; it fails later, at the put.
+        let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
+            Some(t) => t,
+            None => {
                 send_ca_error(
                     writer,
                     hdr,
@@ -4185,7 +4274,7 @@ pub(crate) async fn serve_write_head(
                 )));
             }
         };
-        (write_type, write_grant)
+        (wire_type, write_grant)
     };
 
     // the write-trap mask of the ACF rule that
@@ -4225,42 +4314,89 @@ pub(crate) async fn serve_write_head(
     // which is the 0 marker for extended requests and
     // therefore lost the count on large array put-callbacks.
     let write_count = hdr.actual_count();
-    let new_value = match EpicsValue::from_bytes_array(write_type, payload, count) {
-        Ok(v) => v,
-        Err(_) => {
-            // Same C parity rule as the data_type gate above:
-            // bad payload bytes (wrong length, malformed wire
-            // bytes) is a protocol violation → emit error +
-            // drop the connection. C `caNetConvert` failure
-            // in `write_action` returns RSRV_ERROR.
-            if is_notify {
-                // Same `putNotifyErrorReply` shape.
-                send_put_notify_response(
-                    writer,
-                    hdr.data_type,
-                    hdr.actual_count(),
-                    ECA_BADTYPE,
-                    ioid,
-                    ReplyContext {
-                        req_hdr: *hdr,
-                        client_minor: state.client_minor_version,
-                    },
-                )?;
-            } else {
-                send_ca_error(
-                    writer,
-                    hdr,
-                    ECA_BADTYPE,
-                    entry_cid,
-                    "bad WRITE payload bytes",
-                    state.client_minor_version,
-                )?;
-            }
-            return Err(epics_base_rs::error::CaError::Protocol(format!(
-                "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
-                hdr.data_type, count
-            )));
+
+    // Whatever the buffer type carries, only the value reaches the
+    // record. The metadata a compound put brings along is discarded —
+    // as it is in C, and as it must be: `.TIME` is `DBF_NOACCESS` and
+    // `STAT`/`SEVR`/`UTAG` are `SPC_NOMOD`, so no client can set them
+    // through any path.
+    //
+    // The refusals below land HERE, at the put, rather than at the type
+    // gate — which is why those gates kept their C-observable positions:
+    // a compound WRITE_NOTIFY to a channel the peer cannot write must
+    // still report ECA_NOWTACCESS from the access gate, must still
+    // supersede the channel's in-flight put-callback (both done above),
+    // and must still be bracketed by the trap-write pair below, as C's
+    // unconditional `asTrapWriteWithData` does. ECA_PUTFAIL is C's answer
+    // on either opcode — `send_err(mp, ECA_PUTFAIL, ...)` + RSRV_OK
+    // (`camessage.c:806-816`) and `notifyError` → `ECA_PUTFAIL`
+    // (`camessage.c:1412-1413`) — and neither drops the circuit.
+
+    // A malformed payload is a protocol violation on every buffer type: C
+    // sizes the frame against `dbr_size_n` of the WIRE type and returns
+    // RSRV_ERROR before it looks at the put (`camessage.c:761-764`,
+    // `:1688-1691`), and `caNetConvert` failure does the same. One closure so
+    // that drop rule cannot fork between the native and compound decoders.
+    let value_or_drop = |decoded: CaResult<EpicsValue>| -> CaResult<EpicsValue> {
+        if decoded.is_ok() {
+            return decoded;
         }
+        if is_notify {
+            // Same `putNotifyErrorReply` shape.
+            send_put_notify_response(
+                writer,
+                hdr.data_type,
+                hdr.actual_count(),
+                ECA_BADTYPE,
+                ioid,
+                ReplyContext {
+                    req_hdr: *hdr,
+                    client_minor: state.client_minor_version,
+                },
+            )?;
+        } else {
+            send_ca_error(
+                writer,
+                hdr,
+                ECA_BADTYPE,
+                entry_cid,
+                "bad WRITE payload bytes",
+                state.client_minor_version,
+            )?;
+        }
+        Err(epics_base_rs::error::CaError::Protocol(format!(
+            "WRITE payload conversion failed for type {} count {} (matches C caNetConvert RSRV_ERROR)",
+            hdr.data_type, count
+        )))
+    };
+
+    let plan = match wire_type {
+        AcceptedWriteType::Native(native) => PutPlan::Write {
+            value: value_or_drop(EpicsValue::from_bytes_array(native, payload, count))?,
+        },
+        // C `dbChannel_put`'s per-type arms (`db/db_access.c:820`) are a
+        // header skip plus a put of the base type. `decode_dbr` performs
+        // exactly that skip — one owner for the compound layouts, shared
+        // with the read/monitor path, and bounds-checked where C casts the
+        // struct unchecked.
+        AcceptedWriteType::Compound => {
+            let value = value_or_drop(
+                epics_base_rs::types::decode_dbr(hdr.data_type, payload, count)
+                    .map(|snapshot| snapshot.value),
+            )?;
+            if is_notify {
+                // `mapOldType` (`db_access.c:988`) maps only the native
+                // types, so this one reaches `notifyError`.
+                PutPlan::Refuse {
+                    logged_value: Some(value),
+                }
+            } else {
+                PutPlan::Write { value }
+            }
+        }
+        // C's `default:` arm on either opcode; these buffers carry no value
+        // member for the put-log to render.
+        AcceptedWriteType::MetadataOnly => PutPlan::Refuse { logged_value: None },
     };
 
     // Stringify the value once for the audit log; skipped when
@@ -4274,7 +4410,13 @@ pub(crate) async fn serve_write_head(
     // listeners avoid touching the raw `EpicsValue`.
     let trap_listeners_active = epics_base_rs::server::access_security::has_trap_write_listeners();
     let display_value = if state.audit.is_some() || trap_listeners_active {
-        new_value.display_truncated(64)
+        match &plan {
+            PutPlan::Write { value, .. } => value.display_truncated(64),
+            PutPlan::Refuse { logged_value } => logged_value
+                .as_ref()
+                .map(|v| v.display_truncated(64))
+                .unwrap_or_default(),
+        }
     } else {
         String::new()
     };
@@ -4309,7 +4451,10 @@ pub(crate) async fn serve_write_head(
                 host: state.hostname.as_str().to_string(),
                 peer: state.peer.clone(),
                 value_str: display_value.clone(),
-                dbr_type: write_type as u16,
+                // C `asTrapWriteWithData` (`camessage.c:768-779`) logs
+                // `mp->m_dataType` — the type the client SENT, which for a
+                // compound put differs from the base type the record took.
+                dbr_type: hdr.data_type,
                 no_elements: write_count,
                 event_id: epics_base_rs::server::access_security::next_trap_write_event_id(),
                 rule_was_trap,
@@ -4326,43 +4471,59 @@ pub(crate) async fn serve_write_head(
     // `Sync` (reply inline) vs `Async(handle)` (spawn a completion task
     // that replies when the record's chain settles). A simple PV and a
     // fire-and-forget `CA_PROTO_WRITE` are always synchronous.
+    //
+    // `audit_result` is decided alongside the put rather than re-derived from
+    // its error, so the reason C had for failing a refused buffer type — no
+    // `dbChannel_put` arm, as opposed to a value the field rejected — survives
+    // into both the audit line and the trap-write AfterWrite status.
     use epics_base_rs::server::record::ProcessCompletion;
-    let write_result: CaResult<ProcessCompletion> = match &entry.target {
-        ChannelTarget::SimplePv(pv) => {
-            if let Some(hook) = pv.write_hook() {
-                let ctx = epics_base_rs::server::pv::WriteContext {
-                    user: state.username.clone(),
-                    host: state.hostname.as_str().to_string(),
-                    peer: state.peer.clone(),
-                };
-                hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
-            } else {
-                pv.set(new_value);
-                Ok(ProcessCompletion::Sync)
-            }
-        }
-        ChannelTarget::RecordField { record, field } => {
-            let name = record.read().name.clone();
-            if is_notify {
-                db.put_record_field_from_ca(&name, field, new_value).await
-            } else {
-                // C `write_action` (`rsrv/camessage.c:781-789`)
-                // routes CA_PROTO_WRITE through `dbPutField` —
-                // no putNotify is ever built. Parking a wait-set
-                // whose receiver this fire-and-forget arm drops
-                // would occupy the record's notify slot until
-                // any async processing it starts settles (a
-                // motor's whole motion), failing every
-                // legitimate WRITE_NOTIFY on the record with
-                // ECA_PUTCBINPROG in the meantime.
-                db.put_record_field_from_ca_no_notify(&name, field, new_value)
-                    .await
-                    .map(|()| ProcessCompletion::Sync)
-            }
+    let (write_result, audit_result): (CaResult<ProcessCompletion>, &str) = match plan {
+        PutPlan::Refuse { .. } => (
+            Err(epics_base_rs::error::CaError::UnsupportedType(
+                hdr.data_type,
+            )),
+            "dbr-type-not-puttable",
+        ),
+        PutPlan::Write { value: new_value } => {
+            let result: CaResult<ProcessCompletion> = match &entry.target {
+                ChannelTarget::SimplePv(pv) => {
+                    if let Some(hook) = pv.write_hook() {
+                        let ctx = epics_base_rs::server::pv::WriteContext {
+                            user: state.username.clone(),
+                            host: state.hostname.as_str().to_string(),
+                            peer: state.peer.clone(),
+                        };
+                        hook(new_value, ctx).await.map(|()| ProcessCompletion::Sync)
+                    } else {
+                        pv.set(new_value);
+                        Ok(ProcessCompletion::Sync)
+                    }
+                }
+                ChannelTarget::RecordField { record, field } => {
+                    let name = record.read().name.clone();
+                    if is_notify {
+                        db.put_record_field_from_ca(&name, field, new_value).await
+                    } else {
+                        // C `write_action` (`rsrv/camessage.c:781-789`)
+                        // routes CA_PROTO_WRITE through `dbPutField` —
+                        // no putNotify is ever built. Parking a wait-set
+                        // whose receiver this fire-and-forget arm drops
+                        // would occupy the record's notify slot until
+                        // any async processing it starts settles (a
+                        // motor's whole motion), failing every
+                        // legitimate WRITE_NOTIFY on the record with
+                        // ECA_PUTCBINPROG in the meantime.
+                        db.put_record_field_from_ca_no_notify(&name, field, new_value)
+                            .await
+                            .map(|()| ProcessCompletion::Sync)
+                    }
+                }
+            };
+            let tag = if result.is_ok() { "ok" } else { "fail" };
+            (result, tag)
         }
     };
 
-    let audit_result = if write_result.is_ok() { "ok" } else { "fail" };
     state.audit("caput", &audit_pv, &display_value, audit_result);
 
     // SYNCHRONOUS write paths (no async record completion
@@ -4428,7 +4589,12 @@ pub(crate) async fn serve_write_head(
                 trap_guard: trap_guard.take(),
                 eca_status,
                 reply: WriteNotifyReply {
-                    write_type: write_type as u16,
+                    // C `write_notify_reply` (`camessage.c:1417-1434`) frames
+                    // the completion from the saved request header, so the
+                    // echoed type is always the one the client SENT — the same
+                    // value as the native type for a native put, and the only
+                    // available answer for the compound and refused ones.
+                    write_type: hdr.data_type,
                     write_count,
                     ioid,
                     req_hdr: *hdr,
@@ -4438,10 +4604,11 @@ pub(crate) async fn serve_write_head(
                 sid,
             }));
         }
-        // Synchronous completion — respond immediately.
+        // Synchronous completion — respond immediately. Same echoed type as
+        // the deferred reply above: C frames both from the request header.
         send_put_notify_response(
             writer,
-            write_type as u16,
+            hdr.data_type,
             write_count,
             eca_status,
             ioid,

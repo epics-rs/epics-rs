@@ -1302,7 +1302,7 @@ impl ChannelSource for GatewayChannelSource {
     async fn put_get_checked(
         &self,
         checked: AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,

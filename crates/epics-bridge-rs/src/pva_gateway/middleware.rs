@@ -2488,7 +2488,7 @@ mod tests {
         let res = acl
             .put_delta_checked(
                 checked_for("X").await,
-                FieldDesc::Scalar(ScalarType::Double),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
                 PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
@@ -2524,7 +2524,7 @@ mod tests {
         let err = acl
             .put_delta_checked(
                 checked_for("SECRET:KEY").await,
-                FieldDesc::Scalar(ScalarType::Double),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
                 PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
@@ -2566,7 +2566,7 @@ mod tests {
         let res = audited
             .put_delta_checked(
                 checked_for("X").await,
-                FieldDesc::Scalar(ScalarType::Double),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
                 PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
@@ -2608,7 +2608,7 @@ mod tests {
         let err = ro
             .put_delta_checked(
                 checked_for("X").await,
-                FieldDesc::Scalar(ScalarType::Double),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
                 PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),

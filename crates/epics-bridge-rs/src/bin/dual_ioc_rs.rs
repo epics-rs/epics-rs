@@ -112,7 +112,11 @@ fn parse_pv(def: &str) -> CaResult<(String, EpicsValue)> {
     Ok((name, value))
 }
 
-#[tokio::main]
+// One worker, reactor-style — see qsrv_rs.rs: the default per-CPU pool
+// migrates the mostly-serial serving work across idle workers, costing
+// ~35 µs of extra CPU per put on a 96-core host (doc/qsrv-put-perf.md).
+// Multi-thread flavor is kept so `block_on_sync` works from runtime tasks.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(

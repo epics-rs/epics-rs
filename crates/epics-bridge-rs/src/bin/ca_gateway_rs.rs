@@ -340,7 +340,13 @@ fn main() -> ExitCode {
         }
     }
 
+    // One worker, reactor-style — see qsrv_rs.rs: the default per-CPU
+    // pool migrates the mostly-serial serving work across idle workers,
+    // costing ~35 µs of extra CPU per op on a 96-core host
+    // (doc/qsrv-put-perf.md). Multi-thread flavor is kept so
+    // `block_on_sync` works from runtime tasks.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
     {

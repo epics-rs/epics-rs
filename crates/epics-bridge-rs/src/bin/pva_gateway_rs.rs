@@ -606,7 +606,12 @@ impl ResolvedConfig {
     }
 }
 
-#[tokio::main]
+// One worker, reactor-style — the shape pva2pva forwards from (a single
+// event loop). The default per-CPU pool migrates the mostly-serial
+// serving work across idle workers, costing ~35 µs of extra CPU per op
+// on a 96-core host (doc/qsrv-put-perf.md). Multi-thread flavor is kept
+// so `block_on_sync` works from runtime tasks.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.verbose);

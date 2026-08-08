@@ -810,8 +810,41 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
-/// has been spawned.
+/// Run a data-phase EXEC body inline on the read-loop thread when it can
+/// complete without waiting; promote it to a spawned task only when it
+/// cannot.
+///
+/// pvxs executes GET/PUT/RPC callbacks synchronously on the connection's
+/// event-loop thread and replies from the same stack. Spawning a task per
+/// EXEC instead costs several cross-thread futex wakes per operation
+/// (worker wake, reply-channel wake, `ExecFinished` wake back to the read
+/// loop) — measured ~8.8 wakes per wire PUT against pvxs's ~0.1. One poll
+/// under a noop waker lets the common already-ready body (local source,
+/// uncontended locks, writer channel below capacity) finish with no task
+/// at all; a body that genuinely waits (remote-fronting source, writer
+/// backpressure) is handed to `spawn`, which schedules an immediate first
+/// poll that re-registers every waker the noop poll discarded.
+///
+/// Returns the abort handle when promoted, `None` when the body already
+/// ran to completion (nothing left to abort). Either way the body's
+/// [`ExecFinishGuard`] has queued (or will queue) its `ExecFinished`, and
+/// the read loop drains that queue only after the caller's
+/// [`finish_exec_data_task`] bookkeeping ran, so the `last_request`
+/// disposition in [`apply_exec_finish`] is unchanged.
+fn poll_inline_or_spawn<F>(fut: F) -> Option<epics_base_rs::runtime::task::TaskAbortHandle>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut fut = Box::pin(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(fut.as_mut(), &mut cx) {
+        std::task::Poll::Ready(()) => None,
+        std::task::Poll::Pending => Some(epics_base_rs::runtime::task::spawn(fut).abort_handle()),
+    }
+}
+
+/// Apply the data-phase op continuation after a GET/PUT/RPC EXEC body
+/// has been started by [`poll_inline_or_spawn`].
 ///
 /// pvxs records `op->lastRequest = subcmd & 0x10` *while the op stays
 /// `Executing` in `opByIOID`* (`serverget.cpp:470-471`) and only
@@ -822,9 +855,9 @@ impl Drop for AbortOnDrop {
 /// slow source replied, and have the still-in-flight first reply and the new
 /// operation collide on one IOID on the wire.
 ///
-/// The Rust EXEC handlers serialize their response from a spawned task that
+/// The Rust EXEC handlers serialize their response from a body that
 /// cannot reach `ch.ops`, so the read-loop owner defers cleanup to
-/// [`apply_exec_finish`], which fires when the task's [`ExecFinishGuard`]
+/// [`apply_exec_finish`], which fires when the body's [`ExecFinishGuard`]
 /// signals completion (right after the reply is handed to the writer). Both
 /// branches therefore keep the op reserved and install the abort guard; only
 /// the bookkeeping differs:
@@ -834,17 +867,21 @@ impl Drop for AbortOnDrop {
 ///   is out, not before.
 /// - otherwise: leave it `Executing`; the completion owner returns it to
 ///   `Idle` so a later explicit re-EXEC is accepted.
+///
+/// `abort` is `None` when the body completed inline — there is no task to
+/// abort, and the op's guard slot is already `None` (an `Idle` op holds no
+/// guard, and `begin_exec` only admits `Idle` ops).
 fn finish_exec_data_task(
     ch: &mut ChannelState,
     ioid: u32,
     subcmd: u8,
-    abort: epics_base_rs::runtime::task::TaskAbortHandle,
+    abort: Option<epics_base_rs::runtime::task::TaskAbortHandle>,
 ) {
     if let Some(op_mut) = ch.ops.get_mut(&ioid) {
         if subcmd & QosFlags::DESTROY != 0 {
             op_mut.last_request = true;
         }
-        op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(abort)));
+        op_mut.data_task_abort = abort.map(|a| Arc::new(AbortOnDrop(a)));
     }
 }
 
@@ -4417,7 +4454,7 @@ async fn handle_put_get(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -4527,7 +4564,7 @@ async fn handle_put_get(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -4763,7 +4800,7 @@ async fn handle_process(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -4807,7 +4844,7 @@ async fn handle_process(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -5133,7 +5170,7 @@ async fn handle_channel_array(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
@@ -5212,7 +5249,7 @@ async fn handle_channel_array(
         buf.extend_from_slice(&payload);
         let _ = tx_clone.send(buf).await;
     });
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -6751,7 +6788,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let mut exec_fin_guard = ExecFinishGuard {
@@ -6854,7 +6891,7 @@ async fn handle_op(
                 exec_fin_guard.mark_success();
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         OpKind::Put => {
             // pvxs `serverget.cpp:364` derives `isput = cmd!=CMD_GET
@@ -6901,7 +6938,7 @@ async fn handle_op(
                     success: false,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let join = epics_base_rs::runtime::task::spawn(async move {
+                let abort = poll_inline_or_spawn(async move {
                     let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
@@ -6989,7 +7026,7 @@ async fn handle_op(
                     exec_fin_guard.mark_success();
                     let _ = tx_clone.send(buf).await;
                 });
-                finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+                finish_exec_data_task(ch, ioid, subcmd, abort);
                 return Ok(());
             }
             // PUT EXEC (subcmd & 0x40 == 0): read bitset (which
@@ -7050,7 +7087,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7168,7 +7205,7 @@ async fn handle_op(
                 }
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         OpKind::Monitor => {
             // pvxs `servermon.cpp:643-708` splits the data-phase MONITOR
@@ -7417,7 +7454,7 @@ async fn handle_op(
                 success: false,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7493,7 +7530,7 @@ async fn handle_op(
                 }
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
         // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
@@ -7645,7 +7682,7 @@ async fn handle_get_field(
         success: false,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
         let _exec_fin_guard = ExecFinishGuard {
@@ -7685,7 +7722,7 @@ async fn handle_get_field(
     // Install the abort guard on the reserved op so DESTROY_REQUEST /
     // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
     // here — `last_request` is already set on the reserved op above.
-    finish_exec_data_task(chan_mut, ioid, 0, join.abort_handle());
+    finish_exec_data_task(chan_mut, ioid, 0, abort);
     Ok(())
 }
 

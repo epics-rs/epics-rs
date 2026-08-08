@@ -3161,6 +3161,21 @@ pub(super) async fn handle_connection_io(
     // `interval` yields its first tick immediately; the task consumed it the
     // same way, so the first beat lands 15 s in.
     hb_tick.tick().await;
+    // Coarse read-stall watchdog: one persistent ticker replaces the
+    // per-read `timeout()` wrapper `read_frame` used to carry (a
+    // timer-wheel insert + cancel per pending read). The arm below
+    // returns `PvaError::Timeout` once the peer has completed no frame
+    // for `op_timeout`, so a stall is detected within
+    // [`op_timeout`, `op_timeout` + tick period] instead of exactly at
+    // `op_timeout` — an acceptable coarsening of a guard whose default
+    // is 64,000 s. Unlike the heartbeat this arm is never latched off:
+    // it must keep watching after `hb_stopped`, or an idle-latched
+    // connection whose peer then wedges mid-frame would never be
+    // reclaimed.
+    let mut op_deadline_tick = epics_base_rs::runtime::task::interval(
+        (op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)),
+    );
+    op_deadline_tick.tick().await;
     // Latched when the idle watchdog fires or the writer channel closes —
     // the two conditions that used to `break` the task's loop. Note this
     // stops the *heartbeat*, not the connection: the task ending never tore
@@ -3550,7 +3565,19 @@ pub(super) async fn handle_connection_io(
                 }
                 continue;
             }
-            frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
+            _ = op_deadline_tick.tick() => {
+                // Read-stall bound, moved out of `read_frame` (see the
+                // ticker's construction above). `last_rx` stamps every
+                // completed frame, so this fires only when the peer has
+                // sent no complete frame for `op_timeout` — a wedged or
+                // byte-trickling circuit.
+                let elapsed = now_nanos().saturating_sub(last_rx);
+                if Duration::from_nanos(elapsed) >= op_timeout {
+                    return Err(PvaError::Timeout);
+                }
+                continue;
+            }
+            frame_result = read_frame(&mut reader, &mut rx_buf, max_msg_size) => {
                 frame_result?
             }
         };
@@ -5312,7 +5339,6 @@ fn read_array_size(
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
-    op_timeout: Duration,
     max_msg_size: Option<usize>,
 ) -> PvaResult<Frame> {
     loop {
@@ -5345,13 +5371,15 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
                 }
             }
         }
+        // No per-read timer: wrapping every read in `timeout()` minted
+        // and cancelled a timer-wheel entry per pending read — pure
+        // churn on a hot circuit. The read-stall bound (`op_timeout`)
+        // is enforced coarsely by the connection loop's deadline tick,
+        // which checks the age of the last completed frame.
         let mut chunk = [0u8; 4096];
-        let n = match epics_base_rs::runtime::task::timeout(op_timeout, reader.read(&mut chunk))
-            .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(PvaError::Io(e)),
-            Err(_) => return Err(PvaError::Timeout),
+        let n = match reader.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => return Err(PvaError::Io(e)),
         };
         if n == 0 {
             return Err(PvaError::Protocol("client closed".into()));
@@ -21920,14 +21948,9 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(
-            &mut reader,
-            &mut rx_buf,
-            Duration::from_secs(1),
-            Some(DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect_err("an over-cap header must be refused");
+        let err = read_frame(&mut reader, &mut rx_buf, Some(DEFAULT_MAX_MESSAGE_SIZE))
+            .await
+            .expect_err("an over-cap header must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds max_message_size"),
@@ -21948,7 +21971,7 @@ mod inbound_message_cap_tests {
         wire.extend_from_slice(&[0u8; 16]);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let frame = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+        let frame = read_frame(&mut reader, &mut rx_buf, Some(cap))
             .await
             .expect("a message exactly at the cap must be admitted");
         assert_eq!(frame.payload.len(), cap);
@@ -21960,7 +21983,7 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(cap as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+        let err = read_frame(&mut reader, &mut rx_buf, Some(cap))
             .await
             .expect_err("one byte over the cap must be refused");
         assert!(err.to_string().contains("exceeds max_message_size"));
@@ -21974,7 +21997,7 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), None)
+        let err = read_frame(&mut reader, &mut rx_buf, None)
             .await
             .expect_err("the stream ends after the header, so this cannot succeed");
         // The refusal must be the *stream ending*, not the cap.

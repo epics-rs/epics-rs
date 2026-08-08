@@ -376,16 +376,13 @@ impl AccessGate {
                                 }
                             }
                         };
-                        let calc_ok = |expr: &str| -> bool {
+                        let calc_ok = |compiled: &crate::calc::CompiledExpr| -> bool {
                             let Some(ref inputs) = inp_values else {
                                 return false;
                             };
-                            match crate::calc::compile(expr) {
-                                Ok(c) => crate::calc::eval(&c, &mut inputs.clone())
-                                    .map(|r| r != 0.0)
-                                    .unwrap_or(false),
-                                Err(_) => false,
-                            }
+                            crate::calc::eval(compiled, &mut inputs.clone())
+                                .map(|r| r != 0.0)
+                                .unwrap_or(false)
                         };
                         cfg.compute_for_name(
                             &asg, host, user, roles, asl, method, authority, &calc_ok,
@@ -502,6 +499,13 @@ pub struct AccessRule {
     /// rule. When `Some`, the rule only grants access while the
     /// expression evaluates to 1 against the ASG's `INP*` link values.
     pub calc: Option<String>,
+    /// The expression compiled at ACF parse — C compiles a RULE's CALC
+    /// once at load (`asAsgRuleCalc` runs `postfix()`), then every
+    /// `asComputePvt` evaluates the stored RPN. `parse_acf` upholds
+    /// `calc.is_some() ⟹ calc_compiled.is_some()`; a hand-built rule
+    /// that carries `calc` text without the compiled form fails closed
+    /// in `compute_rules`.
+    pub calc_compiled: Option<crate::calc::CompiledExpr>,
     /// True when the rule must be treated as inert by `asComputePvt`.
     /// C `asAsgRuleDisable` (`asLib.y:300-306`) sets `pasgrule->ignore`
     /// for a RULE that contains an unsupported keyword. This port also
@@ -703,7 +707,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&str) -> bool,
+        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
     ) -> (AccessLevel, bool) {
         let asg = match self.asg.get(asg_name) {
             Some(a) => a,
@@ -784,7 +788,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&str) -> bool,
+        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
     ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
@@ -869,10 +873,14 @@ impl AccessSecurityConfig {
             // `asLibRoutines.c:957-1042` evaluates `calcPerform()` and
             // grants on a true result with good inputs. `calc_ok` returns
             // false when the expression is false, an input is bad, or no
-            // INP* resolver is installed (fail closed).
-            if let Some(ref expr) = rule.calc {
-                if !calc_ok(expr) {
-                    continue;
+            // INP* resolver is installed (fail closed). The program was
+            // compiled once at ACF parse; a rule holding `calc` text with
+            // no compiled form (hand-built, bypassing `parse_acf`) fails
+            // closed here.
+            if rule.calc.is_some() {
+                match rule.calc_compiled {
+                    Some(ref compiled) if calc_ok(compiled) => {}
+                    _ => continue,
                 }
             }
             // C `asLibRoutines.c:1041-1042`: a matching rule sets
@@ -1979,21 +1987,21 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // unconditional grant. The expression is still validated (compiled)
     // here so a syntactically broken CALC is rejected exactly as C's
     // `postfix()` rejects it in `asAsgRuleCalc`.
-    if let Some(ref expr) = calc {
-        // validate the CALC expression at parse (C `postfix()`
-        // rejects a broken one in `asAsgRuleCalc`). The rule is NOT
-        // forced inert anymore: it is conditionally active and gated at
-        // access-check time by `compute_rules`'s `calc_ok`, which
-        // resolves the ASG's INP* links and evaluates the expression.
-        // When no INP* resolver is installed the evaluator returns false
-        // (fail closed), preserving the previous deny behaviour without
-        // hard-disabling the rule.
-        if let Err(e) = crate::calc::compile(expr) {
-            return Err(CaError::Protocol(format!(
-                "ACF: bad CALC expression '{expr}': {e}"
-            )));
-        }
-    }
+    // compile the CALC expression at parse (C `postfix()` rejects a
+    // broken one in `asAsgRuleCalc` and stores the RPN for every later
+    // `asComputePvt`). The rule is conditionally active and gated at
+    // access-check time by `compute_rules`'s `calc_ok`, which resolves
+    // the ASG's INP* links and evaluates the stored program. When no
+    // INP* resolver is installed the evaluator returns false (fail
+    // closed), preserving the previous deny behaviour without
+    // hard-disabling the rule.
+    let calc_compiled =
+        match calc {
+            Some(ref expr) => Some(crate::calc::compile(expr).map_err(|e| {
+                CaError::Protocol(format!("ACF: bad CALC expression '{expr}': {e}"))
+            })?),
+            None => None,
+        };
 
     Ok(AccessRule {
         level,
@@ -2004,6 +2012,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         authority,
         trap,
         calc,
+        calc_compiled,
         ignore,
     })
 }

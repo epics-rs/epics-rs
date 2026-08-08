@@ -149,7 +149,64 @@ impl AccessControl for AllowAllAccess {}
 pub struct AcfAccessControl {
     db: Arc<epics_base_rs::server::database::PvDatabase>,
     cfg: Arc<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    /// C `asAddClient` keeps one computed ASGCLIENT per channel and every
+    /// put is a bit test; pvxs caches the client's computed access on the
+    /// channel at the first PUT (pvxs 3c0154b, issue #176). The Rust QSRV
+    /// channel object is rebuilt per operation, so the computed
+    /// (level, trap) is cached here on the policy owner instead, keyed by
+    /// (channel, full credential identity). Invalidation is by
+    /// construction: an ACF reload swaps in a whole new
+    /// `AcfAccessControl` (`set_access_control`), and a `dbPut
+    /// record.ASG` moves [`asg_change_generation`] which every entry
+    /// snapshots. The rule walk here never evaluates CALC against live
+    /// INP* values (`check_access_method_trap` fails those closed), so an
+    /// entry cannot go stale through a DB value change.
+    grant_cache: parking_lot::RwLock<HashMap<GrantKey, CachedAccess>>,
 }
+
+/// Full identity a cached access computation depends on. `roles` is part
+/// of the key — a re-auth that only changes role claims must miss.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GrantKey {
+    channel: String,
+    user: String,
+    host: String,
+    method: String,
+    authority: String,
+    roles: Vec<String>,
+}
+
+impl GrantKey {
+    fn new(channel: &str, creds: &ClientCreds) -> Self {
+        Self {
+            channel: channel.to_string(),
+            user: creds.user.clone(),
+            host: creds.host.clone(),
+            method: creds.method.clone(),
+            authority: creds.authority.clone(),
+            roles: creds.roles.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CachedAccess {
+    /// [`asg_change_generation`] snapshot taken BEFORE the (ASG, ASL)
+    /// resolve, so a change racing the compute invalidates the entry on
+    /// its next read instead of being lost.
+    asg_generation: u64,
+    level: AccessLevelLite,
+    /// `TRAPWRITE` flag of the first credential's granting rule; only
+    /// meaningful when `level` is `ReadWrite`.
+    write_trap: bool,
+}
+
+/// Bound on distinct (channel × credential) cache entries. C's ASGCLIENT
+/// list is bounded by live channels; this cache is name-keyed, so a
+/// client cycling names/identities could otherwise grow it without
+/// limit. Overflow flushes the whole map — crude, but a full re-walk per
+/// entry is exactly the pre-cache behaviour.
+const GRANT_CACHE_CAP: usize = 4096;
 
 impl AcfAccessControl {
     pub fn new(
@@ -159,6 +216,7 @@ impl AcfAccessControl {
         Self {
             db,
             cfg: Arc::new(cfg),
+            grant_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -173,13 +231,22 @@ impl AcfAccessControl {
     /// must never stand in for an ASG the code failed to look up: doing so
     /// evaluates the wrong access group, which for a record in a read-only
     /// group means granting a write the ACF denies.
-    async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8) {
+    /// The third element is whether the channel resolved to a known
+    /// record. Only a known-record resolution may be cached: an unknown
+    /// name's `DEFAULT` fallback would otherwise keep serving `DEFAULT`
+    /// after the record appears (post-init `dbLoadRecords`), with no
+    /// ASG-field put to move the invalidation generation.
+    async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8, bool) {
         let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
         if let Some(rec) = self.db.get_record(record_name) {
             let inst = rec.read();
-            return (inst.common.access_group().to_string(), inst.common.asl);
+            return (
+                inst.common.access_group().to_string(),
+                inst.common.asl,
+                true,
+            );
         }
-        ("DEFAULT".to_string(), 0u8)
+        ("DEFAULT".to_string(), 0u8, false)
     }
 
     /// Build pvxs-style credential strings from `ClientCreds`.
@@ -210,8 +277,23 @@ impl AcfAccessControl {
     /// maximum level across all credentials — mirrors `SecurityClient::canWrite`
     /// `any_of` semantics (`pvxs/ioc/securityclient.cpp:42-45`).
     async fn level_for_creds(&self, channel: &str, creds: &ClientCreds) -> AccessLevelLite {
+        self.computed_access(channel, creds).await.level
+    }
+
+    /// The single rule evaluation every check on this policy routes
+    /// through, cached per (channel, credential identity) — see the
+    /// [`Self::grant_cache`] field doc for the C/pvxs model and the
+    /// invalidation reasoning.
+    async fn computed_access(&self, channel: &str, creds: &ClientCreds) -> CachedAccess {
         use epics_base_rs::server::access_security::AccessLevel;
-        let (asg, asl) = self.resolve_asg_and_asl(channel).await;
+        let generation = epics_base_rs::server::access_security::asg_change_generation();
+        let key = GrantKey::new(channel, creds);
+        if let Some(hit) = self.grant_cache.read().get(&key)
+            && hit.asg_generation == generation
+        {
+            return *hit;
+        }
+        let (asg, asl, record_known) = self.resolve_asg_and_asl(channel).await;
         let cred_strings = Self::credential_strings(creds);
         // a QSRV access context built through the legacy
         // no-method constructors (`AccessContext::anonymous`,
@@ -235,51 +317,18 @@ impl AcfAccessControl {
         } else {
             creds.method.as_str()
         };
-        let mut best = AccessLevelLite::None;
-        for cred_user in &cred_strings {
-            let lvl = self.cfg.check_access_method(
-                &asg,
-                &creds.host,
-                cred_user,
-                asl,
-                method,
-                &creds.authority,
-            );
-            let lit = match lvl {
-                AccessLevel::ReadWrite => AccessLevelLite::ReadWrite,
-                AccessLevel::Read => AccessLevelLite::Read,
-                _ => AccessLevelLite::None,
-            };
-            if lit == AccessLevelLite::ReadWrite {
-                return lit;
-            }
-            if lit == AccessLevelLite::Read && best == AccessLevelLite::None {
-                best = lit;
-            }
-        }
-        best
-    }
-
-    /// Write authorization plus the matched (granting) rule's
-    /// `TRAPWRITE` flag, in one pass.
-    ///
-    /// pvxs `SecurityClient::canWrite` is `any_of` over the credential
-    /// list (`pvxs/ioc/securityclient.cpp:42-45`): the first credential
-    /// that grants `ReadWrite` wins, and that rule's `trapMask` is the
-    /// grant's trap flag — C `asComputePvt` copies `trapMask` from the
-    /// rule that set the granted access (`asLibRoutines.c:1041-1048`).
-    /// A denied write carries `rule_was_trap = false` (`asComputePvt`
-    /// leaves `trapMask = 0` on a `NoAccess` outcome).
-    async fn grant_for_creds(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
-        use epics_base_rs::server::access_security::AccessLevel;
-        let (asg, asl) = self.resolve_asg_and_asl(channel).await;
-        let cred_strings = Self::credential_strings(creds);
-        // Same empty-method → "anonymous" normalization as
-        // `level_for_creds` (see that method for the rationale).
-        let method = if creds.method.is_empty() {
-            "anonymous"
-        } else {
-            creds.method.as_str()
+        // pvxs `SecurityClient::canWrite` is `any_of` over the credential
+        // list (`pvxs/ioc/securityclient.cpp:42-45`): the first
+        // credential that grants `ReadWrite` wins, and that rule's
+        // `trapMask` is the grant's trap flag — C `asComputePvt` copies
+        // `trapMask` from the rule that set the granted access
+        // (`asLibRoutines.c:1041-1048`). A denied write carries
+        // `rule_was_trap = false` (`asComputePvt` leaves `trapMask = 0`
+        // on a `NoAccess` outcome).
+        let mut entry = CachedAccess {
+            asg_generation: generation,
+            level: AccessLevelLite::None,
+            write_trap: false,
         };
         for cred_user in &cred_strings {
             let (lvl, trap) = self.cfg.check_access_method_trap(
@@ -290,16 +339,34 @@ impl AcfAccessControl {
                 method,
                 &creds.authority,
             );
-            if lvl == AccessLevel::ReadWrite {
-                return WriteGrant {
-                    allowed: true,
-                    rule_was_trap: trap,
-                };
+            match lvl {
+                AccessLevel::ReadWrite => {
+                    entry.level = AccessLevelLite::ReadWrite;
+                    entry.write_trap = trap;
+                    break;
+                }
+                AccessLevel::Read => entry.level = AccessLevelLite::Read,
+                _ => {}
             }
         }
+        if record_known {
+            let mut cache = self.grant_cache.write();
+            if cache.len() >= GRANT_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(key, entry);
+        }
+        entry
+    }
+
+    /// Write authorization plus the matched (granting) rule's
+    /// `TRAPWRITE` flag, from the same cached evaluation every other
+    /// check uses (see [`Self::computed_access`]).
+    async fn grant_for_creds(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+        let computed = self.computed_access(channel, creds).await;
         WriteGrant {
-            allowed: false,
-            rule_was_trap: false,
+            allowed: computed.level == AccessLevelLite::ReadWrite,
+            rule_was_trap: computed.write_trap,
         }
     }
 }
@@ -1949,6 +2016,45 @@ ASG(SECURE) {
         // Only admin can write.
         assert!(acl.can_write("AI:SEC", "admin", "anywhere").await);
         assert!(!acl.can_write("AI:SEC", "guest", "anywhere").await);
+    }
+
+    /// The grant cache must repoint when the record's ASG changes
+    /// (C `asChangeGroup` re-runs `asComputePvt` for every ASGCLIENT
+    /// on `dbPut record.ASG`). The first check populates the cache
+    /// under the record's initial group; moving the record into a
+    /// deny-all group and firing the ASG-change notifier must flip
+    /// the cached decision, not serve the stale grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acf_grant_cache_invalidated_by_asg_field_change() {
+        use epics_base_rs::server::access_security::{notify_asg_field_changed, parse_acf};
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let acf_text = r#"
+ASG(OPEN) {
+    RULE(1, WRITE)
+}
+ASG(LOCKED) {
+}
+"#;
+        let cfg = parse_acf(acf_text).unwrap();
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:MOVE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("AI:MOVE").unwrap();
+        rec.write().common.asg = "OPEN".to_string();
+
+        let acl = AcfAccessControl::new(db.clone(), cfg);
+        // Twice: the second call is the cache-hit path.
+        assert!(acl.can_write("AI:MOVE", "guest", "anywhere").await);
+        assert!(acl.can_write("AI:MOVE", "guest", "anywhere").await);
+
+        // The field-I/O layer's `dbPut record.ASG` sequence: mutate,
+        // then notify.
+        rec.write().common.asg = "LOCKED".to_string();
+        notify_asg_field_changed();
+        assert!(!acl.can_write("AI:MOVE", "guest", "anywhere").await);
     }
 
     /// Regression: AcfAccessControl must honor method, authority,

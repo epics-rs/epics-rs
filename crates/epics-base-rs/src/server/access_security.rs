@@ -1273,13 +1273,30 @@ fn asg_change_broadcast() -> &'static tokio::sync::broadcast::Sender<()> {
     })
 }
 
+/// Monotonic count of ASG-field changes, for pull-style consumers
+/// (see [`asg_change_generation`]) that cannot hold a broadcast
+/// receiver — e.g. a sync access-check cache that must know whether
+/// a cached (channel → ASG) resolution is still current.
+static ASG_CHANGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Fire from the field-I/O layer when a record's `ASG` field is
 /// successfully written. Idempotent: if no subscriber exists yet
 /// the send is a no-op (lagged subscribers also tolerated — the
 /// wire re-eval is coarse and one missed beat is recovered by the
 /// downstream `oldaccess != access` filter).
 pub fn notify_asg_field_changed() {
+    ASG_CHANGE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     let _ = asg_change_broadcast().send(());
+}
+
+/// Current ASG-field-change generation. A consumer that caches
+/// anything derived from a record's `ASG` field snapshots this before
+/// resolving and treats its entry as stale once the value moves —
+/// the pull-side counterpart of [`subscribe_asg_changes`]. C's
+/// equivalent invalidation is `asChangeGroup` re-running
+/// `asComputePvt` for every `ASGCLIENT` on `dbPut record.ASG`.
+pub fn asg_change_generation() -> u64 {
+    ASG_CHANGE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Subscribe to ASG-field-change notifications. Called once at

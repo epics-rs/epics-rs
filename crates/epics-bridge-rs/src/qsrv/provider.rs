@@ -430,16 +430,11 @@ impl AccessControl for AcfAccessControl {
 #[derive(Clone)]
 pub struct AccessContext {
     pub access: Arc<dyn AccessControl>,
-    pub user: String,
-    pub host: String,
-    /// Auth method. pvxs `ClientCredentials::method`
-    /// (pvxs/include/pvxs/srvcommon.h:43).
-    pub method: String,
-    /// Root CA subject CN for the x509 method; empty for others.
-    pub authority: String,
-    /// Role claims for UAG `role/…` entries.
-    /// pvxs `ClientCredentials::roles()` (pvxs/include/pvxs/srvcommon.h:55).
-    pub roles: Vec<String>,
+    /// Full credential set of the downstream client (pvxs
+    /// `ClientCredentials`, srvcommon.h:36-56). Shared by refcount so
+    /// per-op access checks hand `&self.creds` to the policy instead
+    /// of re-cloning five strings per check.
+    pub creds: Arc<ClientCreds>,
 }
 
 impl AccessContext {
@@ -447,11 +442,7 @@ impl AccessContext {
     pub fn anonymous(access: Arc<dyn AccessControl>) -> Self {
         Self {
             access,
-            user: String::new(),
-            host: String::new(),
-            method: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCreds::default()),
         }
     }
 
@@ -459,11 +450,11 @@ impl AccessContext {
     pub fn with_identity(access: Arc<dyn AccessControl>, user: String, host: String) -> Self {
         Self {
             access,
-            user,
-            host,
-            method: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCreds {
+                user,
+                host,
+                ..Default::default()
+            }),
         }
     }
 
@@ -471,11 +462,7 @@ impl AccessContext {
     pub fn with_creds(access: Arc<dyn AccessControl>, creds: ClientCreds) -> Self {
         Self {
             access,
-            user: creds.user,
-            host: creds.host,
-            method: creds.method,
-            authority: creds.authority,
-            roles: creds.roles,
+            creds: Arc::new(creds),
         }
     }
 
@@ -485,15 +472,11 @@ impl AccessContext {
     }
 
     pub async fn can_read(&self, channel: &str) -> bool {
-        self.access
-            .can_read_creds(channel, &self.to_client_creds())
-            .await
+        self.access.can_read_creds(channel, &self.creds).await
     }
 
     pub async fn can_write(&self, channel: &str) -> bool {
-        self.access
-            .can_write_creds(channel, &self.to_client_creds())
-            .await
+        self.access.can_write_creds(channel, &self.creds).await
     }
 
     /// Authorize a write to `channel` and surface the matched rule's
@@ -502,19 +485,7 @@ impl AccessContext {
     /// `asTrapWrite` put-logging — the grant is the single source of the
     /// trap decision.
     pub async fn write_grant(&self, channel: &str) -> WriteGrant {
-        self.access
-            .write_grant(channel, &self.to_client_creds())
-            .await
-    }
-
-    fn to_client_creds(&self) -> ClientCreds {
-        ClientCreds {
-            user: self.user.clone(),
-            host: self.host.clone(),
-            method: self.method.clone(),
-            authority: self.authority.clone(),
-            roles: self.roles.clone(),
-        }
+        self.access.write_grant(channel, &self.creds).await
     }
 }
 
@@ -2239,8 +2210,8 @@ ASG(ROLE_GATED) {
     async fn access_context_with_identity() {
         let ctx =
             AccessContext::with_identity(Arc::new(AllowAllAccess), "alice".into(), "host1".into());
-        assert_eq!(ctx.user, "alice");
-        assert_eq!(ctx.host, "host1");
+        assert_eq!(ctx.creds.user, "alice");
+        assert_eq!(ctx.creds.host, "host1");
     }
 
     #[tokio::test]

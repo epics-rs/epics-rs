@@ -723,7 +723,7 @@ impl BridgeChannel {
             // carries "Put not permitted"; identity goes to the log.
             return Err(super::put_status::put_not_permitted(&format!(
                 "write denied for {} (user='{}' host='{}')",
-                self.pv_name, self.access.user, self.access.host
+                self.pv_name, self.access.creds.user, self.access.creds.host
             )));
         }
 
@@ -811,9 +811,9 @@ impl BridgeChannel {
         // rendered from the value inside the helper.
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &self.pv_name,
-            user: &self.access.user,
-            host: &self.access.host,
-            peer: &self.access.host,
+            user: &self.access.creds.user,
+            host: &self.access.creds.host,
+            peer: &self.access.creds.host,
             dbr_type: self.value_dbf as u16,
         };
         super::trap_write::put_with_trap(grant, meta, epics_val, |value| async move {
@@ -920,7 +920,7 @@ impl Channel for BridgeChannel {
         if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for {} (user='{}' host='{}')",
-                self.pv_name, self.access.user, self.access.host
+                self.pv_name, self.access.creds.user, self.access.creds.host
             )));
         }
 
@@ -999,7 +999,7 @@ impl BridgeChannel {
         if !self.access.can_read(&self.pv_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for {} (user='{}' host='{}')",
-                self.pv_name, self.access.user, self.access.host
+                self.pv_name, self.access.creds.user, self.access.creds.host
             )));
         }
         let mut monitor = BridgeMonitor::new(

@@ -837,7 +837,7 @@ impl GroupChannel {
         if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
 
@@ -966,7 +966,7 @@ impl GroupChannel {
         if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
 
@@ -1495,9 +1495,9 @@ impl GroupChannel {
         let pv_name = format!("{record_name}.{field_name}");
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
-            user: &self.access.user,
-            host: &self.access.host,
-            peer: &self.access.host,
+            user: &self.access.creds.user,
+            host: &self.access.creds.host,
+            peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
         };
         // Synchronous bracket: after H6 every `_already_locked` callee below
@@ -1554,9 +1554,9 @@ impl GroupChannel {
         let pv_name = format!("{record_name}.{field_name}");
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
-            user: &self.access.user,
-            host: &self.access.host,
-            peer: &self.access.host,
+            user: &self.access.creds.user,
+            host: &self.access.creds.host,
+            peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
         };
         super::trap_write::put_with_trap(grant, meta, value, |value| async move {
@@ -1618,7 +1618,7 @@ impl GroupChannel {
             // carry pvxs's `doFieldPreProcessing` text (iocsource.cpp:385).
             return Err(super::put_status::put_not_permitted(&format!(
                 "write denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
 
@@ -1774,7 +1774,11 @@ impl GroupChannel {
                 return Err(super::put_status::put_not_permitted(&format!(
                     "group {} PUT: member '{}' field '{}' write denied for \
                      user='{}' host='{}' (per-member ACF)",
-                    self.def.name, m.field_name, m.channel, self.access.user, self.access.host
+                    self.def.name,
+                    m.field_name,
+                    m.channel,
+                    self.access.creds.user,
+                    self.access.creds.host
                 )));
             }
             member_grants.insert(m.channel.clone(), grant);
@@ -2027,7 +2031,7 @@ impl super::provider::Channel for GroupChannel {
         if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
         // pvRequest can override the group default atomicity.
@@ -2139,7 +2143,7 @@ impl super::provider::Channel for GroupChannel {
         if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
         Ok(AnyMonitor::Group(Box::new(
@@ -2473,7 +2477,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         if !self.access.can_read(&self.def.name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for group {} (user='{}' host='{}')",
-                self.def.name, self.access.user, self.access.host
+                self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
 

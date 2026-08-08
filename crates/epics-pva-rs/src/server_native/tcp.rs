@@ -747,7 +747,10 @@ struct ChannelState {
     name: String,
     cid: u32,
     sid: u32,
-    introspection: Option<FieldDesc>,
+    /// Channel-invariant negotiated descriptor, shared by refcount with
+    /// every op minted on this channel — a per-op deep clone of a full
+    /// NTScalar tree was 11% of server CPU under a PUT load.
+    introspection: Option<Arc<FieldDesc>>,
     /// Source bound at CREATE_CHANNEL that owns this channel. Every
     /// operation (GET/PUT/MONITOR/RPC/PROCESS/GET_FIELD) dispatches
     /// through this owner instead of re-resolving the top-level source
@@ -1146,7 +1149,7 @@ async fn catch_handler_panic<T>(fut: impl std::future::Future<Output = T>) -> Re
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
-    intro: FieldDesc,
+    intro: Arc<FieldDesc>,
     kind: OpKind,
     /// For MONITOR ops: true once the subscriber task has been spawned.
     /// Subsequent START/pipeline-ack messages are no-ops.
@@ -1870,7 +1873,7 @@ struct MonitorSubscriberArgs {
     sid: u32,
     ioid: u32,
     pv_name: String,
-    intro: FieldDesc,
+    intro: Arc<FieldDesc>,
     mask: BitSet,
     /// Per-channel writer (clone of the connection `ChannelTx`).
     tx: ChannelTx,
@@ -2964,7 +2967,7 @@ struct CreateChannelCompletion {
 /// Successful CREATE_CHANNEL resolution: the descriptor negotiated for
 /// the channel plus the owner source that accepted it.
 struct ResolvedChannel {
-    intro: Option<FieldDesc>,
+    intro: Option<Arc<FieldDesc>>,
     owner: DynSource,
     /// Source-supplied contextual info for the report's per-channel
     /// `info` field, queried from the bound owner at resolution time —
@@ -3339,7 +3342,7 @@ pub(super) async fn handle_connection_io(
                             && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
                             && let Some(ch) = channels.get_mut(&cc.sid)
                         {
-                            ch.introspection = Some(intro);
+                            ch.introspection = Some(Arc::new(intro));
                         }
                     } else {
                         // CREATE_CHANNEL failure sid must be the
@@ -4043,7 +4046,7 @@ fn decode_rpc_exec_arg(
 /// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
 /// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
 /// to inert values — these ops never spawn a subscriber task.
-fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState {
+fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> OpState {
     OpState {
         intro,
         kind,
@@ -4977,7 +4980,8 @@ async fn handle_channel_array(
         match source.channel_array_init(&pv_name, ctx).await {
             Ok(array_desc) => {
                 let mask = BitSet::all_set(array_desc.total_bits());
-                let mut array_op = non_monitor_op_state(array_desc.clone(), OpKind::Array, mask);
+                let mut array_op =
+                    non_monitor_op_state(Arc::new(array_desc.clone()), OpKind::Array, mask);
                 array_op.pv_request = req_value;
                 ch.ops.insert(ioid, array_op);
 
@@ -5435,7 +5439,10 @@ async fn handle_create_channel(
                     };
                     // Negotiate the descriptor through the bound owner, so
                     // it matches the source that will serve the operations.
-                    let intro = owner.get_introspection_checked(&nm, conn_ctx.clone()).await;
+                    let intro = owner
+                        .get_introspection_checked(&nm, conn_ctx.clone())
+                        .await
+                        .map(Arc::new);
                     // Capture the owner's per-channel report info once at
                     // admission — pvxs lets a Source stash a `ReportInfo`
                     // on the channel control during onCreate
@@ -6137,7 +6144,7 @@ async fn handle_op(
         // can still proceed without a prototype (descriptor-late).
         let intro = match (kind, ch.introspection.clone()) {
             (OpKind::Rpc, Some(d)) => d,
-            (OpKind::Rpc, None) => FieldDesc::Variant,
+            (OpKind::Rpc, None) => Arc::new(FieldDesc::Variant),
             (_, Some(d)) => d,
             (_, None) => {
                 send_chan_op_error(
@@ -7621,7 +7628,7 @@ async fn handle_get_field(
     // DESTROY_REQUEST / channel teardown abort the in-flight task by
     // dropping the op — the same lifecycle GET/PUT/RPC use.
     let mut reserve = non_monitor_op_state(
-        FieldDesc::Variant,
+        Arc::new(FieldDesc::Variant),
         OpKind::GetField,
         BitSet::with_capacity(0),
     );
@@ -9917,7 +9924,7 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -10012,7 +10019,7 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -10106,7 +10113,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -10201,7 +10208,7 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -10864,7 +10871,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -10974,7 +10981,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -11067,7 +11074,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -11323,7 +11330,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -11491,7 +11498,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12246,7 +12253,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12475,7 +12482,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12642,7 +12649,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12737,7 +12744,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12863,7 +12870,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -12964,7 +12971,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -13122,7 +13129,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Monitor,
                 monitor_started: true,
                 monitor_abort: None,
@@ -13390,7 +13397,7 @@ mod tests {
     ) -> HashMap<u32, ChannelState> {
         let (sid, ioid) = ids;
         let mut op = non_monitor_op_state(
-            intro.clone(),
+            std::sync::Arc::new(intro.clone()),
             OpKind::Monitor,
             BitSet::all_set(intro.total_bits()),
         );
@@ -13429,7 +13436,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -13864,7 +13871,7 @@ mod tests {
         ops.insert(
             7u32,
             non_monitor_op_state(
-                FieldDesc::Scalar(ScalarType::Int),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                 OpKind::Get,
                 BitSet::new(),
             ),
@@ -13876,7 +13883,7 @@ mod tests {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -13912,7 +13919,7 @@ mod tests {
             ops.insert(
                 ioid,
                 non_monitor_op_state(
-                    FieldDesc::Scalar(ScalarType::Int),
+                    std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                     OpKind::Get,
                     BitSet::new(),
                 ),
@@ -13921,7 +13928,7 @@ mod tests {
                 name: format!("dut:pv{sid}"),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -13997,7 +14004,7 @@ mod tests {
         ops.insert(
             7u32,
             non_monitor_op_state(
-                FieldDesc::Scalar(ScalarType::Int),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                 OpKind::Get,
                 BitSet::new(),
             ),
@@ -14009,7 +14016,7 @@ mod tests {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -14088,7 +14095,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Monitor,
                 monitor_started: true,
                 monitor_abort: Some(abort.clone()),
@@ -14206,7 +14213,11 @@ mod tests {
         let abort = Arc::new(AbortOnDrop(task.abort_handle()));
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.data_task_abort = Some(abort);
         op.last_request = true; // a last-request EXEC that is now cancelled
@@ -14223,7 +14234,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -14296,7 +14307,11 @@ mod tests {
         let ioid: u32 = 123;
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.last_request = true; // a last-request EXEC, now about to be cancelled
         let stale_op_id = op.monitor_op_id;
@@ -14310,7 +14325,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -15509,7 +15524,7 @@ mod tests {
         ops.insert(
             ioid,
             non_monitor_op_state(
-                intro.clone(),
+                std::sync::Arc::new(intro.clone()),
                 OpKind::Get,
                 BitSet::all_set(intro.total_bits()),
             ),
@@ -15521,7 +15536,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
@@ -15747,7 +15762,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -15880,7 +15895,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -16013,7 +16028,7 @@ mod tests {
             ops.insert(
                 ioid,
                 non_monitor_op_state(
-                    intro.clone(),
+                    std::sync::Arc::new(intro.clone()),
                     OpKind::Get,
                     BitSet::all_set(intro.total_bits()),
                 ),
@@ -16025,7 +16040,7 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro.clone()),
+                    introspection: Some(std::sync::Arc::new(intro.clone())),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -16183,7 +16198,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -16286,7 +16301,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -16621,9 +16636,15 @@ mod tests {
         changed.set(2);
         let delta = three_field_value(0, 99, 0);
 
-        src.put_delta_checked(checked, three_field_intro(), changed, delta, ctx)
-            .await
-            .expect("put_delta_checked must succeed");
+        src.put_delta_checked(
+            checked,
+            std::sync::Arc::new(three_field_intro()),
+            changed,
+            delta,
+            ctx,
+        )
+        .await
+        .expect("put_delta_checked must succeed");
 
         let final_value = stored.lock().clone().expect("a value must be stored");
         let (a, b, c) = three_field_extract(&final_value);
@@ -16679,7 +16700,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -16810,7 +16831,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -17001,7 +17022,13 @@ mod tests {
                     .check("dut", &ctx_a.host, &ctx_a.account, &ctx_a.method, "")
                     .await;
                 src_a
-                    .put_delta_checked(checked, intro_a, changed_a, delta_a, ctx_a)
+                    .put_delta_checked(
+                        checked,
+                        std::sync::Arc::new(intro_a),
+                        changed_a,
+                        delta_a,
+                        ctx_a,
+                    )
                     .await
             });
             let task_c = tokio::spawn(async move {
@@ -17010,7 +17037,13 @@ mod tests {
                     .check("dut", &ctx_c.host, &ctx_c.account, &ctx_c.method, "")
                     .await;
                 src_c
-                    .put_delta_checked(checked, intro_c, changed_c, delta_c, ctx_c)
+                    .put_delta_checked(
+                        checked,
+                        std::sync::Arc::new(intro_c),
+                        changed_c,
+                        delta_c,
+                        ctx_c,
+                    )
                     .await
             });
 
@@ -17128,7 +17161,7 @@ mod tests {
         let mask = BitSet::all_set(intro.total_bits());
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::Process, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::Process, mask),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -17137,7 +17170,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -17610,7 +17643,10 @@ mod tests {
         let intro = three_field_intro();
         let mask = BitSet::all_set(intro.total_bits());
         let mut ops = HashMap::new();
-        ops.insert(ioid, non_monitor_op_state(intro.clone(), kind, mask));
+        ops.insert(
+            ioid,
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, mask),
+        );
         let mut channels = HashMap::new();
         channels.insert(
             sid,
@@ -17618,7 +17654,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -17738,7 +17774,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -18112,7 +18148,7 @@ mod tests {
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
         );
         channels.insert(
             sid,
@@ -18120,7 +18156,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -18298,7 +18334,7 @@ mod tests {
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -18307,7 +18343,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -18416,7 +18452,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Get,
                 monitor_started: false,
                 monitor_abort: None,
@@ -18446,7 +18482,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -18506,7 +18542,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -18573,7 +18609,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: stat.clone(),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -19344,7 +19380,7 @@ mod tests {
         intro: &FieldDesc,
     ) -> HashMap<u32, ChannelState> {
         let mut op = non_monitor_op_state(
-            intro.clone(),
+            std::sync::Arc::new(intro.clone()),
             OpKind::Monitor,
             BitSet::all_set(intro.total_bits()),
         );
@@ -19368,7 +19404,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -19545,7 +19581,7 @@ mod tests {
             sid: 1,
             ioid: 2,
             pv_name: "dut".into(),
-            intro: intro.clone(),
+            intro: std::sync::Arc::new(intro.clone()),
             mask: BitSet::with_capacity(intro.total_bits()),
             tx: ChannelTx::new(
                 wire_tx,
@@ -19722,7 +19758,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -19898,7 +19934,7 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid: 1,
-                introspection: intro,
+                introspection: intro.map(std::sync::Arc::new),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -20028,7 +20064,7 @@ mod tests {
                     name: format!("dut{sid}"),
                     cid: sid - 1,
                     sid,
-                    introspection: Some(three_field_intro()),
+                    introspection: Some(std::sync::Arc::new(three_field_intro())),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -20055,7 +20091,7 @@ mod tests {
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
             non_monitor_op_state(
-                three_field_intro(),
+                std::sync::Arc::new(three_field_intro()),
                 OpKind::Get,
                 BitSet::all_set(three_field_intro().total_bits()),
             ),
@@ -20110,7 +20146,7 @@ mod tests {
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
             non_monitor_op_state(
-                three_field_intro(),
+                std::sync::Arc::new(three_field_intro()),
                 OpKind::Get,
                 BitSet::all_set(three_field_intro().total_bits()),
             ),
@@ -20657,7 +20693,7 @@ mod autoexec_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -20864,7 +20900,11 @@ mod r14_tests {
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::Get, crate::proto::BitSet::new()),
+            non_monitor_op_state(
+                std::sync::Arc::new(intro.clone()),
+                OpKind::Get,
+                crate::proto::BitSet::new(),
+            ),
         );
         channels.insert(
             sid,
@@ -20872,7 +20912,7 @@ mod r14_tests {
                 name: "slow".into(),
                 cid: 1,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -21048,7 +21088,7 @@ mod bfr15_tests {
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), kind, BitSet::new()),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, BitSet::new()),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -21057,7 +21097,7 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 1,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -21520,7 +21560,11 @@ mod bfr15_tests {
     fn last_request_gpr_error_completion_keeps_op_idle_then_success_removes() {
         let (sid, ioid) = (3u32, 88u32);
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.last_request = true;
         let op_id = op.monitor_op_id;
@@ -21534,7 +21578,7 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
@@ -21597,7 +21641,7 @@ mod bfr15_tests {
         let (sid, ioid) = (4u32, 90u32);
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut op = non_monitor_op_state(
-            FieldDesc::Variant,
+            std::sync::Arc::new(FieldDesc::Variant),
             OpKind::GetField,
             BitSet::with_capacity(0),
         );
@@ -21615,7 +21659,7 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),

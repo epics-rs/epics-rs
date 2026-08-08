@@ -2050,7 +2050,7 @@ impl ChannelSource for RecordingDoublingSource {
     fn put_get_checked(
         &self,
         checked: AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: BitSet,
         delta: PvField,
         ctx: ChannelContext,

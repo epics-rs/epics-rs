@@ -857,7 +857,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     fn put_delta_checked(
         &self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -912,7 +912,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     fn put_get_checked(
         &self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -2178,7 +2178,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn put_delta_checked<'a>(
         &'a self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -2187,7 +2187,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn put_get_checked<'a>(
         &'a self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -2477,7 +2477,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn put_delta_checked<'a>(
         &'a self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -2489,7 +2489,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn put_get_checked<'a>(
         &'a self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,

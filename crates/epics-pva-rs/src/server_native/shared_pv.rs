@@ -1440,7 +1440,7 @@ impl super::source::ChannelSource for SharedSource {
     fn put_delta_checked(
         &self,
         checked: super::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: super::source::ChannelContext,

@@ -120,7 +120,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn put_delta_checked(
         &self,
         _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
         _delta: PvField,
         _ctx: ChannelContext,
@@ -134,7 +134,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     async fn put_get_checked(
         &self,
         _checked: epics_pva_rs::server_native::source::AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
         _delta: PvField,
         _ctx: ChannelContext,
@@ -740,7 +740,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     async fn put_delta_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -764,7 +764,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     async fn put_get_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -1473,7 +1473,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn put_delta_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -1499,7 +1499,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     async fn put_get_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: ChannelContext,
@@ -2426,7 +2426,7 @@ mod tests {
         async fn put_delta_checked(
             &self,
             _checked: AccessChecked,
-            _desc: FieldDesc,
+            _desc: std::sync::Arc<FieldDesc>,
             _changed: epics_pva_rs::proto::BitSet,
             _delta: PvField,
             _ctx: ChannelContext,

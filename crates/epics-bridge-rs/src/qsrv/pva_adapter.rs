@@ -691,7 +691,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     fn put_delta_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
         delta: PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
@@ -2963,7 +2963,13 @@ mod tests {
             .await;
 
         store
-            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .put_delta_checked(
+                checked,
+                std::sync::Arc::new(desc),
+                changed,
+                PvField::Structure(delta),
+                ctx,
+            )
             .await
             .expect("partial group PUT must succeed");
 
@@ -3072,7 +3078,13 @@ mod tests {
             .await;
 
         store
-            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .put_delta_checked(
+                checked,
+                std::sync::Arc::new(desc),
+                changed,
+                PvField::Structure(delta),
+                ctx,
+            )
             .await
             .expect("empty-marked group PUT is a silent no-op");
 

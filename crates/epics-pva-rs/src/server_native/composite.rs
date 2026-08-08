@@ -626,7 +626,7 @@ impl ChannelSource for CompositeSource {
     fn put_delta_checked(
         &self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: crate::server_native::source::ChannelContext,
@@ -653,7 +653,7 @@ impl ChannelSource for CompositeSource {
     fn put_get_checked(
         &self,
         checked: AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
         delta: PvField,
         ctx: crate::server_native::source::ChannelContext,

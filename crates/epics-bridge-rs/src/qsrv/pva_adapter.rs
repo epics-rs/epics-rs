@@ -527,10 +527,11 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     // `_checked` overrides so every wire op runs against the
     // ACF policy with the correct user/host.
 
-    /// Evict this peer's cached resolution of `name` (see
-    /// [`QsrvPvStore::channel_cache`]). The wire layer fires this once
-    /// per opened channel, for explicit DESTROY_CHANNEL and connection
-    /// teardown alike, so entries never outlive their channel.
+    /// Evict this peer's cached resolution of `name` (see the private
+    /// `QsrvPvStore::channel_cache` field docs). The wire layer fires
+    /// this once per opened channel, for explicit DESTROY_CHANNEL and
+    /// connection teardown alike, so entries never outlive their
+    /// channel.
     fn notify_channel_close(
         &self,
         name: &str,

@@ -157,7 +157,9 @@ pub struct AcfAccessControl {
     /// (channel, full credential identity). Invalidation is by
     /// construction: an ACF reload swaps in a whole new
     /// `AcfAccessControl` (`set_access_control`), and a `dbPut
-    /// record.ASG` moves [`asg_change_generation`] which every entry
+    /// record.ASG` moves
+    /// [`asg_change_generation`](epics_base_rs::server::access_security::asg_change_generation)
+    /// which every entry
     /// snapshots. The rule walk here never evaluates CALC against live
     /// INP* values (`check_access_method_trap` fails those closed), so an
     /// entry cannot go stale through a DB value change.
@@ -191,7 +193,8 @@ impl GrantKey {
 
 #[derive(Clone, Copy)]
 struct CachedAccess {
-    /// [`asg_change_generation`] snapshot taken BEFORE the (ASG, ASL)
+    /// [`asg_change_generation`](epics_base_rs::server::access_security::asg_change_generation)
+    /// snapshot taken BEFORE the (ASG, ASL)
     /// resolve, so a change racing the compute invalidates the entry on
     /// its next read instead of being lost.
     asg_generation: u64,

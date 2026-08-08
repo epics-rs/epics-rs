@@ -748,14 +748,29 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
                 crate::qsrv::AnyChannel::Single(single) => {
-                    // Single-record: generic read-merge-write under the
-                    // same identity (the record put consumes only the
-                    // value leaf, so the whole-structure write is fine).
-                    let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
-                        Some(prior) => epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
-                            &desc, &changed, 0, delta, &prior,
-                        ),
-                        None => delta,
+                    // Single-record: the record put consumes only the `value`
+                    // subtree (`pv_structure_to_epics` — scalar/array `value`,
+                    // NTEnum `value.index`), so the prior-read merge exists
+                    // solely to supply `value` when the client's marks did
+                    // not cover it. When they do (bit 0 = whole structure,
+                    // the `value` bit, or NTEnum's `value.index` bit), hand
+                    // the delta over as-is: unmarked leaves are never read
+                    // by the put, and skipping the readback removes a full
+                    // structure build per PUT.
+                    let value_sent = changed.get(0)
+                        || desc.bit_for_path("value").is_some_and(|b| changed.get(b))
+                        || desc
+                            .bit_for_path("value.index")
+                            .is_some_and(|b| changed.get(b));
+                    let merged = if value_sent {
+                        delta
+                    } else {
+                        match self.get_value_checked(checked.clone(), ctx.clone()).await {
+                            Some(prior) => epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                                &desc, &changed, 0, delta, &prior,
+                            ),
+                            None => delta,
+                        }
                     };
                     let pv = match merged {
                         PvField::Structure(s) => s,

@@ -128,7 +128,49 @@ pub struct AccessGate {
     /// when absent, CALC rules fail closed (deny). Installed by the
     /// owning server via [`Self::with_inp_resolver`].
     inp_resolver: Option<InpResolver>,
+    /// C `asAddClient` computes a client's access once per channel and
+    /// every operation is a bit test; the Rust op layer called
+    /// [`Self::check_with_roles`] — resolver + full rule walk — on every
+    /// EXEC. The walk result is deterministic in (policy snapshot,
+    /// pv name, credential identity) whenever no [`InpResolver`] is
+    /// installed (CALC rules then fail closed, reading no live values),
+    /// so those checks are cached here, shared across gate clones.
+    /// An entry is valid only while all three of its stamps hold: the
+    /// `acl_version` generation, the ASG-field-change generation
+    /// ([`asg_change_generation`] — the resolver reads `record.ASG`),
+    /// and the identity of the ACF config `Arc` it was computed against
+    /// (so a cell swap that forgot to bump the version still misses).
+    /// `Open` gates and unattached cells bypass the cache: their checks
+    /// are already walk-free, and an unattached-cell result would
+    /// otherwise survive the ACF being attached.
+    check_cache: std::sync::Arc<parking_lot::RwLock<HashMap<CheckKey, CachedCheck>>>,
 }
+
+/// Full identity a cached [`AccessGate`] check depends on. `roles` is
+/// part of the key — a re-auth that only changes role claims must miss.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CheckKey {
+    pv_name: String,
+    host: String,
+    user: String,
+    method: String,
+    authority: String,
+    roles: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedCheck {
+    acl_version: u64,
+    asg_generation: u64,
+    /// `Arc::as_ptr` of the ACF config the entry was computed against.
+    cfg_ident: usize,
+    level: AccessLevel,
+    rule_was_trap: bool,
+}
+
+/// Bound on distinct (pv × credential) entries; overflow flushes the
+/// map (a re-walk per entry is exactly the pre-cache behaviour).
+const CHECK_CACHE_CAP: usize = 4096;
 
 #[derive(Clone)]
 enum AclVersionSource {
@@ -230,6 +272,7 @@ impl AccessGate {
             inner: AccessGateInner::Required { acf, resolver },
             acl_version: AclVersionSource::Atomic(acl_version),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -252,6 +295,7 @@ impl AccessGate {
                 std::sync::atomic::AtomicU64::new(0),
             )),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -276,6 +320,7 @@ impl AccessGate {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -341,6 +386,35 @@ impl AccessGate {
                 match acf.load_full() {
                     None => (AccessLevel::ReadWrite, false),
                     Some(cfg) => {
+                        // See the [`Self::check_cache`] field doc: cache
+                        // only walk results that read no live values, and
+                        // snapshot every stamp BEFORE the compute so a
+                        // change racing it invalidates the entry instead
+                        // of being lost.
+                        let acl_version = self.acl_version();
+                        let asg_generation = asg_change_generation();
+                        let cfg_ident = std::sync::Arc::as_ptr(&cfg) as usize;
+                        let key = self.inp_resolver.is_none().then(|| CheckKey {
+                            pv_name: pv_name.clone(),
+                            host: host.to_string(),
+                            user: user.to_string(),
+                            method: method.to_string(),
+                            authority: authority.to_string(),
+                            roles: roles.to_vec(),
+                        });
+                        if let Some(ref key) = key
+                            && let Some(hit) = self.check_cache.read().get(key)
+                            && hit.acl_version == acl_version
+                            && hit.asg_generation == asg_generation
+                            && hit.cfg_ident == cfg_ident
+                        {
+                            return AccessChecked {
+                                pv_name,
+                                level: hit.level,
+                                rule_was_trap: hit.rule_was_trap,
+                                _seal: AccessSeal,
+                            };
+                        }
                         let (asg, asl) = resolver(pv_name.clone()).await;
                         // pre-resolve the ASG's INP* links up
                         // front — the resolver is async (it reads the
@@ -384,9 +458,26 @@ impl AccessGate {
                                 .map(|r| r != 0.0)
                                 .unwrap_or(false)
                         };
-                        cfg.compute_for_name(
+                        let (level, rule_was_trap) = cfg.compute_for_name(
                             &asg, host, user, roles, asl, method, authority, &calc_ok,
-                        )
+                        );
+                        if let Some(key) = key {
+                            let mut cache = self.check_cache.write();
+                            if cache.len() >= CHECK_CACHE_CAP {
+                                cache.clear();
+                            }
+                            cache.insert(
+                                key,
+                                CachedCheck {
+                                    acl_version,
+                                    asg_generation,
+                                    cfg_ident,
+                                    level,
+                                    rule_was_trap,
+                                },
+                            );
+                        }
+                        (level, rule_was_trap)
                     }
                 }
             }
@@ -448,6 +539,56 @@ ASG(DEFAULT) {
         let denied = gate.check("x", "h", "intruder", "anonymous", "").await;
         assert_eq!(denied.level(), AccessLevel::NoAccess);
         assert!(!denied.allows_read());
+    }
+
+    /// The gate's check cache must not outlive its policy: a cell swap
+    /// (ACF reload) has to miss even when the caller forgets the
+    /// `bump_acl_version` convention — the config-`Arc` identity stamp
+    /// is what closes that path. The pre-swap repeat exercises the hit
+    /// path against the same policy.
+    #[epics_macros_rs::epics_test]
+    async fn check_cache_misses_on_acf_swap_without_version_bump() {
+        let cfg_deny = parse_acf(
+            r#"
+ASG(DEFAULT) {
+}
+"#,
+        )
+        .unwrap();
+        let cfg_allow = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(1, WRITE)
+}
+"#,
+        )
+        .unwrap();
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg_deny));
+        let resolver: AsgAslResolver =
+            Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell.clone(), resolver);
+
+        assert!(
+            !gate
+                .check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
+        // Cache-hit path, same policy.
+        assert!(
+            !gate
+                .check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
+
+        // Swap the policy WITHOUT bumping acl_version.
+        cell.store(Some(Arc::new(cfg_allow)));
+        assert!(
+            gate.check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
     }
 }
 

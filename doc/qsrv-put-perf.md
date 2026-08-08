@@ -56,3 +56,20 @@ Not fixed here, deliberately: client CLIs and short-lived tools (no
 serving hot path), `ca-soak*` load generators (want the parallelism),
 `procserv_rs` (console supervisor), `realtime-*` bins (exec backend, no
 tokio), the `oracle*` parity harness.
+
+## Final same-day comparison (2026-08-09)
+
+Back-to-back on the same host, same `bench.db`, same `putbench` client,
+20,000 puts per run, 3 runs each. Rust side is the shipped `qsrv-rs`
+release binary (1-worker default above), not the scratch server.
+
+| server | CPU µs/put (runs) | puts/s |
+|---|---|---|
+| pvxs `softIocPVX` | 103.5, 103.5, 104.0 | 3,693–3,724 |
+| `qsrv-rs` | 99.0, 99.5, 102.0 | 3,781–3,842 |
+
+Every `qsrv-rs` run beats every pvxs run on both metrics. The shipped
+bin reads 2–5 µs/put above the scratch `benchsrv` at the same shape
+(96.5–97.0, measured the same day); the difference is not attributed —
+the bin additionally installs a `tracing_subscriber` env-filter, but
+that hypothesis was not isolated.

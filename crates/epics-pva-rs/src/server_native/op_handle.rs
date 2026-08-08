@@ -325,11 +325,13 @@ mod tests {
     fn dummy_creds() -> ClientCredentials {
         ClientCredentials {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "localhost".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "localhost".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }

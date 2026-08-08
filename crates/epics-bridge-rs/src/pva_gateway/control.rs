@@ -600,11 +600,11 @@ impl ChannelSource for ControlSource {
             Some(gate) => gate
                 .check_with_roles(
                     name.clone(),
-                    &ctx.host,
-                    &ctx.account,
-                    &ctx.roles,
-                    &ctx.method,
-                    &ctx.authority,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.roles,
+                    &ctx.creds.method,
+                    &ctx.creds.authority,
                 )
                 .await
                 .allows_write(),
@@ -612,17 +612,17 @@ impl ChannelSource for ControlSource {
         if !granted {
             tracing::warn!(
                 gateway_control = %name,
-                account = %ctx.account,
-                method = %ctx.method,
-                host = %ctx.host,
+                account = %ctx.creds.account,
+                method = %ctx.creds.method,
+                host = %ctx.creds.host,
                 "pva-gateway: control RPC denied — no WRITE grant under the control ACF"
             );
             return Err(OpError::denied(format!(
                 "control RPC '{name}' denied: {account}/{method} from {host} \
                  holds no WRITE grant under the gateway control ACF",
-                account = ctx.account,
-                method = ctx.method,
-                host = ctx.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
+                host = ctx.creds.host,
             )));
         }
         // run_control_rpc validates arguments and executes the admin
@@ -713,11 +713,13 @@ mod tests {
     fn ctx(account: &str, method: &str) -> ChannelContext {
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075),
-            account: account.into(),
-            method: method.into(),
-            host: "localhost".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: account.into(),
+                method: method.into(),
+                host: "localhost".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }

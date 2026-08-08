@@ -89,7 +89,10 @@ pub struct PvaServerConfig {
     pub guid: [u8; 12],
     /// Per-frame read timeout. The server *also* applies the heartbeat-
     /// based idle timeout below — `op_timeout` is just the upper bound on
-    /// any single read.
+    /// how long the peer may go without completing a frame. Enforced
+    /// coarsely by the connection loop's deadline ticker (period
+    /// `op_timeout / 2`, capped at 15 s) rather than a per-read timer,
+    /// so a stall is detected within one tick past the bound.
     pub op_timeout: Duration,
     /// Bind address for the TCP listener (default `0.0.0.0`).
     ///

@@ -205,10 +205,10 @@ struct UpstreamIdentityKey {
 impl UpstreamIdentityKey {
     fn from_ctx(ctx: &ChannelContext) -> Self {
         Self {
-            account: ctx.account.clone(),
-            method: ctx.method.clone(),
-            host: ctx.host.clone(),
-            authority: ctx.authority.clone(),
+            account: ctx.creds.account.clone(),
+            method: ctx.creds.method.clone(),
+            host: ctx.creds.host.clone(),
+            authority: ctx.creds.authority.clone(),
         }
     }
 }
@@ -521,7 +521,14 @@ impl GatewayChannelSource {
                 // documents this.
                 let resolver = self.asg_resolver.read().await;
                 let asg = (resolver)(pv);
-                cfg.check_access_method(&asg, &ctx.host, &ctx.account, 0, &ctx.method, "")
+                cfg.check_access_method(
+                    &asg,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    0,
+                    &ctx.creds.method,
+                    "",
+                )
             }
         }
     }
@@ -550,7 +557,7 @@ impl GatewayChannelSource {
     /// downstream method is logged at `info` so the gateway's
     /// identity-assertion trust boundary is visible in audit output.
     fn upstream_client_for(&self, ctx: &ChannelContext) -> Arc<PvaClient> {
-        if ctx.account.is_empty() || ctx.method == "anonymous" {
+        if ctx.creds.account.is_empty() || ctx.creds.method == "anonymous" {
             return self.cache.client().clone();
         }
         let key = UpstreamIdentityKey::from_ctx(ctx);
@@ -561,12 +568,12 @@ impl GatewayChannelSource {
         // a downstream method other than `ca` cannot be
         // forwarded verbatim — the upstream `ca` credential is a
         // gateway assertion. Make that explicit in audit output.
-        if ctx.method != "ca" {
+        if ctx.creds.method != "ca" {
             tracing::info!(
-                downstream_account = %ctx.account,
-                downstream_method = %ctx.method,
-                downstream_authority = %ctx.authority,
-                downstream_host = %ctx.host,
+                downstream_account = %ctx.creds.account,
+                downstream_method = %ctx.creds.method,
+                downstream_authority = %ctx.creds.authority,
+                downstream_host = %ctx.creds.host,
                 "PVA gateway asserting downstream identity upstream as CA-style \
                  credentials: the pvAccess wire cannot forward this auth method/authority",
             );
@@ -578,11 +585,11 @@ impl GatewayChannelSource {
         // `server_addr` and the client would fall back to UDP search,
         // never reaching a pinned or discovery-isolated upstream.
         let client = Arc::new(self.cache.client().with_asserted_identity(
-            ctx.account.clone(),
-            ctx.host.clone(),
+            ctx.creds.account.clone(),
+            ctx.creds.host.clone(),
             AssertedIdentity {
-                downstream_method: ctx.method.clone(),
-                downstream_authority: ctx.authority.clone(),
+                downstream_method: ctx.creds.method.clone(),
+                downstream_authority: ctx.creds.authority.clone(),
             },
         ));
         pool.insert(key, client.clone());
@@ -595,7 +602,7 @@ impl GatewayChannelSource {
     /// `cache`. Parallels `upstream_client_for` which does the same for
     /// PUT/RPC/PROCESS.
     fn upstream_cache_for(&self, ctx: &ChannelContext) -> Arc<ChannelCache> {
-        if ctx.account.is_empty() || ctx.method == "anonymous" {
+        if ctx.creds.account.is_empty() || ctx.creds.method == "anonymous" {
             return self.cache.clone();
         }
         let key = UpstreamIdentityKey::from_ctx(ctx);
@@ -1229,17 +1236,17 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
-                account = %ctx.account,
-                method = %ctx.method,
+                account = %ctx.creds.account,
+                method = %ctx.creds.method,
                 "pva-gateway: PUT denied by gateway ACF"
             );
             return Err(OpError::denied(format!(
                 "PUT denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
 
@@ -1256,8 +1263,8 @@ impl ChannelSource for GatewayChannelSource {
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
-            account = %ctx.account,
-            method = %ctx.method,
+            account = %ctx.creds.account,
+            method = %ctx.creds.method,
             "pva-gateway: forwarding PUT with downstream credentials"
         );
         // Forward the downstream PUT INIT pvRequest — preserved into
@@ -1302,25 +1309,25 @@ impl ChannelSource for GatewayChannelSource {
     async fn put_get_checked(
         &self,
         checked: AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
-                account = %ctx.account,
-                method = %ctx.method,
+                account = %ctx.creds.account,
+                method = %ctx.creds.method,
                 "pva-gateway: PUT_GET denied by gateway ACF"
             );
             return Err(OpError::denied(format!(
                 "PUT_GET denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
 
@@ -1328,8 +1335,8 @@ impl ChannelSource for GatewayChannelSource {
         let client = self.upstream_client_for(&ctx);
         tracing::debug!(
             pv = %name,
-            account = %ctx.account,
-            method = %ctx.method,
+            account = %ctx.creds.account,
+            method = %ctx.creds.method,
             "pva-gateway: forwarding PUT_GET with downstream credentials"
         );
         // One upstream PUT_GET carrying the downstream's preserved INIT
@@ -1344,10 +1351,10 @@ impl ChannelSource for GatewayChannelSource {
         let read = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
-                    .pvput_get_pv_field_with_request_value_marked(name, req, &delta)
+                    .pvput_get_pv_field_with_request_value_marked(name, req, delta)
                     .await
             }
-            None => client.pvput_get_pv_field_marked(name, &delta).await,
+            None => client.pvput_get_pv_field_marked(name, delta).await,
         };
         read.map(|r| Some(upstream_read(r)))
             .map_err(upstream_op_error)
@@ -1431,17 +1438,17 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
-                account = %ctx.account,
-                method = %ctx.method,
+                account = %ctx.creds.account,
+                method = %ctx.creds.method,
                 "pva-gateway: RPC denied by gateway ACF"
             );
             return Err(OpError::denied(format!(
                 "RPC denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1508,17 +1515,17 @@ impl ChannelSource for GatewayChannelSource {
         if !checked.allows_write() {
             tracing::debug!(
                 pv = %checked.pv_name(),
-                account = %ctx.account,
-                method = %ctx.method,
+                account = %ctx.creds.account,
+                method = %ctx.creds.method,
                 "pva-gateway: PROCESS denied by gateway ACF"
             );
             return Err(OpError::denied(format!(
                 "PROCESS denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1586,9 +1593,9 @@ impl ChannelSource for GatewayChannelSource {
                 "ARRAY getArray denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1619,9 +1626,9 @@ impl ChannelSource for GatewayChannelSource {
                 "ARRAY putArray denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1648,9 +1655,9 @@ impl ChannelSource for GatewayChannelSource {
                 "ARRAY setLength denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1676,9 +1683,9 @@ impl ChannelSource for GatewayChannelSource {
                 "ARRAY getLength denied by gateway access security: \
                  PV '{pv}' from {host}/{account}/{method}",
                 pv = checked.pv_name(),
-                host = ctx.host,
-                account = ctx.account,
-                method = ctx.method,
+                host = ctx.creds.host,
+                account = ctx.creds.account,
+                method = ctx.creds.method,
             )));
         }
         let name = checked.pv_name();
@@ -1997,11 +2004,13 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
-            account: account.to_string(),
-            method: method.to_string(),
-            host: host.to_string(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: account.to_string(),
+                method: method.to_string(),
+                host: host.to_string(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }
@@ -2020,7 +2029,13 @@ mod tests {
     /// folded into the `_checked` family.
     async fn check(src: &GatewayChannelSource, pv: &str, ctx: &ChannelContext) -> AccessChecked {
         src.access()
-            .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                pv,
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await
     }
 
@@ -2576,11 +2591,13 @@ ASG(DEFAULT) {
         let src = make_source();
         let ctx = ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
-            account: "alice".to_string(),
-            method: "x509".to_string(),
-            host: "ws01.lab".to_string(),
-            authority: "Lab Root CA".to_string(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "alice".to_string(),
+                method: "x509".to_string(),
+                host: "ws01.lab".to_string(),
+                authority: "Lab Root CA".to_string(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -2697,7 +2714,7 @@ ASG(DEFAULT) {
         // `make_ctx` helper always leaves authority empty.
         fn ctx_with(host: &str, account: &str, method: &str, authority: &str) -> ChannelContext {
             let mut c = make_ctx(host, account, method);
-            c.authority = authority.to_string();
+            std::sync::Arc::make_mut(&mut c.creds).authority = authority.to_string();
             c
         }
 

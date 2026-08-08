@@ -128,7 +128,49 @@ pub struct AccessGate {
     /// when absent, CALC rules fail closed (deny). Installed by the
     /// owning server via [`Self::with_inp_resolver`].
     inp_resolver: Option<InpResolver>,
+    /// C `asAddClient` computes a client's access once per channel and
+    /// every operation is a bit test; the Rust op layer called
+    /// [`Self::check_with_roles`] — resolver + full rule walk — on every
+    /// EXEC. The walk result is deterministic in (policy snapshot,
+    /// pv name, credential identity) whenever no [`InpResolver`] is
+    /// installed (CALC rules then fail closed, reading no live values),
+    /// so those checks are cached here, shared across gate clones.
+    /// An entry is valid only while all three of its stamps hold: the
+    /// `acl_version` generation, the ASG-field-change generation
+    /// ([`asg_change_generation`] — the resolver reads `record.ASG`),
+    /// and the identity of the ACF config `Arc` it was computed against
+    /// (so a cell swap that forgot to bump the version still misses).
+    /// `Open` gates and unattached cells bypass the cache: their checks
+    /// are already walk-free, and an unattached-cell result would
+    /// otherwise survive the ACF being attached.
+    check_cache: std::sync::Arc<parking_lot::RwLock<HashMap<CheckKey, CachedCheck>>>,
 }
+
+/// Full identity a cached [`AccessGate`] check depends on. `roles` is
+/// part of the key — a re-auth that only changes role claims must miss.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CheckKey {
+    pv_name: String,
+    host: String,
+    user: String,
+    method: String,
+    authority: String,
+    roles: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedCheck {
+    acl_version: u64,
+    asg_generation: u64,
+    /// `Arc::as_ptr` of the ACF config the entry was computed against.
+    cfg_ident: usize,
+    level: AccessLevel,
+    rule_was_trap: bool,
+}
+
+/// Bound on distinct (pv × credential) entries; overflow flushes the
+/// map (a re-walk per entry is exactly the pre-cache behaviour).
+const CHECK_CACHE_CAP: usize = 4096;
 
 #[derive(Clone)]
 enum AclVersionSource {
@@ -230,6 +272,7 @@ impl AccessGate {
             inner: AccessGateInner::Required { acf, resolver },
             acl_version: AclVersionSource::Atomic(acl_version),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -252,6 +295,7 @@ impl AccessGate {
                 std::sync::atomic::AtomicU64::new(0),
             )),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -276,6 +320,7 @@ impl AccessGate {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
             inp_resolver: None,
+            check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -341,6 +386,35 @@ impl AccessGate {
                 match acf.load_full() {
                     None => (AccessLevel::ReadWrite, false),
                     Some(cfg) => {
+                        // See the [`Self::check_cache`] field doc: cache
+                        // only walk results that read no live values, and
+                        // snapshot every stamp BEFORE the compute so a
+                        // change racing it invalidates the entry instead
+                        // of being lost.
+                        let acl_version = self.acl_version();
+                        let asg_generation = asg_change_generation();
+                        let cfg_ident = std::sync::Arc::as_ptr(&cfg) as usize;
+                        let key = self.inp_resolver.is_none().then(|| CheckKey {
+                            pv_name: pv_name.clone(),
+                            host: host.to_string(),
+                            user: user.to_string(),
+                            method: method.to_string(),
+                            authority: authority.to_string(),
+                            roles: roles.to_vec(),
+                        });
+                        if let Some(ref key) = key
+                            && let Some(hit) = self.check_cache.read().get(key)
+                            && hit.acl_version == acl_version
+                            && hit.asg_generation == asg_generation
+                            && hit.cfg_ident == cfg_ident
+                        {
+                            return AccessChecked {
+                                pv_name,
+                                level: hit.level,
+                                rule_was_trap: hit.rule_was_trap,
+                                _seal: AccessSeal,
+                            };
+                        }
                         let (asg, asl) = resolver(pv_name.clone()).await;
                         // pre-resolve the ASG's INP* links up
                         // front — the resolver is async (it reads the
@@ -376,20 +450,34 @@ impl AccessGate {
                                 }
                             }
                         };
-                        let calc_ok = |expr: &str| -> bool {
+                        let calc_ok = |compiled: &crate::calc::CompiledExpr| -> bool {
                             let Some(ref inputs) = inp_values else {
                                 return false;
                             };
-                            match crate::calc::compile(expr) {
-                                Ok(c) => crate::calc::eval(&c, &mut inputs.clone())
-                                    .map(|r| r != 0.0)
-                                    .unwrap_or(false),
-                                Err(_) => false,
-                            }
+                            crate::calc::eval(compiled, &mut inputs.clone())
+                                .map(|r| r != 0.0)
+                                .unwrap_or(false)
                         };
-                        cfg.compute_for_name(
+                        let (level, rule_was_trap) = cfg.compute_for_name(
                             &asg, host, user, roles, asl, method, authority, &calc_ok,
-                        )
+                        );
+                        if let Some(key) = key {
+                            let mut cache = self.check_cache.write();
+                            if cache.len() >= CHECK_CACHE_CAP {
+                                cache.clear();
+                            }
+                            cache.insert(
+                                key,
+                                CachedCheck {
+                                    acl_version,
+                                    asg_generation,
+                                    cfg_ident,
+                                    level,
+                                    rule_was_trap,
+                                },
+                            );
+                        }
+                        (level, rule_was_trap)
                     }
                 }
             }
@@ -452,6 +540,56 @@ ASG(DEFAULT) {
         assert_eq!(denied.level(), AccessLevel::NoAccess);
         assert!(!denied.allows_read());
     }
+
+    /// The gate's check cache must not outlive its policy: a cell swap
+    /// (ACF reload) has to miss even when the caller forgets the
+    /// `bump_acl_version` convention — the config-`Arc` identity stamp
+    /// is what closes that path. The pre-swap repeat exercises the hit
+    /// path against the same policy.
+    #[epics_macros_rs::epics_test]
+    async fn check_cache_misses_on_acf_swap_without_version_bump() {
+        let cfg_deny = parse_acf(
+            r#"
+ASG(DEFAULT) {
+}
+"#,
+        )
+        .unwrap();
+        let cfg_allow = parse_acf(
+            r#"
+ASG(DEFAULT) {
+    RULE(1, WRITE)
+}
+"#,
+        )
+        .unwrap();
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg_deny));
+        let resolver: AsgAslResolver =
+            Arc::new(|_pv| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell.clone(), resolver);
+
+        assert!(
+            !gate
+                .check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
+        // Cache-hit path, same policy.
+        assert!(
+            !gate
+                .check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
+
+        // Swap the policy WITHOUT bumping acl_version.
+        cell.store(Some(Arc::new(cfg_allow)));
+        assert!(
+            gate.check("x", "h", "u", "anonymous", "")
+                .await
+                .allows_write()
+        );
+    }
 }
 
 /// Access granted by a matching `RULE`. Mirrors the C three-way
@@ -502,6 +640,13 @@ pub struct AccessRule {
     /// rule. When `Some`, the rule only grants access while the
     /// expression evaluates to 1 against the ASG's `INP*` link values.
     pub calc: Option<String>,
+    /// The expression compiled at ACF parse — C compiles a RULE's CALC
+    /// once at load (`asAsgRuleCalc` runs `postfix()`), then every
+    /// `asComputePvt` evaluates the stored RPN. `parse_acf` upholds
+    /// `calc.is_some() ⟹ calc_compiled.is_some()`; a hand-built rule
+    /// that carries `calc` text without the compiled form fails closed
+    /// in `compute_rules`.
+    pub calc_compiled: Option<crate::calc::CompiledExpr>,
     /// True when the rule must be treated as inert by `asComputePvt`.
     /// C `asAsgRuleDisable` (`asLib.y:300-306`) sets `pasgrule->ignore`
     /// for a RULE that contains an unsupported keyword. This port also
@@ -703,7 +848,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&str) -> bool,
+        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
     ) -> (AccessLevel, bool) {
         let asg = match self.asg.get(asg_name) {
             Some(a) => a,
@@ -784,7 +929,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&str) -> bool,
+        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
     ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
@@ -869,10 +1014,14 @@ impl AccessSecurityConfig {
             // `asLibRoutines.c:957-1042` evaluates `calcPerform()` and
             // grants on a true result with good inputs. `calc_ok` returns
             // false when the expression is false, an input is bad, or no
-            // INP* resolver is installed (fail closed).
-            if let Some(ref expr) = rule.calc {
-                if !calc_ok(expr) {
-                    continue;
+            // INP* resolver is installed (fail closed). The program was
+            // compiled once at ACF parse; a rule holding `calc` text with
+            // no compiled form (hand-built, bypassing `parse_acf`) fails
+            // closed here.
+            if rule.calc.is_some() {
+                match rule.calc_compiled {
+                    Some(ref compiled) if calc_ok(compiled) => {}
+                    _ => continue,
                 }
             }
             // C `asLibRoutines.c:1041-1042`: a matching rule sets
@@ -1265,13 +1414,30 @@ fn asg_change_broadcast() -> &'static tokio::sync::broadcast::Sender<()> {
     })
 }
 
+/// Monotonic count of ASG-field changes, for pull-style consumers
+/// (see [`asg_change_generation`]) that cannot hold a broadcast
+/// receiver — e.g. a sync access-check cache that must know whether
+/// a cached (channel → ASG) resolution is still current.
+static ASG_CHANGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Fire from the field-I/O layer when a record's `ASG` field is
 /// successfully written. Idempotent: if no subscriber exists yet
 /// the send is a no-op (lagged subscribers also tolerated — the
 /// wire re-eval is coarse and one missed beat is recovered by the
 /// downstream `oldaccess != access` filter).
 pub fn notify_asg_field_changed() {
+    ASG_CHANGE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     let _ = asg_change_broadcast().send(());
+}
+
+/// Current ASG-field-change generation. A consumer that caches
+/// anything derived from a record's `ASG` field snapshots this before
+/// resolving and treats its entry as stale once the value moves —
+/// the pull-side counterpart of [`subscribe_asg_changes`]. C's
+/// equivalent invalidation is `asChangeGroup` re-running
+/// `asComputePvt` for every `ASGCLIENT` on `dbPut record.ASG`.
+pub fn asg_change_generation() -> u64 {
+    ASG_CHANGE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Subscribe to ASG-field-change notifications. Called once at
@@ -1979,21 +2145,21 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // unconditional grant. The expression is still validated (compiled)
     // here so a syntactically broken CALC is rejected exactly as C's
     // `postfix()` rejects it in `asAsgRuleCalc`.
-    if let Some(ref expr) = calc {
-        // validate the CALC expression at parse (C `postfix()`
-        // rejects a broken one in `asAsgRuleCalc`). The rule is NOT
-        // forced inert anymore: it is conditionally active and gated at
-        // access-check time by `compute_rules`'s `calc_ok`, which
-        // resolves the ASG's INP* links and evaluates the expression.
-        // When no INP* resolver is installed the evaluator returns false
-        // (fail closed), preserving the previous deny behaviour without
-        // hard-disabling the rule.
-        if let Err(e) = crate::calc::compile(expr) {
-            return Err(CaError::Protocol(format!(
-                "ACF: bad CALC expression '{expr}': {e}"
-            )));
-        }
-    }
+    // compile the CALC expression at parse (C `postfix()` rejects a
+    // broken one in `asAsgRuleCalc` and stores the RPN for every later
+    // `asComputePvt`). The rule is conditionally active and gated at
+    // access-check time by `compute_rules`'s `calc_ok`, which resolves
+    // the ASG's INP* links and evaluates the stored program. When no
+    // INP* resolver is installed the evaluator returns false (fail
+    // closed), preserving the previous deny behaviour without
+    // hard-disabling the rule.
+    let calc_compiled =
+        match calc {
+            Some(ref expr) => Some(crate::calc::compile(expr).map_err(|e| {
+                CaError::Protocol(format!("ACF: bad CALC expression '{expr}': {e}"))
+            })?),
+            None => None,
+        };
 
     Ok(AccessRule {
         level,
@@ -2004,6 +2170,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         authority,
         trap,
         calc,
+        calc_compiled,
         ignore,
     })
 }

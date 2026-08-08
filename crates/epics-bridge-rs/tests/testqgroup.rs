@@ -618,11 +618,13 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
             .push(("record".into(), PvField::Structure(record)));
         ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "alice".into(),
-            method: "anonymous".into(),
-            host: "host1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "alice".into(),
+                method: "anonymous".into(),
+                host: "host1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: Some(PvField::Structure(req)),
             log: Default::default(),
         }

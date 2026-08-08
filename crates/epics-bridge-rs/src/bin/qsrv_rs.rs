@@ -55,7 +55,12 @@ fn parse_macro(raw: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
-#[tokio::main]
+// One worker, reactor-style — the shape pvxs serves from (a single event
+// loop). With the default per-CPU pool, the mostly-serial serving work
+// migrates across idle workers, costing ~35 µs of extra CPU per put on a
+// 96-core host (doc/qsrv-put-perf.md). Multi-thread flavor is kept:
+// current_thread would refuse `block_on_sync` from runtime tasks.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(

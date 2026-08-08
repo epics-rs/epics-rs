@@ -301,7 +301,12 @@ fn parse_macros(macro_strs: &[String]) -> HashMap<String, String> {
     macros
 }
 
-#[tokio::main]
+// One worker, reactor-style: the default per-CPU pool migrates the
+// mostly-serial serving work across idle workers, costing ~35 µs of
+// extra CPU per put on a 96-core host (doc/qsrv-put-perf.md in the
+// workspace root). Multi-thread flavor is kept so `block_on_sync`
+// works from runtime tasks.
+#[tokio::main(worker_threads = 1)]
 async fn main() -> CaResult<()> {
     let args = Args::parse();
 

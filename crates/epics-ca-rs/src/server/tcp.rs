@@ -936,14 +936,11 @@ impl ClientState {
         asl: u8,
     ) -> (AccessLevel, bool) {
         let calc_inputs = self.calc_inputs(cfg, asg_name);
-        let calc_ok = |expr: &str| -> bool {
+        let calc_ok = |compiled: &epics_base_rs::calc::CompiledExpr| -> bool {
             match calc_inputs {
-                Some(ref i) => match epics_base_rs::calc::compile(expr) {
-                    Ok(c) => epics_base_rs::calc::eval(&c, &mut i.clone())
-                        .map(|r| r != 0.0)
-                        .unwrap_or(false),
-                    Err(_) => false,
-                },
+                Some(ref i) => epics_base_rs::calc::eval(compiled, &mut i.clone())
+                    .map(|r| r != 0.0)
+                    .unwrap_or(false),
                 None => false,
             }
         };

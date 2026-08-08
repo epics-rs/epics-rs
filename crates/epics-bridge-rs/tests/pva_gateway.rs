@@ -2050,9 +2050,9 @@ impl ChannelSource for RecordingDoublingSource {
     fn put_get_checked(
         &self,
         checked: AccessChecked,
-        _desc: FieldDesc,
+        _desc: std::sync::Arc<FieldDesc>,
         _changed: BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         let store = self.value.clone();
@@ -2065,7 +2065,7 @@ impl ChannelSource for RecordingDoublingSource {
                 return Err(OpError::denied("write denied"));
             }
             let incoming =
-                double_of(&delta).ok_or_else(|| OpError::failed("no double .value field"))?;
+                double_of(delta).ok_or_else(|| OpError::failed("no double .value field"))?;
             let doubled = incoming * 2.0;
             *store.lock().unwrap() = doubled;
             Ok(Some(SourceRead::from(nt_double_value(doubled))))
@@ -2486,11 +2486,13 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
 
     let ctx = ChannelContext {
         peer: "127.0.0.1:1234".parse().unwrap(),
-        account: "tester".to_string(),
-        method: "anonymous".to_string(),
-        host: "localhost".to_string(),
-        authority: String::new(),
-        roles: Vec::new(),
+        creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+            account: "tester".to_string(),
+            method: "anonymous".to_string(),
+            host: "localhost".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }),
         pv_request: None,
         log: Default::default(),
     };

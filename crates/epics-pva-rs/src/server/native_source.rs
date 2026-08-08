@@ -1215,11 +1215,13 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         ChannelContext {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
-            account: account.to_string(),
-            method: method.to_string(),
-            host: host.to_string(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: account.to_string(),
+                method: method.to_string(),
+                host: host.to_string(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }
@@ -1254,7 +1256,13 @@ mod tests {
         ) -> Result<(), String> {
             let checked = self
                 .access()
-                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .check(
+                    pv,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.method,
+                    "",
+                )
                 .await;
             self.put_value_checked(checked, value, ctx)
                 .await
@@ -1263,7 +1271,13 @@ mod tests {
         async fn get_value_ctx(&self, pv: &str, ctx: ChannelContext) -> Option<PvField> {
             let checked = self
                 .access()
-                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .check(
+                    pv,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.method,
+                    "",
+                )
                 .await;
             self.get_value_checked(checked, ctx).await
         }
@@ -1274,7 +1288,13 @@ mod tests {
         ) -> Option<MonitorStream<PvField>> {
             let checked = self
                 .access()
-                .check(pv, &ctx.host, &ctx.account, &ctx.method, "")
+                .check(
+                    pv,
+                    &ctx.creds.host,
+                    &ctx.creds.account,
+                    &ctx.creds.method,
+                    "",
+                )
                 .await;
             self.subscribe_checked(checked, ctx).await
         }
@@ -3115,7 +3135,13 @@ ASG(DEFAULT) {
         // PROCESS via the WRITE-gated checked path (no ACF → allowed).
         let checked = source
             .access()
-            .check("CALC:PROC", &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                "CALC:PROC",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await;
         source
             .process_checked(checked, ctx.clone())
@@ -3163,7 +3189,13 @@ ASG(DEFAULT) {
 
         let checked = source
             .access()
-            .check("CALC:PUT.A", &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                "CALC:PUT.A",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await;
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
         put.fields
@@ -3206,7 +3238,13 @@ ASG(DEFAULT) {
         let ctx = make_ctx("localhost", "op", "ca");
         let checked = source
             .access()
-            .check("AI:MON", &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                "AI:MON",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await;
 
         let mut rx = source
@@ -3387,7 +3425,13 @@ ASG(DEFAULT) {
         let ctx = make_ctx("localhost", "op", "ca");
         let checked = source
             .access()
-            .check("AI:IDLE", &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                "AI:IDLE",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await;
 
         let mut rx = source
@@ -3421,7 +3465,13 @@ ASG(DEFAULT) {
         let ctx = make_ctx("localhost", "op", "ca");
         let checked = source
             .access()
-            .check("MAILBOX:PV", &ctx.host, &ctx.account, &ctx.method, "")
+            .check(
+                "MAILBOX:PV",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
             .await;
         assert!(
             source.process_checked(checked, ctx).await.is_err(),

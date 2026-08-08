@@ -1440,9 +1440,9 @@ impl super::source::ChannelSource for SharedSource {
     fn put_delta_checked(
         &self,
         checked: super::source::AccessChecked,
-        desc: FieldDesc,
+        desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: super::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(checked.pv_name()).cloned();
@@ -1451,13 +1451,15 @@ impl super::source::ChannelSource for SharedSource {
                 return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             match pv {
-                Some(p) => p.put_delta(&desc, &changed, delta).map_err(OpError::failed),
+                Some(p) => p
+                    .put_delta(&desc, &changed, delta.clone())
+                    .map_err(OpError::failed),
                 None => Err(OpError::failed(format!(
                     "no such PV: {}",
                     checked.pv_name()
@@ -2071,11 +2073,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: String::new(),
-            method: "anonymous".into(),
-            host: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };

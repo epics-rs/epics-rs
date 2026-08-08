@@ -227,7 +227,7 @@ impl PvaMonitor for BridgeMonitor {
         if !self.access.can_read(&self.record_name).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for {} (user='{}' host='{}')",
-                self.record_name, self.access.user, self.access.host
+                self.record_name, self.access.creds.user, self.access.creds.host
             )));
         }
 

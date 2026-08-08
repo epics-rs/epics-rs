@@ -39,7 +39,7 @@ use crate::proto::{
     QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
-    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
+    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_into,
     encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
 use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
@@ -747,7 +747,10 @@ struct ChannelState {
     name: String,
     cid: u32,
     sid: u32,
-    introspection: Option<FieldDesc>,
+    /// Channel-invariant negotiated descriptor, shared by refcount with
+    /// every op minted on this channel — a per-op deep clone of a full
+    /// NTScalar tree was 11% of server CPU under a PUT load.
+    introspection: Option<Arc<FieldDesc>>,
     /// Source bound at CREATE_CHANNEL that owns this channel. Every
     /// operation (GET/PUT/MONITOR/RPC/PROCESS/GET_FIELD) dispatches
     /// through this owner instead of re-resolving the top-level source
@@ -773,9 +776,29 @@ struct ChannelState {
     /// control. Per-operation handlers still use the connection's *current*
     /// credential (pvxs builds each `ConnectOp`/`ExecOp` from `conn->cred`),
     /// so only the open/close edges are pinned here.
-    open_cred: ClientCredentials,
+    open_cred: Arc<ClientCredentials>,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
+    /// Reusable PUT-delta decode scratch, keyed by the op intro it was
+    /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
+    /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
+    /// and the exec body returns it through [`ExecFinished`] once the
+    /// source call is done. Channel-level (not per-op) because a pvput
+    /// client mints a fresh op per put (INIT/EXEC/DESTROY), which would
+    /// defeat a per-op scratch; ops of one channel negotiating the same
+    /// intro share the tree. Unmarked slots carry stale values from an
+    /// earlier EXEC — semantically dead under the `put_delta_checked`
+    /// contract (only `changed`-marked fields may be read).
+    put_scratch: Option<(Arc<FieldDesc>, PvField)>,
+    /// Memoized inline wire encoding of [`Self::introspection`] for
+    /// GET/PUT/MONITOR INIT replies, keyed by the descriptor Arc and
+    /// the reply byte order. Channel-level for the same reason as
+    /// `put_scratch`: a pvput client re-INITs per put against the one
+    /// negotiated descriptor, so the full `encode_type_desc` tree walk
+    /// would otherwise run on every operation. Only the default
+    /// (`!emit_type_cache`) branch consults it — the 0xFD/0xFE
+    /// TypeStore path already collapses repeats to 3-byte references.
+    intro_wire: Option<(Arc<FieldDesc>, ByteOrder, Vec<u8>)>,
 }
 
 // `source` is a `dyn ChannelSourceObj` trait object with no `Debug`
@@ -807,8 +830,41 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Apply the data-phase op continuation after a GET/PUT/RPC EXEC task
-/// has been spawned.
+/// Run a data-phase EXEC body inline on the read-loop thread when it can
+/// complete without waiting; promote it to a spawned task only when it
+/// cannot.
+///
+/// pvxs executes GET/PUT/RPC callbacks synchronously on the connection's
+/// event-loop thread and replies from the same stack. Spawning a task per
+/// EXEC instead costs several cross-thread futex wakes per operation
+/// (worker wake, reply-channel wake, `ExecFinished` wake back to the read
+/// loop) — measured ~8.8 wakes per wire PUT against pvxs's ~0.1. One poll
+/// under a noop waker lets the common already-ready body (local source,
+/// uncontended locks, writer channel below capacity) finish with no task
+/// at all; a body that genuinely waits (remote-fronting source, writer
+/// backpressure) is handed to `spawn`, which schedules an immediate first
+/// poll that re-registers every waker the noop poll discarded.
+///
+/// Returns the abort handle when promoted, `None` when the body already
+/// ran to completion (nothing left to abort). Either way the body's
+/// [`ExecFinishGuard`] has queued (or will queue) its `ExecFinished`, and
+/// the read loop drains that queue only after the caller's
+/// [`finish_exec_data_task`] bookkeeping ran, so the `last_request`
+/// disposition in [`apply_exec_finish`] is unchanged.
+fn poll_inline_or_spawn<F>(fut: F) -> Option<epics_base_rs::runtime::task::TaskAbortHandle>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut fut = Box::pin(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(fut.as_mut(), &mut cx) {
+        std::task::Poll::Ready(()) => None,
+        std::task::Poll::Pending => Some(epics_base_rs::runtime::task::spawn(fut).abort_handle()),
+    }
+}
+
+/// Apply the data-phase op continuation after a GET/PUT/RPC EXEC body
+/// has been started by [`poll_inline_or_spawn`].
 ///
 /// pvxs records `op->lastRequest = subcmd & 0x10` *while the op stays
 /// `Executing` in `opByIOID`* (`serverget.cpp:470-471`) and only
@@ -819,9 +875,9 @@ impl Drop for AbortOnDrop {
 /// slow source replied, and have the still-in-flight first reply and the new
 /// operation collide on one IOID on the wire.
 ///
-/// The Rust EXEC handlers serialize their response from a spawned task that
+/// The Rust EXEC handlers serialize their response from a body that
 /// cannot reach `ch.ops`, so the read-loop owner defers cleanup to
-/// [`apply_exec_finish`], which fires when the task's [`ExecFinishGuard`]
+/// [`apply_exec_finish`], which fires when the body's [`ExecFinishGuard`]
 /// signals completion (right after the reply is handed to the writer). Both
 /// branches therefore keep the op reserved and install the abort guard; only
 /// the bookkeeping differs:
@@ -831,17 +887,21 @@ impl Drop for AbortOnDrop {
 ///   is out, not before.
 /// - otherwise: leave it `Executing`; the completion owner returns it to
 ///   `Idle` so a later explicit re-EXEC is accepted.
+///
+/// `abort` is `None` when the body completed inline — there is no task to
+/// abort, and the op's guard slot is already `None` (an `Idle` op holds no
+/// guard, and `begin_exec` only admits `Idle` ops).
 fn finish_exec_data_task(
     ch: &mut ChannelState,
     ioid: u32,
     subcmd: u8,
-    abort: epics_base_rs::runtime::task::TaskAbortHandle,
+    abort: Option<epics_base_rs::runtime::task::TaskAbortHandle>,
 ) {
     if let Some(op_mut) = ch.ops.get_mut(&ioid) {
         if subcmd & QosFlags::DESTROY != 0 {
             op_mut.last_request = true;
         }
-        op_mut.data_task_abort = Some(Arc::new(AbortOnDrop(abort)));
+        op_mut.data_task_abort = abort.map(|a| Arc::new(AbortOnDrop(a)));
     }
 }
 
@@ -953,7 +1013,7 @@ fn begin_exec(ch: &mut ChannelState, ioid: u32) -> Option<u64> {
 /// tags THIS exec instance so a signal that arrives late (an aborted task
 /// whose future drops after its ioid was removed and re-INIT'd) cannot flip a
 /// *fresh* op back to `Idle` ([`apply_exec_finish`] ABA guard).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ExecFinished {
     sid: u32,
     ioid: u32,
@@ -974,6 +1034,13 @@ struct ExecFinished {
     /// exit that does not explicitly [`ExecFinishGuard::mark_success`] — error
     /// returns, panics, and aborts all skip the marking.
     success: bool,
+    /// PUT/PUT_GET decode scratch travelling back to its channel
+    /// ([`ChannelState::put_scratch`]) once the source call released its
+    /// borrow. `None` for every other op kind, and for exec exits (panic,
+    /// abort) that lost the value. A stale-`op_id` signal may still return
+    /// its scratch: any tree built from the same `Arc`'d intro is a valid
+    /// scratch, so last-writer-wins is safe.
+    scratch: Option<(Arc<FieldDesc>, PvField)>,
 }
 
 /// RAII finalizer held as a single local at the top of a data-phase
@@ -1004,7 +1071,13 @@ impl Drop for ExecFinishGuard {
         // Unbounded so this sync Drop never loses the signal to a full
         // channel; the only `send` failure is a closed receiver (the read
         // loop already ended and dropped every op).
-        let _ = self.tx.send(self.fin);
+        let _ = self.tx.send(ExecFinished {
+            sid: self.fin.sid,
+            ioid: self.fin.ioid,
+            op_id: self.fin.op_id,
+            success: self.fin.success,
+            scratch: self.fin.scratch.take(),
+        });
     }
 }
 
@@ -1036,6 +1109,13 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
     let Some(ch) = channels.get_mut(&fin.sid) else {
         return;
     };
+    // Return the PUT decode scratch to its channel before any op
+    // disposition: the channel outlives the op (a pvput client destroys
+    // its op per put), and even a stale-op_id signal carries a tree
+    // valid for reuse (same Arc'd intro; last writer wins).
+    if let Some(s) = fin.scratch {
+        ch.put_scratch = Some(s);
+    }
     let (matches, last_request, kind) = match ch.ops.get(&fin.ioid) {
         Some(op) => (op.monitor_op_id == fin.op_id, op.last_request, op.kind),
         None => return,
@@ -1146,7 +1226,7 @@ async fn catch_handler_panic<T>(fut: impl std::future::Future<Output = T>) -> Re
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OpState {
-    intro: FieldDesc,
+    intro: Arc<FieldDesc>,
     kind: OpKind,
     /// For MONITOR ops: true once the subscriber task has been spawned.
     /// Subsequent START/pipeline-ack messages are no-ops.
@@ -1870,7 +1950,7 @@ struct MonitorSubscriberArgs {
     sid: u32,
     ioid: u32,
     pv_name: String,
-    intro: FieldDesc,
+    intro: Arc<FieldDesc>,
     mask: BitSet,
     /// Per-channel writer (clone of the connection `ChannelTx`).
     tx: ChannelTx,
@@ -2005,11 +2085,11 @@ fn spawn_monitor_subscriber(
             .access_gate()
             .check_with_roles(
                 &pv_name,
-                &mon_ctx.host,
-                &mon_ctx.account,
-                &mon_ctx.roles,
-                &mon_ctx.method,
-                &mon_ctx.authority,
+                &mon_ctx.creds.host,
+                &mon_ctx.creds.account,
+                &mon_ctx.creds.roles,
+                &mon_ctx.creds.method,
+                &mon_ctx.creds.authority,
             )
             .await;
 
@@ -2609,7 +2689,7 @@ async fn process_connection_validation(
     tx: &SrvTx,
     order: ByteOrder,
     x509_locked: bool,
-    cred: &mut ClientCredentials,
+    cred: &mut Arc<ClientCredentials>,
     peer: SocketAddr,
     peer_entry: &crate::server_native::peers::PeerEntry,
     config: &PvaServerConfig,
@@ -2694,7 +2774,7 @@ async fn process_connection_validation(
             // Advertised method: commit the claim. A `None` candidate
             // (anonymous handshake) keeps the current credential unchanged.
             if let Some(claimed) = candidate {
-                *cred = claimed;
+                *cred = Arc::new(claimed);
             }
         }
     }
@@ -2951,7 +3031,7 @@ struct CreateChannelCompletion {
     /// lifecycle callbacks use the credential the channel was opened under —
     /// not whatever the connection re-authenticated to while the resolver
     /// was still running (pvxs `serverchan.cpp:62`).
-    open_cred: ClientCredentials,
+    open_cred: Arc<ClientCredentials>,
     /// `Some` → PV was found; carries the negotiated descriptor and the
     /// owner source bound into the channel. `None` → not found; emit an
     /// error response and insert no channel. Folding "found" and "owner"
@@ -2964,7 +3044,7 @@ struct CreateChannelCompletion {
 /// Successful CREATE_CHANNEL resolution: the descriptor negotiated for
 /// the channel plus the owner source that accepted it.
 struct ResolvedChannel {
-    intro: Option<FieldDesc>,
+    intro: Option<Arc<FieldDesc>>,
     owner: DynSource,
     /// Source-supplied contextual info for the report's per-channel
     /// `info` field, queried from the bound owner at resolution time —
@@ -3081,6 +3161,21 @@ pub(super) async fn handle_connection_io(
     // `interval` yields its first tick immediately; the task consumed it the
     // same way, so the first beat lands 15 s in.
     hb_tick.tick().await;
+    // Coarse read-stall watchdog: one persistent ticker replaces the
+    // per-read `timeout()` wrapper `read_frame` used to carry (a
+    // timer-wheel insert + cancel per pending read). The arm below
+    // returns `PvaError::Timeout` once the peer has completed no frame
+    // for `op_timeout`, so a stall is detected within
+    // [`op_timeout`, `op_timeout` + tick period] instead of exactly at
+    // `op_timeout` — an acceptable coarsening of a guard whose default
+    // is 64,000 s. Unlike the heartbeat this arm is never latched off:
+    // it must keep watching after `hb_stopped`, or an idle-latched
+    // connection whose peer then wedges mid-frame would never be
+    // reclaimed.
+    let mut op_deadline_tick = epics_base_rs::runtime::task::interval(
+        (op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)),
+    );
+    op_deadline_tick.tick().await;
     // Latched when the idle watchdog fires or the writer channel closes —
     // the two conditions that used to `break` the task's loop. Note this
     // stops the *heartbeat*, not the connection: the task ending never tore
@@ -3165,8 +3260,8 @@ pub(super) async fn handle_connection_io(
     // Fed into the server's ACF `AccessGate::check` for every op.
     let x509_locked = x509_identity.is_some();
     let mut cred = match x509_identity {
-        Some(id) => ClientCredentials::x509(id, peer),
-        None => ClientCredentials::anonymous(peer),
+        Some(id) => Arc::new(ClientCredentials::x509(id, peer)),
+        None => Arc::new(ClientCredentials::anonymous(peer)),
     };
     // Per-connection emit-side TypeStore. Only consulted when
     // `config.emit_type_cache` is true (off by default for pvAccessCPP
@@ -3292,6 +3387,8 @@ pub(super) async fn handle_connection_io(
                             stat: stat.clone(),
                             open_cred: cc.open_cred,
                             ops: HashMap::new(),
+                            put_scratch: None,
+                    intro_wire: None,
                         });
                         // Register the channel (live + lifetime counts and
                         // the per-channel report entry) in one owner call.
@@ -3339,7 +3436,7 @@ pub(super) async fn handle_connection_io(
                             && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
                             && let Some(ch) = channels.get_mut(&cc.sid)
                         {
-                            ch.introspection = Some(intro);
+                            ch.introspection = Some(Arc::new(intro));
                         }
                     } else {
                         // CREATE_CHANNEL failure sid must be the
@@ -3468,7 +3565,19 @@ pub(super) async fn handle_connection_io(
                 }
                 continue;
             }
-            frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
+            _ = op_deadline_tick.tick() => {
+                // Read-stall bound, moved out of `read_frame` (see the
+                // ticker's construction above). `last_rx` stamps every
+                // completed frame, so this fires only when the peer has
+                // sent no complete frame for `op_timeout` — a wedged or
+                // byte-trickling circuit.
+                let elapsed = now_nanos().saturating_sub(last_rx);
+                if Duration::from_nanos(elapsed) >= op_timeout {
+                    return Err(PvaError::Timeout);
+                }
+                continue;
+            }
+            frame_result = read_frame(&mut reader, &mut rx_buf, max_msg_size) => {
                 frame_result?
             }
         };
@@ -4043,7 +4152,7 @@ fn decode_rpc_exec_arg(
 /// Build a minimal [`OpState`] for non-MONITOR ops (GET / PUT /
 /// PUT_GET / PROCESS). The monitor-specific fields are all defaulted
 /// to inert values — these ops never spawn a subscriber task.
-fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState {
+fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> OpState {
     OpState {
         intro,
         kind,
@@ -4101,7 +4210,7 @@ async fn handle_put_get(
     // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
     decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     // data-phase-completion sender (see [`handle_op`]). The spawned
     // PUT_GET exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its readback reply is sent.
@@ -4372,7 +4481,14 @@ async fn handle_put_get(
     } else {
         let changed =
             BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
-        let put_delta = decode_pv_field_with_bitset_cached(
+        // Same scratch reuse as the PUT EXEC path: decode marked fields
+        // in place, lend to the source, return via `ExecFinished`.
+        let mut put_delta = match ch.put_scratch.take() {
+            Some((d, v)) if Arc::ptr_eq(&d, &intro) => v,
+            _ => crate::pvdata::encode::default_value_for(&intro),
+        };
+        decode_pv_field_with_bitset_into(
+            &mut put_delta,
             &intro,
             &changed,
             0,
@@ -4386,11 +4502,7 @@ async fn handle_put_get(
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
-        account: cred.account.clone(),
-        method: cred.method.clone(),
-        host: cred.host.clone(),
-        authority: cred.authority.clone(),
-        roles: cred.roles.clone(),
+        creds: cred.clone(),
         pv_request: init_pv_request,
         log: Default::default(),
     };
@@ -4412,12 +4524,13 @@ async fn handle_put_get(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
-        let _exec_fin_guard = ExecFinishGuard {
+        let mut exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
         };
@@ -4448,18 +4561,18 @@ async fn handle_put_get(
                     .access_gate()
                     .check_with_roles(
                         &pv_name,
-                        &ctx.host,
-                        &ctx.account,
-                        &ctx.roles,
-                        &ctx.method,
-                        &ctx.authority,
+                        &ctx.creds.host,
+                        &ctx.creds.account,
+                        &ctx.creds.roles,
+                        &ctx.creds.method,
+                        &ctx.creds.authority,
                     )
                     .await;
-                match catch_handler_panic(src.put_get_checked(
+                let outcome = match catch_handler_panic(src.put_get_checked(
                     checked,
                     intro.clone(),
                     changed,
-                    put_delta,
+                    &put_delta,
                     ctx.clone(),
                 ))
                 .await
@@ -4467,17 +4580,22 @@ async fn handle_put_get(
                     Ok(Ok(v)) => Ok(v),
                     Ok(Err(e)) => Err(e.wire_status()),
                     Err(panic) => Err(Status::error(panic)),
-                }
+                };
+                // Source borrow released — send the scratch home with the
+                // completion signal (every later exit goes through the
+                // guard's Drop).
+                exec_fin_guard.fin.scratch = Some((intro.clone(), put_delta));
+                outcome
             } else {
                 let read_checked = src
                     .access_gate()
                     .check_with_roles(
                         &pv_name,
-                        &ctx.host,
-                        &ctx.account,
-                        &ctx.roles,
-                        &ctx.method,
-                        &ctx.authority,
+                        &ctx.creds.host,
+                        &ctx.creds.account,
+                        &ctx.creds.roles,
+                        &ctx.creds.method,
+                        &ctx.creds.authority,
                     )
                     .await;
                 catch_handler_panic(src.read_checked(read_checked, ctx))
@@ -4524,7 +4642,7 @@ async fn handle_put_get(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -4556,7 +4674,7 @@ async fn handle_process(
     // decoded, so it shares the same cache as every other inbound decode.
     decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     // data-phase-completion sender (see [`handle_op`]). The spawned
     // PROCESS exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its reply is sent.
@@ -4730,11 +4848,7 @@ async fn handle_process(
     let pv_name = ch.name.clone();
     let ctx = crate::server_native::source::ChannelContext {
         peer,
-        account: cred.account.clone(),
-        method: cred.method.clone(),
-        host: cred.host.clone(),
-        authority: cred.authority.clone(),
-        roles: cred.roles.clone(),
+        creds: cred.clone(),
         // PROCESS INIT pvRequest, preserved from the op state so a source
         // — and a gateway forwarding createChannelProcess(..., pvRequest)
         // — can inspect `record._options`.
@@ -4758,9 +4872,10 @@ async fn handle_process(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
         let _exec_fin_guard = ExecFinishGuard {
@@ -4771,11 +4886,11 @@ async fn handle_process(
             .access_gate()
             .check_with_roles(
                 &pv_name,
-                &ctx.host,
-                &ctx.account,
-                &ctx.roles,
-                &ctx.method,
-                &ctx.authority,
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.roles,
+                &ctx.creds.method,
+                &ctx.creds.authority,
             )
             .await;
         // a panic in the user PROCESS handler becomes an error
@@ -4804,7 +4919,7 @@ async fn handle_process(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -4880,7 +4995,7 @@ async fn handle_channel_array(
     encode_cache: &mut EncodeTypeCache,
     decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order; `order`
@@ -4964,11 +5079,7 @@ async fn handle_channel_array(
             };
         let ctx = crate::server_native::source::ChannelContext {
             peer,
-            account: cred.account.clone(),
-            method: cred.method.clone(),
-            host: cred.host.clone(),
-            authority: cred.authority.clone(),
-            roles: cred.roles.clone(),
+            creds: cred.clone(),
             pv_request: req_value.clone(),
             log: Default::default(),
         };
@@ -4977,7 +5088,8 @@ async fn handle_channel_array(
         match source.channel_array_init(&pv_name, ctx).await {
             Ok(array_desc) => {
                 let mask = BitSet::all_set(array_desc.total_bits());
-                let mut array_op = non_monitor_op_state(array_desc.clone(), OpKind::Array, mask);
+                let mut array_op =
+                    non_monitor_op_state(Arc::new(array_desc.clone()), OpKind::Array, mask);
                 array_op.pv_request = req_value;
                 ch.ops.insert(ioid, array_op);
 
@@ -5090,11 +5202,7 @@ async fn handle_channel_array(
 
     let ctx = crate::server_native::source::ChannelContext {
         peer,
-        account: cred.account.clone(),
-        method: cred.method.clone(),
-        host: cred.host.clone(),
-        authority: cred.authority.clone(),
-        roles: cred.roles.clone(),
+        creds: cred.clone(),
         // INIT pvRequest re-supplied so the source knows the bound field.
         pv_request: init_pv_request,
         log: Default::default(),
@@ -5127,9 +5235,10 @@ async fn handle_channel_array(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
@@ -5138,11 +5247,11 @@ async fn handle_channel_array(
             .access_gate()
             .check_with_roles(
                 &pv_name,
-                &ctx.host,
-                &ctx.account,
-                &ctx.roles,
-                &ctx.method,
-                &ctx.authority,
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.roles,
+                &ctx.creds.method,
+                &ctx.creds.authority,
             )
             .await;
         // A panic in the (user / gateway) source handler becomes an error
@@ -5208,7 +5317,7 @@ async fn handle_channel_array(
         buf.extend_from_slice(&payload);
         let _ = tx_clone.send(buf).await;
     });
-    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -5230,7 +5339,6 @@ fn read_array_size(
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
-    op_timeout: Duration,
     max_msg_size: Option<usize>,
 ) -> PvaResult<Frame> {
     loop {
@@ -5263,13 +5371,15 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
                 }
             }
         }
+        // No per-read timer: wrapping every read in `timeout()` minted
+        // and cancelled a timer-wheel entry per pending read — pure
+        // churn on a hot circuit. The read-stall bound (`op_timeout`)
+        // is enforced coarsely by the connection loop's deadline tick,
+        // which checks the age of the last completed frame.
         let mut chunk = [0u8; 4096];
-        let n = match epics_base_rs::runtime::task::timeout(op_timeout, reader.read(&mut chunk))
-            .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(PvaError::Io(e)),
-            Err(_) => return Err(PvaError::Timeout),
+        let n = match reader.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => return Err(PvaError::Io(e)),
         };
         if n == 0 {
             return Err(PvaError::Protocol("client closed".into()));
@@ -5328,7 +5438,7 @@ async fn handle_create_channel(
     order: ByteOrder,
     max_channels_per_connection: usize,
     peer: SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     cc_tx: &CcTx,
     pending_channel_spawns: &mut usize,
 ) -> PvaResult<()> {
@@ -5435,7 +5545,10 @@ async fn handle_create_channel(
                     };
                     // Negotiate the descriptor through the bound owner, so
                     // it matches the source that will serve the operations.
-                    let intro = owner.get_introspection_checked(&nm, conn_ctx.clone()).await;
+                    let intro = owner
+                        .get_introspection_checked(&nm, conn_ctx.clone())
+                        .await
+                        .map(Arc::new);
                     // Capture the owner's per-channel report info once at
                     // admission — pvxs lets a Source stash a `ReportInfo`
                     // on the channel control during onCreate
@@ -5471,15 +5584,11 @@ async fn handle_create_channel(
 /// channel is built from `conn->cred`).
 fn channel_lifecycle_ctx(
     peer: SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
 ) -> crate::server_native::source::ChannelContext {
     crate::server_native::source::ChannelContext {
         peer,
-        account: cred.account.clone(),
-        method: cred.method.clone(),
-        host: cred.host.clone(),
-        authority: cred.authority.clone(),
-        roles: cred.roles.clone(),
+        creds: cred.clone(),
         pv_request: None,
         log: Default::default(),
     }
@@ -6018,7 +6127,7 @@ async fn handle_op(
     // op resolves a later 0xFE reference on the same connection.
     decode_cache: &mut TypeCache,
     peer: std::net::SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     // read-loop owner's MONITOR subscriber-completion sender. The
     // spawned subscriber task installs a `MonitorFinishGuard` cloned from
     // this so its terminal op removal is routed back to the owner. Only the
@@ -6137,7 +6246,7 @@ async fn handle_op(
         // can still proceed without a prototype (descriptor-late).
         let intro = match (kind, ch.introspection.clone()) {
             (OpKind::Rpc, Some(d)) => d,
-            (OpKind::Rpc, None) => FieldDesc::Variant,
+            (OpKind::Rpc, None) => Arc::new(FieldDesc::Variant),
             (_, Some(d)) => d,
             (_, None) => {
                 send_chan_op_error(
@@ -6497,11 +6606,7 @@ async fn handle_op(
         if kind == OpKind::Monitor {
             let init_ctx = crate::server_native::source::ChannelContext {
                 peer,
-                account: cred.account.clone(),
-                method: cred.method.clone(),
-                host: cred.host.clone(),
-                authority: cred.authority.clone(),
-                roles: cred.roles.clone(),
+                creds: cred.clone(),
                 pv_request: req_value.clone(),
                 log: Default::default(),
             };
@@ -6509,11 +6614,11 @@ async fn handle_op(
                 .access_gate()
                 .check_with_roles(
                     &ch.name,
-                    &init_ctx.host,
-                    &init_ctx.account,
-                    &init_ctx.roles,
-                    &init_ctx.method,
-                    &init_ctx.authority,
+                    &init_ctx.creds.host,
+                    &init_ctx.creds.account,
+                    &init_ctx.creds.roles,
+                    &init_ctx.creds.method,
+                    &init_ctx.creds.authority,
                 )
                 .await;
             if let Err(e) = source.check_monitor_request(&checked, &init_ctx).await {
@@ -6592,11 +6697,7 @@ async fn handle_op(
                 // pure stream control and carry no per-op options.
                 let mon_ctx = crate::server_native::source::ChannelContext {
                     peer,
-                    account: cred.account.clone(),
-                    method: cred.method.clone(),
-                    host: cred.host.clone(),
-                    authority: cred.authority.clone(),
-                    roles: cred.roles.clone(),
+                    creds: cred.clone(),
                     pv_request: s.pv_request.clone(),
                     log: Default::default(),
                 };
@@ -6666,7 +6767,16 @@ async fn handle_op(
             if config.emit_type_cache {
                 encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
             } else {
-                encode_type_desc(&intro, order, &mut payload);
+                match &ch.intro_wire {
+                    Some((d, o, bytes)) if Arc::ptr_eq(d, &intro) && *o == order => {
+                        payload.extend_from_slice(bytes);
+                    }
+                    _ => {
+                        let start = payload.len();
+                        encode_type_desc(&intro, order, &mut payload);
+                        ch.intro_wire = Some((intro.clone(), order, payload[start..].to_vec()));
+                    }
+                }
             }
         }
         let h = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
@@ -6717,11 +6827,7 @@ async fn handle_op(
             let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
             let mask_t = mask.clone();
-            let cred_account = cred.account.clone();
-            let cred_method = cred.method.clone();
-            let cred_host = cred.host.clone();
-            let cred_authority = cred.authority.clone();
-            let cred_roles = cred.roles.clone();
+            let cred_t = cred.clone();
             // forward the decoded INIT pvRequest into the GET
             // context so QSRV group GET honors `record._options`
             // (e.g. `atomic`). Previously dropped here as `None`.
@@ -6742,9 +6848,10 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
                 let mut exec_fin_guard = ExecFinishGuard {
@@ -6753,11 +6860,7 @@ async fn handle_op(
                 };
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
-                    account: cred_account,
-                    method: cred_method,
-                    host: cred_host,
-                    authority: cred_authority,
-                    roles: cred_roles,
+                    creds: cred_t,
                     pv_request: init_pv_request_t,
                     log: Default::default(),
                 };
@@ -6765,11 +6868,11 @@ async fn handle_op(
                     .access_gate()
                     .check_with_roles(
                         &pv_name,
-                        &ctx.host,
-                        &ctx.account,
-                        &ctx.roles,
-                        &ctx.method,
-                        &ctx.authority,
+                        &ctx.creds.host,
+                        &ctx.creds.account,
+                        &ctx.creds.roles,
+                        &ctx.creds.method,
+                        &ctx.creds.authority,
                     )
                     .await;
                 // a panic in the user GET handler becomes a
@@ -6847,7 +6950,7 @@ async fn handle_op(
                 exec_fin_guard.mark_success();
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         OpKind::Put => {
             // pvxs `serverget.cpp:364` derives `isput = cmd!=CMD_GET
@@ -6869,11 +6972,7 @@ async fn handle_op(
                 let tx_clone = chan_tx.clone();
                 let intro_t = intro.clone();
                 let mask_t = mask.clone();
-                let cred_account = cred.account.clone();
-                let cred_method = cred.method.clone();
-                let cred_host = cred.host.clone();
-                let cred_authority = cred.authority.clone();
-                let cred_roles = cred.roles.clone();
+                let cred_t = cred.clone();
                 // forward the INIT pvRequest into the PUT
                 // readback GET context so the readback honors the
                 // same `record._options` the GET path would.
@@ -6892,20 +6991,17 @@ async fn handle_op(
                     ioid,
                     op_id,
                     success: false,
+                    scratch: None,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let join = epics_base_rs::runtime::task::spawn(async move {
+                let abort = poll_inline_or_spawn(async move {
                     let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
                     };
                     let ctx = crate::server_native::source::ChannelContext {
                         peer,
-                        account: cred_account,
-                        method: cred_method,
-                        host: cred_host,
-                        authority: cred_authority,
-                        roles: cred_roles,
+                        creds: cred_t,
                         pv_request: init_pv_request_t,
                         log: Default::default(),
                     };
@@ -6913,11 +7009,11 @@ async fn handle_op(
                         .access_gate()
                         .check_with_roles(
                             &pv_name,
-                            &ctx.host,
-                            &ctx.account,
-                            &ctx.roles,
-                            &ctx.method,
-                            &ctx.authority,
+                            &ctx.creds.host,
+                            &ctx.creds.account,
+                            &ctx.creds.roles,
+                            &ctx.creds.method,
+                            &ctx.creds.authority,
                         )
                         .await;
                     // a panic in the user GET (PUT readback)
@@ -6982,7 +7078,7 @@ async fn handle_op(
                     exec_fin_guard.mark_success();
                     let _ = tx_clone.send(buf).await;
                 });
-                finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+                finish_exec_data_task(ch, ioid, subcmd, abort);
                 return Ok(());
             }
             // PUT EXEC (subcmd & 0x40 == 0): read bitset (which
@@ -7005,7 +7101,16 @@ async fn handle_op(
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let delta = decode_pv_field_with_bitset_cached(
+            // Decode the marked fields into the channel's reusable
+            // scratch tree instead of building a default-filled tree per
+            // EXEC (`ChannelState::put_scratch`); the exec body lends it
+            // to the source and returns it via `ExecFinished`.
+            let mut delta = match ch.put_scratch.take() {
+                Some((d, v)) if Arc::ptr_eq(&d, &intro) => v,
+                _ => crate::pvdata::encode::default_value_for(&intro),
+            };
+            decode_pv_field_with_bitset_into(
+                &mut delta,
                 &intro,
                 &changed,
                 0,
@@ -7021,11 +7126,7 @@ async fn handle_op(
             let src = source.clone();
             let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
-            let cred_account = cred.account.clone();
-            let cred_method = cred.method.clone();
-            let cred_host = cred.host.clone();
-            let cred_authority = cred.authority.clone();
-            let cred_roles = cred.roles.clone();
+            let cred_t = cred.clone();
             let init_pv_request_t = init_pv_request.clone();
             // ignore a second PUT EXEC while the first write is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
@@ -7041,20 +7142,17 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
                 };
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
-                    account: cred_account,
-                    method: cred_method,
-                    host: cred_host,
-                    authority: cred_authority,
-                    roles: cred_roles,
+                    creds: cred_t,
                     pv_request: init_pv_request_t,
                     log: Default::default(),
                 };
@@ -7068,11 +7166,11 @@ async fn handle_op(
                         .access_gate()
                         .check_with_roles(
                             &pv_name,
-                            &ctx.host,
-                            &ctx.account,
-                            &ctx.roles,
-                            &ctx.method,
-                            &ctx.authority,
+                            &ctx.creds.host,
+                            &ctx.creds.account,
+                            &ctx.creds.roles,
+                            &ctx.creds.method,
+                            &ctx.creds.authority,
                         )
                         .await;
                     // a panic in the user PUT handler becomes an
@@ -7080,14 +7178,18 @@ async fn handle_op(
                     catch_handler_panic(src.put_delta_checked(
                         checked,
                         intro_t.clone(),
-                        changed.clone(),
-                        delta,
+                        changed,
+                        &delta,
                         ctx.clone(),
                     ))
                     .await
                     .map_err(|e| OpError::failed(e))
                     .and_then(|r| r)
                 };
+                // Source borrow released — send the scratch home with the
+                // completion signal (every later exit path goes through
+                // the guard's Drop).
+                exec_fin_guard.fin.scratch = Some((intro_t.clone(), delta));
                 flush_remote_log(&op_log, ioid, order, &tx_clone).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -7109,11 +7211,11 @@ async fn handle_op(
                                 .access_gate()
                                 .check_with_roles(
                                     &pv_name,
-                                    &ctx.host,
-                                    &ctx.account,
-                                    &ctx.roles,
-                                    &ctx.method,
-                                    &ctx.authority,
+                                    &ctx.creds.host,
+                                    &ctx.creds.account,
+                                    &ctx.creds.roles,
+                                    &ctx.creds.method,
+                                    &ctx.creds.authority,
                                 )
                                 .await;
                             // a panic in the user GET (PUT_GET
@@ -7161,7 +7263,7 @@ async fn handle_op(
                 }
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         OpKind::Monitor => {
             // pvxs `servermon.cpp:643-708` splits the data-phase MONITOR
@@ -7296,11 +7398,7 @@ async fn handle_op(
                     // selection, so it is omitted.
                     let wm_ctx = crate::server_native::source::ChannelContext {
                         peer,
-                        account: cred.account.clone(),
-                        method: cred.method.clone(),
-                        host: cred.host.clone(),
-                        authority: cred.authority.clone(),
-                        roles: cred.roles.clone(),
+                        creds: cred.clone(),
                         pv_request: None,
                         log: Default::default(),
                     };
@@ -7382,11 +7480,7 @@ async fn handle_op(
             let tx_clone = chan_tx.clone();
             let rpc_ctx_val = crate::server_native::source::ChannelContext {
                 peer,
-                account: cred.account.clone(),
-                method: cred.method.clone(),
-                host: cred.host.clone(),
-                authority: cred.authority.clone(),
-                roles: cred.roles.clone(),
+                creds: cred.clone(),
                 // RPC INIT pvRequest, preserved from the op state — distinct
                 // from the `(req_desc, req_value)` EXEC argument decoded
                 // above. A source (or gateway) can now inspect the
@@ -7408,9 +7502,10 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let join = epics_base_rs::runtime::task::spawn(async move {
+            let abort = poll_inline_or_spawn(async move {
                 let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
@@ -7419,11 +7514,11 @@ async fn handle_op(
                     .access_gate()
                     .check_with_roles(
                         &pv_name,
-                        &rpc_ctx_val.host,
-                        &rpc_ctx_val.account,
-                        &rpc_ctx_val.roles,
-                        &rpc_ctx_val.method,
-                        &rpc_ctx_val.authority,
+                        &rpc_ctx_val.creds.host,
+                        &rpc_ctx_val.creds.account,
+                        &rpc_ctx_val.creds.roles,
+                        &rpc_ctx_val.creds.method,
+                        &rpc_ctx_val.creds.authority,
                     )
                     .await;
                 // a panic in the user RPC handler becomes an error
@@ -7486,7 +7581,7 @@ async fn handle_op(
                 }
                 let _ = tx_clone.send(buf).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+            finish_exec_data_task(ch, ioid, subcmd, abort);
         }
         // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
         // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
@@ -7508,7 +7603,7 @@ async fn handle_get_field(
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
     peer: SocketAddr,
-    cred: &ClientCredentials,
+    cred: &Arc<ClientCredentials>,
     // data-phase-completion sender (see [`handle_op`]). The slow-path
     // introspection task installs an `ExecFinishGuard` so the read-loop
     // owner releases the reserved GET_FIELD IOID once the reply is sent
@@ -7601,11 +7696,7 @@ async fn handle_get_field(
     // credentials. `pv_request` is `None` — GET_FIELD carries no pvRequest.
     let conn_ctx = crate::server_native::source::ChannelContext {
         peer,
-        account: cred.account.clone(),
-        method: cred.method.clone(),
-        host: cred.host.clone(),
-        authority: cred.authority.clone(),
-        roles: cred.roles.clone(),
+        creds: cred.clone(),
         pv_request: None,
         log: Default::default(),
     };
@@ -7621,7 +7712,7 @@ async fn handle_get_field(
     // DESTROY_REQUEST / channel teardown abort the in-flight task by
     // dropping the op — the same lifecycle GET/PUT/RPC use.
     let mut reserve = non_monitor_op_state(
-        FieldDesc::Variant,
+        Arc::new(FieldDesc::Variant),
         OpKind::GetField,
         BitSet::with_capacity(0),
     );
@@ -7636,9 +7727,10 @@ async fn handle_get_field(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let join = epics_base_rs::runtime::task::spawn(async move {
+    let abort = poll_inline_or_spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
         let _exec_fin_guard = ExecFinishGuard {
@@ -7678,7 +7770,7 @@ async fn handle_get_field(
     // Install the abort guard on the reserved op so DESTROY_REQUEST /
     // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
     // here — `last_request` is already set on the reserved op above.
-    finish_exec_data_task(chan_mut, ioid, 0, join.abort_handle());
+    finish_exec_data_task(chan_mut, ioid, 0, abort);
     Ok(())
 }
 
@@ -8390,11 +8482,13 @@ mod tests {
         });
         let ctx = crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:9001".parse().unwrap(),
-            account: String::new(),
-            method: "anonymous".into(),
-            host: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -9917,18 +10011,20 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous(TEST_PEER);
+            let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
             // INIT: valid Int descriptor, then a truncated (2-byte) i32
             // value — a present-but-malformed pvRequest body.
@@ -10012,18 +10108,20 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous(TEST_PEER);
+            let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
             // INIT: valid Int descriptor, then NOTHING — the value body
             // the descriptor requires is absent (descriptor-only frame).
@@ -10106,18 +10204,20 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // INIT: empty `structure {}` descriptor, no value body.
         let req_desc = FieldDesc::Structure {
@@ -10201,18 +10301,20 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro),
+                    introspection: Some(std::sync::Arc::new(intro)),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous(TEST_PEER);
+            let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
             let mut payload = Vec::new();
             payload.put_u32(sid, order);
@@ -10864,11 +10966,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -10876,7 +10980,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT (subcmd 0x08, no pipeline bit) with an unparseable
         // `pipeline` value → pipeline disabled, one Warn logRemote.
@@ -10974,11 +11078,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -10986,7 +11092,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // pipeline=true, a valid queueSize, and an ARRAY ackAny — `Int32A` is
         // Kind::Integer but stores as an array, and `copyOut` has no scalar arm
@@ -11067,11 +11173,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11079,7 +11187,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // Pipeline MONITOR INIT: subcmd 0x88 (INIT | pipeline), a valid
         // pipeline pvRequest, and the trailing u32 initial-nack rider the
@@ -11156,11 +11264,13 @@ mod tests {
     fn test_channel_ctx() -> crate::server_native::source::ChannelContext {
         crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: String::new(),
-            method: "anonymous".to_string(),
-            host: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCredentials {
+                account: String::new(),
+                method: "anonymous".to_string(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }
@@ -11323,11 +11433,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11335,7 +11447,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT with pipeline=true, queueSize=2 and an explicit
         // initial nack rider of 2 (subcmd 0x88 sets the 0x80 pipeline bit,
@@ -11491,11 +11603,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         (channels, source, pusher)
@@ -11513,7 +11627,7 @@ mod tests {
         config: &PvaServerConfig,
         encode_cache: &mut crate::pvdata::encode::EncodeTypeCache,
         peer: SocketAddr,
-        cred: &ClientCredentials,
+        cred: &Arc<ClientCredentials>,
         mon_fin: &mpsc::UnboundedSender<MonitorFinished>,
     ) -> PvaResult<()> {
         handle_op(
@@ -11606,7 +11720,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // INIT with queueSize 8 — large enough to hold the seed + 3 posts
         // with no squash.
@@ -11679,7 +11793,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -11747,7 +11861,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11800,7 +11914,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11858,7 +11972,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -11959,7 +12073,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12023,7 +12137,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12070,7 +12184,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12246,11 +12360,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         (channels, source, raw_tx)
@@ -12270,7 +12386,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12338,7 +12454,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 2, order),
@@ -12475,18 +12591,20 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         pvx61_drive(
             &pvx61_init_frame(sid, ioid, 8, order),
@@ -12642,18 +12760,20 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
 
         pvx61_drive(
@@ -12737,11 +12857,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -12749,7 +12871,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT with pipeline=true, queueSize=2, but subcmd 0x08:
         // the 0x80 bit is CLEAR, so NO initial-nack rider follows the
@@ -12863,11 +12985,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -12879,7 +13003,7 @@ mod tests {
         );
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT, pipeline OFF, queueSize=2.
         let req_val = make_pipeline_request(
@@ -12964,11 +13088,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -12976,7 +13102,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT (pipeline, queueSize=4 so an ACK is well-formed).
         let req_val = make_pipeline_request(
@@ -13122,7 +13248,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Monitor,
                 monitor_started: true,
                 monitor_abort: None,
@@ -13156,8 +13282,10 @@ mod tests {
                 introspection: None,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -13182,7 +13310,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // ACK frame (subcmd 0x80) with NO u32 ack-count payload.
         let mut payload = Vec::new();
@@ -13235,7 +13363,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13288,7 +13416,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -13390,7 +13518,7 @@ mod tests {
     ) -> HashMap<u32, ChannelState> {
         let (sid, ioid) = ids;
         let mut op = non_monitor_op_state(
-            intro.clone(),
+            std::sync::Arc::new(intro.clone()),
             OpKind::Monitor,
             BitSet::all_set(intro.total_bits()),
         );
@@ -13429,11 +13557,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -13476,7 +13606,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // subcmd 0xC4 = ACK(0x80)|START(0x04)|start(0x40), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13552,7 +13682,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // subcmd 0x84 = ACK(0x80)|STOP(0x04, no start bit), NO ack u32 payload.
         let mut payload = Vec::new();
@@ -13627,7 +13757,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // subcmd 0xC4 with a 3-credit ACK count.
         let mut payload = Vec::new();
@@ -13864,7 +13994,7 @@ mod tests {
         ops.insert(
             7u32,
             non_monitor_op_state(
-                FieldDesc::Scalar(ScalarType::Int),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                 OpKind::Get,
                 BitSet::new(),
             ),
@@ -13876,11 +14006,13 @@ mod tests {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -13912,7 +14044,7 @@ mod tests {
             ops.insert(
                 ioid,
                 non_monitor_op_state(
-                    FieldDesc::Scalar(ScalarType::Int),
+                    std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                     OpKind::Get,
                     BitSet::new(),
                 ),
@@ -13921,11 +14053,13 @@ mod tests {
                 name: format!("dut:pv{sid}"),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             }
         };
         // Channel 1 owns IOID 7; channel 2 owns IOID 9.
@@ -13997,7 +14131,7 @@ mod tests {
         ops.insert(
             7u32,
             non_monitor_op_state(
-                FieldDesc::Scalar(ScalarType::Int),
+                std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int)),
                 OpKind::Get,
                 BitSet::new(),
             ),
@@ -14009,11 +14143,13 @@ mod tests {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
-                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Int))),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14088,7 +14224,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Monitor,
                 monitor_started: true,
                 monitor_abort: Some(abort.clone()),
@@ -14121,8 +14257,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14206,7 +14344,11 @@ mod tests {
         let abort = Arc::new(AbortOnDrop(task.abort_handle()));
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.data_task_abort = Some(abort);
         op.last_request = true; // a last-request EXEC that is now cancelled
@@ -14223,11 +14365,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14296,7 +14440,11 @@ mod tests {
         let ioid: u32 = 123;
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.last_request = true; // a last-request EXEC, now about to be cancelled
         let stale_op_id = op.monitor_op_id;
@@ -14310,11 +14458,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14349,6 +14499,7 @@ mod tests {
                 ioid,
                 op_id: stale_op_id,
                 success: false,
+                scratch: None,
             },
         );
         assert!(
@@ -14371,6 +14522,7 @@ mod tests {
                 ioid,
                 op_id: exec_id,
                 success: true,
+                scratch: None,
             },
         );
         assert!(
@@ -14925,8 +15077,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -14983,8 +15137,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15038,7 +15194,7 @@ mod tests {
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let mut payload = Vec::new();
         payload.put_u32(sid, inbound_order);
@@ -15135,8 +15291,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15182,14 +15340,14 @@ mod tests {
 
     /// Build a `ca`-method credential for the given account, used by the
     /// channel-lifecycle credential-pinning regressions below.
-    fn cred_ca(account: &str) -> ClientCredentials {
-        ClientCredentials {
+    fn cred_ca(account: &str) -> Arc<ClientCredentials> {
+        Arc::new(ClientCredentials {
             method: "ca".into(),
             account: account.into(),
             host: "10.0.0.1".into(),
             authority: String::new(),
             roles: Vec::new(),
-        }
+        })
     }
 
     /// Records the `(method, account)` each edge observed: channel open
@@ -15224,7 +15382,7 @@ mod tests {
         ) -> Option<PvField> {
             self.op_reads
                 .lock()
-                .push((ctx.method.clone(), ctx.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
             if !checked.allows_read() {
                 return None;
             }
@@ -15246,7 +15404,7 @@ mod tests {
         ) {
             self.opened
                 .lock()
-                .push((ctx.method.clone(), ctx.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
         }
         fn notify_channel_close(
             &self,
@@ -15255,7 +15413,7 @@ mod tests {
         ) {
             self.closed
                 .lock()
-                .push((ctx.method.clone(), ctx.account.clone()));
+                .push((ctx.creds.method.clone(), ctx.creds.account.clone()));
         }
     }
 
@@ -15347,6 +15505,8 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: completion.open_cred,
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let ch = channels.get(&completion.sid).unwrap();
@@ -15392,6 +15552,8 @@ mod tests {
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15454,6 +15616,8 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15509,7 +15673,7 @@ mod tests {
         ops.insert(
             ioid,
             non_monitor_op_state(
-                intro.clone(),
+                std::sync::Arc::new(intro.clone()),
                 OpKind::Get,
                 BitSet::all_set(intro.total_bits()),
             ),
@@ -15521,12 +15685,14 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15598,8 +15764,10 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             peer_entry.channel_opened(sid, stat);
@@ -15671,8 +15839,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         peer_entry.channel_opened(1, stat);
@@ -15747,11 +15917,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15759,7 +15931,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // PUT INIT: sid + ioid + subcmd=0x08 + pvRequest(type + value).
         // Use an empty Structure pvRequest (full mask).
@@ -15880,11 +16052,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15892,7 +16066,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let req_desc = FieldDesc::Structure {
             struct_id: String::new(),
@@ -16005,7 +16179,7 @@ mod tests {
         let source: DynSource = Arc::new(shared);
 
         let config = PvaServerConfig::default();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // A channel carrying one already-INIT'd GET op.
         let make_channels = || {
@@ -16013,7 +16187,7 @@ mod tests {
             ops.insert(
                 ioid,
                 non_monitor_op_state(
-                    intro.clone(),
+                    std::sync::Arc::new(intro.clone()),
                     OpKind::Get,
                     BitSet::all_set(intro.total_bits()),
                 ),
@@ -16025,11 +16199,13 @@ mod tests {
                     name: "dut".into(),
                     cid: 0,
                     sid,
-                    introspection: Some(intro.clone()),
+                    introspection: Some(std::sync::Arc::new(intro.clone())),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops,
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             channels
@@ -16183,11 +16359,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16195,7 +16373,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // The "empty pvRequest" structure (no `field` child) → wildcard
         // mask. Its only role here is to be a real descriptor the client can
@@ -16286,11 +16464,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         let mut fresh_cache = TypeCache::new();
@@ -16607,11 +16787,13 @@ mod tests {
             .await;
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "u".into(),
-            method: "anonymous".into(),
-            host: "h".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCredentials {
+                account: "u".into(),
+                method: "anonymous".into(),
+                host: "h".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -16621,9 +16803,15 @@ mod tests {
         changed.set(2);
         let delta = three_field_value(0, 99, 0);
 
-        src.put_delta_checked(checked, three_field_intro(), changed, delta, ctx)
-            .await
-            .expect("put_delta_checked must succeed");
+        src.put_delta_checked(
+            checked,
+            std::sync::Arc::new(three_field_intro()),
+            changed,
+            &delta,
+            ctx,
+        )
+        .await
+        .expect("put_delta_checked must succeed");
 
         let final_value = stored.lock().clone().expect("a value must be stored");
         let (a, b, c) = three_field_extract(&final_value);
@@ -16679,11 +16867,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16691,7 +16881,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // PUT INIT.
         let req_desc = FieldDesc::Structure {
@@ -16810,11 +17000,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16822,7 +17014,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // PUT_GET INIT (subcmd 0x08).
         let req_desc = FieldDesc::Structure {
@@ -16979,11 +17171,13 @@ mod tests {
 
             let ctx = ChannelContext {
                 peer: "127.0.0.1:5075".parse().unwrap(),
-                account: "anonymous".into(),
-                method: "anonymous".into(),
-                host: "127.0.0.1".into(),
-                authority: String::new(),
-                roles: Vec::new(),
+                creds: Arc::new(ClientCredentials {
+                    account: "anonymous".into(),
+                    method: "anonymous".into(),
+                    host: "127.0.0.1".into(),
+                    authority: String::new(),
+                    roles: Vec::new(),
+                }),
                 pv_request: None,
                 log: Default::default(),
             };
@@ -16998,19 +17192,43 @@ mod tests {
             let task_a = tokio::spawn(async move {
                 let checked = src_a
                     .access()
-                    .check("dut", &ctx_a.host, &ctx_a.account, &ctx_a.method, "")
+                    .check(
+                        "dut",
+                        &ctx_a.creds.host,
+                        &ctx_a.creds.account,
+                        &ctx_a.creds.method,
+                        "",
+                    )
                     .await;
                 src_a
-                    .put_delta_checked(checked, intro_a, changed_a, delta_a, ctx_a)
+                    .put_delta_checked(
+                        checked,
+                        std::sync::Arc::new(intro_a),
+                        changed_a,
+                        &delta_a,
+                        ctx_a,
+                    )
                     .await
             });
             let task_c = tokio::spawn(async move {
                 let checked = src_c
                     .access()
-                    .check("dut", &ctx_c.host, &ctx_c.account, &ctx_c.method, "")
+                    .check(
+                        "dut",
+                        &ctx_c.creds.host,
+                        &ctx_c.creds.account,
+                        &ctx_c.creds.method,
+                        "",
+                    )
                     .await;
                 src_c
-                    .put_delta_checked(checked, intro_c, changed_c, delta_c, ctx_c)
+                    .put_delta_checked(
+                        checked,
+                        std::sync::Arc::new(intro_c),
+                        changed_c,
+                        &delta_c,
+                        ctx_c,
+                    )
                     .await
             });
 
@@ -17128,7 +17346,7 @@ mod tests {
         let mask = BitSet::all_set(intro.total_bits());
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::Process, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::Process, mask),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -17137,11 +17355,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -17150,14 +17370,14 @@ mod tests {
     /// Credentials for the `x509` method carrying a chosen root-CA
     /// authority. `ClientCredentials` fields are all `pub`.
     #[cfg(test)]
-    fn x509_cred(authority: &str) -> ClientCredentials {
-        ClientCredentials {
+    fn x509_cred(authority: &str) -> Arc<ClientCredentials> {
+        Arc::new(ClientCredentials {
             method: "x509".into(),
             account: "operator".into(),
             host: "h.example".into(),
             authority: authority.into(),
             roles: Vec::new(),
-        }
+        })
     }
 
     /// A1: the ACF host identity must come from the socket, never the wire.
@@ -17610,7 +17830,10 @@ mod tests {
         let intro = three_field_intro();
         let mask = BitSet::all_set(intro.total_bits());
         let mut ops = HashMap::new();
-        ops.insert(ioid, non_monitor_op_state(intro.clone(), kind, mask));
+        ops.insert(
+            ioid,
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, mask),
+        );
         let mut channels = HashMap::new();
         channels.insert(
             sid,
@@ -17618,11 +17841,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -17738,11 +17963,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -18097,7 +18324,7 @@ mod tests {
     /// rule is unconditional and only WRITE is AUTHORITY-scoped, so
     /// the peer with the matching CA gets BOTH a successful PUT leg
     /// and a non-empty readback — exercising the fixed GET-leg
-    /// `&ctx.authority` forwarding.
+    /// `&ctx.creds.authority` forwarding.
     #[epics_macros_rs::epics_test]
     async fn put_get_readback_honors_authority() {
         let order = ByteOrder::Little;
@@ -18112,7 +18339,7 @@ mod tests {
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
         );
         channels.insert(
             sid,
@@ -18120,11 +18347,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18298,7 +18527,7 @@ mod tests {
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::PutGet, mask),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -18307,11 +18536,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18416,7 +18647,7 @@ mod tests {
         ops.insert(
             ioid,
             OpState {
-                intro: FieldDesc::Variant,
+                intro: std::sync::Arc::new(FieldDesc::Variant),
                 kind: OpKind::Get,
                 monitor_started: false,
                 monitor_abort: None,
@@ -18446,11 +18677,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18464,7 +18697,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
             &frame,
             &tx,
@@ -18506,11 +18739,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18522,7 +18757,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
             &frame,
             &tx,
@@ -18573,11 +18808,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source: source.clone(),
                 stat: stat.clone(),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18590,7 +18827,7 @@ mod tests {
         let inbound_body = frame.payload.len();
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
             &frame,
             &tx,
@@ -18681,8 +18918,10 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let peer_entry = crate::server_native::peers::PeerEntry::new(false);
@@ -18757,8 +18996,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18770,7 +19011,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18841,8 +19082,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18854,7 +19097,7 @@ mod tests {
         let frame = synth_frame(Command::GetField, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         // The reserved GET_FIELD op (holding the task's abort guard) lives
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
@@ -18947,8 +19190,10 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18961,7 +19206,7 @@ mod tests {
             synth_frame(Command::GetField, order, payload)
         };
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
         let frame1 = build();
@@ -19320,11 +19565,13 @@ mod tests {
     fn bfr12_anon_ctx() -> crate::server_native::source::ChannelContext {
         crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: String::new(),
-            method: "anonymous".into(),
-            host: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: Arc::new(ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }
@@ -19344,7 +19591,7 @@ mod tests {
         intro: &FieldDesc,
     ) -> HashMap<u32, ChannelState> {
         let mut op = non_monitor_op_state(
-            intro.clone(),
+            std::sync::Arc::new(intro.clone()),
             OpKind::Monitor,
             BitSet::all_set(intro.total_bits()),
         );
@@ -19368,11 +19615,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -19545,7 +19794,7 @@ mod tests {
             sid: 1,
             ioid: 2,
             pv_name: "dut".into(),
-            intro: intro.clone(),
+            intro: std::sync::Arc::new(intro.clone()),
             mask: BitSet::with_capacity(intro.total_bits()),
             tx: ChannelTx::new(
                 wire_tx,
@@ -19722,11 +19971,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -19735,7 +19986,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // MONITOR INIT (subcmd 0x08): empty pvRequest → full monitor.
         let req_val = PvField::Structure(PvStructure {
@@ -19898,11 +20149,13 @@ mod tests {
                 name: "dut".into(),
                 cid: 0,
                 sid: 1,
-                introspection: intro,
+                introspection: intro.map(std::sync::Arc::new),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -19952,7 +20205,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // GET INIT (subcmd 0x08) — succeeds via ch.introspection.
         let mut init_payload = Vec::new();
@@ -20028,11 +20281,13 @@ mod tests {
                     name: format!("dut{sid}"),
                     cid: sid - 1,
                     sid,
-                    introspection: Some(three_field_intro()),
+                    introspection: Some(std::sync::Arc::new(three_field_intro())),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                    open_cred: ClientCredentials::anonymous(TEST_PEER),
+                    open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    put_scratch: None,
+                    intro_wire: None,
                 },
             );
         }
@@ -20055,7 +20310,7 @@ mod tests {
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
             non_monitor_op_state(
-                three_field_intro(),
+                std::sync::Arc::new(three_field_intro()),
                 OpKind::Get,
                 BitSet::all_set(three_field_intro().total_bits()),
             ),
@@ -20065,7 +20320,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // INIT a fresh GET on channel sid=2 reusing ioid=5.
         let mut init_payload = Vec::new();
@@ -20110,7 +20365,7 @@ mod tests {
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
             non_monitor_op_state(
-                three_field_intro(),
+                std::sync::Arc::new(three_field_intro()),
                 OpKind::Get,
                 BitSet::all_set(three_field_intro().total_bits()),
             ),
@@ -20146,7 +20401,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         // PUT INIT (subcmd 0x08).
         let mut init_payload = Vec::new();
@@ -20230,7 +20485,7 @@ mod tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let mut init_payload = Vec::new();
         init_payload.put_u32(sid, order);
@@ -20361,7 +20616,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous(TEST_PEER);
+        let mut cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         // One connection-scope inbound decode cache shared across both
         // validation frames, mirroring the read loop's single `rx_type_cache`.
         let mut decode_cache = TypeCache::new();
@@ -20499,7 +20754,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let mut cred = ClientCredentials::anonymous(TEST_PEER);
+        let mut cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mut decode_cache = TypeCache::new();
 
         // Initial handshake: identity becomes alice/ca.
@@ -20657,11 +20912,13 @@ mod autoexec_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(intro.clone()),
+                introspection: Some(std::sync::Arc::new(intro.clone())),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -20669,7 +20926,7 @@ mod autoexec_tests {
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let req_desc = pv_request.descriptor();
         let mut init_payload = Vec::new();
@@ -20857,14 +21114,18 @@ mod r14_tests {
         let source: DynSource = std::sync::Arc::new(SlowGetSource);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let intro = FieldDesc::Variant;
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), OpKind::Get, crate::proto::BitSet::new()),
+            non_monitor_op_state(
+                std::sync::Arc::new(intro.clone()),
+                OpKind::Get,
+                crate::proto::BitSet::new(),
+            ),
         );
         channels.insert(
             sid,
@@ -20872,11 +21133,13 @@ mod r14_tests {
                 name: "slow".into(),
                 cid: 1,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21048,7 +21311,7 @@ mod bfr15_tests {
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
-            non_monitor_op_state(intro.clone(), kind, BitSet::new()),
+            non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, BitSet::new()),
         );
         let mut channels = HashMap::new();
         channels.insert(
@@ -21057,11 +21320,13 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 1,
                 sid,
-                introspection: Some(intro),
+                introspection: Some(std::sync::Arc::new(intro)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -21169,7 +21434,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21262,7 +21527,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21350,7 +21615,7 @@ mod bfr15_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21406,7 +21671,7 @@ mod bfr15_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let cred = ClientCredentials::anonymous(TEST_PEER);
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mon = mpsc::unbounded_channel::<MonitorFinished>().0;
         let (exec_tx, mut exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
@@ -21485,6 +21750,7 @@ mod bfr15_tests {
                 ioid,
                 op_id: op_id.wrapping_add(1),
                 success: true,
+                scratch: None,
             },
         );
         assert_eq!(
@@ -21502,6 +21768,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: true,
+                scratch: None,
             },
         );
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
@@ -21520,7 +21787,11 @@ mod bfr15_tests {
     fn last_request_gpr_error_completion_keeps_op_idle_then_success_removes() {
         let (sid, ioid) = (3u32, 88u32);
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
         op.exec_state = ExecState::Executing;
         op.last_request = true;
         let op_id = op.monitor_op_id;
@@ -21534,11 +21805,13 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21551,6 +21824,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             },
         );
         {
@@ -21578,6 +21852,7 @@ mod bfr15_tests {
                 ioid,
                 op_id: op_id2,
                 success: true,
+                scratch: None,
             },
         );
         assert!(
@@ -21597,7 +21872,7 @@ mod bfr15_tests {
         let (sid, ioid) = (4u32, 90u32);
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut op = non_monitor_op_state(
-            FieldDesc::Variant,
+            std::sync::Arc::new(FieldDesc::Variant),
             OpKind::GetField,
             BitSet::with_capacity(0),
         );
@@ -21615,11 +21890,13 @@ mod bfr15_tests {
                 name: "dut".into(),
                 cid: 0,
                 sid,
-                introspection: Some(FieldDesc::Variant),
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
-                open_cred: ClientCredentials::anonymous(TEST_PEER),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21632,6 +21909,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             },
         );
         assert!(
@@ -21670,14 +21948,9 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(
-            &mut reader,
-            &mut rx_buf,
-            Duration::from_secs(1),
-            Some(DEFAULT_MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect_err("an over-cap header must be refused");
+        let err = read_frame(&mut reader, &mut rx_buf, Some(DEFAULT_MAX_MESSAGE_SIZE))
+            .await
+            .expect_err("an over-cap header must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds max_message_size"),
@@ -21698,7 +21971,7 @@ mod inbound_message_cap_tests {
         wire.extend_from_slice(&[0u8; 16]);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let frame = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+        let frame = read_frame(&mut reader, &mut rx_buf, Some(cap))
             .await
             .expect("a message exactly at the cap must be admitted");
         assert_eq!(frame.payload.len(), cap);
@@ -21710,7 +21983,7 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(cap as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), Some(cap))
+        let err = read_frame(&mut reader, &mut rx_buf, Some(cap))
             .await
             .expect_err("one byte over the cap must be refused");
         assert!(err.to_string().contains("exceeds max_message_size"));
@@ -21724,7 +21997,7 @@ mod inbound_message_cap_tests {
         let wire = header_announcing(DEFAULT_MAX_MESSAGE_SIZE as u32 + 1);
         let mut reader = std::io::Cursor::new(wire);
         let mut rx_buf = Vec::new();
-        let err = read_frame(&mut reader, &mut rx_buf, Duration::from_secs(1), None)
+        let err = read_frame(&mut reader, &mut rx_buf, None)
             .await
             .expect_err("the stream ends after the header, so this cannot succeed");
         // The refusal must be the *stream ending*, not the cap.

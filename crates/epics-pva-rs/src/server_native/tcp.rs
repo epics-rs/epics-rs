@@ -790,6 +790,15 @@ struct ChannelState {
     /// earlier EXEC — semantically dead under the `put_delta_checked`
     /// contract (only `changed`-marked fields may be read).
     put_scratch: Option<(Arc<FieldDesc>, PvField)>,
+    /// Memoized inline wire encoding of [`Self::introspection`] for
+    /// GET/PUT/MONITOR INIT replies, keyed by the descriptor Arc and
+    /// the reply byte order. Channel-level for the same reason as
+    /// `put_scratch`: a pvput client re-INITs per put against the one
+    /// negotiated descriptor, so the full `encode_type_desc` tree walk
+    /// would otherwise run on every operation. Only the default
+    /// (`!emit_type_cache`) branch consults it — the 0xFD/0xFE
+    /// TypeStore path already collapses repeats to 3-byte references.
+    intro_wire: Option<(Arc<FieldDesc>, ByteOrder, Vec<u8>)>,
 }
 
 // `source` is a `dyn ChannelSourceObj` trait object with no `Debug`
@@ -3364,6 +3373,7 @@ pub(super) async fn handle_connection_io(
                             open_cred: cc.open_cred,
                             ops: HashMap::new(),
                             put_scratch: None,
+                    intro_wire: None,
                         });
                         // Register the channel (live + lifetime counts and
                         // the per-channel report entry) in one owner call.
@@ -6729,7 +6739,16 @@ async fn handle_op(
             if config.emit_type_cache {
                 encode_type_desc_cached(&intro, order, encode_cache, &mut payload);
             } else {
-                encode_type_desc(&intro, order, &mut payload);
+                match &ch.intro_wire {
+                    Some((d, o, bytes)) if Arc::ptr_eq(d, &intro) && *o == order => {
+                        payload.extend_from_slice(bytes);
+                    }
+                    _ => {
+                        let start = payload.len();
+                        encode_type_desc(&intro, order, &mut payload);
+                        ch.intro_wire = Some((intro.clone(), order, payload[start..].to_vec()));
+                    }
+                }
             }
         }
         let h = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
@@ -9970,6 +9989,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10066,6 +10086,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10161,6 +10182,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10257,6 +10279,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10921,6 +10944,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11032,6 +11056,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11126,6 +11151,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11385,6 +11411,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -11554,6 +11581,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         (channels, source, pusher)
@@ -12310,6 +12338,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         (channels, source, raw_tx)
@@ -12540,6 +12569,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
@@ -12708,6 +12738,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
@@ -12804,6 +12835,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -12931,6 +12963,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -13033,6 +13066,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -13223,6 +13257,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -13500,6 +13535,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -13948,6 +13984,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -13994,6 +14031,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             }
         };
         // Channel 1 owns IOID 7; channel 2 owns IOID 9.
@@ -14083,6 +14121,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14193,6 +14232,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14303,6 +14343,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -14395,6 +14436,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15010,6 +15052,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15069,6 +15112,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15222,6 +15266,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15433,6 +15478,7 @@ mod tests {
                 open_cred: completion.open_cred,
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let ch = channels.get(&completion.sid).unwrap();
@@ -15479,6 +15525,7 @@ mod tests {
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15542,6 +15589,7 @@ mod tests {
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15616,6 +15664,7 @@ mod tests {
                 open_cred: cred_ca("alice"),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15690,6 +15739,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             peer_entry.channel_opened(sid, stat);
@@ -15764,6 +15814,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         peer_entry.channel_opened(1, stat);
@@ -15844,6 +15895,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -15978,6 +16030,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16124,6 +16177,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops,
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             channels
@@ -16283,6 +16337,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16387,6 +16442,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         let mut fresh_cache = TypeCache::new();
@@ -16789,6 +16845,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -16921,6 +16978,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -17275,6 +17333,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -17760,6 +17819,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -17881,6 +17941,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -18264,6 +18325,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18452,6 +18514,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18592,6 +18655,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18653,6 +18717,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18721,6 +18786,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18827,6 +18893,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
             let peer_entry = crate::server_native::peers::PeerEntry::new(false);
@@ -18904,6 +18971,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -18989,6 +19057,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -19096,6 +19165,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -19523,6 +19593,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -19878,6 +19949,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -20055,6 +20127,7 @@ mod tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -20186,6 +20259,7 @@ mod tests {
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
                     put_scratch: None,
+                    intro_wire: None,
                 },
             );
         }
@@ -20816,6 +20890,7 @@ mod autoexec_tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21036,6 +21111,7 @@ mod r14_tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21222,6 +21298,7 @@ mod bfr15_tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
         channels
@@ -21706,6 +21783,7 @@ mod bfr15_tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 
@@ -21790,6 +21868,7 @@ mod bfr15_tests {
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
                 put_scratch: None,
+                intro_wire: None,
             },
         );
 

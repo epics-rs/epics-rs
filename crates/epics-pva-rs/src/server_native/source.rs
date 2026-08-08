@@ -90,33 +90,16 @@ impl RemoteLog {
 pub struct ChannelContext {
     /// Downstream client TCP socket address.
     pub peer: SocketAddr,
-    /// Account name. For `ca`/`anonymous` this comes from
-    /// CONNECTION_VALIDATION; for `x509` it is the verified peer
-    /// leaf-certificate subject CommonName.
-    pub account: String,
-    /// Auth method (`"anonymous"`, `"ca"`, `"x509"`).
-    pub method: String,
-    /// Host identity of the peer as the ACF `HAG(...)` gate matches it —
-    /// [`Self::peer`]'s address in numeric form, port stripped and
-    /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
-    ///
-    /// NOT reverse-resolved, and never taken from the wire: a client's
-    /// advertised `host` field is ignored by the CONNECTION_VALIDATION
-    /// parser, because this is the string host-scoped ACF rules are matched
-    /// against. See `ClientCredentials::host`.
-    pub host: String,
-    /// Certificate authority for the `x509` method: the root CA's
-    /// subject CommonName. Empty for non-TLS methods. ACF
-    /// `AUTHORITY(...)` rule scopes match against this.
-    pub authority: String,
-    /// Group / role memberships of the peer's `account`, re-derived
-    /// SERVER-SIDE from the local passwd/group DB into
-    /// `ClientCredentials::roles` (NEVER from the wire — pvxs
-    /// `ClientCredentials::roles()` / `osdGetRoles`) and forwarded here so
-    /// role-based ACF rules (`R member group:ops`, `role/...` credential
-    /// strings) can be enforced for native PVA clients. A client cannot
-    /// self-assign these to satisfy a group-gated rule.
-    pub roles: Vec<String>,
+    /// Peer identity in force for this operation — account, method,
+    /// host, authority, and roles, exactly as CONNECTION_VALIDATION /
+    /// the TLS handshake established them (see the
+    /// [`ClientCredentials`](super::config::ClientCredentials) field
+    /// docs for the security derivation rules: `host` and `roles` are
+    /// server-derived and never wire-supplied). One immutable block is
+    /// shared by refcount across every context minted under the same
+    /// connection auth state, so per-operation contexts clone in O(1)
+    /// and all layers read the same strings.
+    pub creds: Arc<super::config::ClientCredentials>,
     /// Decoded INIT pvRequest value for the current operation, when
     /// the wire layer captured one. PVA PUT INIT carries
     /// `record._options.process`/`block`; the data-phase payload is
@@ -754,17 +737,20 @@ pub trait ChannelSource: Send + Sync + 'static {
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<AccessChecked>> + Send {
         let gate = self.access();
-        let host = ctx.host.clone();
-        let account = ctx.account.clone();
-        let method = ctx.method.clone();
-        let authority = ctx.authority.clone();
-        // forward the peer's role claims so `role/<name>` UAG
-        // members can match.
-        let roles = ctx.roles.clone();
+        // one refcount carries host/account/method/authority and the
+        // peer's role claims (so `role/<name>` UAG members can match).
+        let creds = ctx.creds.clone();
         let name = pv_name.to_string();
         async move {
             let checked = gate
-                .check_with_roles(&name, &host, &account, &roles, &method, &authority)
+                .check_with_roles(
+                    &name,
+                    &creds.host,
+                    &creds.account,
+                    &creds.roles,
+                    &creds.method,
+                    &creds.authority,
+                )
                 .await;
             if checked.allows_read() {
                 Some(checked)
@@ -818,9 +804,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             self.put_value(checked.pv_name(), value).await
@@ -994,9 +980,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "ARRAY get denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             let _ = (offset, count, stride);
@@ -1022,9 +1008,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "ARRAY put denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             let _ = (offset, stride, value);
@@ -1048,9 +1034,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "ARRAY setLength denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             let _ = length;
@@ -1074,9 +1060,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "ARRAY getLength denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             Err(OpError::failed(
@@ -1348,9 +1334,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "RPC denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             self.rpc(checked.pv_name(), request_desc, request_value)
@@ -1390,9 +1376,9 @@ pub trait ChannelSource: Send + Sync + 'static {
                 return Err(OpError::denied(format!(
                     "PROCESS denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             self.process(checked.pv_name()).await

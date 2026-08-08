@@ -1455,8 +1455,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.put_value_checked(checked, value, ctx).await;
         self.sink
             .record(make_audit_event(&pv, &user, &host, &result));
@@ -1479,8 +1479,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .put_delta_checked(checked, desc, changed, delta, ctx)
@@ -1505,8 +1505,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .put_get_checked(checked, desc, changed, delta, ctx)
@@ -1538,8 +1538,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.process_checked(checked, ctx).await;
         let mut ev = make_audit_event(&pv, &user, &host, &result);
         ev.event = AuditEventKind::Process;
@@ -1552,8 +1552,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Option<PvField> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.get_value_checked(checked, ctx).await;
         if self.audit_get {
             // GET returns Option, which cannot distinguish "not found"
@@ -1583,8 +1583,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Option<SourceRead> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.read_checked(checked, ctx).await;
         if self.audit_get {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1604,8 +1604,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Option<MonitorStream<PvField>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.subscribe_checked(checked, ctx).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1664,8 +1664,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> Option<MonitorStream<RawMonitorEvent>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.subscribe_raw_checked(checked, ctx).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1691,8 +1691,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .subscribe_checked_opts_marked(checked, ctx, opts)
@@ -1716,8 +1716,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<RawMonitorEvent>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .subscribe_raw_checked_opts(checked, ctx, opts)
@@ -1750,8 +1750,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         >,
     > {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.subscribe_seeded(checked, ctx, opts).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1772,8 +1772,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<epics_pva_rs::server_native::source::SubscriptionSeed<RawMonitorEvent>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.subscribe_raw_seeded(checked, ctx, opts).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -1816,8 +1816,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> Result<RpcReply, OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .rpc_checked(checked, request_desc, request_value, ctx)
@@ -1859,8 +1859,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<PvField, OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .channel_array_get(checked, offset, count, stride, ctx)
@@ -1879,8 +1879,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<u32, OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.channel_array_get_length(checked, ctx).await;
         if self.audit_get {
             let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
@@ -1899,8 +1899,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .channel_array_put(checked, offset, stride, value, ctx)
@@ -1917,8 +1917,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self
             .inner
             .channel_array_set_length(checked, length, ctx)
@@ -2014,8 +2014,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<PvField>> {
         let pv = checked.pv_name().to_string();
-        let user = ctx.account.clone();
-        let host = ctx.host.clone();
+        let user = ctx.creds.account.clone();
+        let host = ctx.creds.host.clone();
         let result = self.inner.subscribe_checked_opts(checked, ctx, opts).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
@@ -2453,11 +2453,13 @@ mod tests {
     fn test_ctx() -> ChannelContext {
         ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "alice".into(),
-            method: "anonymous".into(),
-            host: "host1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "alice".into(),
+                method: "anonymous".into(),
+                host: "host1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         }
@@ -2648,7 +2650,7 @@ mod tests {
             true
         }
         async fn has_pv_checked(&self, _name: &str, ctx: ChannelContext) -> bool {
-            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.account);
+            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.creds.account.clone());
             true
         }
         async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
@@ -2660,7 +2662,7 @@ mod tests {
             _name: &str,
             ctx: ChannelContext,
         ) -> Option<FieldDesc> {
-            *self.checked_intro_account.lock().unwrap() = Some(ctx.account);
+            *self.checked_intro_account.lock().unwrap() = Some(ctx.creds.account.clone());
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
         async fn get_value(&self, _name: &str) -> Option<PvField> {
@@ -2713,12 +2715,12 @@ mod tests {
         assert_eq!(
             checked_has_pv_account.lock().unwrap().as_deref(),
             Some("alice"),
-            "has_pv_checked must reach the inner carrying ctx.account through every wrapper"
+            "has_pv_checked must reach the inner carrying ctx.creds.account through every wrapper"
         );
         assert_eq!(
             checked_intro_account.lock().unwrap().as_deref(),
             Some("alice"),
-            "get_introspection_checked must reach the inner carrying ctx.account"
+            "get_introspection_checked must reach the inner carrying ctx.creds.account"
         );
         assert!(
             !plain_has_pv.load(Ordering::SeqCst),

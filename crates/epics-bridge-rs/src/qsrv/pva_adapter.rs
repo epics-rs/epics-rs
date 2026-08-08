@@ -173,15 +173,15 @@ pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandl
 /// defect where these were hardcoded to `"anonymous"` / `""`.
 fn ctx_to_creds(ctx: &epics_pva_rs::server_native::source::ChannelContext) -> ClientCreds {
     ClientCreds {
-        user: ctx.account.clone(),
-        host: ctx.host.clone(),
-        method: ctx.method.clone(),
-        authority: ctx.authority.clone(),
+        user: ctx.creds.account.clone(),
+        host: ctx.creds.host.clone(),
+        method: ctx.creds.method.clone(),
+        authority: ctx.creds.authority.clone(),
         // forward the native PVA peer's parsed role/group
         // claims so `AcfAccessControl` can evaluate role-based UAG
         // entries (`R member group:ops`). Previously hardcoded empty,
         // so role-scoped ACF rules denied real over-the-wire clients.
-        roles: ctx.roles.clone(),
+        roles: ctx.creds.roles.clone(),
     }
 }
 
@@ -564,9 +564,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 Err(e) => {
                     tracing::debug!(
                         "qsrv get_value_checked({name}) {} from {}@{}: {e}",
-                        ctx.account,
-                        ctx.method,
-                        ctx.host
+                        ctx.creds.account,
+                        ctx.creds.method,
+                        ctx.creds.host
                     );
                     None
                 }
@@ -607,8 +607,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}@{}",
                     checked.pv_name(),
-                    ctx.account,
-                    ctx.host
+                    ctx.creds.account,
+                    ctx.creds.host
                 )));
             }
             let name = checked.pv_name().to_string();
@@ -702,8 +702,8 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}@{}",
                     checked.pv_name(),
-                    ctx.account,
-                    ctx.host
+                    ctx.creds.account,
+                    ctx.creds.host
                 )));
             }
             let name = checked.pv_name().to_string();
@@ -2277,11 +2277,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: Some(PvField::Structure(req)),
             log: Default::default(),
         };
@@ -2358,11 +2360,13 @@ mod tests {
             .await;
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: Some(PvField::Structure(req)),
             log: Default::default(),
         };
@@ -2400,11 +2404,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "alice".into(),
-            method: "ca".into(),
-            host: "ws01".into(),
-            authority: String::new(),
-            roles: vec!["operators".into(), "experts".into()],
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "alice".into(),
+                method: "ca".into(),
+                host: "ws01".into(),
+                authority: String::new(),
+                roles: vec!["operators".into(), "experts".into()],
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -2531,11 +2537,13 @@ mod tests {
             .push(("record".into(), PvField::Structure(record)));
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: Some(PvField::Structure(req)),
             log: Default::default(),
         };
@@ -2717,11 +2725,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: Some(PvField::Structure(req)),
             log: Default::default(),
         };
@@ -2821,11 +2831,15 @@ mod tests {
                 .push(("record".into(), PvField::Structure(record)));
             let ctx = ChannelContext {
                 peer: "127.0.0.1:5075".parse().unwrap(),
-                account: "anonymous".into(),
-                method: "anonymous".into(),
-                host: "127.0.0.1".into(),
-                authority: String::new(),
-                roles: Vec::new(),
+                creds: std::sync::Arc::new(
+                    epics_pva_rs::server_native::config::ClientCredentials {
+                        account: "anonymous".into(),
+                        method: "anonymous".into(),
+                        host: "127.0.0.1".into(),
+                        authority: String::new(),
+                        roles: Vec::new(),
+                    },
+                ),
                 pv_request: Some(PvField::Structure(req)),
                 log: Default::default(),
             };
@@ -2961,11 +2975,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -3076,11 +3092,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "anonymous".into(),
-            method: "anonymous".into(),
-            host: "127.0.0.1".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+                account: "anonymous".into(),
+                method: "anonymous".into(),
+                host: "127.0.0.1".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };

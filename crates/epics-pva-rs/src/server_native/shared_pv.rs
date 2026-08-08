@@ -1451,9 +1451,9 @@ impl super::source::ChannelSource for SharedSource {
                 return Err(OpError::denied(format!(
                     "PUT denied by access security: '{}' from {}/{}/{}",
                     checked.pv_name(),
-                    ctx.host,
-                    ctx.account,
-                    ctx.method,
+                    ctx.creds.host,
+                    ctx.creds.account,
+                    ctx.creds.method,
                 )));
             }
             match pv {
@@ -2073,11 +2073,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: String::new(),
-            method: "anonymous".into(),
-            host: String::new(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: String::new(),
+                method: "anonymous".into(),
+                host: String::new(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };

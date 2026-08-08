@@ -2486,11 +2486,13 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
 
     let ctx = ChannelContext {
         peer: "127.0.0.1:1234".parse().unwrap(),
-        account: "tester".to_string(),
-        method: "anonymous".to_string(),
-        host: "localhost".to_string(),
-        authority: String::new(),
-        roles: Vec::new(),
+        creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+            account: "tester".to_string(),
+            method: "anonymous".to_string(),
+            host: "localhost".to_string(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }),
         pv_request: None,
         log: Default::default(),
     };

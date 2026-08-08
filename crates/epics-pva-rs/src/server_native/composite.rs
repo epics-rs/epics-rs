@@ -213,7 +213,13 @@ impl CompositeSource {
             if src.has_pv_checked(name, ctx.clone()).await {
                 let inner = src
                     .access_gate()
-                    .check(name, &ctx.host, &ctx.account, &ctx.method, &ctx.authority)
+                    .check(
+                        name,
+                        &ctx.creds.host,
+                        &ctx.creds.account,
+                        &ctx.creds.method,
+                        &ctx.creds.authority,
+                    )
                     .await;
                 return Some((src, inner));
             }
@@ -1626,7 +1632,7 @@ mod tests {
             ) -> impl std::future::Future<Output = bool> + Send {
                 let acct = self.checked_account.clone();
                 async move {
-                    *acct.lock() = Some(ctx.account);
+                    *acct.lock() = Some(ctx.creds.account.clone());
                     true
                 }
             }
@@ -1673,11 +1679,13 @@ mod tests {
 
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "alice".into(),
-            method: "ca".into(),
-            host: "h".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: "alice".into(),
+                method: "ca".into(),
+                host: "h".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };
@@ -1693,7 +1701,7 @@ mod tests {
         assert_eq!(
             checked_account.lock().as_deref(),
             Some("alice"),
-            "composite must select via has_pv_checked carrying ctx.account"
+            "composite must select via has_pv_checked carrying ctx.creds.account"
         );
         assert!(
             !plain_seen.load(Ordering::SeqCst),
@@ -1717,11 +1725,13 @@ mod tests {
         use crate::server_native::source::ChannelContext;
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().unwrap(),
-            account: "alice".into(),
-            method: "ca".into(),
-            host: "h".into(),
-            authority: String::new(),
-            roles: Vec::new(),
+            creds: std::sync::Arc::new(crate::server_native::config::ClientCredentials {
+                account: "alice".into(),
+                method: "ca".into(),
+                host: "h".into(),
+                authority: String::new(),
+                roles: Vec::new(),
+            }),
             pv_request: None,
             log: Default::default(),
         };

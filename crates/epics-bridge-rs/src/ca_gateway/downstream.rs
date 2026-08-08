@@ -310,7 +310,15 @@ impl DownstreamServer {
     /// cannot be bound is reported now rather than from inside the
     /// gateway's server task.
     pub async fn new(shadow_db: Arc<PvDatabase>, port: u16) -> CaResult<Self> {
-        let server = CaServer::from_parts(shadow_db.clone(), port, None, None, None, None).await?;
+        let server = CaServer::from_parts(
+            shadow_db.clone(),
+            port,
+            None,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        )
+        .await?;
         Ok(Self {
             server: Mutex::new(Some(server)),
             shadow_db,
@@ -330,8 +338,15 @@ impl DownstreamServer {
         port: u16,
         tls: std::sync::Arc<epics_ca_rs::tls::ServerConfig>,
     ) -> CaResult<Self> {
-        let mut server =
-            CaServer::from_parts(shadow_db.clone(), port, None, None, None, None).await?;
+        let mut server = CaServer::from_parts(
+            shadow_db.clone(),
+            port,
+            None,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        )
+        .await?;
         server.set_tls(tls);
         Ok(Self {
             server: Mutex::new(Some(server)),

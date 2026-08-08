@@ -38,9 +38,16 @@ async fn reload_acf_swaps_in_new_rules() {
 
     // No source path → reload_acf_from must work but reload_acf would
     // fail on a server constructed without acf_file.
-    let bare = CaServer::from_parts(server.database().clone(), 0, None, None, None, None)
-        .await
-        .expect("build bare server");
+    let bare = CaServer::from_parts(
+        server.database().clone(),
+        0,
+        None,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .await
+    .expect("build bare server");
     assert!(bare.reload_acf().await.is_err());
     assert!(
         bare.reload_acf_from(acf_path.to_str().unwrap())

@@ -88,15 +88,38 @@ impl CommandDef {
 pub struct CommandContext {
     db: Arc<PvDatabase>,
     bridge: crate::runtime::task::BlockingBridge,
+    /// The IOC's live Access Security policy cell. `asInit` stores the
+    /// parsed ACF here and the `as*` inspection commands read it — the
+    /// same cell the IOC's protocol servers gate on when the shell was
+    /// built by a server-owning root ([`CommandContext::new_with_acf`]).
+    /// [`CommandContext::new`] creates a fresh unobserved cell for
+    /// standalone shells that administer no server.
+    acf: crate::server::access_security::AcfCell,
     /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
     output: std::cell::RefCell<Box<dyn std::io::Write>>,
 }
 
 impl CommandContext {
     pub fn new(db: Arc<PvDatabase>, bridge: crate::runtime::task::BlockingBridge) -> Self {
+        Self::new_with_acf(
+            db,
+            bridge,
+            crate::server::access_security::new_acf_cell(None),
+        )
+    }
+
+    /// Build a context that administers `acf` — the policy cell the
+    /// owning IOC's servers enforce, so `asInit` from this shell is a
+    /// live (re)load rather than a dead-end copy.
+    pub fn new_with_acf(
+        db: Arc<PvDatabase>,
+        bridge: crate::runtime::task::BlockingBridge,
+        acf: crate::server::access_security::AcfCell,
+    ) -> Self {
         Self {
             db,
             bridge,
+            acf,
             output: std::cell::RefCell::new(Box::new(std::io::stdout())),
         }
     }
@@ -104,6 +127,11 @@ impl CommandContext {
     /// Access the PV database.
     pub fn db(&self) -> &Arc<PvDatabase> {
         &self.db
+    }
+
+    /// The IOC's live Access Security policy cell.
+    pub fn acf(&self) -> &crate::server::access_security::AcfCell {
+        &self.acf
     }
 
     /// The captured runtime access — for spawning tasks or blocking on async

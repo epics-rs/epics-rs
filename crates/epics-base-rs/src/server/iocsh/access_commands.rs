@@ -5,12 +5,16 @@
 //! `asIocRegister.c`. The Rust port previously registered none of
 //! them, so an ACF could not be loaded or inspected from the shell.
 //!
-//! These commands operate on a process-global ACF state holder
-//! ([`as_state`]) that mirrors the C `asDbLib.c` globals — a deferred
-//! filename + substitutions string set by `asSetFilename` /
-//! `asSetSubstitutions`, and the parsed [`AccessSecurityConfig`]
-//! activated by `asInit`. The C flow is identical: `asSetFilename`
-//! has "no immediate effect", `asInit` does the (re)load.
+//! The deferred filename + substitutions strings set by
+//! `asSetFilename` / `asSetSubstitutions` live in a process-global
+//! holder ([`as_state`]) mirroring the C `asDbLib.c` globals. The
+//! parsed [`AccessSecurityConfig`] that `asInit` activates does NOT —
+//! it is stored into the shell context's live
+//! [`AcfCell`](crate::server::access_security::AcfCell), the same
+//! cell the IOC's protocol servers gate on, so a script-driven
+//! `asInit` enforces exactly as C's does. The C flow is otherwise
+//! identical: `asSetFilename` has "no immediate effect", `asInit`
+//! does the (re)load.
 
 use std::sync::Mutex;
 
@@ -20,7 +24,13 @@ use crate::server::access_security::{
 };
 
 /// Process-global access-security shell state. Mirrors the
-/// `asDbLib.c` file-scope globals (`acf`, `substitutions`).
+/// `asDbLib.c` file-scope globals (`acf`, `substitutions`) — the
+/// *deferred load parameters* only. The active parsed configuration
+/// lives in the shell context's
+/// [`AcfCell`](crate::server::access_security::AcfCell)
+/// ([`CommandContext::acf`]), the same cell the IOC's servers gate
+/// on, so `asInit` here is a live (re)load exactly as C's
+/// `asInitCommon` swaps the process `asBase`.
 #[derive(Default)]
 struct AsState {
     /// Path to the ACF file, set by `asSetFilename`. `None` until set.
@@ -28,8 +38,6 @@ struct AsState {
     /// Macro substitutions applied when reading the ACF, set by
     /// `asSetSubstitutions`.
     substitutions: Option<String>,
-    /// The active parsed configuration, populated by `asInit`.
-    config: Option<AccessSecurityConfig>,
 }
 
 fn as_state() -> &'static Mutex<AsState> {
@@ -217,7 +225,12 @@ fn cmd_as_init() -> CommandDef {
                 config.hag.len(),
                 config.asg.len()
             );
-            as_state().lock().unwrap().config = Some(config);
+            // Publish into the IOC's live policy cell — the store fires
+            // the process-wide change notification, so live CA clients
+            // re-evaluate their ACCESS_RIGHTS and policy caches drop
+            // (C: `asInitialize` swaps `pasbase` and re-computes every
+            // ASGCLIENT, asLibRoutines.c `asInitCommon`).
+            ctx.acf().store(Some(std::sync::Arc::new(config)));
             ctx.println(&summary);
             Ok(CommandOutcome::Continue)
         },
@@ -225,9 +238,12 @@ fn cmd_as_init() -> CommandDef {
 }
 
 /// Helper: run `f` with the active config, or report "not loaded".
+/// Reads the shell's live
+/// [`AcfCell`](crate::server::access_security::AcfCell) — the same
+/// policy the servers enforce — so the `as*` inspection commands can
+/// never show a config the gates are not actually using.
 fn with_config<F: FnOnce(&AccessSecurityConfig)>(ctx: &CommandContext, f: F) -> CommandResult {
-    let st = as_state().lock().unwrap();
-    match &st.config {
+    match &*ctx.acf().load() {
         Some(cfg) => {
             f(cfg);
             Ok(CommandOutcome::Continue)
@@ -567,7 +583,7 @@ mod tests {
             "asInit with no filename must be a Continue no-op, not an error"
         );
         assert!(
-            as_state().lock().unwrap().config.is_none(),
+            ctx.acf().load().is_none(),
             "no filename must leave access security disabled (no config)"
         );
     }
@@ -596,8 +612,9 @@ mod tests {
         let a = parse_args(&[], &init.args).unwrap();
         assert!(init.handler.call(&a, &ctx).is_ok());
 
-        // Config is now active.
-        assert!(as_state().lock().unwrap().config.is_some());
+        // Config is now active in the context's live cell — the one
+        // the IOC's servers gate on.
+        assert!(ctx.acf().load().is_some());
     }
 
     /// asInit on a malformed ACF surfaces the parse error.

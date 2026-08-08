@@ -618,10 +618,12 @@ mod ioc {
         //      finalizes the groups before it returns the store that exposes
         //      them, so the `add_source` below cannot run early.
         //
-        //      `None` for the ACF: this entry point loads no access-security
-        //      file. Passing `None` leaves the provider on `AllowAllAccess`,
-        //      which is what an IOC with no ACF means on the CA side too.
-        let mount: QsrvMount = match block_on_sync(build_qsrv_mount(&db, None, &group_files)) {
+        //      A fresh cell holding no ACF: this entry point loads no
+        //      access-security file, and an empty cell grants like
+        //      `AllowAllAccess` — which is what an IOC with no ACF means
+        //      on the CA side too.
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let mount: QsrvMount = match block_on_sync(build_qsrv_mount(&db, acf, &group_files)) {
             Ok(m) => m,
             Err(_) => {
                 eprintln!(

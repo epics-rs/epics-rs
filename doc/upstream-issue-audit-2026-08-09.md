@@ -19,8 +19,19 @@ has not fixed).
 
 ## Open Findings
 
-### UI-100 iocsh `asInit` never reaches the live AccessGate — enforcement silently fails open
+### UI-100 iocsh `asInit` never reaches the live AccessGate — enforcement silently fails open — CLEARED
 Severity: HIGH. epics-rs: `crates/epics-base-rs/src/server/iocsh/access_commands.rs:220`. Upstream: adjacent to epics-base#667.
+**Cleared**: one `AcfCell` per IOC, created by `IocApplication::run`
+before the startup script, administered by every shell
+(`IocShell::new_with_acf`) and adopted (never re-wrapped) by
+`CaServer::from_parts` / `PvaServer::from_parts` /
+`build_qsrv_mount`; `AcfCell` is now a newtype whose `store` fires
+`notify_asg_field_changed`, so a post-boot `asInit` also re-gates
+live connections and drops the gate/grant caches. Same family closed
+alongside: the bridge runner previously wrapped `config.acf` into
+THREE independent cells, and the QSRV `AcfAccessControl` froze a
+boot-time snapshot no reload could reach. Regression tests:
+`crates/epics-base-rs/tests/asinit_reaches_live_gate.rs`.
 A script-driven IOC doing `asSetFilename` + `asInit` gets a success
 message and working `astac`/`asdbdump`, but the parsed config lands only
 in `as_state()` — nothing bridges it to the servers' `AcfCell`, which

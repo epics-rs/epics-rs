@@ -148,16 +148,20 @@ impl AccessControl for AllowAllAccess {}
 /// (tcp.rs:300).
 pub struct AcfAccessControl {
     db: Arc<epics_base_rs::server::database::PvDatabase>,
-    cfg: Arc<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    /// The live policy cell. When the IOC runner built this control
+    /// ([`AcfAccessControl::adopting`]) it is the same cell the CA/PVA
+    /// servers and the iocsh `asInit` command use, so a runtime ACF
+    /// (re)load reaches the QSRV path too. A cell holding `None` means
+    /// "no policy" and every check grants, matching [`AllowAllAccess`].
+    acf: epics_base_rs::server::access_security::AcfCell,
     /// C `asAddClient` keeps one computed ASGCLIENT per channel and every
     /// put is a bit test; pvxs caches the client's computed access on the
     /// channel at the first PUT (pvxs 3c0154b, issue #176). The Rust QSRV
     /// channel object is rebuilt per operation, so the computed
     /// (level, trap) is cached here on the policy owner instead, keyed by
     /// (channel, full credential identity). Invalidation is by
-    /// construction: an ACF reload swaps in a whole new
-    /// `AcfAccessControl` (`set_access_control`), and a `dbPut
-    /// record.ASG` moves
+    /// generation: both an ACF (re)load (`AcfCell::store`) and a `dbPut
+    /// record.ASG` move
     /// [`asg_change_generation`](epics_base_rs::server::access_security::asg_change_generation)
     /// which every entry
     /// snapshots. The rule walk here never evaluates CALC against live
@@ -212,13 +216,27 @@ struct CachedAccess {
 const GRANT_CACHE_CAP: usize = 4096;
 
 impl AcfAccessControl {
+    /// Build from a fixed config (tests, standalone use): the config is
+    /// wrapped in a fresh cell this control alone observes.
     pub fn new(
         db: Arc<epics_base_rs::server::database::PvDatabase>,
         cfg: epics_base_rs::server::access_security::AccessSecurityConfig,
     ) -> Self {
+        Self::adopting(
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(Some(cfg)),
+        )
+    }
+
+    /// Adopt the IOC's live policy cell — the runner path, so a later
+    /// `asInit`/ACF reload through that cell re-gates QSRV operations.
+    pub fn adopting(
+        db: Arc<epics_base_rs::server::database::PvDatabase>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+    ) -> Self {
         Self {
             db,
-            cfg: Arc::new(cfg),
+            acf,
             grant_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
@@ -296,6 +314,17 @@ impl AcfAccessControl {
         {
             return *hit;
         }
+        // No policy in the cell (never loaded, or cleared at runtime):
+        // grant everything, matching [`AllowAllAccess`]. Not cached — a
+        // later `asInit` store moves the generation, but skipping the
+        // cache keeps "no policy" trivially always-current.
+        let Some(cfg) = self.acf.load_full() else {
+            return CachedAccess {
+                asg_generation: generation,
+                level: AccessLevelLite::ReadWrite,
+                write_trap: false,
+            };
+        };
         let (asg, asl, record_known) = self.resolve_asg_and_asl(channel).await;
         let cred_strings = Self::credential_strings(creds);
         // a QSRV access context built through the legacy
@@ -334,7 +363,7 @@ impl AcfAccessControl {
             write_trap: false,
         };
         for cred_user in &cred_strings {
-            let (lvl, trap) = self.cfg.check_access_method_trap(
+            let (lvl, trap) = cfg.check_access_method_trap(
                 &asg,
                 &creds.host,
                 cred_user,

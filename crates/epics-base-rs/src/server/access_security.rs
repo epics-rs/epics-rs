@@ -218,14 +218,43 @@ pub type InpResolver = std::sync::Arc<
 /// completes against the policy it started with, because it holds that `Arc`
 /// for its whole body. Only the writer changes — it publishes instead of
 /// waiting for in-flight readers.
-pub type AcfCell = std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>;
+///
+/// A newtype (not an alias) so every post-construction swap goes through
+/// [`AcfCell::store`], which fires [`notify_asg_field_changed`] — the one
+/// change signal policy-derived caches ([`AccessGate`]'s check cache, the
+/// QSRV grant cache) and the CA server's `reeval_access_rights` path key
+/// on. A raw `ArcSwapOption` swap would update enforcement (checks load
+/// per-op) but leave those caches and the wire ACCESS_RIGHTS stale.
+#[derive(Clone)]
+pub struct AcfCell(std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>);
+
+impl AcfCell {
+    /// Snapshot the current policy (lock-free guard).
+    pub fn load(&self) -> arc_swap::Guard<Option<std::sync::Arc<AccessSecurityConfig>>> {
+        self.0.load()
+    }
+
+    /// Snapshot the current policy as an owned `Option<Arc<..>>`.
+    pub fn load_full(&self) -> Option<std::sync::Arc<AccessSecurityConfig>> {
+        self.0.load_full()
+    }
+
+    /// Publish a new policy (or `None` to clear it) and fire the
+    /// process-wide access-policy change notification so live
+    /// connections re-evaluate their rights and derived caches drop
+    /// their entries.
+    pub fn store(&self, value: Option<std::sync::Arc<AccessSecurityConfig>>) {
+        self.0.store(value);
+        notify_asg_field_changed();
+    }
+}
 
 /// Build a shared [`AcfCell`] holding `initial`. The single construction
 /// point, so no caller has to name `arc_swap` or get the `Arc` nesting right.
 pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
-    std::sync::Arc::new(arc_swap::ArcSwapOption::new(
+    AcfCell(std::sync::Arc::new(arc_swap::ArcSwapOption::new(
         initial.map(std::sync::Arc::new),
-    ))
+    )))
 }
 
 #[derive(Clone)]

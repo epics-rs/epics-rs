@@ -51,6 +51,22 @@ impl IocShell {
     /// capture it where the runtime is known (`BlockingBridge::capture()` on
     /// the async setup path).
     pub fn new(db: Arc<PvDatabase>, bridge: crate::runtime::task::BlockingBridge) -> Self {
+        Self::new_with_acf(
+            db,
+            bridge,
+            crate::server::access_security::new_acf_cell(None),
+        )
+    }
+
+    /// Create a shell whose `as*` commands administer `acf` — the live
+    /// policy cell of the IOC's servers. Server-owning roots
+    /// (`IocApplication::run`, a server's `run_with_shell`) must use
+    /// this so a script or interactive `asInit` reaches the gates.
+    pub fn new_with_acf(
+        db: Arc<PvDatabase>,
+        bridge: crate::runtime::task::BlockingBridge,
+        acf: crate::server::access_security::AcfCell,
+    ) -> Self {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
         // C `iocshRegisterCommon` publishes the base version and target arch as
@@ -59,7 +75,7 @@ impl IocShell {
         crate::runtime::env::register_iocsh_env_vars();
         Self {
             registry: Arc::new(RwLock::new(registry)),
-            ctx: CommandContext::new(db, bridge),
+            ctx: CommandContext::new_with_acf(db, bridge, acf),
             on_error: std::cell::Cell::new(OnError::Continue),
         }
     }

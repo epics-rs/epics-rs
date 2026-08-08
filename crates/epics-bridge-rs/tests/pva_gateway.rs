@@ -2052,7 +2052,7 @@ impl ChannelSource for RecordingDoublingSource {
         checked: AccessChecked,
         _desc: std::sync::Arc<FieldDesc>,
         _changed: BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         let store = self.value.clone();
@@ -2065,7 +2065,7 @@ impl ChannelSource for RecordingDoublingSource {
                 return Err(OpError::denied("write denied"));
             }
             let incoming =
-                double_of(&delta).ok_or_else(|| OpError::failed("no double .value field"))?;
+                double_of(delta).ok_or_else(|| OpError::failed("no double .value field"))?;
             let doubled = incoming * 2.0;
             *store.lock().unwrap() = doubled;
             Ok(Some(SourceRead::from(nt_double_value(doubled))))

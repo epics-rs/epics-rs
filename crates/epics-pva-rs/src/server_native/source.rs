@@ -853,13 +853,16 @@ pub trait ChannelSource: Send + Sync + 'static {
     ///
     /// `desc` is the PV introspection (per-field bit numbering);
     /// `changed` is the wire changed-BitSet; `delta` is the decoded
-    /// sparse value (unmarked leaves hold type defaults).
+    /// sparse value, borrowed because the wire layer reuses it as the
+    /// channel's decode scratch across EXECs. Only `changed`-marked
+    /// fields carry client data; unmarked slots hold type defaults or
+    /// stale values from an earlier EXEC and MUST NOT be read.
     fn put_delta_checked(
         &self,
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async move {
@@ -881,9 +884,13 @@ pub trait ChannelSource: Send + Sync + 'static {
             // enforces the WRITE gate.
             let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
                 Some(prior) => crate::pvdata::encode::fill_unmarked_from_prior(
-                    &desc, &changed, 0, delta, &prior,
+                    &desc,
+                    &changed,
+                    0,
+                    delta.clone(),
+                    &prior,
                 ),
-                None => delta,
+                None => delta.clone(),
             };
             self.put_value_checked(checked, merged, ctx).await
         }
@@ -914,7 +921,7 @@ pub trait ChannelSource: Send + Sync + 'static {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send {
         async move {
@@ -2180,7 +2187,7 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &'a PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state atomic PUT_GET.
@@ -2189,7 +2196,7 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &'a PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,
@@ -2479,7 +2486,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &'a PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_delta_checked(
@@ -2491,7 +2498,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &'a PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<SourceRead>, OpError>> + Send + 'a>,

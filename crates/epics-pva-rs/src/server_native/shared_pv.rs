@@ -1442,7 +1442,7 @@ impl super::source::ChannelSource for SharedSource {
         checked: super::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: super::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let pv = self.pvs.lock().get(checked.pv_name()).cloned();
@@ -1457,7 +1457,9 @@ impl super::source::ChannelSource for SharedSource {
                 )));
             }
             match pv {
-                Some(p) => p.put_delta(&desc, &changed, delta).map_err(OpError::failed),
+                Some(p) => p
+                    .put_delta(&desc, &changed, delta.clone())
+                    .map_err(OpError::failed),
                 None => Err(OpError::failed(format!(
                     "no such PV: {}",
                     checked.pv_name()

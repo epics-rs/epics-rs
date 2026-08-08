@@ -39,7 +39,7 @@ use crate::proto::{
     QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
-    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
+    EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_into,
     encode_pv_field, encode_type_desc, encode_type_desc_cached,
 };
 use crate::pvdata::{FieldDesc, NoConvert, PvField, RpcReply};
@@ -779,6 +779,17 @@ struct ChannelState {
     open_cred: ClientCredentials,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
+    /// Reusable PUT-delta decode scratch, keyed by the op intro it was
+    /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
+    /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
+    /// and the exec body returns it through [`ExecFinished`] once the
+    /// source call is done. Channel-level (not per-op) because a pvput
+    /// client mints a fresh op per put (INIT/EXEC/DESTROY), which would
+    /// defeat a per-op scratch; ops of one channel negotiating the same
+    /// intro share the tree. Unmarked slots carry stale values from an
+    /// earlier EXEC — semantically dead under the `put_delta_checked`
+    /// contract (only `changed`-marked fields may be read).
+    put_scratch: Option<(Arc<FieldDesc>, PvField)>,
 }
 
 // `source` is a `dyn ChannelSourceObj` trait object with no `Debug`
@@ -993,7 +1004,7 @@ fn begin_exec(ch: &mut ChannelState, ioid: u32) -> Option<u64> {
 /// tags THIS exec instance so a signal that arrives late (an aborted task
 /// whose future drops after its ioid was removed and re-INIT'd) cannot flip a
 /// *fresh* op back to `Idle` ([`apply_exec_finish`] ABA guard).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ExecFinished {
     sid: u32,
     ioid: u32,
@@ -1014,6 +1025,13 @@ struct ExecFinished {
     /// exit that does not explicitly [`ExecFinishGuard::mark_success`] — error
     /// returns, panics, and aborts all skip the marking.
     success: bool,
+    /// PUT/PUT_GET decode scratch travelling back to its channel
+    /// ([`ChannelState::put_scratch`]) once the source call released its
+    /// borrow. `None` for every other op kind, and for exec exits (panic,
+    /// abort) that lost the value. A stale-`op_id` signal may still return
+    /// its scratch: any tree built from the same `Arc`'d intro is a valid
+    /// scratch, so last-writer-wins is safe.
+    scratch: Option<(Arc<FieldDesc>, PvField)>,
 }
 
 /// RAII finalizer held as a single local at the top of a data-phase
@@ -1044,7 +1062,13 @@ impl Drop for ExecFinishGuard {
         // Unbounded so this sync Drop never loses the signal to a full
         // channel; the only `send` failure is a closed receiver (the read
         // loop already ended and dropped every op).
-        let _ = self.tx.send(self.fin);
+        let _ = self.tx.send(ExecFinished {
+            sid: self.fin.sid,
+            ioid: self.fin.ioid,
+            op_id: self.fin.op_id,
+            success: self.fin.success,
+            scratch: self.fin.scratch.take(),
+        });
     }
 }
 
@@ -1076,6 +1100,13 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
     let Some(ch) = channels.get_mut(&fin.sid) else {
         return;
     };
+    // Return the PUT decode scratch to its channel before any op
+    // disposition: the channel outlives the op (a pvput client destroys
+    // its op per put), and even a stale-op_id signal carries a tree
+    // valid for reuse (same Arc'd intro; last writer wins).
+    if let Some(s) = fin.scratch {
+        ch.put_scratch = Some(s);
+    }
     let (matches, last_request, kind) = match ch.ops.get(&fin.ioid) {
         Some(op) => (op.monitor_op_id == fin.op_id, op.last_request, op.kind),
         None => return,
@@ -3332,6 +3363,7 @@ pub(super) async fn handle_connection_io(
                             stat: stat.clone(),
                             open_cred: cc.open_cred,
                             ops: HashMap::new(),
+                            put_scratch: None,
                         });
                         // Register the channel (live + lifetime counts and
                         // the per-channel report entry) in one owner call.
@@ -4412,7 +4444,14 @@ async fn handle_put_get(
     } else {
         let changed =
             BitSet::decode(&mut cur, inbound_order).map_err(|e| PvaError::Decode(e.to_string()))?;
-        let put_delta = decode_pv_field_with_bitset_cached(
+        // Same scratch reuse as the PUT EXEC path: decode marked fields
+        // in place, lend to the source, return via `ExecFinished`.
+        let mut put_delta = match ch.put_scratch.take() {
+            Some((d, v)) if Arc::ptr_eq(&d, &intro) => v,
+            _ => crate::pvdata::encode::default_value_for(&intro),
+        };
+        decode_pv_field_with_bitset_into(
+            &mut put_delta,
             &intro,
             &changed,
             0,
@@ -4452,12 +4491,13 @@ async fn handle_put_get(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let abort = poll_inline_or_spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
-        let _exec_fin_guard = ExecFinishGuard {
+        let mut exec_fin_guard = ExecFinishGuard {
             tx: exec_fin_tx_task,
             fin: exec_fin,
         };
@@ -4495,11 +4535,11 @@ async fn handle_put_get(
                         &ctx.authority,
                     )
                     .await;
-                match catch_handler_panic(src.put_get_checked(
+                let outcome = match catch_handler_panic(src.put_get_checked(
                     checked,
                     intro.clone(),
                     changed,
-                    put_delta,
+                    &put_delta,
                     ctx.clone(),
                 ))
                 .await
@@ -4507,7 +4547,12 @@ async fn handle_put_get(
                     Ok(Ok(v)) => Ok(v),
                     Ok(Err(e)) => Err(e.wire_status()),
                     Err(panic) => Err(Status::error(panic)),
-                }
+                };
+                // Source borrow released — send the scratch home with the
+                // completion signal (every later exit goes through the
+                // guard's Drop).
+                exec_fin_guard.fin.scratch = Some((intro.clone(), put_delta));
+                outcome
             } else {
                 let read_checked = src
                     .access_gate()
@@ -4798,6 +4843,7 @@ async fn handle_process(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let abort = poll_inline_or_spawn(async move {
@@ -5168,6 +5214,7 @@ async fn handle_channel_array(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let abort = poll_inline_or_spawn(async move {
@@ -6786,6 +6833,7 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let abort = poll_inline_or_spawn(async move {
@@ -6936,6 +6984,7 @@ async fn handle_op(
                     ioid,
                     op_id,
                     success: false,
+                    scratch: None,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
                 let abort = poll_inline_or_spawn(async move {
@@ -7049,7 +7098,16 @@ async fn handle_op(
             // for whether the PUT EXEC fires automatically after INIT
             // or waits for `reExec()`. Each EXEC frame still carries
             // exactly one value and triggers exactly one write.
-            let delta = decode_pv_field_with_bitset_cached(
+            // Decode the marked fields into the channel's reusable
+            // scratch tree instead of building a default-filled tree per
+            // EXEC (`ChannelState::put_scratch`); the exec body lends it
+            // to the source and returns it via `ExecFinished`.
+            let mut delta = match ch.put_scratch.take() {
+                Some((d, v)) if Arc::ptr_eq(&d, &intro) => v,
+                _ => crate::pvdata::encode::default_value_for(&intro),
+            };
+            decode_pv_field_with_bitset_into(
+                &mut delta,
                 &intro,
                 &changed,
                 0,
@@ -7085,6 +7143,7 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let abort = poll_inline_or_spawn(async move {
@@ -7124,14 +7183,18 @@ async fn handle_op(
                     catch_handler_panic(src.put_delta_checked(
                         checked,
                         intro_t.clone(),
-                        changed.clone(),
-                        delta,
+                        changed,
+                        &delta,
                         ctx.clone(),
                     ))
                     .await
                     .map_err(|e| OpError::failed(e))
                     .and_then(|r| r)
                 };
+                // Source borrow released — send the scratch home with the
+                // completion signal (every later exit path goes through
+                // the guard's Drop).
+                exec_fin_guard.fin.scratch = Some((intro_t.clone(), delta));
                 flush_remote_log(&op_log, ioid, order, &tx_clone).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -7452,6 +7515,7 @@ async fn handle_op(
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let abort = poll_inline_or_spawn(async move {
@@ -7680,6 +7744,7 @@ async fn handle_get_field(
         ioid,
         op_id,
         success: false,
+        scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let abort = poll_inline_or_spawn(async move {
@@ -9966,6 +10031,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10061,6 +10127,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10155,6 +10222,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10250,6 +10318,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
             let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
@@ -10913,6 +10982,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -11023,6 +11093,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -11116,6 +11187,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -11372,6 +11444,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -11540,6 +11613,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         (channels, source, pusher)
@@ -12295,6 +12369,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         (channels, source, raw_tx)
@@ -12524,6 +12599,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
@@ -12691,6 +12767,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
@@ -12786,6 +12863,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -12912,6 +12990,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -13013,6 +13092,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -13202,6 +13282,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -13478,6 +13559,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -13925,6 +14007,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -13970,6 +14053,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             }
         };
         // Channel 1 owns IOID 7; channel 2 owns IOID 9.
@@ -14058,6 +14142,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -14167,6 +14252,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -14276,6 +14362,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -14367,6 +14454,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -14401,6 +14489,7 @@ mod tests {
                 ioid,
                 op_id: stale_op_id,
                 success: false,
+                scratch: None,
             },
         );
         assert!(
@@ -14423,6 +14512,7 @@ mod tests {
                 ioid,
                 op_id: exec_id,
                 success: true,
+                scratch: None,
             },
         );
         assert!(
@@ -14979,6 +15069,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15037,6 +15128,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15189,6 +15281,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -15399,6 +15492,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: completion.open_cred,
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let ch = channels.get(&completion.sid).unwrap();
@@ -15444,6 +15538,7 @@ mod tests {
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -15506,6 +15601,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -15579,6 +15675,7 @@ mod tests {
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -15652,6 +15749,7 @@ mod tests {
                     stat: stat.clone(),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
             peer_entry.channel_opened(sid, stat);
@@ -15725,6 +15823,7 @@ mod tests {
                 stat: stat.clone(),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         peer_entry.channel_opened(1, stat);
@@ -15804,6 +15903,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -15937,6 +16037,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -16082,6 +16183,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops,
+                    put_scratch: None,
                 },
             );
             channels
@@ -16240,6 +16342,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -16343,6 +16446,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         let mut fresh_cache = TypeCache::new();
@@ -16677,7 +16781,7 @@ mod tests {
             checked,
             std::sync::Arc::new(three_field_intro()),
             changed,
-            delta,
+            &delta,
             ctx,
         )
         .await
@@ -16742,6 +16846,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -16873,6 +16978,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -17063,7 +17169,7 @@ mod tests {
                         checked,
                         std::sync::Arc::new(intro_a),
                         changed_a,
-                        delta_a,
+                        &delta_a,
                         ctx_a,
                     )
                     .await
@@ -17078,7 +17184,7 @@ mod tests {
                         checked,
                         std::sync::Arc::new(intro_c),
                         changed_c,
-                        delta_c,
+                        &delta_c,
                         ctx_c,
                     )
                     .await
@@ -17212,6 +17318,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -17696,6 +17803,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -17816,6 +17924,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         channels
@@ -18198,6 +18307,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -18385,6 +18495,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -18524,6 +18635,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -18584,6 +18696,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -18651,6 +18764,7 @@ mod tests {
                 stat: stat.clone(),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -18756,6 +18870,7 @@ mod tests {
                     stat: stat.clone(),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
             let peer_entry = crate::server_native::peers::PeerEntry::new(false);
@@ -18832,6 +18947,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -18916,6 +19032,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -19022,6 +19139,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -19446,6 +19564,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -19800,6 +19919,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -19976,6 +20096,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
         channels
@@ -20106,6 +20227,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: ClientCredentials::anonymous(TEST_PEER),
                     ops: HashMap::new(),
+                    put_scratch: None,
                 },
             );
         }
@@ -20735,6 +20857,7 @@ mod autoexec_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops: HashMap::new(),
+                put_scratch: None,
             },
         );
 
@@ -20954,6 +21077,7 @@ mod r14_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -21139,6 +21263,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
         channels
@@ -21562,6 +21687,7 @@ mod bfr15_tests {
                 ioid,
                 op_id: op_id.wrapping_add(1),
                 success: true,
+                scratch: None,
             },
         );
         assert_eq!(
@@ -21579,6 +21705,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: true,
+                scratch: None,
             },
         );
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
@@ -21620,6 +21747,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -21632,6 +21760,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             },
         );
         {
@@ -21659,6 +21788,7 @@ mod bfr15_tests {
                 ioid,
                 op_id: op_id2,
                 success: true,
+                scratch: None,
             },
         );
         assert!(
@@ -21701,6 +21831,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: ClientCredentials::anonymous(TEST_PEER),
                 ops,
+                put_scratch: None,
             },
         );
 
@@ -21713,6 +21844,7 @@ mod bfr15_tests {
                 ioid,
                 op_id,
                 success: false,
+                scratch: None,
             },
         );
         assert!(

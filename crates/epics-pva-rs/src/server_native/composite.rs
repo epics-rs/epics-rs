@@ -628,7 +628,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let name = checked.pv_name().to_string();
@@ -655,7 +655,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: crate::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<
         Output = Result<Option<crate::server_native::source::SourceRead>, OpError>,

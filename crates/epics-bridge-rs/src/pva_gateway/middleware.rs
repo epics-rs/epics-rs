@@ -122,7 +122,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _checked: epics_pva_rs::server_native::source::AccessChecked,
         _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
-        _delta: PvField,
+        _delta: &PvField,
         _ctx: ChannelContext,
     ) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
@@ -136,7 +136,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
         _checked: epics_pva_rs::server_native::source::AccessChecked,
         _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
-        _delta: PvField,
+        _delta: &PvField,
         _ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
@@ -742,7 +742,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         if !self.config.allowed(checked.pv_name()) {
@@ -766,7 +766,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         if !self.config.allowed(checked.pv_name()) {
@@ -1475,7 +1475,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
         let pv = checked.pv_name().to_string();
@@ -1501,7 +1501,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         let pv = checked.pv_name().to_string();
@@ -2428,7 +2428,7 @@ mod tests {
             _checked: AccessChecked,
             _desc: std::sync::Arc<FieldDesc>,
             _changed: epics_pva_rs::proto::BitSet,
-            _delta: PvField,
+            _delta: &PvField,
             _ctx: ChannelContext,
         ) -> Result<(), OpError> {
             self.delta_reached.store(true, Ordering::SeqCst);
@@ -2490,7 +2490,7 @@ mod tests {
                 checked_for("X").await,
                 std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
-                PvField::Scalar(ScalarValue::Double(1.0)),
+                &PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
             )
             .await;
@@ -2526,7 +2526,7 @@ mod tests {
                 checked_for("SECRET:KEY").await,
                 std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
-                PvField::Scalar(ScalarValue::Double(1.0)),
+                &PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
             )
             .await
@@ -2568,7 +2568,7 @@ mod tests {
                 checked_for("X").await,
                 std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
-                PvField::Scalar(ScalarValue::Double(1.0)),
+                &PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
             )
             .await;
@@ -2610,7 +2610,7 @@ mod tests {
                 checked_for("X").await,
                 std::sync::Arc::new(FieldDesc::Scalar(ScalarType::Double)),
                 changed,
-                PvField::Scalar(ScalarValue::Double(1.0)),
+                &PvField::Scalar(ScalarValue::Double(1.0)),
                 test_ctx(),
             )
             .await

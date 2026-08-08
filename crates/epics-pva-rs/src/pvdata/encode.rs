@@ -1756,6 +1756,88 @@ pub fn decode_pv_field_with_bitset_cached(
     }
 }
 
+/// In-place variant of [`decode_pv_field_with_bitset_cached`]: overwrite
+/// exactly the marked fields of `dst`, leaving unmarked slots untouched.
+/// The wire cursor consumes the same bytes as the allocating variant.
+///
+/// `dst` must be shaped like `desc` (a [`default_value_for`] tree or a
+/// previous decode against the same descriptor); a shape mismatch falls
+/// back to the allocating decoder for that subtree, so the call is total
+/// either way.
+///
+/// This exists for the server PUT hot path: a PUT delta usually marks a
+/// couple of leaves of a many-field NT structure, and rebuilding the
+/// unmarked remainder per EXEC (`default_value_for` — a full tree of
+/// field-name Strings) was ~10% of server CPU under a scalar-PUT load.
+/// After this decode, unmarked slots hold values from an earlier EXEC
+/// rather than type defaults; both are semantically dead to the
+/// `put_delta_checked` contract, which reads marked fields only.
+pub fn decode_pv_field_with_bitset_into(
+    dst: &mut PvField,
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<(), DecodeError> {
+    fn any_descendant_set(
+        bitset: &crate::proto::BitSet,
+        pos: usize,
+        desc_local: &FieldDesc,
+    ) -> bool {
+        let total = desc_local.total_bits();
+        for i in 0..total {
+            if bitset.get(pos + i) {
+                return true;
+            }
+        }
+        false
+    }
+
+    match desc {
+        FieldDesc::Scalar(_)
+        | FieldDesc::ScalarArray(_)
+        | FieldDesc::Variant
+        | FieldDesc::VariantArray
+        | FieldDesc::Union { .. }
+        | FieldDesc::UnionArray { .. }
+        | FieldDesc::StructureArray { .. } => {
+            if bitset.get(bit_offset) {
+                *dst = decode_pv_field_cached(desc, cur, order, cache)?;
+            }
+            Ok(())
+        }
+        FieldDesc::Structure { fields, .. } => {
+            if bitset.get(bit_offset) {
+                *dst = decode_pv_field_cached(desc, cur, order, cache)?;
+                return Ok(());
+            }
+            if !any_descendant_set(bitset, bit_offset, desc) {
+                return Ok(());
+            }
+            match dst {
+                PvField::Structure(s) if s.fields.len() == fields.len() => {
+                    let mut child_bit = bit_offset + 1;
+                    for ((_, slot), (_, child_desc)) in s.fields.iter_mut().zip(fields) {
+                        decode_pv_field_with_bitset_into(
+                            slot, child_desc, bitset, child_bit, cur, order, cache,
+                        )?;
+                        child_bit += child_desc.total_bits();
+                    }
+                    Ok(())
+                }
+                _ => {
+                    *dst = decode_pv_field_with_bitset_cached(
+                        desc, bitset, bit_offset, cur, order, cache,
+                    )?;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 // ── Value-region type-cache marker flattening (reader-task owned) ─────────
 //
 // Used by the connection reader to rewrite 0xFD/0xFE type-cache markers that
@@ -2235,7 +2317,7 @@ pub fn prune_to_marked(
     desc: &FieldDesc,
     bitset: &crate::proto::BitSet,
     bit_offset: usize,
-    decoded: PvField,
+    decoded: &PvField,
 ) -> Option<PvField> {
     match desc {
         FieldDesc::Scalar(_)
@@ -2246,7 +2328,7 @@ pub fn prune_to_marked(
         | FieldDesc::UnionArray { .. }
         | FieldDesc::StructureArray { .. } => {
             if bitset.get(bit_offset) {
-                Some(decoded)
+                Some(decoded.clone())
             } else {
                 None
             }
@@ -2254,21 +2336,30 @@ pub fn prune_to_marked(
         FieldDesc::Structure { .. } if bitset.get(bit_offset) => {
             // Own bit set → the whole subtree was sent fresh (pvxs
             // BitSet compression); every descendant is marked.
-            Some(decoded)
+            Some(decoded.clone())
         }
         FieldDesc::Structure { struct_id, fields } => {
-            let mut decoded_children: Vec<(String, PvField)> = match decoded {
-                PvField::Structure(s) => s.fields,
-                _ => Vec::new(),
+            let decoded_struct = match decoded {
+                PvField::Structure(s) => Some(s),
+                _ => None,
             };
             let mut out = PvStructure::new(struct_id);
             let mut child_bit = bit_offset + 1;
             for (name, child_desc) in fields {
-                let decoded_child = decoded_children
-                    .iter()
-                    .position(|(n, _)| n == name)
-                    .map(|idx| decoded_children.swap_remove(idx).1)
-                    .unwrap_or_else(|| default_value_for(child_desc));
+                // Borrow this child's decoded value; only marked leaves
+                // below are cloned into the pruned output, so the cost is
+                // proportional to what the client actually sent. The
+                // default fill is defensive — the decoder emits every
+                // field — and cheap here because an unmarked default is
+                // pruned without cloning.
+                let default_child;
+                let decoded_child = match decoded_struct.and_then(|s| s.get_field(name)) {
+                    Some(c) => c,
+                    None => {
+                        default_child = default_value_for(child_desc);
+                        &default_child
+                    }
+                };
                 if let Some(kept) = prune_to_marked(child_desc, bitset, child_bit, decoded_child) {
                     out.fields.push((name.clone(), kept));
                 }
@@ -4315,7 +4406,7 @@ mod tests {
         let desc = two_member_group_desc();
         let mut changed = crate::proto::BitSet::new();
         changed.set(1); // member `a` only
-        let pruned = prune_to_marked(&desc, &changed, 0, two_member_delta());
+        let pruned = prune_to_marked(&desc, &changed, 0, &two_member_delta());
         let s = match pruned {
             Some(PvField::Structure(s)) => s,
             other => panic!("expected a structure, got {other:?}"),
@@ -4335,7 +4426,7 @@ mod tests {
         let desc = two_member_group_desc();
         let changed = crate::proto::BitSet::new(); // nothing set
         assert!(
-            prune_to_marked(&desc, &changed, 0, two_member_delta()).is_none(),
+            prune_to_marked(&desc, &changed, 0, &two_member_delta()).is_none(),
             "an unmarked delta prunes to None (nothing to apply)"
         );
     }
@@ -4347,12 +4438,137 @@ mod tests {
         let desc = two_member_group_desc();
         let mut changed = crate::proto::BitSet::new();
         changed.set(0);
-        let pruned = prune_to_marked(&desc, &changed, 0, two_member_delta());
+        let pruned = prune_to_marked(&desc, &changed, 0, &two_member_delta());
         let s = match pruned {
             Some(PvField::Structure(s)) => s,
             other => panic!("expected a structure, got {other:?}"),
         };
         assert!(s.get_field("a").is_some() && s.get_field("b").is_some());
+    }
+
+    // ---- decode_pv_field_with_bitset_into: scratch-reuse decode ----
+
+    /// Boundary: marked leaf overwritten, unmarked leaf untouched. The
+    /// unmarked slot deliberately holds a non-default sentinel (99) to
+    /// prove the in-place decode does not rebuild it.
+    #[test]
+    fn decode_into_overwrites_marked_and_keeps_unmarked() {
+        let desc = two_member_group_desc();
+        let mut changed = crate::proto::BitSet::new();
+        changed.set(1); // member `a` only
+        // Wire bytes: just the marked `a` leaf (Long 42).
+        let mut wire = Vec::new();
+        encode_scalar_value(&ScalarValue::Long(42), ByteOrder::Little, &mut wire);
+
+        let mut dst = two_member_delta(); // a=11, b=0
+        if let PvField::Structure(s) = &mut dst {
+            s.fields[1].1 = PvField::Scalar(ScalarValue::Long(99)); // stale sentinel
+        }
+        let mut cur = Cursor::new(wire.as_slice());
+        let mut cache = TypeCache::new();
+        decode_pv_field_with_bitset_into(
+            &mut dst,
+            &desc,
+            &changed,
+            0,
+            &mut cur,
+            ByteOrder::Little,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(
+            cur.remaining(),
+            0,
+            "cursor must consume exactly the marked leaf"
+        );
+        let s = match &dst {
+            PvField::Structure(s) => s,
+            other => panic!("expected structure, got {other:?}"),
+        };
+        assert_eq!(
+            s.get_field("a"),
+            Some(&PvField::Scalar(ScalarValue::Long(42))),
+            "marked leaf must carry the decoded value"
+        );
+        assert_eq!(
+            s.get_field("b"),
+            Some(&PvField::Scalar(ScalarValue::Long(99))),
+            "unmarked leaf must keep its previous (stale) value untouched"
+        );
+    }
+
+    /// Boundary: nothing marked → dst untouched, no bytes consumed.
+    #[test]
+    fn decode_into_nothing_marked_leaves_dst_and_cursor() {
+        let desc = two_member_group_desc();
+        let changed = crate::proto::BitSet::new();
+        let mut dst = two_member_delta();
+        let before = dst.clone();
+        let wire: [u8; 0] = [];
+        let mut cur = Cursor::new(&wire[..]);
+        let mut cache = TypeCache::new();
+        decode_pv_field_with_bitset_into(
+            &mut dst,
+            &desc,
+            &changed,
+            0,
+            &mut cur,
+            ByteOrder::Little,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(dst, before);
+    }
+
+    /// Boundary: root bit set (pvxs BitSet compression) and shape-mismatch
+    /// fallback must both yield exactly what the allocating decoder yields
+    /// from the same bytes.
+    #[test]
+    fn decode_into_matches_allocating_decoder() {
+        let desc = two_member_group_desc();
+        for (mark_root, dst_seed) in [
+            (true, two_member_delta()),
+            (false, PvField::Null), // shape mismatch → fallback path
+        ] {
+            let mut changed = crate::proto::BitSet::new();
+            if mark_root {
+                changed.set(0);
+            } else {
+                changed.set(1);
+                changed.set(2);
+            }
+            let mut wire = Vec::new();
+            encode_scalar_value(&ScalarValue::Long(7), ByteOrder::Little, &mut wire);
+            encode_scalar_value(&ScalarValue::Long(8), ByteOrder::Little, &mut wire);
+
+            let mut dst = dst_seed;
+            let mut cur = Cursor::new(wire.as_slice());
+            let mut cache = TypeCache::new();
+            decode_pv_field_with_bitset_into(
+                &mut dst,
+                &desc,
+                &changed,
+                0,
+                &mut cur,
+                ByteOrder::Little,
+                &mut cache,
+            )
+            .unwrap();
+
+            let mut cur2 = Cursor::new(wire.as_slice());
+            let mut cache2 = TypeCache::new();
+            let allocated = decode_pv_field_with_bitset_cached(
+                &desc,
+                &changed,
+                0,
+                &mut cur2,
+                ByteOrder::Little,
+                &mut cache2,
+            )
+            .unwrap();
+            assert_eq!(dst, allocated, "mark_root={mark_root}");
+            assert_eq!(cur.position(), cur2.position(), "mark_root={mark_root}");
+        }
     }
 
     /// PVA-89: a `ScalarValue::String` carrying non-UTF-8 bytes must

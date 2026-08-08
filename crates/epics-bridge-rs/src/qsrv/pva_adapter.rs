@@ -693,7 +693,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         desc: std::sync::Arc<FieldDesc>,
         changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
@@ -762,15 +762,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         || desc
                             .bit_for_path("value.index")
                             .is_some_and(|b| changed.get(b));
-                    let merged = if value_sent {
+                    // Borrow the wire delta directly on the hot path; the
+                    // rare metadata-only PUT owns its merged copy locally.
+                    let merged_owned;
+                    let merged: &PvField = if value_sent {
                         delta
                     } else {
-                        match self.get_value_checked(checked.clone(), ctx.clone()).await {
+                        merged_owned = match self
+                            .get_value_checked(checked.clone(), ctx.clone())
+                            .await
+                        {
                             Some(prior) => epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
-                                &desc, &changed, 0, delta, &prior,
+                                &desc,
+                                &changed,
+                                0,
+                                delta.clone(),
+                                &prior,
                             ),
-                            None => delta,
-                        }
+                            None => delta.clone(),
+                        };
+                        &merged_owned
                     };
                     let pv = match merged {
                         PvField::Structure(s) => s,
@@ -784,10 +795,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                         Some(req) => {
                             crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log)
                         }
-                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(pv, &ctx.log),
                     };
                     single
-                        .put_with_options(&pv, opts)
+                        .put_with_options(pv, opts)
                         .await
                         .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
                 }
@@ -2967,7 +2978,7 @@ mod tests {
                 checked,
                 std::sync::Arc::new(desc),
                 changed,
-                PvField::Structure(delta),
+                &PvField::Structure(delta),
                 ctx,
             )
             .await
@@ -3082,7 +3093,7 @@ mod tests {
                 checked,
                 std::sync::Arc::new(desc),
                 changed,
-                PvField::Structure(delta),
+                &PvField::Structure(delta),
                 ctx,
             )
             .await

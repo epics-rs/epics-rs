@@ -1304,7 +1304,7 @@ impl ChannelSource for GatewayChannelSource {
         checked: AccessChecked,
         _desc: std::sync::Arc<FieldDesc>,
         _changed: epics_pva_rs::proto::BitSet,
-        delta: PvField,
+        delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
         if !checked.allows_write() {
@@ -1344,10 +1344,10 @@ impl ChannelSource for GatewayChannelSource {
         let read = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
-                    .pvput_get_pv_field_with_request_value_marked(name, req, &delta)
+                    .pvput_get_pv_field_with_request_value_marked(name, req, delta)
                     .await
             }
-            None => client.pvput_get_pv_field_marked(name, &delta).await,
+            None => client.pvput_get_pv_field_marked(name, delta).await,
         };
         read.map(|r| Some(upstream_read(r)))
             .map_err(upstream_op_error)

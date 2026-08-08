@@ -5,7 +5,7 @@
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
 //! once that crate's native PVA server exposes them directly.
 
-// RTEMS-EXEC-MODEL-ALLOW(20): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashMap;
 use std::sync::Arc;

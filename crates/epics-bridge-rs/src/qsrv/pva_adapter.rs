@@ -10,6 +10,7 @@
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc;
@@ -203,6 +204,72 @@ pub struct QsrvPvStore {
     /// `impl Future<..> + Send`, so holding one across an `.await` is a
     /// compile error rather than a review finding.
     pva_pvs: Arc<parking_lot::RwLock<HashMap<String, PvaPvHandle>>>,
+    /// Per-peer cache of resolved channels, keyed `(peer, pv name)`.
+    /// A pvput client mints a fresh op per put, and every op used to
+    /// re-run the full name→record/group resolution plus a fresh
+    /// `AccessContext`. An entry is served only while BOTH guards hold:
+    ///
+    /// - the op's `ctx.creds` is the SAME `Arc` the entry was built
+    ///   from (`Arc::ptr_eq`) — a re-auth mints a new credentials Arc,
+    ///   so a stale identity can never leak into another peer's (or the
+    ///   re-authed peer's own) channel, which is the defect a name-only
+    ///   channel cache had here before; holding the Arc in the entry
+    ///   also makes the pointer comparison ABA-safe, and
+    /// - the provider's [`BridgeProvider::group_generation`] is
+    ///   unchanged, so `dbLoadGroup`-style registry rewrites force
+    ///   re-resolution.
+    ///
+    /// ACF hot-reload needs no guard: the cached `AccessContext` holds
+    /// the provider's live access proxy, so `set_access_control` swaps
+    /// are observed by cached channels on their next check. Entries are
+    /// evicted on `notify_channel_close`, which the wire layer fires
+    /// for explicit DESTROY_CHANNEL and on connection teardown alike.
+    channel_cache: ChannelCache,
+}
+
+/// See [`QsrvPvStore::channel_cache`].
+type ChannelCache = Arc<parking_lot::Mutex<HashMap<SocketAddr, HashMap<String, CachedChannel>>>>;
+
+struct CachedChannel {
+    creds: Arc<epics_pva_rs::server_native::config::ClientCredentials>,
+    generation: u64,
+    channel: Arc<AnyChannel>,
+}
+
+/// Resolve `name` through the per-peer cache (see
+/// [`QsrvPvStore::channel_cache`] for the freshness guards). A free fn
+/// over the captured `Arc`s so the `impl Future + Send` trait methods
+/// and the free monitor path can both call it.
+async fn cached_channel(
+    provider: &Arc<BridgeProvider>,
+    cache: &ChannelCache,
+    name: &str,
+    ctx: &epics_pva_rs::server_native::source::ChannelContext,
+) -> crate::BridgeResult<Arc<AnyChannel>> {
+    let generation = provider.group_generation();
+    if let Some(hit) = cache
+        .lock()
+        .get(&ctx.peer)
+        .and_then(|m| m.get(name))
+        .filter(|e| Arc::ptr_eq(&e.creds, &ctx.creds) && e.generation == generation)
+        .map(|e| e.channel.clone())
+    {
+        return Ok(hit);
+    }
+    let channel = Arc::new(
+        provider
+            .create_channel_with_creds(name, ctx_to_creds(ctx))
+            .await?,
+    );
+    cache.lock().entry(ctx.peer).or_default().insert(
+        name.to_string(),
+        CachedChannel {
+            creds: ctx.creds.clone(),
+            generation,
+            channel: channel.clone(),
+        },
+    );
+    Ok(channel)
 }
 
 impl QsrvPvStore {
@@ -210,6 +277,7 @@ impl QsrvPvStore {
         Self {
             provider,
             pva_pvs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            channel_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -239,13 +307,16 @@ impl QsrvPvStore {
         self.channel_for(name, "", "").await
     }
 
-    /// create a channel for the supplied identity. No
-    /// `channels` cache — caching an `AnyChannel` keyed by PV
-    /// name only reused one peer's `AccessContext` for every
-    /// subsequent peer and silently bypassed any ACF policy the
-    /// IOC runner installed. Metadata is still cached inside the
-    /// `BridgeProvider` (record_cache) so the per-call cost
-    /// stays low.
+    /// create a channel for the supplied identity, uncached. A
+    /// name-only `AnyChannel` cache here once reused one peer's
+    /// `AccessContext` for every subsequent peer and silently
+    /// bypassed any ACF policy the IOC runner installed; the
+    /// ctx-bearing `_checked` paths now cache through
+    /// [`QsrvPvStore::channel_cache`], whose peer + creds-Arc
+    /// keying is what makes caching safe. This ctx-less path has
+    /// no peer to key by, so it stays uncached — metadata is
+    /// still cached inside the `BridgeProvider` (record_cache)
+    /// so the per-call cost stays low.
     async fn channel_for(&self, name: &str, user: &str, host: &str) -> Option<AnyChannel> {
         self.provider
             .create_channel_for(name, user, host)
@@ -456,6 +527,24 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     // `_checked` overrides so every wire op runs against the
     // ACF policy with the correct user/host.
 
+    /// Evict this peer's cached resolution of `name` (see
+    /// [`QsrvPvStore::channel_cache`]). The wire layer fires this once
+    /// per opened channel, for explicit DESTROY_CHANNEL and connection
+    /// teardown alike, so entries never outlive their channel.
+    fn notify_channel_close(
+        &self,
+        name: &str,
+        ctx: &epics_pva_rs::server_native::source::ChannelContext,
+    ) {
+        let mut cache = self.channel_cache.lock();
+        if let Some(by_name) = cache.get_mut(&ctx.peer) {
+            by_name.remove(name);
+            if by_name.is_empty() {
+                cache.remove(&ctx.peer);
+            }
+        }
+    }
+
     /// pvxs `SingleSource::onSubscribe` (`ioc/singlesource.cpp:114-140`) reads
     /// `record._options.DBE` with the THROWING `as<T>()`, before `connect()`
     /// emits the INIT reply. An array-typed DBE of integer, real or string
@@ -531,6 +620,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     ) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let pva_pvs = self.pva_pvs.clone();
         let provider = self.provider.clone();
+        let cache = self.channel_cache.clone();
         async move {
             if !checked.allows_read() {
                 return None;
@@ -545,10 +635,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             {
                 return Some(value);
             }
-            let channel = provider
-                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
-                .await
-                .ok()?;
+            let channel = cached_channel(&provider, &cache, &name, &ctx).await.ok()?;
             // forward the decoded INIT pvRequest so QSRV group
             // GET honors `record._options` (e.g. `atomic`). The native
             // wire layer now threads `init_pv_request` into the GET /
@@ -602,6 +689,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
+        let cache = self.channel_cache.clone();
         async move {
             if !checked.allows_write() {
                 return Err(OpError::denied(format!(
@@ -642,11 +730,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req, &ctx.log),
                 None => crate::qsrv::channel::PutOptions::from_pv_request(&pv, &ctx.log),
             };
-            let channel = provider
-                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
+            let channel = cached_channel(&provider, &cache, &name, &ctx)
                 .await
                 .map_err(|e| OpError::failed(e.to_string()))?;
-            match channel {
+            match &*channel {
                 crate::qsrv::AnyChannel::Single(single) => single
                     .put_with_options(&pv, opts)
                     .await
@@ -697,6 +784,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         ctx: epics_pva_rs::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let provider = self.provider.clone();
+        let cache = self.channel_cache.clone();
         async move {
             if !checked.allows_write() {
                 return Err(OpError::denied(format!(
@@ -711,11 +799,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 Some(PvField::Structure(ref req)) => Some(req),
                 _ => None,
             };
-            let channel = provider
-                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
+            let channel = cached_channel(&provider, &cache, &name, &ctx)
                 .await
                 .map_err(|e| OpError::failed(e.to_string()))?;
-            match channel {
+            match &*channel {
                 crate::qsrv::AnyChannel::Group(group) => {
                     // Prune to the client's marked members (presence ==
                     // marked). Nothing marked → empty apply, which the

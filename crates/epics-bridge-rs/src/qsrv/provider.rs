@@ -720,6 +720,12 @@ pub struct BridgeProvider {
     /// would drop fields contributed to the same group name by other files
     /// or `info(Q:group)` tags.
     group_files: parking_lot::RwLock<Vec<GroupFileEntry>>,
+    /// Bumped on every rewrite of the live [`Self::groups`] map
+    /// (`rebuild_groups` / `reset_groups`). Lets a caller that caches a
+    /// resolved [`AnyChannel`] (the PVA adapter's per-peer channel
+    /// cache) detect that group name→definition bindings may have
+    /// changed and re-resolve, without re-checking the map per op.
+    group_generation: std::sync::atomic::AtomicU64,
     /// QSRV2 serving gate. pvxs adds the single-record and group sources
     /// to the PVA server only when `enable2()` returns true
     /// (`ioc/iochooks.cpp:461-496`, gated by `PVXS_QSRV_ENABLE` /
@@ -806,6 +812,7 @@ impl BridgeProvider {
             ops_subscribe: std::sync::atomic::AtomicU64::new(0),
             base_group_defs: parking_lot::RwLock::new(Vec::new()),
             group_files: parking_lot::RwLock::new(Vec::new()),
+            group_generation: std::sync::atomic::AtomicU64::new(0),
             enabled,
         }
     }
@@ -915,6 +922,13 @@ impl BridgeProvider {
         // immutable receiver is correct — `&mut self` blocked
         // hot-reload through `Arc<BridgeProvider>`.
         *self.access_cell.write() = access;
+    }
+
+    /// Current group-registry generation (see the field doc). A cached
+    /// channel resolution is valid only while this value is unchanged.
+    pub fn group_generation(&self) -> u64 {
+        self.group_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get a clone of the current access control policy.
@@ -1064,6 +1078,8 @@ impl BridgeProvider {
             }
         }
         *self.groups.write() = merged;
+        self.group_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Load group definitions from a record's info(Q:group, ...) tag.
@@ -1255,6 +1271,8 @@ impl BridgeProvider {
         self.base_group_defs.write().clear();
         self.group_files.write().clear();
         self.groups.write().clear();
+        self.group_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         n
     }
 

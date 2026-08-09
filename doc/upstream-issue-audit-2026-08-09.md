@@ -94,11 +94,18 @@ level (debug-only log). C refuses the channel. The group path already
 has the gate (`resolve_db_channel`); the single-record path never calls
 it.
 
-### UI-22 Client retries a refused CREATE_CHANNEL at ~1 s forever
+### UI-22 Client retries a refused CREATE_CHANNEL at ~1 s forever — CLEARED
 Severity: MED. epics-rs: `crates/epics-pva-rs/src/client_native/channel.rs:987-989`, `client_native/search_engine.rs:1251-1256`, `:1514-1525`. Upstream: pvxs#193 (client half; fixed upstream in 084336bb).
 Refusal → re-search → current bucket (≤1 s) → refusal, indefinitely,
 attempt counter reset each pass — the pre-fix pvxs loop. Upstream now
 drops the channel into the furthest search bucket (~30 s).
+CLEARED: new `SearchReason::CreateRefused` selected when
+`researched_after_refusal`; `placement_bucket` parks it at
+`(current + N_SEARCH_BUCKETS - 1) % N_SEARCH_BUCKETS` (pvxs
+`laterBucket`), and the immediate-broadcast fast path stays gated on
+`SearchReason::Initial`, so a refused channel waits one full ring
+revolution (~30 s) by construction. Placement unit test covers the
+wrap-at-0 boundary and every non-zero bucket.
 
 ### UI-63 Enum/menu sources read as string over links deliver index digits, not labels
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/links.rs:1353-1357`, `processing.rs:2517-2536`, `types/value.rs:99,1150`; CA half `crates/epics-ca-rs/src/calink/resolver.rs:553`. Upstream: epics-base#183 (closed-fixed), #855 (mechanism).

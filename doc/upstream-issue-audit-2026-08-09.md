@@ -195,12 +195,19 @@ errno digits) instead of `eprintln!`, and `libc::_exit` instead of
 Existing regressions `missing_child_binary_exits_255_not_127` /
 `failed_chdir_exits_255_not_126` exercise the new failure path.
 
-### UI-24 Tree formatter drops the member name for `any`/union inline fields
+### UI-24 Tree formatter drops the member name for `any`/union inline fields — CLEARED
 Severity: LOW. epics-rs: `crates/epics-pva-rs/src/format.rs:1376-1377`, `:1411-1417`. Upstream: pvxs#46 residue.
 The #46 fix proper is ported, but upstream's inline branch emits
 `' ' << member` and ours never does: `pvinfo-rs` prints `any` instead of
 `any parameters`; value mode omits the member path prefix. No test
 covers union/any/struct[] tree rendering.
+CLEARED: `tree_show_inline` now takes `member` and emits it first,
+before the union `.MEM` selector and value (datafmt.cpp:224-230); the
+misnamed `member_already_emitted` fmt parameter that documented the
+wrong assumption is gone. Test
+`format::tests::tree_inline_branch_keeps_the_member_name` covers the
+inline boundaries: `any`/`any[]` describe mode, valued `any`, valued
+`union u.i`, and the null union.
 
 ### UI-65 DBF_ULONG string puts lack C's via-double fallback
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/types/c_parse.rs:107-135,180-259`. Upstream: epics-base#564 (the fallback is quoted in its comments; dbConvert.c:1044-1057).

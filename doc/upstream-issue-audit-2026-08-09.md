@@ -132,7 +132,7 @@ slot under a different conversion than it was fetched with (that
 directive already emits IVLS); lsi's disconnected-source silent-success
 (`dbGetLinkLS` dtyp<0 → status 0) keeps our failed-read LINK alarm.
 
-### UI-64 DB-link puts to link fields are accepted where C's dbPut refuses
+### UI-64 DB-link puts to link fields are accepted where C's dbPut refuses — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/field_io.rs:653-707` (`put_pv_body`), reached from `links.rs:1504`. Upstream: epics-base#876 (the C guard is dbAccess.c:1340).
 C's `dbPut` refuses writes to DBF_INLINK/OUTLINK/FWDLINK
 (`field_type > DBF_DEVICE` → S_db_badDbrtype); only `dbPutField`
@@ -140,6 +140,24 @@ C's `dbPut` refuses writes to DBF_INLINK/OUTLINK/FWDLINK
 write path lands in `put_pv_body` with no such guard: a local DB link
 can silently rewire another record's link field every process — a
 semantics divergence and lock-model hazard C deliberately forbids.
+
+CLEARED: `check_not_link_field` (new `CaError::BadDbrType`, C
+S_db_badDbrtype) refuses link fields in both `dbPut`-analogue bodies
+(`put_pv_body`, `put_pv_and_post_with_origin`); the OUT-link route now
+lands the refusal on the writer as LINK/INVALID exactly like C
+`setLinkAlarm`. The dbPutField-analogue paths keep their link writes:
+`put_record_field_from_ca*` (re-parse via `put_common_field`),
+`put_pv_no_process` (autosave; C `reboot_restore` = dbPutField), and
+autosave's Process mode routes link entries through the no-process
+write. QSRV single-source Force/Inhibit puts re-route link fields down
+the Passive/CA path per pvxs `doDbPut`'s per-field split
+(iocsource.cpp:451-458, singlesource.cpp:374-383);
+`PvDatabase::is_dbf_link_field` is the one classification owner. QSRV
+GROUP puts keep refusing link members in the preparation pass ("Links
+not supported for put", groupsource.cpp:603-606) — already implemented
+and tested, unchanged. Boundary tests:
+`tests/dbput_refuses_link_fields.rs` (6),
+`testqsingle.rs::link_field_put_succeeds_in_every_process_mode`.
 
 ### UI-101 `iocshLoad`/`<` recursion has no depth guard — self-including script aborts the IOC
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/iocsh/mod.rs:103-113`, `:84-88`. Upstream: epics-base#499 (worse than C).

@@ -50,6 +50,18 @@ pub enum CaError {
     #[error("illegal menu choice: {0}")]
     BadChoice(String),
 
+    /// C `S_db_badDbrtype` ("Illegal Database Request Type") — `dbPut`
+    /// refusing a put to a DBF link field (`field_type > DBF_DEVICE`,
+    /// `dbAccess.c:1340-1347`). Only `dbPutField` changes link fields, by
+    /// routing them through `dbPutFieldLink` (`dbAccess.c:1261-1262`); a
+    /// `dbPut` reached from a record's OUT link (`dbPutLink` →
+    /// `dbDbPutValue`) or from internal code refuses, so a DB link cannot
+    /// silently rewire another record's link field. rsrv answers it with
+    /// ECA_PUTFAIL like every non-zero put status (`to_eca_status`'s
+    /// catch-all).
+    #[error("illegal database request type: {0}")]
+    BadDbrType(String),
+
     #[error("put disabled (DISP=1) for field {0}")]
     PutDisabled(String),
 

@@ -614,7 +614,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     let mut b = BusyRecord::new();
     b.siml = "NO:SUCH:RECORD".to_string();
     db.add_record("E5BUSY", Box::new(b)).await.unwrap();
-    db.put_pv("E5BUSY.OUT", EpicsValue::String("E5TGT".into()))
+    db.put_record_field_from_ca_no_notify("E5BUSY", "OUT", EpicsValue::String("E5TGT".into()))
         .await
         .unwrap();
     db.put_pv("E5BUSY", EpicsValue::Short(1)).await.unwrap();

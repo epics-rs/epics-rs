@@ -2597,9 +2597,13 @@ mod tests {
             .await
             .unwrap();
         // A.FLNK -> B (both default to SCAN=Passive, so FLNK processes B).
-        db.put_pv("FLNK:a.FLNK", EpicsValue::String("FLNK:b".into()))
-            .await
-            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            "FLNK:a",
+            "FLNK",
+            EpicsValue::String("FLNK:b".into()),
+        )
+        .await
+        .unwrap();
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         let store = QsrvPvStore::new(provider);
 

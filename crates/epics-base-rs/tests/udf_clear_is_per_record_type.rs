@@ -93,7 +93,7 @@ async fn dfanout_with_closed_loop_dol_is_defined() {
     db.add_record("DF2", Box::new(DfanoutRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("DF2.DOL", EpicsValue::String("SRC".into()))
+    db.put_record_field_from_ca_no_notify("DF2", "DOL", EpicsValue::String("SRC".into()))
         .await
         .unwrap();
     db.put_pv("DF2.OMSL", EpicsValue::String("closed_loop".into()))

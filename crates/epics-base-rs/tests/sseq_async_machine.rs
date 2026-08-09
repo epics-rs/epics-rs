@@ -713,9 +713,13 @@ async fn sseq_link_status_reclassifies_on_special() {
     // A client put to the DOL1 link string re-runs checkLinks via special().
     // The init-time CON refresh and this LOC refresh race; the gate must let
     // the newer LOC classification win.
-    db.put_pv("SSEQ_SP.DOL1", EpicsValue::String("SSEQ_SP_TGT.VAL".into()))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca_no_notify(
+        "SSEQ_SP",
+        "DOL1",
+        EpicsValue::String("SSEQ_SP_TGT.VAL".into()),
+    )
+    .await
+    .unwrap();
     poll_i16(&db, "SSEQ_SP.DOL1V", 2, "DOL1 repointed to local → LOC").await;
 
     // And it must stay LOC — a stale CON post arriving late cannot clobber it.

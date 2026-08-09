@@ -73,6 +73,31 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
     Ok(())
 }
 
+/// C `dbPut`'s link-field refusal (`field_type > DBF_DEVICE` →
+/// `S_db_badDbrtype`, `dbAccess.c:1340-1347`): only `dbPutField` may change a
+/// DBF_INLINK/OUTLINK/FWDLINK field — it routes them through `dbPutFieldLink`
+/// (`dbAccess.c:1261-1262`) — so every `dbPut`-analogue body refuses them
+/// before converting anything. This is what stops a record's DB OUT link
+/// (`dbPutLink` → `dbDbPutValue` → `dbPut`) from silently rewiring another
+/// record's link field on every process. The port's `dbPutField` analogue is
+/// the `put_record_field_from_ca` family, whose ordinary write path re-parses
+/// the link (`RecordInstance::put_common_field`'s INP/OUT/FLNK arms);
+/// `put_pv_no_process` is the autosave-restore entry whose C analogue is
+/// likewise `dbPutField` (`reboot_restore`), so it stays link-writable.
+///
+/// `field` must already be upper-cased.
+fn check_not_link_field(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+) -> CaResult<()> {
+    if crate::types::dbf_link_class(instance.record.record_type(), field).is_some() {
+        return Err(CaError::BadDbrType(format!(
+            "dbPut: {field} is a link field; only dbPutField changes link fields"
+        )));
+    }
+    Ok(())
+}
+
 /// Does an *external* put to `field` drive a processing cycle on this record?
 ///
 /// C `dbPutField` (`dbAccess.c:1263-1268`) and pvxs `IOCSource::
@@ -650,6 +675,27 @@ impl PvDatabase {
         put_drives_processing_of(&instance, &field_upper)
     }
 
+    /// Is `record_name.field` a DBF link field (INLINK/OUTLINK/FWDLINK)?
+    ///
+    /// The one owner of the classification lookup
+    /// ([`crate::types::dbf_link_class`] keyed by the record's type). C
+    /// callers split on it before choosing a put entry: `dbPutField` sends
+    /// link fields to `dbPutFieldLink` (`dbAccess.c:1261`), `dbProcessNotify`
+    /// short-circuits them past the notify machinery (`dbNotify.c:337-353`),
+    /// and pvxs QSRV picks `dbChannelPutField` over `dbChannelPut` for them
+    /// (`iocsource.cpp:451-458`). Port callers with a dbPutField-shaped
+    /// entry make the same split against the `dbPut`-analogue bodies' refusal
+    /// (`check_not_link_field`). `false` for an unknown record or a non-link
+    /// field.
+    pub fn is_dbf_link_field(&self, record_name: &str, field: &str) -> bool {
+        let field_upper = field.to_ascii_uppercase();
+        let Some(rec) = self.get_record(record_name) else {
+            return false;
+        };
+        let guard = rec.read();
+        crate::types::dbf_link_class(guard.record.record_type(), &field_upper).is_some()
+    }
+
     fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
@@ -695,6 +741,10 @@ impl PvDatabase {
                 // The refusal is returned to the caller; `write_out_link_value`
                 // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
                 check_no_mod(&instance, &field)?;
+
+                // C `dbPut` refuses a link-field target the same way, before
+                // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
+                check_not_link_field(&instance, &field)?;
 
                 let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -1008,6 +1058,7 @@ impl PvDatabase {
                 // Same `dbPut` gate as `put_pv` — this is the third `dbPut` body
                 // (value + monitor post), and C has ONE.
                 check_no_mod(&instance, &field)?;
+                check_not_link_field(&instance, &field)?;
 
                 let request = dbput_request(&*instance.record, &field, value)?;
 
@@ -1599,10 +1650,7 @@ impl PvDatabase {
         // so it processes nothing and returns immediate completion), so the
         // only correction the special case needs is to keep a link field OUT
         // of the notify PACT-defer park.
-        let is_dbf_link_field = {
-            let guard = rec.read();
-            crate::types::dbf_link_class(guard.record.record_type(), &field).is_some()
-        };
+        let is_dbf_link_field = self.is_dbf_link_field(record_name, &field);
         if want_notify && !is_dbf_link_field {
             let mut guard = rec.write();
             if guard.is_processing() {
@@ -2265,6 +2313,14 @@ impl PvDatabase {
     }
 
     /// Put a PV value without triggering process (for restore).
+    ///
+    /// Unlike the `dbPut`-analogue bodies (`put_pv`, `put_pv_and_post`) this
+    /// entry accepts DBF link fields: its production caller is the autosave
+    /// restore, whose C analogue (`reboot_restore`) writes via `dbPutField` —
+    /// and `dbPutField` on a link field is `dbPutFieldLink`, a re-parse
+    /// write that never processes. That is exactly this body's behavior
+    /// (`put_common_field`'s INP/OUT/FLNK arms, no process), so the
+    /// `check_not_link_field` refusal does not apply here.
     pub async fn put_pv_no_process(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();

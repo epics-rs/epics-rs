@@ -825,7 +825,22 @@ impl BridgeChannel {
             dbr_type: self.value_dbf as u16,
         };
         super::trap_write::put_with_trap(grant, meta, epics_val, |value| async move {
-            match opts.process {
+            // pvxs sends a DBF link field down the dbPutField path no matter
+            // the requested process mode: a non-wait put splits per-field
+            // (`dbChannelPutField`, and NO doPostProcessing,
+            // singlesource.cpp:374-383) and a blocking put lands in
+            // `dbProcessNotify`'s link special case (write + immediate done,
+            // dbNotify.c:337-353). The port's `put_record_field_from_ca`
+            // family IS that path — its notify body keeps link fields out of
+            // the PACT park — while the `dbPut`-analogue `put_pv` refuses a
+            // link field outright (S_db_badDbrtype, dbAccess.c:1340). So a
+            // link-field put takes the Passive arms regardless of mode.
+            let process = if self.db.is_dbf_link_field(&self.record_name, &self.field) {
+                ProcessMode::Passive
+            } else {
+                opts.process
+            };
+            match process {
                 ProcessMode::Inhibit => {
                     self.db
                         .put_pv(&format!("{}.{}", self.record_name, self.field), value)

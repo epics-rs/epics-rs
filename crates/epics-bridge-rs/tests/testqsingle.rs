@@ -285,9 +285,13 @@ async fn dollar_modifier_serves_link_field_as_string() {
         .await
         .unwrap();
     // Seed the forward link so the `$` view has a non-empty char string.
-    db.put_pv("TEST:lnk.FLNK", EpicsValue::String("TEST:other".into()))
-        .await
-        .expect("seed FLNK");
+    db.put_record_field_from_ca_no_notify(
+        "TEST:lnk",
+        "FLNK",
+        EpicsValue::String("TEST:other".into()),
+    )
+    .await
+    .expect("seed FLNK");
     let provider = Arc::new(BridgeProvider::new(db.clone()));
 
     let any = provider
@@ -1359,5 +1363,60 @@ async fn r17_31_char_waveform_without_qform_stays_a_byte_array() {
     match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
         PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => {}
         other => panic!("expected a byte array, got {other:?}"),
+    }
+}
+
+/// pvxs sends a DBF link field down the dbPutField path no matter the
+/// requested process mode: `doDbPut` splits per-field
+/// (`iocsource.cpp:451-458`) and the single source skips post-processing
+/// for links entirely (`singlesource.cpp:374-383`); a blocking put lands in
+/// `dbProcessNotify`'s link special case (write + immediate done,
+/// `dbNotify.c:337-353`). The port's Force/Inhibit routes used `put_pv`,
+/// the `dbPut` analogue that now refuses link fields (S_db_badDbrtype,
+/// `dbAccess.c:1340`) — a link-field put must re-route, not refuse.
+#[tokio::test]
+async fn link_field_put_succeeds_in_every_process_mode() {
+    use epics_bridge_rs::qsrv::{ProcessMode, PutOptions};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:lnkmode", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("TEST:lnktgt", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let ch = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:lnkmode.FLNK".into(),
+        "TEST:lnkmode".into(),
+        "FLNK".into(),
+        NtType::Scalar,
+        DbFieldType::String,
+    );
+
+    for (mode, block, target) in [
+        (ProcessMode::Passive, false, "TEST:lnktgt"),
+        (ProcessMode::Inhibit, false, ""),
+        (ProcessMode::Force, false, "TEST:lnktgt"),
+        (ProcessMode::Force, true, ""),
+    ] {
+        let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+        put.fields.push((
+            "value".into(),
+            PvField::Scalar(ScalarValue::String(target.into())),
+        ));
+        let opts = PutOptions {
+            process: mode,
+            block,
+        };
+        ch.put_with_options(&put, opts)
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?} block={block}: link-field put must succeed: {e}"));
+        let text = match db.get_pv("TEST:lnkmode.FLNK").unwrap() {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("FLNK read back non-string: {other:?}"),
+        };
+        assert_eq!(text, target, "{mode:?} block={block}");
     }
 }

@@ -42,6 +42,31 @@ pub struct IocShell {
     /// because the shell drives one script at a time on a single
     /// thread; the `on error` command mutates it mid-script.
     on_error: std::cell::Cell<OnError>,
+    /// Nesting depth of the running `<` / `iocshLoad` script includes —
+    /// `Cell` for the same single-thread reason as `on_error`. C has no
+    /// explicit bound: a self-including script survives only because each
+    /// nested include holds its `FILE*` open and `fopen` eventually fails
+    /// at the process fd limit (epics-base#499). This port reads the whole
+    /// script and closes the fd before recursing, so without an explicit
+    /// cap the recursion is bounded only by the thread stack — a Rust
+    /// stack-overflow abort at boot. See [`MAX_SCRIPT_DEPTH`].
+    script_depth: std::cell::Cell<usize>,
+}
+
+/// Deepest `<` / `iocshLoad` script nesting the shell will enter before
+/// refusing the include — the explicit form of C's incidental fd-limit
+/// backstop (epics-base#499). 32 matches the `db_loader`'s
+/// `max_include_depth` for DB-file includes.
+const MAX_SCRIPT_DEPTH: usize = 32;
+
+/// Depth ticket for one running script — every exit path of the script
+/// executors releases it via `Drop`.
+struct ScriptDepthGuard<'a>(&'a IocShell);
+
+impl Drop for ScriptDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.script_depth.set(self.0.script_depth.get() - 1);
+    }
 }
 
 impl IocShell {
@@ -77,7 +102,23 @@ impl IocShell {
             registry: Arc::new(RwLock::new(registry)),
             ctx: CommandContext::new_with_acf(db, bridge, acf),
             on_error: std::cell::Cell::new(OnError::Continue),
+            script_depth: std::cell::Cell::new(0),
         }
+    }
+
+    /// Take a depth ticket for one nested script, refusing past
+    /// [`MAX_SCRIPT_DEPTH`] so a self-including script errors out at the
+    /// include line instead of overflowing the thread stack.
+    fn enter_script(&self, path: &str) -> Result<ScriptDepthGuard<'_>, String> {
+        let depth = self.script_depth.get();
+        if depth >= MAX_SCRIPT_DEPTH {
+            return Err(format!(
+                "'{path}': script include depth exceeds {MAX_SCRIPT_DEPTH} — \
+                 recursive '<' / iocshLoad?"
+            ));
+        }
+        self.script_depth.set(depth + 1);
+        Ok(ScriptDepthGuard(self))
     }
 
     /// Register an additional command (thread-safe, takes &self).
@@ -263,6 +304,7 @@ impl IocShell {
         path: &str,
         macros: &HashMap<String, String>,
     ) -> Result<(), String> {
+        let _depth = self.enter_script(path)?;
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
         let mut last_err: Option<String> = None;
@@ -303,6 +345,7 @@ impl IocShell {
     /// failed — the equivalent of `iocshSetError` propagating a non-zero exit
     /// status to startup-script callers (e.g., automated IOC verification).
     pub fn execute_script(&self, path: &str) -> Result<(), String> {
+        let _depth = self.enter_script(path)?;
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
 
@@ -868,6 +911,56 @@ mod tests {
         // A non-existent file should return an error
         let result = shell.execute_line("< nonexistent_file.cmd");
         assert!(result.is_err());
+    }
+
+    /// epics-base#499: a self-including script must error out at the
+    /// depth cap, not abort the IOC with a stack overflow. C survives
+    /// only because each nested include holds its `FILE*` open until
+    /// `fopen` fails at the fd limit; this port closes the file before
+    /// recursing, so the cap is explicit. Covers both recursion entries
+    /// (`<` and `iocshLoad`) and checks the depth ticket unwinds to 0.
+    #[test]
+    fn self_including_script_errors_at_the_depth_cap() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = dir.path().join("self.cmd");
+        std::fs::write(&path, format!("< {}\n", path.display())).unwrap();
+        let err = shell
+            .execute_script(&path.display().to_string())
+            .expect_err("self-include via '<' must fail at the cap");
+        assert!(err.contains("depth exceeds"), "got: {err}");
+        assert_eq!(shell.script_depth.get(), 0, "depth ticket fully released");
+
+        let path2 = dir.path().join("self2.cmd");
+        std::fs::write(&path2, format!("iocshLoad {}\n", path2.display())).unwrap();
+        let err = shell
+            .execute_script(&path2.display().to_string())
+            .expect_err("self-include via iocshLoad must fail at the cap");
+        assert!(err.contains("depth exceeds"), "got: {err}");
+        assert_eq!(shell.script_depth.get(), 0, "depth ticket fully released");
+    }
+
+    /// Legitimate nesting under the cap keeps working, and the depth
+    /// resets between runs (the guard is a ticket, not a ratchet).
+    #[test]
+    fn nested_include_under_the_cap_still_runs() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.cmd");
+        std::fs::write(&inner, "#- inner\n").unwrap();
+        let outer = dir.path().join("outer.cmd");
+        std::fs::write(&outer, format!("< {}\n", inner.display())).unwrap();
+        let outer_path = outer.display().to_string();
+        shell
+            .execute_script(&outer_path)
+            .expect("two-level include must succeed");
+        assert_eq!(shell.script_depth.get(), 0);
+        // A second run starts from depth 0 again.
+        shell
+            .execute_script(&outer_path)
+            .expect("re-running the same include must succeed");
+        assert_eq!(shell.script_depth.get(), 0);
     }
 
     #[test]

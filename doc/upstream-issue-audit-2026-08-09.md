@@ -159,12 +159,22 @@ and tested, unchanged. Boundary tests:
 `tests/dbput_refuses_link_fields.rs` (6),
 `testqsingle.rs::link_field_put_succeeds_in_every_process_mode`.
 
-### UI-101 `iocshLoad`/`<` recursion has no depth guard — self-including script aborts the IOC
+### UI-101 `iocshLoad`/`<` recursion has no depth guard — self-including script aborts the IOC — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/iocsh/mod.rs:103-113`, `:84-88`. Upstream: epics-base#499 (worse than C).
 C survives via the incidental fd limit; our `read_to_string` closes the
 fd, so recursion is bounded only by the thread stack → Rust
 stack-overflow abort at boot. The only depth guard in iocsh
 (`max_include_depth: 32`) covers DB-file includes, not scripts.
+CLEARED: `IocShell` now carries a `script_depth` cell; both script
+executors (`execute_script`, `execute_script_with_macros`) take a
+Drop-released `ScriptDepthGuard` via `enter_script`, refusing past
+`MAX_SCRIPT_DEPTH = 32` (matching the db_loader `max_include_depth`
+convention). At the cap the include line errors and unwinds through
+normal `on error` semantics — the explicit form of C's fd-exhaustion
+failure. Tests:
+`iocsh::tests::self_including_script_errors_at_the_depth_cap` (both
+`<` and `iocshLoad` entries, ticket unwinds to 0),
+`iocsh::tests::nested_include_under_the_cap_still_runs`.
 
 ### UI-104 procserv-rs allocates and locks stdio between forkpty and exec
 Severity: MED. epics-rs: `crates/epics-tools-rs/src/procserv/child.rs:309-384`. Upstream: epics-base#211 (fork-safety class).

@@ -220,7 +220,7 @@ fn fill_nt_scalar(desc: &FieldDesc, snap: &Snapshot) -> PvField {
         set_leaf(
             &mut v,
             "display.description",
-            PvField::Scalar(ScalarValue::String(d.description.clone().into())),
+            PvField::Scalar(ScalarValue::String(d.description.clone())),
         );
         set_leaf(
             &mut v,
@@ -384,7 +384,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .unwrap_or_default();
     display.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(description.into())),
+        PvField::Scalar(ScalarValue::String(description)),
     ));
 
     let mut s = PvStructure::new("epics:nt/NTEnum:1.0");

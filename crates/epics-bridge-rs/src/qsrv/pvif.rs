@@ -768,8 +768,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
                 .display
                 .as_ref()
                 .map(|d| d.description.clone())
-                .unwrap_or_default()
-                .into(),
+                .unwrap_or_default(),
         )),
     ));
     pv.fields
@@ -1274,7 +1273,7 @@ fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> 
     }
     d.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(disp.description.clone().into())),
+        PvField::Scalar(ScalarValue::String(disp.description.clone())),
     ));
     d.fields.push((
         "units".into(),

@@ -909,7 +909,8 @@ fn build_link_metadata(
                 md.units = Some(d.units.as_str_lossy().into_owned());
             }
             if !d.description.is_empty() {
-                md.description = Some(d.description.clone());
+                // Same lossy `String` cache rendering as `units` above.
+                md.description = Some(d.description.as_str_lossy().into_owned());
             }
         }
         if let Some(c) = snap.control.as_ref() {

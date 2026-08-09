@@ -307,7 +307,7 @@ three dbCreateRecord rejection tests now assert Err, and
 `on_error_break_stops_at_a_failed_db_command` pins that a real command
 failure (not just an unknown command) trips `on error break`.
 
-### UI-106 qsrv serves an always-empty `display.description` — pvxs fills it from DESC
+### UI-106 qsrv serves an always-empty `display.description` — pvxs fills it from DESC — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/record/record_instance.rs` (`populate_display_info`), `crates/epics-bridge-rs/src/qsrv/pvif.rs:763-776`, `:1275-1278`. Upstream: epics-base#785 (the port is behind the pvxs half).
 The NTScalar/NTEnum builders emit the `display.description` leaf and
 `qsrv_marks::property_leaves` marks it, but no producer ever assigns
@@ -317,6 +317,22 @@ initialize (`iocsource.cpp:307-310`). The C-defect half of #785 — no
 DBE_PROPERTY on a DESC write because DESC lacks `prop(YES)` — is exact
 parity (pinned at `record_instance.rs:5523`) and stays: posting it
 would be a wire-visible divergence upstream has not decided to make.
+CLEARED: `populate_display_info` ends with a uniform epilogue filling
+`display.description` from `common.desc` for every record type (the
+builders always emit the leaf, so a newly-Some display changes leaf
+values, never wire shape). `DisplayInfo::description` became
+`PvString` for the same byte-preservation reason as `units`. Cache
+freshness is owned by the DESC arm of `put_common_field` — the single
+writer of `common.desc` — which invalidates the metadata cache on a
+real change WITHOUT posting DBE_PROPERTY, exactly pvxs's fresh-on-
+rebuild/no-event behavior; DESC stays out of `is_metadata_field`
+(both invariant doc comments updated). Field channels inherit the
+record's DESC through the shared per-record cache, matching pvxs's
+`dbChannelRecord(pChannel)->desc`. Three tests that pinned
+`display.is_none()` for no-display-arm record types now assert
+empty-units/default limits; new boundary tests
+`desc_reaches_display_description_and_a_write_refreshes_it` and
+`an_idempotent_desc_put_keeps_the_cache`.
 
 ### UI-107 HAG hostnames frozen at ACF parse under asCheckClientIP — stale after DNS change
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/access_security.rs:1717-1748`, `:1518`. Upstream: epics-base#863 (AS half; C parity; upstream PR #862 in flight).

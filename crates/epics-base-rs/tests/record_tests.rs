@@ -2131,7 +2131,11 @@ fn test_snapshot_bi_enum_strings() {
     let inst = RecordInstance::new("BI:TEST".into(), rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
-    assert!(snap.display.is_none());
+    // bi has no display source beyond dbCommon DESC (UI-106): the block
+    // exists solely to carry `description`, everything else default.
+    let disp = snap.display.as_ref().unwrap();
+    assert!(disp.units.is_empty());
+    assert!(disp.description.is_empty());
     assert!(snap.control.is_none());
     let enums = snap.enums.as_ref().unwrap();
     assert_eq!(enums.strings.len(), 2);
@@ -2475,7 +2479,11 @@ fn test_snapshot_stringin_no_metadata() {
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     assert_eq!(snap.value, EpicsValue::String("hello".into()));
-    assert!(snap.display.is_none());
+    // stringin has no display source beyond dbCommon DESC (UI-106): the
+    // block carries only `description`, everything else default.
+    let disp = snap.display.as_ref().unwrap();
+    assert!(disp.units.is_empty());
+    assert_eq!(disp.upper_disp_limit, 0.0);
     assert!(snap.control.is_none());
     assert!(snap.enums.is_none());
 }

@@ -56,8 +56,16 @@ after the frame is written and closes the budget on exit so parked
 senders fail instead of waiting forever. Boundary tests in
 `tx_byte_budget_tests`.
 
-### UI-1 EPICS_CA_NAME_SERVERS entries never re-resolve DNS
+### UI-1 EPICS_CA_NAME_SERVERS entries never re-resolve DNS — CLEARED
 Severity: MED. epics-rs: `crates/epics-ca-rs/src/client/mod.rs:805-806`, `client/search.rs:1147-1191`. Upstream: epics-base#488 (partial).
+CLEARED: `parse_nameserver_list` now yields `AddrEntry` (the #488
+primitive) and the entry rides to `run_nameserver_connection`, which
+calls `refresh_dns()` before every dial — same keep-cached-IP-on-failure
+policy as the ADDR_LIST refresh. Regression test
+`a_nameserver_dial_uses_the_fresh_dns_resolution`. Residual: the
+`experimental-rust-tls` SNI override map is still keyed by the
+startup-resolved `SocketAddr`, so a moved nameserver loses its SNI
+override until restart.
 The `EPICS_CA_ADDR_LIST` half of #488 is deliberately fixed (periodic
 `refresh_dns`), but name-server entries are resolved once at startup and
 the per-nameserver task redials the same stale `SocketAddr` forever

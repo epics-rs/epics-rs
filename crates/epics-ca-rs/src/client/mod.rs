@@ -795,15 +795,13 @@ impl CaClient {
         let sni_overrides: std::collections::HashMap<SocketAddr, String> = {
             let mut map: std::collections::HashMap<SocketAddr, String> = nameserver_entries
                 .iter()
-                .filter_map(|(addr, host)| host.clone().map(|h| (*addr, h)))
+                .filter_map(|e| e.hostname.clone().map(|h| (e.sock, h)))
                 .collect();
             for (addr, host) in parse_tls_sni_map() {
                 map.insert(addr, host);
             }
             map
         };
-        let nameserver_addrs: Vec<SocketAddr> =
-            nameserver_entries.iter().map(|(a, _)| *a).collect();
 
         let (search_tx, search_rx) = mpsc::unbounded_channel();
         let (search_resp_tx, search_resp_rx) = mpsc::unbounded_channel();
@@ -834,7 +832,7 @@ impl CaClient {
         // gate — a target IOC's `ca://` links now resolve the way a C IOC's do.
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
-            nameserver_addrs,
+            nameserver_entries,
             search_rx,
             search_resp_tx,
             search_attempts.clone(),
@@ -5376,7 +5374,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
 /// SNI / cert-verification name for that specific server, so multi-IOC TLS
 /// deployments with hostname-bound certs work without a single global
 /// `EPICS_CA_TLS_SERVER_NAME` override.
-pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
+pub(crate) fn parse_nameserver_list() -> Vec<AddrEntry> {
     let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_NAME_SERVERS.get() else {
         return Vec::new();
     };
@@ -5392,20 +5390,25 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // C `cac.cpp:259` — the SAME tokenizer the client address list is built
     // with, which is why a bad token here is reported in exactly the same two
     // lines, naming this variable.
-    let out: Vec<(SocketAddr, Option<String>)> =
-        crate::iocinf::add_addr_to_channel_access_address_list(
-            &list,
-            "EPICS_CA_NAME_SERVERS",
-            default_server_port,
-        )
-        .into_iter()
-        .map(|tok| (tok.sock, tok.hostname))
-        .collect();
+    // `AddrEntry`, not a bare `SocketAddr`: the hostname must survive to
+    // the per-nameserver circuit so its redial path can re-resolve DNS
+    // (the same Launchpad-#488 family `EPICS_CA_ADDR_LIST` already
+    // handles via `AddrEntry::refresh_dns`). The resolved port carries
+    // over — explicit `host:port` entries keep it, bare hostnames got
+    // `default_server_port` above.
+    let out: Vec<AddrEntry> = crate::iocinf::add_addr_to_channel_access_address_list(
+        &list,
+        "EPICS_CA_NAME_SERVERS",
+        default_server_port,
+    )
+    .into_iter()
+    .map(|tok| AddrEntry::new(tok.sock, tok.hostname, tok.sock.port()))
+    .collect();
     // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
     // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
     // and warns about what it drops for the same reason: a repeated entry
     // otherwise buys a second TCP circuit to that name server.
-    crate::iocinf::remove_duplicate_addresses(out, |(addr, _)| *addr)
+    crate::iocinf::remove_duplicate_addresses(out, |e| e.sock)
 }
 
 // Legacy `parse_addr_list() -> Vec<SocketAddr>`

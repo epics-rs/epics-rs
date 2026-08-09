@@ -1858,7 +1858,6 @@ impl PvDatabase {
         // filtered SimplePv never answers a SEARCH and the client never
         // reaches CREATE_CHAN. See that function for the full rationale.
         let record_path = filters::split_channel_name(name).record_path;
-        let (base, _) = parse_pv_name(&record_path);
         if self
             .inner
             .simple_pvs
@@ -1867,15 +1866,58 @@ impl PvDatabase {
         {
             return true;
         }
-        if self.inner.records.read().contains_key(base) {
+        // C's search-side test is `dbChannelTest` (`dbChannel.c:441-464`),
+        // which resolves the FIELD too — `REC.NOSUCH` answers "does not
+        // exist" rather than drawing the client into a CREATE_CHAN it must
+        // then refuse (pvxs#193). Validate an explicit suffix; a bare name
+        // binds `VAL`, which every record type declares, so the record's
+        // existence alone answers it — that also keeps this function
+        // lock-free per record for the DB-link locality callers, which
+        // pass suffix-less record names.
+        let (base, explicit_field) = match record_path.rsplit_once('.') {
+            Some((base, field)) => (base, Some(field)),
+            None => (record_path.as_str(), None),
+        };
+        let rec = self.inner.records.read().get(base).cloned().or_else(|| {
+            // Alias entry exists and points to a live record
+            // (epics-base PR #336).
+            let target = self.inner.aliases.read().get(base).cloned();
+            target.and_then(|t| self.inner.records.read().get(&t).cloned())
+        });
+        let Some(rec) = rec else {
+            return false;
+        };
+        let Some(field) = explicit_field else {
             return true;
+        };
+        let instance = rec.read();
+        // Trailing `$` is the long-string modifier, part of the channel
+        // syntax (`dbChannel.c:486-505`): eligible only on a `DBF_STRING`
+        // or link field, and `dbChannelTest` refuses it anywhere else.
+        match field.strip_suffix('$') {
+            Some(core) => instance
+                .resolve_string_view_field(&core.to_ascii_uppercase())
+                .is_some(),
+            None => {
+                // Existence is the DECLARED-name question, not the
+                // has-a-value question: `dbNameToAddr` resolves any field
+                // the `.dbd` declares — including `DBF_NOACCESS` ones like
+                // `MLOK` — so pvxs answers the SEARCH for them and refuses
+                // at CREATE instead (measured against `softIocPVX`:
+                // `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`).
+                // Three name sources, matching the port's field model:
+                // `resolve_field` (valued fields, incl. common/virtual ones
+                // like `RTYP`/`TIME` that C answers from dbStaticLib),
+                // `field_desc` (declared-but-valueless record fields), and
+                // the `dbCommon` `DBF_NOACCESS` internals the generated
+                // tables drop (`is_dbcommon_noaccess` — see its doc for the
+                // record-own residual).
+                let upper = field.to_ascii_uppercase();
+                instance.resolve_field(&upper).is_some()
+                    || instance.field_desc(&upper).is_some()
+                    || crate::server::record::is_dbcommon_noaccess(&upper)
+            }
         }
-        // Alias entry exists and points to a live record
-        // (epics-base PR #336).
-        if let Some(target) = self.inner.aliases.read().get(base) {
-            return self.inner.records.read().contains_key(target);
-        }
-        false
     }
 
     /// Look up an entry by name. Supports "record.FIELD" syntax.
@@ -2376,6 +2418,39 @@ mod tests {
         assert!(db.has_name("ALIAS_NAME").await);
         assert!(db.has_name("TARGET").await);
         assert!(!db.has_name("NOT:THERE").await);
+    }
+
+    /// C answers a SEARCH through `dbChannelTest` (`dbChannel.c:441-464`),
+    /// which validates the field: `REC.NOSUCH` is "does not exist", not an
+    /// invitation to a CREATE_CHAN the server must then refuse (pvxs#193).
+    /// One case per boundary: bare name, real field, missing field, the
+    /// alias twin of each, and the `$` modifier's eligibility split.
+    #[epics_macros_rs::epics_test]
+    async fn search_gate_refuses_a_field_the_record_does_not_have() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "TARGET",
+            Box::new(crate::server::records::ai::AiRecord::new(42.0)),
+        )
+        .await
+        .unwrap();
+        db.add_alias("ALIAS_NAME", "TARGET").await.unwrap();
+
+        assert!(db.has_name("TARGET.VAL").await);
+        assert!(db.has_name("TARGET.SEVR").await);
+        assert!(!db.has_name("TARGET.NOSUCH").await);
+        // Declared but valueless (`MLOK` is `DBF_NOACCESS`): `dbNameToAddr`
+        // resolves it, so the search answers and CREATE is where the
+        // refusal lands — measured `pvxget ORACLE:AI.MLOK` → `Refused to
+        // create Channel` (see `search_claims_every_dbd_name_but_create_
+        // gates_on_a_servable_field` in `epics-pva-rs`).
+        assert!(db.has_name("TARGET.MLOK").await);
+        assert!(db.has_name("ALIAS_NAME.EGU").await);
+        assert!(!db.has_name("ALIAS_NAME.NOSUCH").await);
+        // `$` re-views a DBF_STRING/link field as a char array; anything
+        // else is `S_dbLib_fieldNotFound` (`dbChannel.c:486-505`).
+        assert!(db.has_name("TARGET.EGU$").await);
+        assert!(!db.has_name("TARGET.VAL$").await);
     }
 
     #[epics_macros_rs::epics_test]

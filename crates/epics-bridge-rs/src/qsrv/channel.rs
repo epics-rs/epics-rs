@@ -598,7 +598,7 @@ impl BridgeChannel {
         // truth for both the served DBF type and (below) the NT shape,
         // so the advertised descriptor cannot drift from the value the
         // GET path will serialize.
-        let (resolved, nt_type) = if string_view {
+        let (value, nt_type) = if string_view {
             // The `$` modifier is valid only on a `DBF_STRING` or link
             // field; every other field type is `S_dbLib_fieldNotFound` and
             // aborts channel creation, matching `dbChannelCreate`
@@ -615,14 +615,28 @@ impl BridgeChannel {
                     record: record_name.to_string(),
                     field: format!("{field_upper}$"),
                 })?;
-            (Some(v), NtType::LongString)
+            (v, NtType::LongString)
         } else {
             // `client_field_value`, not `resolve_field`: the value projected
             // onto the field's DECLARED type, which is what every delivery
             // path serves. Reading the DBF off the raw stored variant is what
             // advertised `.PROC` (`DBF_UCHAR`) as a signed byte and a
             // `DBF_MENU` field as a short.
-            let resolved = instance.client_field_value(&field_upper);
+            //
+            // `None` means the record does not have the field at all — the
+            // projection is infallible, so this is exactly `resolve_field`
+            // returning `None` — and C aborts channel creation there
+            // (`dbChannelCreate` → `S_dbLib_fieldNotFound`,
+            // `dbChannel.c:456-462`; pvxs renders it `Invalid PV:`,
+            // `ioc/channel.cpp:29-38`). Falling through used to fabricate an
+            // NTScalar double prototype the client would connect to and then
+            // fail every operation against (pvxs#193, server half).
+            let value = instance.client_field_value(&field_upper).ok_or_else(|| {
+                BridgeError::FieldNotFound {
+                    record: record_name.to_string(),
+                    field: field_upper.clone(),
+                }
+            })?;
             // `pvif::nt_type_for_channel` is the single owner of the NT
             // choice (the port's `getChannelValueType`): a record-declared
             // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) AND a
@@ -630,8 +644,8 @@ impl BridgeChannel {
             // QSRV long-string idiom — both resolve to the scalar-string
             // NTScalar, not the byte array the `DBF_CHAR` type alone would
             // select.
-            let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, resolved.as_ref());
-            (resolved, nt_type)
+            let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, Some(&value));
+            (value, nt_type)
         };
 
         // DBF type for the bound field. pvxs serves the type from
@@ -639,20 +653,14 @@ impl BridgeChannel {
         // dbChannel.h:452) — the channel's final field type after lookup,
         // which covers `dbCommon` fields, not only record-specific ones.
         //
-        // `resolved` above is `client_field_value`, i.e. already projected onto
+        // `value` above is `client_field_value`, i.e. already projected onto
         // the field's declared type, so reading the DBF off it IS reading the
         // declaration — and the advertised descriptor agrees with the value the
         // GET path serializes by construction, because both are that one
         // projection. Taking it from the RAW stored variant used to advertise
         // `.PROC` (`DBF_UCHAR`) as a signed byte and every `DBF_MENU` field as
         // a short: agreement with the value, but agreement on the wrong type.
-        //
-        // `Double` remains the backstop for a field that resolves to no value
-        // at all.
-        let value_dbf = resolved
-            .as_ref()
-            .map(|v| v.db_field_type())
-            .unwrap_or(DbFieldType::Double);
+        let value_dbf = value.db_field_type();
 
         Ok(Self {
             db,
@@ -1719,6 +1727,17 @@ mod tests {
             .await
             .expect("unfiltered channel must create");
         assert!(ch.channel_filters.is_empty());
+    }
+
+    /// pvxs#193, server half: a field the record does not declare aborts
+    /// channel creation (C `dbChannelCreate` → `S_dbLib_fieldNotFound`,
+    /// `dbChannel.c:456-462`) instead of fabricating an NTScalar double
+    /// prototype the client connects to and then fails every GET against.
+    #[tokio::test]
+    async fn a_field_the_record_does_not_have_refuses_the_channel() {
+        let db = db_with_rec().await;
+        let res = BridgeChannel::new(db, "REC.NOSUCH").await;
+        assert!(matches!(res, Err(BridgeError::FieldNotFound { .. })));
     }
 
     // ---- Force + block (record[process=true,block=true]) end-to-end wiring ----

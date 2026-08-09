@@ -28,9 +28,8 @@ use super::scan::{ScanType, SimModeScan};
 ///
 /// These are common fields — no record's `field_list` declares them — so the
 /// declaration names them here. The remaining `SPC_NOMOD` entries in
-/// `dbCommon.dbd` (MLOK, MLIS, BKLNK, ASP, PPN, PPNR, SPVT, RSET, DSET, DPVT,
-/// RDES, LSET, BKPT) are `DBF_NOACCESS`: they have no field API in this port at
-/// all, and C refuses them one level earlier, at `dbNameToAddr`.
+/// `dbCommon.dbd` are `DBF_NOACCESS` ([`DBCOMMON_NOACCESS`]): they have no
+/// field API in this port at all.
 ///
 /// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
 /// resolves `.TIME`, so the declaration must cover it.
@@ -40,6 +39,31 @@ const DBCOMMON_NOMOD: &[&str] = &[
     "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
     "PUTF", "RPRO", "TIME", "UTAG",
 ];
+
+/// The `DBF_NOACCESS` fields of `dbCommon.dbd` — C-internal pointers with no
+/// value API in this port (the generated tables drop them, `dbd_generated`
+/// module docs). Their NAMES still exist to C's resolver: `dbNameToAddr`
+/// resolves a `DBF_NOACCESS` field and the refusal lands at channel
+/// *creation*, where `mapDBFToDBR` yields `DBR_NOACCESS` — measured against
+/// `softIocPVX`: `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e.
+/// the SEARCH was answered. The search gate
+/// (`PvDatabase::has_name_no_resolve`) consults this list so those names
+/// keep answering; every *value* path stays closed to them.
+///
+/// Record-own `DBF_NOACCESS` internals (`BPTR` and friends) are NOT listed —
+/// the generator drops their names with their descs, so a search for them is
+/// refused where C would answer and then refuse the create. Restoring them
+/// needs the generator to emit the dropped names.
+const DBCOMMON_NOACCESS: &[&str] = &[
+    "MLOK", "MLIS", "BKLNK", "ASP", "PPN", "PPNR", "SPVT", "RSET", "DSET", "DPVT", "RDES", "LSET",
+    "BKPT",
+];
+
+/// Is `field` (already uppercased) a `dbCommon` `DBF_NOACCESS` internal —
+/// a name C resolves but never serves? See [`DBCOMMON_NOACCESS`].
+pub(crate) fn is_dbcommon_noaccess(field: &str) -> bool {
+    DBCOMMON_NOACCESS.contains(&field)
+}
 
 thread_local! {
     /// The origin tag applied to every event posted from the current

@@ -73,8 +73,19 @@ the per-nameserver task redials the same stale `SocketAddr` forever
 moves behind a stable DNS name is lost until client restart; worst on
 `name_servers_only` embedded search and the ca_gateway.
 
-### UI-21 QSRV single-record path admits unresolvable fields as a fabricated NTScalar double
+### UI-21 QSRV single-record path admits unresolvable fields as a fabricated NTScalar double — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/mod.rs:1853-1879` (`has_name_no_resolve`), `crates/epics-bridge-rs/src/qsrv/channel.rs:625-655`, `qsrv/pvif.rs:421`. Upstream: pvxs#193 (server half).
+CLEARED: `BridgeChannel::new` refuses an unresolvable field with
+`FieldNotFound` (C `S_dbLib_fieldNotFound`) instead of fabricating an
+NTScalar double, and `has_name_no_resolve` validates an explicit field
+suffix the way `dbChannelTest` does — declared-name existence, `$`
+eligibility, plus the `dbCommon` `DBF_NOACCESS` names
+(`DBCOMMON_NOACCESS`) that C resolves and pvxs answers SEARCH for
+(measured `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`).
+Residual: record-own `DBF_NOACCESS` names (`BPTR` family) were dropped
+by dbd-codegen with their descs, so a SEARCH for them stays silent where
+C would answer then refuse the create; restoring them needs the
+generator to emit the dropped names.
 The search/CREATE gate tests only the record name (field suffix
 discarded) and `BridgeChannel::new` backstops an unresolvable field
 (`REC.TIME`, any typo) with `DbFieldType::Double`/NTScalar — the client

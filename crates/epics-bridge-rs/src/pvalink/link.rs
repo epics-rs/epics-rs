@@ -1565,6 +1565,10 @@ impl PvaLink {
             precision,
             units,
             description,
+            // A pva link's cached value carries its own labels
+            // (`EnumWithChoices`, the NTEnum read path), so the
+            // metadata-side table the CA lset needs is redundant here.
+            enum_choices: None,
         })
     }
 

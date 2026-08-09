@@ -551,14 +551,30 @@ impl PvDatabase {
         depth: usize,
     ) -> crate::server::recgbl::simm::LinkFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        use crate::server::record::LinkReadAs;
         let Some(value) = self.read_link_value(link, visited, depth) else {
             return empty_read_fetch(link);
         };
-        // A conversion the SOURCE cannot satisfy is C's non-zero `dbGetLink`
-        // status (`dbConvert.c`'s NULL conversion slot), i.e. a FAILED read —
-        // never a silent no-op.
-        let converted = match read_as {
+        match self.apply_link_read_as(link, read_as, value) {
+            Some(v) => LinkFetch::Value(v),
+            None => LinkFetch::Failed,
+        }
+    }
+
+    /// The `dbrType` conversion of one fetched link value — the single owner
+    /// of C `dbGet`'s request-type switch for every framework input read
+    /// (the pre-input [`Self::read_db_link_into_field`] stage, the single-INP
+    /// soft fetch, the DOL fetch, the multi-input loop and the SIOL read).
+    ///
+    /// `None` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
+    /// conversion slot), i.e. a FAILED read — never a silent no-op.
+    pub(crate) fn apply_link_read_as(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+        value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        use crate::server::record::LinkReadAs;
+        match read_as {
             LinkReadAs::Native => Some(value),
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
             // its element 0 (C asks for one element, so `dbGet` converts offset
@@ -575,10 +591,6 @@ impl PvDatabase {
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
-        };
-        match converted {
-            Some(v) => LinkFetch::Value(v),
-            None => LinkFetch::Failed,
         }
     }
 
@@ -598,6 +610,20 @@ impl PvDatabase {
         {
             let guard = rec.read();
             return guard.field_as_dbr_string(&db.field);
+        }
+        // An external ENUM value crosses the wire as a bare index; the label
+        // table lives in the lset's cached metadata (CA: the one-shot
+        // `DBR_CTRL_ENUM` attribute fetch — C `dbCa` instead keeps a second
+        // `DBR_STRING` monitor for exactly this read, `dbCa.c` `pgetString`).
+        // An index past the cached table falls through to the digits, the
+        // same rule as [`value_as_dbr_string`]'s `EnumWithChoices` arm.
+        if let EpicsValue::Enum(idx) = value
+            && let Some(name) = link.external_pv_name()
+            && let Some(m) = self.external_link_metadata(&name)
+            && let Some(choices) = m.enum_choices
+            && let Some(label) = choices.get(*idx as usize)
+        {
+            return Some(PvString::from(label.as_str()));
         }
         crate::server::record::value_as_dbr_string(value)
     }
@@ -1272,6 +1298,12 @@ impl PvDatabase {
             // `display.description` has no C lset slot — it is a pvxs-only
             // pvalink extra (`LinkMetadata::description`).
             description: None,
+            enum_choices: snapshot.enums.as_ref().map(|e| {
+                e.strings
+                    .iter()
+                    .map(|s| s.as_str_lossy().into_owned())
+                    .collect()
+            }),
         })
     }
 

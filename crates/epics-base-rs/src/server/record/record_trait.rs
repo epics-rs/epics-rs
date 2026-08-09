@@ -3202,9 +3202,12 @@ pub trait Record: Send + Sync + 'static {
         let _ = (link_field, target);
     }
 
-    /// The `dbrType` this record's [`ProcessAction::ReadDbLink`] on
-    /// `link_field` asks the SOURCE for — the READ twin of
-    /// [`Self::typed_output_buffer`], and C's `dbGetLink` second argument.
+    /// The `dbrType` this record's framework-run input read on `link_field`
+    /// asks the SOURCE for — the READ twin of [`Self::typed_output_buffer`],
+    /// and C's `dbGetLink` second argument. Consulted by every framework
+    /// fetch path: the pre-input [`ProcessAction::ReadDbLink`] stage, the
+    /// single-INP soft fetch, the closed-loop DOL fetch, the multi-input
+    /// loop and the SIOL simulation read.
     ///
     /// `source` is the far end of the input link as C's
     /// `dbGetLinkDBFtype`/`dbGetNelements` report it (the same lset accessors

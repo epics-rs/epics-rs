@@ -87,6 +87,20 @@ impl Record for StringoutRecord {
         "stringout"
     }
 
+    /// C reads the closed-loop DOL with a plain `dbGetLink(..., DBR_STRING,
+    /// ...)` (`stringoutRecord.c:141`): an ENUM/MENU source delivers its
+    /// state label, never the index digits (epics-base#183).
+    fn input_link_read_as(
+        &self,
+        link_field: &str,
+        _source: &crate::server::record::OutTarget,
+    ) -> Option<crate::server::record::LinkReadAs> {
+        Some(match link_field {
+            "DOL" => crate::server::record::LinkReadAs::String,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringoutRecord.dbd.pod`): the
     /// two-choice NO/YES simulation menu. `MPST`/`APST` are
     /// `menu(stringoutPOST)` (`stringoutRecord.dbd.pod:19-22,128-139`), whose

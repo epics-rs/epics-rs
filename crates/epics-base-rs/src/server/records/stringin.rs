@@ -76,6 +76,20 @@ impl Record for StringinRecord {
         "stringin"
     }
 
+    /// C reads INP (`devSiSoft.c:53`) and SIOL (`stringinRecord.c:208`) with
+    /// a plain `dbGetLink(..., DBR_STRING, ...)`: an ENUM/MENU source
+    /// delivers its state label, never the index digits (epics-base#183).
+    fn input_link_read_as(
+        &self,
+        link_field: &str,
+        _source: &crate::server::record::OutTarget,
+    ) -> Option<crate::server::record::LinkReadAs> {
+        Some(match link_field {
+            "INP" | "SIOL" => crate::server::record::LinkReadAs::String,
+            _ => crate::server::record::LinkReadAs::Native,
+        })
+    }
+
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
     /// two-choice NO/YES simulation menu. `MPST`/`APST` are
     /// `menu(stringinPOST)` (`stringinRecord.dbd.pod:21-24,95-107`), whose

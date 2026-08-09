@@ -107,7 +107,7 @@ CLEARED: new `SearchReason::CreateRefused` selected when
 revolution (~30 s) by construction. Placement unit test covers the
 wrap-at-0 boundary and every non-zero bucket.
 
-### UI-63 Enum/menu sources read as string over links deliver index digits, not labels
+### UI-63 Enum/menu sources read as string over links deliver index digits, not labels — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/links.rs:1353-1357`, `processing.rs:2517-2536`, `types/value.rs:99,1150`; CA half `crates/epics-ca-rs/src/calink/resolver.rs:553`. Upstream: epics-base#183 (closed-fixed), #855 (mechanism).
 `stringin`/`lsi` INP at a DBF_MENU/DBF_ENUM field stores `"2"` where
 fixed C stores `"INVALID"`. The correct renderer exists
@@ -115,6 +115,22 @@ fixed C stores `"INVALID"`. The correct renderer exists
 `LinkReadAs::String`; the single-INP soft path fetches native and
 coerces via field-blind `convert_to`. Same outcome over CA links (calink
 subscribes native; no string subscription).
+CLEARED: every framework input read (single-INP soft, DOL, multi-input
+loop, SIOL) now consults `Record::input_link_read_as` through one
+conversion owner (`apply_link_read_as`); stringin/stringout declare
+`DBR_STRING` for INP/SIOL/DOL, lsi/lso the `dbGetLinkLS` source switch,
+printf the per-conversion request (`%s` → String, FMT-walked). printf's
+A..J slots store raw (they are C locals, not DBF fields — the previous
+Double-typed coercion turned EVERY string delivery into `atof` = 0.0).
+External half: `LinkMetadata::enum_choices` carries the label table
+(calink fills it from the `DBR_CTRL_ENUM` attribute fetch — C `dbCa`'s
+`pgetString` monitor equivalent; pvalink values already arrive as
+`EnumWithChoices`), rendered in `dbr_string_of`'s external arm.
+Residuals: printf's slot↔conversion map is classified unshifted — after
+a failed `*`-width link C's format-time slot inheritance can consume a
+slot under a different conversion than it was fetched with (that
+directive already emits IVLS); lsi's disconnected-source silent-success
+(`dbGetLinkLS` dtyp<0 → status 0) keeps our failed-read LINK alarm.
 
 ### UI-64 DB-link puts to link fields are accepted where C's dbPut refuses
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/field_io.rs:653-707` (`put_pv_body`), reached from `links.rs:1504`. Upstream: epics-base#876 (the C guard is dbAccess.c:1340).

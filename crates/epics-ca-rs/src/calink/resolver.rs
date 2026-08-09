@@ -915,6 +915,21 @@ fn build_link_metadata(
         if let Some(c) = snap.control.as_ref() {
             md.control_limits = Some((c.lower_ctrl_limit, c.upper_ctrl_limit));
         }
+        // An enum channel's CTRL reply is `DBR_CTRL_ENUM`, whose metadata IS
+        // the state-label table. Cached so a `DBR_STRING`-requesting reader
+        // (stringin/lsi INP, printf `%s`) renders the remote index as its
+        // label — C `dbCa` keeps a second `DBR_STRING` monitor (`pgetString`)
+        // for that read; here the labels ride the attribute fetch.
+        if let Some(e) = snap.enums.as_ref()
+            && !e.strings.is_empty()
+        {
+            md.enum_choices = Some(
+                e.strings
+                    .iter()
+                    .map(|s| s.as_str_lossy().into_owned())
+                    .collect(),
+            );
+        }
     }
     md
 }
@@ -1428,6 +1443,28 @@ mod tests {
         assert_eq!(md.alarm_limits, None);
         assert_eq!(md.precision, None);
         assert_eq!(md.units, None);
+    }
+
+    /// an enum channel's `DBR_CTRL_ENUM` reply carries the state-label
+    /// table; it lands in `enum_choices` so a `DBR_STRING`-requesting
+    /// reader (stringin/lsi INP, printf `%s`) can render the remote index
+    /// as its label — C `dbCa`'s `pgetString` monitor equivalent. An empty
+    /// table stays `None` (nothing to render through).
+    #[test]
+    fn build_link_metadata_enum_ctrl_carries_the_choices() {
+        use epics_base_rs::server::snapshot::EnumInfo;
+        let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+        snap.enums = Some(EnumInfo::new(vec!["off".into(), "on".into()]));
+        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), Some(&snap));
+        assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
+        assert_eq!(
+            md.enum_choices,
+            Some(vec!["off".to_string(), "on".to_string()])
+        );
+
+        let empty = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
+        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), Some(&empty));
+        assert_eq!(md.enum_choices, None);
     }
 
     /// when the channel info fetch failed (`None` dbf /

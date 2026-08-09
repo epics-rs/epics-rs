@@ -108,6 +108,29 @@ impl Record for LsiRecord {
         "lsi"
     }
 
+    /// C reads INP (`devLsiSoft.c:32`) and SIOL (`lsiRecord.c:244`) through
+    /// `dbGetLinkLS` (`dbLink.c:497-505`), whose switch is on the SOURCE
+    /// class: a `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it
+    /// spells (capped at SIZV), anything else as `DBR_STRING` — so an
+    /// ENUM/MENU source delivers its state label (epics-base#183).
+    fn input_link_read_as(
+        &self,
+        link_field: &str,
+        source: &crate::server::record::OutTarget,
+    ) -> Option<crate::server::record::LinkReadAs> {
+        use crate::server::record::LinkReadAs;
+        use crate::types::DbFieldType;
+        Some(match link_field {
+            "INP" | "SIOL" => match source.field_type {
+                Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
+                    max_elements: self.sizv as usize,
+                },
+                _ => LinkReadAs::String,
+            },
+            _ => LinkReadAs::Native,
+        })
+    }
+
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsiRecord.dbd.pod`): `SIMM`
     /// is `menu(menuYesNo)` (two-choice NO/YES). `MPST`/`APST` are
     /// `menu(menuPost)` (On Change, Always) — unlike the array records

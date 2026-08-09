@@ -107,6 +107,50 @@ impl PrintfRecord {
         v.to_f64().unwrap_or(0.0)
     }
 
+    /// Which INP0..INP9 slots FMT consumes with a plain `%s` (no `l`
+    /// modifier) — the directives C reads with `DBR_STRING`
+    /// (`printfRecord.c:291`), so an ENUM/MENU source delivers its label.
+    /// Classified under the resolved-links slot mapping (a failed `*`
+    /// width shifts consumption at format time, `printfRecord.c:167-168`,
+    /// which a fetch-time request cannot see; those directives emit IVLS).
+    fn plain_string_slots(&self) -> [bool; 10] {
+        let mut out = [false; 10];
+        let bytes = self.fmt.as_bytes();
+        let mut i = 0;
+        let mut slot = 0usize;
+        while i < bytes.len() && slot < out.len() {
+            if bytes[i] != b'%' {
+                i += 1;
+                continue;
+            }
+            if bytes.get(i + 1) == Some(&b'%') {
+                i += 2;
+                continue;
+            }
+            let (d, next) = Self::parse_directive(bytes, i);
+            i = next;
+            if d.bad {
+                continue;
+            }
+            // Consumption order mirrors `apply_fmt`: `*` width, then `*`
+            // precision (both numeric), then the conversion's own slot.
+            if d.star_width {
+                slot += 1;
+            }
+            if d.star_prec {
+                slot += 1;
+            }
+            if slot >= out.len() {
+                break;
+            }
+            if d.conv == b's' && !d.long {
+                out[slot] = true;
+            }
+            slot += 1;
+        }
+        out
+    }
+
     /// Parse one `%...` directive starting at `bytes[i]` (which is `%`).
     /// Returns the directive and the index just past the conversion
     /// char. Consumes `*` width/precision values from `star_idx`.
@@ -622,6 +666,38 @@ impl Record for PrintfRecord {
             }
         }
         Ok(())
+    }
+
+    /// A..J are C locals (`GET_PRINT`'s per-directive `val` buffer,
+    /// `printfRecord.c:47`), not DBF-typed fields: each cycle stores
+    /// whatever type the directive's request delivered — `%s` a string,
+    /// numerics a number. The default's coercion types the slot by its
+    /// PREVIOUS value (initially `Double`), which turned every string
+    /// delivery into `atof()` = 0.0 before `%s` could read it.
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if let Some(idx) = Self::val_index(name) {
+            self.vals[idx] = value;
+            return Ok(());
+        }
+        crate::server::record::put_field_internal_default(self, name, value)
+    }
+
+    /// C `GET_PRINT` reads each link with the conversion's own `dbrType`:
+    /// `%s` is `dbGetLink(..., DBR_STRING, ...)` (`printfRecord.c:291`), so
+    /// an ENUM/MENU source delivers its state label, not the index
+    /// (epics-base#183). Every other conversion's numeric request is
+    /// value-equivalent to the native fetch (`%ls` reads the char array the
+    /// native fetch already delivers).
+    fn input_link_read_as(
+        &self,
+        link_field: &str,
+        _source: &crate::server::record::OutTarget,
+    ) -> Option<crate::server::record::LinkReadAs> {
+        use crate::server::record::LinkReadAs;
+        Some(match Self::inp_index(link_field) {
+            Some(idx) if self.plain_string_slots()[idx] => LinkReadAs::String,
+            _ => LinkReadAs::Native,
+        })
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {

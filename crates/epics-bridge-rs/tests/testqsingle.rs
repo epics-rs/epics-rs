@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(25): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 

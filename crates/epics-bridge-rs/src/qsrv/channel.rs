@@ -2,7 +2,7 @@
 //!
 //! Corresponds to C++ QSRV's `PDBSinglePV` / `PDBSingleChannel`.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 

@@ -284,6 +284,62 @@ Structurally our port lacks the suspected upstream hazard (separate
 client search socket; lo-mcast re-forward ported), but no live
 same-process repro under the issue's exact env config was run.
 
+### UI-105 iocsh db* failure paths return Ok — invisible to `on error`
+Severity: MED. epics-rs: `crates/epics-base-rs/src/server/iocsh/commands.rs:795-810`, `:1222-1227`, `:1278`; port-original family `commands.rs:92`, `:667-716`, `crates/mqtt-rs/src/z2m.rs:73-94`. Upstream: epics-base#498 (db* family worse than current C).
+Current C base routes exactly these failures through `iocshSetError`
+(`dbStaticIocRegister.c:282-310`, `dbIocRegister.c:56,73`): a bad
+record name, duplicate record, unknown type, or dbLoadRecords parse
+failure makes `on error break|halt|wait` fire. The port's handlers
+print the failure and return `Ok(Continue)`, so a startup script sails
+past a database that did not load. Same print-then-Ok shape in the
+port-original commands with no C constraint (dbDeleteRecord,
+pushd/popd, mqttZ2m*). Module commands whose C callFuncs are void
+(autosave, asyn, areaDetector, astac) mirror C and stay as parity.
+
+### UI-106 qsrv serves an always-empty `display.description` — pvxs fills it from DESC
+Severity: MED. epics-rs: `crates/epics-base-rs/src/server/record/record_instance.rs` (`populate_display_info`), `crates/epics-bridge-rs/src/qsrv/pvif.rs:763-776`, `:1275-1278`. Upstream: epics-base#785 (the port is behind the pvxs half).
+The NTScalar/NTEnum builders emit the `display.description` leaf and
+`qsrv_marks::property_leaves` marks it, but no producer ever assigns
+`DisplayInfo::description`, so the served description is always the
+empty string. pvxs QSRV fills it from dbCommon DESC at channel
+initialize (`iocsource.cpp:307-310`). The C-defect half of #785 — no
+DBE_PROPERTY on a DESC write because DESC lacks `prop(YES)` — is exact
+parity (pinned at `record_instance.rs:5523`) and stays: posting it
+would be a wire-visible divergence upstream has not decided to make.
+
+### UI-107 HAG hostnames frozen at ACF parse under asCheckClientIP — stale after DNS change
+Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/access_security.rs:1717-1748`, `:1518`. Upstream: epics-base#863 (AS half; C parity; upstream PR #862 in flight).
+With `EPICS_CA_AS_CHECK_CLIENT_IP` set, `hag_members` resolves each
+HAG hostname exactly once during `parse_acf` and stores the frozen
+dotted quad; a DNS move leaves stale IPs until an operator re-runs
+`asInit`. Byte-for-byte the C behavior (`asLibRoutines.c:1227-1265`),
+and the sibling of the CA half this port already closed as the UI-1
+family deviation (60 s `refresh_dns` cadence). Fix direction: periodic
+re-resolution that rebuilds the hag map and republishes through
+`AcfCell::store` — the same notification path `cmd_as_init` uses, so
+connected clients re-evaluate automatically. Default mode (claimed
+HOST_NAME string match) involves no DNS and is unaffected.
+
+### UI-108 dbLoadTemplate silently ignores `file "x.template" {}`
+Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/db_loader/substitution.rs:285-289`, `:449-476`. Upstream: epics-base#666 (C dbLoadTemplate half reproduced; msi's parse-error half absent).
+The docs call the subs block optional, but an empty body loads zero
+instances with no diagnostic — pinned as intended by
+`parse_empty_file_body`. Upstream is undecided between expand-once and
+a doc change, so semantics stay; the missing piece is the diagnostic:
+warn when a `file` entry contributes zero loads, the same move
+upstream made for CP/CPP-on-OUTLINK discards.
+
+### UI-109 `IOCSH_STARTUP_SCRIPT` never set
+Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/iocsh/mod.rs` (no producer). Upstream: epics-base#469 (C's setter leaks scope; the port lacks the variable entirely).
+C sets `IOCSH_STARTUP_SCRIPT` when a script starts; #469's bug is that
+`iocshLoad` overwrites the global value without restoring it, so after
+st.cmd finishes the variable names the last nested script. The port
+never sets it at all, so a C-compatible st.cmd reading the variable
+gets nothing. Port it with the corrected scoping upstream wants: set
+on script entry, restore the outer value when a nested script exits,
+keep the top-level value after boot. Verify the exact C set sites
+against the reference before implementing.
+
 ## Parity findings (upstream wart reproduced deliberately — document, do not fix)
 
 - **UI-2** camonitor-rs `-S` renders an emptied char waveform as `0`
@@ -411,6 +467,35 @@ same-process repro under the issue's exact env config was run.
 - #718 — NOT-PRESENT — pool count usize clamped `.max(1)` (`callback_executor.rs:272-274`).
 - #211 — SAME-PROBLEM (scoped to procserv-rs) — UI-104.
 
+### epics-base uncovered delta (second sweep — agents G–J + inline)
+- #498 — SAME-PROBLEM (db* family worse than current C) — UI-105.
+- #785 — SAME-PROBLEM (port behind pvxs on the description half) — UI-106; the missing-prop(YES) half is parity.
+- #863 — split verdict: CA half NOT-PRESENT — already closed as the UI-1 family deviation (60 s `refresh_dns` cadence, per-redial nameserver re-resolution; `search.rs:1040-1117`, `client/mod.rs:4838-4863`); AS half SAME-PROBLEM — UI-107.
+- #666 — SAME-PROBLEM (silent zero-load `file` entry, pinned by test) — UI-108.
+- #469 — PARITY-GAP — UI-109 (variable absent entirely; C's setter has the scope leak).
+- #378 — NOT-PRESENT — the repeater-registered socket discards everything but beacons (`beacon_monitor.rs:546-559`) and the search socket never registers (`search.rs:626`), so a forwarded SEARCH request cannot reach the response parser. Caveat: the parse itself, like C, sanity-checks nothing (`search.rs:1784-1800`) — reachable only by direct unicast to the ephemeral search port.
+- #372 — NOT-PRESENT — HashMap channel tables + 30-bucket retry ring touch only due entries per tick (`search.rs:112`, `:383-460`, `:1981-2049`).
+- #576 — NOT-PRESENT — single-coordinator subscribe; registry insert precedes EVENT_ADD; every disconnect path flags `needs_restore`, every connect restores (`client/mod.rs:3458-3567`, `:3943-4033`, `:4408-4477`).
+- #380 — NOT-PRESENT — `cmd_astac` is a stateless query over the loaded config; no client-registration surface exists to leak (`access_commands.rs:468-503`).
+- #333 — NOT-PRESENT — no narrow-integer timestamp diff anywhere; camonitor's `secs_between` goes through `Duration` (`camonitor-rs.rs:695-702`), wire u32 widened before arithmetic (`codec.rs:47-54`).
+- #368 — NOT-APPLICABLE — mingw-libc defect; the port formats in Rust with `%F`/`%lx` mapped (`printf.rs:248`, `:399-415`, `:510`).
+- #549 — NOT-PRESENT — load errors are values printed once (`commands.rs:1062`, `softioc-rs.rs:340`); latent double-print only for an external binary that prints both the script-line echo and `run()`'s Err (`iocsh/mod.rs:366`, `ioc_app.rs:740`).
+- #683 — NOT-APPLICABLE — no lockset machinery; per-record gates in a leaked static registry (`record_lock.rs:30-58`, `:244-255`).
+- #529 — NOT-PRESENT — template resolver bypasses the include-path search only on `is_absolute()`, matching the current C fix (`substitution.rs:480-511`).
+- #537 — NOT-APPLICABLE — open enhancement; `-m p` parsed but the subscription type stays TIME-class, matching current C camonitor (`camonitor-rs.rs:518-552`, `client/mod.rs:203-216`).
+- #428 — NOT-PRESENT — modern dbParseLink parity including the CP/CPP discard warning (`link.rs:1153-1258`, `record_instance.rs:2872-2879`).
+- #836 — NOT-PRESENT — no pool-space probe in either search-reply driver (`server/udp.rs:643-700`, `blocking.rs:707-724` records the deliberate admission design).
+- #643 — NOT-PRESENT — filter chains are Arc-owned by channel/monitor objects; the only global is a leaked static; no teardown ordering exists to violate (`filters/mod.rs:119`, `qsrv/channel.rs:489`).
+- #256 — NOT-PRESENT — parse errors propagate as Results; in-parse warnings go through the synchronous console subscriber; both end at line-atomic `eprintln!` from the loading thread (`db_loader/mod.rs:77-82`, `log.rs:106-108`).
+- #911 — NOT-PRESENT — `erl_warning()` gates ANSI on isatty + non-empty TERM (`log.rs:332-340`); no unconditional escapes in port output.
+- #858 — NOT-PRESENT — `on error wait` parses through a checked Result (`iocsh/mod.rs:534-539`); the C inversion has no counterpart.
+- #761 — NOT-APPLICABLE — no cantProceed/epicsEventMustTrigger suspension model in the port.
+- #416 — NOT-APPLICABLE — no errlog localEcho/atExit console gate; port logging is the tracing pipeline.
+- #775 — NOT-APPLICABLE — unmerged upstream proposal (bi/bo ZRVL/ONVL); pre-adoption would be a DBD-visible deviation.
+
+The remaining 91 uncovered open issues were title-triaged as
+toolchain/build/CI/docs/platform items with no port surface.
+
 ## Review Log
 
 - 2026-08-09 — initial sweep, 6 agents, ~80 issues. 17 findings: 2 HIGH
@@ -425,3 +510,13 @@ same-process repro under the issue's exact env config was run.
   UI-60, UI-61, UI-62, UI-81, UI-102) — this doc now records them;
   (3) resource-exhaustion bounds denominated in the wrong unit (UI-20
   frames-vs-bytes).
+- 2026-08-09 — second sweep over the 115 open epics-base issues the
+  initial round only surface-classified: title triage → 24 candidates
+  → 4 read-only agents + inline checks. 5 findings: UI-105..UI-109
+  (2 MED, 3 LOW), 19 clean verdicts with evidence. Themes: (1) round
+  1's "fixed half / missed sibling half" recurs — #863's CA DNS
+  refresh was already shipped, its access-security sibling was not
+  (UI-107); (2) signals dropped while porting the mechanism — error
+  status to the shell (UI-105), the zero-load warning (UI-108), the
+  startup-script env var (UI-109); (3) metadata leaf emitted but never
+  produced (UI-106, empty display.description).

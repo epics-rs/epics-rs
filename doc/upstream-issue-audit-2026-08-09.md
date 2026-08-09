@@ -368,6 +368,15 @@ a doc change, so semantics stay; the missing piece is the diagnostic:
 warn when a `file` entry contributes zero loads, the same move
 upstream made for CP/CPP-on-OUTLINK discards.
 
+— CLEARED. `parse_file` snapshots `loads.len()` around the body and
+emits one `tracing::warn!` (filename + entry line) when the entry
+contributed nothing — covering all three row-less shapes (empty
+`{}`, row-less `pattern`, globals-only body) with one uniform check
+rather than special-casing the empty-body early return. Semantics
+unchanged; `parse_empty_file_body` still pins the zero-load parse,
+`zero_load_file_entry_warns` pins the diagnostic for all three
+shapes plus the no-warn case.
+
 ### UI-109 `IOCSH_STARTUP_SCRIPT` never set
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/iocsh/mod.rs` (no producer). Upstream: epics-base#469 (C's setter leaks scope; the port lacks the variable entirely).
 C sets `IOCSH_STARTUP_SCRIPT` when a script starts; #469's bug is that

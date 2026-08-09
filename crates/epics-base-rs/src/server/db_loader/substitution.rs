@@ -279,21 +279,34 @@ impl Parser {
 
     /// `file WORD|QUOTE { ... }`
     fn parse_file(&mut self) -> CaResult<()> {
+        let entry_line = self.line();
         self.expect(&Tok::File)?;
         let filename = self.expect_str()?;
+        let loads_before = self.loads.len();
         self.expect(&Tok::OBrace)?;
         // `file "x" {}` — empty body, no loads.
         if self.peek() == Some(&Tok::CBrace) {
             self.next();
-            return Ok(());
+        } else {
+            match self.peek() {
+                Some(Tok::Pattern) => self.parse_pattern_block(&filename)?,
+                // variable_substitutions: a sequence of `{ var=val,... }`
+                // rows, or nested `global {}` blocks.
+                _ => self.parse_variable_substitutions(&filename)?,
+            }
+            self.expect(&Tok::CBrace)?;
         }
-        match self.peek() {
-            Some(Tok::Pattern) => self.parse_pattern_block(&filename)?,
-            // variable_substitutions: a sequence of `{ var=val,... }`
-            // rows, or nested `global {}` blocks.
-            _ => self.parse_variable_substitutions(&filename)?,
+        // C dbLoadTemplate silently drops a `file` entry whose body
+        // yields no rows (empty `{}`, row-less pattern, globals-only) —
+        // epics-base#666. Upstream is undecided between expand-once and
+        // a doc fix, so the semantics stay; only the silence goes.
+        if self.loads.len() == loads_before {
+            tracing::warn!(
+                file = %filename,
+                line = entry_line,
+                "substitutions entry produced no template loads"
+            );
         }
-        self.expect(&Tok::CBrace)?;
         Ok(())
     }
 
@@ -614,6 +627,61 @@ file "rec.db" {
         let src = r#"file "rec.db" { }"#;
         let loads = parse_substitutions(src).unwrap();
         assert!(loads.is_empty());
+    }
+
+    /// epics-base#666: the zero-load entry stays legal (pinned above),
+    /// but must no longer be silent. All three row-less shapes warn;
+    /// an entry with rows does not.
+    #[test]
+    fn zero_load_file_entry_warns() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let captured = |src: &str| {
+            let buf = Buf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            parse_substitutions(src).unwrap();
+            String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+        };
+
+        for src in [
+            r#"file "rec.db" { }"#,
+            r#"file "rec.db" { pattern {N} }"#,
+            r#"file "rec.db" { global {A=1} }"#,
+        ] {
+            let out = captured(src);
+            assert!(
+                out.contains("no template loads") && out.contains("rec.db"),
+                "row-less entry {src:?} must warn, got: {out:?}"
+            );
+        }
+        assert_eq!(
+            captured(r#"file "rec.db" { { A=1 } }"#),
+            "",
+            "an entry with rows must not warn"
+        );
     }
 
     #[test]

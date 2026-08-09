@@ -85,10 +85,16 @@ suffix the way `dbChannelTest` does — declared-name existence, `$`
 eligibility, plus the `dbCommon` `DBF_NOACCESS` names
 (`DBCOMMON_NOACCESS`) that C resolves and pvxs answers SEARCH for
 (measured `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`).
-Residual: record-own `DBF_NOACCESS` names (`BPTR` family) were dropped
-by dbd-codegen with their descs, so a SEARCH for them stays silent where
-C would answer then refuse the create; restoring them needs the
-generator to emit the dropped names.
+Residual closed: record-own `DBF_NOACCESS` names (`BPTR` family) were
+dropped by dbd-codegen with their descs, so a SEARCH for them stayed
+silent where C answers then refuses the create. The generator now
+keeps the dropped names (`record_noaccess_fields`, per-target), the
+gate consults them through one predicate
+(`RecordInstance::resolves_noaccess_name`, which also carries the
+`dbCommon` list — now generated as `DB_COMMON_NOACCESS` instead of
+hand-kept), and downstream record types route theirs via
+`Record::declared_noaccess_fields` (motor `CBAK`, mca, scaler, epid,
+throttle).
 The search/CREATE gate tests only the record name (field suffix
 discarded) and `BridgeChannel::new` backstops an unresolvable field
 (`REC.TIME`, any typo) with `DbFieldType::Double`/NTScalar — the client

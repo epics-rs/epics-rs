@@ -18,8 +18,11 @@
 //! * **`DBF_NOACCESS` fields** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...).
 //!   These are C-internal pointers with no CA/PVA representation — C's
 //!   `mapDBFToDBR` sends them to `DBR_NOACCESS` and `dbChannelCreate` refuses
-//!   a channel on them. A Rust port has no pointer to expose, so they are
-//!   dropped rather than invented; the count is reported by the generator.
+//!   a channel on them. A Rust port has no pointer to expose, so their
+//!   *descriptors* are dropped rather than invented — but their NAMES are
+//!   kept (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so
+//!   a SEARCH for `REC.BPTR` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 
 #![allow(clippy::all)]
 
@@ -3882,6 +3885,13 @@ pub static A_SUB_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(aSub)` — the `DBF_NOACCESS` internal names dropped from
+/// [`A_SUB_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static A_SUB_NOACCESS: &[&str] = &[
+    "SADR", "CADR", "OVLA", "OVLB", "OVLC", "OVLD", "OVLE", "OVLF", "OVLG", "OVLH", "OVLI", "OVLJ",
+    "OVLK", "OVLL", "OVLM", "OVLN", "OVLO", "OVLP", "OVLQ", "OVLR", "OVLS", "OVLT", "OVLU",
+];
+
 /// `recordtype(aai)` — 19 CA-visible own fields from `dbd/aaiRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static AAI_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
@@ -4152,6 +4162,10 @@ pub static AAI_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(aai)` — the `DBF_NOACCESS` internal names dropped from
+/// [`AAI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static AAI_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
 
 /// `recordtype(aao)` — 21 CA-visible own fields from `dbd/aaoRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static AAO_FIELDS: &[FieldDesc] = &[
@@ -4451,6 +4465,10 @@ pub static AAO_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(aao)` — the `DBF_NOACCESS` internal names dropped from
+/// [`AAO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static AAO_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
 
 /// `recordtype(acalcout)` — 132 CA-visible own fields from `dbd/aCalcoutRecord.dbd` (6 `DBF_NOACCESS` internals dropped).
 pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
@@ -6318,6 +6336,10 @@ pub static ACALCOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(acalcout)` — the `DBF_NOACCESS` internal names dropped from
+/// [`ACALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static ACALCOUT_NOACCESS: &[&str] = &["RPVT", "PAVL", "PAA", "POAV", "RPCL", "ORPC"];
+
 /// `recordtype(ai)` — 43 CA-visible own fields from `dbd/aiRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static AI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -6923,6 +6945,10 @@ pub static AI_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(ai)` — the `DBF_NOACCESS` internal names dropped from
+/// [`AI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static AI_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
 
 /// `recordtype(ao)` — 52 CA-visible own fields from `dbd/aoRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static AO_FIELDS: &[FieldDesc] = &[
@@ -7655,6 +7681,10 @@ pub static AO_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(ao)` — the `DBF_NOACCESS` internal names dropped from
+/// [`AO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static AO_NOACCESS: &[&str] = &["PBRK", "SIMPVT"];
 
 /// `recordtype(asyn)` — 76 CA-visible own fields from `dbd/asynRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static ASYN_FIELDS: &[FieldDesc] = &[
@@ -8727,6 +8757,10 @@ pub static ASYN_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(asyn)` — the `DBF_NOACCESS` internal names dropped from
+/// [`ASYN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static ASYN_NOACCESS: &[&str] = &["OPTR", "IPTR"];
+
 /// `recordtype(bi)` — 22 CA-visible own fields from `dbd/biRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static BI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -9038,6 +9072,10 @@ pub static BI_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(bi)` — the `DBF_NOACCESS` internal names dropped from
+/// [`BI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static BI_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(bo)` — 26 CA-visible own fields from `dbd/boRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
 pub static BO_FIELDS: &[FieldDesc] = &[
@@ -9407,6 +9445,10 @@ pub static BO_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(bo)` — the `DBF_NOACCESS` internal names dropped from
+/// [`BO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static BO_NOACCESS: &[&str] = &["RPVT", "WDPT", "SIMPVT"];
+
 /// `recordtype(busy)` — 24 CA-visible own fields from `dbd/busyRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static BUSY_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -9746,6 +9788,10 @@ pub static BUSY_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(busy)` — the `DBF_NOACCESS` internal names dropped from
+/// [`BUSY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static BUSY_NOACCESS: &[&str] = &["RPVT", "WDPT"];
 
 /// `recordtype(calc)` — 85 CA-visible own fields from `dbd/calcRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static CALC_FIELDS: &[FieldDesc] = &[
@@ -10940,6 +10986,10 @@ pub static CALC_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(calc)` — the `DBF_NOACCESS` internal names dropped from
+/// [`CALC_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static CALC_NOACCESS: &[&str] = &["RPCL"];
 
 /// `recordtype(calcout)` — 119 CA-visible own fields from `dbd/calcoutRecord.dbd` (4 `DBF_NOACCESS` internals dropped).
 pub static CALCOUT_FIELDS: &[FieldDesc] = &[
@@ -12611,6 +12661,10 @@ pub static CALCOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(calcout)` — the `DBF_NOACCESS` internal names dropped from
+/// [`CALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static CALCOUT_NOACCESS: &[&str] = &["RPVT", "EPVT", "RPCL", "ORPC"];
+
 /// `recordtype(compress)` — 20 CA-visible own fields from `dbd/compressRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
 pub static COMPRESS_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types.
@@ -12895,6 +12949,10 @@ pub static COMPRESS_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(compress)` — the `DBF_NOACCESS` internal names dropped from
+/// [`COMPRESS_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static COMPRESS_NOACCESS: &[&str] = &["BPTR", "SPTR", "WPTR"];
 
 /// `recordtype(dfanout)` — 42 CA-visible own fields from `dbd/dfanoutRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static DFANOUT_FIELDS: &[FieldDesc] = &[
@@ -13632,6 +13690,10 @@ pub static EVENT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(event)` — the `DBF_NOACCESS` internal names dropped from
+/// [`EVENT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static EVENT_NOACCESS: &[&str] = &["EPVT", "SIMPVT"];
+
 /// `recordtype(fanout)` — 22 CA-visible own fields from `dbd/fanoutRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static FANOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -14271,6 +14333,10 @@ pub static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(histogram)` — the `DBF_NOACCESS` internal names dropped from
+/// [`HISTOGRAM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static HISTOGRAM_NOACCESS: &[&str] = &["BPTR", "WDOG", "SIMPVT"];
+
 /// `recordtype(int64in)` — 29 CA-visible own fields from `dbd/int64inRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static INT64IN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -14680,6 +14746,10 @@ pub static INT64IN_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(int64in)` — the `DBF_NOACCESS` internal names dropped from
+/// [`INT64IN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static INT64IN_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(int64out)` — 32 CA-visible own fields from `dbd/int64outRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static INT64OUT_FIELDS: &[FieldDesc] = &[
@@ -15133,6 +15203,10 @@ pub static INT64OUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(int64out)` — the `DBF_NOACCESS` internal names dropped from
+/// [`INT64OUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static INT64OUT_NOACCESS: &[&str] = &["SIMPVT"];
+
 /// `recordtype(longin)` — 29 CA-visible own fields from `dbd/longinRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static LONGIN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -15542,6 +15616,10 @@ pub static LONGIN_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(longin)` — the `DBF_NOACCESS` internal names dropped from
+/// [`LONGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static LONGIN_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(longout)` — 35 CA-visible own fields from `dbd/longoutRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static LONGOUT_FIELDS: &[FieldDesc] = &[
@@ -16037,6 +16115,10 @@ pub static LONGOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(longout)` — the `DBF_NOACCESS` internal names dropped from
+/// [`LONGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static LONGOUT_NOACCESS: &[&str] = &["SIMPVT", "OUTPVT"];
+
 /// `recordtype(lsi)` — 15 CA-visible own fields from `dbd/lsiRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static LSI_FIELDS: &[FieldDesc] = &[
     // DBF_STRING from cvt_dbaddr.types.
@@ -16252,6 +16334,10 @@ pub static LSI_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(lsi)` — the `DBF_NOACCESS` internal names dropped from
+/// [`LSI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static LSI_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(lso)` — 19 CA-visible own fields from `dbd/lsoRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static LSO_FIELDS: &[FieldDesc] = &[
@@ -16524,6 +16610,10 @@ pub static LSO_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(lso)` — the `DBF_NOACCESS` internal names dropped from
+/// [`LSO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static LSO_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(mbbi)` — 70 CA-visible own fields from `dbd/mbbiRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static MBBI_FIELDS: &[FieldDesc] = &[
@@ -17509,6 +17599,10 @@ pub static MBBI_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(mbbi)` — the `DBF_NOACCESS` internal names dropped from
+/// [`MBBI_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static MBBI_NOACCESS: &[&str] = &["SIMPVT"];
+
 /// `recordtype(mbbiDirect)` — 48 CA-visible own fields from `dbd/mbbiDirectRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -18184,6 +18278,10 @@ pub static MBBI_DIRECT_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(mbbiDirect)` — the `DBF_NOACCESS` internal names dropped from
+/// [`MBBI_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static MBBI_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(mbbo)` — 73 CA-visible own fields from `dbd/mbboRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static MBBO_FIELDS: &[FieldDesc] = &[
@@ -19212,6 +19310,10 @@ pub static MBBO_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(mbbo)` — the `DBF_NOACCESS` internal names dropped from
+/// [`MBBO_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static MBBO_NOACCESS: &[&str] = &["SIMPVT"];
+
 /// `recordtype(mbboDirect)` — 54 CA-visible own fields from `dbd/mbboDirectRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -19971,6 +20073,10 @@ pub static MBBO_DIRECT_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(mbboDirect)` — the `DBF_NOACCESS` internal names dropped from
+/// [`MBBO_DIRECT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static MBBO_DIRECT_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(permissive)` — 5 CA-visible own fields from `dbd/permissiveRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static PERMISSIVE_FIELDS: &[FieldDesc] = &[
@@ -22208,6 +22314,10 @@ pub static SCALCOUT_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(scalcout)` — the `DBF_NOACCESS` internal names dropped from
+/// [`SCALCOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static SCALCOUT_NOACCESS: &[&str] = &["RPVT", "STRS", "RPCL", "ORPC"];
 
 /// `recordtype(sel)` — 59 CA-visible own fields from `dbd/selRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static SEL_FIELDS: &[FieldDesc] = &[
@@ -26205,6 +26315,10 @@ pub static STRINGIN_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(stringin)` — the `DBF_NOACCESS` internal names dropped from
+/// [`STRINGIN_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static STRINGIN_NOACCESS: &[&str] = &["SIMPVT"];
+
 /// `recordtype(stringout)` — 16 CA-visible own fields from `dbd/stringoutRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -26432,6 +26546,10 @@ pub static STRINGOUT_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(stringout)` — the `DBF_NOACCESS` internal names dropped from
+/// [`STRINGOUT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static STRINGOUT_NOACCESS: &[&str] = &["SIMPVT"];
 
 /// `recordtype(sub)` — 85 CA-visible own fields from `dbd/subRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static SUB_FIELDS: &[FieldDesc] = &[
@@ -27627,6 +27745,10 @@ pub static SUB_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(sub)` — the `DBF_NOACCESS` internal names dropped from
+/// [`SUB_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static SUB_NOACCESS: &[&str] = &["SADR"];
+
 /// `recordtype(subArray)` — 12 CA-visible own fields from `dbd/subArrayRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
@@ -27799,6 +27921,10 @@ pub static SUB_ARRAY_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(subArray)` — the `DBF_NOACCESS` internal names dropped from
+/// [`SUB_ARRAY_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static SUB_ARRAY_NOACCESS: &[&str] = &["BPTR"];
 
 /// `recordtype(swait)` — 87 CA-visible own fields from `dbd/swaitRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static SWAIT_FIELDS: &[FieldDesc] = &[
@@ -29021,6 +29147,10 @@ pub static SWAIT_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(swait)` — the `DBF_NOACCESS` internal names dropped from
+/// [`SWAIT_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static SWAIT_NOACCESS: &[&str] = &["CBST", "RPCL"];
 
 /// `recordtype(transform)` — 151 CA-visible own fields from `dbd/transformRecord.dbd` (17 `DBF_NOACCESS` internals dropped).
 pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
@@ -31140,6 +31270,13 @@ pub static TRANSFORM_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(transform)` — the `DBF_NOACCESS` internal names dropped from
+/// [`TRANSFORM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static TRANSFORM_NOACCESS: &[&str] = &[
+    "RPVT", "RPCA", "RPCB", "RPCC", "RPCD", "RPCE", "RPCF", "RPCG", "RPCH", "RPCI", "RPCJ", "RPCK",
+    "RPCL", "RPCM", "RPCN", "RPCO", "RPCP",
+];
+
 /// `recordtype(waveform)` — 21 CA-visible own fields from `dbd/waveformRecord.dbd` (2 `DBF_NOACCESS` internals dropped).
 pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
     // DBF_DOUBLE from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
@@ -31438,6 +31575,10 @@ pub static WAVEFORM_FIELDS: &[FieldDesc] = &[
         prop: false,
     },
 ];
+
+/// `recordtype(waveform)` — the `DBF_NOACCESS` internal names dropped from
+/// [`WAVEFORM_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static WAVEFORM_NOACCESS: &[&str] = &["BPTR", "SIMPVT"];
 
 /// `dbCommon.dbd` — the 34 CA-visible fields every record type carries.
 ///
@@ -31924,6 +32065,14 @@ pub static DB_COMMON_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// The `DBF_NOACCESS` internals of `dbCommon.dbd`, dropped from
+/// [`DB_COMMON_FIELDS`]: resolvable (a SEARCH is answered), never
+/// servable — see `record_noaccess_fields` for the record-own twins.
+pub static DB_COMMON_NOACCESS: &[&str] = &[
+    "MLOK", "MLIS", "BKLNK", "ASP", "PPN", "PPNR", "SPVT", "RSET", "DSET", "DPVT", "RDES", "LSET",
+    "BKPT", "TIME",
+];
+
 // ---------------------------------------------------------------------
 // Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration
 // order. The index is wire-visible: it IS the value of the DTYP field.
@@ -32379,6 +32528,57 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
         "swait" => SWAIT_FIELDS,
         "transform" => TRANSFORM_FIELDS,
         "waveform" => WAVEFORM_FIELDS,
+        _ => return None,
+    })
+}
+
+/// The record-own `DBF_NOACCESS` internal names for a record type — fields
+/// C's `dbNameToAddr` resolves (a SEARCH is answered) but whose channel is
+/// refused at creation (`mapDBFToDBR` -> `DBR_NOACCESS`). Empty for a type
+/// declaring none, `None` for a type no vendored `.dbd` declares.
+pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "aSub" => A_SUB_NOACCESS,
+        "aai" => AAI_NOACCESS,
+        "aao" => AAO_NOACCESS,
+        "acalcout" => ACALCOUT_NOACCESS,
+        "ai" => AI_NOACCESS,
+        "ao" => AO_NOACCESS,
+        "asyn" => ASYN_NOACCESS,
+        "bi" => BI_NOACCESS,
+        "bo" => BO_NOACCESS,
+        "busy" => BUSY_NOACCESS,
+        "calc" => CALC_NOACCESS,
+        "calcout" => CALCOUT_NOACCESS,
+        "compress" => COMPRESS_NOACCESS,
+        "dfanout" => &[],
+        "event" => EVENT_NOACCESS,
+        "fanout" => &[],
+        "histogram" => HISTOGRAM_NOACCESS,
+        "int64in" => INT64IN_NOACCESS,
+        "int64out" => INT64OUT_NOACCESS,
+        "longin" => LONGIN_NOACCESS,
+        "longout" => LONGOUT_NOACCESS,
+        "lsi" => LSI_NOACCESS,
+        "lso" => LSO_NOACCESS,
+        "mbbi" => MBBI_NOACCESS,
+        "mbbiDirect" => MBBI_DIRECT_NOACCESS,
+        "mbbo" => MBBO_NOACCESS,
+        "mbboDirect" => MBBO_DIRECT_NOACCESS,
+        "permissive" => &[],
+        "printf" => &[],
+        "scalcout" => SCALCOUT_NOACCESS,
+        "sel" => &[],
+        "seq" => &[],
+        "sseq" => &[],
+        "state" => &[],
+        "stringin" => STRINGIN_NOACCESS,
+        "stringout" => STRINGOUT_NOACCESS,
+        "sub" => SUB_NOACCESS,
+        "subArray" => SUB_ARRAY_NOACCESS,
+        "swait" => SWAIT_NOACCESS,
+        "transform" => TRANSFORM_NOACCESS,
+        "waveform" => WAVEFORM_NOACCESS,
         _ => return None,
     })
 }

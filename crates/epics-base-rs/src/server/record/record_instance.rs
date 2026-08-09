@@ -28,8 +28,8 @@ use super::scan::{ScanType, SimModeScan};
 ///
 /// These are common fields — no record's `field_list` declares them — so the
 /// declaration names them here. The remaining `SPC_NOMOD` entries in
-/// `dbCommon.dbd` are `DBF_NOACCESS` ([`DBCOMMON_NOACCESS`]): they have no
-/// field API in this port at all.
+/// `dbCommon.dbd` are `DBF_NOACCESS` ([`is_dbcommon_noaccess`]): they have
+/// no field API in this port at all.
 ///
 /// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
 /// resolves `.TIME`, so the declaration must cover it.
@@ -40,29 +40,25 @@ const DBCOMMON_NOMOD: &[&str] = &[
     "PUTF", "RPRO", "TIME", "UTAG",
 ];
 
-/// The `DBF_NOACCESS` fields of `dbCommon.dbd` — C-internal pointers with no
-/// value API in this port (the generated tables drop them, `dbd_generated`
-/// module docs). Their NAMES still exist to C's resolver: `dbNameToAddr`
-/// resolves a `DBF_NOACCESS` field and the refusal lands at channel
-/// *creation*, where `mapDBFToDBR` yields `DBR_NOACCESS` — measured against
-/// `softIocPVX`: `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e.
-/// the SEARCH was answered. The search gate
-/// (`PvDatabase::has_name_no_resolve`) consults this list so those names
-/// keep answering; every *value* path stays closed to them.
-///
-/// Record-own `DBF_NOACCESS` internals (`BPTR` and friends) are NOT listed —
-/// the generator drops their names with their descs, so a search for them is
-/// refused where C would answer and then refuse the create. Restoring them
-/// needs the generator to emit the dropped names.
-const DBCOMMON_NOACCESS: &[&str] = &[
-    "MLOK", "MLIS", "BKLNK", "ASP", "PPN", "PPNR", "SPVT", "RSET", "DSET", "DPVT", "RDES", "LSET",
-    "BKPT",
-];
-
 /// Is `field` (already uppercased) a `dbCommon` `DBF_NOACCESS` internal —
-/// a name C resolves but never serves? See [`DBCOMMON_NOACCESS`].
+/// a name C resolves but never serves?
+///
+/// These are C-internal pointers with no value API in this port. Their NAMES
+/// still exist to C's resolver: `dbNameToAddr` resolves a `DBF_NOACCESS`
+/// field and the refusal lands at channel *creation*, where `mapDBFToDBR`
+/// yields `DBR_NOACCESS` — measured against `softIocPVX`:
+/// `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e. the SEARCH
+/// was answered. The search gate (`PvDatabase::has_name_no_resolve`)
+/// consults this — via [`RecordInstance::resolves_noaccess_name`] — so those
+/// names keep answering; every *value* path stays closed to them.
+///
+/// The name list is the generated spec ([`DB_COMMON_NOACCESS`]
+/// (super::dbd_generated::DB_COMMON_NOACCESS)) minus the names the port
+/// *serves* despite their C `DBF_NOACCESS` typing: `TIME` resolves to a real
+/// value here (see [`DBCOMMON_NOMOD`]), so it is answered by the gate's
+/// resolve arm, not this one.
 pub(crate) fn is_dbcommon_noaccess(field: &str) -> bool {
-    DBCOMMON_NOACCESS.contains(&field)
+    super::dbd_generated::DB_COMMON_NOACCESS.contains(&field) && !DBCOMMON_NOMOD.contains(&field)
 }
 
 thread_local! {
@@ -1747,6 +1743,18 @@ impl RecordInstance {
     /// from a `dbFldDes`.
     pub(crate) fn field_desc(&self, field: &str) -> Option<&'static FieldDesc> {
         field_desc_of(self.record.as_ref(), field)
+    }
+
+    /// Is `field` (already uppercased) a `DBF_NOACCESS` internal name —
+    /// record-own (`BPTR`, `RPVT`, ...) or `dbCommon` (`MLOK`, `RSET`, ...)?
+    ///
+    /// C's `dbNameToAddr` resolves such a name, so a SEARCH for it is
+    /// answered and the refusal lands at channel creation (`mapDBFToDBR` →
+    /// `DBR_NOACCESS`). The search gate (`PvDatabase::has_name_no_resolve`)
+    /// asks this so the port answers the same way; every value path stays
+    /// closed to these names.
+    pub(crate) fn resolves_noaccess_name(&self, field: &str) -> bool {
+        is_dbcommon_noaccess(field) || self.record.noaccess_names().contains(&field)
     }
 
     /// The `DBF_*` type `field` is SERVED as — the single source of truth for

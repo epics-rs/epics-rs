@@ -1229,12 +1229,24 @@ pub enum InputFetchPolicy {
 pub trait FieldDeclaration {
     /// The record type's field descriptors, in `.dbd` declaration order.
     fn field_list(&self) -> &'static [FieldDesc];
+
+    /// The record-own `DBF_NOACCESS` internal names the generator dropped
+    /// from [`FieldDeclaration::field_list`] (`BPTR`, `RPVT`, ...): names
+    /// C's `dbNameToAddr` resolves — so a SEARCH is answered — but whose
+    /// channel is refused at creation. Same base-table-then-own resolution
+    /// as `field_list`.
+    fn noaccess_names(&self) -> &'static [&'static str];
 }
 
 impl<R: Record + ?Sized> FieldDeclaration for R {
     fn field_list(&self) -> &'static [FieldDesc] {
         super::dbd_generated::record_fields(self.record_type())
             .unwrap_or_else(|| self.declared_fields())
+    }
+
+    fn noaccess_names(&self) -> &'static [&'static str] {
+        super::dbd_generated::record_noaccess_fields(self.record_type())
+            .unwrap_or_else(|| self.declared_noaccess_fields())
     }
 }
 
@@ -1308,6 +1320,15 @@ pub trait Record: Send + Sync + 'static {
     /// [`Record::implements_field`] for that — see its docs for why the two
     /// must not be the same question.
     fn declared_fields(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+
+    /// The analogue of [`Record::declared_fields`] for
+    /// [`FieldDeclaration::noaccess_names`]: the record-own `DBF_NOACCESS`
+    /// internal names of a record type no base `.dbd` declares. A downstream
+    /// crate whose generated table reports dropped internals returns its
+    /// `record_noaccess_fields` entry here, next to its `declared_fields`.
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         &[]
     }
 

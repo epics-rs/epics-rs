@@ -1909,13 +1909,13 @@ impl PvDatabase {
                 // `resolve_field` (valued fields, incl. common/virtual ones
                 // like `RTYP`/`TIME` that C answers from dbStaticLib),
                 // `field_desc` (declared-but-valueless record fields), and
-                // the `dbCommon` `DBF_NOACCESS` internals the generated
-                // tables drop (`is_dbcommon_noaccess` — see its doc for the
-                // record-own residual).
+                // the `DBF_NOACCESS` internals the generated tables drop —
+                // record-own (`BPTR`, from `record_noaccess_fields`) and
+                // `dbCommon` (`MLOK`) alike.
                 let upper = field.to_ascii_uppercase();
                 instance.resolve_field(&upper).is_some()
                     || instance.field_desc(&upper).is_some()
-                    || crate::server::record::is_dbcommon_noaccess(&upper)
+                    || instance.resolves_noaccess_name(&upper)
             }
         }
     }
@@ -2445,6 +2445,22 @@ mod tests {
         // create Channel` (see `search_claims_every_dbd_name_but_create_
         // gates_on_a_servable_field` in `epics-pva-rs`).
         assert!(db.has_name("TARGET.MLOK").await);
+        // Record-own `DBF_NOACCESS` twin (`waveform.BPTR`): C's resolver
+        // does not distinguish common from record-own internals
+        // (`dbFindField` walks the type's full `dbFldDes` set), so the
+        // same answer-then-refuse applies. The generated tables drop the
+        // descs but keep the names (`record_noaccess_fields`).
+        db.add_record(
+            "WF",
+            Box::new(crate::server::records::waveform::WaveformRecord::new(
+                8,
+                crate::types::DbFieldType::Double,
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(db.has_name("WF.BPTR").await);
+        assert!(!db.has_name("WF.NOSUCH").await);
         assert!(db.has_name("ALIAS_NAME.EGU").await);
         assert!(!db.has_name("ALIAS_NAME.NOSUCH").await);
         // `$` re-views a DBF_STRING/link field as a char array; anything

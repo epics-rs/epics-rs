@@ -1031,6 +1031,10 @@ impl Record for EpidRecord {
         dbd_generated::EPID_FIELDS
     }
 
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
+        dbd_generated::EPID_NOACCESS
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }

@@ -502,6 +502,10 @@ impl Record for McaRecord {
         dbd_generated::MCA_FIELDS
     }
 
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
+        dbd_generated::MCA_NOACCESS
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if let Some((i, member)) = roi_field(name) {
             let r = &self.roi[i];

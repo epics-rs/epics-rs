@@ -1520,6 +1520,23 @@ pub fn apply_fields(
         );
 
         if owned {
+            // C refuses `field(VAL, ...)` on a long-string field at load
+            // time: lso/lsi/printf VAL (and lsi OVAL) is `DBF_NOACCESS` +
+            // `SPC_DBADDR`, and `dbPutString` reports "Can't set array
+            // field before iocInit()" (epics-base#548 keeps it that way).
+            // The port refuses identically; asking `long_string_fields`
+            // names that constraint instead of the accidental Char-parse
+            // failure the value text would otherwise produce.
+            if record
+                .long_string_fields()
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&upper_name))
+            {
+                return Err(CaError::InvalidValue(format!(
+                    "field {upper_name}: can't set array field before iocInit() \
+                     (a long-string field is not settable from a .db file, as in C)"
+                )));
+            }
             // Parse to the type the record STORES, exactly as
             // `put_field_internal_default` coerces to it: `put_field`'s arms
             // match on what is stored, and a `menu()` field is declared

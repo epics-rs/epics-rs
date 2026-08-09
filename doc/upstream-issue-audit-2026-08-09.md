@@ -229,13 +229,19 @@ writing nothing, and `1e999` refuses without C's partial prefix write.
 Test `c_parse::tests::ulong_string_put_falls_back_via_double`
 (includes the UInt64 no-fallback control).
 
-### UI-80 lso/lsi `field(VAL, ...)` load failure carries a misleading diagnostic
+### UI-80 lso/lsi `field(VAL, ...)` load failure carries a misleading diagnostic — CLEARED
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/db_loader/mod.rs:1529-1560`. Upstream: epics-base#548.
 Load is refused as in C, but for an accidental reason: the loader parses
 VAL as scalar `Char` and reports a value-syntax error, steering the
 operator toward "malformed string" instead of "field not settable from a
 .db". `Record::long_string_fields()` exists but the loader never
 consults it.
+CLEARED: the owned-field arm asks `Record::long_string_fields` before
+parsing and refuses with C's real constraint — "can't set array field
+before iocInit()" (measured on the reference softIoc: `Can't set
+'L.VAL' to 'hello' Can't set array field before iocInit() : Bad Field
+value`). Tests in `db_load_refuses_long_string_val.rs` cover lso VAL,
+printf VAL, and the ordinary-field control (lso SIZV still loads).
 
 ### UI-103 Out-of-quote backslash diverges from C `split()`; `lint_line` disagrees with the splitters
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/iocsh/registry.rs:418-420` vs `:449-456`. Upstream: adjacent to epics-base#362 (the reported in-quote defect is fixed here).

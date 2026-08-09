@@ -288,20 +288,29 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
 /// equivalently — see macCore.c:777). A `)` inside a `${...}` body (e.g.
 /// `${foo(bar)}`) must NOT be mistaken for the outer call's closing paren.
 /// Returns the byte offset of ')' or the string length if not found.
+///
+/// Quoting and escaping follow the same rules as `lint_line` and the
+/// splitters, so the three scanners agree on where the call ends: both
+/// `"` and `'` quote, and a backslash escapes the next character in and
+/// out of quotes (C split(), measured: `echo(a\))` prints `a)`,
+/// `echo('a)b')` prints `a)b`).
 fn find_closing_paren(s: &str) -> usize {
-    let mut in_quotes = false;
+    // `0` = not in a quote; otherwise the opening quote byte.
+    let mut quote = 0u8;
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let ch = bytes[i];
-        if in_quotes {
-            if ch == b'\\' {
-                i += 1; // skip escaped char
-            } else if ch == b'"' {
-                in_quotes = false;
+        if ch == b'\\' {
+            i += 2; // skip the escaped char too
+            continue;
+        }
+        if quote != 0 {
+            if ch == quote {
+                quote = 0;
             }
-        } else if ch == b'"' {
-            in_quotes = true;
+        } else if ch == b'"' || ch == b'\'' {
+            quote = ch;
         } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             // Skip $(...) — find the matching ')' for the macro ref
             if let Some(end) = bytes[i + 2..].iter().position(|&c| c == b')') {
@@ -329,10 +338,21 @@ fn find_closing_paren(s: &str) -> usize {
 /// both `"` and `'` open a quoted string; the quote is closed
 /// only by the *same* character it was opened with — matching C
 /// `iocsh.cpp` `split()` (`if ((c == '"') || (c == '\'')) quote = c;`).
+/// Outside a quote a backslash consumes itself and takes the next
+/// character literally (`iocsh.cpp:275-278,326`): `\,` does not split,
+/// `\"` does not open a quote. Escapes are interpreted in the first
+/// pass, exactly once; the second pass only trims and strips the outer
+/// quotes of a part whose first non-blank character was a *functional*
+/// quote — an escape-produced quote is data and stays. (The previous
+/// shape re-ran escape processing in the second pass, collapsing
+/// `"a\\\\b"` twice.)
 fn split_comma_args(s: &str) -> Vec<String> {
-    // First, split on commas respecting quoted strings
-    let mut raw_parts: Vec<String> = Vec::new();
+    // First, split on commas respecting quoted strings. `opens_quoted`
+    // remembers whether the part's first non-blank char was a functional
+    // opening quote — the only parts the second pass may strip.
+    let mut raw_parts: Vec<(String, bool)> = Vec::new();
     let mut current = String::new();
+    let mut opens_quoted = false;
     // `0` = not in a quote; otherwise the opening quote char.
     let mut quote: char = '\0';
     let mut chars = s.chars().peekable();
@@ -358,50 +378,43 @@ fn split_comma_args(s: &str) -> Vec<String> {
             } else {
                 current.push(ch);
             }
+        } else if ch == '\\' {
+            // C split() outside a quote: the backslash is consumed and
+            // the next character is literal — it neither splits nor
+            // opens a quote. A trailing backslash is lint_line's
+            // "Trailing backslash." and never gets here.
+            if let Some(next) = chars.next() {
+                current.push(next);
+            }
         } else if ch == '"' || ch == '\'' {
+            if current.chars().all(char::is_whitespace) {
+                opens_quoted = true;
+            }
             quote = ch;
             current.push(ch);
         } else if ch == ',' {
-            raw_parts.push(std::mem::take(&mut current));
+            raw_parts.push((std::mem::take(&mut current), opens_quoted));
+            opens_quoted = false;
         } else {
             current.push(ch);
         }
     }
-    raw_parts.push(current);
+    raw_parts.push((current, opens_quoted));
 
-    // Now process each part: trim whitespace, then strip outer quotes
+    // Now process each part: trim whitespace, then strip outer quotes.
     let mut args = Vec::new();
-    for part in raw_parts {
+    for (part, opens_quoted) in raw_parts {
         let trimmed = part.trim();
         if trimmed.is_empty() && args.is_empty() {
             continue; // skip leading empty
         }
-        let outer_quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let outer_quote = trimmed
+            .chars()
+            .next()
+            .filter(|c| (*c == '"' || *c == '\'') && opens_quoted);
         if let Some(q) = outer_quote {
             if trimmed.len() >= 2 && trimmed.ends_with(q) {
-                // Strip outer quotes and process escapes
-                let inner = &trimmed[1..trimmed.len() - 1];
-                let mut val = String::new();
-                let mut chs = inner.chars().peekable();
-                while let Some(c) = chs.next() {
-                    if c == '\\' {
-                        if let Some(&next) = chs.peek() {
-                            match next {
-                                '"' | '\'' | '\\' => {
-                                    val.push(chs.next().unwrap());
-                                }
-                                _ => {
-                                    val.push(c);
-                                }
-                            }
-                        } else {
-                            val.push(c);
-                        }
-                    } else {
-                        val.push(c);
-                    }
-                }
-                args.push(val);
+                args.push(trimmed[1..trimmed.len() - 1].to_string());
                 continue;
             }
         }
@@ -415,6 +428,9 @@ fn split_comma_args(s: &str) -> Vec<String> {
 ///
 /// both `"` and `'` delimit a quoted string; the quote is closed
 /// only by the matching character — mirrors C `iocsh.cpp` `split()`.
+/// Outside a quote a backslash consumes itself and takes the next
+/// character literally (`iocsh.cpp:275-278,326`): `echo \"hello\"`
+/// yields the token `"hello"`, `a\ b` is one token `a b`.
 fn split_space_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -442,6 +458,15 @@ fn split_space_args(s: &str) -> Vec<String> {
                 quote = '\0';
             } else {
                 current.push(ch);
+            }
+        } else if ch == '\\' {
+            // C split() outside a quote: consume the backslash, take the
+            // next character literally — a `\"` is data, a `\ ` is not a
+            // separator. A trailing backslash is lint_line's
+            // "Trailing backslash." and never gets here.
+            if let Some(next) = chars.next() {
+                current.push(next);
+                has_token = true;
             }
         } else if ch == '"' || ch == '\'' {
             quote = ch;
@@ -664,6 +689,40 @@ mod tests {
     #[test]
     fn test_tokenize_escaped_backslash() {
         assert_eq!(tokenize(r#"cmd "a\\b""#), vec!["cmd", r#"a\b"#]);
+    }
+
+    /// C split() outside a quote (iocsh.cpp:275-278,326): the backslash
+    /// consumes itself and the next character is literal — it neither
+    /// separates nor opens a quote nor closes the call. Every expected
+    /// token below was measured on the reference softIoc's `echo`.
+    #[test]
+    fn out_of_quote_backslash_escapes_like_c_split() {
+        // Space syntax: `echo \"hello\"` prints `"hello"`, `echo a\ b`
+        // prints `a b`.
+        assert_eq!(tokenize(r#"echo \"hello\""#), vec!["echo", r#""hello""#]);
+        assert_eq!(tokenize(r#"echo a\ b"#), vec!["echo", "a b"]);
+        // Call syntax: `echo(a\,b)` prints `a,b` — the escaped comma
+        // does not split the argument.
+        assert_eq!(tokenize(r#"echo(a\,b)"#), vec!["echo", "a,b"]);
+        // Escape-produced quotes are data, not outer quotes — nothing
+        // strips them: `echo(\"hi\")` prints `"hi"`.
+        assert_eq!(tokenize(r#"echo(\"hi\")"#), vec!["echo", r#""hi""#]);
+        // The closing-paren scanner honors the same rules:
+        // `echo(a\))` prints `a)`, `echo('a)b')` prints `a)b`.
+        assert_eq!(tokenize(r#"echo(a\))"#), vec!["echo", "a)"]);
+        assert_eq!(tokenize(r#"echo('a)b')"#), vec!["echo", "a)b"]);
+        // lint_line agrees these lines are well-formed — pre-fix it
+        // passed them and the splitters then mis-parsed.
+        assert_eq!(lint_line(r#"echo \"hello\""#), None);
+        assert_eq!(lint_line(r#"echo(a\,b)"#), None);
+    }
+
+    /// Escapes are interpreted exactly once: the call splitter's second
+    /// pass no longer re-processes them, so an in-quote `\\\\` (four
+    /// backslashes in the script) yields two, not one.
+    #[test]
+    fn call_syntax_escapes_are_not_double_processed() {
+        assert_eq!(tokenize(r#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\b"#]);
     }
 
     #[test]

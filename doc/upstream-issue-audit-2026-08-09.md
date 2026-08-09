@@ -243,12 +243,26 @@ before iocInit()" (measured on the reference softIoc: `Can't set
 value`). Tests in `db_load_refuses_long_string_val.rs` cover lso VAL,
 printf VAL, and the ordinary-field control (lso SIZV still loads).
 
-### UI-103 Out-of-quote backslash diverges from C `split()`; `lint_line` disagrees with the splitters
+### UI-103 Out-of-quote backslash diverges from C `split()`; `lint_line` disagrees with the splitters — CLEARED
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/iocsh/registry.rs:418-420` vs `:449-456`. Upstream: adjacent to epics-base#362 (the reported in-quote defect is fixed here).
 C consumes `\` as an escape outside quotes (`echo \"hello\"` →
 `"hello"`); our splitters only honor backslash inside quotes (→
 `\hello"`), while `lint_line` honors it everywhere — the lint passes
 lines the splitters then mis-parse.
+CLEARED: `split_space_args`, `split_comma_args`, and
+`find_closing_paren` now apply lint_line's rules — out-of-quote `\X`
+is a literal X (neither separator, quote, nor closing paren), and the
+paren scanner tracks `'` quotes like the rest. Two family members
+found by the sweep and fixed in the same change: the comma splitter's
+second pass re-processed escapes (`"a\\\\b"` collapsed twice) — it is
+now trim+strip only, gated on a functional-outer-quote flag so an
+escape-produced quote is never stripped — and `find_closing_paren`
+took an escaped `\)` or a `)` inside single quotes as the call's end.
+All expectations measured on the reference softIoc (`echo \"hello\"`→
+`"hello"`, `a\ b`→`a b`, `echo(a\,b)`→`a,b`, `echo(\"hi\")`→`"hi"`,
+`echo(a\))`→`a)`, `echo('a)b')`→`a)b`). Tests
+`registry::tests::out_of_quote_backslash_escapes_like_c_split`,
+`registry::tests::call_syntax_escapes_are_not_double_processed`.
 
 ### UI-25 Same-host/same-process discovery (pvxs#200) not live-verified
 Severity: LOW/SUSPECTED. Upstream: pvxs#200 (open, cause undiagnosed upstream).

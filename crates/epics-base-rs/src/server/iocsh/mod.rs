@@ -805,6 +805,15 @@ mod tests {
         assert!(echoes_script_line(""));
     }
 
+    /// A path as an unquoted iocsh token. The arg scanner honors C's
+    /// out-of-quote backslash escape, which would eat the separators of
+    /// a native Windows path — forward slashes survive the scanner and
+    /// every Windows API accepts them (what a real Windows st.cmd
+    /// writes too).
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
     fn make_shell() -> IocShell {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(PvDatabase::new());
@@ -956,7 +965,7 @@ mod tests {
         assert_eq!(shell.script_depth.get(), 0, "depth ticket fully released");
 
         let path2 = dir.path().join("self2.cmd");
-        std::fs::write(&path2, format!("iocshLoad {}\n", path2.display())).unwrap();
+        std::fs::write(&path2, format!("iocshLoad {}\n", script_token(&path2))).unwrap();
         let err = shell
             .execute_script(&path2.display().to_string())
             .expect_err("self-include via iocshLoad must fail at the cap");
@@ -999,7 +1008,7 @@ mod tests {
         let inner = dir.path().join("inner.cmd");
         std::fs::write(&inner, "#- inner\n").unwrap();
         let outer = dir.path().join("outer.cmd");
-        std::fs::write(&outer, format!("iocshLoad {}\n", inner.display())).unwrap();
+        std::fs::write(&outer, format!("iocshLoad {}\n", script_token(&inner))).unwrap();
         let outer_path = outer.display().to_string();
 
         // SAFETY: single-threaded test process (nextest), sole owner of
@@ -1350,7 +1359,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_macro_cmd.cmd");
         std::fs::write(&tmp, "$(CMD)\n").unwrap();
-        let line = format!("iocshLoad {} CMD=dbl", tmp.display());
+        let line = format!("iocshLoad {} CMD=dbl", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -1362,7 +1371,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_no_macros.cmd");
         std::fs::write(&tmp, "dbl\n").unwrap();
-        let line = format!("iocshLoad {}", tmp.display());
+        let line = format!("iocshLoad {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -1396,7 +1405,7 @@ mod tests {
         let script_path = std::env::temp_dir().join("iocsh_dup_load.cmd");
         std::fs::write(
             &script_path,
-            format!("dbLoadRecords {}\n", db_path.display()),
+            format!("dbLoadRecords {}\n", script_token(&db_path)),
         )
         .unwrap();
         let result = shell.execute_script(script_path.to_str().unwrap());
@@ -1430,7 +1439,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_err.cmd");
         std::fs::write(&tmp, "nonexistent_cmd\ndbl\n").unwrap();
-        let line = format!("iocshLoad {}", tmp.display());
+        let line = format!("iocshLoad {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(

@@ -113,6 +113,13 @@ impl Record for LsiRecord {
     /// class: a `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it
     /// spells (capped at SIZV), anything else as `DBR_STRING` — so an
     /// ENUM/MENU source delivers its state label (epics-base#183).
+    ///
+    /// Deliberate deviation: `dbGetLinkLS` returns 0 — success, nothing
+    /// written — when the source type is unknown (`dtyp < 0`, a
+    /// disconnected CA source; `dbLink.c:504-505`), so C keeps stale VAL
+    /// with no alarm. That silent success is the same wart family as
+    /// `putStringUlong`'s accepted-but-writes-nothing (`c_parse.rs`); the
+    /// port keeps its failed-read LINK alarm instead.
     fn input_link_read_as(
         &self,
         link_field: &str,

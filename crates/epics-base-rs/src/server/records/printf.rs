@@ -110,9 +110,21 @@ impl PrintfRecord {
     /// Which INP0..INP9 slots FMT consumes with a plain `%s` (no `l`
     /// modifier) — the directives C reads with `DBR_STRING`
     /// (`printfRecord.c:291`), so an ENUM/MENU source delivers its label.
-    /// Classified under the resolved-links slot mapping (a failed `*`
-    /// width shifts consumption at format time, `printfRecord.c:167-168`,
-    /// which a fetch-time request cannot see; those directives emit IVLS).
+    ///
+    /// Deliberate deviation, stated precisely: this map is computed at
+    /// FETCH time under the no-failure slot pairing. When a `*` width
+    /// link fails at read time, C's `goto bad_format`
+    /// (`printfRecord.c:167-168`) skips the conversion's own `plink++`,
+    /// so C's LATER directives consume shifted slots with fresh
+    /// format-time reads under their own DBR types — a pairing this
+    /// fetch-time request cannot see. `apply_fmt` reproduces the slot
+    /// SHIFT itself; only the shifted slot's fetch conversion stays as
+    /// requested here. Closing that would need either a corrective
+    /// second fetch (a PP link source would process twice — a real
+    /// semantic break C does not have) or C's lazy read-during-format
+    /// model, which the async-read/sync-format phase split rules out.
+    /// The failed-`*` directive itself emits IVLS in both
+    /// implementations.
     fn plain_string_slots(&self) -> [bool; 10] {
         let mut out = [false; 10];
         let bytes = self.fmt.as_bytes();

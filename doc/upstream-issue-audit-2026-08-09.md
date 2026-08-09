@@ -135,11 +135,16 @@ External half: `LinkMetadata::enum_choices` carries the label table
 (calink fills it from the `DBR_CTRL_ENUM` attribute fetch — C `dbCa`'s
 `pgetString` monitor equivalent; pvalink values already arrive as
 `EnumWithChoices`), rendered in `dbr_string_of`'s external arm.
-Residuals: printf's slot↔conversion map is classified unshifted — after
-a failed `*`-width link C's format-time slot inheritance can consume a
-slot under a different conversion than it was fetched with (that
-directive already emits IVLS); lsi's disconnected-source silent-success
-(`dbGetLinkLS` dtyp<0 → status 0) keeps our failed-read LINK alarm.
+Residuals closed as deliberate deviations, documented at the owning
+code: printf's fetch-time slot↔conversion map stays unshifted — after a
+failed `*`-width link C's `goto bad_format` skips the conversion's
+`plink++` so later directives re-read shifted slots under their own DBR
+types; `apply_fmt` reproduces the slot shift, and correcting the
+shifted slot's fetch conversion would need a second fetch (double-
+processing a PP source) or C's lazy read-during-format model
+(`printf.rs::plain_string_slots`). lsi keeps its failed-read LINK alarm
+where C's `dbGetLinkLS` silently succeeds without writing on a
+disconnected source (`dbLink.c:504-505`; `lsi.rs::input_link_read_as`).
 
 ### UI-64 DB-link puts to link fields are accepted where C's dbPut refuses — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/database/field_io.rs:653-707` (`put_pv_body`), reached from `links.rs:1504`. Upstream: epics-base#876 (the C guard is dbAccess.c:1340).

@@ -1268,13 +1268,14 @@ pub(crate) async fn run_transport_manager(
     client_identity: super::types::ClientIdentitySlot,
     #[cfg(feature = "experimental-rust-tls")] tls: Option<ClientTlsConfig>,
     #[cfg(feature = "experimental-rust-tls")] tls_server_name: Option<String>,
-    // Per-server SNI / cert-verification overrides built from the
-    // hostname half of EPICS_CA_NAME_SERVERS=host:port entries.
-    // Looked up per connect_server call so each TLS handshake uses
-    // the operator-supplied DNS name for that specific peer; falls
-    // back to tls_server_name (the global override), then the IP
-    // literal. Empty when no name servers were given by hostname.
-    #[cfg(feature = "experimental-rust-tls")] sni_overrides: HashMap<SocketAddr, String>,
+    // Per-server SNI / cert-verification overrides: the static
+    // EPICS_CA_TLS_SNI_MAP rows plus the *live* resolution of every
+    // EPICS_CA_NAME_SERVERS hostname (re-keyed by each entry's own
+    // `refresh_dns`). Looked up per connect_server call so each TLS
+    // handshake uses the operator-supplied DNS name for that specific
+    // peer; falls back to tls_server_name (the global override), then
+    // the IP literal.
+    #[cfg(feature = "experimental-rust-tls")] sni_overrides: std::sync::Arc<super::SniOverrides>,
 ) {
     // circuits are keyed by `(SocketAddr, priority)`, so two
     // channels to the same IOC at different priorities own independent
@@ -1317,25 +1318,21 @@ pub(crate) async fn run_transport_manager(
     let (circuit_dead_tx, mut circuit_dead_rx) = mpsc::unbounded_channel::<CircuitKey>();
 
     // Helper: resolve the right SNI / cert-verification name for a
-    // particular target address. Lookup order:
-    //   1. Exact (ip:port) match — EPICS_CA_NAME_SERVERS hostname or
-    //      EPICS_CA_TLS_SNI_MAP "ip:port=host" entry.
-    //   2. Wildcard (ip:0) match — EPICS_CA_TLS_SNI_MAP "ip=host"
+    // particular target address. Lookup order (`SniOverrides::lookup`):
+    //   1. Exact (ip:port) EPICS_CA_TLS_SNI_MAP "ip:port=host" row.
+    //   2. An EPICS_CA_NAME_SERVERS hostname whose *current* DNS
+    //      resolution is this address.
+    //   3. Wildcard (ip:0) match — EPICS_CA_TLS_SNI_MAP "ip=host"
     //      entry (any port). lets operators map an IOC's IP
     //      once and have it apply to every port the search engine
     //      finds it on.
-    //   3. Global EPICS_CA_TLS_SERVER_NAME fallback.
-    //   4. (Caller's last fallback) IP literal as SNI.
+    //   4. Global EPICS_CA_TLS_SERVER_NAME fallback.
+    //   5. (Caller's last fallback) IP literal as SNI.
     #[cfg(feature = "experimental-rust-tls")]
     let pick_sni = |addr: SocketAddr| -> Option<String> {
-        if let Some(h) = sni_overrides.get(&addr) {
-            return Some(h.clone());
-        }
-        let wildcard = SocketAddr::new(addr.ip(), 0);
-        if let Some(h) = sni_overrides.get(&wildcard) {
-            return Some(h.clone());
-        }
-        tls_server_name.clone()
+        sni_overrides
+            .lookup(addr)
+            .or_else(|| tls_server_name.clone())
     };
 
     loop {
@@ -5542,7 +5539,7 @@ mod priority_circuit_tests {
             identity,
             None,
             None,
-            HashMap::new(),
+            std::sync::Arc::new(crate::client::SniOverrides::default()),
         ));
         (cmd_tx, event_rx, observable)
     }
@@ -5844,7 +5841,7 @@ mod circuit_retirement_tests {
             identity,
             None,
             None,
-            std::collections::HashMap::new(),
+            std::sync::Arc::new(crate::client::SniOverrides::default()),
         ));
         (cmd_tx, event_rx, observable)
     }

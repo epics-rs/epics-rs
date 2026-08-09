@@ -62,10 +62,13 @@ CLEARED: `parse_nameserver_list` now yields `AddrEntry` (the #488
 primitive) and the entry rides to `run_nameserver_connection`, which
 calls `refresh_dns()` before every dial — same keep-cached-IP-on-failure
 policy as the ADDR_LIST refresh. Regression test
-`a_nameserver_dial_uses_the_fresh_dns_resolution`. Residual: the
-`experimental-rust-tls` SNI override map is still keyed by the
-startup-resolved `SocketAddr`, so a moved nameserver loses its SNI
-override until restart.
+`a_nameserver_dial_uses_the_fresh_dns_resolution`. Residual closed:
+the `experimental-rust-tls` SNI override map was keyed by the
+startup-resolved `SocketAddr` (a moved nameserver lost its SNI
+override until restart); `SniOverrides` now keeps nameserver rows
+keyed by hostname and `AddrEntry::refresh_dns` — the one resolution
+owner — rewrites the row, so the stale-key state is unconstructable
+(`a_moved_nameserver_keeps_its_sni_override`).
 The `EPICS_CA_ADDR_LIST` half of #488 is deliberately fixed (periodic
 `refresh_dns`), but name-server entries are resolved once at startup and
 the per-nameserver task redials the same stale `SocketAddr` forever

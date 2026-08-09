@@ -37,7 +37,13 @@ struct RecordDef {
 }
 
 /// Generate a .db string from record definitions and load it via db_loader.
-fn load_records(prefix: &str, dev: &str, port: &str, records: &[RecordDef], ctx: &CommandContext) {
+fn load_records(
+    prefix: &str,
+    dev: &str,
+    port: &str,
+    records: &[RecordDef],
+    ctx: &CommandContext,
+) -> Result<(), String> {
     let mut db_string = String::new();
     for r in records {
         let pv_name = format!("{prefix}{dev}:{}", r.suffix);
@@ -61,38 +67,52 @@ fn load_records(prefix: &str, dev: &str, port: &str, records: &[RecordDef], ctx:
     }
 
     let macros = HashMap::new();
-    match db_loader::parse_db(&db_string, &macros) {
-        Ok(defs) => {
-            for def in defs {
-                match db_loader::create_record(&def.record_type) {
-                    Ok(mut record) => {
-                        let mut common_fields = Vec::new();
-                        if let Err(e) =
-                            db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
-                        {
-                            eprintln!("z2m: apply_fields for {}: {e}", def.name);
-                            continue;
-                        }
-                        // Record + loaded common fields in one call: the sink
-                        // runs the `iocInit` passes against the final field
-                        // set, not a pre-load one (see `ioc.rs`).
-                        let load = epics_base_rs::server::database::RecordLoad::from_common_fields(
-                            common_fields,
-                        );
-                        ctx.block_on(async {
-                            if let Err(e) =
-                                ctx.db().add_loaded_record(&def.name, record, load).await
-                            {
-                                eprintln!("z2m: register '{}' skipped: {e}", def.name);
-                            }
-                        });
-                    }
-                    Err(e) => eprintln!("z2m: create_record({}): {e}", def.record_type),
+    // Per-record failures are printed and accumulated so the command ends
+    // in Err and `on error` sees a device whose records did not land
+    // (epics-base#498 / UI-105).
+    let mut deferred: Vec<String> = Vec::new();
+    let defs = db_loader::parse_db(&db_string, &macros)
+        .map_err(|e| format!("z2m: parse_db failed: {e}"))?;
+    for def in defs {
+        match db_loader::create_record(&def.record_type) {
+            Ok(mut record) => {
+                let mut common_fields = Vec::new();
+                if let Err(e) =
+                    db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
+                {
+                    let msg = format!("z2m: apply_fields for {}: {e}", def.name);
+                    eprintln!("{msg}");
+                    deferred.push(msg);
+                    continue;
                 }
+                // Record + loaded common fields in one call: the sink
+                // runs the `iocInit` passes against the final field
+                // set, not a pre-load one (see `ioc.rs`).
+                let load =
+                    epics_base_rs::server::database::RecordLoad::from_common_fields(common_fields);
+                ctx.block_on(async {
+                    if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
+                        let msg = format!("z2m: register '{}' skipped: {e}", def.name);
+                        eprintln!("{msg}");
+                        deferred.push(msg);
+                    }
+                });
+            }
+            Err(e) => {
+                let msg = format!("z2m: create_record({}): {e}", def.record_type);
+                eprintln!("{msg}");
+                deferred.push(msg);
             }
         }
-        Err(e) => eprintln!("z2m: parse_db failed: {e}"),
     }
+    if let Some(first) = deferred.first() {
+        return Err(if deferred.len() == 1 {
+            first.clone()
+        } else {
+            format!("{first} (+{} more)", deferred.len() - 1)
+        });
+    }
+    Ok(())
 }
 
 /// Register a Z2M JSON topic and return its canonical drvInfo (param name).
@@ -243,7 +263,7 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     scan_io_intr: false,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -291,7 +311,7 @@ pub fn cmd_z2m_temp_sensor() -> CommandDef {
                     scan_io_intr: true,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -364,7 +384,7 @@ pub fn cmd_z2m_light() -> CommandDef {
                     scan_io_intr: false,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -407,7 +427,7 @@ pub fn cmd_z2m_switch() -> CommandDef {
                     scan_io_intr: false,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -445,7 +465,7 @@ pub fn cmd_z2m_motion() -> CommandDef {
                     scan_io_intr: true,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -483,7 +503,7 @@ pub fn cmd_z2m_remote2() -> CommandDef {
                     scan_io_intr: true,
                 },
             ];
-            load_records(&prefix, &dev, &port, &records, ctx);
+            load_records(&prefix, &dev, &port, &records, ctx)?;
             Ok(CommandOutcome::Continue)
         },
     )

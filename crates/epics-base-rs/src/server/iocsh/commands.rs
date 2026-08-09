@@ -89,7 +89,7 @@ fn cmd_db_delete_record() -> CommandDef {
             if ctx.block_on(ctx.db().remove_record(&name)) {
                 ctx.println(&format!("dbDeleteRecord: removed '{name}'"));
             } else {
-                ctx.println(&format!("dbDeleteRecord: no record named '{name}'"));
+                return Err(format!("dbDeleteRecord: no record named '{name}'"));
             }
             Ok(CommandOutcome::Continue)
         },
@@ -664,15 +664,13 @@ fn cmd_pushd() -> CommandDef {
             let cwd = match std::env::current_dir() {
                 Ok(p) => p,
                 Err(e) => {
-                    ctx.println(&format!("pushd: cannot read cwd: {e}"));
-                    return Ok(CommandOutcome::Continue);
+                    return Err(format!("pushd: cannot read cwd: {e}"));
                 }
             };
             match &args[0] {
                 ArgValue::String(dir) => {
                     if let Err(e) = std::env::set_current_dir(dir) {
-                        ctx.println(&format!("pushd: {dir}: {e}"));
-                        return Ok(CommandOutcome::Continue);
+                        return Err(format!("pushd: {dir}: {e}"));
                     }
                     dir_stack().lock().unwrap().push(cwd);
                 }
@@ -680,14 +678,12 @@ fn cmd_pushd() -> CommandDef {
                     // No arg: swap cwd with top of stack.
                     let mut stack = dir_stack().lock().unwrap();
                     let Some(top) = stack.pop() else {
-                        ctx.println("pushd: directory stack empty");
-                        return Ok(CommandOutcome::Continue);
+                        return Err("pushd: directory stack empty".into());
                     };
                     if let Err(e) = std::env::set_current_dir(&top) {
                         // Restore on failure.
                         stack.push(top);
-                        ctx.println(&format!("pushd: {e}"));
-                        return Ok(CommandOutcome::Continue);
+                        return Err(format!("pushd: {e}"));
                     }
                     stack.push(cwd);
                 }
@@ -707,14 +703,12 @@ fn cmd_popd() -> CommandDef {
         |_args: &[ArgValue], ctx: &CommandContext| {
             let mut stack = dir_stack().lock().unwrap();
             let Some(top) = stack.pop() else {
-                ctx.println("popd: directory stack empty");
-                return Ok(CommandOutcome::Continue);
+                return Err("popd: directory stack empty".into());
             };
             if let Err(e) = std::env::set_current_dir(&top) {
                 // Restore the entry — failed cd must not lose stack state.
                 stack.push(top);
-                ctx.println(&format!("popd: {e}"));
-                return Ok(CommandOutcome::Continue);
+                return Err(format!("popd: {e}"));
             }
             drop(stack);
             print_stack(ctx);
@@ -791,24 +785,19 @@ fn cmd_db_create_record() -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
+            // Failures return Err so `on error` sees them — current C
+            // base wraps exactly these in `iocshSetError`
+            // (dbStaticIocRegister.c:282-310); epics-base#498 / UI-105.
             if let Err(e) = db_loader::validate_record_name(&name, 0, 0) {
-                ctx.println(&format!("dbCreateRecord: {e}"));
-                return Ok(CommandOutcome::Continue);
+                return Err(format!("dbCreateRecord: {e}"));
             }
             if ctx.db().get_record(&name).is_some() {
-                ctx.println(&format!("dbCreateRecord: record '{name}' already exists"));
-                return Ok(CommandOutcome::Continue);
+                return Err(format!("dbCreateRecord: record '{name}' already exists"));
             }
-            let record = match db_loader::create_record(&rec_type) {
-                Ok(r) => r,
-                Err(e) => {
-                    ctx.println(&format!("dbCreateRecord: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
+            let record =
+                db_loader::create_record(&rec_type).map_err(|e| format!("dbCreateRecord: {e}"))?;
             if let Err(e) = ctx.block_on(ctx.db().add_record(&name, record)) {
-                ctx.println(&format!("dbCreateRecord: {e}"));
-                return Ok(CommandOutcome::Continue);
+                return Err(format!("dbCreateRecord: {e}"));
             }
             ctx.println(&format!("dbCreateRecord: created '{name}' ({rec_type})"));
             Ok(CommandOutcome::Continue)
@@ -1136,6 +1125,11 @@ async fn install_record_defs(
     defs: Vec<db_loader::DbRecordDef>,
     breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
 ) -> Result<(), String> {
+    // Non-fatal per-record failures (alias reject, merge-field put): the
+    // load continues past them, but the command must still end in Err so
+    // `on error` fires — C's dbLoadRecords returns non-zero after its
+    // parser recovered and kept going (epics-base#498 / UI-105).
+    let mut deferred: Vec<String> = Vec::new();
     for mut def in defs {
         // Resolve a `LINR` field naming a loaded breakpoint table to its
         // menuConvert index (shared with the IocBuilder load path).
@@ -1220,10 +1214,12 @@ async fn install_record_defs(
             // are also registered (C parser appends).
             for alias in &def.aliases {
                 if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
-                    eprintln!(
+                    let msg = format!(
                         "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
                         def.name
                     );
+                    eprintln!("{msg}");
+                    deferred.push(msg);
                 }
             }
 
@@ -1275,7 +1271,10 @@ async fn install_record_defs(
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {
-                            eprintln!("put_common_field({name}) failed for {}: {e}", def.name);
+                            let msg =
+                                format!("put_common_field({name}) failed for {}: {e}", def.name);
+                            eprintln!("{msg}");
+                            deferred.push(msg);
                         }
                     }
                 }
@@ -1333,6 +1332,13 @@ async fn install_record_defs(
             ctx.println(&e);
             return Err(e);
         }
+    }
+    if let Some(first) = deferred.first() {
+        return Err(if deferred.len() == 1 {
+            first.clone()
+        } else {
+            format!("{first} (+{} more)", deferred.len() - 1)
+        });
     }
     Ok(())
 }

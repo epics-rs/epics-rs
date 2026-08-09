@@ -284,7 +284,7 @@ Structurally our port lacks the suspected upstream hazard (separate
 client search socket; lo-mcast re-forward ported), but no live
 same-process repro under the issue's exact env config was run.
 
-### UI-105 iocsh db* failure paths return Ok — invisible to `on error`
+### UI-105 iocsh db* failure paths return Ok — invisible to `on error` — CLEARED
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/iocsh/commands.rs:795-810`, `:1222-1227`, `:1278`; port-original family `commands.rs:92`, `:667-716`, `crates/mqtt-rs/src/z2m.rs:73-94`. Upstream: epics-base#498 (db* family worse than current C).
 Current C base routes exactly these failures through `iocshSetError`
 (`dbStaticIocRegister.c:282-310`, `dbIocRegister.c:56,73`): a bad
@@ -295,6 +295,17 @@ past a database that did not load. Same print-then-Ok shape in the
 port-original commands with no C constraint (dbDeleteRecord,
 pushd/popd, mqttZ2m*). Module commands whose C callFuncs are void
 (autosave, asyn, areaDetector, astac) mirror C and stay as parity.
+CLEARED: every reachable failure arm in the two families now returns
+Err — dbCreateRecord's four rejections, dbDeleteRecord's missing
+record, all pushd/popd failures — and the two non-fatal dbLoadRecords
+loops (alias reject, merge put_common_field) accumulate into a final
+Err after the load completes, matching C's parse-recover-then-return
+non-zero. mqtt z2m's `load_records` returns Result with the same
+accumulation; all six mqttZ2m* commands propagate. Unreachable
+missing-arg arms (parse_args rejects first) left as-is. Tests: the
+three dbCreateRecord rejection tests now assert Err, and
+`on_error_break_stops_at_a_failed_db_command` pins that a real command
+failure (not just an unknown command) trips `on error break`.
 
 ### UI-106 qsrv serves an always-empty `display.description` — pvxs fills it from DESC
 Severity: MED. epics-rs: `crates/epics-base-rs/src/server/record/record_instance.rs` (`populate_display_info`), `crates/epics-bridge-rs/src/qsrv/pvif.rs:763-776`, `:1275-1278`. Upstream: epics-base#785 (the port is behind the pvxs half).

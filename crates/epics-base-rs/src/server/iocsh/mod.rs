@@ -1105,7 +1105,9 @@ mod tests {
     /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a
     /// new record at runtime through the same factory registry as
     /// `dbLoadRecords`. Verifies the happy path plus three rejection
-    /// branches (duplicate name, bad name, unknown record type).
+    /// branches (duplicate name, bad name, unknown record type), which
+    /// return Err so `on error` sees them — current C base wraps these
+    /// in `iocshSetError` (epics-base#498 / UI-105).
     #[test]
     fn test_execute_line_db_create_record_happy_path() {
         let shell = make_shell();
@@ -1119,9 +1121,9 @@ mod tests {
     #[test]
     fn test_execute_line_db_create_record_rejects_duplicate() {
         let shell = make_shell();
-        // TEST_REC was added by make_shell() — re-creating must fail
-        // gracefully (logged via println, returns Continue, not Err).
-        shell.execute_line("dbCreateRecord ai TEST_REC").unwrap();
+        // TEST_REC was added by make_shell() — re-creating must fail.
+        let r = shell.execute_line("dbCreateRecord ai TEST_REC");
+        assert!(r.is_err(), "duplicate name must return Err");
         // After the rejected call, the original record (val=42.0) is
         // still there, not overwritten. Verify with dbgf which reads
         // the live VAL.
@@ -1135,16 +1137,38 @@ mod tests {
         // Space inside the name → validate_record_name returns Err.
         // Quote so the parser keeps the space as one argument.
         let r = shell.execute_line("dbCreateRecord ai \"BAD NAME\"");
-        // The command itself returns Continue (errors are printed),
-        // and the record must NOT be in the registry afterward.
-        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+        assert!(r.is_err(), "bad name must return Err");
     }
 
     #[test]
     fn test_execute_line_db_create_record_rejects_unknown_type() {
         let shell = make_shell();
         let r = shell.execute_line("dbCreateRecord nonexistent NEW_REC");
-        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+        assert!(r.is_err(), "unknown record type must return Err");
+    }
+
+    /// UI-105 / epics-base#498 — a failing db* command must trip
+    /// `on error break`, not just print. The failure here is a real
+    /// command failure (unknown record type), not an unknown command.
+    #[test]
+    fn on_error_break_stops_at_a_failed_db_command() {
+        let shell = make_shell();
+        let dir = std::env::temp_dir().join(format!("iocsh_ui105_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("st.cmd");
+        std::fs::write(
+            &path,
+            "on error break\ndbCreateRecord nonexistent X\ndbCreateRecord ai SHOULD_NOT_EXIST\n",
+        )
+        .unwrap();
+        let result = shell.execute_script(path.to_str().unwrap());
+        assert!(result.is_err(), "script must surface the db failure");
+        let r = shell.execute_line("dbgf SHOULD_NOT_EXIST");
+        assert!(
+            r.is_err(),
+            "on error break must stop before the next line creates the record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PR #603 — line ending in `\` joins to the next physical line.

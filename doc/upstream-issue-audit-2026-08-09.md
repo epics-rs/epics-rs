@@ -176,7 +176,7 @@ failure. Tests:
 `<` and `iocshLoad` entries, ticket unwinds to 0),
 `iocsh::tests::nested_include_under_the_cap_still_runs`.
 
-### UI-104 procserv-rs allocates and locks stdio between forkpty and exec
+### UI-104 procserv-rs allocates and locks stdio between forkpty and exec — CLEARED
 Severity: MED. epics-rs: `crates/epics-tools-rs/src/procserv/child.rs:309-384`. Upstream: epics-base#211 (fork-safety class).
 `in_child_setup_and_exec` builds `CString`s/`Vec` (malloc) and uses
 `eprintln!` (stdio lock) after fork; respawns run from the live tokio
@@ -184,6 +184,16 @@ supervisor (multi-threaded), so an arena/stdio lock held by another
 thread at fork time deadlocks the child pre-exec. The SAFETY comment at
 child.rs:110-112 claims async-signal-safe-only. (The daemonize fork is
 safe: pre-runtime, single-threaded.)
+CLEARED: `ChildExecImage::prepare` builds every allocation before
+`forkpty` — cwd/exec `CString`s, the NULL-terminated `argv_ptrs`
+vector, and pre-formatted failure lines; NUL validation now surfaces
+as a parent-side `ProcServError::Config` instead of a child exit. The
+post-fork path is syscall-only: `libc::chdir`/`libc::execvp` on the
+pre-built pointers, `write_child_failure` (raw `write(2)` + stack
+errno digits) instead of `eprintln!`, and `libc::_exit` instead of
+`std::process::exit` (no atexit/stdio flush in the forked image).
+Existing regressions `missing_child_binary_exits_255_not_127` /
+`failed_chdir_exits_255_not_126` exercise the new failure path.
 
 ### UI-24 Tree formatter drops the member name for `any`/union inline fields
 Severity: LOW. epics-rs: `crates/epics-pva-rs/src/format.rs:1376-1377`, `:1411-1417`. Upstream: pvxs#46 residue.

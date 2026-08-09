@@ -52,8 +52,9 @@ const DBCOMMON_NOMOD: &[&str] = &[
 /// consults this — via [`RecordInstance::resolves_noaccess_name`] — so those
 /// names keep answering; every *value* path stays closed to them.
 ///
-/// The name list is the generated spec ([`DB_COMMON_NOACCESS`]
-/// (super::dbd_generated::DB_COMMON_NOACCESS)) minus the names the port
+/// The name list is the generated spec
+/// ([`DB_COMMON_NOACCESS`](super::dbd_generated::DB_COMMON_NOACCESS))
+/// minus the names the port
 /// *serves* despite their C `DBF_NOACCESS` typing: `TIME` resolves to a real
 /// value here (see [`DBCOMMON_NOMOD`]), so it is answered by the gate's
 /// resolve arm, not this one.

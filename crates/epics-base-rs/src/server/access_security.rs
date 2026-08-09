@@ -262,7 +262,7 @@ pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
 const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Spawn the periodic HAG re-resolution task for `cell` (UI-107 /
-/// epics-base#863, access-security half). Every [`HAG_DNS_REFRESH`],
+/// epics-base#863, access-security half). Every `HAG_DNS_REFRESH`,
 /// when `asCheckClientIP` is on and a policy is loaded, re-resolves the
 /// raw HAG spellings through [`AccessSecurityConfig::with_refreshed_hags`]
 /// and republishes a changed config via [`AcfCell::store`] — the same
@@ -775,7 +775,7 @@ pub struct AccessSecurityConfig {
     pub uag: HashMap<String, Vec<String>>,
     pub hag: HashMap<String, Vec<String>>,
     /// The HAG members exactly as spelled in the ACF, keyed like `hag`.
-    /// `hag` stores [`hag_members`] resolution *output* (dotted quads
+    /// `hag` stores `hag_members` resolution *output* (dotted quads
     /// under `asCheckClientIP`), which cannot be re-resolved after a
     /// DNS change; [`Self::with_refreshed_hags`] re-runs the resolution
     /// from these raw spellings (epics-base#863 / UI-107).
@@ -785,7 +785,7 @@ pub struct AccessSecurityConfig {
 }
 
 impl AccessSecurityConfig {
-    /// Re-run [`hag_members`] — the single resolution owner — over the
+    /// Re-run `hag_members` — the single resolution owner — over the
     /// raw HAG spellings and return the refreshed config when any
     /// stored member changed, `None` when resolution is unchanged.
     ///

@@ -665,7 +665,7 @@ mod ioc {
         .to_vec();
         let mut name = pv.as_bytes().to_vec();
         name.push(0);
-        while name.len() % 8 != 0 {
+        while !name.len().is_multiple_of(8) {
             name.push(0);
         }
         frame.extend_from_slice(

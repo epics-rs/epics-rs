@@ -28,9 +28,8 @@ use super::scan::{ScanType, SimModeScan};
 ///
 /// These are common fields — no record's `field_list` declares them — so the
 /// declaration names them here. The remaining `SPC_NOMOD` entries in
-/// `dbCommon.dbd` (MLOK, MLIS, BKLNK, ASP, PPN, PPNR, SPVT, RSET, DSET, DPVT,
-/// RDES, LSET, BKPT) are `DBF_NOACCESS`: they have no field API in this port at
-/// all, and C refuses them one level earlier, at `dbNameToAddr`.
+/// `dbCommon.dbd` are `DBF_NOACCESS` ([`is_dbcommon_noaccess`]): they have
+/// no field API in this port at all.
 ///
 /// TIME is `DBF_NOACCESS` in C too (`dbpf REC.TIME` → "failed"), but this port
 /// resolves `.TIME`, so the declaration must cover it.
@@ -40,6 +39,28 @@ const DBCOMMON_NOMOD: &[&str] = &[
     "NAME", "STAT", "SEVR", "AMSG", "NSTA", "NSEV", "NAMSG", "ACKS", "ACKT", "LCNT", "PACT",
     "PUTF", "RPRO", "TIME", "UTAG",
 ];
+
+/// Is `field` (already uppercased) a `dbCommon` `DBF_NOACCESS` internal —
+/// a name C resolves but never serves?
+///
+/// These are C-internal pointers with no value API in this port. Their NAMES
+/// still exist to C's resolver: `dbNameToAddr` resolves a `DBF_NOACCESS`
+/// field and the refusal lands at channel *creation*, where `mapDBFToDBR`
+/// yields `DBR_NOACCESS` — measured against `softIocPVX`:
+/// `pvxget ORACLE:AI.MLOK` → `Refused to create Channel`, i.e. the SEARCH
+/// was answered. The search gate (`PvDatabase::has_name_no_resolve`)
+/// consults this — via [`RecordInstance::resolves_noaccess_name`] — so those
+/// names keep answering; every *value* path stays closed to them.
+///
+/// The name list is the generated spec
+/// ([`DB_COMMON_NOACCESS`](super::dbd_generated::DB_COMMON_NOACCESS))
+/// minus the names the port
+/// *serves* despite their C `DBF_NOACCESS` typing: `TIME` resolves to a real
+/// value here (see [`DBCOMMON_NOMOD`]), so it is answered by the gate's
+/// resolve arm, not this one.
+pub(crate) fn is_dbcommon_noaccess(field: &str) -> bool {
+    super::dbd_generated::DB_COMMON_NOACCESS.contains(&field) && !DBCOMMON_NOMOD.contains(&field)
+}
 
 thread_local! {
     /// The origin tag applied to every event posted from the current
@@ -346,12 +367,15 @@ pub(crate) struct MetadataSnapshot {
 /// below feed the live-computed `field_metadata_override`, never the
 /// cache — its invalidation on their write is harmless).
 ///
-/// Currently uncovered (because it is not yet populated by any
-/// `populate_*` function): `DESC` (would map to `display.description`
-/// — populate hook missing). The `Q:form` info tag is now wired
-/// (`populate_display_info` -> `display.form`), but as an immutable
-/// load-time info tag — not a runtime field — it needs no cache
-/// invalidation and so is intentionally absent from this field set.
+/// Deliberate exception: `DESC` feeds `display.description`
+/// (`populate_display_info`) but stays OUT of this set — C never marks
+/// it prop(YES) (epics-base#785), so a DESC write must not post
+/// DBE_PROPERTY. Its cache invalidation is owned by the DESC arm of
+/// `put_common_field`, the single writer of `common.desc`. The
+/// `Q:form` info tag is now wired (`populate_display_info` ->
+/// `display.form`), but as an immutable load-time info tag — not a
+/// runtime field — it needs no cache invalidation and so is
+/// intentionally absent from this field set.
 fn is_metadata_field(name: &str) -> bool {
     matches!(
         name,
@@ -765,11 +789,14 @@ pub struct RecordInstance {
     /// # Symmetric note for `populate_*` extensions
     ///
     /// If a future change adds a new field to `populate_display_info`,
-    /// `populate_control_info`, or `populate_enum_info` (e.g. populating
-    /// `display.description` from DESC), the new source field name MUST
-    /// also be added to `is_metadata_field` so writes to it invalidate
-    /// the cache. (The `Q:form` -> `display.form` mapping is exempt: it
-    /// reads an immutable load-time info tag, not a runtime field.)
+    /// `populate_control_info`, or `populate_enum_info`, the new source
+    /// field name MUST also be added to `is_metadata_field` so writes
+    /// to it invalidate the cache — unless, like DESC
+    /// (`display.description`), the field must not post DBE_PROPERTY;
+    /// then its write owner invalidates directly (see the DESC arm of
+    /// `put_common_field`). (The `Q:form` -> `display.form` mapping is
+    /// exempt: it reads an immutable load-time info tag, not a runtime
+    /// field.)
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
@@ -1725,6 +1752,18 @@ impl RecordInstance {
         field_desc_of(self.record.as_ref(), field)
     }
 
+    /// Is `field` (already uppercased) a `DBF_NOACCESS` internal name —
+    /// record-own (`BPTR`, `RPVT`, ...) or `dbCommon` (`MLOK`, `RSET`, ...)?
+    ///
+    /// C's `dbNameToAddr` resolves such a name, so a SEARCH for it is
+    /// answered and the refusal lands at channel creation (`mapDBFToDBR` →
+    /// `DBR_NOACCESS`). The search gate (`PvDatabase::has_name_no_resolve`)
+    /// asks this so the port answers the same way; every value path stays
+    /// closed to these names.
+    pub(crate) fn resolves_noaccess_name(&self, field: &str) -> bool {
+        is_dbcommon_noaccess(field) || self.record.noaccess_names().contains(&field)
+    }
+
     /// The `DBF_*` type `field` is SERVED as — the single source of truth for
     /// the type on the wire, on every delivery path.
     ///
@@ -2179,6 +2218,17 @@ impl RecordInstance {
                 display.form = form;
             }
         }
+        // `display.description` from dbCommon DESC — pvxs QSRV fills it
+        // on every metadata populate (iocsource.cpp:306-310), for every
+        // record type including those with no other display source. The
+        // qsrv builders always emit the leaf (defaulting a `None`
+        // display), so creating the DisplayInfo here changes leaf
+        // values, never the wire shape. Cache freshness is owned by the
+        // DESC arm of `put_common_field`, which invalidates without
+        // posting DBE_PROPERTY (epics-base#785 / UI-106).
+        snap.display
+            .get_or_insert_with(Default::default)
+            .description = self.common.desc.clone();
     }
 
     /// Populate ControlInfo from record fields if applicable.
@@ -2956,7 +3006,16 @@ impl RecordInstance {
                 if let EpicsValue::String(s) = value {
                     // DBF_STRING data field — store the bytes verbatim so a
                     // non-UTF-8 DESC round-trips unchanged.
-                    self.common.desc = s;
+                    if self.common.desc != s {
+                        self.common.desc = s;
+                        // DESC feeds `display.description` (a metadata-cache
+                        // source) but is not property-class — C never marks
+                        // it prop(YES) (epics-base#785) — so refresh the
+                        // cache here at the write owner without posting
+                        // DBE_PROPERTY: the pvxs behavior (fresh on the next
+                        // metadata build, no event).
+                        self.invalidate_metadata_cache();
+                    }
                 }
             }
             "PHAS" => {
@@ -5742,7 +5801,9 @@ mod metadata_cache_tests {
         inst.notify_field_written("VAL");
         assert!(inst.metadata_cache.lock().unwrap().is_some());
 
-        // Same for DESC
+        // DESC is not property-class either — its cache invalidation
+        // is owned by the DESC arm of `put_common_field`, not by this
+        // notify path (UI-106).
         inst.notify_field_written("DESC");
         assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
@@ -5794,6 +5855,50 @@ mod metadata_cache_tests {
         assert!(
             inst.metadata_cache.lock().unwrap().is_none(),
             "real metadata change must invalidate cache"
+        );
+    }
+
+    /// UI-106 / epics-base#785 — DESC feeds `display.description`
+    /// (pvxs fills it on every metadata populate, iocsource.cpp:306-310),
+    /// and a changed DESC refreshes the cache at its write owner so the
+    /// next snapshot serves the new text.
+    #[test]
+    fn desc_reaches_display_description_and_a_write_refreshes_it() {
+        let mut inst = ai_instance();
+        inst.put_common_field("DESC", EpicsValue::String("before".into()))
+            .unwrap();
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(
+            snap.display.as_ref().unwrap().description.as_str_lossy(),
+            "before"
+        );
+        inst.put_common_field("DESC", EpicsValue::String("after".into()))
+            .unwrap();
+        assert!(
+            inst.metadata_cache.lock().unwrap().is_none(),
+            "a changed DESC must invalidate the metadata cache"
+        );
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(
+            snap.display.as_ref().unwrap().description.as_str_lossy(),
+            "after"
+        );
+    }
+
+    /// …and an idempotent DESC put must NOT invalidate — same
+    /// discipline as faac1df1 for the property-class fields.
+    #[test]
+    fn an_idempotent_desc_put_keeps_the_cache() {
+        let mut inst = ai_instance();
+        inst.put_common_field("DESC", EpicsValue::String("same".into()))
+            .unwrap();
+        let _ = inst.snapshot_for_field("VAL");
+        assert!(inst.metadata_cache.lock().unwrap().is_some());
+        inst.put_common_field("DESC", EpicsValue::String("same".into()))
+            .unwrap();
+        assert!(
+            inst.metadata_cache.lock().unwrap().is_some(),
+            "an unchanged DESC must not invalidate the metadata cache"
         );
     }
 

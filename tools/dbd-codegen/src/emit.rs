@@ -266,8 +266,11 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
          //! * **`DBF_NOACCESS` fields** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...).\n\
          //!   These are C-internal pointers with no CA/PVA representation — C's\n\
          //!   `mapDBFToDBR` sends them to `DBR_NOACCESS` and `dbChannelCreate` refuses\n\
-         //!   a channel on them. A Rust port has no pointer to expose, so they are\n\
-         //!   dropped rather than invented; the count is reported by the generator.\n",
+         //!   a channel on them. A Rust port has no pointer to expose, so their\n\
+         //!   *descriptors* are dropped rather than invented — but their NAMES are\n\
+         //!   kept (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so\n\
+         //!   a SEARCH for `REC.BPTR` is answered and the refusal lands at channel\n\
+         //!   creation, and the search gate needs the names to do the same.\n",
         input.dbd_dir
     )
     .unwrap();
@@ -366,6 +369,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     );
 
     let mut record_consts: Vec<(String, String)> = Vec::new();
+    let mut noaccess_consts: Vec<(String, String)> = Vec::new();
     for rec in input.records {
         let konst = fields_const(&rec.name);
         let own: Vec<&Field> = rec
@@ -373,19 +377,21 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
             .iter()
             .filter(|f| !f.from_common && !is_internal(f))
             .collect();
-        let dropped = rec
+        let internal: Vec<&str> = rec
             .fields
             .iter()
             .filter(|f| !f.from_common && is_internal(f))
-            .count();
+            .map(|f| f.name.as_str())
+            .collect();
 
         writeln!(
             out,
             "/// `recordtype({})` — {} CA-visible own fields from `dbd/{}` \
-             ({dropped} `DBF_NOACCESS` internals dropped).",
+             ({} `DBF_NOACCESS` internals dropped).",
             rec.name,
             own.len(),
-            rec.source
+            rec.source,
+            internal.len()
         )
         .unwrap();
         writeln!(out, "pub static {konst}: &[FieldDesc] = &[").unwrap();
@@ -399,7 +405,30 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
             )?);
         }
         out.push_str("];\n\n");
-        record_consts.push((rec.name.clone(), konst));
+        record_consts.push((rec.name.clone(), konst.clone()));
+
+        // The dropped internals keep their NAMES: C's `dbNameToAddr`
+        // resolves a `DBF_NOACCESS` field, so a SEARCH for it is answered
+        // and the refusal lands at channel creation. The search gate
+        // consults this list to answer the same way.
+        if !internal.is_empty() {
+            let na_konst = format!("{}_NOACCESS", konst.trim_end_matches("_FIELDS"));
+            writeln!(
+                out,
+                "/// `recordtype({})` — the `DBF_NOACCESS` internal names dropped from\n\
+                 /// [`{konst}`]: resolvable (a SEARCH is answered), never servable.",
+                rec.name
+            )
+            .unwrap();
+            writeln!(out, "pub static {na_konst}: &[&str] = &[").unwrap();
+            for name in &internal {
+                writeln!(out, "    {},", rust_str(name)).unwrap();
+            }
+            out.push_str("];\n\n");
+            noaccess_consts.push((rec.name.clone(), na_konst));
+        } else {
+            noaccess_consts.push((rec.name.clone(), "&[]".to_string()));
+        }
     }
 
     // Every `cvt_dbaddr.types` row must name a field that really is
@@ -455,6 +484,25 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
             )?);
         }
         out.push_str("];\n\n");
+
+        let common_internal: Vec<&str> = input
+            .common
+            .iter()
+            .filter(|f| is_internal(f))
+            .map(|f| f.name.as_str())
+            .collect();
+        if !common_internal.is_empty() {
+            out.push_str(
+                "/// The `DBF_NOACCESS` internals of `dbCommon.dbd`, dropped from\n\
+                 /// [`DB_COMMON_FIELDS`]: resolvable (a SEARCH is answered), never\n\
+                 /// servable — see `record_noaccess_fields` for the record-own twins.\n",
+            );
+            out.push_str("pub static DB_COMMON_NOACCESS: &[&str] = &[\n");
+            for name in &common_internal {
+                writeln!(out, "    {},", rust_str(name)).unwrap();
+            }
+            out.push_str("];\n\n");
+        }
     }
 
     if !input.devices.is_empty() {
@@ -471,6 +519,22 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         &mut out,
         "record_type",
         record_consts.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
+
+    out.push_str(
+        "/// The record-own `DBF_NOACCESS` internal names for a record type — fields\n\
+         /// C's `dbNameToAddr` resolves (a SEARCH is answered) but whose channel is\n\
+         /// refused at creation (`mapDBFToDBR` -> `DBR_NOACCESS`). Empty for a type\n\
+         /// declaring none, `None` for a type no vendored `.dbd` declares.\n\
+         pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {\n",
+    );
+    emit_str_lookup(
+        &mut out,
+        "record_type",
+        noaccess_consts
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
     );
     out.push_str("}\n\n");
 

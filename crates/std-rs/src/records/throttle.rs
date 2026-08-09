@@ -746,6 +746,10 @@ impl Record for ThrottleRecord {
         dbd_generated::THROTTLE_FIELDS
     }
 
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
+        dbd_generated::THROTTLE_NOACCESS
+    }
+
     /// C `throttleRecord.c:308` keeps `recGblFwdLink(prec)` commented
     /// out in `process()` — the forward link is fired ONLY from
     /// `valuePut`'s non-CONSTANT branch (`throttleRecord.c:580`), i.e.

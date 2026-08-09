@@ -779,8 +779,11 @@ impl CaClient {
         }
 
         let nameserver_entries = parse_nameserver_list();
-        // Build the per-address SNI map. Two sources:
-        // 1. EPICS_CA_NAME_SERVERS hostnames.
+        // Build the per-address SNI registry. Two sources:
+        // 1. EPICS_CA_NAME_SERVERS hostnames — live rows, re-keyed by
+        //    each entry's own `refresh_dns` so a nameserver that moves
+        //    behind a stable DNS name keeps its SNI override
+        //    (epics-base#488 residual).
         // 2. EPICS_CA_TLS_SNI_MAP for IPs reached via UDP search
         //   . The CA SEARCH wire protocol carries no
         //    hostname, so a UDP-discovered TLS IOC otherwise has to
@@ -792,18 +795,17 @@ impl CaClient {
         // Per-address overrides win over the global
         // EPICS_CA_TLS_SERVER_NAME (config.tls_server_name).
         #[cfg(feature = "experimental-rust-tls")]
-        let sni_overrides: std::collections::HashMap<SocketAddr, String> = {
-            let mut map: std::collections::HashMap<SocketAddr, String> = nameserver_entries
+        let sni_overrides = std::sync::Arc::new(SniOverrides::new(
+            parse_tls_sni_map().into_iter().collect(),
+            nameserver_entries
                 .iter()
-                .filter_map(|(addr, host)| host.clone().map(|h| (*addr, h)))
-                .collect();
-            for (addr, host) in parse_tls_sni_map() {
-                map.insert(addr, host);
-            }
-            map
-        };
-        let nameserver_addrs: Vec<SocketAddr> =
-            nameserver_entries.iter().map(|(a, _)| *a).collect();
+                .filter_map(|e| e.hostname.clone().map(|h| (h, e.sock))),
+        ));
+        #[cfg(feature = "experimental-rust-tls")]
+        let nameserver_entries: Vec<AddrEntry> = nameserver_entries
+            .into_iter()
+            .map(|e| e.with_sni(sni_overrides.clone()))
+            .collect();
 
         let (search_tx, search_rx) = mpsc::unbounded_channel();
         let (search_resp_tx, search_resp_rx) = mpsc::unbounded_channel();
@@ -834,7 +836,7 @@ impl CaClient {
         // gate — a target IOC's `ca://` links now resolve the way a C IOC's do.
         let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
             addr_list,
-            nameserver_addrs,
+            nameserver_entries,
             search_rx,
             search_resp_tx,
             search_attempts.clone(),
@@ -4797,6 +4799,11 @@ pub(crate) struct AddrEntry {
     pub sock: SocketAddr,
     pub hostname: Option<String>,
     pub port: u16,
+    /// TLS-only: SNI registry this entry publishes fresh resolutions
+    /// into. Attached ([`AddrEntry::with_sni`]) only to
+    /// `EPICS_CA_NAME_SERVERS` entries; `None` for addr-list entries.
+    #[cfg(feature = "experimental-rust-tls")]
+    sni: Option<std::sync::Arc<SniOverrides>>,
 }
 
 impl AddrEntry {
@@ -4805,7 +4812,18 @@ impl AddrEntry {
             sock,
             hostname,
             port,
+            #[cfg(feature = "experimental-rust-tls")]
+            sni: None,
         }
+    }
+
+    /// Publish this entry's future [`refresh_dns`](Self::refresh_dns)
+    /// resolutions into `sni`, so a TLS data circuit to the re-resolved
+    /// address still finds the operator-supplied hostname.
+    #[cfg(feature = "experimental-rust-tls")]
+    pub fn with_sni(mut self, sni: std::sync::Arc<SniOverrides>) -> Self {
+        self.sni = Some(sni);
+        self
     }
 
     /// Re-resolve the hostname (if any) and return the freshened
@@ -4823,6 +4841,12 @@ impl AddrEntry {
         };
         let new_sock = resolve_host(host, self.port)?;
         self.sock = new_sock;
+        // The one place a tracked hostname is ever resolved, so the SNI
+        // registry row can never lag the address actually being dialed.
+        #[cfg(feature = "experimental-rust-tls")]
+        if let Some(sni) = &self.sni {
+            sni.record_resolution(host, new_sock);
+        }
         Ok(new_sock)
     }
 }
@@ -5305,6 +5329,66 @@ fn expand_shell_vars(s: &str) -> String {
     out
 }
 
+/// Live SNI / cert-verification-name registry, shared between the
+/// transport manager (reader, one [`SniOverrides::lookup`] per TLS
+/// connect) and every nameserver [`AddrEntry::refresh_dns`] (writer,
+/// one [`SniOverrides::record_resolution`] per successful re-resolve).
+///
+/// Two layers, one meaning each:
+/// - `static_map` — operator-pinned `EPICS_CA_TLS_SNI_MAP` rows,
+///   immutable for the client's lifetime (exact `ip:port` keys plus
+///   `port == 0` wildcard rows).
+/// - `nameservers` — hostname → *current* DNS resolution, one row per
+///   `EPICS_CA_NAME_SERVERS` entry given by name. Keyed by hostname,
+///   not by resolved address, so a nameserver that moves behind a
+///   stable DNS name cannot leave a stale address key behind: the same
+///   `refresh_dns` that redials the new address rewrites the row.
+///   (Replaces the startup-frozen `SocketAddr`-keyed snapshot — the
+///   epics-base#488 residual that lost a moved nameserver's SNI
+///   override until client restart.)
+#[cfg(feature = "experimental-rust-tls")]
+#[derive(Debug, Default)]
+pub(crate) struct SniOverrides {
+    static_map: std::collections::HashMap<SocketAddr, String>,
+    nameservers: parking_lot::Mutex<std::collections::HashMap<String, SocketAddr>>,
+}
+
+#[cfg(feature = "experimental-rust-tls")]
+impl SniOverrides {
+    fn new(
+        static_map: std::collections::HashMap<SocketAddr, String>,
+        nameservers: impl IntoIterator<Item = (String, SocketAddr)>,
+    ) -> Self {
+        Self {
+            static_map,
+            nameservers: parking_lot::Mutex::new(nameservers.into_iter().collect()),
+        }
+    }
+
+    /// Resolve the SNI name for `addr`. Precedence is that of the
+    /// snapshot map this replaces: exact `EPICS_CA_TLS_SNI_MAP` row,
+    /// then a nameserver whose current resolution is `addr`, then the
+    /// wildcard (`port == 0`) map row.
+    pub(crate) fn lookup(&self, addr: SocketAddr) -> Option<String> {
+        if let Some(h) = self.static_map.get(&addr) {
+            return Some(h.clone());
+        }
+        if let Some((host, _)) = self
+            .nameservers
+            .lock()
+            .iter()
+            .find(|(_, sock)| **sock == addr)
+        {
+            return Some(host.clone());
+        }
+        self.static_map.get(&SocketAddr::new(addr.ip(), 0)).cloned()
+    }
+
+    fn record_resolution(&self, hostname: &str, sock: SocketAddr) {
+        self.nameservers.lock().insert(hostname.to_string(), sock);
+    }
+}
+
 /// Parse `EPICS_CA_TLS_SNI_MAP` — whitespace-separated `IP[:port]=hostname`
 /// entries. Returns a vec of `(SocketAddr, hostname)` pairs ready to
 /// merge into the per-server SNI override map.
@@ -5376,7 +5460,7 @@ fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
 /// SNI / cert-verification name for that specific server, so multi-IOC TLS
 /// deployments with hostname-bound certs work without a single global
 /// `EPICS_CA_TLS_SERVER_NAME` override.
-pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
+pub(crate) fn parse_nameserver_list() -> Vec<AddrEntry> {
     let Some(list) = epics_base_rs::runtime::env_table::EPICS_CA_NAME_SERVERS.get() else {
         return Vec::new();
     };
@@ -5392,20 +5476,25 @@ pub(crate) fn parse_nameserver_list() -> Vec<(SocketAddr, Option<String>)> {
     // C `cac.cpp:259` — the SAME tokenizer the client address list is built
     // with, which is why a bad token here is reported in exactly the same two
     // lines, naming this variable.
-    let out: Vec<(SocketAddr, Option<String>)> =
-        crate::iocinf::add_addr_to_channel_access_address_list(
-            &list,
-            "EPICS_CA_NAME_SERVERS",
-            default_server_port,
-        )
-        .into_iter()
-        .map(|tok| (tok.sock, tok.hostname))
-        .collect();
+    // `AddrEntry`, not a bare `SocketAddr`: the hostname must survive to
+    // the per-nameserver circuit so its redial path can re-resolve DNS
+    // (the same Launchpad-#488 family `EPICS_CA_ADDR_LIST` already
+    // handles via `AddrEntry::refresh_dns`). The resolved port carries
+    // over — explicit `host:port` entries keep it, bare hostnames got
+    // `default_server_port` above.
+    let out: Vec<AddrEntry> = crate::iocinf::add_addr_to_channel_access_address_list(
+        &list,
+        "EPICS_CA_NAME_SERVERS",
+        default_server_port,
+    )
+    .into_iter()
+    .map(|tok| AddrEntry::new(tok.sock, tok.hostname, tok.sock.port()))
+    .collect();
     // C `cac.cpp:260`: `removeDuplicateAddresses ( &dest, &tmpList, 0 )` — the
     // name-server list is deduped by the SAME helper as `EPICS_CA_ADDR_LIST`,
     // and warns about what it drops for the same reason: a repeated entry
     // otherwise buys a second TCP circuit to that name server.
-    crate::iocinf::remove_duplicate_addresses(out, |(addr, _)| *addr)
+    crate::iocinf::remove_duplicate_addresses(out, |e| e.sock)
 }
 
 // Legacy `parse_addr_list() -> Vec<SocketAddr>`
@@ -5649,6 +5738,60 @@ mod tls_sni_config_tests {
         assert!(cfg.tls_server_name.is_none(), "default must be None");
         cfg.tls_server_name = Some("ioc.example.com".into());
         assert_eq!(cfg.tls_server_name.as_deref(), Some("ioc.example.com"));
+    }
+
+    /// epics-base#488 residual: the SNI row must follow the hostname,
+    /// not the address it resolved to at startup. `refresh_dns` — the
+    /// one place a tracked hostname is resolved — rewrites the row, so
+    /// a TLS circuit to the moved nameserver's new address still gets
+    /// its hostname and the stale address stops matching.
+    #[cfg(feature = "experimental-rust-tls")]
+    #[test]
+    fn a_moved_nameserver_keeps_its_sni_override() {
+        let stale: SocketAddr = "192.0.2.1:5064".parse().unwrap();
+        let sni = std::sync::Arc::new(SniOverrides::new(
+            std::collections::HashMap::new(),
+            [("localhost".to_string(), stale)],
+        ));
+        assert_eq!(sni.lookup(stale).as_deref(), Some("localhost"));
+
+        // The nameserver task's redial path: refresh through the entry.
+        let mut entry = AddrEntry::new(stale, Some("localhost".into()), 5064).with_sni(sni.clone());
+        let fresh = entry.refresh_dns().expect("localhost resolves");
+        assert_ne!(fresh, stale, "precondition: the resolution moved");
+        assert_eq!(sni.lookup(fresh).as_deref(), Some("localhost"));
+        assert_eq!(
+            sni.lookup(stale),
+            None,
+            "hostname-keyed row must not leave the startup address behind"
+        );
+    }
+
+    /// Precedence of the snapshot map this registry replaces: exact
+    /// static row, then live nameserver binding, then wildcard row.
+    #[cfg(feature = "experimental-rust-tls")]
+    #[test]
+    fn static_sni_rows_win_and_wildcard_comes_last() {
+        let pinned: SocketAddr = "10.0.0.1:5064".parse().unwrap();
+        let sni = SniOverrides::new(
+            [
+                (pinned, "pin.example.com".to_string()),
+                (
+                    "10.0.0.1:0".parse().unwrap(),
+                    "wild.example.com".to_string(),
+                ),
+            ]
+            .into(),
+            [("ns.example.com".to_string(), pinned)],
+        );
+        // Exact static row beats the nameserver binding for the same addr.
+        assert_eq!(sni.lookup(pinned).as_deref(), Some("pin.example.com"));
+        // No exact row, no binding at this port → wildcard row.
+        assert_eq!(
+            sni.lookup("10.0.0.1:5065".parse().unwrap()).as_deref(),
+            Some("wild.example.com")
+        );
+        assert_eq!(sni.lookup("10.0.0.2:5064".parse().unwrap()), None);
     }
 }
 

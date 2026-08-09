@@ -2092,8 +2092,13 @@ impl PvDatabase {
             }
         }
 
-        // Read INP value
-        let inp_value = self.read_link_value_soft(&inp_parsed, is_soft, visited, depth);
+        // Read INP value, converted to the record's declared `dbrType`
+        // request (stringin/lsi ask for `DBR_STRING`/`dbGetLinkLS` —
+        // `devSiSoft.c:53`, `devLsiSoft.c:32` — so an ENUM/MENU source
+        // delivers its state label, not the index).
+        let inp_value = self
+            .read_link_value_soft(&inp_parsed, is_soft, visited, depth)
+            .and_then(|v| self.typed_input_value(&rec, "INP", &inp_parsed, v));
 
         // epics-base PR #d0cf47c: single-INP MS-class link must also
         // propagate the source record's STAT/SEVR/AMSG just like the
@@ -2144,7 +2149,12 @@ impl PvDatabase {
         // never reaches here (`dol_info` excludes it — the constant is seeded
         // once at init), so the PP-aware fetch is the right one.
         let dol_value = if let Some((ref dol_parsed, _oif)) = dol_info {
-            self.fetch_input_link(&rec, dol_parsed, visited, depth)
+            // Converted to the record's declared request: stringout reads
+            // DOL with `DBR_STRING` (`stringoutRecord.c:141`), lso via
+            // `dbGetLinkLS` (`lsoRecord.c:114`) — an ENUM/MENU DOL source
+            // delivers its label, not the index.
+            let fetch = self.fetch_input_link(&rec, dol_parsed, visited, depth);
+            self.convert_link_fetch(&rec, "DOL", dol_parsed, fetch)
                 .value()
         } else {
             None
@@ -2209,7 +2219,10 @@ impl PvDatabase {
 
         // 1.5. Multi-input link fetch (calc/calcout/sel/sub)
         // Also collect alarm info from source records for MS/NMS propagation.
-        let multi_input_values: Vec<(String, EpicsValue)>;
+        // (value field, value, store-raw) — `store_raw` marks a value a
+        // string-class declared request produced, which must reach the field
+        // as-is instead of through the numeric store funnel below.
+        let multi_input_values: Vec<(String, EpicsValue, bool)>;
         let mut link_alarms: Vec<(
             crate::server::record::MonitorSwitch,
             super::links::LinkAlarm,
@@ -2290,6 +2303,38 @@ impl PvDatabase {
                         self.process_passive_db_source(db, visited, depth);
                     }
                     let (fetch, alarm) = self.read_link_with_alarm(&parsed);
+                    // The record's declared per-link request (printf reads a
+                    // `%s` slot with `DBR_STRING`, `printfRecord.c:291`) —
+                    // a conversion miss counts as a failed read below. A
+                    // string-class request also bypasses the store's
+                    // `to_f64` funnel: that funnel IS the `DBR_DOUBLE`
+                    // request of the calc-class records (calcRecord.c:434),
+                    // not a rule of the store.
+                    let (fetch, store_raw) = match fetch {
+                        crate::server::recgbl::simm::LinkFetch::Value(v) => {
+                            use crate::server::recgbl::simm::LinkFetch;
+                            use crate::server::record::LinkReadAs;
+                            let source = self.resolve_out_target(&parsed);
+                            let read_as = {
+                                let instance = rec.read();
+                                instance.record.input_link_read_as(link_field, &source)
+                            };
+                            match read_as {
+                                None => (LinkFetch::NoData, false),
+                                Some(read_as) => {
+                                    let raw = matches!(
+                                        read_as,
+                                        LinkReadAs::String | LinkReadAs::CharArrayAsString { .. }
+                                    );
+                                    match self.apply_link_read_as(&parsed, read_as, v) {
+                                        Some(v) => (LinkFetch::Value(v), raw),
+                                        None => (LinkFetch::Failed, false),
+                                    }
+                                }
+                            }
+                        }
+                        f => (f, false),
+                    };
                     let read_failed = !fetch.is_ok();
                     any_input_read_failed |= read_failed;
                     // `NoData` (a CONSTANT link) delivers nothing — the value
@@ -2307,7 +2352,7 @@ impl PvDatabase {
                         _ => None,
                     };
                     if let Some(value) = value {
-                        results.push((val_field.clone(), value));
+                        results.push((val_field.clone(), value, store_raw));
                     }
                     // "Resolved" is C's `RTN_SUCCESS(dbGetLink(...))` — status
                     // 0 — which a CONSTANT link satisfies (it delivers nothing
@@ -2596,8 +2641,14 @@ impl PvDatabase {
                 // `to_f64()` answers None for every array variant, so routing every
                 // value through it dropped array-valued links outright — AA..LL never
                 // populated and the record calculated on an empty array.
-                for (val_field, value) in &multi_input_values {
-                    if value.is_array() {
+                for (val_field, value, store_raw) in &multi_input_values {
+                    if *store_raw {
+                        // A string-class declared request (printf `%s`)
+                        // already produced the value the record asked for —
+                        // the numeric funnel below is the OTHER records'
+                        // `DBR_DOUBLE` request, not a store rule.
+                        let _ = instance.record.put_field_internal(val_field, value.clone());
+                    } else if value.is_array() {
                         if instance
                             .record
                             .put_field_internal(val_field, value.clone())
@@ -5332,6 +5383,65 @@ impl PvDatabase {
         self.fetch_link(reader, link)
     }
 
+    /// Apply the reader's declared `dbrType` request
+    /// ([`Record::input_link_read_as`](crate::server::record::Record::input_link_read_as))
+    /// to one delivered link value — C's `dbGetLink(plink, dbrType, ...)`
+    /// second argument, which the generic fetch paths never passed: they
+    /// delivered the source's native value and let the target field coerce
+    /// blind, turning a `DBR_STRING` request at an ENUM/MENU source into
+    /// index digits (epics-base#183).
+    ///
+    /// The source is resolved with NO record lock held (the
+    /// [`Self::read_db_link_into_field`] rule: a self-referencing link
+    /// would otherwise re-enter this record's own gate), and only when the
+    /// fetch actually delivered a value. `None` from the record is C's
+    /// `default: break` — no read — mapped to `NoData`; a conversion the
+    /// source cannot satisfy is a FAILED read (C's non-zero status).
+    fn convert_link_fetch(
+        &self,
+        rec: &Arc<parking_lot::RwLock<RecordInstance>>,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        fetch: crate::server::recgbl::simm::LinkFetch,
+    ) -> crate::server::recgbl::simm::LinkFetch {
+        use crate::server::recgbl::simm::LinkFetch;
+        let LinkFetch::Value(value) = fetch else {
+            return fetch;
+        };
+        let source = self.resolve_out_target(link);
+        let read_as = {
+            let instance = rec.read();
+            instance.record.input_link_read_as(link_field, &source)
+        };
+        match read_as {
+            None => LinkFetch::NoData,
+            Some(read_as) => match self.apply_link_read_as(link, read_as, value) {
+                Some(v) => LinkFetch::Value(v),
+                None => LinkFetch::Failed,
+            },
+        }
+    }
+
+    /// The `Option`-shaped twin of [`Self::convert_link_fetch`] for the
+    /// single-INP soft path, whose reader deals in `Option<EpicsValue>`:
+    /// a conversion (or declaration) miss is `None`, which that path
+    /// already classifies as a failed read of a real link (LINK alarm,
+    /// VAL untouched — C `read_si` returning `dbGetLink`'s status).
+    fn typed_input_value(
+        &self,
+        rec: &Arc<parking_lot::RwLock<RecordInstance>>,
+        link_field: &str,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        let source = self.resolve_out_target(link);
+        let read_as = {
+            let instance = rec.read();
+            instance.record.input_link_read_as(link_field, &source)
+        }?;
+        self.apply_link_read_as(link, read_as, value)
+    }
+
     /// C `dbDbGetValue`'s tail, applied to the reader: the ONE place a
     /// process-time link read folds its source's alarm in. Computes the
     /// `(MS class, source alarm)` pair through the inheritance owner with no
@@ -6113,8 +6223,11 @@ impl PvDatabase {
             // locality fallback) / Ca / Pva / constant via `fetch_link`
             // (C `dbGetLink`), which keeps C's three outcomes apart: a value,
             // a CONSTANT link's "status 0 with the buffer untouched", and a
-            // failure.
+            // failure. Converted to the record's declared request: stringin
+            // reads SIOL with `DBR_STRING` (`stringinRecord.c:208`), lsi via
+            // `dbGetLinkLS` (`lsiRecord.c:244`).
             let fetch = self.fetch_link(rec, &siol_link);
+            let fetch = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch);
             let mut instance = rec.write();
 
             // C reads SIOL with a plain `dbGetLink`, whose failure path is

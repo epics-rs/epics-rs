@@ -120,7 +120,15 @@ impl RegressionIoc {
         // CA server on a kernel-assigned port: `from_parts` binds the
         // sockets and reports the port it got, so nothing can take the
         // number in between.
-        let ca_server = CaServer::from_parts(db.clone(), 0, None, None, None, None).await?;
+        let ca_server = CaServer::from_parts(
+            db.clone(),
+            0,
+            None,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        )
+        .await?;
         let ca_port = ca_server.udp_port();
         let _ca_task = tokio::spawn(async move { ca_server.run().await });
 

@@ -96,8 +96,12 @@ async fn main() -> CaResult<()> {
     let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
 
     // ── Build both servers from the same database ──
-    let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await?;
-    let pva_server = PvaServer::from_parts(db, pva_port, None, None, None);
+    // One policy cell for both protocols, so an `asInit` from the shell
+    // (or a future ACF reload) gates CA and PVA together.
+    let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+    let ca_server =
+        CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await?;
+    let pva_server = PvaServer::from_parts(db, pva_port, acf, None, None);
 
     // CA runs in background, PVA runs with iocsh (shell exit stops everything)
     let ca_handle = epics_base_rs::runtime::task::spawn(async move { ca_server.run().await });

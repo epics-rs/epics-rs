@@ -71,7 +71,7 @@ async fn closed_loop_dol_inherits_ms() {
     db.add_record("A1", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("A1.DOL", EpicsValue::String("SRC MS".into()))
+    db.put_record_field_from_ca_no_notify("A1", "DOL", EpicsValue::String("SRC MS".into()))
         .await
         .unwrap();
     db.put_pv("A1.OMSL", EpicsValue::String("closed_loop".into()))
@@ -81,7 +81,7 @@ async fn closed_loop_dol_inherits_ms() {
     db.add_record("B1", Box::new(BoRecord::new(0)))
         .await
         .unwrap();
-    db.put_pv("B1.DOL", EpicsValue::String("SRC MS".into()))
+    db.put_record_field_from_ca_no_notify("B1", "DOL", EpicsValue::String("SRC MS".into()))
         .await
         .unwrap();
     db.put_pv("B1.OMSL", EpicsValue::String("closed_loop".into()))
@@ -124,14 +124,14 @@ async fn siml_and_siol_inherit_ms() {
     db.add_record("R3", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("R3.SIML", EpicsValue::String("SRC0 MS".into()))
+    db.put_record_field_from_ca_no_notify("R3", "SIML", EpicsValue::String("SRC0 MS".into()))
         .await
         .unwrap();
 
     db.add_record("R4", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("R4.SIML", EpicsValue::String("SRC0".into()))
+    db.put_record_field_from_ca_no_notify("R4", "SIML", EpicsValue::String("SRC0".into()))
         .await
         .unwrap();
 
@@ -139,7 +139,7 @@ async fn siml_and_siol_inherit_ms() {
     db.add_record("R2", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("R2.SIOL", EpicsValue::String("SRC MS".into()))
+    db.put_record_field_from_ca_no_notify("R2", "SIOL", EpicsValue::String("SRC MS".into()))
         .await
         .unwrap();
     db.put_pv("R2.SIMM", EpicsValue::Short(1)).await.unwrap();
@@ -177,7 +177,7 @@ async fn sdis_and_tsel_inherit_ms() {
     db.add_record("D1", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("D1.SDIS", EpicsValue::String("SRC MS".into()))
+    db.put_record_field_from_ca_no_notify("D1", "SDIS", EpicsValue::String("SRC MS".into()))
         .await
         .unwrap();
     // DISV=1 and the source delivers 5, so the record is NOT disabled and its
@@ -187,7 +187,7 @@ async fn sdis_and_tsel_inherit_ms() {
     db.add_record("T2", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("T2.TSEL", EpicsValue::String("SRC MS".into()))
+    db.put_record_field_from_ca_no_notify("T2", "TSEL", EpicsValue::String("SRC MS".into()))
         .await
         .unwrap();
 

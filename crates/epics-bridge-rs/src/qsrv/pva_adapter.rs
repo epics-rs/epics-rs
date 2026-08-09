@@ -1437,10 +1437,11 @@ pub struct QsrvMount {
 /// are built. What the caller still owns is the other half — bind and start
 /// accepting only after `add_source`.
 ///
-/// `acf` is the IOC-wide access-security configuration, or `None`. Passing
-/// `None` leaves the provider on `AllowAllAccess`; passing the same config
-/// the CA server got is what keeps the two protocols on one policy, which
-/// is the documented configuration trap on the host side.
+/// `acf` is the IOC's live access-security policy cell — the SAME cell the
+/// CA/PVA servers and the iocsh `asInit` command use (`IocRunConfig.acf`),
+/// which is what keeps every protocol on one policy and lets a runtime
+/// `asInit`/ACF reload re-gate QSRV operations. A cell holding `None`
+/// behaves as `AllowAllAccess` until a policy is stored.
 ///
 /// `group_files` carries `dbLoadGroup` requests the caller obtained by some
 /// route other than the iocsh command — which on the RTEMS target is the
@@ -1457,7 +1458,7 @@ pub struct QsrvMount {
 /// store already existed.
 pub async fn build_qsrv_mount(
     db: &Arc<epics_base_rs::server::database::PvDatabase>,
-    acf: Option<epics_base_rs::server::access_security::AccessSecurityConfig>,
+    acf: epics_base_rs::server::access_security::AcfCell,
     group_files: &[epics_base_rs::server::ioc_app::GroupLoadRequest],
 ) -> QsrvMount {
     // ── QSRV2 enable gate (pvxs enable2(), iochooks.cpp:401-496) ──
@@ -1470,13 +1471,17 @@ pub async fn build_qsrv_mount(
 
     let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
 
-    // Install the IOC-wide ACF on the QSRV bridge so PVA single-record /
-    // group operations enforce the same policy the CA server does. Without
-    // this, an IOC launched with an ACF would protect CA but leave the PVA
-    // QSRV path on `AllowAllAccess`.
-    if let Some(acf_cfg) = acf {
-        let acf = Arc::new(super::provider::AcfAccessControl::new(db.clone(), acf_cfg));
-        provider.set_access_control(acf);
+    // Install the IOC-wide ACF cell on the QSRV bridge so PVA
+    // single-record / group operations enforce the same policy the CA
+    // server does. Installed unconditionally — a cell holding `None`
+    // grants like `AllowAllAccess`, and installing it even then is what
+    // lets a post-boot `asInit` (which stores into this same cell) turn
+    // access security ON for QSRV without a restart.
+    provider.set_access_control(Arc::new(super::provider::AcfAccessControl::adopting(
+        db.clone(),
+        acf.clone(),
+    )));
+    if acf.load().is_some() {
         tracing::info!("qsrv: ACF installed on BridgeProvider");
     }
 
@@ -1595,9 +1600,10 @@ pub async fn run_ca_pva_qsrv_ioc(
     // — the one owner shared with the RTEMS target IOC, so the two entry
     // points cannot disagree about whether `PVXS_QSRV_ENABLE` was honoured
     // or whether groups were finalized before the first client GET. The ACF
-    // is the same `config.acf` the CA server gets via `CaServer::from_parts`
-    // below; handing the PVA side a different one is the documented
-    // configuration trap.
+    // is the same `config.acf` CELL the CA server adopts via
+    // `CaServer::from_parts` below — one cell for CA, PVA, QSRV and the
+    // iocsh `asInit` command; handing any side a different one is the
+    // documented configuration trap.
     let QsrvMount {
         store,
         enabled: qsrv2_on,
@@ -2591,9 +2597,13 @@ mod tests {
             .await
             .unwrap();
         // A.FLNK -> B (both default to SCAN=Passive, so FLNK processes B).
-        db.put_pv("FLNK:a.FLNK", EpicsValue::String("FLNK:b".into()))
-            .await
-            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            "FLNK:a",
+            "FLNK",
+            EpicsValue::String("FLNK:b".into()),
+        )
+        .await
+        .unwrap();
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         let store = QsrvPvStore::new(provider);
 

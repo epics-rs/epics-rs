@@ -512,6 +512,12 @@ impl CaServer {
     /// TCP override (`EPICS_CAS_SERVER_PORT`); pass `None` to share the
     /// UDP discovery port with the TCP listener.
     ///
+    /// `acf` is the IOC's live policy cell, ADOPTED rather than
+    /// re-created: the runner passes `IocRunConfig.acf` so this server,
+    /// the sibling PVA/QSRV servers, and the iocsh `asInit` command all
+    /// gate on one cell. A standalone caller creates its own with
+    /// [`epics_base_rs::server::access_security::new_acf_cell`].
+    ///
     /// Binds the TCP and UDP sockets, exactly as
     /// [`CaServerBuilder::build`] does — the returned server is already
     /// listening, and a bind failure is reported here rather than from
@@ -520,7 +526,7 @@ impl CaServer {
         db: Arc<PvDatabase>,
         port: u16,
         tcp_port: Option<u16>,
-        acf: Option<access_security::AccessSecurityConfig>,
+        acf: epics_base_rs::server::access_security::AcfCell,
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> CaResult<Self> {
@@ -540,7 +546,7 @@ impl CaServer {
             tcp,
             udp,
             stats,
-            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
+            acf,
             acf_source_path: std::sync::Mutex::new(None),
             acf_reload_tx,
             autosave_config,
@@ -787,6 +793,7 @@ impl CaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
+        let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
@@ -802,7 +809,9 @@ impl CaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, bridge);
+            // The shell administers this server's live policy cell so an
+            // interactive `asInit` is a real ACF (re)load, not a dead-end.
+            let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {
@@ -1413,9 +1422,16 @@ mod access_notifier_tests {
 
     async fn empty_server() -> CaServer {
         let db = Arc::new(PvDatabase::new());
-        CaServer::from_parts(db, 0, None, None, None, None)
-            .await
-            .expect("bind ephemeral server")
+        CaServer::from_parts(
+            db,
+            0,
+            None,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        )
+        .await
+        .expect("bind ephemeral server")
     }
 
     // The detachable handle must keep firing after the CaServer value is

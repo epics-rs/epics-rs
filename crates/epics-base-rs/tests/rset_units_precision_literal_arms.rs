@@ -171,14 +171,15 @@ fn bo_high_serves_the_units_literal_the_wire_can_carry() {
 }
 
 /// bo's only literal is HIGH's. VAL is DBF_ENUM, so `get_units` writes nothing
-/// for it and no display block exists to carry one — the override must not
-/// conjure one into being for a field the rset never answers.
+/// for it — the override must not conjure units into being for a field the
+/// rset never answers. (The display block itself now always exists, carrying
+/// dbCommon DESC — UI-106 — so the assertion is on `units` staying empty.)
 #[test]
 fn bos_units_literal_is_highs_alone() {
     let inst = inst("T:BO", BoRecord::default());
 
     assert!(
-        snap(&inst, "VAL").display.is_none(),
-        "boRecord.c:294-299 answers only HIGH; VAL gets no units and no display block"
+        snap(&inst, "VAL").display.unwrap().units.is_empty(),
+        "boRecord.c:294-299 answers only HIGH; VAL gets no units"
     );
 }

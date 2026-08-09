@@ -18,8 +18,11 @@
 //! * **`DBF_NOACCESS` fields** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...).
 //!   These are C-internal pointers with no CA/PVA representation — C's
 //!   `mapDBFToDBR` sends them to `DBR_NOACCESS` and `dbChannelCreate` refuses
-//!   a channel on them. A Rust port has no pointer to expose, so they are
-//!   dropped rather than invented; the count is reported by the generator.
+//!   a channel on them. A Rust port has no pointer to expose, so their
+//!   *descriptors* are dropped rather than invented — but their NAMES are
+//!   kept (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so
+//!   a SEARCH for `REC.BPTR` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 
 #![allow(clippy::all)]
 
@@ -786,6 +789,10 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(epid)` — the `DBF_NOACCESS` internal names dropped from
+/// [`EPID_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static EPID_NOACCESS: &[&str] = &["CT", "CTP"];
+
 /// `recordtype(throttle)` — 21 CA-visible own fields from `dbd/throttleRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
 pub static THROTTLE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -1084,6 +1091,10 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// `recordtype(throttle)` — the `DBF_NOACCESS` internal names dropped from
+/// [`THROTTLE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
+pub static THROTTLE_NOACCESS: &[&str] = &["RPVT"];
+
 /// `recordtype(timestamp)` — 4 CA-visible own fields from `dbd/timestampRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -1151,6 +1162,19 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
         "epid" => EPID_FIELDS,
         "throttle" => THROTTLE_FIELDS,
         "timestamp" => TIMESTAMP_FIELDS,
+        _ => return None,
+    })
+}
+
+/// The record-own `DBF_NOACCESS` internal names for a record type — fields
+/// C's `dbNameToAddr` resolves (a SEARCH is answered) but whose channel is
+/// refused at creation (`mapDBFToDBR` -> `DBR_NOACCESS`). Empty for a type
+/// declaring none, `None` for a type no vendored `.dbd` declares.
+pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "epid" => EPID_NOACCESS,
+        "throttle" => THROTTLE_NOACCESS,
+        "timestamp" => &[],
         _ => return None,
     })
 }

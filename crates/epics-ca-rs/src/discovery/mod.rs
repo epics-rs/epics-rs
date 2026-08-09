@@ -47,7 +47,7 @@ pub use dns_update::{DnsRegistration, DnsUpdater, TsigAlgo, TsigKey};
 #[cfg(feature = "discovery")]
 pub use dnssd::DnsSdBackend;
 #[cfg(feature = "discovery")]
-pub use mdns::MdnsBackend;
+pub use mdns::{MdnsAnnouncer, MdnsBackend};
 #[cfg(feature = "discovery")]
 pub use zone::ZoneSnippet;
 

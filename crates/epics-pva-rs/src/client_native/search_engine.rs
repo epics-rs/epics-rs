@@ -165,6 +165,14 @@ pub enum SearchReason {
     /// server sent CMD_DESTROY_CHANNEL). pvxs-equivalent recovery
     /// path — see the type-level comment.
     Reconnect,
+    /// The server answered the SEARCH and then refused CREATE_CHANNEL.
+    /// The refusal will often recur on retry (a QSRV field that cannot
+    /// be served, an ACL deny), so the re-search is parked in the
+    /// furthest future bucket — one full ring revolution, ~30 s — rather
+    /// than the current one (pvxs 084336bb, `clientconn.cpp:376-381`).
+    /// Riding the current bucket here is what produced a ~1 s
+    /// SEARCH → CREATE → refuse loop against the same server, forever.
+    CreateRefused,
 }
 
 pub enum SearchCommand {
@@ -1252,6 +1260,11 @@ fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
     match reason {
         SearchReason::Initial => (current_bucket + 1) % N_SEARCH_BUCKETS,
         SearchReason::Reconnect => current_bucket,
+        // pvxs 084336bb: `laterBucket = currentBucket ? currentBucket - 1
+        // : nBuckets - 1` — the furthest future bucket, so a refusal that
+        // will recur is retried once per ring revolution (~30 s), not
+        // once per tick.
+        SearchReason::CreateRefused => (current_bucket + N_SEARCH_BUCKETS - 1) % N_SEARCH_BUCKETS,
     }
 }
 
@@ -4393,6 +4406,27 @@ mod tests {
             0,
             "wrap-around at ring boundary"
         );
+    }
+
+    /// pvxs 084336bb: a refused CREATE_CHANNEL parks the re-search in
+    /// the furthest future bucket (`currentBucket ? currentBucket - 1 :
+    /// nBuckets - 1`) — a full ring revolution, ~30 s — so a refusal
+    /// that recurs is not re-asked once per tick. Wrap-around at
+    /// bucket 0 is the boundary the pvxs ternary exists for.
+    #[test]
+    fn placement_create_refused_is_the_furthest_bucket_with_wraparound() {
+        assert_eq!(
+            placement_bucket(0, SearchReason::CreateRefused),
+            N_SEARCH_BUCKETS - 1,
+            "wrap-around at ring boundary"
+        );
+        for current in 1..N_SEARCH_BUCKETS {
+            assert_eq!(
+                placement_bucket(current, SearchReason::CreateRefused),
+                current - 1,
+                "CreateRefused must park one full revolution out (got {current})"
+            );
+        }
     }
 
     /// pvxs `tickSearch` (client.cpp:1193-1196) escalates the retry

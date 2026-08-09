@@ -192,7 +192,15 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
         .build()
         .await?;
     let scan = ScanOwner::start(db.clone());
-    let ca_server = CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await?;
+    let ca_server = CaServer::from_parts(
+        db.clone(),
+        ca_port,
+        None,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .await?;
     let ca_port = ca_server.udp_port();
     let _ca_task = tokio::spawn(async move { ca_server.run().await });
     let source = Arc::new(PvDatabaseSource::new(db.clone()));

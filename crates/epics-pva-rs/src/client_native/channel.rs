@@ -815,19 +815,19 @@ impl Channel {
                     // otherwise this is a fresh resolve and `Initial`
                     // earns the immediate broadcast for fast first-attempt
                     // latency.
-                    let reason = if self
+                    let reason = if researched_after_refusal {
+                        // A refused CREATE_CHANNEL usually recurs on retry, so
+                        // the re-search parks in the furthest future bucket —
+                        // one ring revolution, ~30 s — instead of riding the
+                        // ≤1 s tick (pvxs 084336bb, `clientconn.cpp:376-381`).
+                        // With the previous Reconnect placement a server that
+                        // answered SEARCH instantly and then refused CREATE was
+                        // re-asked about once a second, forever.
+                        super::search_engine::SearchReason::CreateRefused
+                    } else if self
                         .has_been_active
                         .load(std::sync::atomic::Ordering::Relaxed)
-                        || researched_after_refusal
                     {
-                        // Force the bucket-paced Reconnect search once we have
-                        // re-searched after a refusal, even on a channel that was
-                        // never Active: pvxs re-pushes the refused channel into the
-                        // current search bucket (clientconn.cpp:373-377), so the
-                        // re-search rides the ≤1 s tick instead of an immediate
-                        // Initial broadcast. Otherwise a server that answers SEARCH
-                        // instantly and then refuses CREATE would spin this loop
-                        // with no pacing.
                         super::search_engine::SearchReason::Reconnect
                     } else {
                         super::search_engine::SearchReason::Initial
@@ -981,9 +981,9 @@ impl Channel {
             // Every candidate failed. A searched CREATE_CHANNEL refusal is a
             // channel-state transition back to Searching, not a terminal op error:
             // re-enter the search ring and keep the waiting operation pending
-            // (pvxs clientconn.cpp:368-378). The next pass clears nothing extra —
-            // `alternatives` is already drained — and issues a Reconnect search
-            // that rides the ≤1 s bucket tick.
+            // (pvxs clientconn.cpp:368-381). The next pass clears nothing extra —
+            // `alternatives` is already drained — and issues a CreateRefused
+            // search parked one full ring revolution out (pvxs 084336bb).
             if refusal_reenters_search(last_failure, saw_connect_failure, is_direct) {
                 researched_after_refusal = true;
                 continue;

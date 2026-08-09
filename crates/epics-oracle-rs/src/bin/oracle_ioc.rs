@@ -144,7 +144,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Port 0 => the kernel assigns; `from_parts` binds first and reports the
     // port it actually bound. This is the bind-and-read-back the harness
     // requires, not a probe-then-rebind.
-    let server = CaServer::from_parts(db, 0, None, None, None, None).await?;
+    let server = CaServer::from_parts(
+        db,
+        0,
+        None,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .await?;
     let port = server.udp_port();
 
     // Announce only after the sockets exist. The harness blocks on this line,
@@ -176,7 +184,13 @@ async fn serve_pva(
     // Same reasoning as the CA path: scanning is core-owned (C iocInit),
     // not the PVA server's — the harness's Scanned drive records need it.
     let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-    let server = PvaServer::from_parts(db, 0, None, None, None);
+    let server = PvaServer::from_parts(
+        db,
+        0,
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    );
 
     // Announce from a side task rather than by racing the server future: a
     // healthy `run_reporting` never returns, and selecting on it would drop

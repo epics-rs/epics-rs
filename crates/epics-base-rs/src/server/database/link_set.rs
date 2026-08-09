@@ -178,6 +178,12 @@ pub struct LinkMetadata {
     /// `display.description` — carried so a link snapshot is complete;
     /// pvxs exposes it through the same `fld_meta` cache.
     pub description: Option<String>,
+    /// ENUM state labels of the remote channel, when it has any. The label
+    /// table a `DBR_STRING`-requesting reader (stringin/lsi INP, printf
+    /// `%s`) renders a remote enum index through — C `dbCa` keeps a second
+    /// `DBR_STRING` monitor (`pgetString`) for that read; here the labels
+    /// ride the same attribute fetch as the limits (CA: `DBR_CTRL_ENUM`).
+    pub enum_choices: Option<Vec<String>>,
 }
 
 /// Ungated remote alarm snapshot for a link — the remote

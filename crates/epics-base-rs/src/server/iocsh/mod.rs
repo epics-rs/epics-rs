@@ -42,6 +42,31 @@ pub struct IocShell {
     /// because the shell drives one script at a time on a single
     /// thread; the `on error` command mutates it mid-script.
     on_error: std::cell::Cell<OnError>,
+    /// Nesting depth of the running `<` / `iocshLoad` script includes —
+    /// `Cell` for the same single-thread reason as `on_error`. C has no
+    /// explicit bound: a self-including script survives only because each
+    /// nested include holds its `FILE*` open and `fopen` eventually fails
+    /// at the process fd limit (epics-base#499). This port reads the whole
+    /// script and closes the fd before recursing, so without an explicit
+    /// cap the recursion is bounded only by the thread stack — a Rust
+    /// stack-overflow abort at boot. See [`MAX_SCRIPT_DEPTH`].
+    script_depth: std::cell::Cell<usize>,
+}
+
+/// Deepest `<` / `iocshLoad` script nesting the shell will enter before
+/// refusing the include — the explicit form of C's incidental fd-limit
+/// backstop (epics-base#499). 32 matches the `db_loader`'s
+/// `max_include_depth` for DB-file includes.
+const MAX_SCRIPT_DEPTH: usize = 32;
+
+/// Depth ticket for one running script — every exit path of the script
+/// executors releases it via `Drop`.
+struct ScriptDepthGuard<'a>(&'a IocShell);
+
+impl Drop for ScriptDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.script_depth.set(self.0.script_depth.get() - 1);
+    }
 }
 
 impl IocShell {
@@ -51,6 +76,22 @@ impl IocShell {
     /// capture it where the runtime is known (`BlockingBridge::capture()` on
     /// the async setup path).
     pub fn new(db: Arc<PvDatabase>, bridge: crate::runtime::task::BlockingBridge) -> Self {
+        Self::new_with_acf(
+            db,
+            bridge,
+            crate::server::access_security::new_acf_cell(None),
+        )
+    }
+
+    /// Create a shell whose `as*` commands administer `acf` — the live
+    /// policy cell of the IOC's servers. Server-owning roots
+    /// (`IocApplication::run`, a server's `run_with_shell`) must use
+    /// this so a script or interactive `asInit` reaches the gates.
+    pub fn new_with_acf(
+        db: Arc<PvDatabase>,
+        bridge: crate::runtime::task::BlockingBridge,
+        acf: crate::server::access_security::AcfCell,
+    ) -> Self {
         let mut registry = CommandRegistry::new();
         commands::register_builtins(&mut registry);
         // C `iocshRegisterCommon` publishes the base version and target arch as
@@ -59,9 +100,25 @@ impl IocShell {
         crate::runtime::env::register_iocsh_env_vars();
         Self {
             registry: Arc::new(RwLock::new(registry)),
-            ctx: CommandContext::new(db, bridge),
+            ctx: CommandContext::new_with_acf(db, bridge, acf),
             on_error: std::cell::Cell::new(OnError::Continue),
+            script_depth: std::cell::Cell::new(0),
         }
+    }
+
+    /// Take a depth ticket for one nested script, refusing past
+    /// [`MAX_SCRIPT_DEPTH`] so a self-including script errors out at the
+    /// include line instead of overflowing the thread stack.
+    fn enter_script(&self, path: &str) -> Result<ScriptDepthGuard<'_>, String> {
+        let depth = self.script_depth.get();
+        if depth >= MAX_SCRIPT_DEPTH {
+            return Err(format!(
+                "'{path}': script include depth exceeds {MAX_SCRIPT_DEPTH} — \
+                 recursive '<' / iocshLoad?"
+            ));
+        }
+        self.script_depth.set(depth + 1);
+        Ok(ScriptDepthGuard(self))
     }
 
     /// Register an additional command (thread-safe, takes &self).
@@ -242,11 +299,18 @@ impl IocShell {
     /// Macros use `$(KEY)` / `${KEY}` syntax via `db_loader::substitute_macros`.
     /// Per-line errors are reported (matching `execute_script`) but
     /// the script continues to the next line.
+    ///
+    /// As the `iocshLoad` mirror this is also the level that records
+    /// `IOCSH_STARTUP_SCRIPT` — top-level loads enter here (C
+    /// `iocsh(pathname)` is `iocshLoad(pathname, NULL)`), `<` includes
+    /// enter [`Self::execute_script`] (C `iocshBody`) and never set it.
     pub fn execute_script_with_macros(
         &self,
         path: &str,
         macros: &HashMap<String, String>,
     ) -> Result<(), String> {
+        set_startup_script_once(path);
+        let _depth = self.enter_script(path)?;
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
         let mut last_err: Option<String> = None;
@@ -286,7 +350,12 @@ impl IocShell {
     /// do not abort execution. The final return value is `Err` if any command
     /// failed — the equivalent of `iocshSetError` propagating a non-zero exit
     /// status to startup-script callers (e.g., automated IOC verification).
+    ///
+    /// This is the `iocshBody`-with-a-file level (`<` includes land
+    /// here) — it does not record `IOCSH_STARTUP_SCRIPT`; see
+    /// [`Self::execute_script_with_macros`].
     pub fn execute_script(&self, path: &str) -> Result<(), String> {
+        let _depth = self.enter_script(path)?;
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
 
@@ -599,6 +668,19 @@ fn echoes_script_line(line: &str) -> bool {
     !line.trim_start().starts_with("#-")
 }
 
+/// C `iocshLoad` (`iocsh.cpp:1347-1351`) records the loaded script in
+/// `IOCSH_STARTUP_SCRIPT` — since epics-base#469's fix only when the
+/// variable is not already set, so it permanently names the *first*
+/// script (or an inherited value from the parent environment) and a
+/// nested `iocshLoad` no longer overwrites it. Set before the file is
+/// even opened, like C — an unreadable path still lands here.
+fn set_startup_script_once(path: &str) {
+    if std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none() {
+        // SAFETY: same single-threaded-shell rationale as `epicsEnvSet`.
+        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", path) };
+    }
+}
+
 ///
 /// Returns `(physical_line_number, logical_line)` pairs. The line
 /// number is the 1-based index of the *first* physical line in the
@@ -721,6 +803,15 @@ mod tests {
         // Commands and blanks — echoed (unchanged behaviour).
         assert!(echoes_script_line("dbLoadRecords(\"x.db\")"));
         assert!(echoes_script_line(""));
+    }
+
+    /// A path as an unquoted iocsh token. The arg scanner honors C's
+    /// out-of-quote backslash escape, which would eat the separators of
+    /// a native Windows path — forward slashes survive the scanner and
+    /// every Windows API accepts them (what a real Windows st.cmd
+    /// writes too).
+    fn script_token(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', "/")
     }
 
     fn make_shell() -> IocShell {
@@ -852,6 +943,103 @@ mod tests {
         // A non-existent file should return an error
         let result = shell.execute_line("< nonexistent_file.cmd");
         assert!(result.is_err());
+    }
+
+    /// epics-base#499: a self-including script must error out at the
+    /// depth cap, not abort the IOC with a stack overflow. C survives
+    /// only because each nested include holds its `FILE*` open until
+    /// `fopen` fails at the fd limit; this port closes the file before
+    /// recursing, so the cap is explicit. Covers both recursion entries
+    /// (`<` and `iocshLoad`) and checks the depth ticket unwinds to 0.
+    #[test]
+    fn self_including_script_errors_at_the_depth_cap() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = dir.path().join("self.cmd");
+        std::fs::write(&path, format!("< {}\n", path.display())).unwrap();
+        let err = shell
+            .execute_script(&path.display().to_string())
+            .expect_err("self-include via '<' must fail at the cap");
+        assert!(err.contains("depth exceeds"), "got: {err}");
+        assert_eq!(shell.script_depth.get(), 0, "depth ticket fully released");
+
+        let path2 = dir.path().join("self2.cmd");
+        std::fs::write(&path2, format!("iocshLoad {}\n", script_token(&path2))).unwrap();
+        let err = shell
+            .execute_script(&path2.display().to_string())
+            .expect_err("self-include via iocshLoad must fail at the cap");
+        assert!(err.contains("depth exceeds"), "got: {err}");
+        assert_eq!(shell.script_depth.get(), 0, "depth ticket fully released");
+    }
+
+    /// Legitimate nesting under the cap keeps working, and the depth
+    /// resets between runs (the guard is a ticket, not a ratchet).
+    #[test]
+    fn nested_include_under_the_cap_still_runs() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.cmd");
+        std::fs::write(&inner, "#- inner\n").unwrap();
+        let outer = dir.path().join("outer.cmd");
+        std::fs::write(&outer, format!("< {}\n", inner.display())).unwrap();
+        let outer_path = outer.display().to_string();
+        shell
+            .execute_script(&outer_path)
+            .expect("two-level include must succeed");
+        assert_eq!(shell.script_depth.get(), 0);
+        // A second run starts from depth 0 again.
+        shell
+            .execute_script(&outer_path)
+            .expect("re-running the same include must succeed");
+        assert_eq!(shell.script_depth.get(), 0);
+    }
+
+    /// epics-base#469 (as fixed upstream in 48eed22f3): the first
+    /// loaded script — and only the first — lands in
+    /// `IOCSH_STARTUP_SCRIPT`; a nested `iocshLoad` does not overwrite
+    /// it, a `<` include (the `iocshBody` path) never sets it, and an
+    /// inherited value from the parent environment is kept. One test fn
+    /// so the process-global variable has a single owner.
+    #[test]
+    fn startup_script_env_is_first_load_only() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.cmd");
+        std::fs::write(&inner, "#- inner\n").unwrap();
+        let outer = dir.path().join("outer.cmd");
+        std::fs::write(&outer, format!("iocshLoad {}\n", script_token(&inner))).unwrap();
+        let outer_path = outer.display().to_string();
+
+        // SAFETY: single-threaded test process (nextest), sole owner of
+        // this variable.
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
+        shell
+            .execute_script_with_macros(&outer_path, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            std::env::var("IOCSH_STARTUP_SCRIPT").as_deref(),
+            Ok(outer_path.as_str()),
+            "the outer script wins; the nested iocshLoad must not overwrite"
+        );
+
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
+        shell.execute_script(&inner.display().to_string()).unwrap();
+        assert!(
+            std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none(),
+            "the iocshBody path ('<' includes) must not set the variable"
+        );
+
+        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", "inherited.cmd") };
+        shell
+            .execute_script_with_macros(&outer_path, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            std::env::var("IOCSH_STARTUP_SCRIPT").as_deref(),
+            Ok("inherited.cmd"),
+            "a value inherited from the environment is kept (C getenv guard)"
+        );
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
     }
 
     #[test]
@@ -996,7 +1184,9 @@ mod tests {
     /// epics-base PR #812 — `dbCreateRecord <type> <name>` creates a
     /// new record at runtime through the same factory registry as
     /// `dbLoadRecords`. Verifies the happy path plus three rejection
-    /// branches (duplicate name, bad name, unknown record type).
+    /// branches (duplicate name, bad name, unknown record type), which
+    /// return Err so `on error` sees them — current C base wraps these
+    /// in `iocshSetError` (epics-base#498 / UI-105).
     #[test]
     fn test_execute_line_db_create_record_happy_path() {
         let shell = make_shell();
@@ -1010,9 +1200,9 @@ mod tests {
     #[test]
     fn test_execute_line_db_create_record_rejects_duplicate() {
         let shell = make_shell();
-        // TEST_REC was added by make_shell() — re-creating must fail
-        // gracefully (logged via println, returns Continue, not Err).
-        shell.execute_line("dbCreateRecord ai TEST_REC").unwrap();
+        // TEST_REC was added by make_shell() — re-creating must fail.
+        let r = shell.execute_line("dbCreateRecord ai TEST_REC");
+        assert!(r.is_err(), "duplicate name must return Err");
         // After the rejected call, the original record (val=42.0) is
         // still there, not overwritten. Verify with dbgf which reads
         // the live VAL.
@@ -1026,16 +1216,38 @@ mod tests {
         // Space inside the name → validate_record_name returns Err.
         // Quote so the parser keeps the space as one argument.
         let r = shell.execute_line("dbCreateRecord ai \"BAD NAME\"");
-        // The command itself returns Continue (errors are printed),
-        // and the record must NOT be in the registry afterward.
-        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+        assert!(r.is_err(), "bad name must return Err");
     }
 
     #[test]
     fn test_execute_line_db_create_record_rejects_unknown_type() {
         let shell = make_shell();
         let r = shell.execute_line("dbCreateRecord nonexistent NEW_REC");
-        assert!(matches!(r, Ok(CommandOutcome::Continue)));
+        assert!(r.is_err(), "unknown record type must return Err");
+    }
+
+    /// UI-105 / epics-base#498 — a failing db* command must trip
+    /// `on error break`, not just print. The failure here is a real
+    /// command failure (unknown record type), not an unknown command.
+    #[test]
+    fn on_error_break_stops_at_a_failed_db_command() {
+        let shell = make_shell();
+        let dir = std::env::temp_dir().join(format!("iocsh_ui105_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("st.cmd");
+        std::fs::write(
+            &path,
+            "on error break\ndbCreateRecord nonexistent X\ndbCreateRecord ai SHOULD_NOT_EXIST\n",
+        )
+        .unwrap();
+        let result = shell.execute_script(path.to_str().unwrap());
+        assert!(result.is_err(), "script must surface the db failure");
+        let r = shell.execute_line("dbgf SHOULD_NOT_EXIST");
+        assert!(
+            r.is_err(),
+            "on error break must stop before the next line creates the record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PR #603 — line ending in `\` joins to the next physical line.
@@ -1147,7 +1359,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_macro_cmd.cmd");
         std::fs::write(&tmp, "$(CMD)\n").unwrap();
-        let line = format!("iocshLoad {} CMD=dbl", tmp.display());
+        let line = format!("iocshLoad {} CMD=dbl", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -1159,7 +1371,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_no_macros.cmd");
         std::fs::write(&tmp, "dbl\n").unwrap();
-        let line = format!("iocshLoad {}", tmp.display());
+        let line = format!("iocshLoad {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
@@ -1193,7 +1405,7 @@ mod tests {
         let script_path = std::env::temp_dir().join("iocsh_dup_load.cmd");
         std::fs::write(
             &script_path,
-            format!("dbLoadRecords {}\n", db_path.display()),
+            format!("dbLoadRecords {}\n", script_token(&db_path)),
         )
         .unwrap();
         let result = shell.execute_script(script_path.to_str().unwrap());
@@ -1227,7 +1439,7 @@ mod tests {
         let shell = make_shell();
         let tmp = std::env::temp_dir().join("iocsh_load_err.cmd");
         std::fs::write(&tmp, "nonexistent_cmd\ndbl\n").unwrap();
-        let line = format!("iocshLoad {}", tmp.display());
+        let line = format!("iocshLoad {}", script_token(&tmp));
         let result = shell.execute_line(&line);
         std::fs::remove_file(&tmp).ok();
         assert!(

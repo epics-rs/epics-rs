@@ -443,7 +443,12 @@ async fn main() -> CaResult<()> {
                 zone: args.dns_update_zone.clone().unwrap(),
                 instance: args.dns_update_instance.clone().unwrap(),
                 host,
-                port: args.port,
+                // Advertise the port the server will actually bind: an
+                // omitted --port defers to the EPICS environment, same
+                // as the builder's own seeding above.
+                port: args
+                    .port
+                    .unwrap_or_else(epics_base_rs::runtime::net::ca_server_port),
                 txt: Vec::new(),
                 ttl: std::time::Duration::from_secs(args.dns_update_ttl),
                 keepalive: std::time::Duration::from_secs(args.dns_update_keepalive),

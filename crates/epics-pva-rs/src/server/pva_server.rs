@@ -117,17 +117,22 @@ impl PvaServer {
         PvaServerBuilder::new()
     }
 
+    /// `acf` is the IOC's live policy cell, ADOPTED rather than
+    /// re-created: a protocol runner passes `IocRunConfig.acf` so this
+    /// server, the sibling CA/QSRV servers, and the iocsh `asInit`
+    /// command all gate on one cell. A standalone caller creates its
+    /// own with [`epics_base_rs::server::access_security::new_acf_cell`].
     pub fn from_parts(
         db: Arc<PvDatabase>,
         port: u16,
-        acf: Option<access_security::AccessSecurityConfig>,
+        acf: epics_base_rs::server::access_security::AcfCell,
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> Self {
         Self {
             db,
             port: Some(port),
-            acf: epics_base_rs::server::access_security::new_acf_cell(acf),
+            acf,
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
@@ -295,6 +300,7 @@ impl PvaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
+        let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
@@ -312,7 +318,9 @@ impl PvaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, bridge);
+            // Administer this server's live policy cell so an interactive
+            // `asInit` is a real ACF (re)load, not a dead-end.
+            let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {
@@ -352,6 +360,7 @@ impl PvaServer {
         F: FnOnce(&iocsh::IocShell) + Send + 'static,
     {
         let db = self.db.clone();
+        let acf = self.acf.clone();
         let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
 
         let autosave_cmds = self
@@ -371,7 +380,9 @@ impl PvaServer {
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let shell = iocsh::IocShell::new(db, bridge);
+            // Same as `run_with_shell`: the shell administers this
+            // server's live policy cell.
+            let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {
@@ -422,7 +433,13 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_port_zero_reports_both_bound_ports() {
         let db = Arc::new(PvDatabase::new());
-        let server = PvaServer::from_parts(db, 0, None, None, None);
+        let server = PvaServer::from_parts(
+            db,
+            0,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        );
 
         let (tx, mut rx) = watch::channel(None);
         let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });

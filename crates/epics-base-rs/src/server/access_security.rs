@@ -218,14 +218,83 @@ pub type InpResolver = std::sync::Arc<
 /// completes against the policy it started with, because it holds that `Arc`
 /// for its whole body. Only the writer changes — it publishes instead of
 /// waiting for in-flight readers.
-pub type AcfCell = std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>;
+///
+/// A newtype (not an alias) so every post-construction swap goes through
+/// [`AcfCell::store`], which fires [`notify_asg_field_changed`] — the one
+/// change signal policy-derived caches ([`AccessGate`]'s check cache, the
+/// QSRV grant cache) and the CA server's `reeval_access_rights` path key
+/// on. A raw `ArcSwapOption` swap would update enforcement (checks load
+/// per-op) but leave those caches and the wire ACCESS_RIGHTS stale.
+#[derive(Clone)]
+pub struct AcfCell(std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>);
+
+impl AcfCell {
+    /// Snapshot the current policy (lock-free guard).
+    pub fn load(&self) -> arc_swap::Guard<Option<std::sync::Arc<AccessSecurityConfig>>> {
+        self.0.load()
+    }
+
+    /// Snapshot the current policy as an owned `Option<Arc<..>>`.
+    pub fn load_full(&self) -> Option<std::sync::Arc<AccessSecurityConfig>> {
+        self.0.load_full()
+    }
+
+    /// Publish a new policy (or `None` to clear it) and fire the
+    /// process-wide access-policy change notification so live
+    /// connections re-evaluate their rights and derived caches drop
+    /// their entries.
+    pub fn store(&self, value: Option<std::sync::Arc<AccessSecurityConfig>>) {
+        self.0.store(value);
+        notify_asg_field_changed();
+    }
+}
 
 /// Build a shared [`AcfCell`] holding `initial`. The single construction
 /// point, so no caller has to name `arc_swap` or get the `Arc` nesting right.
 pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
-    std::sync::Arc::new(arc_swap::ArcSwapOption::new(
+    AcfCell(std::sync::Arc::new(arc_swap::ArcSwapOption::new(
         initial.map(std::sync::Arc::new),
-    ))
+    )))
+}
+
+/// HAG DNS re-resolution cadence — the same 60 s the CA client's
+/// `refresh_dns` interval uses for its half of epics-base#863.
+const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Spawn the periodic HAG re-resolution task for `cell` (UI-107 /
+/// epics-base#863, access-security half). Every `HAG_DNS_REFRESH`,
+/// when `asCheckClientIP` is on and a policy is loaded, re-resolves the
+/// raw HAG spellings through [`AccessSecurityConfig::with_refreshed_hags`]
+/// and republishes a changed config via [`AcfCell::store`] — the same
+/// notification path `asInit` uses, so live clients re-evaluate their
+/// rights automatically. C recovers stale HAG IPs only on a manual
+/// `asInit`; this is the sibling of the CA-side `refresh_dns` deviation.
+///
+/// Resolution runs inline in the task (the established `refresh_dns`
+/// pattern): a wedged resolver delays this refresher, nothing else. The
+/// task holds only a `Weak` to the cell and ends when the owning IOC
+/// drops it.
+pub fn spawn_hag_refresh(cell: &AcfCell) {
+    let weak = std::sync::Arc::downgrade(&cell.0);
+    crate::runtime::task::spawn(async move {
+        loop {
+            crate::runtime::task::sleep(HAG_DNS_REFRESH).await;
+            let Some(inner) = weak.upgrade() else { break };
+            if !as_check_client_ip() {
+                continue;
+            }
+            let Some(config) = inner.load_full() else {
+                continue;
+            };
+            if let Some(refreshed) = config.with_refreshed_hags() {
+                tracing::info!(
+                    target: "epics_base_rs::access_security",
+                    "HAG DNS refresh: re-resolved members changed; republishing policy"
+                );
+                AcfCell(inner).store(Some(std::sync::Arc::new(refreshed)));
+            }
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -705,11 +774,42 @@ pub struct AsgInp {
 pub struct AccessSecurityConfig {
     pub uag: HashMap<String, Vec<String>>,
     pub hag: HashMap<String, Vec<String>>,
+    /// The HAG members exactly as spelled in the ACF, keyed like `hag`.
+    /// `hag` stores `hag_members` resolution *output* (dotted quads
+    /// under `asCheckClientIP`), which cannot be re-resolved after a
+    /// DNS change; [`Self::with_refreshed_hags`] re-runs the resolution
+    /// from these raw spellings (epics-base#863 / UI-107).
+    pub hag_raw: HashMap<String, Vec<String>>,
     pub asg: HashMap<String, AccessSecurityGroup>,
     pub unknown_access: AccessLevel,
 }
 
 impl AccessSecurityConfig {
+    /// Re-run `hag_members` — the single resolution owner — over the
+    /// raw HAG spellings and return the refreshed config when any
+    /// stored member changed, `None` when resolution is unchanged.
+    ///
+    /// Only meaningful under `asCheckClientIP` (the default string
+    /// mode stores lowercased literals that no DNS change can move);
+    /// callers gate on [`as_check_client_ip`] before paying for
+    /// resolution. C freezes HAG IPs at ACF load until a manual
+    /// `asInit` (epics-base#863; its PR #862 moves upstream toward
+    /// refresh) — this is the sibling of the CA-side `refresh_dns`
+    /// deviation that closed the client half of that issue.
+    pub fn with_refreshed_hags(&self) -> Option<Self> {
+        let refreshed: HashMap<String, Vec<String>> = self
+            .hag_raw
+            .iter()
+            .map(|(name, raw)| (name.clone(), hag_members(raw)))
+            .collect();
+        if refreshed == self.hag {
+            return None;
+        }
+        let mut new = self.clone();
+        new.hag = refreshed;
+        Some(new)
+    }
+
     /// Render the parsed ACF (UAG/HAG/ASG with their `INP*` links and
     /// RULEs) in C `asDumpFP` shape, as a `String`.
     ///
@@ -1452,6 +1552,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
         hag: HashMap::new(),
+        hag_raw: HashMap::new(),
         asg: HashMap::new(),
         unknown_access: AccessLevel::Read,
     };
@@ -1486,7 +1587,8 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 let members = read_brace_list(&mut chars)?;
                 // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
                 // time and stores names or resolved IPs accordingly.
-                config.hag.insert(name, hag_members(&members));
+                config.hag.insert(name.clone(), hag_members(&members));
+                config.hag_raw.insert(name, members);
             }
             "ASG" => {
                 let name = read_paren_name(&mut chars)?;
@@ -2432,6 +2534,63 @@ ASG(DEFAULT) {
         assert_eq!(entries[1], "alive.invalid");
     }
 
+    /// UI-107 / epics-base#863 (access-security half): under
+    /// `asCheckClientIP` the parsed `hag` holds resolution *output*
+    /// frozen at load time. `with_refreshed_hags` re-runs `hag_members`
+    /// over the raw spellings — the periodic refresher's engine.
+    #[test]
+    fn with_refreshed_hags_recovers_a_stale_resolution() {
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let mut config = parse_acf("HAG(local) { localhost }\n").unwrap();
+        assert_eq!(config.hag_raw["local"], vec!["localhost"]);
+
+        // Simulate DNS moving after load: the stored quad no longer
+        // matches what `localhost` resolves to.
+        config.hag.insert("local".into(), vec!["192.0.2.1".into()]);
+
+        let refreshed = config
+            .with_refreshed_hags()
+            .expect("a moved resolution must produce a refreshed config");
+        set_as_check_client_ip(false);
+        assert_eq!(refreshed.hag["local"], vec!["127.0.0.1"]);
+        assert_eq!(
+            refreshed.hag_raw["local"],
+            vec!["localhost"],
+            "raw spellings survive the refresh for the next round"
+        );
+    }
+
+    /// An unchanged resolution yields `None` — the refresher
+    /// republishes (re-notifying every connected client) only on real
+    /// movement.
+    #[test]
+    fn with_refreshed_hags_is_none_when_resolution_is_unchanged() {
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let config = parse_acf("HAG(local) { localhost }\n").unwrap();
+        let idempotent = config.with_refreshed_hags();
+        set_as_check_client_ip(false);
+        assert!(
+            idempotent.is_none(),
+            "a freshly parsed config re-resolves to itself"
+        );
+    }
+
+    /// In default string mode the stored members are lowercased
+    /// literals no DNS change can move — a refresh is always a no-op
+    /// (`spawn_hag_refresh` gates on the flag, but the method must
+    /// hold on its own for direct callers).
+    #[test]
+    fn with_refreshed_hags_is_none_in_name_mode() {
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(false);
+        let config = parse_acf("HAG(local) { LocalHost }\n").unwrap();
+        assert_eq!(config.hag_raw["local"], vec!["LocalHost"]);
+        assert_eq!(config.hag["local"], vec!["localhost"]);
+        assert!(config.with_refreshed_hags().is_none());
+    }
+
     #[test]
     fn test_check_access_default_rw() {
         let acf = "ASG(DEFAULT) { RULE(1, WRITE) RULE(1, READ) }";
@@ -2718,6 +2877,7 @@ ASG(MIXED_CASE) {
         let config = AccessSecurityConfig {
             uag: HashMap::new(),
             hag: HashMap::new(),
+            hag_raw: HashMap::new(),
             asg: HashMap::new(),
             unknown_access: AccessLevel::Read,
         };

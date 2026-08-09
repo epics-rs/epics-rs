@@ -40,8 +40,10 @@ pub struct DisplayInfo {
     /// Display format hint (0=Default, 1=String, 2=Binary, 3=Decimal,
     /// 4=Hex, 5=Exponential, 6=Engineering). From record's Q:form info tag.
     pub form: i16,
-    /// Record description (DESC field).
-    pub description: String,
+    /// Record description (DESC field). `PvString` for the same
+    /// byte-preserving reason as `units`: a non-UTF-8 DESC must reach
+    /// the wire unmangled.
+    pub description: PvString,
 }
 
 /// Control limits (DRVH/DRVL for output records, or HOPR/LOPR).

@@ -660,8 +660,10 @@ impl SearchTransport {
     /// fanned to nobody, and retried forever. That is a configuration error
     /// and it fails here — before any task is spawned — rather than
     /// presenting as every channel timing out.
-    fn name_servers_only(nameserver_addrs: &[SocketAddr]) -> epics_base_rs::error::CaResult<Self> {
-        if nameserver_addrs.is_empty() {
+    fn name_servers_only(
+        nameserver_entries: &[super::AddrEntry],
+    ) -> epics_base_rs::error::CaResult<Self> {
+        if nameserver_entries.is_empty() {
             return Err(epics_base_rs::error::CaError::InvalidValue(
                 "name-servers-only search engine requires a non-empty \
                  EPICS_CA_NAME_SERVERS: with no UDP socket and no name server \
@@ -907,7 +909,7 @@ impl SearchTransport {
 /// silently never resolved one reachable by broadcast alone.
 pub(crate) async fn run_search_engine(
     addr_list: Vec<super::AddrEntry>,
-    nameserver_addrs: Vec<SocketAddr>,
+    nameserver_entries: Vec<super::AddrEntry>,
     request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
     attempts: SearchAttempts,
@@ -917,7 +919,7 @@ pub(crate) async fn run_search_engine(
     };
     run_engine(
         transport,
-        nameserver_addrs,
+        nameserver_entries,
         request_rx,
         response_tx,
         attempts,
@@ -965,15 +967,15 @@ pub(crate) async fn run_search_engine(
     )
 )]
 pub(crate) fn name_servers_only_search_engine(
-    nameserver_addrs: Vec<SocketAddr>,
+    nameserver_entries: Vec<super::AddrEntry>,
     request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
     attempts: SearchAttempts,
 ) -> epics_base_rs::error::CaResult<impl std::future::Future<Output = ()> + Send + 'static> {
-    let transport = SearchTransport::name_servers_only(&nameserver_addrs)?;
+    let transport = SearchTransport::name_servers_only(&nameserver_entries)?;
     Ok(run_engine(
         transport,
-        nameserver_addrs,
+        nameserver_entries,
         request_rx,
         response_tx,
         attempts,
@@ -982,7 +984,7 @@ pub(crate) fn name_servers_only_search_engine(
 
 async fn run_engine(
     mut transport: SearchTransport,
-    nameserver_addrs: Vec<SocketAddr>,
+    nameserver_entries: Vec<super::AddrEntry>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
     attempts: SearchAttempts,
@@ -1007,12 +1009,12 @@ async fn run_engine(
         .unwrap_or(256)
         .max(8);
     let mut nameserver_send_txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::new();
-    for addr in nameserver_addrs {
+    for entry in nameserver_entries {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(ns_queue_cap);
         nameserver_send_txs.push(tx);
         let resp_tx = tcp_response_tx.clone();
         epics_base_rs::runtime::task::spawn(async move {
-            run_nameserver_connection(addr, rx, resp_tx).await;
+            run_nameserver_connection(entry, rx, resp_tx).await;
         });
     }
 
@@ -1144,12 +1146,47 @@ async fn run_engine(
 /// port's 5 s connect cap plus 1→30 s exponential backoff diverged in
 /// both directions: it abandoned a slow-but-live name server C would have
 /// reached, and it hammered a down one far harder than C does.
+///
+/// One deliberate deviation from that rule: C redials the address it
+/// resolved at startup forever, so a name server that moves behind a
+/// stable DNS name is lost until client restart (the epics-base#488
+/// family, which C fixed for neither list). The entry arrives here as an
+/// [`AddrEntry`](super::AddrEntry) and every redial re-resolves its
+/// hostname first — the same deviation, same primitive, and same
+/// keep-cached-IP-on-failure policy as the `EPICS_CA_ADDR_LIST` refresh
+/// (`SearchTransport::refresh_dns`). Literal-IP entries re-resolve to
+/// themselves; the extra lookup per redial is bounded by the CONN_TMO
+/// cadence.
 async fn run_nameserver_connection(
-    addr: SocketAddr,
+    mut entry: super::AddrEntry,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
 ) {
     loop {
+        let prev_sock = entry.sock;
+        let addr = match entry.refresh_dns() {
+            Ok(new_sock) => {
+                if new_sock != prev_sock {
+                    tracing::info!(
+                        target: "epics_ca_rs::client::search",
+                        hostname = ?entry.hostname,
+                        old = %prev_sock,
+                        new = %new_sock,
+                        "ca-rs: EPICS_CA_NAME_SERVERS entry re-resolved"
+                    );
+                }
+                new_sock
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "epics_ca_rs::client::search",
+                    hostname = ?entry.hostname,
+                    error = %e,
+                    "ca-rs: name-server DNS refresh failed; keeping cached IP"
+                );
+                entry.sock
+            }
+        };
         // The client's one dial (`transport::dial_ca`), which is also what
         // decides the transport: on a target with no reactor this circuit
         // comes up on the same two pump threads an upstream circuit does. The
@@ -2161,6 +2198,12 @@ fn build_search_payload(cid: u32, pv_name: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A literal-IP name-server entry — what every test here configures;
+    /// `refresh_dns` is a no-op for it.
+    fn ns_entry(addr: SocketAddr) -> crate::client::AddrEntry {
+        crate::client::AddrEntry::new(addr, None, addr.port())
+    }
+
     /// C `getNTimers` (`udpiiu.cpp:96-111`) caps the search-timer ladder at 18
     /// rungs, so the effective ceiling on `EPICS_CA_MAX_SEARCH_PERIOD` is
     /// `(1 << 17) * 32e-3 == 4194.304 s` and the boundary sits at
@@ -2388,7 +2431,8 @@ mod tests {
     fn name_servers_only_drops_address_list_mutations() {
         let mut state = SearchEngineState::new();
         let ns: SocketAddr = "127.0.0.1:5064".parse().unwrap();
-        let mut transport = SearchTransport::name_servers_only(&[ns]).expect("non-empty NS list");
+        let mut transport =
+            SearchTransport::name_servers_only(&[ns_entry(ns)]).expect("non-empty NS list");
         let a: SocketAddr = "10.0.0.7:5064".parse().unwrap();
 
         handle_request_or_addr(&mut state, &mut transport, SearchRequest::AddAddress(a));
@@ -3107,6 +3151,37 @@ mod tests {
     /// type and is additionally covered by
     /// `name_servers_only_drops_address_list_mutations`, which runs in both
     /// configurations.
+    /// epics-base#488 for `EPICS_CA_NAME_SERVERS`: the dial must use the
+    /// entry's *current* DNS resolution, not the one cached at startup.
+    /// The entry's cached sock points at TEST-NET-1 (unroutable), the
+    /// hostname still names this host — only a redial that re-resolves
+    /// can reach the listener. Pre-fix, the circuit redialled the cached
+    /// `SocketAddr` forever and this accept times out.
+    #[cfg(not(feature = "rtems-exec-model"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_nameserver_dial_uses_the_fresh_dns_resolution() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind");
+        let port = listener.local_addr().expect("listener addr").port();
+        let stale = crate::client::AddrEntry::new(
+            SocketAddr::from(([192, 0, 2, 1], port)),
+            Some("localhost".into()),
+            port,
+        );
+        let (_out_tx, out_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
+        let circuit = tokio::spawn(run_nameserver_connection(stale, out_rx, resp_tx));
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+        circuit.abort();
+        assert!(
+            accepted.is_ok(),
+            "the name-server circuit dialled the stale startup resolution \
+             instead of re-resolving the hostname"
+        );
+    }
+
     #[cfg(not(feature = "rtems-exec-model"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
@@ -3147,7 +3222,7 @@ mod tests {
         let ns_addr = ns_listener.local_addr().expect("mock name-server addr");
 
         assert!(
-            SearchTransport::name_servers_only(&[ns_addr])
+            SearchTransport::name_servers_only(&[ns_entry(ns_addr)])
                 .expect("non-empty name-server list")
                 .bound_udp_addrs()
                 .is_empty(),
@@ -3185,7 +3260,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
-            vec![ns_addr],
+            vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
             std::sync::Arc::new(dashmap::DashMap::new()),
@@ -3295,7 +3370,7 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
-            vec![ns_addr],
+            vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
             std::sync::Arc::new(dashmap::DashMap::new()),
@@ -3381,7 +3456,7 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
-            vec![ns_addr],
+            vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
             std::sync::Arc::new(dashmap::DashMap::new()),
@@ -3479,7 +3554,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
-            vec![ns_addr],
+            vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
             std::sync::Arc::new(dashmap::DashMap::new()),
@@ -3588,7 +3663,7 @@ mod tests {
         // that path actually uses — and binds no socket for a pure
         // state-ordering test.
         let mut transport =
-            SearchTransport::name_servers_only(&[server_a]).expect("non-empty NS list");
+            SearchTransport::name_servers_only(&[ns_entry(server_a)]).expect("non-empty NS list");
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<SearchResponse>();
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SearchRequest>();
 

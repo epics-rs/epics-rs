@@ -1374,7 +1374,7 @@ fn tree_show(
         || (!sv && matches!(desc, FieldDesc::UnionArray { .. }));
 
     if inline {
-        tree_show_inline(out, desc, value, fmt, depth);
+        tree_show_inline(out, desc, value, member, fmt, depth);
     } else if braced {
         tree_show_braced(out, desc, value, member, fmt, depth);
     } else {
@@ -1406,16 +1406,21 @@ fn tree_show_value(out: &mut String, value: &PvField, fmt: &ValueFmt) {
 }
 
 /// pvxs Tree inline branch (datafmt.cpp:214-238): `any NAME = VAL` /
-/// `union NAME.MEM TYPE = VAL`. `member` and the type name have already been
-/// emitted by [`tree_show`].
+/// `union NAME.MEM TYPE = VAL`. The type name (and id) have already been
+/// emitted by [`tree_show`]; `member` is emitted here, before the union
+/// selector (datafmt.cpp:224-230).
 fn tree_show_inline(
     out: &mut String,
     desc: &FieldDesc,
     value: Option<&PvField>,
-    member_already_emitted: &ValueFmt,
+    member: &str,
+    fmt: &ValueFmt,
     depth: usize,
 ) {
-    let fmt = member_already_emitted;
+    if !member.is_empty() {
+        out.push(' ');
+        out.push_str(member);
+    }
     match desc {
         // (showValue is implied true for the Union inline branch.)
         FieldDesc::Union { variants, .. } => match value {
@@ -1855,6 +1860,89 @@ fn array_elements(desc: &FieldDesc, value: Option<&PvField>) -> Vec<(FieldDesc, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pvdata::VariantValue;
+
+    /// pvxs#46 residue: the Tree inline branch (`any` / `any[]` /
+    /// valued `union`) must emit the member name before the union
+    /// selector and value (datafmt.cpp:224-230). Pre-fix `pvinfo-rs`
+    /// printed `any` where pvxs prints `any parameters`.
+    #[test]
+    fn tree_inline_branch_keeps_the_member_name() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("parameters".into(), FieldDesc::Variant),
+                ("history".into(), FieldDesc::VariantArray),
+                (
+                    "u".into(),
+                    FieldDesc::Union {
+                        struct_id: String::new(),
+                        variants: vec![
+                            ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+                            ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+
+        // Describe mode (show_value=false, pvinfo): `any`/`any[]` are
+        // inline; the union renders braced and is not asserted here.
+        let describe = ValueFmt {
+            format: ValueFormat::Tree,
+            array_limit: 0,
+            show_value: false,
+        };
+        let out = format_value(&desc, None, &describe, None, 0);
+        assert!(out.contains("any parameters\n"), "got: {out:?}");
+        assert!(out.contains("any[] history\n"), "got: {out:?}");
+
+        // Value mode (show_value=true): `any` and the valued `union`
+        // are inline; the union adds `.MEM` after the member name.
+        let mut s = PvStructure::new("");
+        s.set(
+            "parameters",
+            PvField::Variant(Box::new(VariantValue {
+                desc: Some(FieldDesc::Scalar(ScalarType::Int)),
+                value: PvField::Scalar(ScalarValue::Int(5)),
+            })),
+        );
+        s.set("history", PvField::VariantArray(Vec::new()));
+        s.set(
+            "u",
+            PvField::Union {
+                selector: 1,
+                variant_name: "i".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Int(7))),
+            },
+        );
+        let value_mode = ValueFmt {
+            format: ValueFormat::Tree,
+            array_limit: 0,
+            show_value: true,
+        };
+        let out = format_value(
+            &desc,
+            Some(&PvField::Structure(s.clone())),
+            &value_mode,
+            None,
+            0,
+        );
+        assert!(out.contains("any parameters int32_t = 5\n"), "got: {out:?}");
+        assert!(out.contains("union u.i int32_t = 7\n"), "got: {out:?}");
+
+        // Null-union boundary: member name, no selector, ` null`.
+        s.set(
+            "u",
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        );
+        let out = format_value(&desc, Some(&PvField::Structure(s)), &value_mode, None, 0);
+        assert!(out.contains("union u null\n"), "got: {out:?}");
+    }
 
     fn nt_scalar_double(value: f64, sec: i64, nsec: i32) -> (FieldDesc, PvField) {
         let desc = FieldDesc::Structure {

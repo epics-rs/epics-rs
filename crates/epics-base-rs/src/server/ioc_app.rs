@@ -341,7 +341,13 @@ pub struct IocRunConfig {
     /// (epics-base PR #69, `EPICS_CAS_SERVER_PORT`) while keeping the
     /// canonical UDP discovery port.
     pub tcp_port: Option<u16>,
-    pub acf: Option<access_security::AccessSecurityConfig>,
+    /// The IOC's single live Access Security policy cell, seeded from
+    /// [`IocApplication::acf`] and shared with the startup/interactive
+    /// iocsh shells (whose `asInit` stores into it). A protocol runner
+    /// must hand this cell to every server it builds — never re-wrap
+    /// the config in a fresh cell — so a later `asInit`/ACF reload
+    /// reaches all of them at once.
+    pub acf: access_security::AcfCell,
     pub autosave_config: Option<autosave::SaveSetConfig>,
     pub autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     pub shell_commands: Vec<CommandDef>,
@@ -659,6 +665,18 @@ impl IocApplication {
             link_set_installers,
         } = self;
 
+        // The IOC's single live policy cell, created BEFORE the startup
+        // script runs so the script's `asInit` and the servers built
+        // afterwards observe the same store (upstream issue #667
+        // adjacent: a config that only lands in a shell-local copy is
+        // access security silently OFF).
+        let acf = access_security::new_acf_cell(acf);
+        // Periodic HAG DNS re-resolution under asCheckClientIP — C
+        // freezes HAG IPs at ACF load until a manual asInit
+        // (epics-base#863 / UI-107). Weak-referenced: ends when this
+        // IOC's cell drops.
+        access_security::spawn_hag_refresh(&acf);
+
         // Register record type factories with global registry so dbLoadRecords
         // (called from st.cmd) can find them. This bridges the injected factories
         // to the global registry that the iocsh dbLoadRecords command uses.
@@ -691,6 +709,7 @@ impl IocApplication {
         if let Some(script) = startup_script {
             let db1 = db.clone();
             let b1 = bridge.clone();
+            let acf1 = acf.clone();
 
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             // Mandatory: the startup script is what loads this IOC's database.
@@ -709,11 +728,14 @@ impl IocApplication {
                 crate::runtime::task::StackSizeClass::Big,
             )
             .try_spawn(move || {
-                let shell = iocsh::IocShell::new(db1, b1);
+                let shell = iocsh::IocShell::new_with_acf(db1, b1, acf1);
                 for cmd in startup_commands {
                     shell.register(cmd);
                 }
-                let result = shell.execute_script(&script);
+                // The iocshLoad mirror: C `iocsh(pathname)` is
+                // `iocshLoad(pathname, NULL)`, which also records
+                // IOCSH_STARTUP_SCRIPT (epics-base#469).
+                let result = shell.execute_script_with_macros(&script, &Default::default());
                 let _ = tx.send(result);
             })
             .map_err(|e| {
@@ -1072,6 +1094,7 @@ impl IocApplication {
         if !pending.is_empty() {
             let db1 = db.clone();
             let b1 = bridge.clone();
+            let acf1 = acf.clone();
             let shell_cmds_clone = shell_commands.clone();
             let (tx, rx) = crate::runtime::sync::oneshot::channel();
             // Mandatory for the same reason as "iocsh-startup": the queue holds
@@ -1086,7 +1109,7 @@ impl IocApplication {
                 crate::runtime::task::StackSizeClass::Big,
             )
             .try_spawn(move || {
-                let shell = iocsh::IocShell::new(db1, b1);
+                let shell = iocsh::IocShell::new_with_acf(db1, b1, acf1);
                 for cmd in shell_cmds_clone {
                     shell.register(cmd);
                 }

@@ -40,7 +40,7 @@ async fn build() -> PvDatabase {
     db.add_record("AO", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv("AO.OUT", EpicsValue::String("WF.NELM PP".into()))
+    db.put_record_field_from_ca_no_notify("AO", "OUT", EpicsValue::String("WF.NELM PP".into()))
         .await
         .unwrap();
 

@@ -25,7 +25,7 @@ use nix::pty::ForkptyResult;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{Pid, chdir, execvp};
+use nix::unistd::Pid;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -107,9 +107,16 @@ impl ChildHandle {
     /// 2. **Reaper** — blocking `waitpid` on a `spawn_blocking` thread,
     ///    emits the final `Exited` event and flips `alive` to false
     pub fn spawn(spec: &ChildSpec) -> ProcServResult<(Self, mpsc::Receiver<ChildEvent>)> {
+        // Everything the child needs after the fork — CStrings, the
+        // argv pointer vector, failure messages — is allocated here,
+        // BEFORE forkpty (epics-base#211 fork-safety class; see
+        // `ChildExecImage`).
+        let image = ChildExecImage::prepare(spec)?;
         // SAFETY: forkpty is unsafe because between fork and exec we
-        // may only call async-signal-safe functions. We do exactly
-        // that: setsid + chdir (libc syscalls, both AS-safe) + execvp.
+        // may only call async-signal-safe functions. The child arm
+        // calls exactly those: signal/pthread_sigmask, setrlimit,
+        // chdir, execvp, write, _exit — no malloc, no stdio locks
+        // (`in_child_setup_and_exec`).
         let result = unsafe { nix::pty::forkpty(None, None) }
             .map_err(|e| ProcServError::Forkpty(e.to_string()))?;
 
@@ -144,9 +151,9 @@ impl ChildHandle {
             ForkptyResult::Child => {
                 // We're in the child. Exec the target program.
                 // `in_child_setup_and_exec` returns `!` — either
-                // execvp succeeds (we never return) or it logs the
-                // error and `process::exit`s.
-                in_child_setup_and_exec(spec);
+                // execvp succeeds (we never return) or it reports via
+                // raw `write(2)` and `_exit`s.
+                in_child_setup_and_exec(spec, &image);
             }
         }
     }
@@ -297,16 +304,116 @@ fn restore_c_child_signal_environment() {
     let _ = blocked.thread_block();
 }
 
+/// Everything the post-fork child path needs, built in the parent
+/// BEFORE `forkpty` (upstream fork-safety class, epics-base#211).
+/// Respawns run from the live multi-threaded tokio supervisor, so at
+/// fork time another thread can hold the malloc arena or the stdio
+/// lock; a child-side `CString::new` or `eprintln!` can then deadlock
+/// before ever reaching `execvp`. `argv_ptrs` is the NULL-terminated
+/// `execvp` vector; it borrows `_argv`'s heap buffers, which stay put
+/// when the struct moves.
+struct ChildExecImage {
+    cwd: Option<CString>,
+    exec: CString,
+    _argv: Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    /// Pre-formatted failure lines ending in ` errno=`; the child
+    /// appends the digits from a stack buffer (`write_child_failure`).
+    chdir_fail: Vec<u8>,
+    exec_fail: Vec<u8>,
+}
+
+impl ChildExecImage {
+    fn prepare(spec: &ChildSpec) -> ProcServResult<Self> {
+        let cstr = |bytes: &[u8], what: &str| {
+            CString::new(bytes).map_err(|_| ProcServError::Config(format!("{what} contains NUL")))
+        };
+        let cwd = match &spec.cwd {
+            Some(p) => Some(cstr(p.as_os_str().as_encoded_bytes(), "chdir path")?),
+            None => None,
+        };
+        // argv[0] presented to the child is always the positional command
+        // (`spec.program`), so a `--exec` override runs a different binary
+        // under the original command line. C `childExec` (procServ.cc:62,
+        // 459-462); C's argv[0]-is-the-prior-token quirk is not reproduced.
+        let arg0 = cstr(spec.program.as_os_str().as_encoded_bytes(), "program name")?;
+        // The binary actually exec'd: the `--exec` override if set, else the
+        // command itself. `execvp` PATH-searches a slashless name, like C.
+        let exec = match &spec.child_exec {
+            Some(exe) => cstr(exe.as_os_str().as_encoded_bytes(), "exec path")?,
+            None => arg0.clone(),
+        };
+        let mut argv: Vec<CString> = Vec::with_capacity(1 + spec.args.len());
+        argv.push(arg0);
+        for a in &spec.args {
+            argv.push(cstr(a.as_bytes(), "argument")?);
+        }
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+
+        let chdir_fail = match &spec.cwd {
+            Some(p) => {
+                format!("procserv child: chdir to {} failed, errno=", p.display()).into_bytes()
+            }
+            None => Vec::new(),
+        };
+        let exec_fail = format!(
+            "procserv child: execvp({}) failed, errno=",
+            spec.child_exec.as_ref().unwrap_or(&spec.program).display()
+        )
+        .into_bytes();
+
+        Ok(Self {
+            cwd,
+            exec,
+            _argv: argv,
+            argv_ptrs,
+            chdir_fail,
+            exec_fail,
+        })
+    }
+}
+
+/// Async-signal-safe failure report: `write(2)` the pre-built message,
+/// then the decimal errno and a newline formatted in a stack buffer.
+/// No allocation, no stdio lock — callable between fork and exec.
+fn write_child_failure(msg: &[u8], errno: i32) {
+    let mut buf = [0u8; 12];
+    let mut i = buf.len() - 1;
+    buf[i] = b'\n';
+    let mut n = errno.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    unsafe {
+        let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
+        let _ = libc::write(2, buf[i..].as_ptr().cast(), buf.len() - i);
+    }
+}
+
 /// In-child path of `forkpty` — optional chdir, then `execvp` the
-/// target program. Never returns on success; on failure prints to
-/// stderr (which goes back through the PTY to the parent) and exits
-/// with [`CHILD_LAUNCH_FAILURE_EXIT`].
+/// target program. Never returns on success; on failure reports via raw
+/// `write(2)` (back through the PTY to the parent) and `_exit`s with
+/// [`CHILD_LAUNCH_FAILURE_EXIT`].
+///
+/// Everything here must be async-signal-safe: the supervisor forks from
+/// the multi-threaded tokio runtime, so the child can inherit a held
+/// malloc arena or stdio lock. All allocation and formatting happened in
+/// [`ChildExecImage::prepare`] before the fork; this path is limited to
+/// signal/sigmask restoration, `setrlimit`, `chdir(2)`, `execvp(3)`
+/// (whose PATH walk uses stack buffers in modern glibc/musl — the same
+/// post-fork call C procServ makes), `write(2)`, and `_exit(2)`.
 ///
 /// Note: `forkpty(3)` already calls `setsid()` internally and
 /// connects the slave fd as the controlling terminal, so we MUST
 /// NOT call `setsid` here again — it would return `EPERM` because
 /// we're already a session leader.
-fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
+fn in_child_setup_and_exec(spec: &ChildSpec, image: &ChildExecImage) -> ! {
     // R6-75: hand the child C's signal environment, not the Rust runtime's.
     restore_c_child_signal_environment();
 
@@ -321,66 +428,16 @@ fn in_child_setup_and_exec(spec: &ChildSpec) -> ! {
         let _ = setrlimit(Resource::RLIMIT_CORE, core, hard);
     }
 
-    if let Some(ref cwd) = spec.cwd {
-        let c_cwd = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("procserv child: invalid chdir path");
-                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-            }
-        };
-        if let Err(e) = chdir(c_cwd.as_c_str()) {
-            eprintln!("procserv child: chdir to {} failed: {e}", cwd.display());
-            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-        }
+    if let Some(cwd) = &image.cwd
+        && unsafe { libc::chdir(cwd.as_ptr()) } != 0
+    {
+        write_child_failure(&image.chdir_fail, nix::errno::Errno::last_raw());
+        unsafe { libc::_exit(CHILD_LAUNCH_FAILURE_EXIT) };
     }
 
-    // argv[0] presented to the child is always the positional command
-    // (`spec.program`), so a `--exec` override runs a different binary
-    // under the original command line. C `childExec` (procServ.cc:62,
-    // 459-462); C's argv[0]-is-the-prior-token quirk is not reproduced.
-    let arg0 = match CString::new(spec.program.as_os_str().as_encoded_bytes()) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("procserv child: program name contains NUL");
-            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-        }
-    };
-    // The binary actually exec'd: the `--exec` override if set, else the
-    // command itself. `execvp` PATH-searches a slashless name, like C.
-    let exec_target = match &spec.child_exec {
-        Some(exe) => match CString::new(exe.as_os_str().as_encoded_bytes()) {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("procserv child: exec path contains NUL");
-                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-            }
-        },
-        None => arg0.clone(),
-    };
-    let mut argv: Vec<CString> = Vec::with_capacity(1 + spec.args.len());
-    argv.push(arg0);
-    for a in &spec.args {
-        match CString::new(a.as_bytes()) {
-            Ok(c) => argv.push(c),
-            Err(_) => {
-                eprintln!("procserv child: argument contains NUL: {a:?}");
-                std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-            }
-        }
-    }
-
-    let argv_refs: Vec<&std::ffi::CStr> = argv.iter().map(|c| c.as_c_str()).collect();
-    match execvp(exec_target.as_c_str(), &argv_refs) {
-        Ok(infallible) => match infallible {},
-        Err(e) => {
-            eprintln!(
-                "procserv child: execvp({}) failed: {e}",
-                spec.child_exec.as_ref().unwrap_or(&spec.program).display()
-            );
-            std::process::exit(CHILD_LAUNCH_FAILURE_EXIT);
-        }
-    }
+    unsafe { libc::execvp(image.exec.as_ptr(), image.argv_ptrs.as_ptr()) };
+    write_child_failure(&image.exec_fail, nix::errno::Errno::last_raw());
+    unsafe { libc::_exit(CHILD_LAUNCH_FAILURE_EXIT) }
 }
 
 /// Set `O_NONBLOCK` on a borrowed fd. Required before wrapping in

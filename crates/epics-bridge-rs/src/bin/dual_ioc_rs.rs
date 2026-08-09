@@ -192,16 +192,21 @@ async fn main() -> ExitCode {
         .pva_port
         .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port);
 
+    // One live policy cell for both protocol servers, so an ACF
+    // (re)load gates CA and PVA together.
+    let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+
     let ca_handle = if args.no_ca {
         None
     } else {
-        let server = match CaServer::from_parts(db.clone(), ca_port, None, None, None, None).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error binding CA server on port {ca_port}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+        let server =
+            match CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error binding CA server on port {ca_port}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
         Some(tokio::spawn(async move {
             tracing::info!(port = ca_port, "CA listener starting");
             server.run().await
@@ -211,7 +216,7 @@ async fn main() -> ExitCode {
     let pva_handle = if args.no_pva {
         None
     } else {
-        let server = PvaServer::from_parts(db.clone(), pva_port, None, None, None);
+        let server = PvaServer::from_parts(db.clone(), pva_port, acf, None, None);
         Some(tokio::spawn(async move {
             tracing::info!(port = pva_port, "PVA listener starting");
             server.run().await

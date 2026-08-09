@@ -166,14 +166,23 @@ pub async fn run_tcp_server_on_listener(
                     // detection. We add OS keepalive (CA-libca style) so a
                     // pre-handshake half-open peer still gets reaped even
                     // before the application timer arms.
-                    {
+                    // Read `SO_SNDBUF` here, while the raw stream is still in
+                    // scope (the TLS accept below consumes it): the byte cap
+                    // on the connection's writer queue is
+                    // `SO_SNDBUF × TCP_TX_LIMIT_MULT`, pvxs `tcp_tx_limit`
+                    // (`serverconn.cpp:20,61`).
+                    let tx_limit_bytes = {
                         let sock = socket2::SockRef::from(&stream);
                         let keepalive = socket2::TcpKeepalive::new()
                             .with_time(std::time::Duration::from_secs(15))
                             .with_interval(std::time::Duration::from_secs(5));
                         let _ = sock.set_keepalive(true);
                         let _ = sock.set_tcp_keepalive(&keepalive);
-                    }
+                        match sock.send_buffer_size() {
+                            Ok(sz) if sz > 0 => sz.saturating_mul(super::tcp::TCP_TX_LIMIT_MULT),
+                            _ => super::tcp::TX_LIMIT_FALLBACK,
+                        }
+                    };
 
                     // TLS-NAMESERVER: peek the first byte to dispatch
                     // TLS vs plain PVA on a single port.
@@ -295,6 +304,7 @@ pub async fn run_tcp_server_on_listener(
                                             peer_entry: peer_entry.clone(),
                                             x509_identity: x509_id,
                                             channel_invalidator: conn_invalidator,
+                                            tx_limit_bytes,
                                         },
                                     )
                                     .await
@@ -327,6 +337,7 @@ pub async fn run_tcp_server_on_listener(
                                     peer_entry: peer_entry.clone(),
                                     x509_identity: None,
                                     channel_invalidator: conn_invalidator,
+                                    tx_limit_bytes,
                                 },
                             )
                             .await

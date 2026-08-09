@@ -493,9 +493,13 @@ pub(crate) enum BareLeaf {
     /// A `DBR_CHAR` array whose channel format is `String` — pvxs
     /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:634-636`).
     LongString,
-    /// `dbChannelFinalElements() != 1` — pvxs `valueType.arrayOf()`.
+    /// The value is stored as an `*Array` variant ([`nt_type_for_field`])
+    /// — pvxs `valueType.arrayOf()`. Deliberate divergence: pvxs keys
+    /// array-ness on `dbChannelFinalElements() != 1`, so C QSRV serves a
+    /// `NELM=1` waveform as a scalar; the port pins the shape to the
+    /// FTVL storage variant and keeps it NTScalarArray.
     Array(ScalarType),
-    /// A single element — pvxs `fromDbrType(final_field_type)`.
+    /// A scalar-stored value — pvxs `fromDbrType(final_field_type)`.
     Scalar(ScalarType),
 }
 
@@ -764,8 +768,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
                 .display
                 .as_ref()
                 .map(|d| d.description.clone())
-                .unwrap_or_default()
-                .into(),
+                .unwrap_or_default(),
         )),
     ));
     pv.fields
@@ -1270,7 +1273,7 @@ fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> 
     }
     d.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(disp.description.clone().into())),
+        PvField::Scalar(ScalarValue::String(disp.description.clone())),
     ));
     d.fields.push((
         "units".into(),

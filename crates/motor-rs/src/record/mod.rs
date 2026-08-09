@@ -395,6 +395,10 @@ impl Record for MotorRecord {
         dbd_generated::MOTOR_FIELDS
     }
 
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
+        dbd_generated::MOTOR_NOACCESS
+    }
+
     /// C `special()` pass-0 blink (motorRecord.cc:2582-2608): "Someone
     /// wrote to drive field. Blink .dmov unless record is disabled."
     /// Every database put to a drive field drops DMOV before the record

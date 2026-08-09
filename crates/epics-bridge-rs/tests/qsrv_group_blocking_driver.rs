@@ -101,7 +101,7 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
     write!(group_file, r#"{{ "{GROUP_PV}": {{ {fields} }} }}"#).expect("write group json");
     let mount = build_qsrv_mount(
         &db,
-        None,
+        epics_base_rs::server::access_security::new_acf_cell(None),
         &[GroupLoadRequest {
             filename: group_file.path().to_string_lossy().into_owned(),
             macros: String::new(),

@@ -1209,6 +1209,10 @@ impl Record for ScalerRecord {
         dbd_generated::SCALER_FIELDS
     }
 
+    fn declared_noaccess_fields(&self) -> &'static [&'static str] {
+        dbd_generated::SCALER_NOACCESS
+    }
+
     /// C `scalerRecord.c:471,770-787`: `process()` calls `monitor()` only
     /// while `ss == SCALER_STATE_IDLE`, and `monitor()` re-posts every
     /// active channel `S1..Snch` with a literal `DBE_LOG` regardless of

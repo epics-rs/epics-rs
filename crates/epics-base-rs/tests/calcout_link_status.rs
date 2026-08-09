@@ -101,9 +101,13 @@ async fn calcout_input_status_reclassifies_on_special() {
     poll_status(&db, "CALC_SP.INCV", CON, "empty INPC → CON").await;
 
     // A client put to the INP link re-runs checkLinks via special().
-    db.put_pv("CALC_SP.INPC", EpicsValue::String("CALC_SP_TGT.VAL".into()))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca_no_notify(
+        "CALC_SP",
+        "INPC",
+        EpicsValue::String("CALC_SP_TGT.VAL".into()),
+    )
+    .await
+    .unwrap();
     poll_status(&db, "CALC_SP.INCV", LOC, "INPC repointed to local → LOC").await;
 }
 
@@ -123,9 +127,13 @@ async fn calcout_outv_classifies_via_process() {
 
     // Configure a local OUT link, then process: check_alarms mirrors
     // common.out into the record and re-classifies OUTV → LOC.
-    db.put_pv("CALC_OUT.OUT", EpicsValue::String("CALC_OUT_TGT".into()))
-        .await
-        .unwrap();
+    db.put_record_field_from_ca_no_notify(
+        "CALC_OUT",
+        "OUT",
+        EpicsValue::String("CALC_OUT_TGT".into()),
+    )
+    .await
+    .unwrap();
     let mut visited = HashSet::new();
     db.process_record_with_links("CALC_OUT", &mut visited, 0)
         .await

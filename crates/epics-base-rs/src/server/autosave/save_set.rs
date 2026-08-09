@@ -365,8 +365,18 @@ pub async fn restore_from_entries_with_mode(
             }
         };
 
+        // A DBF link field takes the no-process write in BOTH modes:
+        // C `reboot_restore` puts via `dbPutField`, and `dbPutField` on a
+        // link field is `dbPutFieldLink` (`dbAccess.c:1261`) — a re-parse
+        // write that never processes. The `dbPut`-analogue `put_pv` would
+        // refuse it (`S_db_badDbrtype`, dbAccess.c:1340).
+        let (base, field) = crate::server::database::parse_pv_name(&entry.pv_name);
+        let is_link_field = db.is_dbf_link_field(base, field);
         let put_result = match mode {
             RestoreMode::NoProcess => db.put_pv_no_process(&entry.pv_name, parsed).await,
+            RestoreMode::Process if is_link_field => {
+                db.put_pv_no_process(&entry.pv_name, parsed).await
+            }
             RestoreMode::Process => db.put_pv(&entry.pv_name, parsed).await,
         };
         match put_result {

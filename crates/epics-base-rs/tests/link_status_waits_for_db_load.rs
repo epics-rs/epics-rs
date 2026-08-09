@@ -223,7 +223,7 @@ async fn runtime_link_re_point_still_classifies_after_a_post_init_load() {
     assert!(db.begin_load().is_err());
 
     // `dbpf CO.INPA "9.5"` — the link becomes a CONSTANT.
-    db.put_pv("CO.INPA", EpicsValue::String("9.5".into()))
+    db.put_record_field_from_ca_no_notify("CO", "INPA", EpicsValue::String("9.5".into()))
         .await
         .unwrap();
     epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;

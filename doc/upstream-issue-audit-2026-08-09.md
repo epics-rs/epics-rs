@@ -388,6 +388,20 @@ on script entry, restore the outer value when a nested script exits,
 keep the top-level value after boot. Verify the exact C set sites
 against the reference before implementing.
 
+— CLEARED. The reference overturned the assumed save/restore design:
+upstream already landed #469's fix (48eed22f3, in R7.0.10) as
+*set-once* — `iocshLoad` sets the variable only when `getenv` finds
+nothing, so the first script (or an inherited environment value) wins
+and nested loads never overwrite. Ported as
+`set_startup_script_once`, called from `execute_script_with_macros`
+(the `iocshLoad` mirror; the top-level st.cmd load in `ioc_app` now
+routes through it, matching C `iocsh(pathname)` ≡
+`iocshLoad(pathname, NULL)`) and set before the file is opened, like
+C. `execute_script` is the `iocshBody` level — `<` includes land
+there and never set it, also like C. Test:
+`startup_script_env_is_first_load_only` (nested-load no-overwrite,
+include no-set, inherited-value kept).
+
 ## Parity findings (upstream wart reproduced deliberately — document, do not fix)
 
 - **UI-2** camonitor-rs `-S` renders an emptied char waveform as `0`

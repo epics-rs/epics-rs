@@ -299,11 +299,17 @@ impl IocShell {
     /// Macros use `$(KEY)` / `${KEY}` syntax via `db_loader::substitute_macros`.
     /// Per-line errors are reported (matching `execute_script`) but
     /// the script continues to the next line.
+    ///
+    /// As the `iocshLoad` mirror this is also the level that records
+    /// `IOCSH_STARTUP_SCRIPT` — top-level loads enter here (C
+    /// `iocsh(pathname)` is `iocshLoad(pathname, NULL)`), `<` includes
+    /// enter [`Self::execute_script`] (C `iocshBody`) and never set it.
     pub fn execute_script_with_macros(
         &self,
         path: &str,
         macros: &HashMap<String, String>,
     ) -> Result<(), String> {
+        set_startup_script_once(path);
         let _depth = self.enter_script(path)?;
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
@@ -344,6 +350,10 @@ impl IocShell {
     /// do not abort execution. The final return value is `Err` if any command
     /// failed — the equivalent of `iocshSetError` propagating a non-zero exit
     /// status to startup-script callers (e.g., automated IOC verification).
+    ///
+    /// This is the `iocshBody`-with-a-file level (`<` includes land
+    /// here) — it does not record `IOCSH_STARTUP_SCRIPT`; see
+    /// [`Self::execute_script_with_macros`].
     pub fn execute_script(&self, path: &str) -> Result<(), String> {
         let _depth = self.enter_script(path)?;
         let content =
@@ -658,6 +668,19 @@ fn echoes_script_line(line: &str) -> bool {
     !line.trim_start().starts_with("#-")
 }
 
+/// C `iocshLoad` (`iocsh.cpp:1347-1351`) records the loaded script in
+/// `IOCSH_STARTUP_SCRIPT` — since epics-base#469's fix only when the
+/// variable is not already set, so it permanently names the *first*
+/// script (or an inherited value from the parent environment) and a
+/// nested `iocshLoad` no longer overwrites it. Set before the file is
+/// even opened, like C — an unreadable path still lands here.
+fn set_startup_script_once(path: &str) {
+    if std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none() {
+        // SAFETY: same single-threaded-shell rationale as `epicsEnvSet`.
+        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", path) };
+    }
+}
+
 ///
 /// Returns `(physical_line_number, logical_line)` pairs. The line
 /// number is the 1-based index of the *first* physical line in the
@@ -961,6 +984,53 @@ mod tests {
             .execute_script(&outer_path)
             .expect("re-running the same include must succeed");
         assert_eq!(shell.script_depth.get(), 0);
+    }
+
+    /// epics-base#469 (as fixed upstream in 48eed22f3): the first
+    /// loaded script — and only the first — lands in
+    /// `IOCSH_STARTUP_SCRIPT`; a nested `iocshLoad` does not overwrite
+    /// it, a `<` include (the `iocshBody` path) never sets it, and an
+    /// inherited value from the parent environment is kept. One test fn
+    /// so the process-global variable has a single owner.
+    #[test]
+    fn startup_script_env_is_first_load_only() {
+        let shell = make_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.cmd");
+        std::fs::write(&inner, "#- inner\n").unwrap();
+        let outer = dir.path().join("outer.cmd");
+        std::fs::write(&outer, format!("iocshLoad {}\n", inner.display())).unwrap();
+        let outer_path = outer.display().to_string();
+
+        // SAFETY: single-threaded test process (nextest), sole owner of
+        // this variable.
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
+        shell
+            .execute_script_with_macros(&outer_path, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            std::env::var("IOCSH_STARTUP_SCRIPT").as_deref(),
+            Ok(outer_path.as_str()),
+            "the outer script wins; the nested iocshLoad must not overwrite"
+        );
+
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
+        shell.execute_script(&inner.display().to_string()).unwrap();
+        assert!(
+            std::env::var_os("IOCSH_STARTUP_SCRIPT").is_none(),
+            "the iocshBody path ('<' includes) must not set the variable"
+        );
+
+        unsafe { std::env::set_var("IOCSH_STARTUP_SCRIPT", "inherited.cmd") };
+        shell
+            .execute_script_with_macros(&outer_path, &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            std::env::var("IOCSH_STARTUP_SCRIPT").as_deref(),
+            Ok("inherited.cmd"),
+            "a value inherited from the environment is kept (C getenv guard)"
+        );
+        unsafe { std::env::remove_var("IOCSH_STARTUP_SCRIPT") };
     }
 
     #[test]

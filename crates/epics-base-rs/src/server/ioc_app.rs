@@ -732,7 +732,10 @@ impl IocApplication {
                 for cmd in startup_commands {
                     shell.register(cmd);
                 }
-                let result = shell.execute_script(&script);
+                // The iocshLoad mirror: C `iocsh(pathname)` is
+                // `iocshLoad(pathname, NULL)`, which also records
+                // IOCSH_STARTUP_SCRIPT (epics-base#469).
+                let result = shell.execute_script_with_macros(&script, &Default::default());
                 let _ = tx.send(result);
             })
             .map_err(|e| {

@@ -671,6 +671,11 @@ impl IocApplication {
         // adjacent: a config that only lands in a shell-local copy is
         // access security silently OFF).
         let acf = access_security::new_acf_cell(acf);
+        // Periodic HAG DNS re-resolution under asCheckClientIP — C
+        // freezes HAG IPs at ACF load until a manual asInit
+        // (epics-base#863 / UI-107). Weak-referenced: ends when this
+        // IOC's cell drops.
+        access_security::spawn_hag_refresh(&acf);
 
         // Register record type factories with global registry so dbLoadRecords
         // (called from st.cmd) can find them. This bridges the injected factories

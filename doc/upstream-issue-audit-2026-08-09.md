@@ -347,6 +347,18 @@ re-resolution that rebuilds the hag map and republishes through
 connected clients re-evaluate automatically. Default mode (claimed
 HOST_NAME string match) involves no DNS and is unaffected.
 
+— CLEARED. `AccessSecurityConfig` now keeps the raw HAG spellings
+(`hag_raw`; the resolved `hag` stores `hag_members` *output*, which a
+DNS move makes unre-resolvable), `with_refreshed_hags` re-runs
+`hag_members` — still the single resolution owner — and returns a
+refreshed config only on change, and `spawn_hag_refresh` (wired in
+`ioc_app` right after `new_acf_cell`) republishes it every 60 s
+(`HAG_DNS_REFRESH`, the CA-side `refresh_dns` cadence) via
+`AcfCell::store`, the same client-notification path `asInit` uses.
+Gated on `asCheckClientIP`; the task holds a `Weak` and ends with the
+IOC. Tests: stale-quad re-resolve, unchanged → `None`, name-mode
+no-op.
+
 ### UI-108 dbLoadTemplate silently ignores `file "x.template" {}`
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/db_loader/substitution.rs:285-289`, `:449-476`. Upstream: epics-base#666 (C dbLoadTemplate half reproduced; msi's parse-error half absent).
 The docs call the subs block optional, but an empty body loads zero

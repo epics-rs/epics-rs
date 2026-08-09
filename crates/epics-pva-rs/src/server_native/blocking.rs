@@ -172,7 +172,7 @@ use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
 use super::source::{ChannelInvalidator, DynSource};
-use super::tcp::{ConnInit, handle_connection_io};
+use super::tcp::{ConnInit, TCP_TX_LIMIT_MULT, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
 
 /// The EPICS priority every PVA server thread runs at.
@@ -930,6 +930,7 @@ impl BlockingPvaServer {
             peer_entry,
             x509_identity: None,
             channel_invalidator: invalidator,
+            tx_limit_bytes: tx_limit_bytes(&stream),
         };
         conn_worker.run_detached(format!("PVA connection {peer}"), move || {
             let _lease = lease;
@@ -1032,6 +1033,39 @@ const UDP_RECV_BUF: usize = 64 * 1024;
 /// listing (`pvxlist`) that sees exactly the expected server.
 pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
     bind_udp_search_socket(addr)
+}
+
+/// `SO_SNDBUF × TCP_TX_LIMIT_MULT` for an accepted socket — the byte cap
+/// pvxs applies to a connection's queued TX (`tcp_tx_limit`,
+/// `serverconn.cpp:20,61`). Raw `libc` rather than `socket2` for the same
+/// RTEMS reason as [`bind_udp_search`]; on a failed read the connection is
+/// served under [`TX_LIMIT_FALLBACK`] instead of refused as pvxs does.
+#[cfg(unix)]
+fn tx_limit_bytes(stream: &TcpStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the fd is a valid open socket borrowed from `stream`; `val`
+    // and `len` outlive the call and `len` matches `val`'s size.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &mut val as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 && val > 0 {
+        (val as usize).saturating_mul(TCP_TX_LIMIT_MULT)
+    } else {
+        TX_LIMIT_FALLBACK
+    }
+}
+
+#[cfg(not(unix))]
+fn tx_limit_bytes(_stream: &TcpStream) -> usize {
+    TX_LIMIT_FALLBACK
 }
 
 #[cfg(unix)]
@@ -1498,6 +1532,7 @@ mod tests {
                         peer_entry: PeerEntry::new(false),
                         x509_identity: None,
                         channel_invalidator: ChannelInvalidator::new(),
+                        tx_limit_bytes: TX_LIMIT_FALLBACK,
                     },
                     &registry,
                 )
@@ -1813,6 +1848,7 @@ mod tests {
                 peer_entry: PeerEntry::new(false),
                 x509_identity: None,
                 channel_invalidator: ChannelInvalidator::new(),
+                tx_limit_bytes: TX_LIMIT_FALLBACK,
             },
             &ConnRegistry::new(),
         )

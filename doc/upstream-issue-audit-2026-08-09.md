@@ -39,7 +39,7 @@ stays `None` = permissive. Access security is silently OFF while
 appearing loaded. The live cell is fed exclusively by the programmatic
 `IocApplication::acf()` path.
 
-### UI-20 Server outbound queue bounded in frames, not bytes
+### UI-20 Server outbound queue bounded in frames, not bytes — CLEARED
 Severity: HIGH. epics-rs: `crates/epics-pva-rs/src/server_native/config.rs:414`, `tcp.rs:3110`, `tcp.rs:2997-3003`. Upstream: pvxs#161.
 Per-connection writer queue admits by frame count (default 1024) with no
 byte watermark; ~10 MB NTNDArray monitor frames to a slow client can pin
@@ -47,6 +47,14 @@ byte watermark; ~10 MB NTNDArray monitor frames to a slow client can pin
 with a byte-denominated `tcp_tx_limit` (2 × socket send buffer). The
 per-op squash FIFO bounds staleness, not writer-queue bytes. Static
 analysis; not measured live.
+CLEARED: `SrvTx` is now a struct carrying a `TxBudget` semaphore of
+`SO_SNDBUF × 2` bytes (pvxs `tcp_tx_limit`, `serverconn.cpp:20,61`),
+read per-connection by both drivers (`accept.rs` via socket2,
+`blocking.rs` via raw libc) and threaded through `ConnInit`. Every send
+acquires `clamp(len, 1..=limit)` permits; the writer task releases them
+after the frame is written and closes the budget on exit so parked
+senders fail instead of waiting forever. Boundary tests in
+`tx_byte_budget_tests`.
 
 ### UI-1 EPICS_CA_NAME_SERVERS entries never re-resolve DNS
 Severity: MED. epics-rs: `crates/epics-ca-rs/src/client/mod.rs:805-806`, `client/search.rs:1147-1191`. Upstream: epics-base#488 (partial).

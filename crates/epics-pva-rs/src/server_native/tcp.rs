@@ -2955,18 +2955,160 @@ fn parse_client_credentials(
 /// and TLS-wrapped streams.
 type SrvRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+/// pvxs bounds a connection's queued TX by *bytes*, not frames:
+/// `tcp_tx_limit = SO_SNDBUF × tcp_tx_limit_mult` with
+/// `tcp_tx_limit_mult = 2` (`serverconn.cpp:20,61`), and monitor
+/// replies are deferred once the output buffer reaches that limit
+/// (`servermon.cpp:123`, pvxs#161). The multiplier is shared with the
+/// drivers that read `SO_SNDBUF` at accept time.
+pub(super) const TCP_TX_LIMIT_MULT: usize = 2;
+
+/// Byte limit used when `SO_SNDBUF` cannot be read at accept time.
+/// pvxs throws and refuses the connection there; serving under a
+/// conservative fixed budget (2 × 256 KiB) is the deliberate
+/// deviation — a failed `getsockopt` is not worth a lost client.
+pub(super) const TX_LIMIT_FALLBACK: usize = TCP_TX_LIMIT_MULT * 256 * 1024;
+
+/// Byte budget for one connection's writer queue — the port of pvxs
+/// `tcp_tx_limit`. Producers acquire `clamp(len, 1..=limit)` permits
+/// before a frame may enter the queue; the writer task releases the
+/// same amount after the frame is written (or the connection dies).
+/// The clamp keeps a frame larger than the whole limit admissible —
+/// it charges the full budget and travels alone, exactly how pvxs
+/// admits one oversized monitor reply before suspending the rest.
+#[derive(Clone)]
+struct TxBudget {
+    sem: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+}
+
+impl TxBudget {
+    /// Largest representable charge: `acquire_many` takes `u32`, and the
+    /// semaphore itself caps permits at `Semaphore::MAX_PERMITS`
+    /// (smaller than `u32::MAX` on 32-bit targets — this file compiles
+    /// for armv7 RTEMS through the blocking driver).
+    const MAX_CHARGE: usize = {
+        let sem_max = tokio::sync::Semaphore::MAX_PERMITS;
+        if sem_max < u32::MAX as usize {
+            sem_max
+        } else {
+            u32::MAX as usize
+        }
+    };
+
+    fn new(limit_bytes: usize) -> Self {
+        let limit = limit_bytes.clamp(1, Self::MAX_CHARGE);
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    fn charge(&self, len: usize) -> u32 {
+        // ≤ self.limit ≤ MAX_CHARGE ≤ u32::MAX, so the cast is lossless.
+        len.clamp(1, self.limit) as u32
+    }
+
+    /// Take `len` bytes of budget, waiting while the queue is full.
+    /// `Err` means the budget was closed — the writer task is gone and
+    /// the frame can never be written.
+    async fn acquire(&self, len: usize) -> Result<(), ()> {
+        match self.sem.clone().acquire_many_owned(self.charge(len)).await {
+            Ok(permits) => {
+                permits.forget();
+                Ok(())
+            }
+            Err(_closed) => Err(()),
+        }
+    }
+
+    fn release(&self, len: usize) {
+        self.sem.add_permits(self.charge(len) as usize);
+    }
+}
+
+/// Closes the budget when the writer task's future is dropped — whether
+/// the loop broke on a write error/timeout or `AbortOnDrop` cancelled it
+/// at an await point. Without this, producers blocked in
+/// `TxBudget::acquire` would wait forever once the writer is gone: the
+/// mpsc receiver closing fails only senders that reach `tx.send`, not
+/// senders parked on the semaphore in front of it.
+struct TxBudgetCloseGuard(TxBudget);
+
+impl Drop for TxBudgetCloseGuard {
+    fn drop(&mut self) {
+        self.0.sem.close();
+    }
+}
+
 /// Per-connection write side. Producers (the main read loop — including
 /// its heartbeat arm — and the monitor subscribers) push fully-framed
 /// PVA messages into the
 /// channel; a single dedicated writer task drains it in arrival order.
 /// Replaces `Arc<Mutex<SrvWrite>>` so a slow client cannot block other
-/// producers waiting for the lock. The channel is *bounded* —
-/// `await`-style sends propagate backpressure all the way back to the
-/// monitor subscribers / read loop, so memory cannot grow unbounded
-/// when the client is slow. Errors on the write side drop the
-/// receiver; subsequent sends fail and the read loop independently
-/// observes the dead socket and tears down.
-type SrvTx = tokio::sync::mpsc::Sender<Vec<u8>>;
+/// producers waiting for the lock. The channel is bounded twice —
+/// by frame count (`write_queue_depth`) and by bytes ([`TxBudget`],
+/// pvxs `tcp_tx_limit`) — and `await`-style sends propagate
+/// backpressure all the way back to the monitor subscribers / read
+/// loop, so memory cannot grow unbounded when the client is slow.
+/// The frame-count bound alone was the defect: 1024 queued frames of
+/// arbitrary size is not a memory bound at all. Errors on the write
+/// side drop the receiver and close the budget; subsequent sends fail
+/// and the read loop independently observes the dead socket and tears
+/// down.
+#[derive(Clone)]
+struct SrvTx {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    budget: TxBudget,
+}
+
+impl SrvTx {
+    /// Build the writer-queue pair plus the budget handle the writer
+    /// task releases into.
+    fn channel(
+        depth: usize,
+        tx_limit_bytes: usize,
+    ) -> (Self, tokio::sync::mpsc::Receiver<Vec<u8>>, TxBudget) {
+        let (tx, rx) = tokio::sync::mpsc::channel(depth);
+        let budget = TxBudget::new(tx_limit_bytes);
+        (
+            Self {
+                tx,
+                budget: budget.clone(),
+            },
+            rx,
+            budget,
+        )
+    }
+
+    async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        if self.budget.acquire(buf.len()).await.is_err() {
+            return Err(tokio::sync::mpsc::error::SendError(buf));
+        }
+        let len = buf.len();
+        match self.tx.send(buf).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The frame never entered the queue; hand its budget back
+                // so any producer racing the shutdown is not stuck short.
+                self.budget.release(len);
+                Err(e)
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
 
 /// Connection writer handle bound to one channel's byte accounting.
 ///
@@ -3073,6 +3215,11 @@ pub(super) struct ConnInit {
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
     pub(super) channel_invalidator: ChannelInvalidator,
+    /// Byte cap on this connection's queued-but-unwritten TX — pvxs
+    /// `tcp_tx_limit` (`serverconn.cpp:20,61`: `SO_SNDBUF ×`
+    /// [`TCP_TX_LIMIT_MULT`]). The driver reads the accepted socket's
+    /// `SO_SNDBUF` and multiplies; [`TX_LIMIT_FALLBACK`] when it cannot.
+    pub(super) tx_limit_bytes: usize,
 }
 
 pub(super) async fn handle_connection_io(
@@ -3087,6 +3234,7 @@ pub(super) async fn handle_connection_io(
         peer_entry,
         x509_identity,
         channel_invalidator,
+        tx_limit_bytes,
     } = init;
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
@@ -3107,10 +3255,14 @@ pub(super) async fn handle_connection_io(
     //    fails fast. Mirrors the parallel guard in `epics-ca-rs`'s
     //    server-side dispatch wrap (the CA G1 audit fix).
     let send_tmo = config.send_timeout;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(config.write_queue_depth);
+    let (tx, mut rx, writer_budget) = SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
     let writer_task = epics_base_rs::runtime::task::spawn(async move {
+        // Dropping this guard — loop break OR abort at the `recv` await —
+        // closes the byte budget so producers parked in `TxBudget::acquire`
+        // fail instead of waiting on a writer that no longer exists.
+        let _budget_guard = TxBudgetCloseGuard(writer_budget.clone());
         while let Some(frame) = rx.recv().await {
             match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&frame))
                 .await
@@ -3118,6 +3270,9 @@ pub(super) async fn handle_connection_io(
                 Ok(Ok(())) => {
                     // bytes_out counter for PvaServer::report().
                     peer_entry_writer.touch_tx(frame.len());
+                    // The frame left the queue for the socket buffer;
+                    // return its bytes to the TX budget.
+                    writer_budget.release(frame.len());
                 }
                 Ok(Err(e)) => {
                     debug!(peer = ?writer_peer, error = %e, "writer task: TCP write failed, dropping connection");
@@ -8223,6 +8378,19 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
+/// Test-only writer-queue pair with an effectively unlimited byte
+/// budget, so the existing frame-count-oriented tests keep their exact
+/// semantics; the byte bound has its own dedicated tests. Defined at
+/// module level so every `#[cfg(test)]` sub-module reaches it via
+/// `super::*` — and *below* all production code, because the peer_buf
+/// source guard treats everything before the file's first column-0
+/// `#[cfg(test)]` as the production text it scans.
+#[cfg(test)]
+fn test_srv_tx(depth: usize) -> (SrvTx, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    let (tx, rx, _budget) = SrvTx::channel(depth, TxBudget::MAX_CHARGE);
+    (tx, rx)
+}
+
 /// A fixed-order outbound cell for `handle_op` calls in tests that do not
 /// renegotiate the connection byte order mid-stream. Production threads the
 /// read loop's live cell; these tests latch it once to the handler's `order`
@@ -10020,7 +10188,7 @@ mod tests {
                     intro_wire: None,
                 },
             );
-            let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let (tx, _rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -10117,7 +10285,7 @@ mod tests {
                     intro_wire: None,
                 },
             );
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let (tx, mut rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -10213,7 +10381,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -10310,7 +10478,7 @@ mod tests {
                     intro_wire: None,
                 },
             );
-            let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let (tx, _rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
             let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -10976,7 +11144,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11088,7 +11256,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11183,7 +11351,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11443,7 +11611,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11716,7 +11884,7 @@ mod tests {
         let (sid, ioid) = (1u32, 700u32);
         let intro = three_field_intro();
         let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11789,7 +11957,7 @@ mod tests {
         let (sid, ioid) = (2u32, 701u32);
         let intro = three_field_intro();
         let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11857,7 +12025,7 @@ mod tests {
         let (sid, ioid) = (3u32, 702u32);
         let intro = three_field_intro();
         let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11910,7 +12078,7 @@ mod tests {
         let (sid, ioid) = (4u32, 703u32);
         let intro = three_field_intro();
         let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -11968,7 +12136,7 @@ mod tests {
         let (sid, ioid) = (5u32, 704u32);
         let intro = three_field_intro();
         let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12069,7 +12237,7 @@ mod tests {
         let (sid, ioid) = (6u32, 705u32);
         let intro = three_field_intro();
         let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12133,7 +12301,7 @@ mod tests {
         let (sid, ioid) = (7u32, 706u32);
         let intro = three_field_intro();
         let (mut channels, _source, _pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12180,7 +12348,7 @@ mod tests {
         let (sid, ioid) = (11u32, 710u32);
         let intro = three_field_intro();
         let (mut channels, _source, pusher) = pvx61_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12382,7 +12550,7 @@ mod tests {
         let (sid, ioid) = (8u32, 707u32);
         let intro = three_field_intro();
         let (mut channels, _source, raw_tx) = pvx61_raw_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12450,7 +12618,7 @@ mod tests {
         let (sid, ioid) = (9u32, 708u32);
         let intro = three_field_intro();
         let (mut channels, _source, raw_tx) = pvx61_raw_channels(sid, &intro);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12600,7 +12768,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12769,7 +12937,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12867,7 +13035,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -12995,7 +13163,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         assert_ne!(
             config.monitor_queue_depth, 2,
@@ -13098,7 +13266,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13306,7 +13474,7 @@ mod tests {
         let window = Arc::new(AtomicU32::new(0));
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13359,7 +13527,7 @@ mod tests {
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13412,7 +13580,7 @@ mod tests {
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13602,7 +13770,7 @@ mod tests {
         );
         log.lock().clear();
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13678,7 +13846,7 @@ mod tests {
         );
         log.lock().clear(); // drop the build-time "start:true" edge
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13753,7 +13921,7 @@ mod tests {
         );
         log.lock().clear();
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -13873,7 +14041,7 @@ mod tests {
         // --- (a) no MustReply: the real match alone must produce a reply. ---
         let body = build_search_body(order, 7, 0x00, &["tls"], &[(42, "MY:PV")]);
         let frame = synth_frame(Command::Search, order, body);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         handle_tcp_search(&source, &frame, &tx, &config, peer)
             .await
             .expect("handle_tcp_search must succeed");
@@ -13894,7 +14062,7 @@ mod tests {
         // --- (b) MustReply: the same match must still carry the CID. ---
         let body = build_search_body(order, 9, 0x01, &["tls"], &[(43, "MY:PV")]);
         let frame = synth_frame(Command::Search, order, body);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         handle_tcp_search(&source, &frame, &tx, &config, peer)
             .await
             .expect("handle_tcp_search must succeed");
@@ -13933,7 +14101,7 @@ mod tests {
 
         let body = build_search_body(order, 11, 0x00, &["tls"], &[(50, "OTHER:PV")]);
         let frame = synth_frame(Command::Search, order, body);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         handle_tcp_search(&source, &frame, &tx, &config, peer)
             .await
             .expect("handle_tcp_search must succeed");
@@ -15028,7 +15196,7 @@ mod tests {
         let cid: u32 = 7;
 
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
 
         let mut payload = Vec::new();
         payload.put_u32(unknown_sid, order);
@@ -15083,7 +15251,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -15143,7 +15311,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
 
         // Payload encoded big-endian; header flagged big-endian.
         let mut payload = Vec::new();
@@ -15190,7 +15358,7 @@ mod tests {
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -15297,7 +15465,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut _rx) = test_srv_tx(8);
 
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -15445,7 +15613,7 @@ mod tests {
         });
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let (cc_tx, mut cc_rx) = tokio::sync::mpsc::channel::<CreateChannelCompletion>(8);
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         let mut pending = 0usize;
@@ -15557,7 +15725,7 @@ mod tests {
             },
         );
 
-        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut _rx) = test_srv_tx(8);
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(cid, order);
@@ -15621,7 +15789,7 @@ mod tests {
             },
         );
 
-        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut _rx) = test_srv_tx(8);
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let teardown = ChannelTeardownCtx {
@@ -15696,7 +15864,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -15779,7 +15947,7 @@ mod tests {
             2
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let teardown = ChannelTeardownCtx {
             tx: &tx,
@@ -15847,7 +16015,7 @@ mod tests {
         );
         peer_entry.channel_opened(1, stat);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let teardown = ChannelTeardownCtx {
             tx: &tx,
@@ -15927,7 +16095,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -16062,7 +16230,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -16222,7 +16390,7 @@ mod tests {
         // Last request: subcmd = 0x50 (0x40 | 0x10).
         let mut channels = make_channels();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
             &exec_frame(0x50),
@@ -16283,7 +16451,7 @@ mod tests {
         // completion, never removed.
         let mut channels = make_channels();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
             &exec_frame(0x00),
@@ -16369,7 +16537,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -16877,7 +17045,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -17010,7 +17178,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -17715,7 +17883,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
@@ -17775,7 +17943,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
@@ -17872,7 +18040,7 @@ mod tests {
 
         // IOID initialised as a GET, not a PROCESS.
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
@@ -17917,7 +18085,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
@@ -18000,7 +18168,7 @@ mod tests {
     ) -> (bool, bool, Option<bool>) {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
         let mut channels = process_channels_no_op(sid, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let frame = process_init_frame(sid, ioid, pv_request, order);
@@ -18156,7 +18324,7 @@ mod tests {
     ) -> (bool, bool, bool) {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
         let mut channels = process_channels_no_op(sid, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
@@ -18219,7 +18387,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
 
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -18273,7 +18441,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
 
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -18357,7 +18525,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -18444,7 +18612,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         let mut channels = primed_process_channels(sid, ioid, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -18546,7 +18714,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -18687,7 +18855,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = test_srv_tx(4);
 
         // GET_FIELD payload: sid + ioid + subfield string.
         let mut payload = Vec::new();
@@ -18749,7 +18917,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = test_srv_tx(4);
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
@@ -18818,7 +18986,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = test_srv_tx(4);
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
@@ -18927,7 +19095,7 @@ mod tests {
             let peer_entry = crate::server_native::peers::PeerEntry::new(false);
             peer_entry.channel_opened(sid, stat.clone());
 
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            let (tx, mut rx) = test_srv_tx(4);
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
             let teardown = ChannelTeardownCtx {
                 tx: &tx,
@@ -19003,7 +19171,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = test_srv_tx(4);
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
@@ -19089,7 +19257,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = test_srv_tx(4);
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
         payload.put_u32(ioid, order);
@@ -19197,7 +19365,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let build = || {
             let mut payload = Vec::new();
             payload.put_u32(sid, order);
@@ -19788,7 +19956,7 @@ mod tests {
             keep: Arc::new(parking_lot::Mutex::new(Some(keep_rx))),
         });
 
-        let (wire_tx, _wire_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (wire_tx, _wire_rx) = test_srv_tx(64);
         let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
         let (_join, start_ctl) = spawn_monitor_subscriber(MonitorSubscriberArgs {
             sid: 1,
@@ -19981,7 +20149,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = test_srv_tx(64);
         let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -20201,7 +20369,7 @@ mod tests {
         let (sid, ioid) = (1u32, 700u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
         let mut channels = bfr13_channels(Some(three_field_intro()), source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -20316,7 +20484,7 @@ mod tests {
             ),
         );
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -20397,7 +20565,7 @@ mod tests {
         let (sid, ioid) = (1u32, 701u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
         let mut channels = bfr13_channels(Some(three_field_intro()), source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -20481,7 +20649,7 @@ mod tests {
         let source: DynSource = Arc::new(Bfr13FailSource);
         // No prototype on the channel → INIT fails "must provide prototype".
         let mut channels = bfr13_channels(None, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -20615,7 +20783,7 @@ mod tests {
         };
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let mut cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         // One connection-scope inbound decode cache shared across both
         // validation frames, mirroring the read loop's single `rx_type_cache`.
@@ -20753,7 +20921,7 @@ mod tests {
         };
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let mut cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         let mut decode_cache = TypeCache::new();
 
@@ -20922,7 +21090,7 @@ mod autoexec_tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -21143,7 +21311,7 @@ mod r14_tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
 
         // Build a GET EXEC frame (subcmd = 0x00, no INIT bit).
         let mut payload = Vec::new();
@@ -21431,7 +21599,7 @@ mod bfr15_tests {
             block_put: false,
         });
         let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
@@ -21524,7 +21692,7 @@ mod bfr15_tests {
             block_put: true,
         });
         let mut channels = channels_with_op(sid, ioid, OpKind::Put, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
@@ -21612,7 +21780,7 @@ mod bfr15_tests {
             block_put: false,
         });
         let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = test_srv_tx(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
@@ -21668,7 +21836,7 @@ mod bfr15_tests {
             block_put: false,
         });
         let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = test_srv_tx(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
@@ -22005,5 +22173,86 @@ mod inbound_message_cap_tests {
             err.to_string().contains("client closed"),
             "an unbounded reader must not refuse on size: {err}"
         );
+    }
+}
+
+/// The writer queue's byte budget (pvxs#161 / `tcp_tx_limit`,
+/// `serverconn.cpp:20,61`): one case per invariant boundary — bytes
+/// exhausted while frame slots remain, a frame larger than the whole
+/// limit, and a parked sender when the budget closes.
+#[cfg(test)]
+mod tx_byte_budget_tests {
+    use super::*;
+
+    /// `write_queue_depth` alone bounded frames, not memory: 1024 slots
+    /// of arbitrary `Vec<u8>` is no bound at all. The byte budget must
+    /// park a 1-byte frame while slots are free, and the writer's
+    /// release must re-admit it.
+    #[epics_macros_rs::epics_test]
+    async fn bytes_not_frames_bound_the_writer_queue() {
+        let (tx, mut rx, budget) = SrvTx::channel(1024, 1024);
+        tx.send(vec![0u8; 1024])
+            .await
+            .expect("the first frame exactly fills the byte budget");
+        assert!(
+            futures_util::future::poll_immediate(tx.send(vec![0u8; 1]))
+                .await
+                .is_none(),
+            "1023 frame slots are free; only the byte budget can be parking this send"
+        );
+        // Act as the writer task: drain one frame, return its bytes.
+        let frame = rx.recv().await.expect("the queued frame");
+        budget.release(frame.len());
+        tx.send(vec![0u8; 1])
+            .await
+            .expect("the released budget must re-admit the parked size");
+    }
+
+    /// A frame larger than the whole limit charges `limit` and travels
+    /// alone — the clamp in [`TxBudget::charge`]. Refusing it outright
+    /// would wedge the connection; letting it charge its true size
+    /// would park it forever.
+    #[epics_macros_rs::epics_test]
+    async fn an_oversized_frame_is_admitted_alone() {
+        let (tx, mut rx, budget) = SrvTx::channel(1024, 8);
+        tx.send(vec![0u8; 100])
+            .await
+            .expect("a frame larger than the whole limit must still be admitted");
+        assert!(
+            futures_util::future::poll_immediate(tx.send(vec![0u8; 1]))
+                .await
+                .is_none(),
+            "the oversized frame holds the entire budget until written"
+        );
+        let frame = rx.recv().await.expect("the oversized frame");
+        budget.release(frame.len());
+        tx.send(vec![0u8; 1])
+            .await
+            .expect("releasing the oversized frame frees the whole budget");
+    }
+
+    /// The writer-death path: closing the budget (what
+    /// [`TxBudgetCloseGuard`] does when the writer task ends or is
+    /// aborted) must fail a sender parked in `TxBudget::acquire` — the
+    /// mpsc receiver closing alone cannot reach it there.
+    #[epics_macros_rs::epics_test]
+    async fn a_closed_budget_fails_parked_senders() {
+        let (tx, _rx, budget) = SrvTx::channel(1024, 8);
+        tx.send(vec![0u8; 8]).await.expect("fill the budget");
+        let mut parked = std::pin::pin!(tx.send(vec![0u8; 1]));
+        assert!(
+            futures_util::future::poll_immediate(parked.as_mut())
+                .await
+                .is_none(),
+            "the sender must be parked on the exhausted budget"
+        );
+        drop(TxBudgetCloseGuard(budget));
+        match futures_util::future::poll_immediate(parked.as_mut()).await {
+            Some(Err(tokio::sync::mpsc::error::SendError(frame))) => {
+                assert_eq!(frame.len(), 1, "the unsent frame comes back to the caller");
+            }
+            Some(Ok(())) => panic!("a closed budget must not admit new frames"),
+            None => panic!("closing the budget must wake and fail the parked sender"),
+        }
     }
 }

@@ -330,7 +330,7 @@ same-process repro under the issue's exact env config was run.
 - #46 — NOT-PRESENT for the cited defect (fix ported, `format.rs:1366-1374`); residue filed as UI-24.
 - #87 — PARITY — UI-23.
 - #55 — NOT-PRESENT — display.precision from PREC served (`record_instance.rs:2007-2028`, `pvif.rs:1279-1286`); adjacent nesting defect is CBUG-G1.
-- #69 — NOT-PRESENT — scalar-vs-array keys on FTVL-pinned storage variant, not count (`pvif.rs:401-423`); NELM=1 waveform stays NTScalarArray (wire-visible divergence from C QSRV's max-count==1 rule; the stale doc comment at pvif.rs:496 still describes the C rule).
+- #69 — NOT-PRESENT — scalar-vs-array keys on FTVL-pinned storage variant, not count (`pvif.rs:401-423`); NELM=1 waveform stays NTScalarArray (wire-visible divergence from C QSRV's max-count==1 rule; the stale doc comment at pvif.rs:496 now states the port's rule and the divergence — fixed in this fix phase).
 
 ### QSRV / pvalink / discovery (pvxs) — agent C (all clean)
 - #148 — NOT-PRESENT — pruned-delta presence ≡ fixed isMarked(true,true) (`group.rs:702-707`, `encode.rs:2316-2374`); no-putorder warning also present (`group.rs:1640-1644`).

@@ -128,9 +128,7 @@ fn parse(target: NumericField, s: &str) -> Option<EpicsValue> {
         // out-of-range *positive* band is rejected.
         NumericField::UChar => EpicsValue::UChar(outside_band(parse_ulong(s)?, 0xff)? as u8),
         NumericField::UShort => EpicsValue::UShort(outside_band(parse_ulong(s)?, 0xffff)? as u16),
-        NumericField::ULong => {
-            EpicsValue::ULong(outside_band(parse_ulong(s)?, 0xffff_ffff)? as u32)
-        }
+        NumericField::ULong => EpicsValue::ULong(parse_ulong_via_double(s)?),
         // No band: the destination is as wide as `unsigned long`.
         NumericField::UInt64 => EpicsValue::UInt64(parse_ulong(s)?),
 
@@ -163,6 +161,56 @@ fn outside_band(v: u64, max: u64) -> Option<u64> {
     (!(v > max && v <= !max)).then_some(v)
 }
 
+/// C `putStringUlong` (`dbConvert.c:1036-1067`) — the one string→integer row
+/// with a fallback: on `S_stdlib_noConversion`, or on a successful parse that
+/// stopped at `.`/`e`/`E`, re-parse via double, because "db_access pretends
+/// unsigned long is double". So `1.0e3` stores 1000 and `".5"` stores 0. The
+/// double is stored only inside `0..=UINT_MAX`; above/below it C keeps the
+/// already-parsed integer prefix (`1.5e20` stores 1). An integer parse that
+/// overflowed (ERANGE or the band test) gets NO fallback and stays refused.
+///
+/// Deviation: with no leading digits AND a double outside `0..=UINT_MAX`
+/// (e.g. `-.5`), C reports success while writing nothing — the field keeps
+/// its old value (`dbConvert.c:1055-1058` skips the store, status stays 0;
+/// measured: `dbpf B.SVAL -.5` leaves the previous value in place).
+/// "Accepted but writes nothing" is not expressible through this owner's
+/// return value, so that input is refused instead. Relatedly, on a
+/// double-parse ERANGE (`1e999`) C returns the error AFTER the first parse
+/// already wrote the integer prefix through `pdst` (measured: the field
+/// becomes 1); this owner refuses without writing — puts here are atomic.
+fn parse_ulong_via_double(s: &str) -> Option<u32> {
+    let d = scan_int(s);
+    let int_value = if d.any {
+        let v = u64::try_from(d.magnitude?).ok()?;
+        let v = if d.negative { v.wrapping_neg() } else { v };
+        Some(outside_band(v, 0xffff_ffff)? as u32)
+    } else {
+        None
+    };
+    let stopped_at_float = s
+        .as_bytes()
+        .get(d.end)
+        .is_some_and(|c| matches!(c, b'.' | b'e' | b'E'));
+    match int_value {
+        Some(prefix) if stopped_at_float => match parse_double(s) {
+            Some(dval) if (0.0..=u32::MAX as f64).contains(&dval) => Some(dval as u32),
+            // Out-of-band double: C skips the store, keeping the integer
+            // prefix the first parse already wrote into the field.
+            Some(_) => Some(prefix),
+            // Double-parse ERANGE (`1e999`): C returns that status.
+            None => None,
+        },
+        Some(prefix) => Some(prefix),
+        // No digits at all (S_stdlib_noConversion) → via-double or refuse.
+        None => {
+            let dval = parse_double(s)?;
+            (0.0..=u32::MAX as f64)
+                .contains(&dval)
+                .then_some(dval as u32)
+        }
+    }
+}
+
 /// What the integer scanner found, before it is given a signedness.
 struct Digits {
     negative: bool,
@@ -172,6 +220,10 @@ struct Digits {
     /// Whether any digit was consumed at all. `false` is `strtol`'s
     /// `endp == str`, i.e. `S_stdlib_noConversion`.
     any: bool,
+    /// Byte index where scanning stopped — `strtol`'s `*endp`. C's
+    /// `putStringUlong` reads the character here to decide on the
+    /// via-double fallback.
+    end: usize,
 }
 
 /// The scanning half of `strtol`/`strtoul` with `base == 0`: leading space, an
@@ -225,6 +277,7 @@ fn scan_int(s: &str) -> Digits {
         negative,
         magnitude,
         any,
+        end: i,
     }
 }
 
@@ -473,6 +526,47 @@ mod tests {
         assert_eq!(
             put(NumericField::UInt64, "-1"),
             Some(EpicsValue::UInt64(u64::MAX))
+        );
+    }
+
+    /// C `putStringUlong`'s via-double fallback (`dbConvert.c:1042-1057`) —
+    /// DBF_ULONG only, "db_access pretends unsigned long is double". Every
+    /// expected value measured via `dbpf B.SVAL <s>` on the reference softIoc
+    /// (bi.SVAL is a plain DBF_ULONG field).
+    #[test]
+    fn ulong_string_put_falls_back_via_double() {
+        // Integer parse stops at '.'/'e' → re-parse as double.
+        assert_eq!(
+            put(NumericField::ULong, "1.0e3"),
+            Some(EpicsValue::ULong(1000))
+        );
+        // No digits at all (S_stdlib_noConversion) → via-double, truncated.
+        assert_eq!(put(NumericField::ULong, ".5"), Some(EpicsValue::ULong(0)));
+        // Fallback double above UINT_MAX → the integer prefix is kept.
+        assert_eq!(
+            put(NumericField::ULong, "1.5e20"),
+            Some(EpicsValue::ULong(1))
+        );
+        // Sign-extended prefix kept when the double is negative.
+        assert_eq!(
+            put(NumericField::ULong, "-1.5"),
+            Some(EpicsValue::ULong(4294967295))
+        );
+        // Double-parse ERANGE is refused (C returns S_stdlib_overflow; it
+        // has also already partially written the prefix — see the owner's
+        // deviation note).
+        assert_eq!(put(NumericField::ULong, "1e999"), None);
+        // Band overflow on the integer parse gets NO fallback.
+        assert_eq!(put(NumericField::ULong, "4294967296.5"), None);
+        // No digits + double outside the band: C silently writes nothing;
+        // this owner refuses (documented deviation).
+        assert_eq!(put(NumericField::ULong, "-.5"), None);
+        // The fallback is putStringUlong-only: UInt64 keeps the longest
+        // integer prefix (C `putStringUInt64`, dbConvert.c:1089-1109, has
+        // no via-double path).
+        assert_eq!(
+            put(NumericField::UInt64, "1.0e3"),
+            Some(EpicsValue::UInt64(1))
         );
     }
 

@@ -209,13 +209,25 @@ wrong assumption is gone. Test
 inline boundaries: `any`/`any[]` describe mode, valued `any`, valued
 `union u.i`, and the null union.
 
-### UI-65 DBF_ULONG string puts lack C's via-double fallback
+### UI-65 DBF_ULONG string puts lack C's via-double fallback — CLEARED
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/types/c_parse.rs:107-135,180-259`. Upstream: epics-base#564 (the fallback is quoted in its comments; dbConvert.c:1044-1057).
 C re-parses via double when the integer parse stops at `.`/`e`/`E`:
 `1.0e3` → 1000, `".5"` → 0. Ours stores 1 for `1.0e3` (longest integer
 prefix — accepted, wrong value) and refuses `".5"`. GET direction
 unaffected. The negative-wrap behavior #564 complained about is
 correctly reproduced (upstream wontfix).
+CLEARED: `parse_ulong_via_double` ports `putStringUlong` exactly, keyed
+on `scan_int`'s new `end` index (`strtoul`'s `*endp`): fallback on
+noConversion or a `.`/`e`/`E` stop, double stored only inside
+`0..=UINT_MAX`, out-of-band double keeps the integer prefix, integer
+overflow gets no fallback. All expectations measured via `dbpf B.SVAL`
+on the reference softIoc (`1.0e3`→1000, `.5`→0, `1.5e20`→1, `-1.5`→
+4294967295, `1e999`→error, `-.5`→C silent no-write). Two documented
+deviations, both from the port's atomic-put shape: `-.5`-class inputs
+(no digits, double out of band) are refused where C reports success
+writing nothing, and `1e999` refuses without C's partial prefix write.
+Test `c_parse::tests::ulong_string_put_falls_back_via_double`
+(includes the UInt64 no-fallback control).
 
 ### UI-80 lso/lsi `field(VAL, ...)` load failure carries a misleading diagnostic
 Severity: LOW. epics-rs: `crates/epics-base-rs/src/server/db_loader/mod.rs:1529-1560`. Upstream: epics-base#548.

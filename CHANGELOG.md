@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.26.0 — 2026-08-11
+
+Minor release. The upstream-issue audit lands its fix wave across the CA
+client/server, iocsh, db links, and access security; the QSRV PUT path is
+measured past pvxs QSRV2 on both server CPU and throughput; and the CA client
+no longer silently writes a wrong value on a cross-typed put. Five breaking
+API changes (epics-ca-rs, epics-base-rs, epics-pva-rs, epics-bridge-rs).
+Workspace version 0.25.4 -> 0.26.0, internal `[workspace.dependencies]` pins
+move to 0.26.0 in lockstep.
+
+### Breaking
+
+- **epics-ca-rs: `protocol::check_write_element_count` is renamed
+  `check_write_request`** and now owns the DBR-type bound as well as the
+  element-count bound, in C's order (`comQueSend.cpp:323/330`): a scalar
+  `put_as_dbr_*` with a type past `LAST_BUFFER_TYPE` is refused client-side
+  instead of reaching the server, which answers ECA_BADTYPE and drops the
+  circuit.
+
+- **epics-base-rs: `AcfCell` is a newtype, and `IocApplication.acf` holds
+  one** in place of `Option<AccessSecurityConfig>`. The cell is the IOC's
+  single live Access Security policy — every server built from the app must
+  share it so a later `asInit`/ACF reload reaches all of them. The old alias
+  invited re-wrapping the config in a fresh cell, which left the interactive
+  shell storing into a copy the servers never read.
+
+- **epics-base-rs: the record snapshot's `description` is `PvString`, not
+  `String`.** A non-UTF-8 DESC must reach the client byte-preserved, the
+  same rule `units` already follows.
+
+- **epics-pva-rs: the native server's per-op credential fields
+  (`account`/`method`/`host`/`authority`/`roles`) collapse into one shared
+  `ClientCreds`,** handed to access checks by reference instead of
+  re-cloning five strings per check.
+
+- **epics-bridge-rs: `AccessContext` carries `access` plus
+  `creds: Arc<ClientCreds>`** in place of its five owned string fields, for
+  the same reason.
+
+### The CA client writes the value you asked for
+
+`put`, `put_with_timeout` and `put_nowait` stamp the channel's native type on
+the frame but encoded the caller's variant verbatim, so `Long(1)` to an ENUM
+field shipped an ENUM header over i32 bytes and the server decoded the leading
+zero bytes as index 0 — a silent wrong-value write with a successful callback,
+found live under a sequencer daemon. The value now routes through
+`convert_to(native_type)` before encoding, as C's `nciu::write` does.
+`CaClient::drop` no longer panics on a thread without a tokio runtime (that
+unwind panic was masking the daemon's real bring-up error), and
+`EPICS_CA_NAME_SERVERS` entries are re-resolved through DNS on every redial
+instead of once at startup, with a nameserver's TLS SNI row keyed by hostname
+rather than its startup address.
+
+### QSRV PUT overtakes pvxs QSRV2
+
+Back-to-back on the same host, db and client (20,000 puts, 3 runs each), the
+shipped `qsrv-rs` reads 99.0–102.0 µs of server CPU per put at 3,781–3,842
+puts/s against pvxs `softIocPVX`'s 103.5–104.0 µs at 3,693–3,724 — every Rust
+run beats every pvxs run on both metrics (`doc/qsrv-put-perf.md`). What got it
+there: the server bins serve from one tokio worker (an idle multi-worker pool
+costs ~30 µs/put in wake/steal churn while one client's traffic is a single
+runnable task); per-peer channel resolution and the ACF grant per
+(channel, credential) are cached; a RULE's CALC compiles once at ACF parse; the
+INIT reply's inline type encoding is memoized; the negotiated `FieldDesc` and
+peer credentials are shared by `Arc`; a PUT delta decodes into the channel's
+scratch value; and a ready EXEC body runs inline instead of spawning a task.
+
+### The upstream-issue audit lands its fixes
+
+The 2026-08-09 sweep (`doc/upstream-issue-audit-2026-08-09.md`, 115 open
+epics-base issues triaged) turned into fixes across the workspace:
+
+- Framework link reads honor the record's declared DBR type, and
+  dbPut-analogue writes to DBF link fields are refused, as C refuses them.
+- iocsh: `<`/`iocshLoad` nesting is bounded at 32 levels; out-of-quote
+  backslash is honored in every line scanner; `db*` and directory-stack
+  failures return `Err` instead of printing and continuing;
+  `IOCSH_STARTUP_SCRIPT` is recorded on the first script load; `asInit`
+  stores into the IOC's live `AcfCell`.
+- Access security: HAG hostnames are re-resolved periodically under
+  `asCheckClientIP`, so a DHCP-moved client host does not keep its old grant.
+- db: SEARCH answers for record-own DBF_NOACCESS names as C does; a
+  substitutions-file entry that yields no template loads warns;
+  `putStringUlong`'s via-double fallback is ported for DBF_ULONG.
+- CA server: a compound DBR put (`DBR_STS_*`, `DBR_TIME_*`, …) no longer
+  drops the circuit (`doc/ca-compound-dbr-put.md`).
+- PVA: the server writer queue is bounded in bytes, not frames; qsrv refuses
+  a channel on a field the record does not have and serves
+  `display.description` from DESC as pvxs does; a refused CREATE_CHANNEL's
+  re-search parks a full ring out; the client emits the member name in the
+  `Tree` inline branch.
+- procServ: child exec allocations move before `forkpty`, off the
+  post-fork async-signal-unsafe window.
+
+The `--all-features` build of epics-ca-rs compiles again (`MdnsAnnouncer` is
+re-exported beside `MdnsBackend`, whose `announce_helper` returns it).
+
 ## v0.25.4 — 2026-08-04
 
 Patch release. The IPv6 SEARCH socket now builds on the embedded targets too,

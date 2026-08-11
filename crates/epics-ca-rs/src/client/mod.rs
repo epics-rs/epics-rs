@@ -2661,12 +2661,25 @@ impl CaChannel {
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // The frame is stamped with the channel's NATIVE type below, so
+        // the payload must be the native encoding. A caller variant that
+        // differs (e.g. `Long` on an ENUM field) would otherwise ship a
+        // native-typed header over foreign bytes, and the server —
+        // which decodes strictly against the header type — would read
+        // the first two bytes of the big-endian i32 as the enum index:
+        // `Long(1)` landed as 0, silently. `convert_to` is the single
+        // value-coercion owner (C cast semantics), so the header/payload
+        // pairing holds for every variant. Menu labels still go through
+        // `put_string`, which the server resolves against its menu.
+        let value = value.convert_to(snap.native_type);
         // C `nciu::write` rejects countIn > channel count with
         // ECA_BADCOUNT before queueing the request. Pre-fix Rust sent
         // an oversized write that the server would either accept past
-        // its array bound or reject asynchronously.
+        // its array bound or reject asynchronously. Validated on the
+        // converted value — the count of the actual wire request, which
+        // conversion can change (String → CHAR-array on a CHAR field).
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2692,8 +2705,10 @@ impl CaChannel {
     /// Write with completion callback and configurable timeout.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // Native encoding to match the native-typed header; see `put`.
+        let value = value.convert_to(snap.native_type);
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2721,8 +2736,10 @@ impl CaChannel {
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // Native encoding to match the native-typed header; see `put`.
+        let value = value.convert_to(snap.native_type);
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let payload = value.to_bytes();
         let count = value.count() as u32;

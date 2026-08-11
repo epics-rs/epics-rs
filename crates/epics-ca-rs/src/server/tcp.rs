@@ -4870,11 +4870,20 @@ pub(crate) async fn register_subscription(
         }
     };
 
-    let mask = if payload.len() >= 14 {
-        u16::from_be_bytes([payload[12], payload[13]])
-    } else {
-        DBE_VALUE | DBE_ALARM
-    };
+    // C `event_add_action` (epics-base #934, 4128a7c07):
+    // `INVALID_DB_REQ(m_dataType) || m_postsize < sizeof(*pmi)` is ONE
+    // silent pre-lookup gate — a truncated `struct mon_info` (16 bytes:
+    // three f32 dead-band fields, u16 mask, u16 pad) is RSRV_ERROR with
+    // no reply frame, exactly like the bad-type arm above. Pre-fix a
+    // short payload was accepted with a DBE_VALUE|DBE_ALARM default
+    // mask C never applies.
+    if payload.len() < 16 {
+        return Err(epics_base_rs::error::CaError::Protocol(format!(
+            "EVENT_ADD with truncated mon_info payload ({} < 16 bytes; matches C event_add_action silent drop)",
+            payload.len()
+        )));
+    }
+    let mask = u16::from_be_bytes([payload[12], payload[13]]);
     let entry = match state.channels.get(&sid) {
         Some(e) => e,
         None => {

@@ -3483,6 +3483,69 @@ mod tests {
         f
     }
 
+    /// epics-base #934 (4128a7c07): `event_add_action` refuses a truncated
+    /// `struct mon_info` — `m_postsize < sizeof(*pmi)` (16 bytes) joins the
+    /// INVALID_DB_REQ pre-lookup gate and returns RSRV_ERROR with NO reply
+    /// frame. Pre-fix a short payload was accepted with a defaulted
+    /// DBE_VALUE|DBE_ALARM mask C never applies.
+    #[test]
+    fn event_add_with_truncated_mon_info_drops_silently() {
+        let db = seed_db(&[("SHORT:MON", EpicsValue::Double(1.0))]);
+        let acf = new_acf();
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        state.apply_connection_identity(peer, None, None);
+        let (outbox, mut drain) = outbox::channel();
+
+        let run = |state: &mut ClientState, frame: Vec<u8>| {
+            let (hdr, hdr_size) =
+                CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
+            let payload = frame[hdr_size..].to_vec();
+            block_on_sync(dispatch_message(
+                &hdr, &payload, state, &db, &outbox, peer, None,
+            ))
+            .unwrap()
+            .unwrap();
+        };
+        run(&mut state, version_frame());
+        run(&mut state, create_chan_frame(0x1234, "SHORT:MON")); // -> sid 1
+        while drain.try_next().is_some() {} // shed the create_chan replies
+
+        // 8-byte payload: two dead-band floats, mask and pad missing.
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = DBR_DOUBLE_MON;
+        h.count = 1;
+        h.cid = 1;
+        h.available = 77;
+        h.set_payload_size(8, 1, CA_MINOR_VERSION).unwrap();
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&0f32.to_be_bytes());
+        f.extend_from_slice(&0f32.to_be_bytes());
+
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        let outcome = block_on_sync(register_subscription(
+            &hdr,
+            &payload,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0usize,
+            false,
+        ))
+        .expect("blockable");
+        assert!(
+            outcome.is_err(),
+            "truncated mon_info must be RSRV_ERROR, not an installed subscription"
+        );
+        // Silent, like C: no CA_PROTO_ERROR (or any) frame precedes the drop.
+        assert!(
+            drain.try_next().is_none(),
+            "C event_add_action sends nothing before RSRV_ERROR"
+        );
+    }
+
     fn events_off_frame() -> Vec<u8> {
         CaHeader::new(CA_PROTO_EVENTS_OFF).to_bytes().to_vec()
     }

@@ -1476,6 +1476,31 @@ impl Drop for CaClient {
             fwd.abort();
         }
 
+        // Drop must be infallible in ANY thread context. On the tokio
+        // backend `runtime::task::spawn` panics without an ambient
+        // reactor — which is exactly the state of a sync caller
+        // unwinding on its own thread, where the panic would mask the
+        // error that triggered the unwind. Without a reactor the
+        // graceful drain cannot be polled: send the shutdown request
+        // (unbounded, sync) and abort the tasks directly —
+        // `AbortHandle::abort` is thread-safe and runtime-free. The
+        // server reclaims the circuit on TCP close, the same path as a
+        // client that dies without `ca_context_destroy`. The guard is
+        // tokio-only: on the RTEMS exec backend the executor always
+        // exists, and design doc §5.1 forbids silently skipping the
+        // drain there.
+        #[cfg(tokio_backend)]
+        if tokio::runtime::Handle::try_current().is_err() {
+            let (tx, _rx) = oneshot::channel();
+            let _ = coord_tx.send(CoordRequest::Shutdown { reply: tx });
+            coord_abort.abort();
+            transport_abort.abort();
+            search_abort.abort();
+            #[cfg(ca_beacon_monitor)]
+            beacon_abort.abort();
+            return;
+        }
+
         // Spawn the graceful drain through the `runtime::task` seam so it
         // runs on the RTEMS exec backend too — a bare `tokio::spawn`
         // behind a `Handle::try_current()` guard silently skipped it on

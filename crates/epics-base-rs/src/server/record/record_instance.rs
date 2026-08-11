@@ -1864,6 +1864,22 @@ impl RecordInstance {
         // the CA create-channel path announced from `client_field_value` and
         // the same one the monitor path posts.
         let value = self.client_field_value(field)?;
+        Some(self.finish_field_snapshot(field, value))
+    }
+
+    /// The one finishing pipeline behind both `Snapshot` producers
+    /// ([`Self::snapshot_for_field`] for GET, [`Self::make_monitor_snapshot`]
+    /// for updates). Every step that shapes a served snapshot — alarm/utag
+    /// carry, the metadata cache, per-field routing and RSET overrides, menu
+    /// enums, property support, the `Q:time:tag` nsec split — runs here, so
+    /// the two paths cannot drift apart. Upstream pvxs PR #189 is exactly
+    /// that drift: its subscription callback served unmasked nanoseconds
+    /// while its GET path applied the nsec mask.
+    fn finish_field_snapshot(
+        &self,
+        field: &str,
+        value: EpicsValue,
+    ) -> super::super::snapshot::Snapshot {
         let mut snap = super::super::snapshot::Snapshot::new(
             value,
             self.common.stat,
@@ -1928,7 +1944,7 @@ impl RecordInstance {
         // gate is.
         crate::server::snapshot::apply_nsec_mask(&mut snap, self.qtime_nsec_mask());
 
-        Some(snap)
+        snap
     }
 
     /// Resolve `info(Q:time:tag)` to pvxs's `MappingInfo::nsecMask`.
@@ -4457,40 +4473,7 @@ impl RecordInstance {
         // CA create-channel path use, or a client that was told `DBR_ENUM` at
         // create time would be posted a `DBR_SHORT` update.
         let value = self.project_to_declared_type(field, value);
-        let mut snap = super::super::snapshot::Snapshot::new(
-            value,
-            self.common.stat,
-            self.common.sevr as u16,
-            self.common.time,
-        );
-        // Carry the record's `utag` into the monitor update's
-        // `timeStamp.userTag`, same as the GET path
-        // (`snapshot_for_field`) and pvxs `iocsource.cpp:245`. Narrows
-        // the 64-bit `epicsUTag` to the int32 wire field by low-32-bit
-        // truncation.
-        snap.user_tag = self.common.utag as i32;
-        // Same amsg carry as the GET path (`snapshot_for_field`): a monitor
-        // update serves the record's own `common.amsg`, so PVA
-        // `alarm.message` matches a read of the same channel.
-        snap.alarm.amsg = self.common.amsg.clone();
-        let meta = self.cached_metadata();
-        snap.display = meta.display;
-        snap.control = meta.control;
-        snap.enums = meta.enums;
-        // Same per-field routing owner as the GET path — a monitor update must
-        // carry the same metadata a read of that field would.
-        self.route_field_metadata(field, &mut snap);
-        // Per-field RSET metadata, same as the GET path
-        // (`snapshot_for_field`) — a monitor update for VELO must carry
-        // VELO's limits, not the record-level VAL limits.
-        self.apply_field_metadata_override(field, &mut snap);
-        // A monitored DBF_MENU field carries the same DBR_ENUM value and
-        // choice labels as the GET path, so a `camonitor`/`pvmonitor`
-        // update shows the menu label, not a bare index.
-        self.attach_menu_enum(field, &mut snap);
-        // Same owner, same settled value, same mask as the GET path.
-        self.assign_property_support(field, &mut snap);
-        snap
+        self.finish_field_snapshot(field, value)
     }
 
     /// Apply a record's per-field metadata override (C RSET
@@ -5700,6 +5683,28 @@ mod metadata_cache_tests {
         assert_eq!(snap.user_tag, 123_456_700);
         assert_eq!(snap.timestamp.subsec_nanos(), 0);
         assert_eq!(snap.timestamp.unix_secs(), 42);
+    }
+
+    /// The monitor path applies the same `Q:time:tag` nsec split as GET.
+    /// Pre-fix, `make_monitor_snapshot` skipped `apply_nsec_mask`, so a
+    /// monitor update on a `nsec:lsb:N` record posted the raw nanoseconds
+    /// and the record utag while a GET of the same channel served the
+    /// split — upstream pvxs PR #189 is the same defect in its
+    /// `subscriptionCallback`.
+    #[test]
+    fn qtime_nsec_mask_applies_on_the_monitor_path() {
+        use std::time::{Duration, SystemTime};
+        let mut inst = ai_instance();
+        // 100 ns-multiple so the subsec_nanos assertion holds on Windows too;
+        // see qtime_nsec_lsb_31_is_served_not_ignored for the FILETIME reason.
+        inst.common.time = SystemTime::UNIX_EPOCH + Duration::new(42, 123_456_700);
+        inst.common.utag = 5;
+        inst.set_info("Q:time:tag", "nsec:lsb:31");
+
+        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0));
+        assert_eq!(mon.user_tag, 123_456_700);
+        assert_eq!(mon.timestamp.subsec_nanos(), 0);
+        assert_eq!(mon.timestamp.unix_secs(), 42);
     }
 
     /// The mirror boundary: a tag pvxs's `strncmp` rejects must leave the

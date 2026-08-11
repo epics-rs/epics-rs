@@ -3546,6 +3546,210 @@ mod tests {
         );
     }
 
+    /// Build a WRITE / WRITE_NOTIFY frame with an explicit wire count and
+    /// payload, for the epics-base #934 cross-check tests below.
+    fn put_frame(
+        cmmd: u16,
+        data_type: u16,
+        count: u32,
+        sid: u32,
+        ioid: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = data_type;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(payload.len(), count, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Session helper for the #934 write tests: VERSION + CREATE_CHAN for
+    /// `pv` (-> sid 1), outbox drained of the create replies.
+    fn write_test_session(
+        pv: &str,
+        seed: EpicsValue,
+    ) -> (Arc<PvDatabase>, ClientState, outbox::Outbox, OutboxDrain) {
+        let db = seed_db(&[(pv, seed)]);
+        let acf = new_acf();
+        let mut state = ClientState::new(acf, 5064, db.clone());
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        state.apply_connection_identity(peer, None, None);
+        let (outbox, mut drain) = outbox::channel();
+        for frame in [version_frame(), create_chan_frame(0x1234, pv)] {
+            let (hdr, hdr_size) =
+                CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
+            let payload = frame[hdr_size..].to_vec();
+            block_on_sync(dispatch_message(
+                &hdr, &payload, &mut state, &db, &outbox, peer, None,
+            ))
+            .unwrap()
+            .unwrap();
+        }
+        while drain.try_next().is_some() {}
+        (db, state, outbox, drain)
+    }
+
+    /// epics-base #934 (4128a7c07): `write_notify_action` cross-checks
+    /// `dbr_size_n(m_dataType, m_count)` against `m_postsize` AFTER the
+    /// access gate — a declared count whose DBR size exceeds the received
+    /// payload is RSRV_ERROR with NO reply frame. Pre-fix the payload was
+    /// silently truncated by `from_bytes_array` and the put proceeded.
+    #[test]
+    fn write_notify_payload_shorter_than_declared_count_drops_silently() {
+        let (db, mut state, outbox, mut drain) =
+            write_test_session("WR:ARR", EpicsValue::DoubleArray(vec![1.0, 2.0]));
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        // count=2 doubles declared, 8-byte payload (one double).
+        let f = put_frame(
+            CA_PROTO_WRITE_NOTIFY,
+            DBR_DOUBLE_MON,
+            2,
+            1,
+            0x51,
+            &9.0f64.to_be_bytes(),
+        );
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        let res = block_on_sync(dispatch_message(
+            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+        ))
+        .unwrap();
+        assert!(
+            res.is_err(),
+            "short WRITE_NOTIFY payload must be RSRV_ERROR (C size > m_postsize)"
+        );
+        assert!(
+            drain.try_next().is_none(),
+            "C write_notify_action sends nothing before this RSRV_ERROR"
+        );
+        // The put never ran.
+        assert_eq!(
+            simple_pv(&db, "WR:ARR").get(),
+            EpicsValue::DoubleArray(vec![1.0, 2.0])
+        );
+    }
+
+    /// epics-base #934 (4128a7c07): both write actions clamp `m_count` to
+    /// `dbChannelFinalElements` BEFORE sizing and putting, so an oversized
+    /// count writes the channel's real capacity and the put-callback reply
+    /// echoes the CLAMPED count. Pre-fix the full wire count was decoded
+    /// (an array landed in a scalar channel) and echoed back.
+    #[test]
+    fn write_notify_count_above_capacity_clamps_to_channel_elements() {
+        let (db, mut state, outbox, mut drain) =
+            write_test_session("WR:CLAMP", EpicsValue::Double(1.0));
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        // count=4 doubles on a scalar channel, payload fully present.
+        let mut payload = Vec::new();
+        for v in [9.0f64, 8.0, 7.0, 6.0] {
+            payload.extend_from_slice(&v.to_be_bytes());
+        }
+        let f = put_frame(CA_PROTO_WRITE_NOTIFY, DBR_DOUBLE_MON, 4, 1, 0x52, &payload);
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        block_on_sync(dispatch_message(
+            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+        ))
+        .unwrap()
+        .unwrap();
+
+        // The scalar channel holds the FIRST element, not a 4-element array.
+        assert_eq!(simple_pv(&db, "WR:CLAMP").get(), EpicsValue::Double(9.0));
+
+        // The WRITE_NOTIFY reply echoes the clamped count (C echoes the
+        // mutated mp->m_count).
+        let reply = loop {
+            let f = drain.try_next().expect("a WRITE_NOTIFY reply frame");
+            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
+                break f.to_vec();
+            }
+        };
+        let (rh, _) = CaHeader::from_bytes_for_peer(&reply, state.client_minor_version()).unwrap();
+        assert_eq!(rh.actual_count(), 1, "reply must echo the clamped count");
+    }
+
+    /// epics-base #934 (4128a7c07): the size cross-check covers
+    /// DBR_PUT_ACKT/ACKS too — `dbr_size_n(DBR_PUT_ACKT, m_count)` = 2
+    /// bytes against an empty payload is RSRV_ERROR before the access
+    /// gate (write_action order). Pre-fix the missing u16 defaulted to 0
+    /// and the alarm-ack path ran with a value the peer never sent.
+    #[test]
+    fn write_put_ackt_with_empty_payload_drops_silently() {
+        let (db, mut state, outbox, mut drain) =
+            write_test_session("WR:ACK", EpicsValue::Double(1.0));
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        let f = put_frame(
+            CA_PROTO_WRITE,
+            epics_base_rs::types::DBR_PUT_ACKT,
+            1,
+            1,
+            0x53,
+            &[],
+        );
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        let res = block_on_sync(dispatch_message(
+            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+        ))
+        .unwrap();
+        assert!(
+            res.is_err(),
+            "PUT_ACKT with no payload must be RSRV_ERROR (C size > m_postsize)"
+        );
+        assert!(
+            drain.try_next().is_none(),
+            "C write_action sends nothing before this RSRV_ERROR"
+        );
+    }
+
+    /// epics-base PR #944 (regression #943): a scalar DBR_STRING put is
+    /// exempt from the `dbr_size_n` check — libca frames it as
+    /// `CA_MESSAGE_ALIGN(strlen+1)`, not 40 bytes — but the payload must
+    /// be NUL-terminated within `m_postsize`
+    /// (`epicsStrnLen >= m_postsize` → RSRV_ERROR). The accept arm is
+    /// covered end-to-end by the CLI tests (real `caput` framing).
+    #[test]
+    fn write_scalar_string_without_nul_drops_silently() {
+        let (db, mut state, outbox, mut drain) =
+            write_test_session("WR:STR", EpicsValue::Double(1.0));
+        let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+
+        let f = put_frame(
+            CA_PROTO_WRITE,
+            epics_base_rs::types::DBR_STRING,
+            1,
+            1,
+            0x54,
+            b"AAAAAAAA",
+        );
+        let (hdr, hdr_size) =
+            CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
+        let payload = f[hdr_size..].to_vec();
+        let res = block_on_sync(dispatch_message(
+            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+        ))
+        .unwrap();
+        assert!(
+            res.is_err(),
+            "scalar string with no NUL in the payload must be RSRV_ERROR (PR #944)"
+        );
+        assert!(
+            drain.try_next().is_none(),
+            "C write_action sends nothing before this RSRV_ERROR"
+        );
+        assert_eq!(simple_pv(&db, "WR:STR").get(), EpicsValue::Double(1.0));
+    }
+
     fn events_off_frame() -> Vec<u8> {
         CaHeader::new(CA_PROTO_EVENTS_OFF).to_bytes().to_vec()
     }
@@ -3968,6 +4172,23 @@ mod tests {
         f
     }
 
+    /// A deprecated `CA_PROTO_WRITE` carrying `DBR_CLASS_NAME` with its
+    /// full 40-byte (`dbr_size_n`) payload — post-#934 the server
+    /// cross-checks `dbr_size_n(type, count)` against the postsize, so a
+    /// shorter frame would be dropped before reaching `dbChannel_put`.
+    fn class_name_write_frame(sid: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_WRITE);
+        h.data_type = epics_base_rs::types::DBR_CLASS_NAME;
+        h.count = 1;
+        h.cid = sid;
+        h.available = 0;
+        h.set_payload_size(40, 1, CA_MINOR_VERSION)
+            .expect("modern peer");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&[0u8; 40]);
+        f
+    }
+
     /// Alarm status a compound-put test injects — a value the record must NOT
     /// end up carrying.
     const INJECTED_STATUS: u16 = 3;
@@ -4313,12 +4534,7 @@ mod tests {
 
         let (mut c, sid) = connected_client(addr, "BLK:MDO");
 
-        c.write_all(&plain_write_frame(
-            sid,
-            epics_base_rs::types::DBR_CLASS_NAME,
-            7.5,
-        ))
-        .unwrap();
+        c.write_all(&class_name_write_frame(sid)).unwrap();
         let rb_ioid = 0x0000_5A5C;
         c.write_all(&read_notify_frame(sid, rb_ioid, DBR_DOUBLE_MON))
             .unwrap();
@@ -4401,12 +4617,7 @@ mod tests {
             "the compound WRITE_NOTIFY is still a failed put"
         );
 
-        c.write_all(&plain_write_frame(
-            sid,
-            epics_base_rs::types::DBR_CLASS_NAME,
-            7.5,
-        ))
-        .unwrap();
+        c.write_all(&class_name_write_frame(sid)).unwrap();
         let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
         assert_eq!(
             u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
@@ -4453,10 +4664,10 @@ mod tests {
     }
 
     /// The other side of the same boundary: ABOVE `LAST_BUFFER_TYPE` there is no
-    /// such tolerance. C's `caNetConvert` (`ca/src/client/convert.cpp:1421`)
-    /// answers ECA_BADTYPE and `write_action` returns RSRV_ERROR, so the circuit
-    /// goes down. Guards the compound tolerance above from widening into
-    /// "accept anything".
+    /// such tolerance. Post-#934, `write_action`'s `INVALID_DB_REQ` gate runs
+    /// before anything else and answers with `log_header` only — no error
+    /// frame — then RSRV_ERROR, so the circuit goes down silently. Guards the
+    /// compound tolerance above from widening into "accept anything".
     #[test]
     fn dbr_type_above_last_buffer_type_still_drops_the_circuit() {
         let db = seed_db(&[("BLK:BADT", EpicsValue::Double(0.0))]);
@@ -4471,19 +4682,12 @@ mod tests {
         let over = epics_base_rs::types::LAST_BUFFER_TYPE + 1;
         c.write_all(&plain_write_frame(sid, over, 7.5)).unwrap();
 
-        let err = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_ERROR);
-        assert_eq!(
-            u32::from_be_bytes([err[12], err[13], err[14], err[15]]),
-            crate::protocol::ECA_BADTYPE,
-            "past C's protocol bound the answer is ECA_BADTYPE, not ECA_PUTFAIL"
-        );
-
-        // ... and the circuit goes down: a read returns EOF rather than blocking.
+        // The circuit goes down with no frame first: EOF, not ECA_BADTYPE.
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut probe = [0u8; 1];
         match c.read(&mut probe) {
             Ok(0) => { /* RSRV_ERROR: the circuit is torn down, as C does */ }
-            Ok(_) => panic!("unexpected extra frame bytes after the ECA_BADTYPE reply"),
+            Ok(_) => panic!("C sends no frame for a bad-type WRITE (log_header only)"),
             Err(e) if is_read_timeout(e.kind()) => {
                 panic!("circuit stayed open; C drops it (write_action RSRV_ERROR)")
             }

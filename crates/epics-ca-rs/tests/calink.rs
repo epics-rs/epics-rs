@@ -113,6 +113,49 @@ async fn ca_link_resolves_remote_value() {
     assert_eq!(resolver.link_count(), 1);
 }
 
+/// epics-base #856 (`dbCa: iocInit wait for all conditions`): the
+/// iocInit gate `init_ready` is satisfied only once the detached CTRL
+/// attribute fetch has completed too, and it does flip true on a live
+/// link — a connected, value-serving link is necessary but not
+/// sufficient.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_link_init_ready_flips_after_metadata_fetch() {
+    let server = CaServer::builder()
+        .port(0)
+        .pv("CALINK:INITREADY", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("CA server");
+    let port = server.udp_port();
+    let _server = tokio::spawn(async move { server.run().await });
+
+    let client = Arc::new(pinned_client(port).await);
+    let resolver = CaLinkResolver::with_client(client);
+
+    use epics_base_rs::server::database::LinkSet;
+    // Unopened link: not init-ready.
+    assert!(!LinkSet::init_ready(&resolver, "CALINK:INITREADY"));
+
+    let connected = resolver
+        .wait_for_link_connected("CALINK:INITREADY", Duration::from_secs(5))
+        .await;
+    assert!(connected, "CA link must connect to the upstream CA server");
+
+    // The attribute fetch is detached from the monitor path, so poll
+    // for the flip; a connected link whose fetch never completes would
+    // hold iocInit, and this assert names that failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !LinkSet::init_ready(&resolver, "CALINK:INITREADY") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "metadata fetch never completed: init_ready stayed false on a connected link"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(LinkSet::is_connected(&resolver, "CALINK:INITREADY"));
+}
+
 /// Gap 2 — the `ca://` scheme prefix is accepted: `epics-base-rs`
 /// stores a `ca://X` link verbatim in `ParsedLink::Ca`, so the
 /// resolver must strip it.

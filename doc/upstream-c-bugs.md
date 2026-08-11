@@ -133,7 +133,7 @@ proven defect (see "Leads rejected").
 
 ---
 
-### Filed upstream PRs — live GitHub status (as of 2026-07-20)
+### Filed upstream PRs — live GitHub status (as of 2026-07-27)
 
 This is the authoritative submission-status table; it replaces the per-entry
 `Status:` prose, which is stale (the catalogue was extracted 2026-07-13, before
@@ -159,29 +159,29 @@ its own row pointing at the shared PR.
 | CBUG-B2 | epics-modules/optics **#27** | open | pf4 Pb top-bin `keV[j+1]`/`mu[j+1]` OOB read — removed by the `[j-1,j]` interval fix (supersedes closed #26) |
 | CBUG-B3 | epics-modules/optics **#25** | open | pf4 glass-term guard |
 | CBUG-B5 | epics-modules/asyn **#234** | merged | `asynInterposeCom` ixon `return` |
-| CBUG-B7 | epics-modules/asyn **#238** | open | `asynInterposeCom` `nextChar` returns uninitialized `c` on a successful 0-byte read → guard `nbytes == 0` as EOF |
+| CBUG-B7 | epics-modules/asyn **#238** | merged | `asynInterposeCom` `nextChar` returns uninitialized `c` on a successful 0-byte read → guard `nbytes == 0` as EOF |
 | CBUG-B9 | epics-modules/asyn **#233** | merged | `drvAsynIPServerPort` UDP read bound |
 | CBUG-B14 | epics-modules/std **#27** | open | `throttleRecord` `dbScanLock` |
-| CBUG-B15 | epics-modules/std **#28** | open | `epidRecord` commit UDF alarm before return |
-| CBUG-B16 | epics-modules/std **#28** | open | `devEpidSoft` abort unconditionally when INP constant |
+| CBUG-B15 | epics-modules/std **#28** | merged | `epidRecord` commit UDF alarm before return |
+| CBUG-B16 | epics-modules/std **#28** | merged | `devEpidSoft` abort unconditionally when INP constant |
 | CBUG-B17 | epics-modules/std **#29** | open | `throttleRecord` writes link-status for the wrong link (special hardcodes `outLinkStat`; checkLink `caLink`/`caLinkNc` stale across loop) |
 | CBUG-B20 | areaDetector/ADCore **#594** | merged | `NDPluginROIStat` RGB heap OOB |
 | CBUG-B21 | areaDetector/ADCore **#595** | merged | `NDPluginAttrPlot` `<=` off-by-one |
-| CBUG-B22 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `numFilter < 1` divide-by-zero guard |
-| CBUG-B23 | areaDetector/ADCore **#598** | open | `NDPluginProcess` `autoOffsetScale` `maxValue > minValue` guard |
+| CBUG-B22 | areaDetector/ADCore **#598** | merged | `NDPluginProcess` `numFilter < 1` divide-by-zero guard |
+| CBUG-B23 | areaDetector/ADCore **#598** | merged | `NDPluginProcess` `autoOffsetScale` `maxValue > minValue` guard |
 | CBUG-B25 | areaDetector/ADCore **#596** | merged | `NDPluginTimeSeries` narrow-before-divide |
 | CBUG-B26 | areaDetector/ADCore **#597** | merged | `NDPluginStats` dark-frame value-init |
-| CBUG-B27 | areaDetector/ADCore **#598** | open | `NDPluginStats` histogram `histMax <= histMin` guard |
+| CBUG-B27 | areaDetector/ADCore **#598** | merged | `NDPluginStats` histogram `histMax <= histMin` guard |
 | CBUG-C1 | epics-modules/calc **#39** | open | `sCalc lrc()` empty-operand OOB read |
 | CBUG-D2 | epics-modules/calc **#41** | open | `sCalc` `<<`/`>>` negative shift-count OOB read/write |
-| CBUG-D3 | epics-base/epics-base **#932** | open | `EPICS_CA_CONN_TMO` non-positive watchdog flood |
-| CBUG-D5 | epics-base/epics-base **#932** | open | `EPICS_CA_MAX_SEARCH_PERIOD` non-finite crash |
+| CBUG-D3 | epics-base/epics-base **#932** | merged | `EPICS_CA_CONN_TMO` non-positive watchdog flood |
+| CBUG-D5 | epics-base/epics-base **#932** | merged | `EPICS_CA_MAX_SEARCH_PERIOD` non-finite crash |
 | CBUG-E2 | epics-base/epics-base **#933** | open | `dbConvert`/`dbFastLinkConv` float→int cast UB → saturation; **port already saturates (refuses the bug)**; the entry's `Bucket:` header was flipped REPRODUCED → NOT-REPRODUCED on 2026-07-20 to match its body — see note below |
 | CBUG-F1 | epics-modules/calc **#40** | open | `aCalc INC()` off-by-two |
 | CBUG-F2 | epics-modules/calc **#41** | open | `aCalc SUBRANGE` inclusive upper bound OOB read |
 | CBUG-F3 | epics-modules/calc **#41** | open | `aCalc DERIV`/`nderiv` fit-window > array OOB read |
 | CBUG-F5 | epics-modules/calc **#41** | open | `sCalc LITERAL_STRING` copy bound never advances OOB write |
-| CBUG-F6 | epics-base/epics-base **#932** | open | `calcRecord` drop unhandled `special(SPC_MOD)` from INPM..INPU |
+| CBUG-F6 | epics-base/epics-base **#932** | merged | `calcRecord` drop unhandled `special(SPC_MOD)` from INPM..INPU |
 | CBUG-F11 | epics-modules/asyn **#235** | merged | `asynManager` traceIO truncate hang |
 | CBUG-G1 | epics-base/pvxs **#196** | open | QSRV2 `display.precision` |
 
@@ -222,10 +222,10 @@ from the already-correct port.
 |---|---|---|---|
 | CBUG-B1 | epics-modules/optics **#27** | open | `pf4` `OtherAbsorptionLength` interpolate on `[j-1,j]` (frac was always negative) |
 | CBUG-B4 | epics-modules/optics **#27** | open | `pf4` unknown/out-of-range Other material: skip the blade + diagnose, not silently opaque |
-| CBUG-B6 | epics-modules/asyn **#236** | open | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
-| CBUG-B8 | epics-modules/asyn **#236** | open | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
-| CBUG-B10 | epics-modules/asyn **#237** | open | `asyn*Base.c` `readDefault` errorMessage "read", not "write", is not supported (6 files) |
-| CBUG-B11 | areaDetector/ADCore **#599** | open | `NDPluginCircularBuff` writing `0` to `SoftTrigger` disarms, not fires (guard latch+flush behind `if (value)`) |
+| CBUG-B6 | epics-modules/asyn **#236** | merged | `asynInterposeCom` disable flow control now sends NOFLOW (crtscts + ixon) |
+| CBUG-B8 | epics-modules/asyn **#236** | merged | `asynInterposeCom` IAC-stuff the COM-PORT-OPTION subnegotiation payload |
+| CBUG-B10 | epics-modules/asyn **#237** | merged | `asyn*Base.c` `readDefault` errorMessage "read", not "write", is not supported (6 files) |
+| CBUG-B11 | areaDetector/ADCore **#599** | merged | `NDPluginCircularBuff` writing `0` to `SoftTrigger` disarms, not fires (guard latch+flush behind `if (value)`) |
 | CBUG-B13 | epics-modules/motor **#254** | open | `motorRecord` key CDIR on the commanded stroke after a jog-stop backlash |
 | CBUG-B18 | epics-modules/scaler **#4** | open | `scalerRecord` `special(RATE)` posts `.RATE`, not `.TP` |
 | CBUG-B19 | epics-modules/scaler **#4** | open | `scalerRecord` `monitor()` posts `monitor_mask`, not literal `DBE_LOG` |
@@ -234,8 +234,8 @@ from the already-correct port.
 
 | PR | state | one line |
 |---|---|---|
-| epics-base/epics-base **#924** | open | `seqRecord` upper display limit of the DLYn fields |
-| epics-base/epics-base **#926** | open | `selRecord` precision for the A-L / LA-LL fields |
+| epics-base/epics-base **#924** | merged | `seqRecord` upper display limit of the DLYn fields |
+| epics-base/epics-base **#926** | merged | `selRecord` precision for the A-L / LA-LL fields |
 | epics-base/pvxs **#179** | closed | qsrv & monitor: seven correctness issues (bundle, not 1:1) |
 | epics-base/pvxs **#180** | open | codec/client: bound decode, reject pre-INIT monitor data |
 | epics-base/pvxs **#181** | open | ossl/client/config: TLS peer-identity / downgrade / keychain |

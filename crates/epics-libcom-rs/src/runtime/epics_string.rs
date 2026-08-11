@@ -6,6 +6,10 @@
 //! every caller that must turn a source-text escape into the byte it denotes
 //! goes through it —
 //!
+//! [`print_escaped`] is the opposite direction — `epicsStrPrintEscaped`
+//! (epicsString.c:230-262), which `asDumpQuoted` (asLibRoutines.c, epics-base
+//! PR #871) escapes UAG/HAG members through before printing them quoted.
+//!
 //! * the `.db` loader, for field and info VALUES (`dbLexRoutines.c:1398-1403`
 //!   and `:1435-1440`, both `dbTranslateEscape(value, value)`), and
 //! * iocsh `echo` (`libComRegister.c:84-91`).
@@ -110,8 +114,51 @@ pub fn raw_from_escaped_bytes(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Escape bytes for display — C `epicsStrPrintEscaped` (epicsString.c:230-262),
+/// the `FILE *` form, returning the text instead of writing a stream.
+///
+/// * `\a \b \f \n \r \t \v \\ \' \"` — the named escapes.
+/// * Printable ASCII (C-locale `isprint`) — the byte itself.
+/// * Anything else — `\xNN`, lower-case hex.
+/// * NUL — `\0`. C's `switch` here forgot the NUL case (so C prints `\x00`)
+///   while its sibling `epicsStrnEscapedFromRaw` has a deliberate `case '\0'`
+///   (`:145`); the port refuses that divergence (CBUG-D4, same refusal as
+///   `asyn-rs`'s private copy of this table) and renders `\0` — the form
+///   [`raw_from_escaped`]'s `case '0'` decodes back to NUL.
+/// * C guards on `strlen(s) == 0` (`:236-237`) despite taking an explicit
+///   length: a buffer whose FIRST byte is NUL prints nothing at all, however
+///   many bytes follow it. Kept.
+pub fn print_escaped(src: &[u8]) -> String {
+    if src.first().is_none_or(|&c| c == 0) {
+        return String::new();
+    }
+    let mut out = String::with_capacity(src.len());
+    for &c in src {
+        match c {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'"' => out.push_str("\\\""),
+            0 => out.push_str("\\0"),
+            0x20..=0x7e => out.push(c as char),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{c:02x}");
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::print_escaped;
     use super::raw_from_escaped;
 
     /// The softIoc transcripts quoted in the module docs.
@@ -176,5 +223,34 @@ mod tests {
     #[test]
     fn plain_text_is_untouched() {
         assert_eq!(raw_from_escaped("@asyn(PORT,0)"), b"@asyn(PORT,0)");
+    }
+
+    /// `epicsStrPrintEscaped`'s table: named escapes, isprint passthrough,
+    /// lower-case `\xNN` for the rest, and NUL as `\0` (CBUG-D4 refused — C
+    /// prints `\x00` from this function but `\0` from
+    /// `epicsStrnEscapedFromRaw`; the port renders the decodable form from
+    /// both). Round-trips through [`raw_from_escaped`].
+    #[test]
+    fn print_escaped_renders_the_c_table() {
+        assert_eq!(
+            print_escaped(b"\x07\x08\x0c\n\r\t\x0b\\'\""),
+            r#"\a\b\f\n\r\t\v\\\'\""#
+        );
+        assert_eq!(print_escaped(b" ~OK"), " ~OK");
+        assert_eq!(print_escaped(b"\x03\x1b\x7f\xff"), r"\x03\x1b\x7f\xff");
+        assert_eq!(print_escaped(b"a\0b"), r"a\0b");
+
+        let raw = b"a\"b\\c\td";
+        assert_eq!(raw_from_escaped(&print_escaped(raw)), raw);
+    }
+
+    /// R17-49: C guards on `strlen(s) == 0` (epicsString.c:236-237), so a
+    /// buffer whose first byte is NUL prints nothing — only the FIRST byte;
+    /// a later NUL escapes normally.
+    #[test]
+    fn print_escaped_prints_nothing_when_the_first_byte_is_nul() {
+        assert_eq!(print_escaped(b"\0a"), "");
+        assert_eq!(print_escaped(b""), "");
+        assert_eq!(print_escaped(b"x\0y"), r"x\0y");
     }
 }

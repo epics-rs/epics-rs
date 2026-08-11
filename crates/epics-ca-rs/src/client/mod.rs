@@ -1476,6 +1476,31 @@ impl Drop for CaClient {
             fwd.abort();
         }
 
+        // Drop must be infallible in ANY thread context. On the tokio
+        // backend `runtime::task::spawn` panics without an ambient
+        // reactor — which is exactly the state of a sync caller
+        // unwinding on its own thread, where the panic would mask the
+        // error that triggered the unwind. Without a reactor the
+        // graceful drain cannot be polled: send the shutdown request
+        // (unbounded, sync) and abort the tasks directly —
+        // `AbortHandle::abort` is thread-safe and runtime-free. The
+        // server reclaims the circuit on TCP close, the same path as a
+        // client that dies without `ca_context_destroy`. The guard is
+        // tokio-only: on the RTEMS exec backend the executor always
+        // exists, and design doc §5.1 forbids silently skipping the
+        // drain there.
+        #[cfg(tokio_backend)]
+        if tokio::runtime::Handle::try_current().is_err() {
+            let (tx, _rx) = oneshot::channel();
+            let _ = coord_tx.send(CoordRequest::Shutdown { reply: tx });
+            coord_abort.abort();
+            transport_abort.abort();
+            search_abort.abort();
+            #[cfg(ca_beacon_monitor)]
+            beacon_abort.abort();
+            return;
+        }
+
         // Spawn the graceful drain through the `runtime::task` seam so it
         // runs on the RTEMS exec backend too — a bare `tokio::spawn`
         // behind a `Handle::try_current()` guard silently skipped it on
@@ -2661,12 +2686,25 @@ impl CaChannel {
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // The frame is stamped with the channel's NATIVE type below, so
+        // the payload must be the native encoding. A caller variant that
+        // differs (e.g. `Long` on an ENUM field) would otherwise ship a
+        // native-typed header over foreign bytes, and the server —
+        // which decodes strictly against the header type — would read
+        // the first two bytes of the big-endian i32 as the enum index:
+        // `Long(1)` landed as 0, silently. `convert_to` is the single
+        // value-coercion owner (C cast semantics), so the header/payload
+        // pairing holds for every variant. Menu labels still go through
+        // `put_string`, which the server resolves against its menu.
+        let value = value.convert_to(snap.native_type);
         // C `nciu::write` rejects countIn > channel count with
         // ECA_BADCOUNT before queueing the request. Pre-fix Rust sent
         // an oversized write that the server would either accept past
-        // its array bound or reject asynchronously.
+        // its array bound or reject asynchronously. Validated on the
+        // converted value — the count of the actual wire request, which
+        // conversion can change (String → CHAR-array on a CHAR field).
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2692,8 +2730,10 @@ impl CaChannel {
     /// Write with completion callback and configurable timeout.
     pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // Native encoding to match the native-typed header; see `put`.
+        let value = value.convert_to(snap.native_type);
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2721,8 +2761,10 @@ impl CaChannel {
     /// which monitors DMOV for completion instead.
     pub async fn put_nowait(&self, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
+        // Native encoding to match the native-typed header; see `put`.
+        let value = value.convert_to(snap.native_type);
         validate_put_count(&snap, value.count())?;
-        validate_put_strings(value)?;
+        validate_put_strings(&value)?;
 
         let payload = value.to_bytes();
         let count = value.count() as u32;

@@ -370,7 +370,7 @@ impl CaLink {
     /// `testInitReady` (dbCa.c:835-845, epics-base #856 "dbCa: iocInit
     /// wait for all conditions"): servable (connected with the first
     /// monitor event cached — C's NATIVE wait bit) AND the attribute
-    /// fetch complete (the ATTRIB bit; [`fetch_link_metadata`] stores
+    /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
     /// `Some` even when the CTRL get failed, exactly the
     /// action-completed edge `getAttribEventCallback` clears the bit
     /// on). C's STRING bit has no twin here: this port keeps one native

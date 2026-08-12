@@ -366,6 +366,19 @@ impl CaLink {
         self.with_servable(|_| ()).is_some()
     }
 
+    /// The iocInit wait's all-conditions gate for this link — C
+    /// `testInitReady` (dbCa.c:835-845, epics-base #856 "dbCa: iocInit
+    /// wait for all conditions"): servable (connected with the first
+    /// monitor event cached — C's NATIVE wait bit) AND the attribute
+    /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
+    /// `Some` even when the CTRL get failed, exactly the
+    /// action-completed edge `getAttribEventCallback` clears the bit
+    /// on). C's STRING bit has no twin here: this port keeps one native
+    /// monitor and renders strings from it.
+    pub fn init_ready(&self) -> bool {
+        self.is_connected() && self.meta.load().is_some()
+    }
+
     /// Current cached value, or `None` when the link is not servable: no
     /// event yet, the circuit is down, READ access is denied, or the cached
     /// snapshot's type/count no longer matches the channel after an
@@ -970,6 +983,14 @@ impl LinkSet for CaLinkResolver {
             Some(link) => link.is_connected(),
             // Not opened yet — report not connected. `open` /
             // `get_value` open it lazily.
+            None => false,
+        }
+    }
+
+    fn init_ready(&self, name: &str) -> bool {
+        let name = strip_ca_scheme(name);
+        match self.links.read().get(name) {
+            Some(link) => link.init_ready(),
             None => false,
         }
     }

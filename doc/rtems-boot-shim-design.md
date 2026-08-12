@@ -154,6 +154,15 @@ in §1.1's dropped table.
 Keep base's two `ifconfig`/`netstat` dumps (`:1084-1087`) — they cost nothing
 and rung 3's diagnosis depends on knowing the guest's address.
 
+Step 10 gained a second arm after this design was written: base #853 added a
+libbsd static-IP path (`rtems_bsd_ifconfig` + a PF_ROUTE link-up wait, with
+DHCP as the fallback), and the shim carries it as
+`configure_static_network()`. Base sources the addresses from motload/PPCBUG
+NVRAM at run time; the shim has no NVRAM contract (§1.1 drops that path), so
+they arrive as the compile-time defines `EPICS_RTEMS_STATIC_IP` /
+`EPICS_RTEMS_STATIC_NETMASK` / `EPICS_RTEMS_STATIC_GATEWAY` instead — see the
+comment block in `rtems_init.c`.
+
 `delayedPanic` (`:145-150`) is worth carrying: two 1-second waits before
 `rtems_panic` so the console actually flushes the message. On a serial-scrape
 acceptance ladder, a panic that loses its own message is a wasted boot.

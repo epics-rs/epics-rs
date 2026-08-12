@@ -832,7 +832,9 @@ impl AccessSecurityConfig {
         for name in uags {
             out.push_str(&format!("UAG({name})\n"));
             for m in &self.uag[name] {
-                out.push_str(&format!("\t{m}\n"));
+                out.push('\t');
+                dump_quoted(&mut out, m);
+                out.push('\n');
             }
         }
         let mut hags: Vec<_> = self.hag.keys().collect();
@@ -840,7 +842,9 @@ impl AccessSecurityConfig {
         for name in hags {
             out.push_str(&format!("HAG({name})\n"));
             for h in &self.hag[name] {
-                out.push_str(&format!("\t{h}\n"));
+                out.push('\t');
+                dump_quoted(&mut out, h);
+                out.push('\n');
             }
         }
         let mut asgs: Vec<_> = self.asg.keys().collect();
@@ -1548,6 +1552,17 @@ pub fn subscribe_asg_changes() -> tokio::sync::broadcast::Receiver<()> {
 }
 
 /// Parse an ACF (Access Control File).
+/// C `asDumpQuoted` (asLibRoutines.c:660-666, epics-base #871): print a
+/// UAG/HAG member as `"` + `epicsStrPrintEscaped` + `"`. C passes
+/// `strlen(s)`, so the escape never runs past a NUL byte.
+fn dump_quoted(out: &mut String, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    out.push('"');
+    out.push_str(&crate::runtime::epics_string::print_escaped(&bytes[..len]));
+    out.push('"');
+}
+
 pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
@@ -2672,6 +2687,23 @@ ASG(DEFAULT) {
             config.check_access("DEFAULT", "", ""),
             AccessLevel::ReadWrite
         );
+    }
+
+    /// epics-base #871 (7e18b8cff): `asDump*` quotes every UAG and HAG
+    /// member through `asDumpQuoted` — `"` + `epicsStrPrintEscaped` + `"`
+    /// — so a member that needed ACF quoting (`"role/op"`, an embedded
+    /// `"`) survives the dump unambiguously instead of printing raw.
+    #[test]
+    fn dump_report_quotes_uag_and_hag_members() {
+        let cfg =
+            parse_acf("UAG(special) { someone, \"role/op\", \"a\\\"b\" }\nHAG(hosts) { HostA }\n")
+                .unwrap();
+        let dump = cfg.dump_report();
+        assert!(dump.contains("\t\"someone\"\n"), "{dump}");
+        assert!(dump.contains("\t\"role/op\"\n"), "{dump}");
+        assert!(dump.contains("\t\"a\\\"b\"\n"), "{dump}");
+        // HAG members are stored lowercased; quoted the same way.
+        assert!(dump.contains("\t\"hosta\"\n"), "{dump}");
     }
 
     // ----- epics-base PR #563/#618: METHOD / AUTHORITY -----

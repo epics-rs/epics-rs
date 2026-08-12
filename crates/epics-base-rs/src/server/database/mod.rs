@@ -971,8 +971,10 @@ impl PvDatabase {
     }
 
     /// Wait for the CA links to local records to report
-    /// `is_connected() == true`. Mirrors `dbCa: iocInit wait for local CA
-    /// links to connect` (epics-base PR #768/#856). The working set is
+    /// `init_ready() == true` — connected, first monitor event cached,
+    /// attribute fetch complete. Mirrors `dbCa: iocInit wait for local CA
+    /// links to connect` (epics-base PR #768) as extended by #856's
+    /// `testInitReady` all-conditions gate. The working set is
     /// exactly `Self::external_link_targets`: only the CA facility's
     /// local-target links — `pva://` links and non-local CA links connect
     /// in the background and are never waited on (pvxs parity).
@@ -1010,7 +1012,11 @@ impl PvDatabase {
         loop {
             let mut connected = 0usize;
             for (lset, name) in &targets {
-                if lset.is_connected(name) {
+                // `init_ready`, not `is_connected`: C `testInitReady`
+                // (dbCa.c:835, epics-base #856) releases iocInit only when
+                // the link's monitor AND attribute-fetch actions have all
+                // completed, not on the bare connection edge.
+                if lset.init_ready(name) {
                     connected += 1;
                 }
             }
@@ -1069,7 +1075,9 @@ impl PvDatabase {
     pub async fn unconnected_external_links(&self) -> Vec<String> {
         let mut names = Vec::new();
         for (lset, name) in self.external_link_targets().await {
-            if !lset.is_connected(&name) {
+            // Same predicate as the wait loop, so the M/N accounting and
+            // this diagnostic agree on which links held iocInit.
+            if !lset.init_ready(&name) {
                 names.push(name);
             }
         }
@@ -2393,6 +2401,56 @@ mod tests {
         );
         // And it is reported as unconnected by neither path (silent, like C).
         assert!(db.unconnected_external_links().await.is_empty());
+    }
+
+    /// Lset that is connected but whose post-connect init actions (the
+    /// metadata fetch) never complete: `init_ready` stays false.
+    struct ConnectedMetaPendingLset {
+        names: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl link_set::LinkSet for ConnectedMetaPendingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn init_ready(&self, _: &str) -> bool {
+            false
+        }
+        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+            None
+        }
+        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            self.get_cached_value(name)
+        }
+        fn link_names(&self) -> Vec<String> {
+            self.names.clone()
+        }
+    }
+
+    /// epics-base #856 (ef4829829, "dbCa: iocInit wait for all
+    /// conditions"): a connected link whose attribute fetch has not
+    /// completed still holds iocInit — the wait polls `init_ready`
+    /// (C `testInitReady`'s three-bit gate), not `is_connected` alone,
+    /// and the timeout diagnostic names the link it proceeded without.
+    #[epics_macros_rs::epics_test]
+    async fn wait_for_external_links_holds_until_init_ready() {
+        let db = PvDatabase::new();
+        db.add_pv("meta:pending", EpicsValue::Long(0))
+            .await
+            .unwrap();
+        let lset = Arc::new(ConnectedMetaPendingLset {
+            names: vec!["meta:pending".to_string()],
+        });
+        db.register_link_set("ca", lset).await;
+        let (c, t) = db
+            .wait_for_external_links(std::time::Duration::from_millis(250))
+            .await;
+        assert_eq!((c, t), (0, 1));
+        assert_eq!(
+            db.unconnected_external_links().await,
+            vec!["meta:pending".to_string()]
+        );
     }
 
     // epics-base PR #336 — alias parsing + lookup integration tests.

@@ -692,6 +692,14 @@ impl PortDriverBase {
     /// (the port is not yet registered, so no listeners exist).
     pub fn set_auto_connect(&mut self, yes: bool) {
         self.auto_connect = yes;
+        // asyn PR #217 (asynManager.c:2322-2324): flipping auto-connect ON
+        // while the port is down starts the connect timer, so the flip
+        // alone brings the port up. Pre-fix, the only autonomous attempt
+        // was the one exception-wake pass — one try, then silence until
+        // traffic or a disconnect edge armed the timer.
+        if yes && !self.connected.get() {
+            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+        }
         self.announce_exception(AsynException::AutoConnect, -1);
     }
 
@@ -700,7 +708,17 @@ impl PortDriverBase {
     /// device pasynUser hits the device's dpc, otherwise the port's
     /// dpc (asynManager.c:2314 + findDpCommon).
     pub fn set_auto_connect_addr(&mut self, addr: i32, yes: bool) {
-        self.device_state(addr).auto_connect = yes;
+        let device_down = {
+            let dev = self.device_state(addr);
+            dev.auto_connect = yes;
+            !dev.connected
+        };
+        // Same PR #217 arm as `set_auto_connect`: C keys the check on the
+        // dpCommon `findDpCommon` resolved — the DEVICE's — while the
+        // timer it starts is the port's (asynManager.c:2322-2324).
+        if yes && device_down {
+            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+        }
         self.announce_exception(AsynException::AutoConnect, addr);
     }
 
@@ -3440,6 +3458,47 @@ mod tests {
         base.set_auto_connect(false);
         base.set_auto_connect(false);
         assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    /// asyn PR #217 (asynManager.c:2322-2324): enabling auto-connect on a
+    /// down port/device arms the connect timer; a connected port, or a
+    /// flip to OFF, arms nothing. Pre-fix no flip armed the timer, so a
+    /// never-connected port enabled late made one exception-wake attempt
+    /// and then sat silent.
+    #[test]
+    fn auto_connect_enable_arms_connect_timer_boundaries() {
+        // dropped while auto-connect was OFF (the disconnect edge arms
+        // nothing then, port.rs sync_connection_edge), enabled late →
+        // the flip itself must arm
+        let mut base = PortDriverBase::new("act", 1, PortFlags::default());
+        base.set_auto_connect(false);
+        base.set_connected(false);
+        assert!(base.connect_retry_at.is_none());
+        base.set_auto_connect(true);
+        assert!(base.connect_retry_at.is_some());
+
+        // down + OFF → untouched (C's timer callback no-ops on
+        // !autoConnect; the flip itself must not arm)
+        let mut base = PortDriverBase::new("act2", 1, PortFlags::default());
+        base.set_auto_connect(false);
+        base.set_connected(false);
+        base.set_auto_connect(false);
+        assert!(base.connect_retry_at.is_none());
+
+        // connected + ON → nothing to retry (a fresh base is born
+        // `Connection::Own(true)`)
+        let mut base = PortDriverBase::new("act3", 1, PortFlags::default());
+        base.set_auto_connect(true);
+        assert!(base.connect_retry_at.is_none());
+
+        // device down + ON via the addr variant → the PORT timer arms,
+        // keyed on the device's dpCommon exactly as C's findDpCommon
+        // resolution is; the port itself stays connected
+        let mut base = PortDriverBase::new("act4", 2, PortFlags::default());
+        base.device_state(1).connected = false;
+        assert!(base.connect_retry_at.is_none());
+        base.set_auto_connect_addr(1, true);
+        assert!(base.connect_retry_at.is_some());
     }
 
     #[test]

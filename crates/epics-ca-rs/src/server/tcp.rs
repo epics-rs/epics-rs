@@ -3952,6 +3952,37 @@ pub(crate) async fn serve_write_head(
                 )));
             }
         };
+        // epics-base #934 (4128a7c07): both write actions clamp `m_count`
+        // to `dbChannelFinalElements`, then cross-check
+        // `dbr_size_n(m_dataType, m_count)` against `m_postsize` — a short
+        // frame is a silent RSRV_ERROR. The size check runs BEFORE the
+        // access gate on the deprecated WRITE (`write_action`) and AFTER
+        // it on WRITE_NOTIFY (`write_notify_action`).
+        // `dbr_size_n(PUT_ACKT/ACKS, n)` is the bare u16 array; C's
+        // `COUNT<=0` arm sizes one element.
+        let mut ack_count = hdr.actual_count();
+        if ack_count > entry.final_element_count {
+            ack_count = entry.final_element_count;
+        }
+        let ack_size = epics_base_rs::types::dbr_buffer_size(
+            hdr.data_type,
+            epics_base_rs::types::DbFieldType::Short,
+            ack_count.max(1) as usize,
+        );
+        let ack_size_check = || -> CaResult<()> {
+            if ack_size > payload.len() {
+                return Err(epics_base_rs::error::CaError::Protocol(format!(
+                    "WRITE (ACKT/ACKS) payload {} bytes < dbr_size_n {} \
+                     (matches C size > m_postsize silent RSRV_ERROR)",
+                    payload.len(),
+                    ack_size
+                )));
+            }
+            Ok(())
+        };
+        if !is_notify {
+            ack_size_check()?;
+        }
         // Alarm-acknowledge PUTs travel
         // the same WRITE wire opcodes but pre-fix bypassed
         // the access_rights check that the regular WRITE
@@ -3971,7 +4002,7 @@ pub(crate) async fn serve_write_head(
                     send_put_notify_response(
                         writer,
                         hdr.data_type,
-                        hdr.actual_count(),
+                        ack_count,
                         denied.eca_code(),
                         ioid,
                         ReplyContext {
@@ -4005,11 +4036,15 @@ pub(crate) async fn serve_write_head(
                 return Ok(WriteHeadOutcome::Done);
             }
         };
-        let value_u16 = if payload.len() >= 2 {
-            u16::from_be_bytes([payload[0], payload[1]])
-        } else {
-            0
-        };
+        // WRITE_NOTIFY runs the size cross-check here — after the access
+        // gate — matching C `write_notify_action`'s order (a denied peer
+        // gets ECA_NOWTACCESS; the size check never runs for it).
+        if is_notify {
+            ack_size_check()?;
+        }
+        // The size gate guarantees the u16 is present; pre-fix a missing
+        // value silently defaulted to 0.
+        let value_u16 = u16::from_be_bytes([payload[0], payload[1]]);
         // C dispatches alarm acknowledgement on the DBR *request type*
         // inside `dbPut` (`dbAccess.c:1331-1335`), ABOVE the SPC_NOMOD
         // gate that refuses an ordinary put to ACKT/ACKS — the client
@@ -4059,7 +4094,7 @@ pub(crate) async fn serve_write_head(
             send_put_notify_response(
                 writer,
                 hdr.data_type,
-                hdr.actual_count(),
+                ack_count,
                 eca.eca(),
                 ioid,
                 ReplyContext {
@@ -4132,6 +4167,9 @@ pub(crate) async fn serve_write_head(
     // error header. Captured here as a Copy so the error sites
     // below can use it after the `entry` borrow ends.
     let entry_cid = entry.cid;
+    // The #934 count clamp's bound, captured as a Copy for the same
+    // borrow-lifetime reason as `entry_cid` above.
+    let final_element_count = entry.final_element_count;
     // Clone the per-channel put-callback slot (Arc-backed) so the
     // supersede gate and the async-completion install below use it
     // without holding the `entry` borrow across them.
@@ -4146,42 +4184,35 @@ pub(crate) async fn serve_write_head(
         }
     };
 
-    // The DBR-type gate and the write-access gate run in
-    // OPPOSITE orders for the two write opcodes, and the order is
-    // observable when BOTH fail: a bad type tears the connection
-    // down (RSRV_ERROR), denied access keeps it (RSRV_OK), and
-    // only the gate that runs FIRST reports its error.
+    // Post-#934 (epics-base 4128a7c07) BOTH opcodes gate the TYPE first,
+    // then clamp `m_count` to `dbChannelFinalElements`, then cross-check
+    // `dbr_size_n(m_dataType, m_count)` against `m_postsize`; only the
+    // reply shapes and the size-vs-access order still differ:
     //
-    // * `write_notify_action` (camessage.c:1647-1656): TYPE first
-    //   (ECA_BADTYPE → RSRV_ERROR/drop), THEN access
-    //   (ECA_NOWTACCESS → RSRV_OK/keep).
-    // * `write_action` (camessage.c:741-766): ACCESS first
-    //   (ECA_NOWTACCESS → RSRV_OK/keep). There is NO standalone
-    //   type pre-check — the type is validated only by
-    //   `caNetConvert` (camessage.c:753) AFTER access passes
-    //   (ECA_BADTYPE → RSRV_ERROR/drop).
+    // * `write_notify_action`: type (`putNotifyErrorReply` ECA_BADTYPE →
+    //   RSRV_ERROR/drop), clamp, access (ECA_NOWTACCESS → RSRV_OK/keep),
+    //   size cross-check (silent RSRV_ERROR/drop).
+    // * `write_action`: type (`log_header` only — SILENT RSRV_ERROR/drop;
+    //   #934 moved this ahead of the access gate, which pre-#934 ran
+    //   first with no standalone type check), clamp, size cross-check
+    //   (silent RSRV_ERROR/drop), access (ECA_NOWTACCESS → RSRV_OK/keep).
     //
-    // So a deprecated CA_PROTO_WRITE carrying an unsupported DBR
-    // type to a channel the peer cannot write must reply
-    // ECA_NOWTACCESS and KEEP the connection — not ECA_BADTYPE +
-    // drop. Pre-fix Rust ran the type gate first for both
-    // opcodes, inverting `write_action`. Each gate's witness type
-    // (`write_type`, `write_grant`) flows to the write below.
+    // The observable both-fail case therefore inverted with #934: a
+    // deprecated WRITE carrying a bad type to a channel the peer cannot
+    // write is now a silent drop, not ECA_NOWTACCESS + keep.
     //
-    // A type-state WRITE gate: `lookup_access` is the only path
-    // to the cache; the witness ensures the matching ECA code
-    // reaches the wire.
-    let (wire_type, write_grant) = if is_notify {
-        let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
-            Some(t) => t,
-            None => {
+    // A type-state WRITE gate: `lookup_access` is the only path to the
+    // cache; the witness ensures the matching ECA code reaches the wire.
+    let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
+        Some(t) => t,
+        None => {
+            // A peer sending a DBR above `LAST_BUFFER_TYPE` has a
+            // corrupted dispatcher or is probing, so C drops. A compound
+            // type is BELOW that bound and therefore never reaches here.
+            if is_notify {
                 // C `putNotifyErrorReply` (camessage.c:1482-1501)
-                // preserves `m_dataType`/`m_count` from the
-                // request, then returns RSRV_ERROR (drop) — a
-                // peer sending a DBR above `LAST_BUFFER_TYPE` has
-                // a corrupted dispatcher or is probing, so C
-                // drops. A compound type is BELOW that bound and
-                // therefore never reaches here.
+                // preserves `m_dataType`/`m_count` from the request —
+                // the count is pre-clamp here, as in C.
                 send_put_notify_response(
                     writer,
                     hdr.data_type,
@@ -4193,12 +4224,64 @@ pub(crate) async fn serve_write_head(
                         client_minor: state.client_minor_version,
                     },
                 )?;
+            }
+            // `write_action` sends nothing: C logs "bad put data type"
+            // and returns RSRV_ERROR without a frame.
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "{} with unsupported DBR type {} (matches C INVALID_DB_REQ RSRV_ERROR)",
+                if is_notify { "WRITE_NOTIFY" } else { "WRITE" },
+                hdr.data_type
+            )));
+        }
+    };
+
+    // #934 count clamp. C mutates `mp->m_count` in place, so the size
+    // cross-check, the payload decode, the DB put and every later reply
+    // echo all see the clamped count.
+    let mut write_count = hdr.actual_count();
+    if write_count > final_element_count {
+        write_count = final_element_count;
+    }
+
+    // `dbr_size_n(m_dataType, m_count)` vs `m_postsize` (`payload` is
+    // the postsize-long buffer). C's `COUNT<=0` arm sizes one element.
+    //
+    // Scalar DBR_STRING is exempt: libca frames it as
+    // `CA_MESSAGE_ALIGN(strlen + 1)` (comQueSend.cpp:332-341), not the
+    // 40-byte `dbr_size[DBR_STRING]`, so #934 as merged drops every
+    // default-mode `caput` (upstream regression #943; the exemption is
+    // PR #944's fix: require a NUL within `m_postsize` instead).
+    let size_check = || -> CaResult<()> {
+        if hdr.data_type == epics_base_rs::types::DBR_STRING && write_count == 1 {
+            if !payload.contains(&0) {
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
-                    "WRITE_NOTIFY with unsupported DBR type {} (matches C write_notify_action RSRV_ERROR)",
-                    hdr.data_type
+                    "WRITE scalar string payload {} bytes with no NUL terminator \
+                     (matches C epicsStrnLen >= m_postsize silent RSRV_ERROR, PR #944)",
+                    payload.len()
                 )));
             }
-        };
+            return Ok(());
+        }
+        let native = epics_base_rs::types::native_type_for_dbr(hdr.data_type)?;
+        let size = epics_base_rs::types::dbr_buffer_size(
+            hdr.data_type,
+            native,
+            write_count.max(1) as usize,
+        );
+        if size > payload.len() {
+            return Err(epics_base_rs::error::CaError::Protocol(format!(
+                "WRITE payload {} bytes < dbr_size_n {} for type {} count {} \
+                 (matches C size > m_postsize silent RSRV_ERROR)",
+                payload.len(),
+                size,
+                hdr.data_type,
+                write_count
+            )));
+        }
+        Ok(())
+    };
+
+    let write_grant = if is_notify {
         let write_grant = match state.lookup_access(sid).require_write() {
             Ok(g) => g,
             Err(denied) => {
@@ -4207,13 +4290,12 @@ pub(crate) async fn serve_write_head(
                 // the extended-form count instead of the u16
                 // marker. The echoed type is the REQUEST's
                 // (`putNotifyErrorReply` preserves `m_dataType`,
-                // camessage.c:1482-1501) — identical to the
-                // native code for a native put, and the only
-                // available answer for a compound one.
+                // camessage.c:1482-1501); the count is the CLAMPED
+                // one — C reads the mutated `mp->m_count`.
                 send_put_notify_response(
                     writer,
                     hdr.data_type,
-                    hdr.actual_count(),
+                    write_count,
                     denied.eca_code(),
                     ioid,
                     ReplyContext {
@@ -4225,16 +4307,17 @@ pub(crate) async fn serve_write_head(
                 return Ok(WriteHeadOutcome::Done);
             }
         };
-        (wire_type, write_grant)
+        size_check()?;
+        write_grant
     } else {
-        // C `write_action` (camessage.c:741-750) emits
-        // `send_err(mp, ECA_NOWTACCESS, ...)` and returns RSRV_OK
-        // (keep) BEFORE any type handling. Without surfacing this
-        // the Rust server dropped denied PROTO_WRITEs silently —
-        // libca's `cac::exception` never fired, so a `caput` from
-        // a read-only peer looked like it had succeeded even
-        // though the value never reached the DB.
-        let write_grant = match state.lookup_access(sid).require_write() {
+        size_check()?;
+        // C `write_action` emits `send_err(mp, ECA_NOWTACCESS, ...)` and
+        // returns RSRV_OK (keep). Without surfacing this the Rust server
+        // dropped denied PROTO_WRITEs silently — libca's
+        // `cac::exception` never fired, so a `caput` from a read-only
+        // peer looked like it had succeeded even though the value never
+        // reached the DB.
+        match state.lookup_access(sid).require_write() {
             Ok(g) => g,
             Err(denied) => {
                 send_ca_error(
@@ -4248,30 +4331,7 @@ pub(crate) async fn serve_write_head(
                 state.audit("caput", &audit_pv, "", "denied");
                 return Ok(WriteHeadOutcome::Done);
             }
-        };
-        // Type validated only after access passes (C
-        // `caNetConvert`, camessage.c:753) — a type ABOVE
-        // `LAST_BUFFER_TYPE` is a protocol violation →
-        // RSRV_ERROR/drop. A compound type converts fine in C and
-        // so passes here too; it fails later, at the put.
-        let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
-            Some(t) => t,
-            None => {
-                send_ca_error(
-                    writer,
-                    hdr,
-                    ECA_BADTYPE,
-                    entry_cid,
-                    "bad data type",
-                    state.client_minor_version,
-                )?;
-                return Err(epics_base_rs::error::CaError::Protocol(format!(
-                    "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
-                    hdr.data_type
-                )));
-            }
-        };
-        (wire_type, write_grant)
+        }
     };
 
     // the write-trap mask of the ACF rule that
@@ -4305,12 +4365,11 @@ pub(crate) async fn serve_write_head(
         supersede_put_notify(prev, writer, state.client_minor_version)?;
     }
 
-    let count = hdr.actual_count() as usize;
-    // Echo the FULL 32-bit count
-    // (`hdr.actual_count()`); pre-fix used `hdr.count`
-    // which is the 0 marker for extended requests and
-    // therefore lost the count on large array put-callbacks.
-    let write_count = hdr.actual_count();
+    // The CLAMPED full 32-bit count flows to the decode, the put and the
+    // reply echo (pre-fix the echo used `hdr.count`, which is the 0
+    // marker for extended requests and therefore lost the count on large
+    // array put-callbacks; then the raw wire count, which #934 clamps).
+    let count = write_count as usize;
 
     // Whatever the buffer type carries, only the value reaches the
     // record. The metadata a compound put brings along is discarded —
@@ -4339,11 +4398,12 @@ pub(crate) async fn serve_write_head(
             return decoded;
         }
         if is_notify {
-            // Same `putNotifyErrorReply` shape.
+            // Same `putNotifyErrorReply` shape; count post-clamp, as C's
+            // mutated `mp->m_count` is at this point.
             send_put_notify_response(
                 writer,
                 hdr.data_type,
-                hdr.actual_count(),
+                write_count,
                 ECA_BADTYPE,
                 ioid,
                 ReplyContext {
@@ -4870,11 +4930,20 @@ pub(crate) async fn register_subscription(
         }
     };
 
-    let mask = if payload.len() >= 14 {
-        u16::from_be_bytes([payload[12], payload[13]])
-    } else {
-        DBE_VALUE | DBE_ALARM
-    };
+    // C `event_add_action` (epics-base #934, 4128a7c07):
+    // `INVALID_DB_REQ(m_dataType) || m_postsize < sizeof(*pmi)` is ONE
+    // silent pre-lookup gate — a truncated `struct mon_info` (16 bytes:
+    // three f32 dead-band fields, u16 mask, u16 pad) is RSRV_ERROR with
+    // no reply frame, exactly like the bad-type arm above. Pre-fix a
+    // short payload was accepted with a DBE_VALUE|DBE_ALARM default
+    // mask C never applies.
+    if payload.len() < 16 {
+        return Err(epics_base_rs::error::CaError::Protocol(format!(
+            "EVENT_ADD with truncated mon_info payload ({} < 16 bytes; matches C event_add_action silent drop)",
+            payload.len()
+        )));
+    }
+    let mask = u16::from_be_bytes([payload[12], payload[13]]);
     let entry = match state.channels.get(&sid) {
         Some(e) => e,
         None => {
@@ -8583,14 +8652,15 @@ mod write_gate_order_tests {
         read_create_chan_sid(client, Duration::from_secs(3)).await
     }
 
-    /// Deprecated `CA_PROTO_WRITE`, access-denied AND bad type: C
-    /// `write_action` checks access FIRST → ECA_NOWTACCESS + RSRV_OK
-    /// (keep). The error rides a `CA_PROTO_ERROR` reply (`m_available` =
-    /// ECA status). Pre-fix the type-first path replied ECA_BADTYPE and
-    /// dropped the connection.
+    /// Deprecated `CA_PROTO_WRITE`, access-denied AND bad type: post-#934
+    /// (epics-base 4128a7c07) C `write_action` checks the TYPE first —
+    /// `INVALID_DB_REQ` is `log_header` + RSRV_ERROR with NO frame, so
+    /// the access gate (and its ECA_NOWTACCESS reply) is never reached.
+    /// Pre-#934 C ran access first and replied ECA_NOWTACCESS + keep,
+    /// which the pre-fix code mirrored.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deprecated_write_denied_reports_nowtaccess_and_keeps_conn() {
-        let (mut client, handle, _acf_reload_tx) = spawn_read_only_server(55330).await;
+    async fn deprecated_write_bad_type_drops_silently_before_access() {
+        let (mut client, mut handle, _acf_reload_tx) = spawn_read_only_server(55330).await;
         let sid = handshake(&mut client).await;
 
         client
@@ -8599,23 +8669,27 @@ mod write_gate_order_tests {
             .expect("write");
         client.flush().await.expect("flush write");
 
-        let err = read_frame_of_cmmd(&mut client, CA_PROTO_ERROR, Duration::from_secs(3)).await;
-        assert_eq!(
-            err.available, ECA_NOWTACCESS,
-            "deprecated WRITE must report access denial first (ECA_NOWTACCESS), \
-             not the type error (ECA_BADTYPE={ECA_BADTYPE}); got {}",
-            err.available
-        );
-
-        // RSRV_OK after ECA_NOWTACCESS — the connection must stay up.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // RSRV_ERROR with no reply — the connection drops without a frame.
+        let res = tokio::time::timeout(Duration::from_secs(2), &mut handle)
+            .await
+            .expect("handle_client completes after WRITE bad type")
+            .expect("join ok");
         assert!(
-            !handle.is_finished(),
-            "deprecated WRITE access-denied must KEEP the connection (C write_action RSRV_OK)"
+            res.is_err(),
+            "deprecated WRITE bad type must DROP the connection \
+             (C write_action INVALID_DB_REQ RSRV_ERROR), got {res:?}"
+        );
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut rest)
+            .await
+            .expect("read to EOF");
+        assert!(
+            rest.is_empty(),
+            "C write_action sends nothing before this RSRV_ERROR, got {} bytes",
+            rest.len()
         );
 
         drop(client);
-        handle.abort();
     }
 
     /// `CA_PROTO_WRITE_NOTIFY`, same access-denied + bad type: C

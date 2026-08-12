@@ -249,6 +249,21 @@ pub trait LinkSet: Send + Sync {
     /// record's advisory write gate. MUST NOT perform I/O.
     fn is_connected(&self, name: &str) -> bool;
 
+    /// True iff `name` has completed every post-connect init action
+    /// iocInit's external-link wait holds for — C `testInitReady`
+    /// (dbCa.c:835-845, epics-base #856 "dbCa: iocInit wait for all
+    /// conditions"): connected with the first monitor event cached AND
+    /// the attribute (metadata) fetch complete. Distinct from
+    /// [`Self::is_connected`], which is C's lset `isConnected` and keeps
+    /// its readable-cache semantics.
+    ///
+    /// Synchronous and non-blocking like `is_connected`; polled only by
+    /// the iocInit wait. Default: `is_connected` — right for an lset
+    /// with no post-connect init actions.
+    fn init_ready(&self, name: &str) -> bool {
+        self.is_connected(name)
+    }
+
     /// Read the current value of `name`. Returns None when the
     /// upstream isn't yet connected or the lset has no cache for
     /// this name.

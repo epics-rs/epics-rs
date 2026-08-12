@@ -1,8 +1,9 @@
 /*
  * POSIX_Init — the RTEMS entry task for an epics-rs IOC.
  *
- * Brings up the console, the clock, libbsd and DHCP, then calls the Rust
- * `main`. Derived from EPICS base's POSIX arm,
+ * Brings up the console, the clock, libbsd and the network — DHCP, or a
+ * compile-time static address — then calls the Rust `main`. Derived from
+ * EPICS base's POSIX arm,
  * `modules/libcom/RTEMS/posix/rtems_init.c`; each step cites the base line it
  * comes from, and `doc/rtems-boot-shim-design.md` §1.1 records what base does
  * here that we deliberately drop (NFS/TFTP mounts, iocsh registration and the
@@ -19,10 +20,15 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/route.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sysexits.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -187,6 +193,136 @@ static void start_dhcpcd(void)
     }
 }
 
+/*
+ * Static network configuration (base #853: posix/rtems_init.c:1095-1131,
+ * setBootConfigFromNVRAM.c `applyNetConfig`).
+ *
+ * Base discovers the addresses in motload/PPCBUG NVRAM at run time; this shim
+ * has no NVRAM contract (§1.1 drops the NVRAM boot path), so the same values
+ * arrive as compile-time defines instead. Build with
+ *
+ *     -DEPICS_RTEMS_STATIC_IP=\"10.0.0.5\"
+ *     -DEPICS_RTEMS_STATIC_NETMASK=\"255.255.255.0\"
+ *     -DEPICS_RTEMS_STATIC_GATEWAY=\"10.0.0.1\"   (optional)
+ *
+ * (via `CFLAGS_armv7-rtems-eabihf`; the `cc` crate forwards them) to configure
+ * the first hardware interface statically. With the first two undefined the
+ * image keeps its DHCP path, and — matching base, where a bad NVRAM config
+ * returns -1 and `try_dhcp` takes over — a static setup that fails at run
+ * time also falls back to DHCP rather than booting unreachable.
+ */
+#if defined(EPICS_RTEMS_STATIC_IP) && defined(EPICS_RTEMS_STATIC_NETMASK)
+
+/*
+ * Block until `ifname` reports link up via an RTM_IFINFO routing message, or
+ * until `timeout_secs` elapses (base #853 `wait_for_link_up`, modeled there on
+ * dhcpcd's `manage_link`). The static path needs this explicit wait because,
+ * unlike DHCP — whose BOUND hook fires only once the link carries traffic —
+ * `rtems_bsd_ifconfig` returns before the PHY negotiates.
+ *
+ * `route_sock` must already be open from before the interface was configured,
+ * so no RTM_IFINFO event can be missed.
+ */
+static int wait_for_link_up(int route_sock, const char *ifname, int timeout_secs)
+{
+    struct timeval tv = {.tv_sec = timeout_secs, .tv_usec = 0};
+    char buf[sizeof(struct if_msghdr) + sizeof(struct sockaddr_dl)];
+
+    printf("rtems-boot: waiting for link on %s (timeout %d s)\n", ifname,
+           timeout_secs);
+    setsockopt(route_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (recv(route_sock, buf, sizeof(buf), 0) > 0) {
+        struct rt_msghdr *rtm = (struct rt_msghdr *)(void *)buf;
+        if (rtm->rtm_type == RTM_IFINFO) {
+            struct if_msghdr *ifm = (struct if_msghdr *)(void *)buf;
+            char name[IFNAMSIZ];
+            if (if_indextoname(ifm->ifm_index, name) != NULL &&
+                strcmp(name, ifname) == 0 &&
+                ifm->ifm_data.ifi_link_state == LINK_STATE_UP) {
+                return 0;
+            }
+        }
+    }
+
+    /* recv returned <= 0: SO_RCVTIMEO expired (EAGAIN) or socket error. */
+    printf("rtems-boot: ***** link did not come up on %s within %d s *****\n",
+           ifname, timeout_secs);
+    return -1;
+}
+
+/*
+ * Configure the interface at index 1 — the index base's `applyNetConfig` and
+ * `wait_for_link_up` both hard-code for "the first hardware interface" —
+ * with the compiled-in address. Returns 1 when the interface is configured,
+ * 0 to fall back to DHCP.
+ */
+static int configure_static_network(void)
+{
+    /* Writable copies: `rtems_bsd_ifconfig` takes `char *`. */
+    static char ip[] = EPICS_RTEMS_STATIC_IP;
+    static char netmask[] = EPICS_RTEMS_STATIC_NETMASK;
+#ifdef EPICS_RTEMS_STATIC_GATEWAY
+    static char gateway_buf[] = EPICS_RTEMS_STATIC_GATEWAY;
+    char *gateway = gateway_buf;
+#else
+    char *gateway = NULL;
+#endif
+    char ifnamebuf[IF_NAMESIZE];
+    char *ifname = if_indextoname(1, ifnamebuf);
+    int route_sock;
+    int exit_code;
+
+    if (ifname == NULL) {
+        printf("rtems-boot: no network interface found; trying DHCP\n");
+        return 0;
+    }
+
+    /*
+     * Open the route socket before configuring the interface, so the
+     * RTM_IFINFO that reports link-up cannot be missed (base #853,
+     * rtems_init.c:1102-1106).
+     */
+    route_sock = socket(PF_ROUTE, SOCK_RAW, 0);
+    if (route_sock < 0) {
+        printf("rtems-boot: cannot open PF_ROUTE socket: %s\n",
+               strerror(errno));
+    }
+
+    printf("rtems-boot: static ifconfig %s ip=%s netmask=%s gateway=%s\n",
+           ifname, ip, netmask, gateway != NULL ? gateway : "none");
+    exit_code = rtems_bsd_ifconfig(ifname, ip, netmask, gateway);
+    if (exit_code != EX_OK) {
+        printf("rtems-boot: rtems_bsd_ifconfig failed (exit code %d); trying "
+               "DHCP\n",
+               exit_code);
+        if (route_sock >= 0) {
+            close(route_sock);
+        }
+        return 0;
+    }
+
+    /*
+     * Block until the physical link comes up, analogous to the DHCP BOUND
+     * wait; on timeout continue loudly, as the DHCP path does. Base's
+     * timeout: 30 s (rtems_init.c:1148).
+     */
+    if (route_sock >= 0) {
+        wait_for_link_up(route_sock, ifname, 30);
+        close(route_sock);
+    }
+    return 1;
+}
+
+#else /* !EPICS_RTEMS_STATIC_IP || !EPICS_RTEMS_STATIC_NETMASK */
+
+static int configure_static_network(void)
+{
+    return 0;
+}
+
+#endif
+
 void *POSIX_Init(void *argument)
 {
     struct timespec now;
@@ -279,18 +415,26 @@ void *POSIX_Init(void *argument)
      */
     rtems_bsd_ifconfig_lo0();
 
-    /* 10. DHCP, bounded — boot anyway on timeout, loudly (base :1050-1072). */
-    rtems_dhcpcd_add_hook(&dhcpcd_hook);
-    start_dhcpcd();
-    for (waited = 0; !dhcp_bound && waited < EPICS_RTEMS_DHCP_TIMEOUT_SECONDS;
-         ++waited) {
-        rtems_task_wake_after(rtems_clock_get_ticks_per_second());
-    }
-    if (!dhcp_bound) {
-        printf("rtems-boot: ***** DHCP did not bind in %d s; continuing with no "
-               "address. Server ports will bind but nothing off-board can reach "
-               "them. *****\n",
-               EPICS_RTEMS_DHCP_TIMEOUT_SECONDS);
+    /*
+     * 10. Network configuration (base #853, :1095-1160): static when the
+     * image was built with an address — see configure_static_network above —
+     * otherwise DHCP, bounded: boot anyway on timeout, loudly (base
+     * :1050-1072).
+     */
+    if (!configure_static_network()) {
+        rtems_dhcpcd_add_hook(&dhcpcd_hook);
+        start_dhcpcd();
+        for (waited = 0;
+             !dhcp_bound && waited < EPICS_RTEMS_DHCP_TIMEOUT_SECONDS;
+             ++waited) {
+            rtems_task_wake_after(rtems_clock_get_ticks_per_second());
+        }
+        if (!dhcp_bound) {
+            printf("rtems-boot: ***** DHCP did not bind in %d s; continuing "
+                   "with no address. Server ports will bind but nothing "
+                   "off-board can reach them. *****\n",
+                   EPICS_RTEMS_DHCP_TIMEOUT_SECONDS);
+        }
     }
 
     /*

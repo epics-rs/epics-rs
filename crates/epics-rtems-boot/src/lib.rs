@@ -624,6 +624,45 @@ mod tests {
         assert!(link_args("/p", DEFAULT_BSP).contains(&ENTRY_SYMBOL.to_string()));
     }
 
+    /// Base #853's invariant: the PF_ROUTE socket must be open before
+    /// `rtems_bsd_ifconfig` runs, or the RTM_IFINFO that reports link-up can
+    /// fire into nothing and `wait_for_link_up` waits out its full timeout on
+    /// a link that is already up.
+    #[test]
+    fn the_route_socket_opens_before_the_interface_is_configured() {
+        let init = include_str!("../csrc/rtems_init.c");
+        let sock = init
+            .find("socket(PF_ROUTE, SOCK_RAW, 0)")
+            .expect("the static path opens a route socket");
+        let ifconfig = init
+            .find("rtems_bsd_ifconfig(")
+            .expect("the static path configures the interface");
+        assert!(
+            sock < ifconfig,
+            "the route socket must open before rtems_bsd_ifconfig"
+        );
+    }
+
+    /// The static path is opt-in per image and total in its fallback: with
+    /// the two defines absent the stub returns 0, and every run-time failure
+    /// inside the configured path also returns 0 — so an image never boots
+    /// networkless when DHCP could still have reached it (base #853's
+    /// `try_dhcp = status != 0`).
+    #[test]
+    fn the_static_path_is_gated_and_falls_back_to_dhcp() {
+        let init = include_str!("../csrc/rtems_init.c");
+        assert!(
+            init.contains(
+                "#if defined(EPICS_RTEMS_STATIC_IP) && defined(EPICS_RTEMS_STATIC_NETMASK)"
+            )
+        );
+        assert!(init.contains("if (!configure_static_network()) {"));
+        // The DHCP machinery stays compiled unconditionally — it is the
+        // fallback, not an #else.
+        assert!(init.contains("rtems_dhcpcd_add_hook(&dhcpcd_hook);"));
+        assert!(init.contains("start_dhcpcd();"));
+    }
+
     /// The shim's whole purpose is to reach Rust; base's own contract is the
     /// `main(argc, argv)` call at `rtems_init.c:1183`.
     #[test]

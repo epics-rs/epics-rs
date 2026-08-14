@@ -70,6 +70,14 @@ impl ParamSetValue {
             interrupt_mask,
         }
     }
+
+    /// The address list this update lands in — the list whose changed flags a
+    /// later `callParamCallbacks` has to consume for it to reach a record.
+    pub fn addr(&self) -> i32 {
+        match self {
+            Self::Value { addr, .. } | Self::UInt32Digital { addr, .. } => *addr,
+        }
+    }
 }
 
 /// Operation the worker thread will dispatch to the port driver.

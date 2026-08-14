@@ -1789,7 +1789,33 @@ impl PortActor {
                         failed.get_or_insert(e);
                     }
                 }
-                base.call_param_callbacks(*addr)?;
+                // Flush every address list this batch wrote, not just the
+                // request's. C has no bundled set-then-flush: a driver calls
+                // `setXxxParam` per list and then `callParamCallbacks(addr)`
+                // once for each list it touched (asynPortDriver.cpp:820). This
+                // carrier bundles the two, so it owes a flush for every list it
+                // just wrote — `call_param_callbacks` consumes the changed flags
+                // of one list only, so flushing the request address alone stores
+                // the other lists' values while firing no interrupt for them,
+                // and a multi-device driver's per-address records never update
+                // at all (six joint angles written at addresses 0..6, one
+                // I/O Intr). Request address first, then each further address in
+                // the order the batch first wrote it.
+                let mut lists = vec![*addr];
+                for u in updates {
+                    if !lists.contains(&u.addr()) {
+                        lists.push(u.addr());
+                    }
+                }
+                // One list that cannot be flushed must not strand the rest, for
+                // the same reason one bad update does not strand the good ones
+                // above; the first error still reaches whoever waits on the
+                // reply.
+                for list in lists {
+                    if let Err(e) = base.call_param_callbacks(list) {
+                        failed.get_or_insert(e);
+                    }
+                }
                 match failed {
                     Some(e) => Err(e),
                     None => Ok(RequestResult::write_ok()),
@@ -1962,6 +1988,7 @@ mod alarm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interrupt::InterruptFilter;
     use crate::param::ParamType;
     use crate::port::{PortDriverBase, PortFlags};
     use std::sync::Arc;
@@ -3780,6 +3807,67 @@ mod tests {
                  when the op was queue-gated)"
             );
         }
+    }
+
+    /// `callParamCallbacks(addr)` consumes the changed flags of **one** address
+    /// list (`ParamList::take_changed`), and C drivers call it once per list
+    /// they wrote (asynPortDriver.cpp:820). This carrier bundles the sets and
+    /// the flush, so it owes a flush for every list the batch wrote: flushing
+    /// only the request address stored the other lists' values and fired no
+    /// interrupt for them, so a multi-device driver publishing six joint angles
+    /// at addresses 0..6 in one call left five records at UDF for the life of
+    /// the IOC while the array parameter carrying the same six numbers updated
+    /// normally.
+    #[test]
+    fn a_publish_flushes_every_address_list_it_wrote() {
+        let mut base = PortDriverBase::new(
+            "multi_addr",
+            3,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base.interrupts.register_sync_callback(
+            InterruptFilter {
+                reason: Some(val),
+                ..InterruptFilter::default()
+            },
+            move |iv| {
+                recorder
+                    .lock()
+                    .push((iv.addr, iv.value.as_int32().unwrap()))
+            },
+        );
+        let tx = spawn_actor(TestDriverBase(base));
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(
+            &tx,
+            RequestOp::CallParamCallbacks {
+                addr: 0,
+                updates: (0..3)
+                    .map(|a| {
+                        crate::request::ParamSetValue::new(
+                            val,
+                            a,
+                            crate::param::ParamValue::Int32(10 + a),
+                        )
+                    })
+                    .collect(),
+            },
+            user,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *seen.lock(),
+            vec![(0, 10), (1, 11), (2, 12)],
+            "every address the batch wrote is flushed, request address first"
+        );
     }
 
     /// R13-48: `asynDrvUser->create` is a direct interface call — asynRecord's

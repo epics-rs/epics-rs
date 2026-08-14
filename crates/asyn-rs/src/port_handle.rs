@@ -724,6 +724,10 @@ impl PortHandle {
     /// Delivery to the actor inbox is guaranteed (waits if channel is full).
     /// The actor processes messages in FIFO order.
     ///
+    /// `addr` names the address list to flush; a batch that writes further
+    /// lists gets those flushed too, in the order it first wrote them, so a
+    /// multi-device driver can publish every address in one call.
+    ///
     /// # Example
     /// ```ignore
     /// port_handle.set_params_and_notify(0, vec![

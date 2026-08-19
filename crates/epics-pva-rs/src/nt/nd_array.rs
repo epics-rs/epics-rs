@@ -46,7 +46,9 @@
 // the module-doc layout block above is kept in sync with
 // nt_nd_array_desc()/pvxs nt.cpp:196-251 — it had drifted to a stale
 // pre-fix shape (trailing descriptor+display, 5-field attribute).
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, VariantValue};
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray, VariantValue,
+};
 
 /// Per-array data buffer. Caller chooses one variant; the builder produces
 /// the corresponding union selector.
@@ -132,22 +134,65 @@ impl NdArrayBuffer {
         }
     }
 
-    /// Convert into a `PvField::ScalarArray`.
+    /// Convert into a `PvField::ScalarArrayTyped`.
+    ///
+    /// Was `PvField::ScalarArray(Vec<ScalarValue>)`, which boxed every element
+    /// into a 24-byte enum: a 640x480 RGB8 frame became a 22 MB vector from
+    /// 0.9 MB of pixels, and the encoder then walked it element by element (the
+    /// slow arm in `encode.rs` says as much -- "allocator- and CPU-bound").
+    /// Measured on a RealSense D405 IOC at 15 fps, that one conversion cost
+    /// ~106% CPU for colour and ~30% for depth, and the two tracked element
+    /// COUNT rather than byte count, which is the signature of per-element
+    /// boxing.
+    ///
+    /// `ScalarArrayTyped` carries an `Arc<[T]>` the encoder can bulk-memcpy
+    /// when host endian matches wire endian. Building it costs one allocation
+    /// and one copy, independent of element count.
     pub fn into_scalar_array(self) -> PvField {
-        let items = match self {
-            Self::Boolean(v) => v.into_iter().map(ScalarValue::Boolean).collect(),
-            Self::Byte(v) => v.into_iter().map(ScalarValue::Byte).collect(),
-            Self::UByte(v) => v.into_iter().map(ScalarValue::UByte).collect(),
-            Self::Short(v) => v.into_iter().map(ScalarValue::Short).collect(),
-            Self::UShort(v) => v.into_iter().map(ScalarValue::UShort).collect(),
-            Self::Int(v) => v.into_iter().map(ScalarValue::Int).collect(),
-            Self::UInt(v) => v.into_iter().map(ScalarValue::UInt).collect(),
-            Self::Long(v) => v.into_iter().map(ScalarValue::Long).collect(),
-            Self::ULong(v) => v.into_iter().map(ScalarValue::ULong).collect(),
-            Self::Float(v) => v.into_iter().map(ScalarValue::Float).collect(),
-            Self::Double(v) => v.into_iter().map(ScalarValue::Double).collect(),
-        };
-        PvField::ScalarArray(items)
+        PvField::ScalarArrayTyped(self.into_typed_scalar_array())
+    }
+
+    /// Borrowing counterpart of [`Self::into_scalar_array`].
+    ///
+    /// Lets a caller holding `&NtNdArray` build the value without cloning the
+    /// pixel buffer first -- `Arc::from(&[T])` copies once either way, so the
+    /// intermediate `Vec` clone was pure overhead.
+    pub fn to_scalar_array(&self) -> PvField {
+        PvField::ScalarArrayTyped(self.to_typed_scalar_array())
+    }
+
+    /// Move the buffer into a [`TypedScalarArray`].
+    pub fn into_typed_scalar_array(self) -> TypedScalarArray {
+        match self {
+            Self::Boolean(v) => TypedScalarArray::Boolean(v.into()),
+            Self::Byte(v) => TypedScalarArray::Byte(v.into()),
+            Self::UByte(v) => TypedScalarArray::UByte(v.into()),
+            Self::Short(v) => TypedScalarArray::Short(v.into()),
+            Self::UShort(v) => TypedScalarArray::UShort(v.into()),
+            Self::Int(v) => TypedScalarArray::Int(v.into()),
+            Self::UInt(v) => TypedScalarArray::UInt(v.into()),
+            Self::Long(v) => TypedScalarArray::Long(v.into()),
+            Self::ULong(v) => TypedScalarArray::ULong(v.into()),
+            Self::Float(v) => TypedScalarArray::Float(v.into()),
+            Self::Double(v) => TypedScalarArray::Double(v.into()),
+        }
+    }
+
+    /// Copy the buffer into a [`TypedScalarArray`] without consuming it.
+    pub fn to_typed_scalar_array(&self) -> TypedScalarArray {
+        match self {
+            Self::Boolean(v) => TypedScalarArray::Boolean(v.as_slice().into()),
+            Self::Byte(v) => TypedScalarArray::Byte(v.as_slice().into()),
+            Self::UByte(v) => TypedScalarArray::UByte(v.as_slice().into()),
+            Self::Short(v) => TypedScalarArray::Short(v.as_slice().into()),
+            Self::UShort(v) => TypedScalarArray::UShort(v.as_slice().into()),
+            Self::Int(v) => TypedScalarArray::Int(v.as_slice().into()),
+            Self::UInt(v) => TypedScalarArray::UInt(v.as_slice().into()),
+            Self::Long(v) => TypedScalarArray::Long(v.as_slice().into()),
+            Self::ULong(v) => TypedScalarArray::ULong(v.as_slice().into()),
+            Self::Float(v) => TypedScalarArray::Float(v.as_slice().into()),
+            Self::Double(v) => TypedScalarArray::Double(v.as_slice().into()),
+        }
     }
 
     pub fn variant_field_desc(&self) -> FieldDesc {
@@ -544,11 +589,13 @@ fn codec_value(c: &NdCodec) -> PvField {
 /// [`nt_nd_array_desc`]. Field order mirrors pvxs `nt.cpp:196-251`.
 pub fn nt_nd_array_value(nt: &NtNdArray) -> PvField {
     let mut s = PvStructure::new("epics:nt/NTNDArray:1.0");
-    let buffer_clone = nt.value.clone();
+    // Borrow rather than clone: `to_scalar_array` copies the pixels straight
+    // into the `Arc<[T]>`, so the intermediate `Vec` clone this used to make
+    // was a second full-frame copy for nothing.
     let union = PvField::Union {
         selector: nt.value.selector(),
         variant_name: nt.value.variant_name().to_string(),
-        value: Box::new(buffer_clone.into_scalar_array()),
+        value: Box::new(nt.value.to_scalar_array()),
     };
     s.fields.push(("value".into(), union));
     s.fields.push(("codec".into(), codec_value(&nt.codec)));

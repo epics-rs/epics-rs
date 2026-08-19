@@ -71,7 +71,7 @@ fn normalise_array_variants(v: &mut PvField) {
 fn wire_golden_decode_roundtrip() {
     let mut failures: Vec<String> = Vec::new();
 
-    for build in complex_pv_matrix() {
+    for mut build in complex_pv_matrix() {
         let path = fixture_path(build.name);
         let Ok(golden) = std::fs::read(&path) else {
             failures.push(format!("{} → fixture missing at {:?}", build.name, path));
@@ -110,6 +110,13 @@ fn wire_golden_decode_roundtrip() {
                 }
             };
         normalise_array_variants(&mut value_decoded);
+        // Normalise the expected side too. The comparison is about VALUES, not
+        // which array representation a builder happened to pick: NTNDArray now
+        // builds `ScalarArrayTyped` (an `Arc<[T]>` the encoder bulk-copies)
+        // where it used to build `ScalarArray`, and both encode to identical
+        // wire bytes -- which the re-encode check below is what actually
+        // proves.
+        normalise_array_variants(&mut build.value);
         if value_decoded != build.value {
             failures.push(format!(
                 "{}: value mismatch.\n  want: {:?}\n  got:  {:?}",

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldMetadataOverride, InputFetchPolicy, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldMetadataOverride, Ftype, InputFetchPolicy, LinkReadAs, OutTarget, ProcessOutcome, Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
@@ -163,7 +165,7 @@ impl Default for ASubRecord {
             snam: PvString::new(),
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
-            a: std::array::from_fn(|_| EpicsValue::Double(0.0)),
+            a: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
             vala: std::array::from_fn(|_| EpicsValue::DoubleArray(Vec::new())),
             out: std::array::from_fn(|_| String::new()),
             fta: [FTYPE_DOUBLE; NUM_ARGS],
@@ -226,6 +228,93 @@ fn parse_channel(name: &str) -> Option<(&'static str, usize)> {
         }
     }
     None
+}
+
+/// The `menuFtype` of an `FTx` index, with C `initFields`'s clamp: an index
+/// past the menu is treated as CHAR (`if (*pft > DBF_ENUM) *pft = DBF_CHAR;`,
+/// aSubRecord.c:186-187).
+fn channel_ftype(ft: i16) -> Ftype {
+    Ftype::from_index(ft).unwrap_or(Ftype::Char)
+}
+
+/// An input cell as C `initFields` allocates it (aSubRecord.c:176-198):
+/// `callocMustSucceed(NOx, dbValueSize(FTx))`, a zero-filled FTx-typed
+/// buffer of NOx elements (`*pno == 0` is clamped to 1). The port stores
+/// the one-element case as the FTx-typed zero scalar.
+fn channel_default(ft: i16, no: i32) -> EpicsValue {
+    let ftype = channel_ftype(ft);
+    if no > 1 {
+        ftype.zeroed(no as usize)
+    } else {
+        ftype
+            .zeroed(1)
+            .first_element()
+            .expect("zeroed(1) has element 0")
+    }
+}
+
+/// A scalar as the 1-element FTx-typed array an `NOx > 1` cell stores — C's
+/// buffer is an array whatever the source's shape; a scalar source just
+/// delivers `nRequest = 1`.
+fn wrap_one_element(scalar: EpicsValue, ftype: Ftype) -> EpicsValue {
+    match (ftype, scalar) {
+        (Ftype::String, EpicsValue::String(v)) => EpicsValue::StringArray(vec![v]),
+        (Ftype::Char, EpicsValue::Char(v)) => EpicsValue::CharArray(vec![v]),
+        (Ftype::UChar, EpicsValue::UChar(v)) => EpicsValue::UCharArray(vec![v]),
+        (Ftype::Short, EpicsValue::Short(v)) => EpicsValue::ShortArray(vec![v]),
+        (Ftype::UShort, EpicsValue::UShort(v)) => EpicsValue::UShortArray(vec![v]),
+        (Ftype::Long, EpicsValue::Long(v)) => EpicsValue::LongArray(vec![v]),
+        (Ftype::ULong, EpicsValue::ULong(v)) => EpicsValue::ULongArray(vec![v]),
+        (Ftype::Int64, EpicsValue::Int64(v)) => EpicsValue::Int64Array(vec![v]),
+        (Ftype::UInt64, EpicsValue::UInt64(v)) => EpicsValue::UInt64Array(vec![v]),
+        (Ftype::Float, EpicsValue::Float(v)) => EpicsValue::FloatArray(vec![v]),
+        (Ftype::Double, EpicsValue::Double(v)) => EpicsValue::DoubleArray(vec![v]),
+        (Ftype::Enum, EpicsValue::Enum(v)) => EpicsValue::EnumArray(vec![v]),
+        // The scalar came out of `convert_to(ftype.element_type())`, so the
+        // pair always matches; a framework-internal transient lands as the
+        // typed zero element rather than a panic.
+        (ftype, _) => ftype.zeroed(1),
+    }
+}
+
+/// Shape a value entering input cell `x` — a framework link delivery or a
+/// direct put — to the channel's declared `FTx`/`NOx`. This is C
+/// `fetch_values`'s `dbGetLink(plink, (&prec->fta)[i], (&prec->a)[i], 0,
+/// &nRequest)` with `nRequest = NOx` (aSubRecord.c:278-288): the link layer
+/// converts the source element-wise into the FTx-typed buffer and clamps
+/// the delivered count to NOx. Returns the shaped value and the new NEx.
+fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> (EpicsValue, i32) {
+    let ftype = channel_ftype(ft);
+    let elem = ftype.element_type();
+    if no > 1 {
+        let converted = value.convert_to(elem);
+        let mut arr = if converted.is_array() {
+            converted
+        } else {
+            wrap_one_element(converted, ftype)
+        };
+        arr.truncate(no as usize);
+        let ne = arr.count() as i32;
+        (arr, ne)
+    } else {
+        // A one-element destination takes element 0 (C `dbGet` converts the
+        // source field at offset 0).
+        let scalar = match value.first_element() {
+            Some(first) => first,
+            None if value.is_array() => return (channel_default(ft, no), 1),
+            None => value,
+        };
+        let converted = scalar.convert_to(elem);
+        // `convert_to` has one array-producing scalar arm (String into a
+        // CHAR target yields the byte buffer); a one-element cell keeps
+        // element 0 of it.
+        let v = match converted.first_element() {
+            Some(first) => first,
+            None if converted.is_array() => channel_default(ft, no),
+            None => converted,
+        };
+        (v, 1)
+    }
 }
 
 /// Surface an output array channel: empty -> scalar 0.0, single
@@ -385,9 +474,14 @@ impl Record for ASubRecord {
         let (prefix, idx) =
             parse_channel(name).ok_or_else(|| CaError::FieldNotFound(name.to_string()))?;
         match prefix {
-            // Input value A..U — store native; track NEx (elements used).
+            // Input value A..U — shaped to the channel's declared FTx/NOx.
+            // C `fetch_values` lands every link value in the FTx-typed
+            // NOx-element buffer (aSubRecord.c:278-288); a direct put takes
+            // the same conversion through `dbPut` into that buffer. NEx
+            // tracks the elements actually delivered.
             "" => {
-                self.nea[idx] = value.count().max(1) as i32;
+                let (value, ne) = shape_channel_value(value, self.fta[idx], self.noa[idx]);
+                self.nea[idx] = ne;
                 self.a[idx] = value;
             }
             "INP" | "OUT" => {
@@ -416,9 +510,24 @@ impl Record for ASubRecord {
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?,
                 };
                 match prefix {
-                    "FT" => self.fta[idx] = v as i16,
+                    // FTx/NOx declare the input cell's element type and
+                    // capacity: C `initFields` clamps them (out-of-menu FTx
+                    // -> CHAR at aSubRecord.c:186-187, NOx 0 -> 1 at :189-190)
+                    // and allocates the cell as a zero-filled FTx-typed
+                    // buffer with NEx = NOx (:192-196). Both are SPC_NOMOD,
+                    // so this put is the load path — re-deriving the cell
+                    // here is that allocation.
+                    "FT" => {
+                        self.fta[idx] = channel_ftype(v as i16).index();
+                        self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
+                        self.nea[idx] = self.noa[idx].max(1);
+                    }
+                    "NO" => {
+                        self.noa[idx] = v.max(1);
+                        self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
+                        self.nea[idx] = self.noa[idx];
+                    }
                     "FTV" => self.ftva[idx] = v as i16,
-                    "NO" => self.noa[idx] = v,
                     "NOV" => self.nova[idx] = v,
                     "NE" => self.nea[idx] = v,
                     "NEV" => self.neva[idx] = v,
@@ -522,6 +631,28 @@ impl Record for ASubRecord {
         InputFetchPolicy::AbortOnFirstFailure
     }
 
+    /// C `fetch_values` asks `dbGetLink` for the channel's declared FTx
+    /// (`dbGetLink(plink, (&prec->fta)[i], ...)`, aSubRecord.c:283-284), so a
+    /// STRING channel reading a scalar source receives its DBR_STRING form —
+    /// an ENUM/MENU source delivers its state label, a numeric source its
+    /// text — which the store must not funnel through a numeric conversion.
+    /// A STRING channel with an ARRAY source keeps the native read: the
+    /// whole array reaches the FTx-typed cell, whose put boundary converts
+    /// it element-wise to strings (C's per-element `DBR_STRING` conversion
+    /// of `nRequest = NOx` elements). Every non-STRING FTx likewise reads
+    /// native — the cell is FTx-typed, so the put boundary's element-wise
+    /// coercion is C's `dbGet` conversion into the FTx buffer.
+    fn input_link_read_as(&self, link_field: &str, source: &OutTarget) -> Option<LinkReadAs> {
+        let string_channel = parse_channel(link_field)
+            .filter(|(prefix, _)| *prefix == "INP")
+            .is_some_and(|(_, idx)| channel_ftype(self.fta[idx]) == Ftype::String);
+        if string_channel && source.element_count <= 1 {
+            Some(LinkReadAs::String)
+        } else {
+            Some(LinkReadAs::Native)
+        }
+    }
+
     /// The cycle status from the framework's single `do_sub` owner. Stored
     /// verbatim; [`Self::multi_output_links`] is its only reader.
     fn set_subroutine_status(&mut self, status: i64) {
@@ -593,6 +724,9 @@ mod tests {
         assert_eq!(rec.fta[0], 0);
 
         rec.put_field("FTC", EpicsValue::Short(5)).unwrap(); // LONG
+        // C requires the capacity declared up front: NOx elements are
+        // allocated at init, and `dbGetLink` clamps `nRequest` to NOx.
+        rec.put_field("NOC", EpicsValue::Long(3)).unwrap();
         rec.put_field("C", EpicsValue::LongArray(vec![10, 20, 30]))
             .unwrap();
         assert_eq!(
@@ -601,6 +735,103 @@ mod tests {
         );
         // NEC tracks elements used.
         assert_eq!(rec.get_field("NEC"), Some(EpicsValue::Long(3)));
+    }
+
+    /// FTx/NOx declare the input cell — C `initFields` (aSubRecord.c:176-198)
+    /// allocates a zero-filled FTx-typed buffer of NOx elements, NEx = NOx,
+    /// clamping an out-of-menu FTx to CHAR (:186-187).
+    #[test]
+    fn ftx_nox_declare_the_input_cell() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTA", EpicsValue::Short(10)).unwrap(); // DOUBLE
+        rec.put_field("NOA", EpicsValue::Long(4)).unwrap();
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::DoubleArray(vec![0.0; 4]))
+        );
+        assert_eq!(
+            rec.get_field("NEA"),
+            Some(EpicsValue::Long(4)),
+            "C initFields: NEx starts at NOx"
+        );
+
+        rec.put_field("FTB", EpicsValue::Short(0)).unwrap(); // STRING
+        assert_eq!(rec.get_field("B"), Some(EpicsValue::String("".into())));
+
+        rec.put_field("FTC", EpicsValue::Short(99)).unwrap(); // out of menu
+        rec.put_field("NOC", EpicsValue::Long(2)).unwrap();
+        assert_eq!(
+            rec.get_field("FTC"),
+            Some(EpicsValue::Short(1)),
+            "aSubRecord.c:186-187: FTx past DBF_ENUM becomes CHAR"
+        );
+        assert_eq!(rec.get_field("C"), Some(EpicsValue::CharArray(vec![0, 0])));
+    }
+
+    /// Values entering an input cell convert into the declared buffer — C
+    /// `dbGetLink(plink, FTx, a[i], 0, &nRequest)` with `nRequest` clamped
+    /// to NOx (aSubRecord.c:278-288); `dbPut` converts the same way.
+    #[test]
+    fn input_puts_convert_and_clamp_to_the_declared_buffer() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTA", EpicsValue::Short(5)).unwrap(); // LONG
+        rec.put_field("NOA", EpicsValue::Long(3)).unwrap();
+        // An array source converts element-wise and clamps to NOx.
+        rec.put_field("A", EpicsValue::DoubleArray(vec![1.9, 2.2, 3.7, 4.4]))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::LongArray(vec![1, 2, 3]))
+        );
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(3)));
+
+        // A scalar source fills one element of an array cell (nRequest = 1).
+        rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![7])));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(1)));
+
+        // An array into a one-element cell keeps element 0 (C's one-element
+        // destination, same rule as the store's scalar reduction).
+        rec.put_field("B", EpicsValue::DoubleArray(vec![5.5, 6.6]))
+            .unwrap();
+        assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(5.5)));
+        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(1)));
+    }
+
+    /// C `fetch_values` requests the channel's FTx from `dbGetLink`
+    /// (aSubRecord.c:283-284): a STRING channel with a scalar source reads
+    /// DBR_STRING; an array source and every non-STRING channel read native
+    /// (the FTx-typed cell converts at its put boundary).
+    #[test]
+    fn string_channels_read_scalar_links_as_strings() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTC", EpicsValue::Short(0)).unwrap(); // STRING
+        let scalar = OutTarget {
+            element_count: 1,
+            ..OutTarget::UNRESOLVED
+        };
+        assert_eq!(
+            rec.input_link_read_as("INPC", &scalar),
+            Some(LinkReadAs::String)
+        );
+        let array = OutTarget {
+            element_count: 8,
+            ..OutTarget::UNRESOLVED
+        };
+        assert_eq!(
+            rec.input_link_read_as("INPC", &array),
+            Some(LinkReadAs::Native)
+        );
+        assert_eq!(
+            rec.input_link_read_as("INPA", &scalar),
+            Some(LinkReadAs::Native),
+            "a DOUBLE channel reads native"
+        );
+        assert_eq!(
+            rec.input_link_read_as("SUBL", &scalar),
+            Some(LinkReadAs::Native),
+            "only INPx links carry a channel FTx"
+        );
     }
 
     /// All 21 input channels feed `multi_input_links`.

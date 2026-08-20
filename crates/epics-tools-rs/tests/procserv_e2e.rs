@@ -26,6 +26,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
+/// How long to wait for something the supervisor must do: bind its console
+/// port, write a line, record a pid, reap a child, exit.
+///
+/// One constant for every such wait, because none of them is a timing
+/// assertion. The two tests that do measure time measure it with `elapsed`
+/// against a separate bound, and the `read_for` windows below collect for a
+/// fixed span on purpose; everything else here waits for an event that must
+/// arrive, and returns the moment it does. A short deadline therefore buys
+/// nothing and costs a failure whenever the machine is busy —
+/// `toggle_into_oneshot_grants_one_more_run` lost its post-kill shutdown line
+/// at 3 s during a full `--workspace` run, on a supervisor that was working.
+const MUST_ARRIVE: Duration = Duration::from_secs(15);
+
 /// Build a config wrapping `/bin/cat` on a random localhost port.
 fn cat_config(port: u16) -> ProcServConfig {
     ProcServConfig {
@@ -191,7 +204,7 @@ async fn cat_round_trip_via_tcp_console() {
     // Connect to the supervisor's TCP console.
     let mut conn = {
         // Listener is set up async; retry briefly.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -262,10 +275,10 @@ async fn occupied_control_port_fails_fast_not_headless() {
     let cfg = cat_config(port); // same loopback port → bind conflict
     let server = ProcServ::new(cfg).expect("build");
 
-    match timeout(Duration::from_secs(2), server.run()).await {
+    match timeout(MUST_ARRIVE, server.run()).await {
         Ok(Err(_)) => {} // fail-fast: run() surfaced the bind error
         Ok(Ok(code)) => panic!("expected a bind failure, got a clean exit code {code}"),
-        Err(_) => panic!("run() did not fail-fast within 2s — came up headless?"),
+        Err(_) => panic!("run() did not fail-fast on the bind error — came up headless?"),
     }
 }
 
@@ -293,7 +306,7 @@ async fn unwritable_pid_and_log_paths_do_not_abort_startup() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -331,7 +344,7 @@ async fn kill_keystroke_signals_child() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -394,7 +407,7 @@ async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -408,7 +421,7 @@ async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
     // First Ctrl-X: kills the live child. Wait for the reaper line so the
     // supervisor has definitely cleared its child slot.
     conn.write_all(&[0x18]).await.unwrap();
-    let first = read_until(&mut conn, "Received a sigChild", Duration::from_secs(3)).await;
+    let first = read_until(&mut conn, "Received a sigChild", MUST_ARRIVE).await;
     assert!(
         first.contains("Received a sigChild"),
         "child should have been reaped after the first kill key, got: {first:?}"
@@ -417,7 +430,7 @@ async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
     // Second Ctrl-X, now with no child running. C restarts it and still
     // broadcasts the kill notice.
     conn.write_all(&[0x18]).await.unwrap();
-    let out = read_until(&mut conn, "Restarting child", Duration::from_secs(3)).await;
+    let out = read_until(&mut conn, "Restarting child", MUST_ARRIVE).await;
 
     assert!(
         out.contains("Got a kill command"),
@@ -459,7 +472,7 @@ async fn server_messages_are_written_to_the_log() {
     });
 
     // Allow the supervisor to spawn the child and flush the start banner.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + MUST_ARRIVE;
     let mut contents = String::new();
     while Instant::now() < deadline {
         contents = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -500,7 +513,7 @@ async fn log_port_client_is_readonly_but_receives_output() {
 
     // Connect a control (read/write) client and a log (read-only) client.
     let connect = |port: u16| async move {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -518,7 +531,7 @@ async fn log_port_client_is_readonly_but_receives_output() {
 
     // (a) Control types; the log viewer must observe the echoed output.
     ctl.write_all(b"hello from ctl\n").await.unwrap();
-    let log_seen = read_until(&mut log, "hello from ctl", Duration::from_secs(2)).await;
+    let log_seen = read_until(&mut log, "hello from ctl", MUST_ARRIVE).await;
     assert!(
         log_seen.contains("hello from ctl"),
         "log-port client must receive output, got: {log_seen:?}"
@@ -531,7 +544,7 @@ async fn log_port_client_is_readonly_but_receives_output() {
     // supervisor (so it is never echoed to control or fed to the child).
     log.write_all(b"INJECTED_BY_LOG\n").await.unwrap();
     ctl.write_all(b"CTL_MARKER\n").await.unwrap();
-    let ctl_seen = read_until(&mut ctl, "CTL_MARKER", Duration::from_secs(2)).await;
+    let ctl_seen = read_until(&mut ctl, "CTL_MARKER", MUST_ARRIVE).await;
     assert!(
         ctl_seen.contains("CTL_MARKER"),
         "control client must see its own marker echo, got: {ctl_seen:?}"
@@ -569,7 +582,7 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     });
 
     let connect = |port: u16| async move {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -586,24 +599,14 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     // window, proves both clients are registered in the roster (see the
     // ordering note in `two_clients_share_same_party_line`) before ctl's
     // line is typed below.
-    let _ = read_until(
-        &mut ctl,
-        "procServ server started at:",
-        Duration::from_secs(2),
-    )
-    .await;
-    let _ = read_until(
-        &mut log,
-        "procServ server started at:",
-        Duration::from_secs(2),
-    )
-    .await;
+    let _ = read_until(&mut ctl, "procServ server started at:", MUST_ARRIVE).await;
+    let _ = read_until(&mut log, "procServ server started at:", MUST_ARRIVE).await;
 
     // Control types; `cat` echoes the line back as child output, which the
     // supervisor broadcasts. The logger sees it stamped; control raw.
     ctl.write_all(b"stamp me\n").await.unwrap();
-    let log_seen = read_until(&mut log, "stamp me", Duration::from_secs(2)).await;
-    let ctl_seen = read_until(&mut ctl, "stamp me", Duration::from_secs(2)).await;
+    let log_seen = read_until(&mut log, "stamp me", MUST_ARRIVE).await;
+    let ctl_seen = read_until(&mut ctl, "stamp me", MUST_ARRIVE).await;
 
     assert!(
         log_seen.contains("STAMP> stamp me"),
@@ -634,7 +637,7 @@ async fn timefmt_controls_banner_timestamp_format() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -644,12 +647,7 @@ async fn timefmt_controls_banner_timestamp_format() {
         }
     };
 
-    let cleaned = read_until(
-        &mut conn,
-        "server started at: TIMEFMT_MARKER",
-        Duration::from_secs(2),
-    )
-    .await;
+    let cleaned = read_until(&mut conn, "server started at: TIMEFMT_MARKER", MUST_ARRIVE).await;
     assert!(
         cleaned.contains("server started at: TIMEFMT_MARKER"),
         "banner must render the start time with the configured timefmt; got: {cleaned:?}"
@@ -681,7 +679,7 @@ async fn manual_restart_preempts_active_holdoff() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -700,7 +698,7 @@ async fn manual_restart_preempts_active_holdoff() {
     // restart 3s out; the "Received a sigChild" reaper line confirms the
     // child died and the holdoff deadline is now pending.
     conn.write_all(&[0x18]).await.unwrap();
-    let exited = read_until(&mut conn, "Received a sigChild", Duration::from_secs(3)).await;
+    let exited = read_until(&mut conn, "Received a sigChild", MUST_ARRIVE).await;
     assert!(
         exited.contains("Received a sigChild"),
         "child should exit on kill keystroke, got: {exited:?}"
@@ -711,7 +709,7 @@ async fn manual_restart_preempts_active_holdoff() {
     // `respawn_child` emits C's "@@@ Restarting child" announcement.
     let t0 = Instant::now();
     conn.write_all(&[0x12]).await.unwrap();
-    let restarted = read_until(&mut conn, "Restarting child", Duration::from_secs(2)).await;
+    let restarted = read_until(&mut conn, "Restarting child", MUST_ARRIVE).await;
     let elapsed = t0.elapsed();
     assert!(
         restarted.contains("Restarting child"),
@@ -737,7 +735,7 @@ async fn two_clients_share_same_party_line() {
 
     // Connect client A.
     let mut a = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -754,21 +752,11 @@ async fn two_clients_share_same_party_line() {
     // proof A is registered and will receive the party-line broadcast
     // below — a fixed sleep isn't: under load the banner write can
     // simply not have reached the socket yet within an arbitrary window.
-    let _ = read_until(
-        &mut a,
-        "procServ server started at:",
-        Duration::from_secs(2),
-    )
-    .await;
+    let _ = read_until(&mut a, "procServ server started at:", MUST_ARRIVE).await;
 
     // Connect client B.
     let mut b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let _ = read_until(
-        &mut b,
-        "procServ server started at:",
-        Duration::from_secs(2),
-    )
-    .await;
+    let _ = read_until(&mut b, "procServ server started at:", MUST_ARRIVE).await;
 
     // A types — `cat` echoes the line back through the PTY, and the
     // supervisor broadcasts that child output to every client, so both A
@@ -825,7 +813,7 @@ async fn client_keystrokes_are_not_forwarded_to_other_clients() {
 
     // Connect A (with retry while the listener comes up) and B.
     let mut a = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -875,7 +863,7 @@ async fn ignored_chars_are_stripped_from_child_stdin() {
     });
 
     let mut c = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -887,7 +875,7 @@ async fn ignored_chars_are_stripped_from_child_stdin() {
     let _ = read_for(&mut c, Duration::from_millis(400)).await;
 
     c.write_all(b"haZllo\n").await.unwrap();
-    let seen = read_until(&mut c, "hallo", Duration::from_secs(2)).await;
+    let seen = read_until(&mut c, "hallo", MUST_ARRIVE).await;
     assert!(
         seen.contains("hallo"),
         "filtered input must reach the child as 'hallo': {seen:?}"
@@ -920,7 +908,7 @@ async fn child_exit_sigkills_orphaned_process_group() {
 
     // Wait for the grandchild PID to be recorded.
     let gpid: i32 = {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             if let Ok(s) = std::fs::read_to_string(&pidfile)
                 && let Some(p) = s.split_whitespace().next().and_then(|x| x.parse().ok())
@@ -975,7 +963,7 @@ async fn teardown_sigkills_a_child_that_traps_the_configurable_kill_signal() {
 
     // Wait for the child to record its PID (proves it installed the trap).
     let child_pid: i32 = {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             if let Ok(s) = std::fs::read_to_string(&pidfile)
                 && let Some(p) = s.split_whitespace().next().and_then(|x| x.parse().ok())
@@ -998,7 +986,7 @@ async fn teardown_sigkills_a_child_that_traps_the_configurable_kill_signal() {
     // `kill -0` still reports it alive. Poll for the real condition
     // instead of guessing how long the reaper thread takes to get
     // scheduled under load.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + MUST_ARRIVE;
     loop {
         let still_alive = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -1039,14 +1027,14 @@ async fn norestart_keeps_server_alive_after_child_exit() {
     // delay — under load a blind sleep can both fire too early (flaking
     // the invariant this test targets) and needlessly slow the fast path.
     {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         while !marker.exists() {
             assert!(Instant::now() < deadline, "child never exited");
             sleep(Duration::from_millis(20)).await;
         }
     }
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1055,12 +1043,7 @@ async fn norestart_keeps_server_alive_after_child_exit() {
             }
         }
     };
-    let banner = read_until(
-        &mut conn,
-        "procServ server started at:",
-        Duration::from_secs(2),
-    )
-    .await;
+    let banner = read_until(&mut conn, "procServ server started at:", MUST_ARRIVE).await;
     assert!(
         banner.contains("procServ server started at:"),
         "server should still serve a banner after the child exited under norestart; got: {banner:?}"
@@ -1085,7 +1068,7 @@ async fn child_exit_code_becomes_server_exit_code() {
     cfg.restart_mode = RestartMode::OneShot;
     let (server, _ports) = spawn_bound(cfg).await;
 
-    let code = timeout(Duration::from_secs(5), server.run())
+    let code = timeout(MUST_ARRIVE, server.run())
         .await
         .expect("one-shot supervisor should exit promptly")
         .expect("run ok");
@@ -1110,7 +1093,7 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1119,17 +1102,17 @@ async fn toggle_into_oneshot_grants_one_more_run() {
             }
         }
     };
-    // Drain the banner + the first child's "@@@ The PID of new child".
-    let _ = read_until(&mut conn, "The PID of new child", Duration::from_secs(2)).await;
+    // Wait for the greeting, which proves this client is in the roster
+    // before the keystrokes below are typed — the same barrier the
+    // party-line tests use. Not the first child's "@@@ The PID of new
+    // child": that line is broadcast when the child spawns, which races
+    // the connect above, so a client that arrives a moment late never sees
+    // it and the wait can only ever expire.
+    let _ = read_until(&mut conn, "procServ server started at:", MUST_ARRIVE).await;
 
     // ^T → OnExit→Disabled (OFF); ^T → Disabled→OneShot (sets first_run).
     conn.write_all(&[0x14]).await.unwrap();
-    let off = read_until(
-        &mut conn,
-        "Toggled auto restart mode to OFF",
-        Duration::from_secs(2),
-    )
-    .await;
+    let off = read_until(&mut conn, "Toggled auto restart mode to OFF", MUST_ARRIVE).await;
     assert!(
         off.contains("Toggled auto restart mode to OFF"),
         "got: {off:?}"
@@ -1138,7 +1121,7 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     let on = read_until(
         &mut conn,
         "Toggled auto restart mode to ONESHOT",
-        Duration::from_secs(2),
+        MUST_ARRIVE,
     )
     .await;
     assert!(
@@ -1149,7 +1132,7 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     // First kill: the child exits but oneshot+first_run grants one more
     // run — a SECOND "@@@ The PID of new child" must appear (no shutdown).
     conn.write_all(&[0x18]).await.unwrap();
-    let relaunch = read_until(&mut conn, "The PID of new child", Duration::from_secs(3)).await;
+    let relaunch = read_until(&mut conn, "The PID of new child", MUST_ARRIVE).await;
     assert!(
         relaunch.contains("The PID of new child"),
         "toggle-into-oneshot must grant one more run, got: {relaunch:?}"
@@ -1158,19 +1141,14 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     // Second kill: the granted run is spent (first_run cleared by the
     // relaunch's respawn_child) — this exit shuts the server down.
     conn.write_all(&[0x18]).await.unwrap();
-    let shutdown = read_until(
-        &mut conn,
-        "oneshot mode: server will exit",
-        Duration::from_secs(3),
-    )
-    .await;
+    let shutdown = read_until(&mut conn, "oneshot mode: server will exit", MUST_ARRIVE).await;
     assert!(
         shutdown.contains("oneshot mode: server will exit"),
         "spent oneshot must shut the server down, got: {shutdown:?}"
     );
 
     // run() resolves once the spent oneshot shuts the supervisor down.
-    timeout(Duration::from_secs(3), server_task)
+    timeout(MUST_ARRIVE, server_task)
         .await
         .expect("supervisor should exit after the spent oneshot")
         .expect("server task join");
@@ -1190,7 +1168,7 @@ async fn banner_precedes_telnet_negotiation() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1244,7 +1222,7 @@ async fn clean_shutdown_removes_both_the_info_and_pid_files() {
     cfg.restart_mode = RestartMode::OneShot;
 
     let (server, _ports) = spawn_bound(cfg).await;
-    timeout(Duration::from_secs(5), server.run())
+    timeout(MUST_ARRIVE, server.run())
         .await
         .expect("one-shot supervisor should exit promptly")
         .expect("run ok");
@@ -1283,7 +1261,7 @@ async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
     // The control port is up (the manager's other discovery path), so the
     // info file must already be there — that is the whole point of writing
     // it before the main loop.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + MUST_ARRIVE;
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => break,
@@ -1293,7 +1271,7 @@ async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
     }
 
     let body = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match std::fs::read_to_string(&info) {
                 Ok(s) if !s.is_empty() => break s,
@@ -1341,7 +1319,7 @@ async fn info_file_reports_the_kernel_assigned_port_for_a_port_zero_config() {
     });
 
     let body = {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_ARRIVE;
         loop {
             match std::fs::read_to_string(&info) {
                 Ok(s) if !s.is_empty() => break s,
@@ -1365,7 +1343,7 @@ async fn info_file_reports_the_kernel_assigned_port_for_a_port_zero_config() {
 
     // The published port must be the live listener, not a guess: a client
     // that reads the info file (manage-procs) can connect to it.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + MUST_ARRIVE;
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => break,

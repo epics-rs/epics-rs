@@ -110,7 +110,10 @@ pub fn parse_db_with_breaktables(
     input: &str,
     macros: &HashMap<String, String>,
 ) -> CaResult<(Vec<DbRecordDef>, Vec<crate::server::cvt_bpt::BrkTable>)> {
-    let expanded = substitute_macros(input, macros);
+    // Per LINE, not per file: C's loader expands each `fgets` line
+    // separately (`dbLexRoutines.c:375-391`), so quote state cannot leak
+    // across lines — see `substitute_macros_per_line`.
+    let expanded = substitute_macros_per_line(input, macros);
     let mut records = Vec::new();
     let mut breaktables: Vec<crate::server::cvt_bpt::BrkTable> = Vec::new();
     // Standalone `alias("record","newname")` directives (dbYacc.y:275).
@@ -501,6 +504,25 @@ pub fn expand_macros(
 /// re-implementing macLib.
 pub fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
     expand_macros(input, macros, MacroExpandOptions::default()).text
+}
+
+/// [`substitute_macros`], one line at a time — how C's file readers feed
+/// macLib.
+///
+/// `dbLoadRecords` hands `macExpandString` a single `fgets` line
+/// (`dbLexRoutines.c:375-391`), and `asInitFile` does the same
+/// (`asLibRoutines.c:202-219`), so the expander's quote tracking (`trans`'s
+/// `quote`, C `macCore.c`) resets at every newline. Expanding a whole file
+/// in one [`substitute_macros`] call let one line's quote state leak into
+/// the next: an apostrophe in a `#` comment opened single-quote suppression
+/// and silently disabled every `$(...)` on the lines after it, until the
+/// parser failed on an unexpanded record name. Within a line the quote
+/// rules are unchanged — `'$(X)'` still suppresses.
+pub fn substitute_macros_per_line(input: &str, macros: &HashMap<String, String>) -> String {
+    input
+        .split_inclusive('\n')
+        .map(|line| substitute_macros(line, macros))
+        .collect()
 }
 
 /// Translate `chars` into `out`, expanding macro references.
@@ -2978,6 +3000,45 @@ record(ai, "REC") {
         // After the scoped $(INNER,A=9), a bare $(A) is undefined.
         let out = substitute_macros("$(INNER,A=9)|$(A)", &macros);
         assert_eq!(out, "9|$(A,undefined)");
+    }
+
+    // Quote state resets at every newline (C expands one fgets line per
+    // `macExpandString` call, dbLexRoutines.c:375-391): a quote character on
+    // one line must not suppress expansion on the next, while suppression
+    // WITHIN a line keeps working.
+    #[test]
+    fn substitute_macros_per_line_resets_quote_state_at_newline() {
+        let mut macros = HashMap::new();
+        macros.insert("X".to_string(), "VAL".to_string());
+        // Whole-file expansion leaks the apostrophe's quote state forward…
+        assert_eq!(
+            substitute_macros("don't\n$(X)", &macros),
+            "don't\n$(X)",
+            "precondition: the whole-file engine suppresses across the newline"
+        );
+        // …the per-line form does not.
+        assert_eq!(
+            substitute_macros_per_line("don't\n$(X)", &macros),
+            "don't\nVAL"
+        );
+        // Same-line suppression is unchanged.
+        assert_eq!(
+            substitute_macros_per_line("'$(X)' $(X)\n$(X)", &macros),
+            "'$(X)' VAL\nVAL"
+        );
+    }
+
+    // The formerly-bypassing path end to end: an apostrophe in a `#` comment
+    // must not stop `$(P)` expanding on the record line below it.
+    #[test]
+    fn parse_db_expands_macros_after_a_comment_apostrophe() {
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "T:".to_string());
+        let db = "# this comment's apostrophe must stay harmless\n\
+                  record(ai, \"$(P)X\") {\n}\n";
+        let records = parse_db(db, &macros).expect("the comment must not break expansion");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "T:X");
     }
 
     // Macros are NOT expanded inside single quotes.

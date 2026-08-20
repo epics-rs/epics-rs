@@ -213,7 +213,11 @@ fn cmd_as_init() -> CommandDef {
             let content = match &substitutions {
                 Some(subs) if !subs.is_empty() => {
                     let macros = super::commands::parse_macro_string(subs);
-                    crate::server::db_loader::substitute_macros(&raw, &macros)
+                    // Per line, as C `asInitFile` feeds `macExpandString` one
+                    // `fgets` line at a time (`asLibRoutines.c:202-219`) — a
+                    // quote in one ACF comment must not suppress `$(...)` on
+                    // the lines after it.
+                    crate::server::db_loader::substitute_macros_per_line(&raw, &macros)
                 }
                 _ => raw,
             };
@@ -615,6 +619,47 @@ mod tests {
         // Config is now active in the context's live cell — the one
         // the IOC's servers gate on.
         assert!(ctx.acf().load().is_some());
+    }
+
+    /// ACF substitutions expand per line (C `asLibRoutines.c:202-219` feeds
+    /// `macExpandString` one `fgets` line at a time): an apostrophe in a
+    /// comment must not suppress `$(...)` on the lines after it.
+    #[test]
+    fn as_init_expands_substitutions_after_a_comment_apostrophe() {
+        let _guard = as_state_test_guard();
+        reset_as_state_for_test();
+        let (_db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+
+        let tmp = tempfile::Builder::new().suffix(".acf").tempfile().unwrap();
+        writeln!(
+            tmp.as_file(),
+            "# the operators' group\nUAG($(G)) {{ alice }}\n\
+             ASG(DEFAULT) {{ RULE(1, WRITE) {{ UAG($(G)) }} }}"
+        )
+        .unwrap();
+
+        let set = reg.get("asSetFilename").unwrap();
+        let a = parse_args(&[tmp.path().to_string_lossy().into()], &set.args).unwrap();
+        assert!(set.handler.call(&a, &ctx).is_ok());
+
+        let subs = reg.get("asSetSubstitutions").unwrap();
+        let a = parse_args(&["G=ops".into()], &subs.args).unwrap();
+        assert!(subs.handler.call(&a, &ctx).is_ok());
+
+        let init = reg.get("asInit").unwrap();
+        let a = parse_args(&[], &init.args).unwrap();
+        assert!(
+            init.handler.call(&a, &ctx).is_ok(),
+            "the comment's apostrophe must not leave $(G) unexpanded"
+        );
+        let config = ctx.acf().load();
+        let config = config.as_ref().expect("config must be active");
+        assert!(
+            config.uag.contains_key("ops"),
+            "UAG($(G)) must have expanded to UAG(ops)"
+        );
     }
 
     /// asInit on a malformed ACF surfaces the parse error.

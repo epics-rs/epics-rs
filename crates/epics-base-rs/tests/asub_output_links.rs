@@ -191,3 +191,47 @@ async fn r9_78_empty_snam_pushes_output_links() {
         "empty SNAM is C do_sub's `return 0`, so status 0 pushes OUTA <- VALA"
     );
 }
+
+/// A declared `FTVB=STRING` output carries its string through OUTB — the
+/// push reads the FTVx-typed cell (C `dbPutLink(&(&prec->outa)[i],
+/// (&prec->ftva)[i], ...)`, aSubRecord.c:236-238), so the sink receives a
+/// string, not a numeric collapse.
+#[epics_macros_rs::epics_test]
+async fn r9_78_string_output_pushes_through_out_link() {
+    let db = PvDatabase::new();
+    db.add_record("SINK_S", Box::new(StringoutRecord::new("")))
+        .await
+        .unwrap();
+
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert(
+        "swriter".into(),
+        Arc::new(Box::new(|rec: &mut dyn Record| {
+            rec.put_field("VALB", EpicsValue::String("armed".into()))?;
+            Ok(0i64)
+        }) as SubroutineFn),
+    );
+    db.install_subroutine_registry(registry).await;
+    db.add_record("NAME_HOLDER2", Box::new(StringoutRecord::new("swriter")))
+        .await
+        .unwrap();
+
+    let mut rec = ASubRecord::default();
+    rec.put_field("SUBL", EpicsValue::String("NAME_HOLDER2".into()))
+        .unwrap();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ: resolve SNAM
+    rec.put_field("FTVB", EpicsValue::Short(0)).unwrap(); // STRING
+    rec.put_field("OUTB", EpicsValue::String("SINK_S".into()))
+        .unwrap();
+    db.add_record("ASUB_S", Box::new(rec)).await.unwrap();
+
+    process(&db, "ASUB_S").await;
+
+    let inst = db.get_record("SINK_S").unwrap();
+    let g = inst.read();
+    assert_eq!(
+        g.record.get_field("VAL"),
+        Some(EpicsValue::String("armed".into())),
+        "the typed VALB string must land in the stringout sink"
+    );
+}

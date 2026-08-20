@@ -166,7 +166,7 @@ impl Default for ASubRecord {
             inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
-            vala: std::array::from_fn(|_| EpicsValue::DoubleArray(Vec::new())),
+            vala: std::array::from_fn(|_| channel_default(FTYPE_DOUBLE, 1)),
             out: std::array::from_fn(|_| String::new()),
             fta: [FTYPE_DOUBLE; NUM_ARGS],
             ftva: [FTYPE_DOUBLE; NUM_ARGS],
@@ -237,7 +237,8 @@ fn channel_ftype(ft: i16) -> Ftype {
     Ftype::from_index(ft).unwrap_or(Ftype::Char)
 }
 
-/// An input cell as C `initFields` allocates it (aSubRecord.c:176-198):
+/// A channel cell as C `initFields` allocates it (aSubRecord.c:176-198,
+/// run for the A..U/FTx/NOx triple AND the VALA..VALU/FTVx/NOVx one):
 /// `callocMustSucceed(NOx, dbValueSize(FTx))`, a zero-filled FTx-typed
 /// buffer of NOx elements (`*pno == 0` is clamped to 1). The port stores
 /// the one-element case as the FTx-typed zero scalar.
@@ -277,12 +278,16 @@ fn wrap_one_element(scalar: EpicsValue, ftype: Ftype) -> EpicsValue {
     }
 }
 
-/// Shape a value entering input cell `x` — a framework link delivery or a
-/// direct put — to the channel's declared `FTx`/`NOx`. This is C
-/// `fetch_values`'s `dbGetLink(plink, (&prec->fta)[i], (&prec->a)[i], 0,
-/// &nRequest)` with `nRequest = NOx` (aSubRecord.c:278-288): the link layer
-/// converts the source element-wise into the FTx-typed buffer and clamps
-/// the delivered count to NOx. Returns the shaped value and the new NEx.
+/// Shape a value entering a channel cell — a framework link delivery, a
+/// direct put, or a subroutine's output write — to the cell's declared
+/// type/capacity. On the input side this is C `fetch_values`'s
+/// `dbGetLink(plink, (&prec->fta)[i], (&prec->a)[i], 0, &nRequest)` with
+/// `nRequest = NOx` (aSubRecord.c:278-288): the link layer converts the
+/// source element-wise into the FTx-typed buffer and clamps the delivered
+/// count to NOx. On the output side it is the buffer itself: a C
+/// subroutine writes *into* the FTVx-typed NOVx-element `vala[i]`, so no
+/// other shape can exist there. Returns the shaped value and the new
+/// NEx/NEVx.
 fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> (EpicsValue, i32) {
     let ftype = channel_ftype(ft);
     let elem = ftype.element_type();
@@ -495,9 +500,15 @@ impl Record for ASubRecord {
                     self.out[idx] = s;
                 }
             }
-            // Output value VALA..VALU — store native; track NEVx.
+            // Output value VALA..VALU — shaped to the channel's declared
+            // FTVx/NOVx, the same rule as the input side: a C subroutine
+            // writes INTO the FTVx-typed NOVx-element buffer, so no other
+            // shape can leave `do_sub`, and the OUT push reads that buffer
+            // (`dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], ...)`,
+            // aSubRecord.c:236-238). NEVx tracks the elements written.
             "VAL" => {
-                self.neva[idx] = value.count().max(1) as i32;
+                let (value, ne) = shape_channel_value(value, self.ftva[idx], self.nova[idx]);
+                self.neva[idx] = ne;
                 self.vala[idx] = value;
             }
             "FT" | "FTV" | "NO" | "NOV" | "NE" | "NEV" => {
@@ -510,13 +521,14 @@ impl Record for ASubRecord {
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?,
                 };
                 match prefix {
-                    // FTx/NOx declare the input cell's element type and
-                    // capacity: C `initFields` clamps them (out-of-menu FTx
-                    // -> CHAR at aSubRecord.c:186-187, NOx 0 -> 1 at :189-190)
-                    // and allocates the cell as a zero-filled FTx-typed
-                    // buffer with NEx = NOx (:192-196). Both are SPC_NOMOD,
-                    // so this put is the load path — re-deriving the cell
-                    // here is that allocation.
+                    // FTx/NOx and FTVx/NOVx declare their cell's element type
+                    // and capacity: C `initFields` clamps them (out-of-menu
+                    // FTx -> CHAR at aSubRecord.c:186-187, NOx 0 -> 1 at
+                    // :189-190) and allocates the cell as a zero-filled
+                    // FTx-typed buffer with NEx = NOx (:192-196) — run for
+                    // both the input and the output triple. All four are
+                    // SPC_NOMOD, so these puts are the load path —
+                    // re-deriving the cell here is that allocation.
                     "FT" => {
                         self.fta[idx] = channel_ftype(v as i16).index();
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
@@ -527,8 +539,16 @@ impl Record for ASubRecord {
                         self.a[idx] = channel_default(self.fta[idx], self.noa[idx]);
                         self.nea[idx] = self.noa[idx];
                     }
-                    "FTV" => self.ftva[idx] = v as i16,
-                    "NOV" => self.nova[idx] = v,
+                    "FTV" => {
+                        self.ftva[idx] = channel_ftype(v as i16).index();
+                        self.vala[idx] = channel_default(self.ftva[idx], self.nova[idx]);
+                        self.neva[idx] = self.nova[idx].max(1);
+                    }
+                    "NOV" => {
+                        self.nova[idx] = v.max(1);
+                        self.vala[idx] = channel_default(self.ftva[idx], self.nova[idx]);
+                        self.neva[idx] = self.nova[idx];
+                    }
                     "NE" => self.nea[idx] = v,
                     "NEV" => self.neva[idx] = v,
                     _ => unreachable!(),
@@ -699,7 +719,10 @@ mod tests {
             rec.put_field(name, EpicsValue::Double(3.0)).unwrap();
             assert_eq!(rec.get_field(name), Some(EpicsValue::Double(3.0)));
         }
-        for name in ["VALM", "VALU"] {
+        for (name, nov) in [("VALM", "NOVM"), ("VALU", "NOVU")] {
+            // C requires the output capacity declared up front, like the
+            // input side: the subroutine writes into an NOVx-element buffer.
+            rec.put_field(nov, EpicsValue::Long(2)).unwrap();
             rec.put_field(name, EpicsValue::DoubleArray(vec![1.0, 2.0]))
                 .unwrap();
             assert_eq!(
@@ -796,6 +819,41 @@ mod tests {
             .unwrap();
         assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(5.5)));
         assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(1)));
+    }
+
+    /// FTVx/NOVx declare the output cell the same way (C `initFields` runs
+    /// for the output triple too): the cell allocates typed and zeroed, and
+    /// a subroutine's write converts and clamps into it — C's subroutine
+    /// writes INTO the FTVx-typed NOVx-element buffer, so no other shape
+    /// can leave `do_sub`.
+    #[test]
+    fn ftvx_novx_declare_the_output_cell() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTVA", EpicsValue::Short(10)).unwrap(); // DOUBLE
+        rec.put_field("NOVA", EpicsValue::Long(3)).unwrap();
+        assert_eq!(
+            rec.get_field("VALA"),
+            Some(EpicsValue::DoubleArray(vec![0.0; 3]))
+        );
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
+
+        rec.put_field("VALA", EpicsValue::LongArray(vec![1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("VALA"),
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])),
+            "a subroutine write converts element-wise and clamps to NOVx"
+        );
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(3)));
+
+        rec.put_field("FTVB", EpicsValue::Short(0)).unwrap(); // STRING
+        rec.put_field("VALB", EpicsValue::String("done".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("VALB"),
+            Some(EpicsValue::String("done".into())),
+            "a declared STRING output keeps its string"
+        );
     }
 
     /// C `fetch_values` requests the channel's FTx from `dbGetLink`

@@ -9538,9 +9538,11 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
     use std::sync::Mutex;
 
     let db = PvDatabase::new();
-    db.add_record("ASUB_E", Box::new(ASubRecord::default()))
-        .await
-        .unwrap();
+    let mut asub = ASubRecord::default();
+    // The output capacity must be declared, as C requires: the subroutine
+    // writes a 2-element array into VALA's NOVA-element buffer.
+    asub.put_field("NOVA", EpicsValue::Long(2)).unwrap();
+    db.add_record("ASUB_E", Box::new(asub)).await.unwrap();
 
     // Subroutine writes VALA from a shared cell so the test controls whether
     // the output changes between processes.
@@ -9568,7 +9570,7 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
     db.process_record("ASUB_E").await.unwrap();
     assert!(
         rx.try_recv().is_ok(),
-        "ON CHANGE: VALA changed from empty default -> monitor event"
+        "ON CHANGE: VALA changed from its zeroed default -> monitor event"
     );
     // Same VALA again -> no event.
     db.process_record("ASUB_E").await.unwrap();

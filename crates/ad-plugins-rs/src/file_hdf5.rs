@@ -1175,16 +1175,23 @@ impl Hdf5Writer {
     /// Ordering mirrors C `NDFileHDF5::openFile` (`NDFileHDF5.cpp:264`-`335`):
     /// the file layout tree and datasets are created, then `createHardLinks`
     /// (`NDFileHDF5.cpp:320`-`321`) runs, and only then `startSWMR`
-    /// (`NDFileHDF5.cpp:324`-`326`). The new rust-hdf5 0.2.17 `SwmrFileWriter`
-    /// exposes `create_group` / `assign_dataset_to_group` / `create_hard_link`
-    /// callable before `start_swmr()`; a group or link created before
-    /// `start_swmr()` is visible to SWMR readers for the whole streaming
-    /// window. So here the image dataset is placed at the layout's nested
-    /// `resolved_dataset_path` and the layout `<hardlink>` elements are
+    /// (`NDFileHDF5.cpp:324`-`326`). `SwmrFileWriter` exposes `create_group` /
+    /// `create_hard_link` callable before `start_swmr()`; a group or link
+    /// created before `start_swmr()` is visible to SWMR readers for the whole
+    /// streaming window. So here the image dataset is placed at the layout's
+    /// nested `resolved_dataset_path` and the layout `<hardlink>` elements are
     /// materialised before SWMR mode is entered — not on the close path.
+    ///
+    /// The layout groups are built first because the dataset carries its full
+    /// nested path as its name, and rust-hdf5 resolves that path against the
+    /// groups that already exist (libhdf5's rule: the default link creation
+    /// property list has `H5Pset_create_intermediate_group` off). The parent
+    /// group the path names is therefore also the dataset's single placement
+    /// owner — nothing re-parents it afterwards.
     fn open_swmr(&mut self, path: &Path, array: &NDArray) -> ADResult<()> {
         let mut swmr = SwmrFileWriter::create(path)
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR create error: {}", e)))?;
+        self.build_swmr_layout_groups(&mut swmr)?;
 
         let usize_frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
         let frame_dims: Vec<u64> = usize_frame_dims.iter().map(|&d| d as u64).collect();
@@ -1214,15 +1221,10 @@ impl Hdf5Writer {
 
         // The streaming dataset is created with its full nested layout path
         // as the dataset name (default flat `data` without a layout). The
-        // `SwmrFileWriter` emits a path-named dataset that is also assigned to
-        // a group under that group with just the leaf, while keeping the full
-        // name addressable so a layout `<hardlink target="/entry/.../data">`
-        // resolves against it. `ds_group_path` is the parent group the
-        // dataset is re-parented into via `assign_dataset_to_group` below.
-        let ds_group_path: Option<String> = self
-            .resolved_dataset_path
-            .rsplit_once('/')
-            .map(|(group_path, _leaf)| group_path.to_string());
+        // `SwmrFileWriter` links it into the group that path names — built
+        // just above — under just the leaf, while keeping the full name
+        // addressable so a layout `<hardlink target="/entry/.../data">`
+        // resolves against it.
         let ds_name = self.resolved_dataset_path.clone();
 
         macro_rules! create_ds {
@@ -1276,25 +1278,10 @@ impl Hdf5Writer {
             NDDataType::Float64 => create_ds!(f64)?,
         };
 
-        // Build the layout group tree, place the image dataset inside its
-        // nested layout group, materialise its constant attributes and the
-        // layout `<hardlink>` elements — all BEFORE `start_swmr()` so SWMR
-        // readers see the nested paths and aliases for the whole streaming
-        // window. C `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then
-        // `startSWMR`.
-        self.build_swmr_layout_groups(&mut swmr)?;
-        if let Some(ref group_path) = ds_group_path {
-            // `SwmrFileWriter` keys groups by their absolute path (leading
-            // `/`); `resolved_dataset_path` is stored stripped, so re-add it.
-            let abs_group = format!("/{}", group_path);
-            swmr.assign_dataset_to_group(&abs_group, ds_index)
-                .map_err(|e| {
-                    ADError::UnsupportedConversion(format!(
-                        "SWMR assign dataset to group '{}': {}",
-                        abs_group, e
-                    ))
-                })?;
-        }
+        // Materialise the image dataset's constant attributes and the layout
+        // `<hardlink>` elements — all BEFORE `start_swmr()` so SWMR readers
+        // see the nested paths and aliases for the whole streaming window.
+        // C `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then `startSWMR`.
         self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
         self.write_swmr_ndarray_default_attrs(&mut swmr, ds_index, array)?;
         self.build_swmr_layout_hardlinks(&mut swmr)?;

@@ -3309,6 +3309,51 @@ mod tests {
         }
     }
 
+    /// Shrink the circuit's timers so a test that drives a real loopback peer
+    /// can run on the real clock, and prove the shrink took.
+    ///
+    /// `EPICS_CA_CONN_TMO` sets both halves these tests wait on:
+    /// `CircuitWatchdog::retire_bound()` is `echo_idle_secs()` — the timeout
+    /// itself, floored at 1 s — plus the fixed `ECHO_TIMEOUT_SECS`, and the
+    /// per-name-server redial waits one more `connection_timeout()`. At the
+    /// compiled 30 s default that is 65 s of waiting, which is why these two
+    /// tests used to ask for a paused clock instead.
+    ///
+    /// A paused clock is the wrong tool here. Tokio auto-advances it whenever
+    /// the runtime idles, and it idles while the OS still owes the test an
+    /// `accept` — the park polls I/O once with a zero timeout and, finding
+    /// nothing ready, jumps straight to the next timer
+    /// (`tokio::runtime::time::Driver::park_thread_timeout`; only in-flight
+    /// `spawn_blocking` work inhibits it, never pending I/O). A few such park
+    /// cycles cover the whole 65 s budget in microseconds of wall clock, so a
+    /// virtual deadline around a real accept measures the machine's socket
+    /// latency and not the property under test. That is what made
+    /// `a_silent_name_server_is_retired_on_the_circuit_bound` fail under a
+    /// loaded `--workspace` run and pass alone.
+    ///
+    /// `connection_timeout()` caches its resolution for the life of the
+    /// process, so the value has to be in the environment before anything
+    /// resolves it — one test per process under nextest, and `#[serial]` for
+    /// `cargo test`. The assertion is the point: a cache that was already
+    /// warm would leave the test running the 30 s default, passing slowly
+    /// rather than failing, and that is exactly the kind of silence these
+    /// tests exist to break.
+    ///
+    /// SAFETY: `std::env::set_var` in a multi-threaded process; every caller
+    /// is `#[serial_test::serial]`, the same key `conn_tmo_env_tests` uses.
+    fn shrink_circuit_timers(secs: u64) -> Duration {
+        // SAFETY: as above — every caller is `#[serial_test::serial]`.
+        unsafe { std::env::set_var("EPICS_CA_CONN_TMO", secs.to_string()) };
+        let resolved = crate::client::transport::connection_timeout();
+        assert_eq!(
+            resolved,
+            Duration::from_secs(secs),
+            "EPICS_CA_CONN_TMO was already resolved in this process, so the \
+             shrink did not take; this test must own the resolution"
+        );
+        resolved
+    }
+
     /// An `EPICS_CA_NAME_SERVERS` peer that accepts, keeps reading and never
     /// answers is retired on the bound every CA TCP connection is held to —
     /// `CircuitWatchdog::retire_bound()`, i.e. `echo_idle_secs()` of quiet plus
@@ -3327,16 +3372,22 @@ mod tests {
     /// waits. Against the pre-fix reader the first accept is the only one there
     /// will ever be, so this test times out instead of passing.
     ///
-    /// Virtual time (`start_paused`), because the bound is built from
-    /// `EPICS_CA_CONN_TMO` and defaults to 30 s + 5 s, with another 30 s before
-    /// the redial. Real sockets under a paused clock still work — tokio
-    /// auto-advances only while nothing is runnable, which is precisely what a
-    /// silent peer produces.
+    /// Real time on shrunk timers ([`shrink_circuit_timers`]), not a paused
+    /// clock: the bound is built from `EPICS_CA_CONN_TMO`, and a peer that is
+    /// real enough to accept a connection is real enough that its `accept`
+    /// cannot be measured on tokio's virtual clock.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    #[serial_test::serial]
     async fn a_silent_name_server_is_retired_on_the_circuit_bound() {
         use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
+
+        // 1 s floors `echo_idle_secs()`, so the bound is the 5 s echo probe
+        // plus one second and the redial one second more: ~7 s of real
+        // waiting for a property whose failure mode is "no second accept
+        // ever", which needs no tight margin.
+        let conn_tmo = shrink_circuit_timers(1);
 
         let ns_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3389,7 +3440,7 @@ mod tests {
         // verdict) plus one CONN_TMO of redial cadence is the whole budget;
         // the slack covers the dial itself.
         let budget = crate::client::transport::CircuitWatchdog::retire_bound()
-            + crate::client::transport::connection_timeout()
+            + conn_tmo
             + Duration::from_secs(10);
         let started = tokio::time::Instant::now();
         tokio::time::timeout(budget, accept_rx.recv())
@@ -3425,11 +3476,22 @@ mod tests {
     ///
     /// Measured from the peer, which is where the difference is observable: the
     /// FIN must arrive on the bound, not on the bound plus the redial cadence.
+    ///
+    /// Real time on shrunk timers, for the reason [`shrink_circuit_timers`]
+    /// gives — and here the peer's `accept` and its EOF are both real events,
+    /// so a virtual clock would have measured neither.
     #[cfg(not(feature = "rtems-exec-model"))]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    #[serial_test::serial]
     async fn retiring_a_name_service_circuit_closes_it_before_the_backoff() {
         use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
+
+        // The margin this test lives on IS the backoff, so the timeout cannot
+        // shrink to the 1 s floor its sibling uses: 3 s puts the fixed bound
+        // at 8 s and the pre-fix hold at 11 s, three seconds apart, and the
+        // slack below is spent inside that gap.
+        let conn_tmo = shrink_circuit_timers(3);
 
         let ns_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3465,10 +3527,10 @@ mod tests {
         let _engine_handle = tokio::spawn(engine);
 
         let bound = crate::client::transport::CircuitWatchdog::retire_bound();
-        let backoff = crate::client::transport::connection_timeout();
+        let backoff = conn_tmo;
         // Generous enough to absorb the dial and the probe round trip, and
         // still far below the `bound + backoff` the pre-fix scope produced.
-        let allowed = bound + Duration::from_secs(10);
+        let allowed = bound + Duration::from_millis(1_500);
         let held = tokio::time::timeout(bound + backoff + Duration::from_secs(30), eof_rx.recv())
             .await
             .expect("the retired circuit must close; the peer saw no FIN at all")

@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 netcdf3 = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff"] }
 rayon = { version = "1", optional = true }
-rust-hdf5 = { version = "0.3.2", features = ["threadsafe", "all_filters", "parallel"] }
+rust-hdf5 = { version = "0.5.1", features = ["threadsafe", "all_filters", "parallel"] }
 epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
 

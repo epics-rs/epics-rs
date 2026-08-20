@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.26.1 — 2026-08-20
+
+Patch release. `ad-plugins-rs` moves to rust-hdf5 0.5.1, which brings that
+crate's 0.4/0.5 read overhaul to the HDF5 file plugin. An asyn parameter batch
+now fires an interrupt for every address list it wrote, an NTNDArray frame no
+longer boxes its pixels one `ScalarValue` at a time on the PVA path, and the
+merged-upstream fix wave for epics-base #853/#856/#871/#934/#944 and asyn #217
+is in. Workspace version 0.26.0 -> 0.26.1, internal `[workspace.dependencies]`
+pins move to 0.26.1 in lockstep.
+
+### `ad-plugins-rs` reads and writes HDF5 through rust-hdf5 0.5.1
+
+The jump from 0.3.2 picks up that crate's read-path rewrite — a typed full
+read landing in the vector it returns rather than a second buffer of the same
+size, a hyperslab of an unfiltered chunked dataset reading only the byte
+ranges the selection intersects, a per-dataset cache of partly-consumed
+filtered chunk images, and `zlib-rs` inflating what `flate2` compressed.
+rust-hdf5's own probes against libhdf5 1.14.6 put a 128 MiB contiguous read at
+0.89x of its time where it was 1.79x, and opening plus reading 2000 small
+datasets at 0.29x where it was 2.52x. Stored bytes are unchanged.
+
+One thing on this side had to move. 0.5.1 resolves a dataset's path against
+the groups that already exist — libhdf5's rule with
+`H5Pset_create_intermediate_group` off — so `Hdf5Writer::open_swmr` builds the
+layout group tree before creating the streaming dataset that carries the
+nested layout path as its name. The group that path names is now the dataset's
+placement, and the `assign_dataset_to_group` call that used to re-parent it
+afterwards is gone: one owner rather than a create followed by a move.
+
+### An asyn parameter batch flushes every address list it wrote
+
+`callParamCallbacks` consumes one address list's changed flags, and a C driver
+calls it once per list it wrote. `RequestOp::CallParamCallbacks` bundles the
+sets and the flush, so flushing the request address alone stored the other
+lists' values while firing no interrupt for them: a multi-device driver
+publishing six joint angles at addresses 0..6 in one call left five records at
+UDF for the life of the IOC, while the array parameter carrying the same six
+numbers updated normally. Found in the ur-robot RTDE receive driver.
+
+### An NTNDArray frame no longer costs 24x its pixels on the PVA path
+
+`NdArrayBuffer::into_scalar_array` boxed every element into a `ScalarValue`,
+24 bytes wide because the enum carries a `String(PvString)` variant, so a
+640x480 RGB8 frame turned 0.9 MB of pixels into a 22 MB `Vec<ScalarValue>`
+that the encoder then walked element by element. It now returns the
+`PvField::ScalarArrayTyped` variant the encoder bulk-copies, and
+`nt_nd_array_value` borrows the pixel buffer instead of cloning it first. On a
+RealSense D405 IOC serving colour and depth at 640x480 @ 15 fps, the two PVA
+plugins' CPU increment falls from 135.3% to 14.3% of one core. The wire format
+does not change.
+
+### The merged-upstream fix wave
+
+- **CA server:** both write actions clamp `m_count` to the channel's final
+  element count and cross-check `dbr_size_n` against the postsize before
+  access (epics-base #934), carrying #944's scalar-`DBR_STRING` exemption —
+  without it every default-mode `caput` drops, since libca frames a scalar
+  string as `ALIGN(strlen+1)` rather than 40 bytes. An `EVENT_ADD` whose
+  `mon_info` payload is truncated is now dropped instead of defaulted to a
+  `DBE_VALUE|DBE_ALARM` mask C never applies.
+
+- **CA links:** the iocInit link wait is gated on `init_ready` — monitor and
+  attribute fetch both complete — instead of `is_connected`, which the first
+  monitor event satisfies before the detached CTRL fetch lands, so records
+  could init against absent metadata (epics-base #856).
+
+- **Access security:** `dump_report` quotes UAG and HAG members C's
+  `asDumpQuoted` way, via `epicsStrPrintEscaped` ported into
+  `epics-libcom-rs` (epics-base #871).
+
+- **asyn:** enabling auto-connect while the port or addressed device is down
+  arms `connect_retry_at`, so the flip alone brings the link up (asyn #217).
+
+- **QSRV:** `make_monitor_snapshot` applies the `Q:time:tag` nsec split that
+  `snapshot_for_field` ends with, so a monitor and a GET of the same channel
+  no longer disagree; both producers share one `finish_field_snapshot` tail
+  (the same drift as pvxs #189).
+
+- **RTEMS:** an opt-in static-IP arm in the network bring-up — first interface
+  through `rtems_bsd_ifconfig`, link-up waited on a `PF_ROUTE` socket opened
+  before it, addresses from `EPICS_RTEMS_STATIC_IP`/`_NETMASK`/`_GATEWAY`
+  compile-time defines, falling back to DHCP on any failure (epics-base #853).
+
 ## v0.26.0 — 2026-08-11
 
 Minor release. The upstream-issue audit lands its fix wave across the CA

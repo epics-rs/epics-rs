@@ -371,6 +371,42 @@ mod tests {
         unsafe { std::env::set_var(p.name(), v) };
     }
 
+    /// The state every compiled-default assertion needs: nothing the generated
+    /// table knows about is set in the process environment. Restored on drop.
+    ///
+    /// Hand-picked `clear` calls cannot establish it, because the list that is
+    /// cleared and the list that is asserted on are then maintained apart:
+    /// `unset_resolves_to_the_compiled_default` cleared three parameters and
+    /// asserted on five, so a developer shell exporting
+    /// `EPICS_CA_AUTO_ADDR_LIST=NO` — which a shell that sets
+    /// `EPICS_CA_ADDR_LIST` normally does — failed it, on a table the test
+    /// never doubted. Walking `ENV_PARAM_LIST` deletes the second list:
+    /// whatever a test asserts on, the table has already covered.
+    #[must_use]
+    struct SilentEnv(Vec<(&'static str, String)>);
+
+    impl SilentEnv {
+        fn take() -> Self {
+            let saved = ENV_PARAM_LIST
+                .iter()
+                .filter_map(|p| std::env::var(p.name()).ok().map(|v| (p.name(), v)))
+                .collect();
+            for p in ENV_PARAM_LIST {
+                clear(*p);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for SilentEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                // SAFETY: see `clear`.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+    }
+
     #[test]
     fn test_get_missing() {
         assert_eq!(get("_EPICS_RT_NONEXISTENT_VAR_12345"), None);
@@ -396,9 +432,7 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn unset_resolves_to_the_compiled_default() {
-        clear(EPICS_CA_CONN_TMO);
-        clear(EPICS_CA_SERVER_PORT);
-        clear(EPICS_CA_ADDR_LIST);
+        let _silent = SilentEnv::take();
         assert_eq!(EPICS_CA_CONN_TMO.double(), Ok(30.0));
         assert_eq!(EPICS_CA_SERVER_PORT.long(), Some(5064));
         assert_eq!(EPICS_CA_AUTO_ADDR_LIST.bool(), Some(true));
@@ -536,8 +570,7 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn describe_matches_env_prt_config_param() {
-        clear(EPICS_CA_ADDR_LIST);
-        clear(EPICS_CA_SERVER_PORT);
+        let _silent = SilentEnv::take();
         assert_eq!(
             EPICS_CA_ADDR_LIST.describe(),
             "EPICS_CA_ADDR_LIST is undefined"
@@ -551,7 +584,6 @@ mod tests {
             EPICS_CA_ADDR_LIST.describe(),
             "EPICS_CA_ADDR_LIST: 10.0.0.1"
         );
-        clear(EPICS_CA_ADDR_LIST);
     }
 
     #[test]

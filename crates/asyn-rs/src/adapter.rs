@@ -1653,6 +1653,15 @@ impl AsynDeviceSupport {
 
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        // busy is the driver-clearable output: the busy module's devBusyAsyn
+        // registers the output interrupt callback UNCONDITIONALLY (`if
+        // (interruptCallback)` with no `asyn:READBACK` info gate,
+        // devBusyAsyn.c:245-260) — that always-on readback is the record's
+        // whole point (driver holds VAL=1, clears to 0 on completion). Forced
+        // here, not info-gated: a C db's busy records carry no info tag.
+        if record.record_type() == "busy" {
+            self.set_asyn_readback(true);
+        }
         if !self.reason_set {
             // C calls drvUser->create only when the port registered asynDrvUser
             // **and** the record named a userParam (`if (pasynInterface &&
@@ -3130,6 +3139,12 @@ pub fn register_asyn_device_menus() {
             epics_base_rs::server::record::register_device_menu(record_type, choices);
         }
     }
+    // The busy record's asyn binding comes from the busy MODULE, not asyn's own
+    // .dbd (busySupport_withASYN.dbd: `device(busy,INST_IO,asynBusyInt32,
+    // "asynInt32")`), so it is registered here rather than in the generated
+    // table above. The binding itself is the universal factory + the
+    // unconditional readback forced in `init` (devBusyAsyn.c parity).
+    epics_base_rs::server::record::register_device_menu("busy", &["asynInt32"]);
 }
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
@@ -5914,6 +5929,27 @@ mod tests {
                 Some(InterfaceType::Int32),
                 ParamType::Int32
             )]
+        );
+    }
+
+    /// devBusyAsyn.c:245-260 — the busy module's device support registers the
+    /// output interrupt callback unconditionally, no `asyn:READBACK` info
+    /// gate. A Passive busy record with no info tags must therefore come out
+    /// of `init` with the readback path active (that is how the driver's
+    /// param write releases the record), and an explicit
+    /// `info(asyn:READBACK, "0")` must not defeat it (C never consults it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_record_enables_readback_unconditionally() {
+        use epics_base_rs::server::records::busy::BusyRecord;
+        let mut ads = make_adapter(ScanType::Passive);
+        let mut info = std::collections::HashMap::new();
+        info.insert("asyn:READBACK".to_string(), "0".to_string());
+        ads.apply_record_info(&info);
+        let mut rec = BusyRecord::new();
+        ads.init(&mut rec).unwrap();
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "busy must register the driver readback with no info tag"
         );
     }
 

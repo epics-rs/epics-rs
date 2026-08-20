@@ -64,6 +64,13 @@ pub struct BusyRecord {
     // when `mlst != val`. Captured in the monitor() owner during process()
     // because the framework reads monitor_value_changed() afterwards.
     value_changed: bool,
+    /// Set by `set_device_did_compute(true)` when a device readback has
+    /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
+    /// `process()` then skips the forward `convert_val_to_rval()` that would
+    /// recompute RVAL from VAL and discard the readback — C `processBusy`'s
+    /// callback branch sets `rval`/`val` and never re-converts
+    /// (devBusyAsyn.c:482-488). Mirrors [`bo`](super::bo).
+    skip_convert: bool,
 }
 
 impl Default for BusyRecord {
@@ -94,6 +101,7 @@ impl Default for BusyRecord {
             sims: 0,
             high_reset_pending: false,
             value_changed: false,
+            skip_convert: false,
         }
     }
 }
@@ -197,8 +205,15 @@ impl Record for BusyRecord {
 
         // Step 1: DOL reading handled by framework (OMSL=ClosedLoop)
 
-        // Step 2: VAL → RVAL conversion
-        self.convert_val_to_rval();
+        // Step 2: VAL → RVAL conversion — unless a device readback
+        // (`apply_raw_readback`) already set both RVAL and VAL, in which case
+        // skip the forward convert that would recompute RVAL from VAL and
+        // discard the readback. One-shot, mirrors bo (C `processBusy`'s
+        // callback branch returns without re-converting).
+        if !self.skip_convert {
+            self.convert_val_to_rval();
+        }
+        self.skip_convert = false;
 
         // Step 3: Save current VAL before write (for FLNK decision)
         self.oval = self.val;
@@ -267,6 +282,23 @@ impl Record for BusyRecord {
     }
 
     fn can_device_write(&self) -> bool {
+        true
+    }
+
+    fn set_device_did_compute(&mut self, did: bool) {
+        self.skip_convert = did;
+    }
+
+    /// Device readback (devBusyAsyn's always-on output callback): store the
+    /// raw and resolve VAL to 0/1, mirroring C `processBusy`'s callback branch
+    /// (devBusyAsyn.c:484-487 `pr->rval = value; pr->val = (pr->rval) ? 1 :
+    /// 0`). No MASK split — busy has only the Int32 device support
+    /// (`asynBusyInt32`), whose readback is unmasked. Returns `true` so the
+    /// store reports `computed` and the framework skips the forward convert
+    /// (via `set_device_did_compute`).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        self.rval = raw as u32;
+        self.val = if self.rval != 0 { 1 } else { 0 };
         true
     }
 
@@ -578,6 +610,39 @@ mod tests {
     fn test_can_device_write() {
         let rec = BusyRecord::new();
         assert!(rec.can_device_write());
+    }
+
+    /// devBusyAsyn.c:484-487 — the driver callback stores the raw unmasked
+    /// (`pr->rval = value`) and maps VAL to 0/1; the following process() must
+    /// not recompute RVAL from VAL (the one-shot `set_device_did_compute`
+    /// gate), or a non-0/1 raw readback would be discarded.
+    #[test]
+    fn raw_readback_is_kept_through_process() {
+        let mut rec = BusyRecord::new();
+        assert!(rec.apply_raw_readback(5));
+        assert_eq!((rec.rval, rec.val), (5, 1));
+        rec.set_device_did_compute(true);
+        rec.process().unwrap();
+        assert_eq!(rec.rval, 5, "readback RVAL survives the process cycle");
+        // One-shot: the next (non-readback) process converts VAL forward again.
+        rec.process().unwrap();
+        assert_eq!(rec.rval, 1);
+    }
+
+    /// The release cycle: driver clears the param to 0, the readback maps
+    /// VAL 1 → 0, and that process fires FLNK (`val == 0 || oval == 0`) —
+    /// the completion a `caput -c`/`wait=True` client blocks on.
+    #[test]
+    fn raw_readback_zero_releases_and_fires_flnk() {
+        let mut rec = BusyRecord::new();
+        rec.put_field("VAL", EpicsValue::Enum(1)).unwrap();
+        rec.process().unwrap();
+        assert!(!rec.should_fire_forward_link(), "sustained busy: no FLNK");
+        assert!(rec.apply_raw_readback(0));
+        assert_eq!((rec.rval, rec.val), (0, 0));
+        rec.set_device_did_compute(true);
+        rec.process().unwrap();
+        assert!(rec.should_fire_forward_link());
     }
 
     #[test]

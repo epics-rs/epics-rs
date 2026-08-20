@@ -43,7 +43,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.25", features = ["ad"] }
+epics-rs = { version = "0.26", features = ["ad"] }
 ```
 
 ```rust

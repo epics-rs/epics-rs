@@ -1770,6 +1770,19 @@ impl PortActor {
                             mask,
                             interrupt_mask,
                         } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
+                        crate::request::ParamSetValue::Status {
+                            reason,
+                            addr,
+                            status,
+                            alarm_status,
+                            alarm_severity,
+                        } => base.set_param_status(
+                            *reason,
+                            *addr,
+                            *status,
+                            *alarm_status,
+                            *alarm_severity,
+                        ),
                     };
                     // A set that fails (a value the parameter cannot hold) is
                     // reported, not swallowed: C `asynPortDriver::setIntegerParam`
@@ -3867,6 +3880,75 @@ mod tests {
             *seen.lock(),
             vec![(0, 10), (1, 11), (2, 12)],
             "every address the batch wrote is flushed, request address first"
+        );
+    }
+
+    /// `ParamSetValue::Status` is the background-thread half of C's alarm
+    /// push — `lock(); setParamStatus(..); callParamCallbacks(); unlock()`.
+    /// A status-only transition marks the param changed (paramVal.cpp:71-78),
+    /// so the flush delivers the stored triplet on the `InterruptValue` while
+    /// the value stays what it was; the recovery transition back to `Success`
+    /// is delivered the same way.
+    #[test]
+    fn a_status_publish_delivers_the_alarm_without_touching_the_value() {
+        let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base.interrupts.register_sync_callback(
+            InterruptFilter {
+                reason: Some(val),
+                ..InterruptFilter::default()
+            },
+            move |iv| {
+                recorder.lock().push((
+                    iv.value.as_int32().unwrap(),
+                    iv.aux_status,
+                    iv.alarm_status,
+                    iv.alarm_severity,
+                ))
+            },
+        );
+        let tx = spawn_actor(TestDriverBase(base));
+
+        let publish = |updates| {
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            send_and_wait(
+                &tx,
+                RequestOp::CallParamCallbacks { addr: 0, updates },
+                user,
+            )
+            .unwrap();
+        };
+        publish(vec![crate::request::ParamSetValue::new(
+            val,
+            0,
+            crate::param::ParamValue::Int32(7),
+        )]);
+        publish(vec![crate::request::ParamSetValue::status(
+            val,
+            0,
+            crate::error::AsynStatus::Disconnected,
+            0,
+            0,
+        )]);
+        publish(vec![crate::request::ParamSetValue::status(
+            val,
+            0,
+            crate::error::AsynStatus::Success,
+            0,
+            0,
+        )]);
+
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (7, crate::error::AsynStatus::Success, 0, 0),
+                (7, crate::error::AsynStatus::Disconnected, 0, 0),
+                (7, crate::error::AsynStatus::Success, 0, 0),
+            ],
+            "a status transition fires with the prior value intact, and so \
+             does the recovery back to Success"
         );
     }
 

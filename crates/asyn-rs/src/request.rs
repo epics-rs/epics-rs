@@ -41,6 +41,21 @@ pub enum ParamSetValue {
         /// interruptMask)`); `0` for a plain value set.
         interrupt_mask: u32,
     },
+    /// C `setParamStatus` / `setParamAlarmStatus` / `setParamAlarmSeverity`
+    /// from a background thread — the alarm-push half of the C pattern
+    /// `lock(); setParamStatus(..); callParamCallbacks(); unlock()`. The
+    /// value is untouched; a status/alarm transition alone marks the param
+    /// changed so the flush delivers it (paramVal.cpp:71-104), and the
+    /// devEpics fill-in maps a non-Success `status` to the EPICS alarm
+    /// (asynDisconnected → COMM/INVALID) when `alarm_status`/`alarm_severity`
+    /// are left 0 (asynEpicsUtils.c:238-265).
+    Status {
+        reason: usize,
+        addr: i32,
+        status: AsynStatus,
+        alarm_status: u16,
+        alarm_severity: u16,
+    },
 }
 
 impl ParamSetValue {
@@ -71,11 +86,33 @@ impl ParamSetValue {
         }
     }
 
+    /// C `setParamStatus(list, index, status)` plus the alarm pair: set the
+    /// transport status and EPICS alarm without touching the value. Pass
+    /// `alarm_status`/`alarm_severity` 0 to let the record-side fill-in map
+    /// `status` itself (the C-normal path).
+    pub fn status(
+        reason: usize,
+        addr: i32,
+        status: AsynStatus,
+        alarm_status: u16,
+        alarm_severity: u16,
+    ) -> Self {
+        Self::Status {
+            reason,
+            addr,
+            status,
+            alarm_status,
+            alarm_severity,
+        }
+    }
+
     /// The address list this update lands in — the list whose changed flags a
     /// later `callParamCallbacks` has to consume for it to reach a record.
     pub fn addr(&self) -> i32 {
         match self {
-            Self::Value { addr, .. } | Self::UInt32Digital { addr, .. } => *addr,
+            Self::Value { addr, .. }
+            | Self::UInt32Digital { addr, .. }
+            | Self::Status { addr, .. } => *addr,
         }
     }
 }

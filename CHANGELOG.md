@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.26.2 — 2026-08-20
+
+Patch release. aSub channel cells are now allocated and filled by their
+declared FTx/NOx and FTVx/NOVx, asyn gains the busy module's devBusyAsyn
+device support plus a background-thread route for alarm pushes, and db/acf
+macro expansion runs per line so quote state cannot leak across lines.
+Additive API only (`ParamSetValue` gains a `Status` variant and busy's DTYP
+menu gains asynInt32); workspace version 0.26.1 -> 0.26.2, pins unchanged.
+
+### aSub cells take the shape FTx/NOx declares
+
+The A..U cells all initialised as scalar `Double(0.0)` whatever FTA..FTU
+declared, so a link store judged its destination by that stale scalar: an
+array source was reduced to its first element and a string source was
+dropped by the numeric funnel. Each cell now allocates from FTx/NOx as C
+`initFields` does, every value entering A..U is shaped to that declaration,
+a STRING channel reads a scalar link as DBR_STRING, and VALA..VALU take the
+same rule — a subroutine's write lands in the FTVx-typed NOVx-element
+buffer, so an array written without declaring NOVx keeps element 0 only, as
+C requires. An empty array source reports NEx 0 rather than claiming an
+element that was never delivered.
+
+### asyn: driver-clearable busy records and background alarm pushes
+
+devBusyAsyn is ported: a busy record over asynInt32 follows the driver
+parameter with no `asyn:READBACK` tag, mirroring the C device support's
+unconditional output interrupt registration, so the driver clears the busy
+when the operation completes. And `ParamSetValue::Status` gives a poll
+thread the C `setParamStatus` + `callParamCallbacks` route it lacked — a
+driver thread can now raise and clear COMM/INVALID on its readback
+parameters when the device stops responding.
+
+### Macro expansion is per line, as macLib sees it
+
+C feeds `macExpandString` one line at a time, so its quote tracking resets
+at each newline. Expanding a whole db/acf file in one call let an
+apostrophe in a comment suppress every `$(...)` below it; `parse_db` and
+`asInit` now expand per line.
+
 ## v0.26.1 — 2026-08-20
 
 Patch release. `ad-plugins-rs` moves to rust-hdf5 0.5.1, which brings that

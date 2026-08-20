@@ -306,7 +306,10 @@ fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> (EpicsValue, i32)
         // source field at offset 0).
         let scalar = match value.first_element() {
             Some(first) => first,
-            None if value.is_array() => return (channel_default(ft, no), 1),
+            // An empty array source delivers zero elements: C `dbGet` clamps
+            // `nRequest` to the source count (dbAccess.c:999-1000) and
+            // `fetch_values` records it as NEx (aSubRecord.c:287).
+            None if value.is_array() => return (channel_default(ft, no), 0),
             None => value,
         };
         let converted = scalar.convert_to(elem);
@@ -819,6 +822,16 @@ mod tests {
             .unwrap();
         assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(5.5)));
         assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(1)));
+
+        // An EMPTY array source delivers zero elements — dbGet clamps
+        // nRequest to the source count (dbAccess.c:999-1000) and NEx records
+        // it (aSubRecord.c:287) — on both cell shapes.
+        rec.put_field("B", EpicsValue::DoubleArray(vec![])).unwrap();
+        assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(0.0)));
+        assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(0)));
+        rec.put_field("A", EpicsValue::DoubleArray(vec![])).unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![])));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(0)));
     }
 
     /// FTVx/NOVx declare the output cell the same way (C `initFields` runs
